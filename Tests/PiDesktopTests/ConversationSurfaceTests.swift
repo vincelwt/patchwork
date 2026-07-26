@@ -3,26 +3,61 @@ import XCTest
 @testable import PiDesktop
 
 final class TranscriptPresenterTests: XCTestCase {
-    func testConsecutiveCallsAndResultsRollUpUntilAssistantProse() throws {
+    func testTurnCollapsesNarrationAndToolsIntoOneWorkBlock() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
         let messages = [
+            user(id: "u", text: "Inspect it", at: start),
             assistant(id: "a1", blocks: [text("I’ll inspect it."), call("c1", "read", ["path": .string("A.swift")])]),
             result(id: "r1", callID: "c1", text: "contents"),
             assistant(id: "a2", blocks: [call("c2", "grep", ["pattern": .string("TODO")])]),
             result(id: "r2", callID: "c2", text: "A.swift:2"),
-            assistant(id: "a3", blocks: [text("Here is the answer.")])
+            assistant(id: "a3", blocks: [text("Here is the answer.")], at: start.addingTimeInterval(61))
         ]
 
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
-        XCTAssertEqual(items.count, 3, "prose, one rollup, and final prose should remain")
-        guard case let .activity(group) = items[1] else { return XCTFail("Expected a rollup") }
+        XCTAssertEqual(items.count, 3, "user message, one work block, and the answer")
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertFalse(block.isActive, "A settled turn collapses")
+        XCTAssertEqual(block.title, "Worked for 1m 1s")
+
+        // Narration keeps its position above the tools it introduced.
+        guard case let .note(narration) = block.entries.first else { return XCTFail("Expected narration first") }
+        XCTAssertEqual(narration.textContent, "I’ll inspect it.")
+        guard case let .activity(group) = block.entries.last else { return XCTFail("Expected a rollup") }
         XCTAssertEqual(group.steps.map(\.id), ["c1", "c2"])
         XCTAssertEqual(group.summary, "Read files")
-        XCTAssertFalse(group.isActive)
         XCTAssertEqual(group.completedCount, 2)
+
+        guard case let .message(answer, _) = items[2] else { return XCTFail("Expected the answer") }
+        XCTAssertEqual(answer.textContent, "Here is the answer.")
     }
 
-    func testLiveRollupCombinesUniqueKindsAndReportsCurrentStep() throws {
+    func testReasoningSplitsTheLogAndStaysInOrder() throws {
         let messages = [
+            user(id: "u", text: "Go", at: nil),
+            assistant(id: "a1", blocks: [thinking("Checking the build"), call("c1", "bash", ["command": .string("swift build")])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            assistant(id: "a2", blocks: [thinking("Now the tests"), call("c2", "bash", ["command": .string("swift test")])]),
+            result(id: "r2", callID: "c2", text: "passed"),
+            assistant(id: "a3", blocks: [text("Green.")])
+        ]
+
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        let shape = block.entries.map { entry -> String in
+            switch entry {
+            case .thinking: "thinking"
+            case .activity: "activity"
+            case .note: "note"
+            }
+        }
+        XCTAssertEqual(shape, ["thinking", "activity", "thinking", "activity"])
+        XCTAssertEqual(block.stepCount, 2)
+    }
+
+    func testLiveTurnStaysOpenAndReportsProgress() throws {
+        let messages = [
+            user(id: "u", text: "Run it", at: Date(timeIntervalSince1970: 10)),
             assistant(id: "a", blocks: [
                 call("c1", "bash", ["command": .string("swift test")]),
                 call("c2", "chrome_js", ["title": .string("Inspect")])
@@ -31,11 +66,12 @@ final class TranscriptPresenterTests: XCTestCase {
         ]
 
         let items = TranscriptPresenter.items(messages: messages, streaming: assistant(id: "stream", blocks: []))
-        guard case let .activity(group) = items.first else { return XCTFail("Expected a rollup") }
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertTrue(block.isActive, "A turn in flight stays open")
+        guard case let .activity(group) = block.entries.last else { return XCTFail("Expected a rollup") }
         XCTAssertEqual(group.kinds, [.commands, .browser])
         XCTAssertEqual(group.summary, "Ran commands and Used browser")
         XCTAssertTrue(group.isActive)
-        XCTAssertEqual(group.currentStep?.id, "c2")
         XCTAssertEqual(group.progressText, "Step 2 of 2")
     }
 
@@ -46,14 +82,46 @@ final class TranscriptPresenterTests: XCTestCase {
             assistant(id: "done", blocks: [text("I could not edit it.")])
         ]
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
-        guard case let .activity(group) = items.first else { return XCTFail("Expected a rollup") }
-        XCTAssertTrue(group.hasFailure)
+        guard case let .work(block) = items.first else { return XCTFail("Expected a work block") }
+        XCTAssertTrue(block.hasFailure)
+        guard case let .activity(group) = block.entries.first else { return XCTFail("Expected a rollup") }
         XCTAssertFalse(group.shouldStartExpanded, "A completed turn stays collapsed even when its summary reports failure")
         XCTAssertEqual(group.steps.first?.result?.textContent, "permission denied")
+    }
 
-        var liveFailure = group
-        liveFailure.isActive = true
-        XCTAssertFalse(liveFailure.shouldStartExpanded, "Live failures remain high-level until the user expands them")
+    func testCompactionIsShownAsItsOwnTranscriptEvent() throws {
+        let compaction = ChatMessage(
+            id: "compaction-1",
+            role: .system,
+            blocks: [text("Context compacted"), text("Summarized the first 40 turns.")],
+            timestamp: nil,
+            raw: .null
+        )
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "u", text: "hi", at: nil), compaction, assistant(id: "a", blocks: [text("done")])],
+            streaming: nil
+        )
+        guard case let .compaction(note) = items[1] else { return XCTFail("Expected a compaction marker") }
+        XCTAssertEqual(note.title, "Context compacted")
+        XCTAssertEqual(note.summary, "Summarized the first 40 turns.")
+    }
+
+    func testWorkBlockFallsBackToStepCountsWithoutUsableTimestamps() {
+        let block = TranscriptWorkBlock(
+            id: "w",
+            entries: [.activity(TranscriptActivityGroup(
+                id: "g",
+                steps: [TranscriptActivityStep(id: "s", name: "bash", kind: .commands, arguments: .object([:]), result: nil)],
+                isActive: false
+            ))],
+            isActive: false,
+            startedAt: nil,
+            endedAt: nil
+        )
+        XCTAssertEqual(block.title, "Worked · 1 step")
+        XCTAssertEqual(NumberFormatting.duration(0), "0s")
+        XCTAssertEqual(NumberFormatting.duration(61), "1m 1s")
+        XCTAssertEqual(NumberFormatting.duration(3_725), "1h 2m")
     }
 
     func testEveryDocumentedToolKindHasAReadableMapping() {
@@ -70,12 +138,20 @@ final class TranscriptPresenterTests: XCTestCase {
         }
     }
 
-    private func assistant(id: String, blocks: [MessageBlock]) -> ChatMessage {
-        ChatMessage(id: id, role: .assistant, blocks: blocks, timestamp: nil, raw: .null)
+    private func user(id: String, text value: String, at date: Date?) -> ChatMessage {
+        ChatMessage(id: id, role: .user, blocks: [text(value)], timestamp: date, raw: .null)
+    }
+
+    private func assistant(id: String, blocks: [MessageBlock], at date: Date? = nil) -> ChatMessage {
+        ChatMessage(id: id, role: .assistant, blocks: blocks, timestamp: date, raw: .null)
     }
 
     private func text(_ value: String) -> MessageBlock {
         MessageBlock(id: UUID().uuidString, kind: .text(value))
+    }
+
+    private func thinking(_ value: String) -> MessageBlock {
+        MessageBlock(id: UUID().uuidString, kind: .thinking(value))
     }
 
     private func call(_ id: String, _ name: String, _ arguments: [String: JSONValue]) -> MessageBlock {
@@ -92,6 +168,43 @@ final class TranscriptPresenterTests: XCTestCase {
             isError: failed,
             raw: .null
         )
+    }
+}
+
+final class LimitsReportTests: XCTestCase {
+    func testParsesEveryAccountWindowAndKeepsUnknownLines() throws {
+        let report = LimitsReportParser.parse("""
+        ChatGPT
+          Email: someone@example.com
+          Plan: pro
+          primary: 62% remaining · 38% used · 300 min window · resets Jul 27, 10:00
+          secondary: 8% remaining · 92% used · resets Aug 1, 09:00
+          Banked resets: 2 available
+
+        Claude
+          Email: other@example.com
+          Five hour: 90% remaining
+        """)
+
+        XCTAssertEqual(report.accounts.map(\.name), ["ChatGPT", "Claude"])
+        let chatGPT = try XCTUnwrap(report.accounts.first)
+        XCTAssertEqual(chatGPT.email, "someone@example.com")
+        XCTAssertEqual(chatGPT.plan, "pro")
+        XCTAssertEqual(chatGPT.windows.map(\.remainingPercent), [62, 8])
+        XCTAssertEqual(chatGPT.windows.first?.resets, "Jul 27, 10:00")
+        XCTAssertEqual(chatGPT.tightest?.remainingPercent, 8)
+        XCTAssertEqual(chatGPT.notes, ["Banked resets: 2 available"])
+        XCTAssertEqual(report.accounts.last?.windows.first?.label, "Five hour")
+    }
+
+    func testUnreachableAccountReportsItsErrorInsteadOfDisappearing() throws {
+        let report = LimitsReportParser.parse("""
+        Claude
+          Unable to load limits: not signed in with OAuth
+        """)
+        let account = try XCTUnwrap(report.accounts.first)
+        XCTAssertEqual(account.error, "not signed in with OAuth")
+        XCTAssertTrue(account.windows.isEmpty)
     }
 }
 

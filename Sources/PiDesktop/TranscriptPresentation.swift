@@ -63,6 +63,85 @@ struct TranscriptActivityStep: Identifiable, Hashable, Sendable {
     }
 }
 
+/// One reasoning block inside a turn's work log.
+struct TranscriptThinking: Identifiable, Hashable, Sendable {
+    let id: String
+    let text: String
+    let streaming: Bool
+}
+
+/// Everything Pi did inside one turn before its answer, in the order it happened.
+enum TranscriptWorkEntry: Identifiable, Hashable, Sendable {
+    case thinking(TranscriptThinking)
+    case activity(TranscriptActivityGroup)
+    /// Narration Pi produced mid-turn, plus system/custom/unknown entries that belong to the log.
+    case note(ChatMessage)
+
+    var id: String {
+        switch self {
+        case let .thinking(value): "thinking:\(value.id)"
+        case let .activity(group): "activity:\(group.id)"
+        // Block-derived so narration split around a tool call keeps two distinct identities.
+        case let .note(message): "note:\(message.blocks.first?.id ?? message.id)"
+        }
+    }
+}
+
+/// A turn's work log: expanded while Pi is working, collapsed to one line once it has answered.
+struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
+    let id: String
+    var entries: [TranscriptWorkEntry]
+    var isActive: Bool
+    var startedAt: Date?
+    var endedAt: Date?
+
+    var activities: [TranscriptActivityGroup] {
+        entries.compactMap { if case let .activity(group) = $0 { return group } else { return nil } }
+    }
+
+    var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }
+    var hasFailure: Bool { activities.contains(where: \.hasFailure) }
+
+    var duration: TimeInterval? {
+        guard let startedAt, let endedAt else { return nil }
+        let value = endedAt.timeIntervalSince(startedAt)
+        return value > 0 ? value : nil
+    }
+
+    /// The settled headline. A missing or nonsensical timestamp pair falls back to step counts
+    /// rather than printing a bogus duration.
+    var title: String {
+        if let duration { return "Worked for \(NumberFormatting.duration(duration))" }
+        if stepCount > 0 { return "Worked · \(stepCount) step\(stepCount == 1 ? "" : "s")" }
+        return "Worked"
+    }
+}
+
+/// Compaction and branch summaries are session-level events: always visible, never buried.
+struct TranscriptCompaction: Identifiable, Hashable, Sendable {
+    let id: String
+    let title: String
+    let summary: String
+    let timestamp: Date?
+
+    /// Pi writes these as system entries whose first block is the title; matching on that keeps
+    /// the parser's shape untouched.
+    static let titles: Set<String> = ["Context compacted", "Branch summary"]
+
+    init?(message: ChatMessage) {
+        guard message.role == .system else { return nil }
+        let texts = message.blocks.compactMap { block -> String? in
+            guard case let .text(value) = block.kind else { return nil }
+            return value
+        }
+        guard let title = texts.first, Self.titles.contains(title) else { return nil }
+        id = message.id
+        self.title = title
+        summary = texts.dropFirst().joined(separator: "\n")
+        timestamp = message.timestamp
+    }
+}
+
 struct TranscriptActivityGroup: Identifiable, Hashable, Sendable {
     let id: String
     var steps: [TranscriptActivityStep]
@@ -97,114 +176,207 @@ struct TranscriptActivityGroup: Identifiable, Hashable, Sendable {
 
 enum TranscriptItem: Identifiable, Hashable, Sendable {
     case message(ChatMessage, streaming: Bool)
-    case activity(TranscriptActivityGroup)
+    case work(TranscriptWorkBlock)
+    case compaction(TranscriptCompaction)
 
     var id: String {
         switch self {
-        case let .message(message, streaming): "message:\(streaming ? "stream:" : "")\(message.id)"
-        case let .activity(group): "activity:\(group.id)"
+        case let .message(message, streaming):
+            "message:\(streaming ? "stream:" : "")\(message.id):\(message.blocks.first?.id ?? "")"
+        case let .work(block): block.id
+        case let .compaction(note): "compaction:\(note.id)"
         }
     }
 }
 
-/// Projects raw Pi messages into prose and compact tool groups without changing the retained
-/// session data. A group ends when Pi produces prose (or a new user turn begins).
+/// Projects raw Pi messages into Codex-style turns: one user message, one collapsible work log
+/// (reasoning, tool activity, mid-turn narration), then the answer. Nothing in the retained
+/// session data is changed; this is presentation only.
 enum TranscriptPresenter {
     static func items(messages: [ChatMessage], streaming: ChatMessage?, isRunning: Bool = false) -> [TranscriptItem] {
-        var result: [TranscriptItem] = []
-        var pending: TranscriptActivityGroup?
-        var deferredEntries: [TranscriptItem] = []
+        var builder = TurnBuilder(isLive: isRunning || streaming != nil)
+        for message in messages { builder.consume(message, streaming: false) }
+        if let streaming { builder.consume(streaming, streaming: true) }
+        return builder.finish()
+    }
+}
 
-        func flush(active: Bool = false) {
-            guard var group = pending, !group.steps.isEmpty else {
-                pending = nil
-                result.append(contentsOf: deferredEntries)
-                deferredEntries.removeAll(keepingCapacity: true)
-                return
+/// Single pass over the message list. The work log accumulates until Pi's answer closes the
+/// turn, so trailing prose has to be held back until we know no more tools follow it.
+private struct TurnBuilder {
+    let isLive: Bool
+
+    private var result: [TranscriptItem] = []
+    private var entries: [TranscriptWorkEntry] = []
+    private var pending: TranscriptActivityGroup?
+    /// Prose that is the answer unless more work arrives after it.
+    private var trailing: [TranscriptItem] = []
+    private var turnStart: Date?
+    private var lastTimestamp: Date?
+    private var turnIndex = 0
+
+    init(isLive: Bool) { self.isLive = isLive }
+
+    mutating func consume(_ message: ChatMessage, streaming: Bool) {
+        if let timestamp = message.timestamp { lastTimestamp = timestamp }
+
+        switch message.role {
+        case .user:
+            closeTurn(active: false)
+            turnStart = message.timestamp
+            result.append(.message(message, streaming: streaming))
+        case .assistant:
+            consumeAssistant(message, streaming: streaming)
+        case .tool, .bash:
+            attachResult(message)
+        case .system:
+            if let note = TranscriptCompaction(message: message) {
+                closeTurn(active: false)
+                result.append(.compaction(note))
+            } else {
+                log(message, streaming: streaming)
             }
-            group.isActive = active
-            result.append(.activity(group))
-            result.append(contentsOf: deferredEntries)
-            deferredEntries.removeAll(keepingCapacity: true)
-            pending = nil
+        case .custom, .unknown:
+            log(message, streaming: streaming)
         }
+    }
 
-        func appendCalls(_ calls: [ToolCallPayload]) {
-            guard !calls.isEmpty else { return }
-            if pending == nil {
-                pending = TranscriptActivityGroup(id: calls[0].id, steps: [], isActive: true)
-            }
-            pending?.steps.append(contentsOf: calls.map {
-                TranscriptActivityStep(
-                    id: $0.id,
-                    name: $0.name,
-                    kind: ToolActivityKind.classify(toolName: $0.name),
-                    arguments: $0.arguments,
-                    result: nil
-                )
-            })
-        }
+    mutating func finish() -> [TranscriptItem] {
+        closeTurn(active: isLive)
+        return result
+    }
 
-        func consume(_ message: ChatMessage, streaming isStreaming: Bool) {
-            if message.role == .assistant {
-                let calls = message.blocks.compactMap { block -> ToolCallPayload? in
-                    guard case let .toolCall(call) = block.kind else { return nil }
-                    return call
-                }
-                let visibleBlocks = message.blocks.filter {
-                    if case .toolCall = $0.kind { return false }
-                    return true
-                }
-                let hasProse = visibleBlocks.contains {
-                    guard case let .text(text) = $0.kind else { return false }
+    // MARK: - Message kinds
+
+    private mutating func consumeAssistant(_ message: ChatMessage, streaming: Bool) {
+        // Blocks are handled in order, so narration that precedes a tool call stays above it in
+        // the work log instead of being reordered after it.
+        var prose: [MessageBlock] = []
+
+        func proseMessage() -> ChatMessage? {
+            let hasContent = prose.contains { block in
+                if case let .text(text) = block.kind {
                     return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-
-                if hasProse { flush() }
-                if !visibleBlocks.isEmpty {
-                    var visible = message
-                    visible.blocks = visibleBlocks
-                    result.append(.message(visible, streaming: isStreaming))
-                }
-                appendCalls(calls)
-                return
+                return true
             }
-
-            if message.role == .tool || message.role == .bash {
-                let callID = message.toolCallID ?? message.id
-                if let index = pending?.steps.lastIndex(where: { $0.id == callID }) {
-                    pending?.steps[index].result = message
-                } else {
-                    let name = message.toolName ?? (message.role == .bash ? "bash" : "tool")
-                    if pending == nil {
-                        pending = TranscriptActivityGroup(id: callID, steps: [], isActive: true)
-                    }
-                    pending?.steps.append(TranscriptActivityStep(
-                        id: callID,
-                        name: name,
-                        kind: ToolActivityKind.classify(toolName: name),
-                        arguments: .object([:]),
-                        result: message
-                    ))
-                }
-                return
-            }
-
-            if message.role == .user { flush() }
-            let entry = TranscriptItem.message(message, streaming: isStreaming)
-            if pending == nil { result.append(entry) }
-            else { deferredEntries.append(entry) }
+            defer { prose.removeAll(keepingCapacity: true) }
+            guard hasContent else { return nil }
+            var visible = message
+            visible.blocks = prose
+            return visible
         }
 
-        for message in messages { consume(message, streaming: false) }
-        if let streaming { consume(streaming, streaming: true) }
-
-        if let group = pending {
-            let unfinished = group.steps.contains { !$0.complete }
-            // During a run, a completed tool still waits for Pi's final prose. Historical groups
-            // that ended without prose settle once every result is present.
-            flush(active: isRunning || streaming != nil || unfinished)
+        for block in message.blocks {
+            switch block.kind {
+            case let .thinking(text):
+                // Narration that precedes reasoning or a tool call is log, not the answer, and
+                // belongs at this exact position in the work block.
+                if let narration = proseMessage() { demoteTrailing(); entries.append(.note(narration)) }
+                demoteTrailing()
+                closeActivity()
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    entries.append(.thinking(TranscriptThinking(id: block.id, text: text, streaming: streaming)))
+                }
+            case let .toolCall(call):
+                if let narration = proseMessage() { demoteTrailing(); entries.append(.note(narration)) }
+                demoteTrailing()
+                appendCall(call)
+            default:
+                prose.append(block)
+            }
         }
-        return result
+        if let answer = proseMessage() { trailing.append(.message(answer, streaming: streaming)) }
+    }
+
+    /// System, custom, and unknown entries join the work log when a turn is in flight and stand
+    /// on their own otherwise, so an extension message is never silently swallowed.
+    private mutating func log(_ message: ChatMessage, streaming: Bool) {
+        if entries.isEmpty, pending == nil, trailing.isEmpty {
+            result.append(.message(message, streaming: streaming))
+        } else {
+            demoteTrailing()
+            entries.append(.note(message))
+        }
+    }
+
+    // MARK: - Tool activity
+
+    private mutating func appendCall(_ call: ToolCallPayload) {
+        if pending == nil { pending = TranscriptActivityGroup(id: call.id, steps: [], isActive: true) }
+        pending?.steps.append(TranscriptActivityStep(
+            id: call.id,
+            name: call.name,
+            kind: ToolActivityKind.classify(toolName: call.name),
+            arguments: call.arguments,
+            result: nil
+        ))
+    }
+
+    private mutating func attachResult(_ message: ChatMessage) {
+        let callID = message.toolCallID ?? message.id
+        if let index = pending?.steps.lastIndex(where: { $0.id == callID }) {
+            pending?.steps[index].result = message
+            return
+        }
+        // A result can land after reasoning already closed its group.
+        for entryIndex in entries.indices.reversed() {
+            guard case var .activity(group) = entries[entryIndex],
+                  let stepIndex = group.steps.lastIndex(where: { $0.id == callID && $0.result == nil }) else { continue }
+            group.steps[stepIndex].result = message
+            entries[entryIndex] = .activity(group)
+            return
+        }
+
+        // An orphan result (resumed session, tool call outside the loaded branch) still shows.
+        let name = message.toolName ?? (message.role == .bash ? "bash" : "tool")
+        demoteTrailing()
+        if pending == nil { pending = TranscriptActivityGroup(id: callID, steps: [], isActive: true) }
+        pending?.steps.append(TranscriptActivityStep(
+            id: callID,
+            name: name,
+            kind: ToolActivityKind.classify(toolName: name),
+            arguments: .object([:]),
+            result: message
+        ))
+    }
+
+    // MARK: - Turn assembly
+
+    /// Prose followed by more work was narration, not the answer.
+    private mutating func demoteTrailing() {
+        guard !trailing.isEmpty else { return }
+        closeActivity()
+        for item in trailing {
+            if case let .message(message, _) = item { entries.append(.note(message)) }
+        }
+        trailing.removeAll(keepingCapacity: true)
+    }
+
+    private mutating func closeActivity(active: Bool = false) {
+        guard var group = pending, !group.steps.isEmpty else {
+            pending = nil
+            return
+        }
+        group.isActive = active
+        entries.append(.activity(group))
+        pending = nil
+    }
+
+    private mutating func closeTurn(active: Bool) {
+        closeActivity(active: active)
+        if !entries.isEmpty {
+            result.append(.work(TranscriptWorkBlock(
+                id: "work:\(turnIndex):\(entries.first?.id ?? "")",
+                entries: entries,
+                isActive: active,
+                startedAt: turnStart,
+                endedAt: lastTimestamp
+            )))
+        }
+        result.append(contentsOf: trailing)
+        entries.removeAll(keepingCapacity: true)
+        trailing.removeAll(keepingCapacity: true)
+        turnIndex += 1
     }
 }

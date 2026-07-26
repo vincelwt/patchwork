@@ -4,6 +4,9 @@ struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
     let onImage: (ImagePayload) -> Void
+    /// Answers get a hover action row; the same view reused inside a work log does not.
+    var showsActions = false
+    @State private var hovering = false
 
     var body: some View {
         Group {
@@ -23,9 +26,9 @@ struct MessageView: View {
         HStack {
             Spacer(minLength: PiTheme.space32 * 2)
             VStack(alignment: .leading, spacing: PiTheme.space8) { blockList(showThinking: false, fillWidth: false) }
-                .padding(.horizontal, PiTheme.space12)
-                .padding(.vertical, PiTheme.space8)
-                .background(Color.piUserBubble, in: RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous))
+                .padding(.horizontal, PiTheme.space16)
+                .padding(.vertical, PiTheme.space10)
+                .background(Color.piUserBubble, in: RoundedRectangle(cornerRadius: PiTheme.userBubbleRadius, style: .continuous))
         }
         // `.contain` keeps the role announcement while leaving image and disclosure controls
         // inside the bubble individually reachable by VoiceOver.
@@ -41,8 +44,13 @@ struct MessageView: View {
                 }
             }
             blockList(showThinking: true)
+            if showsActions, !isStreaming, !message.textContent.isEmpty {
+                MessageActionRow(message: message)
+                    .opacity(hovering ? 1 : 0)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onHover { hovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Message from Pi")
     }
@@ -77,24 +85,204 @@ struct MessageView: View {
 
 /// Pi's terminal renders thinking as visible muted Markdown unless the user explicitly hides it.
 /// Desktop follows that default instead of reducing the reasoning to an empty disclosure label.
-private struct ThinkingBlockView: View {
+struct ThinkingBlockView: View {
     let text: String
     let streaming: Bool
 
     var body: some View {
-        PiGridRow(symbol: "sparkles", tint: .secondary) {
-            MarkdownBlockView(
-                text: text,
-                streaming: streaming,
-                size: PiFont.bodySize - 1,
-                fillWidth: true
-            )
-            .foregroundStyle(.secondary)
-            .opacity(0.84)
-        }
+        MarkdownBlockView(
+            text: text,
+            streaming: streaming,
+            size: PiFont.bodySize - 1,
+            fillWidth: true
+        )
+        .foregroundStyle(.secondary)
         .textSelection(.enabled)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Thinking")
+    }
+}
+
+// MARK: - Turn work log
+
+/// One turn's work: live and open while Pi is working, one quiet “Worked for …” line with a
+/// separator once it has answered. This is the transcript's only rhythm marker between turns.
+struct TranscriptWorkView: View {
+    let block: TranscriptWorkBlock
+    let onImage: (ImagePayload) -> Void
+
+    /// `nil` until the user decides; the run's own state owns it until then.
+    @State private var userExpanded: Bool?
+    @State private var hovering = false
+
+    private var isOpen: Bool { userExpanded ?? block.isActive }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+            Button { userExpanded = !isOpen } label: {
+                HStack(spacing: PiTheme.space6) {
+                    if block.isActive { ProgressView().controlSize(.mini) }
+                    headline
+                    if block.hasFailure, !isOpen {
+                        Text("· failed").font(PiFont.caption).foregroundStyle(Color.piRed)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                        .opacity(hovering || isOpen ? 1 : 0.4)
+                    Spacer(minLength: 0)
+                }
+                .frame(minHeight: 18)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+
+            PiHairline()
+
+            if isOpen {
+                HStack(alignment: .top, spacing: PiTheme.space12) {
+                    // A quiet rail separates the log from the answer without indenting the
+                    // answer itself.
+                    Rectangle()
+                        .fill(Color.piHairline)
+                        .frame(width: PiTheme.hairline)
+                    VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+                        ForEach(block.entries) { entry in
+                            switch entry {
+                            case let .thinking(value):
+                                ThinkingBlockView(text: value.text, streaming: value.streaming)
+                            case let .activity(group):
+                                TranscriptActivityGroupView(group: group, onImage: onImage)
+                            case let .note(message):
+                                WorkNoteView(message: message, onImage: onImage)
+                            }
+                        }
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
+        .accessibilityValue(isOpen ? "expanded" : "collapsed")
+    }
+
+    @ViewBuilder
+    private var headline: some View {
+        if block.isActive, let startedAt = block.startedAt {
+            // One timer, and only while a turn is actually in flight.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text("Working for \(NumberFormatting.duration(context.date.timeIntervalSince(startedAt)))")
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        } else {
+            Text(block.isActive ? "Working" : block.title)
+                .font(PiFont.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Mid-turn narration reads as log, not as the answer, so it stays quiet inside the work block.
+private struct WorkNoteView: View {
+    let message: ChatMessage
+    let onImage: (ImagePayload) -> Void
+
+    var body: some View {
+        if message.role == .assistant {
+            MarkdownBlockView(text: message.textContent, size: PiFont.bodySize - 1)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Pi narration")
+        } else {
+            MessageView(message: message, isStreaming: false, onImage: onImage)
+        }
+    }
+}
+
+/// Compaction is a real event in the session, so it gets its own visible marker instead of
+/// hiding inside a generic system row.
+struct CompactionRowView: View {
+    let note: TranscriptCompaction
+    @State private var expanded = false
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space6) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: PiTheme.space8) {
+                    PiHairline()
+                    HStack(spacing: PiTheme.space4) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 9, weight: .medium))
+                        Text(note.title)
+                            .font(PiFont.caption)
+                        if !note.summary.isEmpty {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                                .opacity(hovering || expanded ? 1 : 0.4)
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    PiHairline()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .disabled(note.summary.isEmpty)
+
+            if expanded, !note.summary.isEmpty {
+                MarkdownBlockView(text: note.summary, size: PiFont.bodySize - 1)
+                    .foregroundStyle(.secondary)
+                    .padding(PiTheme.space10)
+                    .piInset()
+            }
+        }
+        .padding(.vertical, PiTheme.space4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(note.title)
+    }
+}
+
+/// Copy and timestamp, revealed on hover so a settled answer stays clean.
+private struct MessageActionRow: View {
+    let message: ChatMessage
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: PiTheme.space8) {
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(message.textContent, forType: .string)
+                copied = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    copied = false
+                }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(copied ? Color.piGreen : Color.secondary)
+                    .frame(width: 20, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(copied ? "Copied" : "Copy message")
+            .accessibilityLabel("Copy message")
+
+            if let timestamp = message.timestamp {
+                Text(timestamp.formatted(date: .omitted, time: .shortened))
+                    .font(PiFont.micro)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
     }
 }
 
@@ -203,7 +391,7 @@ struct TranscriptActivityGroupView: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 ForEach(group.steps) { step in
-                    ToolActivityStepRow(step: step, onImage: onImage)
+                    ToolActivityStepRow(step: step, isLive: group.isActive, onImage: onImage)
                 }
             }
         }
@@ -219,15 +407,17 @@ struct TranscriptActivityGroupView: View {
 
 private struct ToolActivityStepRow: View {
     let step: TranscriptActivityStep
+    /// A step left unfinished by a killed run must not spin forever in a historical transcript.
+    let isLive: Bool
     let onImage: (ImagePayload) -> Void
 
     var body: some View {
         DisclosureRow(
             symbol: step.failed ? "xmark.circle" : (step.complete ? "checkmark.circle" : step.kind.symbol),
             title: step.displayName,
-            trailing: step.failed ? "failed" : (step.complete ? nil : "running"),
+            trailing: step.failed ? "failed" : (step.complete ? nil : (isLive ? "running" : "no result")),
             symbolTint: step.failed ? Color.piRed : .secondary,
-            showsProgress: !step.complete,
+            showsProgress: !step.complete && isLive,
             initiallyExpanded: step.failed
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {

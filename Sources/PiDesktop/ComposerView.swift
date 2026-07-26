@@ -109,9 +109,9 @@ private struct ComposerToolbar: View {
 
             Spacer(minLength: PiTheme.space8)
 
-            ThinkingPickerControl()
-
-            ModelPickerControl()
+            // The composer carries one control: how hard Pi should work. Model and thinking
+            // level are reported in the status bar.
+            ModeSlider()
 
             if isStreaming, let onAbort {
                 IconButton(symbol: "stop.fill", help: "Stop Pi (⌘.)", action: onAbort)
@@ -149,6 +149,56 @@ private struct ComposerToolbar: View {
         .padding(.horizontal, PiTheme.space10)
         .padding(.bottom, PiTheme.space8)
         .padding(.top, PiTheme.space4)
+    }
+}
+
+/// `/mode` as a continuous choice from quickest to strongest, which is how the modes actually
+/// differ (model, thinking level, subagents). Unknown or missing status degrades to a label.
+struct ModeSlider: View {
+    @EnvironmentObject private var store: AppStore
+    @State private var dragging: Double?
+
+    private var mode: PiMode? { store.statusModel.mode }
+    private var index: Double {
+        dragging ?? Double(PiMode.allCases.firstIndex(of: mode ?? .smart) ?? 0)
+    }
+
+    var body: some View {
+        HStack(spacing: PiTheme.space6) {
+            Text(mode?.label ?? "mode")
+                .font(PiFont.caption)
+                .foregroundStyle(mode == nil ? .tertiary : .secondary)
+                .frame(width: 34, alignment: .trailing)
+
+            Slider(
+                value: Binding(
+                    get: { index },
+                    set: { value in
+                        dragging = value
+                        let candidate = PiMode.allCases[min(PiMode.allCases.count - 1, max(0, Int(value.rounded())))]
+                        if candidate != mode { store.setMode(candidate) }
+                    }
+                ),
+                in: 0...Double(PiMode.allCases.count - 1),
+                step: 1
+            ) { editing in
+                if !editing { dragging = nil }
+            }
+            .controlSize(.mini)
+            .frame(width: 84)
+            .disabled(mode == nil)
+        }
+        .opacity(mode == nil ? 0.55 : 1)
+        .help(mode.map { "Mode \($0.label) · \($0.detail)" } ?? "The mode extension is not loaded")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Effort")
+        .accessibilityValue(mode.map { "\($0.label), \($0.detail)" } ?? "unavailable")
+        .accessibilityAdjustableAction { direction in
+            guard let mode, let current = PiMode.allCases.firstIndex(of: mode) else { return }
+            let next = direction == .increment ? current + 1 : current - 1
+            guard PiMode.allCases.indices.contains(next) else { return }
+            store.setMode(PiMode.allCases[next])
+        }
     }
 }
 
