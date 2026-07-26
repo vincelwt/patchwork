@@ -458,6 +458,11 @@ struct ImageViewerView: View {
     }
 }
 
+/// Presented top-center, cleared of the unified toolbar, by the root overlay in
+/// `PiDesktopApp.swift` — nowhere near the composer at the bottom of the window. Capped here so
+/// a long message wraps into a compact pill instead of stretching edge to edge.
+private let toastMaxWidth: CGFloat = 420
+
 struct ToastView: View {
     let toast: ToastMessage
 
@@ -472,6 +477,7 @@ struct ToastView: View {
         }
         .padding(.horizontal, PiTheme.space12)
         .padding(.vertical, PiTheme.space8)
+        .frame(maxWidth: toastMaxWidth)
         .background(Color.piTranscript, in: Capsule())
         .overlay { Capsule().stroke(Color.piHairline, lineWidth: PiTheme.hairline) }
         .shadow(color: .black.opacity(0.16), radius: 14, y: 5)

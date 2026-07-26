@@ -32,8 +32,7 @@ struct QuickSwitcherView: View {
                     text: $query,
                     placeholder: "Go to conversation",
                     onMove: { delta in
-                        guard !matches.isEmpty else { return }
-                        selection = min(max(0, selection + delta), matches.count - 1)
+                        selection = QuickSwitchNavigation.move(selection, by: delta, count: matches.count)
                     },
                     onSubmit: { activate(matches) },
                     onCancel: { isPresented = false }
@@ -61,7 +60,11 @@ struct QuickSwitcherView: View {
                 ScrollViewReader { reader in
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(Array(matches.enumerated()), id: \.element.id) { index, session in
+                            // Identified by file path, not `session.id`: that id is read from
+                            // the JSONL's own content and can collide across two distinct
+                            // files, which would otherwise make SwiftUI misrender rows as
+                            // duplicates.
+                            ForEach(Array(matches.enumerated()), id: \.element.fileURL.standardizedFileURL.path) { index, session in
                                 QuickSwitchRow(
                                     session: session,
                                     running: store.isRunning(session),
@@ -130,20 +133,25 @@ private struct QuickSwitchRow: View {
     let selected: Bool
 
     var body: some View {
-        HStack(spacing: PiTheme.space8) {
+        // Same one-icon-column, one-text-origin grid the sidebar rows use, so a result reads
+        // like the conversation list it is drawn from rather than a differently-aligned list.
+        HStack(spacing: PiTheme.space6) {
             if unread {
                 Circle().fill(Color.accentColor)
                     .frame(width: 6, height: 6)
-                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
+                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
             } else {
                 Image(systemName: "folder")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
-                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
+                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
             }
             Text(session.displayName)
                 .font(selected ? PiFont.rowEmphasis : PiFont.row)
                 .lineLimit(1)
+                // Wins the tug-of-war for space over the folder tag, so a long title stays
+                // legible and the folder name (secondary, disambiguating info) truncates first.
+                .layoutPriority(1)
             Text(folderName)
                 .font(PiFont.micro)
                 .foregroundStyle(.tertiary)
@@ -157,7 +165,8 @@ private struct QuickSwitchRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, PiTheme.space12)
+        .padding(.leading, PiTheme.sidebarIconInset)
+        .padding(.trailing, PiTheme.space8)
         .frame(height: PiTheme.quickSwitchRowHeight)
         .contentShape(Rectangle())
         .background(
