@@ -99,8 +99,28 @@ private struct DisclosureRow<Detail: View>: View {
     var showsProgress = false
     @ViewBuilder var detail: () -> Detail
 
-    @State private var expanded = false
+    @State private var expanded: Bool
     @State private var hovering = false
+
+    init(
+        symbol: String,
+        title: String,
+        titleTint: Color = .secondary,
+        trailing: String? = nil,
+        symbolTint: Color = .secondary,
+        showsProgress: Bool = false,
+        initiallyExpanded: Bool = false,
+        @ViewBuilder detail: @escaping () -> Detail
+    ) {
+        self.symbol = symbol
+        self.title = title
+        self.titleTint = titleTint
+        self.trailing = trailing
+        self.symbolTint = symbolTint
+        self.showsProgress = showsProgress
+        self.detail = detail
+        _expanded = State(initialValue: initiallyExpanded)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space6) {
@@ -141,6 +161,79 @@ private struct DisclosureRow<Detail: View>: View {
                     .padding(.leading, PiTheme.gridTextInset)
             }
         }
+    }
+}
+
+// MARK: - Activity rollup
+
+struct TranscriptActivityGroupView: View {
+    let group: TranscriptActivityGroup
+    let onImage: (ImagePayload) -> Void
+
+    var body: some View {
+        DisclosureRow(
+            symbol: group.kinds.first?.symbol ?? ToolActivityKind.tool.symbol,
+            title: group.summary,
+            titleTint: group.hasFailure ? Color.piRed : .secondary,
+            trailing: group.progressText,
+            symbolTint: group.hasFailure ? Color.piRed : .secondary,
+            showsProgress: group.isActive && !group.hasFailure,
+            initiallyExpanded: group.hasFailure
+        ) {
+            VStack(alignment: .leading, spacing: PiTheme.space8) {
+                ForEach(group.steps) { step in
+                    ToolActivityStepRow(step: step, onImage: onImage)
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        let status = group.hasFailure ? "failed" : (group.isActive ? "in progress" : "completed")
+        return "Activity, \(group.summary), \(group.steps.count) steps, \(status)"
+    }
+}
+
+private struct ToolActivityStepRow: View {
+    let step: TranscriptActivityStep
+    let onImage: (ImagePayload) -> Void
+
+    var body: some View {
+        DisclosureRow(
+            symbol: step.failed ? "xmark.circle" : (step.complete ? "checkmark.circle" : step.kind.symbol),
+            title: step.displayName,
+            trailing: step.failed ? "failed" : (step.complete ? nil : "running"),
+            symbolTint: step.failed ? Color.piRed : .secondary,
+            showsProgress: !step.complete,
+            initiallyExpanded: step.failed
+        ) {
+            VStack(alignment: .leading, spacing: PiTheme.space8) {
+                if step.kind == .question {
+                    Text("Answered in the native questionnaire")
+                        .font(PiFont.caption)
+                        .foregroundStyle(.secondary)
+                } else if step.arguments != .object([:]) {
+                    Text("Arguments").font(PiFont.micro).foregroundStyle(.tertiary)
+                    CodeBlockView(language: nil, code: step.arguments.prettyPrinted(maxLength: 8_000))
+                }
+                if let result = step.result {
+                    Text("Result").font(PiFont.micro).foregroundStyle(.tertiary)
+                    ForEach(result.blocks) { block in
+                        switch block.kind {
+                        case let .text(text):
+                            if !text.isEmpty { CodeBlockView(language: nil, code: text) }
+                        case let .image(image):
+                            ConversationImage(image: image, onOpen: { onImage(image) })
+                        default:
+                            EmptyView()
+                        }
+                    }
+                }
+            }
+        }
+        .accessibilityLabel("\(step.displayName), \(step.failed ? "failed" : (step.complete ? "completed" : "running"))")
     }
 }
 
@@ -266,15 +359,7 @@ private struct UnknownMessageRow: View {
 
 enum ToolSymbol {
     static func forName(_ name: String) -> String {
-        switch name.lowercased() {
-        case "bash": "terminal"
-        case "read", "grep", "find", "ls": "doc.text.magnifyingglass"
-        case "write", "edit": "pencil"
-        case "subagent", "subagent_wait", "subagent_supervisor": "person.2"
-        case "process": "gearshape.2"
-        case "web_search", "fetch_content": "globe"
-        default: "wrench.and.screwdriver"
-        }
+        ToolActivityKind.classify(toolName: name).symbol
     }
 }
 

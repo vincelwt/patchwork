@@ -8,6 +8,7 @@ struct ComposerView: View {
     @Binding var attachments: [ImageAttachment]
     var isStreaming: Bool
     var placeholder = "Ask Pi anything…"
+    var autofocus = false
     var onSend: () -> Void
     var onSteer: (() -> Void)?
     var onFollowUp: (() -> Void)?
@@ -28,27 +29,18 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .topLeading) {
-                NativeComposerTextView(
-                    content: content,
-                    bridge: bridge,
-                    onSubmit: onSend,
-                    admitImages: { store.admitAttachments($0, existing: $1) },
-                    onHeightChange: { editorHeight = $0 }
-                )
-                .frame(height: clampedHeight)
-                .padding(.horizontal, PiTheme.space10)
-                .padding(.top, PiTheme.space8)
-
-                if text.isEmpty, attachments.isEmpty {
-                    Text(placeholder)
-                        .font(PiFont.body)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, PiTheme.space12)
-                        .padding(.top, PiTheme.space10)
-                        .allowsHitTesting(false)
-                }
-            }
+            NativeComposerTextView(
+                content: content,
+                bridge: bridge,
+                placeholder: placeholder,
+                autofocus: autofocus,
+                onSubmit: onSend,
+                admitImages: { store.admitAttachments($0, existing: $1) },
+                onHeightChange: { editorHeight = $0 }
+            )
+            .frame(height: clampedHeight)
+            .padding(.horizontal, PiTheme.space10)
+            .padding(.top, PiTheme.space8)
 
             ComposerToolbar(
                 isStreaming: isStreaming,
@@ -65,6 +57,13 @@ struct ComposerView: View {
             RoundedRectangle(cornerRadius: PiTheme.composerRadius, style: .continuous)
                 .stroke(Color.piHairline, lineWidth: PiTheme.hairline)
         }
+        .task(id: optionsContextID) { store.prepareComposerOptions() }
+    }
+
+    private var optionsContextID: String {
+        store.selectedSession?.fileURL.standardizedFileURL.path
+            ?? store.selectedFolder?.standardizedFileURL.path
+            ?? "no-folder"
     }
 
     private var canSend: Bool {
@@ -110,25 +109,48 @@ private struct ComposerToolbar: View {
 
             Spacer(minLength: PiTheme.space8)
 
-            ComposerMetricsMenu()
-
-            Button(action: store.cycleThinkingLevel) {
-                Text(thinkingLabel)
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(!store.isSelectedRuntime)
-            .help("Thinking level")
-
-            Button(action: store.cycleModel) {
-                Text(modelLabel)
+            Menu {
+                ForEach(store.availableThinkingLevels, id: \.self) { level in
+                    Button {
+                        store.setThinkingLevel(level)
+                    } label: {
+                        if level == thinkingLabel { Label(level.capitalized, systemImage: "checkmark") }
+                        else { Text(level.capitalized) }
+                    }
+                }
+            } label: {
+                Text(thinkingLabel.capitalized)
                     .font(PiFont.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            .disabled(!store.isSelectedRuntime)
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(store.availableThinkingLevels.isEmpty || store.composerOptionsLoading)
+            .help("Thinking level")
+
+            Menu {
+                ForEach(store.availableModels) { model in
+                    Button {
+                        store.setModel(model)
+                    } label: {
+                        if model.provider == currentProvider && model.modelID == currentModelID {
+                            Label(model.compactLabel, systemImage: "checkmark")
+                        } else {
+                            Text(model.compactLabel)
+                        }
+                    }
+                    .help(model.detailLabel)
+                }
+            } label: {
+                Text(modelLabel)
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 130)
+            }
+            .menuStyle(.borderlessButton)
+            .disabled(store.availableModels.isEmpty || store.composerOptionsLoading)
             .help(modelHelp)
 
             if isStreaming, let onAbort {
@@ -167,17 +189,18 @@ private struct ComposerToolbar: View {
     }
 
     private var thinkingLabel: String {
-        store.isSelectedRuntime
-            ? (store.runtimeState.thinkingLevel ?? "off")
-            : (store.selectedSession?.thinkingLevel ?? "off")
+        store.runtimeState.thinkingLevel ?? store.selectedSession?.thinkingLevel ?? "off"
     }
     private var modelLabel: String {
-        if store.isSelectedRuntime { return store.runtimeState.modelName ?? store.runtimeState.modelID ?? "Model" }
-        return store.selectedSession?.model ?? "Model"
+        store.runtimeState.modelName
+            ?? store.runtimeState.modelID
+            ?? store.selectedSession?.model
+            ?? (store.composerOptionsLoading ? "Loading…" : "Model")
     }
+    private var currentProvider: String? { store.runtimeState.provider ?? store.selectedSession?.provider }
+    private var currentModelID: String? { store.runtimeState.modelID ?? store.selectedSession?.model }
     private var modelHelp: String {
-        let provider = store.isSelectedRuntime ? store.runtimeState.provider : store.selectedSession?.provider
-        return provider.map { "\($0) · \(modelLabel)" } ?? modelLabel
+        currentProvider.map { "\($0) · \(modelLabel)" } ?? modelLabel
     }
 }
 
@@ -222,46 +245,12 @@ private struct ComposerRuntimeLabel: View {
                     Text("Working")
                 }
                 .foregroundStyle(.secondary)
-            } else if store.isSelectedRuntime, store.runtimeState.isConnected {
-                Text("Ready").foregroundStyle(.secondary)
             } else {
-                Text("Pi starts on send").foregroundStyle(.tertiary)
+                EmptyView()
             }
         }
         .font(PiFont.caption)
         .lineLimit(1)
-    }
-}
-
-private struct ComposerMetricsMenu: View {
-    @EnvironmentObject private var store: AppStore
-    private var metrics: TokenMetrics { store.selectedMetrics }
-
-    var body: some View {
-        Menu {
-            Text("Input  \(NumberFormatting.tokens(metrics.input))")
-            Text("Output  \(NumberFormatting.tokens(metrics.output))")
-            Text("Cache read  \(NumberFormatting.tokens(metrics.cacheRead))")
-            Text("Cache write  \(NumberFormatting.tokens(metrics.cacheWrite))")
-            if let hit = metrics.latestCacheHitPercent { Text("Latest cache hit  \(Int(hit.rounded()))%") }
-            Divider()
-            if let tokens = metrics.contextTokens, let window = metrics.contextWindow {
-                Text("Context  \(NumberFormatting.tokens(tokens)) / \(NumberFormatting.tokens(window))")
-            }
-            if let percent = metrics.contextPercent { Text("Context usage  \(Int(percent.rounded()))%") }
-            Text("Cost  \(NumberFormatting.cost(metrics.cost))")
-        } label: {
-            HStack(spacing: PiTheme.space4) {
-                if let percent = metrics.contextPercent { Text("\(Int(percent.rounded()))%") }
-                Text(NumberFormatting.cost(metrics.cost))
-            }
-            .font(PiFont.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Session tokens, cache, context, and cost")
     }
 }
 

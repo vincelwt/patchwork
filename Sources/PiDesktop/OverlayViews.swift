@@ -12,7 +12,24 @@ struct ExtensionDialogView: View {
         _value = State(initialValue: request.prefill ?? "")
     }
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        if let question = store.questionnaireQuestion(for: request),
+           let session = store.pendingQuestionnaire {
+            QuestionnaireDialogView(
+                request: request,
+                question: question,
+                questionCount: session.questions.count,
+                currentIndex: session.currentIndex,
+                headers: session.questions.map(\.header),
+                savedAnswer: session.answers[session.currentIndex]
+            )
+            .id(question.id)
+        } else {
+            genericDialog
+        }
+    }
+
+    private var genericDialog: some View {
         VStack(alignment: .leading, spacing: PiTheme.space16) {
             HStack(alignment: .top, spacing: PiTheme.space10) {
                 Image(systemName: "puzzlepiece.extension.fill")
@@ -91,6 +108,258 @@ struct ExtensionDialogView: View {
                 .padding(PiTheme.space6)
                 .piInset()
         }
+    }
+}
+
+private struct QuestionnaireDialogView: View {
+    @EnvironmentObject private var store: AppStore
+    let request: ExtensionDialogRequest
+    let question: QuestionnaireQuestion
+    let questionCount: Int
+    let currentIndex: Int
+    let headers: [String]
+
+    @State private var selected: Set<Int>
+    @State private var customText: String
+    @State private var usesCustom: Bool
+    @State private var focusedOption = 0
+    @FocusState private var customFocused: Bool
+
+    init(
+        request: ExtensionDialogRequest,
+        question: QuestionnaireQuestion,
+        questionCount: Int,
+        currentIndex: Int,
+        headers: [String],
+        savedAnswer: QuestionnaireAnswer?
+    ) {
+        self.request = request
+        self.question = question
+        self.questionCount = questionCount
+        self.currentIndex = currentIndex
+        self.headers = headers
+        _selected = State(initialValue: savedAnswer?.optionIndexes ?? [])
+        _customText = State(initialValue: savedAnswer?.customText ?? "")
+        _usesCustom = State(initialValue: savedAnswer?.customText != nil)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space16) {
+            headerTabs
+            VStack(alignment: .leading, spacing: PiTheme.space4) {
+                Text(question.question)
+                    .font(PiFont.title)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(question.multiSelect ? "Choose one or more options." : "Choose one option.")
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: PiTheme.space16) {
+                    choices.frame(minWidth: 330, maxWidth: .infinity)
+                    if let preview = activePreview { previewPane(preview).frame(minWidth: 280, maxWidth: 380) }
+                }
+                VStack(alignment: .leading, spacing: PiTheme.space12) {
+                    choices
+                    if let preview = activePreview { previewPane(preview) }
+                }
+            }
+
+            HStack(spacing: PiTheme.space8) {
+                Button("Cancel", action: store.cancelQuestionnaire)
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Back") {
+                    if currentAnswer.isValid { store.saveQuestionnaireAnswer(currentAnswer, move: -1) }
+                    else { store.moveQuestionnaireBack() }
+                }
+                .disabled(currentIndex == 0)
+                if currentIndex + 1 < questionCount {
+                    Button("Next") { store.saveQuestionnaireAnswer(currentAnswer, move: 1) }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!currentAnswer.isValid)
+                } else {
+                    Button("Submit") { store.submitQuestionnaire(currentAnswer) }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!currentAnswer.isValid || !otherQuestionsAnswered)
+                }
+            }
+        }
+        .padding(PiTheme.space20)
+        .frame(minWidth: 560, idealWidth: activePreview == nil ? 620 : 840, maxWidth: 920)
+        .background(Color.piTranscript)
+        .interactiveDismissDisabled()
+        .focusable()
+        .onMoveCommand(perform: moveFocus)
+        .onKeyPress(.space) {
+            guard !customFocused else { return .ignored }
+            choose(index: focusedOption)
+            return .handled
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Questionnaire, question \(currentIndex + 1) of \(questionCount)")
+    }
+
+    private var headerTabs: some View {
+        HStack(spacing: PiTheme.space6) {
+            ForEach(Array(headers.enumerated()), id: \.offset) { index, header in
+                Text(header)
+                    .font(PiFont.micro.weight(index == currentIndex ? .semibold : .regular))
+                    .foregroundStyle(index == currentIndex ? Color.primary : Color.secondary)
+                    .padding(.horizontal, PiTheme.space8)
+                    .frame(height: 24)
+                    .background(index == currentIndex ? Color.piInsetStrong : Color.piInset, in: Capsule())
+                    .accessibilityLabel("\(header), question \(index + 1)\(index == currentIndex ? ", current" : "")")
+            }
+        }
+    }
+
+    private var choices: some View {
+        VStack(spacing: PiTheme.space6) {
+            ForEach(question.options) { option in
+                Button { choose(index: option.id) } label: {
+                    optionCard(option)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(option.label). \(option.description)")
+                .accessibilityValue(selected.contains(option.id) && !usesCustom ? "Selected" : "Not selected")
+            }
+            Button {
+                usesCustom = true
+                selected.removeAll()
+                customFocused = true
+                focusedOption = question.options.count
+            } label: {
+                HStack(alignment: .top, spacing: PiTheme.space10) {
+                    selectionSymbol(selected: usesCustom)
+                    VStack(alignment: .leading, spacing: PiTheme.space4) {
+                        Text("Type something.").font(PiFont.rowEmphasis)
+                        TextField("Your answer", text: $customText)
+                            .textFieldStyle(.plain)
+                            .focused($customFocused)
+                            .onTapGesture { usesCustom = true; selected.removeAll() }
+                            .onSubmit { submitOrAdvance() }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(PiTheme.space10)
+                .contentShape(Rectangle())
+                .background(cardBackground(selected: usesCustom, focused: focusedOption == question.options.count))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Type something. Custom answer")
+            .accessibilityValue(usesCustom ? "Selected" : "Not selected")
+        }
+    }
+
+    private func optionCard(_ option: QuestionnaireOption) -> some View {
+        HStack(alignment: .top, spacing: PiTheme.space10) {
+            selectionSymbol(selected: selected.contains(option.id) && !usesCustom)
+            VStack(alignment: .leading, spacing: PiTheme.space2) {
+                Text(option.label).font(PiFont.rowEmphasis)
+                Text(option.description)
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(PiTheme.space10)
+        .contentShape(Rectangle())
+        .background(cardBackground(
+            selected: selected.contains(option.id) && !usesCustom,
+            focused: focusedOption == option.id
+        ))
+    }
+
+    private func selectionSymbol(selected: Bool) -> some View {
+        Image(systemName: question.multiSelect
+              ? (selected ? "checkmark.square.fill" : "square")
+              : (selected ? "largecircle.fill.circle" : "circle"))
+            .font(.system(size: 13))
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .frame(width: 16, height: 18)
+    }
+
+    private func cardBackground(selected: Bool, focused: Bool) -> some View {
+        RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous)
+            .fill(selected ? Color.accentColor.opacity(0.09) : (focused ? Color.piHover : Color.piInset))
+            .overlay {
+                RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous)
+                    .stroke(selected ? Color.accentColor.opacity(0.55) : Color.piHairline, lineWidth: PiTheme.hairline)
+            }
+    }
+
+    private func previewPane(_ preview: String) -> some View {
+        VStack(alignment: .leading, spacing: PiTheme.space8) {
+            Text("Preview").font(PiFont.micro.weight(.semibold)).foregroundStyle(.tertiary)
+            ScrollView {
+                MarkdownBlockView(text: preview, size: PiFont.bodySize - 1)
+                    .padding(PiTheme.space10)
+            }
+            .frame(maxHeight: 320)
+            .piInset()
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Option preview")
+    }
+
+    private var activePreview: String? {
+        guard !usesCustom else { return nil }
+        return question.options.first(where: { $0.id == focusedOption })?.preview
+            ?? question.options.first(where: { selected.contains($0.id) })?.preview
+            ?? question.options.compactMap(\.preview).first
+    }
+
+    private var currentAnswer: QuestionnaireAnswer {
+        QuestionnaireAnswer(
+            optionIndexes: usesCustom ? [] : selected,
+            customText: usesCustom ? customText : nil
+        )
+    }
+
+    private var otherQuestionsAnswered: Bool {
+        guard let session = store.pendingQuestionnaire else { return false }
+        return session.answers.enumerated().allSatisfy { index, answer in
+            index == currentIndex || answer?.isValid == true
+        }
+    }
+
+    private func choose(index: Int) {
+        focusedOption = index
+        if index == question.options.count {
+            usesCustom = true
+            selected.removeAll()
+            customFocused = true
+            return
+        }
+        guard question.options.indices.contains(index) else { return }
+        usesCustom = false
+        customText = ""
+        if question.multiSelect {
+            if selected.contains(index) { selected.remove(index) }
+            else { selected.insert(index) }
+        } else {
+            selected = [index]
+        }
+    }
+
+    private func moveFocus(_ direction: MoveCommandDirection) {
+        let count = question.options.count + 1
+        switch direction {
+        case .up, .left: focusedOption = (focusedOption - 1 + count) % count
+        case .down, .right: focusedOption = (focusedOption + 1) % count
+        default: break
+        }
+    }
+
+    private func submitOrAdvance() {
+        guard currentAnswer.isValid else { return }
+        if currentIndex + 1 < questionCount { store.saveQuestionnaireAnswer(currentAnswer, move: 1) }
+        else if otherQuestionsAnswered { store.submitQuestionnaire(currentAnswer) }
     }
 }
 

@@ -25,6 +25,7 @@ struct NewChatView: View {
                     attachments: $store.attachments,
                     isStreaming: false,
                     placeholder: "Describe a task for Pi…",
+                    autofocus: true,
                     onSend: { store.submitDraft() }
                 )
                 ExtensionWidgetStrip(placement: .belowEditor)
