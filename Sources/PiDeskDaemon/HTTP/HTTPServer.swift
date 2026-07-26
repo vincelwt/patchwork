@@ -241,7 +241,7 @@ final class HTTPServer: @unchecked Sendable {
 
     private func writeResponse(fd: Int32, _ response: HTTPResponse, keepAlive: Bool) {
         var headers = response.headers
-        headers["X-Pi-Desktop-Api"] = "\(PiDeskKit.apiVersion)"
+        headers["X-Pi-Desktop-Api"] = "\(PiDeskAPI.apiVersion)"
         headers["Content-Length"] = "\(response.body.count)"
         headers["Connection"] = keepAlive ? "keep-alive" : "close"
 
@@ -257,7 +257,7 @@ final class HTTPServer: @unchecked Sendable {
 
     private func writeSSEHead(fd: Int32) {
         let headers = [
-            "X-Pi-Desktop-Api": "\(PiDeskKit.apiVersion)",
+            "X-Pi-Desktop-Api": "\(PiDeskAPI.apiVersion)",
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive"

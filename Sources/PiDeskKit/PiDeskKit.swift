@@ -2,7 +2,10 @@ import Foundation
 
 /// Shared control-plane surface for the daemon, the CLI, the web remote, and the app.
 /// The wire contract lives in `docs/daemon-api.md`; everything here must match it exactly.
-public enum PiDeskKit {
+///
+/// Deliberately not named `PiDeskKit`: a type with the same name as its module shadows the
+/// module, so clients could not qualify any other symbol as `PiDeskKit.Something`.
+public enum PiDeskAPI {
     /// Bumped only for breaking wire changes; additive fields never bump it.
     public static let apiVersion = 1
 }

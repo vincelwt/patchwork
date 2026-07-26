@@ -21,7 +21,7 @@ final class DaemonCoreTests: XCTestCase {
         let core = TestSupport.makeCore(in: directory, concurrency: 3)
         let health = await core.health()
         XCTAssertTrue(health.ok)
-        XCTAssertEqual(health.api, PiDeskKit.apiVersion)
+        XCTAssertEqual(health.api, PiDeskAPI.apiVersion)
         XCTAssertEqual(health.runningRuns, 0)
         XCTAssertEqual(health.queuedRuns, 0)
         XCTAssertTrue(health.schedulesEnabled)

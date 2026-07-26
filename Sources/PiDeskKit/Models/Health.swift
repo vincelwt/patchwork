@@ -17,7 +17,7 @@ public struct HealthStatus: Codable, Hashable, Sendable {
     public init(
         ok: Bool,
         version: String,
-        api: Int = PiDeskKit.apiVersion,
+        api: Int = PiDeskAPI.apiVersion,
         startedAt: Date,
         runningRuns: Int,
         queuedRuns: Int,
@@ -40,7 +40,7 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         ok = try container.decodeIfPresent(Bool.self, forKey: .ok) ?? false
         version = try container.decodeIfPresent(String.self, forKey: .version) ?? "0.0.0"
-        api = try container.decodeIfPresent(Int.self, forKey: .api) ?? PiDeskKit.apiVersion
+        api = try container.decodeIfPresent(Int.self, forKey: .api) ?? PiDeskAPI.apiVersion
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
         runningRuns = try container.decodeIfPresent(Int.self, forKey: .runningRuns) ?? 0
         queuedRuns = try container.decodeIfPresent(Int.self, forKey: .queuedRuns) ?? 0

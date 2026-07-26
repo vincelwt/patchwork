@@ -34,7 +34,7 @@ final class HTTPServerIntegrationTests: XCTestCase {
     func testHealthReportsOkAndApiVersion() async throws {
         let health = try await client.health()
         XCTAssertTrue(health.ok)
-        XCTAssertEqual(health.api, PiDeskKit.apiVersion)
+        XCTAssertEqual(health.api, PiDeskAPI.apiVersion)
         XCTAssertEqual(health.runningRuns, 0)
         XCTAssertEqual(health.queuedRuns, 0)
     }

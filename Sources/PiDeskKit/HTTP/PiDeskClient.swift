@@ -253,7 +253,7 @@ public final class PiDeskClient: Sendable {
     }
 
     private static func baseHeaders(transport: PiDeskTransport) -> [String: String] {
-        var headers = ["X-Pi-Desktop-Api": "\(PiDeskKit.apiVersion)"]
+        var headers = ["X-Pi-Desktop-Api": "\(PiDeskAPI.apiVersion)"]
         if case let .tcp(_, _, token) = transport { headers["Authorization"] = "Bearer \(token)" }
         return headers
     }
