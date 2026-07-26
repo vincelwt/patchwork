@@ -312,7 +312,8 @@ final class AnswerTextView: NSTextView {
         let height = manager.usedRect(for: container).height.rounded(.up)
         if abs(height - reportedHeight) > 0.5 {
             reportedHeight = height
-            onHeightChange?(max(height, 1))
+            // SwiftUI drops state mutations made synchronously during make/updateNSView.
+            DispatchQueue.main.async { [weak self] in self?.onHeightChange?(max(height, 1)) }
         }
         guard !codeRanges.isEmpty else {
             onCodeBlocksChange?([])

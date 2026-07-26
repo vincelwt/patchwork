@@ -1,13 +1,17 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import PiDesktop
 
-/// Covers the two pieces of the cross-block answer selection view that are meaningfully testable
-/// without a rendering host: the run partitioner (pure), and the attributed-string builder that
-/// stands in for what a drag-select + ⌘C over the whole answer would actually copy. Real AppKit
-/// drag/selection interaction is not exercised here, the same way the rest of the suite never
-/// simulates mouse events — see `ComposerInlineImageTests` for the established pattern of testing
-/// AppKit text state programmatically instead.
+private func descendant<View: NSView>(_ type: View.Type, in root: NSView) -> View? {
+    if let match = root as? View { return match }
+    return root.subviews.lazy.compactMap { descendant(type, in: $0) }.first
+}
+
+/// Covers the cross-block answer partitioner, attributed-string builder, and hosted text sizing.
+/// Real AppKit drag/selection interaction is not exercised here, the same way the rest of the
+/// suite never simulates mouse events — see `ComposerInlineImageTests` for the established pattern
+/// of testing AppKit text state programmatically instead.
 final class SelectableAnswerTextTests: XCTestCase {
     // MARK: - Partitioning
 
@@ -144,6 +148,25 @@ final class SelectableAnswerTextTests: XCTestCase {
         let built = AnswerAttributedTextBuilder.build(blocks: [])
         XCTAssertEqual(built.attributedString.length, 0)
         XCTAssertTrue(built.codeBlocks.isEmpty)
+    }
+
+    @MainActor
+    func testSettledAnswerHostAllocatesHeightForTheWholeAnswer() throws {
+        let source = """
+        Implemented and merged as `d5b1d67`.
+
+        - Sidebar Automations page with create/edit/run/delete and pause switches.
+        - `⌥⌘S` opens it without losing the current conversation or draft.
+        - Build, release packaging, and 898 tests passed.
+        """
+        let host = NSHostingView(rootView: MarkdownAnswerText(text: source))
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 500)
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        host.layoutSubtreeIfNeeded()
+
+        let textView = try XCTUnwrap(descendant(AnswerTextView.self, in: host))
+        XCTAssertGreaterThan(textView.frame.height, PiFont.size * 3, "The list must not be clipped below the first paragraph")
     }
 }
 
