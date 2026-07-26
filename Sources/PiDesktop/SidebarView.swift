@@ -15,10 +15,6 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
             SidebarActionRow(
-                title: "Quick switch", symbol: "magnifyingglass", shortcut: "⌘K",
-                action: { store.quickSwitchPresented = true }
-            )
-            SidebarActionRow(
                 title: "New folder", symbol: "folder.badge.plus", shortcut: "",
                 action: { store.newVirtualFolderRequested = true }
             )
@@ -101,13 +97,12 @@ private struct SidebarFooter: View {
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
-            StatusDot(
-                color: runningCount > 0 ? .piGreen : (store.runtimeState.isConnected ? .piGreen : .secondary),
-                isPulsing: runningCount > 0
-            )
-            Text(label).font(PiFont.caption).foregroundStyle(.secondary).lineLimit(1)
-                .accessibilityLabel("Session activity")
-                .accessibilityValue(label)
+            StatusDot(color: runningCount > 0 ? .piGreen : .secondary, isPulsing: runningCount > 0)
+            if let label {
+                Text(label).font(PiFont.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .accessibilityLabel("Session activity")
+                    .accessibilityValue(label)
+            }
             Spacer(minLength: PiTheme.space4)
             Button { Task { await store.refreshSessions() } } label: {
                 Group {
@@ -131,10 +126,11 @@ private struct SidebarFooter: View {
         .frame(height: PiTheme.statusBarHeight)
     }
 
-    private var label: String {
+    /// `nil` when idle: there is deliberately no "ready"/"idle" copy, only real activity.
+    private var label: String? {
         if runningCount == 1 { return "1 session running" }
         if runningCount > 1 { return "\(runningCount) sessions running" }
-        return store.runtimeState.isConnected ? "Pi ready" : "Ready on demand"
+        return nil
     }
 }
 
@@ -178,6 +174,10 @@ struct SidebarSnapshot {
         )
     }
 
+    /// Builds the folder forest: filesystem project roots plus top-level virtual folders, each
+    /// carrying its own nested virtual folders (any depth) alongside its directly assigned
+    /// sessions. A folder's own `.sessions` never include a descendant's, so every session in
+    /// `sessions` still appears exactly once across the whole tree.
     private static func groups(
         _ sessions: [SessionSummary],
         virtualFolders: [VirtualFolder],
@@ -196,20 +196,47 @@ struct SidebarSnapshot {
             }
         }
 
-        var result = virtualFolders.compactMap { folder -> SessionFolderGroup? in
-            let values = virtualSessions[folder.id] ?? []
-            guard includeEmptyVirtualFolders || !values.isEmpty else { return nil }
-            return SessionFolderGroup(virtualFolder: folder, sessions: values.sorted { $0.modifiedAt > $1.modifiedAt })
+        // Every folder is bucketed under its cycle/dangling-safe effective parent (see
+        // `WorkspaceOrganization.effectiveParentID`), keyed exactly like `SessionFolderGroup.id`
+        // ("" stands for top level here, since that can never collide with a real path or a
+        // "virtual:" id) \u2014 this is what lets a project or another folder host children at any depth.
+        var childrenByParent: [String: [VirtualFolder]] = [:]
+        for folder in virtualFolders {
+            let key = WorkspaceOrganization.effectiveParentID(of: folder, in: virtualFolders) ?? ""
+            childrenByParent[key, default: []].append(folder)
         }
-        result += filesystemSessions.map {
-            SessionFolderGroup(path: $0.key, sessions: $0.value.sorted { $0.modifiedAt > $1.modifiedAt })
+
+        func keep(_ group: SessionFolderGroup) -> Bool {
+            includeEmptyVirtualFolders || !group.sessions.isEmpty || !group.children.isEmpty
         }
-        return result.sorted { lhs, rhs in
-            let left = lhs.sessions.first?.modifiedAt ?? lhs.createdAt ?? .distantPast
-            let right = rhs.sessions.first?.modifiedAt ?? rhs.createdAt ?? .distantPast
-            if left == right { return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
-            return left > right
+
+        // `depth` only guards this recursion against a pathologically deep (but already acyclic,
+        // hence never truly infinite) parent chain; real folder trees are nowhere near this deep.
+        func build(_ folder: VirtualFolder, depth: Int) -> SessionFolderGroup {
+            let own = (virtualSessions[folder.id] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
+            let nested = depth >= PiTheme.sidebarMaxFolderDepth ? [] : childrenByParent[WorkspaceOrganization.groupID(forVirtualFolderID: folder.id)] ?? []
+            let children = nested.map { build($0, depth: depth + 1) }.filter(keep).sorted(by: groupSort)
+            return SessionFolderGroup(virtualFolder: folder, sessions: own, children: children)
         }
+
+        let topVirtual = (childrenByParent[""] ?? []).map { build($0, depth: 0) }.filter(keep)
+
+        let projectPaths = Set(filesystemSessions.keys)
+            .union(childrenByParent.keys.filter { !$0.isEmpty && !$0.hasPrefix("virtual:") })
+        let projectGroups = projectPaths.map { path -> SessionFolderGroup in
+            let own = (filesystemSessions[path] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
+            let children = (childrenByParent[path] ?? []).map { build($0, depth: 0) }.filter(keep).sorted(by: groupSort)
+            return SessionFolderGroup(path: path, sessions: own, children: children)
+        }.filter { !$0.sessions.isEmpty || !$0.children.isEmpty }
+
+        return (topVirtual + projectGroups).sorted(by: groupSort)
+    }
+
+    private static func groupSort(_ lhs: SessionFolderGroup, _ rhs: SessionFolderGroup) -> Bool {
+        let left = lhs.sessions.first?.modifiedAt ?? lhs.createdAt ?? .distantPast
+        let right = rhs.sessions.first?.modifiedAt ?? rhs.createdAt ?? .distantPast
+        if left == right { return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
+        return left > right
     }
 }
 
@@ -220,23 +247,28 @@ struct SessionFolderGroup: Identifiable {
     let virtualFolderID: String?
     let virtualName: String?
     let createdAt: Date?
+    /// Nested virtual folders (any depth) that live inside this group. Filesystem groups can
+    /// have children; virtual folders can have both children and, recursively, grandchildren.
+    let children: [SessionFolderGroup]
 
-    init(path: String, sessions: [SessionSummary]) {
+    init(path: String, sessions: [SessionSummary], children: [SessionFolderGroup] = []) {
         id = path
         self.path = path
         self.sessions = sessions
         virtualFolderID = nil
         virtualName = nil
         createdAt = nil
+        self.children = children
     }
 
-    init(virtualFolder: VirtualFolder, sessions: [SessionSummary]) {
+    init(virtualFolder: VirtualFolder, sessions: [SessionSummary], children: [SessionFolderGroup] = []) {
         id = "virtual:\(virtualFolder.id)"
         path = id
         self.sessions = sessions
         virtualFolderID = virtualFolder.id
         virtualName = virtualFolder.name
         createdAt = virtualFolder.createdAt
+        self.children = children
     }
 
     var isVirtual: Bool { virtualFolderID != nil }
@@ -248,10 +280,14 @@ struct SessionFolderGroup: Identifiable {
         return now.timeIntervalSince(newest) <= Self.recencyWindow
     }
 
-    var name: String {
-        if let virtualName { return virtualName }
+    static func projectName(forPath path: String) -> String {
         let value = URL(fileURLWithPath: path).lastPathComponent
         return value.isEmpty ? path : value
+    }
+
+    var name: String {
+        if let virtualName { return virtualName }
+        return Self.projectName(forPath: path)
     }
 }
 
@@ -266,8 +302,6 @@ private struct ArchiveSection: View {
         VStack(alignment: .leading, spacing: PiTheme.space2) {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PiTheme.space6) {
-                    PiChevron(expanded: isOpen)
-                        .frame(width: PiTheme.sidebarDisclosureColumn, alignment: .center)
                     Image(systemName: "archivebox")
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
@@ -283,6 +317,7 @@ private struct ArchiveSection: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
+            .accessibilityValue(isOpen ? "expanded" : "collapsed")
 
             if isOpen {
                 ForEach(groups) { group in
@@ -299,15 +334,19 @@ private struct SessionFolderSection: View {
     let group: SessionFolderGroup
     var archived = false
     var forceExpanded = false
+    var depth = 0
     @State private var hovering = false
     @State private var renaming = false
     @State private var renameValue = ""
     @State private var confirmingDelete = false
+    @State private var creatingChild = false
+    @State private var childName = ""
 
     private var hasRunning: Bool { group.sessions.contains { store.isRunning($0) } }
     /// All active project folders open by default. Explicit user collapse still wins.
     private var defaultExpanded: Bool { true }
     private var isOpen: Bool { forceExpanded || store.isFolderExpanded(path: group.id, defaultExpanded: defaultExpanded) }
+    private var indent: CGFloat { CGFloat(min(depth, PiTheme.sidebarMaxFolderDepth)) * PiTheme.sidebarIndentStep }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space2) {
@@ -316,9 +355,9 @@ private struct SessionFolderSection: View {
                 store.setFolderExpanded(!isOpen, path: group.id)
             } label: {
                 HStack(spacing: PiTheme.space6) {
-                    PiChevron(expanded: isOpen)
-                        .frame(width: PiTheme.sidebarDisclosureColumn, alignment: .center)
-                    Image(systemName: group.isVirtual ? "folder.fill" : "folder")
+                    // No chevron column: the icon itself carries open/closed state, and the
+                    // whole row (not a disclosure glyph) is the click target.
+                    Image(systemName: isOpen ? "folder.fill" : "folder")
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
@@ -328,7 +367,8 @@ private struct SessionFolderSection: View {
                     Text("\(group.sessions.count)")
                         .font(PiFont.micro.monospacedDigit()).foregroundStyle(.tertiary)
                 }
-                .padding(.horizontal, PiTheme.space8)
+                .padding(.leading, PiTheme.space8 + indent)
+                .padding(.trailing, PiTheme.space8)
                 .frame(height: PiTheme.folderHeaderHeight)
                 .contentShape(Rectangle())
                 .piRowBackground(selected: false, hovering: hovering)
@@ -339,10 +379,28 @@ private struct SessionFolderSection: View {
             .accessibilityLabel("\(group.name) folder, \(group.sessions.count) conversations")
             .accessibilityValue(isOpen ? "expanded" : "collapsed")
             .contextMenu {
-                if group.virtualFolderID != nil {
+                if let id = group.virtualFolderID {
+                    Button("New Folder Inside…") { childName = ""; creatingChild = true }
                     Button("Rename Folder…") { renameValue = group.name; renaming = true }
+                    Menu("Move Folder to…") {
+                        Button("Top level") { store.reparentVirtualFolder(id: id, to: nil) }
+                        if !projectDestinations.isEmpty { Divider() }
+                        ForEach(projectDestinations, id: \.self) { path in
+                            Button(SessionFolderGroup.projectName(forPath: path)) {
+                                store.reparentVirtualFolder(id: id, to: path)
+                            }
+                        }
+                        let folderDestinations = availableFolderDestinations(excluding: id)
+                        if !folderDestinations.isEmpty { Divider() }
+                        ForEach(folderDestinations) { entry in
+                            Button(String(repeating: "  ", count: entry.depth) + entry.folder.name) {
+                                store.reparentVirtualFolder(id: id, to: WorkspaceOrganization.groupID(forVirtualFolderID: entry.folder.id))
+                            }
+                        }
+                    }
                     Button("Delete Folder…", role: .destructive) { confirmingDelete = true }
                 } else {
+                    Button("New Folder Inside…") { childName = ""; creatingChild = true }
                     Button("New Chat Here") {
                         store.openNewChat()
                         store.chooseFolder(URL(fileURLWithPath: group.path, isDirectory: true))
@@ -358,7 +416,10 @@ private struct SessionFolderSection: View {
             }
 
             if isOpen {
-                ForEach(group.sessions) { SessionRow(session: $0, archived: archived) }
+                ForEach(group.children) { child in
+                    SessionFolderSection(group: child, archived: archived, forceExpanded: forceExpanded, depth: depth + 1)
+                }
+                ForEach(group.sessions) { SessionRow(session: $0, archived: archived, depth: depth + 1) }
             }
         }
         .padding(.top, PiTheme.space6)
@@ -369,13 +430,32 @@ private struct SessionFolderSection: View {
                 if let id = group.virtualFolderID { store.renameVirtualFolder(id: id, to: renameValue) }
             }
         }
+        .alert("New folder", isPresented: $creatingChild) {
+            TextField("Folder name", text: $childName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") { store.createVirtualFolder(named: childName, parentID: group.id) }
+        }
         .confirmationDialog("Delete “\(group.name)”?", isPresented: $confirmingDelete) {
             Button("Delete Folder", role: .destructive) {
                 if let id = group.virtualFolderID { store.deleteVirtualFolder(id: id) }
             }
         } message: {
-            Text("Conversations return to their project or Desktop group. Session files are not changed.")
+            Text("Subfolders move up a level and conversations return to their project or Desktop group. Session files are not changed.")
         }
+    }
+
+    /// Known project paths, from live sessions, as candidate "Move Folder to…" destinations.
+    private var projectDestinations: [String] {
+        Set(store.sessions.map { $0.cwd.standardizedFileURL.path }).sorted {
+            SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
+        }
+    }
+
+    /// The whole folder tree minus `id` and its own descendants, so the menu never offers a
+    /// move that `reparent` would refuse as a cycle.
+    private func availableFolderDestinations(excluding id: String) -> [WorkspaceOrganization.FolderTreeEntry] {
+        WorkspaceOrganization.allFolderEntries(store.virtualFolders)
+            .filter { $0.folder.id != id && !WorkspaceOrganization.wouldCreateCycle(moving: id, into: $0.folder.id, in: store.virtualFolders) }
     }
 }
 
@@ -383,6 +463,7 @@ private struct SessionRow: View {
     @EnvironmentObject private var store: AppStore
     let session: SessionSummary
     let archived: Bool
+    var depth = 0
     @State private var hovering = false
     @State private var renaming = false
     @State private var renameValue = ""
@@ -394,24 +475,19 @@ private struct SessionRow: View {
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
     private var git: GitSnapshot { store.folderGit[session.cwd.standardizedFileURL.path] ?? .none }
+    private var indent: CGFloat { CGFloat(min(depth, PiTheme.sidebarMaxFolderDepth)) * PiTheme.sidebarIndentStep }
 
     var body: some View {
         Button { store.selectSession(session) } label: {
             HStack(spacing: PiTheme.space6) {
-                // The unread dot lives in the shared icon column, so a thread title never shifts
-                // sideways when it is read.
-                Circle()
-                    .fill(unread ? Color.accentColor : Color.clear)
-                    .frame(width: 6, height: 6)
-                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
-                    .accessibilityHidden(true)
+                leadingIcon
                 Text(session.displayName)
                     .font(selected ? PiFont.rowEmphasis : PiFont.row)
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: PiTheme.space4)
                 trailingAccessory
             }
-            .padding(.leading, PiTheme.sidebarIconInset)
+            .padding(.leading, PiTheme.sidebarIconInset + indent)
             .padding(.trailing, PiTheme.space8)
             .frame(height: PiTheme.sidebarRowHeight)
             .contentShape(Rectangle())
@@ -424,9 +500,12 @@ private struct SessionRow: View {
             Button("Rename…") { renameValue = session.displayName; renaming = true }
             Menu("Move to…") {
                 Button("Project / Desktop") { store.moveSession(session, toVirtualFolder: nil) }
-                if !store.virtualFolders.isEmpty { Divider() }
-                ForEach(store.virtualFolders) { folder in
-                    Button(folder.name) { store.moveSession(session, toVirtualFolder: folder.id) }
+                let entries = WorkspaceOrganization.allFolderEntries(store.virtualFolders)
+                if !entries.isEmpty { Divider() }
+                ForEach(entries) { entry in
+                    Button(String(repeating: "  ", count: entry.depth) + entry.folder.name) {
+                        store.moveSession(session, toVirtualFolder: entry.folder.id)
+                    }
                 }
             }
             Button("Mark as unread") { store.markUnread(session) }
@@ -441,6 +520,31 @@ private struct SessionRow: View {
         }
         .help(session.cwd.path)
         .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")")
+    }
+
+    /// The unread dot and the hover archive/restore button share this one column, so a thread
+    /// title never shifts sideways when the row is hovered or read.
+    @ViewBuilder
+    private var leadingIcon: some View {
+        if hovering {
+            Image(systemName: archived ? "tray.and.arrow.up" : "archivebox")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight, alignment: .center)
+                .contentShape(Rectangle())
+                // Higher priority than the row's own Button gesture, so this click archives
+                // instead of also selecting/opening the conversation underneath it.
+                .highPriorityGesture(TapGesture().onEnded { store.toggleArchive(session) })
+                .help(archived ? "Restore" : "Archive")
+                .accessibilityLabel(archived ? "Restore conversation" : "Archive conversation")
+                .accessibilityAddTraits(.isButton)
+        } else {
+            Circle()
+                .fill(unread ? Color.accentColor : Color.clear)
+                .frame(width: 6, height: 6)
+                .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
+                .accessibilityHidden(true)
+        }
     }
 
     @ViewBuilder

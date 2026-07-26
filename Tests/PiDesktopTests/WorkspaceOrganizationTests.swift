@@ -77,6 +77,208 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertEqual(snapshot.activeGroups.first?.sessions.count, 0)
     }
 
+    // MARK: - Nested folders
+
+    func testVirtualFolderDecodesWithoutParentIDField() throws {
+        let legacyJSON = Data("""
+        {"id":"legacy","name":"Legacy","createdAt":0}
+        """.utf8)
+        let decoded = try JSONDecoder().decode(VirtualFolder.self, from: legacyJSON)
+        XCTAssertEqual(decoded.id, "legacy")
+        XCTAssertNil(decoded.parentID, "A pre-nesting state.json has no parentID key at all")
+    }
+
+    func testCreateRejectsDanglingVirtualParent() {
+        var folders: [VirtualFolder] = []
+        let orphan = WorkspaceOrganization.create(
+            named: "Orphan", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: "missing"), in: &folders
+        )
+        XCTAssertNil(orphan)
+        XCTAssertTrue(folders.isEmpty)
+    }
+
+    func testNestingUnderAnotherFolderAndUnderAProjectPath() throws {
+        var folders: [VirtualFolder] = []
+        let top = try XCTUnwrap(WorkspaceOrganization.create(named: "Top", in: &folders))
+        let nested = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Nested", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: top.id), in: &folders
+        ))
+        let inProject = try XCTUnwrap(WorkspaceOrganization.create(named: "InProject", parentID: "/tmp/project-a", in: &folders))
+
+        XCTAssertEqual(
+            WorkspaceOrganization.effectiveParentID(of: nested, in: folders),
+            WorkspaceOrganization.groupID(forVirtualFolderID: top.id)
+        )
+        XCTAssertEqual(WorkspaceOrganization.effectiveParentID(of: inProject, in: folders), "/tmp/project-a")
+    }
+
+    func testReparentRejectsSelfAndDescendantCycles() throws {
+        var folders: [VirtualFolder] = []
+        let a = try XCTUnwrap(WorkspaceOrganization.create(named: "A", in: &folders))
+        let b = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "B", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: a.id), in: &folders
+        ))
+
+        XCTAssertFalse(WorkspaceOrganization.reparent(id: a.id, to: WorkspaceOrganization.groupID(forVirtualFolderID: a.id), in: &folders))
+        XCTAssertFalse(WorkspaceOrganization.reparent(id: a.id, to: WorkspaceOrganization.groupID(forVirtualFolderID: b.id), in: &folders))
+        XCTAssertFalse(WorkspaceOrganization.reparent(id: a.id, to: WorkspaceOrganization.groupID(forVirtualFolderID: "missing"), in: &folders))
+        XCTAssertNil(folders.first(where: { $0.id == a.id })?.parentID, "Rejected moves leave the folder untouched")
+
+        XCTAssertTrue(WorkspaceOrganization.reparent(id: b.id, to: "/tmp/project-a", in: &folders), "Moving into a filesystem project is always allowed")
+        XCTAssertEqual(folders.first(where: { $0.id == b.id })?.parentID, "/tmp/project-a")
+    }
+
+    func testEffectiveParentIDBreaksHandEditedCycles() {
+        let a = VirtualFolder(id: "a", name: "A", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: "b"))
+        let b = VirtualFolder(id: "b", name: "B", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: "a"))
+        let folders = [a, b]
+        XCTAssertNil(WorkspaceOrganization.effectiveParentID(of: a, in: folders))
+        XCTAssertNil(WorkspaceOrganization.effectiveParentID(of: b, in: folders))
+    }
+
+    func testDeleteTopLevelFolderPromotesChildToTopLevel() throws {
+        var folders: [VirtualFolder] = []
+        var assignments: [String: String] = [:]
+        let parent = try XCTUnwrap(WorkspaceOrganization.create(named: "Parent", in: &folders))
+        let child = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Child", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: parent.id), in: &folders
+        ))
+
+        XCTAssertTrue(WorkspaceOrganization.delete(id: parent.id, folders: &folders, assignments: &assignments))
+        XCTAssertNil(folders.first(where: { $0.id == child.id })?.parentID)
+    }
+
+    func testDeleteNestedFolderPromotesGrandchildToItsParent() throws {
+        var folders: [VirtualFolder] = []
+        var assignments: [String: String] = [:]
+        let top = try XCTUnwrap(WorkspaceOrganization.create(named: "Top", in: &folders))
+        let mid = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Mid", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: top.id), in: &folders
+        ))
+        let leaf = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Leaf", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: mid.id), in: &folders
+        ))
+        assignments["/tmp/leaf-session.jsonl"] = leaf.id
+
+        XCTAssertTrue(WorkspaceOrganization.delete(id: mid.id, folders: &folders, assignments: &assignments))
+
+        XCTAssertEqual(folders.first(where: { $0.id == leaf.id })?.parentID, WorkspaceOrganization.groupID(forVirtualFolderID: top.id))
+        XCTAssertNil(folders.first(where: { $0.id == mid.id }))
+        XCTAssertEqual(assignments["/tmp/leaf-session.jsonl"], leaf.id, "A session's assignment survives its folder's parent being deleted")
+    }
+
+    func testDeleteFolderInsideProjectPromotesChildToProject() throws {
+        var folders: [VirtualFolder] = []
+        var assignments: [String: String] = [:]
+        let projectPath = "/tmp/project-a"
+        let mid = try XCTUnwrap(WorkspaceOrganization.create(named: "Mid", parentID: projectPath, in: &folders))
+        let leaf = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Leaf", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: mid.id), in: &folders
+        ))
+
+        XCTAssertTrue(WorkspaceOrganization.delete(id: mid.id, folders: &folders, assignments: &assignments))
+        XCTAssertEqual(folders.first(where: { $0.id == leaf.id })?.parentID, projectPath)
+    }
+
+    func testMoveSessionIntoAndOutOfADeeplyNestedFolder() throws {
+        var folders: [VirtualFolder] = []
+        let top = try XCTUnwrap(WorkspaceOrganization.create(named: "Top", in: &folders))
+        let nested = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Nested", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: top.id), in: &folders
+        ))
+        var assignments: [String: String] = [:]
+
+        WorkspaceOrganization.move(sessionPath: "/tmp/s.jsonl", to: nested.id, folders: folders, assignments: &assignments)
+        XCTAssertEqual(assignments["/tmp/s.jsonl"], nested.id)
+
+        WorkspaceOrganization.move(sessionPath: "/tmp/s.jsonl", to: nil, folders: folders, assignments: &assignments)
+        XCTAssertTrue(assignments.isEmpty, "Clearing an assignment works the same regardless of nesting depth")
+    }
+
+    func testOrderedChildrenIndentsByDepth() throws {
+        var folders: [VirtualFolder] = []
+        let root = try XCTUnwrap(WorkspaceOrganization.create(named: "Root", in: &folders))
+        let child = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Child", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: root.id), in: &folders
+        ))
+        _ = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Grandchild", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: child.id), in: &folders
+        ))
+
+        let entries = WorkspaceOrganization.orderedChildren(of: nil, in: folders)
+        XCTAssertEqual(entries.map(\.folder.name), ["Root", "Child", "Grandchild"])
+        XCTAssertEqual(entries.map(\.depth), [0, 1, 2])
+    }
+
+    func testAllFolderEntriesCoversTopLevelAndProjectNestedFolders() throws {
+        var folders: [VirtualFolder] = []
+        let inProject = try XCTUnwrap(WorkspaceOrganization.create(named: "InProject", parentID: "/tmp/project-a", in: &folders))
+        let top = try XCTUnwrap(WorkspaceOrganization.create(named: "TopLevel", in: &folders))
+
+        let entries = WorkspaceOrganization.allFolderEntries(folders)
+        XCTAssertEqual(Set(entries.map(\.folder.id)), Set([inProject.id, top.id]))
+    }
+
+    func testSidebarSnapshotRendersNestedFoldersAndProjectsEverySessionOnce() throws {
+        var folders: [VirtualFolder] = []
+        let projectPath = "/tmp/project-a"
+        let inProject = try XCTUnwrap(WorkspaceOrganization.create(named: "In Project", parentID: projectPath, in: &folders))
+        let nested = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Nested", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: inProject.id), in: &folders
+        ))
+        let topLevel = try XCTUnwrap(WorkspaceOrganization.create(named: "Top", in: &folders))
+
+        let sessions = [
+            summary(id: "loose", cwd: projectPath),
+            summary(id: "inProject", cwd: projectPath),
+            summary(id: "nested", cwd: projectPath),
+            summary(id: "top", cwd: "/tmp/other")
+        ]
+        let assignments = [
+            sessions[1].fileURL.standardizedFileURL.path: inProject.id,
+            sessions[2].fileURL.standardizedFileURL.path: nested.id,
+            sessions[3].fileURL.standardizedFileURL.path: topLevel.id
+        ]
+        let snapshot = SidebarSnapshot(sessions: sessions, query: "", virtualFolders: folders, assignments: assignments)
+
+        func flatten(_ groups: [SessionFolderGroup]) -> [SessionSummary] {
+            groups.flatMap { $0.sessions + flatten($0.children) }
+        }
+        let projected = flatten(snapshot.activeGroups)
+        XCTAssertEqual(projected.count, sessions.count, "Every session appears exactly once across the tree")
+        XCTAssertEqual(Set(projected.map(\.id)), Set(sessions.map(\.id)))
+
+        let project = try XCTUnwrap(snapshot.activeGroups.first { $0.path == projectPath })
+        XCTAssertEqual(project.sessions.map(\.id), ["loose"])
+        let inProjectGroup = try XCTUnwrap(project.children.first { $0.virtualFolderID == inProject.id })
+        XCTAssertEqual(inProjectGroup.sessions.map(\.id), ["inProject"])
+        let nestedGroup = try XCTUnwrap(inProjectGroup.children.first { $0.virtualFolderID == nested.id })
+        XCTAssertEqual(nestedGroup.sessions.map(\.id), ["nested"])
+
+        let topGroup = try XCTUnwrap(snapshot.activeGroups.first { $0.virtualFolderID == topLevel.id })
+        XCTAssertEqual(topGroup.sessions.map(\.id), ["top"])
+    }
+
+    @MainActor
+    func testNestedFolderParentPersistsAcrossReloadAndReparentUpdatesIt() throws {
+        let base = temporaryDirectory("NestedFolderPersistence")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let persistence = AppPersistence(baseURL: base)
+        let parent = try XCTUnwrap(persistence.createVirtualFolder(named: "Parent"))
+        let child = try XCTUnwrap(persistence.createVirtualFolder(
+            named: "Child", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: parent.id)
+        ))
+
+        let reloaded = AppPersistence(baseURL: base)
+        XCTAssertEqual(
+            reloaded.state.virtualFolders.first(where: { $0.id == child.id })?.parentID,
+            WorkspaceOrganization.groupID(forVirtualFolderID: parent.id)
+        )
+
+        XCTAssertTrue(reloaded.reparentVirtualFolder(id: child.id, to: nil))
+        XCTAssertNil(AppPersistence(baseURL: base).state.virtualFolders.first(where: { $0.id == child.id })?.parentID)
+    }
+
     @MainActor
     func testExternalTerminalWriteBecomesUnreadThroughSharedMonitor() async throws {
         let base = temporaryDirectory("ExternalUnread")

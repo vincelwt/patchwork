@@ -2,28 +2,95 @@ import Foundation
 
 /// An app-owned organizational folder. It never maps to, creates, or mutates a filesystem
 /// directory; assignments are Pi Desktop metadata keyed by the session file's stable path.
+///
+/// `parentID` places a folder in the same tree `SidebarView.SessionFolderGroup` renders, using
+/// the identical id scheme: `nil` is top level, a filesystem project path (e.g.
+/// `/Users/vince/code`) nests inside that project group, and `"virtual:<uuid>"` nests inside
+/// another virtual folder. Sharing the scheme means a drop target's or menu's group id can be
+/// written straight into `parentID` with no translation.
 struct VirtualFolder: Identifiable, Codable, Hashable, Sendable {
     let id: String
     var name: String
     let createdAt: Date
+    var parentID: String?
 
-    init(id: String = UUID().uuidString, name: String, createdAt: Date = Date()) {
+    init(id: String = UUID().uuidString, name: String, createdAt: Date = Date(), parentID: String? = nil) {
         self.id = id
         self.name = name
         self.createdAt = createdAt
+        self.parentID = parentID
+    }
+
+    /// Hand-written so folders persisted before nesting existed (no `parentID` key) keep
+    /// decoding as top-level, matching `PersistedAppState`'s forward-compatible pattern.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        parentID = try container.decodeIfPresent(String.self, forKey: .parentID)
     }
 }
 
-/// Pure CRUD/move rules shared by persistence and tests.
+/// Pure CRUD/move/tree rules shared by persistence and tests.
 enum WorkspaceOrganization {
     static func cleanedName(_ name: String) -> String? {
         let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : String(value.prefix(80))
     }
 
-    static func create(named name: String, in folders: inout [VirtualFolder]) -> VirtualFolder? {
+    /// Same id scheme `SessionFolderGroup.id` uses: a filesystem project path names itself, a
+    /// virtual folder is `"virtual:<uuid>"`. `virtualFolderID` inverts it; a plain project path
+    /// has no folder id and returns `nil`.
+    static func groupID(forVirtualFolderID id: String) -> String { "virtual:\(id)" }
+
+    static func virtualFolderID(fromGroupID groupID: String) -> String? {
+        groupID.hasPrefix("virtual:") ? String(groupID.dropFirst("virtual:".count)) : nil
+    }
+
+    /// Ancestor folder ids walking up from `folderID` through `parentID`, nearest first. Stops
+    /// at top level, a filesystem project, or the first repeated id, so a corrupted cycle can
+    /// never make this loop forever.
+    static func ancestorFolderIDs(of folderID: String, in folders: [VirtualFolder]) -> [String] {
+        var chain: [String] = []
+        var visited: Set<String> = [folderID]
+        var currentID = folderID
+        while let node = folders.first(where: { $0.id == currentID }),
+              let parentGroupID = node.parentID,
+              let parentFolderID = virtualFolderID(fromGroupID: parentGroupID) {
+            guard visited.insert(parentFolderID).inserted else { break }
+            chain.append(parentFolderID)
+            currentID = parentFolderID
+        }
+        return chain
+    }
+
+    /// A folder can never become its own ancestor: true if `newParentFolderID` is `folderID`
+    /// itself or already sits underneath it.
+    static func wouldCreateCycle(moving folderID: String, into newParentFolderID: String, in folders: [VirtualFolder]) -> Bool {
+        newParentFolderID == folderID || ancestorFolderIDs(of: newParentFolderID, in: folders).contains(folderID)
+    }
+
+    /// Defensive parent resolution for rendering: a dangling virtual parent, or an ancestor
+    /// cycle that `reparent` should have made unreachable, both degrade to top level instead of
+    /// hanging the sidebar tree in infinite recursion over hand-edited state.
+    static func effectiveParentID(of folder: VirtualFolder, in folders: [VirtualFolder]) -> String? {
+        guard let parentGroupID = folder.parentID else { return nil }
+        guard let parentFolderID = virtualFolderID(fromGroupID: parentGroupID) else { return parentGroupID }
+        guard folders.contains(where: { $0.id == parentFolderID }),
+              !wouldCreateCycle(moving: folder.id, into: parentFolderID, in: folders) else { return nil }
+        return parentGroupID
+    }
+
+    /// `parentID` may be top level, a filesystem project path (always accepted \u2014 projects are
+    /// derived from live sessions, never persisted as entities), or another folder's group id
+    /// (must already exist).
+    static func create(named name: String, parentID: String? = nil, in folders: inout [VirtualFolder]) -> VirtualFolder? {
         guard let clean = cleanedName(name) else { return nil }
-        let folder = VirtualFolder(name: clean)
+        if let parentID, let parentFolderID = virtualFolderID(fromGroupID: parentID) {
+            guard folders.contains(where: { $0.id == parentFolderID }) else { return nil }
+        }
+        let folder = VirtualFolder(name: clean, parentID: parentID)
         folders.append(folder)
         return folder
     }
@@ -35,9 +102,30 @@ enum WorkspaceOrganization {
         return true
     }
 
+    /// Refuses a move that would make `id` its own ancestor or that targets a virtual folder
+    /// that does not exist; a filesystem project path or top level (`nil`) is always accepted.
+    @discardableResult
+    static func reparent(id: String, to newParentGroupID: String?, in folders: inout [VirtualFolder]) -> Bool {
+        guard let index = folders.firstIndex(where: { $0.id == id }) else { return false }
+        if let newParentGroupID, let newParentFolderID = virtualFolderID(fromGroupID: newParentGroupID) {
+            guard folders.contains(where: { $0.id == newParentFolderID }),
+                  !wouldCreateCycle(moving: id, into: newParentFolderID, in: folders) else { return false }
+        }
+        folders[index].parentID = newParentGroupID
+        return true
+    }
+
+    /// Deleting a folder reparents its direct children up to the deleted folder's own parent
+    /// (least destructive: a subtree stays together instead of scattering to top level) and
+    /// clears only assignments that pointed at the deleted folder itself \u2014 sessions filed under
+    /// a surviving child or grandchild keep their assignment untouched.
     @discardableResult
     static func delete(id: String, folders: inout [VirtualFolder], assignments: inout [String: String]) -> Bool {
-        guard folders.contains(where: { $0.id == id }) else { return false }
+        guard let target = folders.first(where: { $0.id == id }) else { return false }
+        let deletedGroupID = groupID(forVirtualFolderID: id)
+        for index in folders.indices where folders[index].parentID == deletedGroupID {
+            folders[index].parentID = target.parentID
+        }
         folders.removeAll { $0.id == id }
         assignments = assignments.filter { $0.value != id }
         return true
@@ -52,19 +140,62 @@ enum WorkspaceOrganization {
         guard folders.contains(where: { $0.id == folderID }) else { return }
         assignments[path] = folderID
     }
+
+    struct FolderTreeEntry: Identifiable {
+        let folder: VirtualFolder
+        let depth: Int
+        var id: String { folder.id }
+    }
+
+    /// Depth-first order of the folders parented directly or indirectly under `parentGroupID`
+    /// (`nil` for top level), for pickers like "Move to\u2026". Uses the same cycle-safe parent
+    /// resolution as rendering, and `maxDepth` is a second, independent recursion guard.
+    static func orderedChildren(
+        of parentGroupID: String?, in folders: [VirtualFolder], depth: Int = 0, maxDepth: Int = 48
+    ) -> [FolderTreeEntry] {
+        guard depth < maxDepth else { return [] }
+        let direct = folders
+            .filter { effectiveParentID(of: $0, in: folders) == parentGroupID }
+            .sorted { $0.createdAt < $1.createdAt }
+        return direct.flatMap { folder in
+            [FolderTreeEntry(folder: folder, depth: depth)]
+                + orderedChildren(of: groupID(forVirtualFolderID: folder.id), in: folders, depth: depth + 1, maxDepth: maxDepth)
+        }
+    }
+
+    /// Every folder exactly once: the top-level subtree first, then each filesystem project
+    /// that hosts folders (first-seen order), so a flat picker can show the whole tree with
+    /// simple per-depth indentation.
+    static func allFolderEntries(_ folders: [VirtualFolder]) -> [FolderTreeEntry] {
+        var roots: [String?] = [nil]
+        var seenProjectPaths: Set<String> = []
+        for folder in folders {
+            guard let parent = effectiveParentID(of: folder, in: folders), virtualFolderID(fromGroupID: parent) == nil,
+                  seenProjectPaths.insert(parent).inserted else { continue }
+            roots.append(parent)
+        }
+        return roots.flatMap { orderedChildren(of: $0, in: folders) }
+    }
 }
 
 extension AppPersistence {
     @discardableResult
-    func createVirtualFolder(named name: String) -> VirtualFolder? {
+    func createVirtualFolder(named name: String, parentID: String? = nil) -> VirtualFolder? {
         var result: VirtualFolder?
-        updateState { result = WorkspaceOrganization.create(named: name, in: &$0.virtualFolders) }
+        updateState { result = WorkspaceOrganization.create(named: name, parentID: parentID, in: &$0.virtualFolders) }
         return result
     }
 
     func renameVirtualFolder(id: String, to name: String) -> Bool {
         var changed = false
         updateState { changed = WorkspaceOrganization.rename(id: id, to: name, in: &$0.virtualFolders) }
+        return changed
+    }
+
+    @discardableResult
+    func reparentVirtualFolder(id: String, to parentID: String?) -> Bool {
+        var changed = false
+        updateState { changed = WorkspaceOrganization.reparent(id: id, to: parentID, in: &$0.virtualFolders) }
         return changed
     }
 
@@ -134,14 +265,19 @@ extension AppStore {
     }
 
     @discardableResult
-    func createVirtualFolder(named name: String) -> VirtualFolder? {
-        guard let folder = persistence.createVirtualFolder(named: name) else { return nil }
+    func createVirtualFolder(named name: String, parentID: String? = nil) -> VirtualFolder? {
+        guard let folder = persistence.createVirtualFolder(named: name, parentID: parentID) else { return nil }
         objectWillChange.send()
         return folder
     }
 
     func renameVirtualFolder(id: String, to name: String) {
         guard persistence.renameVirtualFolder(id: id, to: name) else { return }
+        objectWillChange.send()
+    }
+
+    func reparentVirtualFolder(id: String, to parentID: String?) {
+        guard persistence.reparentVirtualFolder(id: id, to: parentID) else { return }
         objectWillChange.send()
     }
 

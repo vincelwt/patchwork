@@ -48,12 +48,19 @@ enum PiTheme {
     static let gridGutter: CGFloat = 7
     static var gridTextInset: CGFloat { gridIconColumn + gridGutter }
 
-    /// The sidebar grid. A disclosure gutter that only folders use, then one icon column, then
-    /// the single text origin shared by action rows, folder headers, and conversation rows, so
-    /// the list keeps one edge and stays shallow.
+    /// The sidebar grid: one icon column, then the single text origin shared by action rows,
+    /// folder headers, and conversation rows, so the list keeps one edge and stays shallow.
+    /// There is deliberately no reserved disclosure gutter — folders expand on a click anywhere
+    /// in their header row rather than a dedicated chevron slot.
     static let sidebarDisclosureColumn: CGFloat = 12
     static let sidebarIconColumn: CGFloat = 14
-    static var sidebarIconInset: CGFloat { space8 + sidebarDisclosureColumn + space6 }
+    /// Extra leading space per nesting level in the virtual folder tree, applied to both a
+    /// folder header and the sessions/subfolders indented one step past it.
+    static let sidebarIndentStep: CGFloat = 14
+    /// Nesting stops adding indentation (and the tree stops recursing) past this depth — a sane
+    /// ceiling so corrupted parent data can never make the sidebar recurse without bound.
+    static let sidebarMaxFolderDepth = 24
+    static var sidebarIconInset: CGFloat { space8 }
     static var sidebarTextInset: CGFloat { sidebarIconInset + sidebarIconColumn + space6 }
 
     // Radii — one small, one medium, one for the composer. No other values.
