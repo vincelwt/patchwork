@@ -563,6 +563,11 @@ enum AnswerAttributedTextBuilder {
             result.append(NSAttributedString(string: substring, attributes: attributes))
         }
         if result.length == 0 { result.append(NSAttributedString(string: text, attributes: [.font: baseFont, .foregroundColor: color])) }
+        if result.length > 0 {
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.lineSpacing = PiFont.bodyLineSpacing
+            result.addAttribute(.paragraphStyle, value: paragraphStyle, range: NSRange(location: 0, length: result.length))
+        }
         return result
     }
 

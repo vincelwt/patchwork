@@ -65,6 +65,28 @@ final class SelectableAnswerTextTests: XCTestCase {
         }
     }
 
+    func testEverySettledAnswerProseBlockUsesSharedLineSpacing() throws {
+        let blocks: [MarkdownBlock] = [
+            .paragraph("paragraph"),
+            .heading(level: 1, text: "heading"),
+            .list(items: [.init(marker: "•", text: "list item", depth: 0)], ordered: false, start: 1),
+            .quote("quote")
+        ]
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
+
+        for fragment in ["paragraph", "heading", "list item", "quote"] {
+            let range = try XCTUnwrap(built.attributedString.string.range(of: fragment))
+            let style = try XCTUnwrap(
+                built.attributedString.attribute(
+                    .paragraphStyle,
+                    at: NSRange(range, in: built.attributedString.string).location,
+                    effectiveRange: nil
+                ) as? NSParagraphStyle
+            )
+            XCTAssertEqual(style.lineSpacing, PiFont.bodyLineSpacing, accuracy: 0.001, fragment)
+        }
+    }
+
     func testBoldSpanGetsABoldFontTrait() throws {
         let blocks = MarkdownBlockParser.blocks(from: "plain **bold** plain")
         let built = AnswerAttributedTextBuilder.build(blocks: blocks)

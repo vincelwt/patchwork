@@ -547,9 +547,7 @@ private struct MarkdownBlockRow: View {
         case let .paragraph(text):
             inline(text)
         case let .heading(_, text):
-            Text(MarkdownInline.attributed(text, baseWeight: .semibold))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            inline(text, baseWeight: .semibold)
                 .padding(.top, PiTheme.space4)
         case let .list(items, ordered, _):
             VStack(alignment: .leading, spacing: PiTheme.space4) {
@@ -581,8 +579,8 @@ private struct MarkdownBlockRow: View {
         }
     }
 
-    private func inline(_ text: String) -> some View {
-        Text(MarkdownInline.attributed(text))
+    private func inline(_ text: String, baseWeight: Font.Weight = .regular) -> some View {
+        Text(MarkdownInline.attributed(text, baseWeight: baseWeight))
             .lineSpacing(PiFont.bodyLineSpacing)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
