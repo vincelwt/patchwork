@@ -164,7 +164,7 @@ struct ConversationView: View {
 
     @ViewBuilder
     private var messageArea: some View {
-        if store.isConversationLoading {
+        if store.isConversationLoading && store.messages.isEmpty {
             VStack(spacing: PiTheme.space8) {
                 ProgressView().controlSize(.small)
                 Text("Loading conversation…").font(PiFont.caption).foregroundStyle(.secondary)
@@ -201,7 +201,7 @@ struct ConversationView: View {
     }
 }
 
-private struct MessageScrollView: View {
+struct MessageScrollView: View {
     @EnvironmentObject private var store: AppStore
     let messages: [ChatMessage]
     let streaming: ChatMessage?

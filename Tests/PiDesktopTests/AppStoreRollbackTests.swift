@@ -16,6 +16,7 @@ private final class FakeRuntime: PiRuntimeProtocol {
     /// sessionFile reported by get_state, which decides which session owns the runtime.
     var sessionFile: String = ""
     var sessionID: String = ""
+    var delaysStateResponse = false
 
     func start(cwd: URL, sessionPath: URL?) throws {
         isRunning = true
@@ -30,6 +31,8 @@ private final class FakeRuntime: PiRuntimeProtocol {
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append((type, payload))
         switch type {
+        case "get_state" where delaysStateResponse:
+            if let completion { pending[type] = completion }
         case "get_state":
             completion?(.success(.object([
                 "type": .string("response"),
@@ -143,6 +146,61 @@ final class AppStoreRollbackTests: XCTestCase {
                       "The notification names the other conversation")
         XCTAssertTrue(toast.text.contains("Pi crashed in A"))
         XCTAssertEqual(runtime.commandCount("prompt"), 1, "A failure must never resubmit the prompt")
+    }
+
+    func testMessageAppearsBeforeRuntimeStartupFinishesAndSurvivesHistoryHydration() throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        runtime.delaysStateResponse = true
+
+        store.draft = "show this now"
+        store.submitDraft()
+
+        XCTAssertEqual(store.messages.last?.textContent, "show this now")
+        XCTAssertTrue(store.messages.last?.id.hasPrefix("local-") == true)
+        XCTAssertEqual(runtime.commandCount("prompt"), 0, "RPC startup is still pending")
+
+        runtime.succeed("get_state", data: .object([
+            "isStreaming": .bool(false),
+            "sessionFile": .string(sessionA.fileURL.path),
+            "sessionId": .string(sessionA.id)
+        ]))
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+
+        runtime.succeed("get_messages", data: .object([
+            "messages": .array([.object([
+                "role": .string("assistant"),
+                "content": .string("Earlier answer"),
+                "timestamp": .number(1_000)
+            ])])
+        ]))
+        XCTAssertEqual(store.messages.map(\.textContent), ["Earlier answer", "show this now"])
+        XCTAssertTrue(store.messages.last?.id.hasPrefix("local-") == true)
+    }
+
+    func testNewChatMessageAppearsBeforeSessionPromotion() throws {
+        let (store, runtime, _, _) = makeStore()
+        store.openNewChat()
+        store.selectedFolder = temporaryDirectory
+        runtime.sessionFile = temporaryDirectory.appendingPathComponent("fresh.jsonl").path
+        runtime.sessionID = "fresh-session"
+        runtime.delaysStateResponse = true
+
+        store.draft = "first prompt"
+        store.submitDraft()
+
+        XCTAssertEqual(store.route, .newChat)
+        XCTAssertEqual(store.messages.last?.textContent, "first prompt")
+
+        runtime.succeed("get_state", data: .object([
+            "isStreaming": .bool(false),
+            "sessionFile": .string(runtime.sessionFile),
+            "sessionId": .string(runtime.sessionID)
+        ]))
+        XCTAssertEqual(store.route, .session("fresh-session"))
+        XCTAssertEqual(store.messages.last?.textContent, "first prompt")
     }
 
     func testFailureOnTheOriginatingConversationRestoresTheDraft() async throws {
