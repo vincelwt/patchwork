@@ -377,6 +377,7 @@ final class AppStore: ObservableObject {
         startGitRefreshLoop()
         activityMonitor.start()
         refreshExtensionStatuses()
+        LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
     }
 
     func refreshSessions() async {
@@ -629,6 +630,25 @@ final class AppStore: ObservableObject {
     /// `/limits` renders its report through the existing extension editor dialog bridge.
     func showLimits() {
         runExtensionCommand("/limits")
+    }
+
+    /// `/limits` reports through the extension editor dialog. Desktop recognises that dialog,
+    /// closes it, and draws the report natively instead of showing a text dump.
+    static let limitsDialogTitlePrefix = "AI usage limits"
+
+    static func isLimitsDialog(method: String, title: String?) -> Bool {
+        method == "editor" && (title ?? "").hasPrefix(limitsDialogTitlePrefix)
+    }
+
+    /// Only ever driven by an explicit hover: this must not spawn a Pi process on its own.
+    func refreshLimits() {
+        guard runtime.isRunning else {
+            LimitsReportStore.shared.fail("Open a conversation to load the full report")
+            return
+        }
+        runtime.send(type: "prompt", payload: ["message": .string("/limits")]) { result in
+            if case let .failure(error) = result { LimitsReportStore.shared.fail(error.localizedDescription) }
+        }
     }
 
     // MARK: - Ephemeral status probe
@@ -1401,6 +1421,15 @@ final class AppStore: ObservableObject {
         case "select", "confirm", "input", "editor":
             guard let id = event["id"]?.stringValue, let dialogMethod = ExtensionDialogRequest.Method(rawValue: method) else { return }
             guard !dialogQueue.contains(where: { $0.id == id }) else { return }
+            if Self.isLimitsDialog(method: method, title: event["title"]?.stringValue) {
+                LimitsReportStore.shared.apply(text: event["prefill"]?.stringValue?.suffixString(20_000) ?? "")
+                runtime.sendUncorrelated(.object([
+                    "type": .string("extension_ui_response"),
+                    "id": .string(id),
+                    "cancelled": .bool(true)
+                ]))
+                return
+            }
             let request = ExtensionDialogRequest(
                 id: id, method: dialogMethod, title: event["title"]?.stringValue ?? "Pi",
                 message: event["message"]?.stringValue?.suffixString(4_000),

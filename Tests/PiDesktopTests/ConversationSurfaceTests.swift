@@ -282,3 +282,25 @@ final class CapabilityPresenterTests: XCTestCase {
         XCTAssertNil(CapabilityPresenter.capability(toolName: "read", callID: "read-1", arguments: .object([:])))
     }
 }
+
+final class LimitsBridgeTests: XCTestCase {
+    @MainActor
+    func testOnlyTheLimitsEditorDialogIsConsumedNatively() {
+        XCTAssertTrue(AppStore.isLimitsDialog(method: "editor", title: "AI usage limits (Esc to close)"))
+        XCTAssertFalse(AppStore.isLimitsDialog(method: "editor", title: "Edit commit message"))
+        XCTAssertFalse(AppStore.isLimitsDialog(method: "input", title: "AI usage limits (Esc to close)"))
+        XCTAssertFalse(AppStore.isLimitsDialog(method: "editor", title: nil))
+    }
+
+    @MainActor
+    func testAppliedReportReplacesTheCacheAndAnEmptyOneKeepsIt() {
+        let store = LimitsReportStore.shared
+        store.apply(text: "ChatGPT\n  5h: 40% remaining")
+        XCTAssertEqual(store.report?.accounts.first?.windows.first?.remainingPercent, 40)
+
+        // A blank report must never wipe a good one out from under the popover.
+        store.apply(text: "")
+        XCTAssertEqual(store.report?.accounts.first?.windows.first?.remainingPercent, 40)
+        XCTAssertNotNil(store.lastError)
+    }
+}

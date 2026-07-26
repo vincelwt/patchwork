@@ -11,8 +11,11 @@ struct StatusBarView: View {
             RuntimeStateLabel()
 
             // Token counts live in the hover detail; the bar itself carries the number that
-            // actually matters at a glance.
-            CostLabel(metrics: metrics)
+            // actually matters at a glance. A conversation that has not cost anything yet says
+            // nothing at all.
+            if metrics.total > 0 || metrics.cost > 0 {
+                CostLabel(metrics: metrics)
+            }
 
             if let percent = metrics.contextPercent {
                 HStack(spacing: PiTheme.space4) {
