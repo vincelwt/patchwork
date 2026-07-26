@@ -10,22 +10,35 @@ struct PiProcessCandidate: Equatable, Sendable {
 /// Parses raw `ps`/`lsof` text. Kept free of `Process` entirely so tests can feed canned output
 /// without ever shelling out.
 enum ProcessSnapshotParser {
-    /// `ps -axo pid=,comm=,args=`: three whitespace-separated fields per line. `args` can itself
-    /// contain spaces, so only the first two splits are meaningful.
+    /// `ps -axo pid=,comm=,args=`: pid, comm, then the full argument vector, which itself
+    /// contains spaces — so only the first two splits are meaningful.
     static func candidates(fromPSOutput output: String) -> [PiProcessCandidate] {
         output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line -> PiProcessCandidate? in
             let fields = line.trimmingCharacters(in: .whitespaces)
                 .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-            guard fields.count >= 2, let pid = Int32(fields[0]), isPiExecutable(String(fields[1])) else { return nil }
-            return PiProcessCandidate(pid: pid, command: String(fields[1]))
+            guard fields.count >= 2, let pid = Int32(fields[0]) else { return nil }
+            let command = String(fields[1])
+            let arguments = fields.count > 2 ? String(fields[2]) : command
+            guard isPiProcess(command: command, arguments: arguments) else { return nil }
+            return PiProcessCandidate(pid: pid, command: command)
         }
     }
 
-    /// `comm` may be a bare name or a resolved full path depending on how the process was
-    /// launched; only the final path component identifies the Pi CLI either way.
-    static func isPiExecutable(_ comm: String) -> Bool {
-        (comm as NSString).lastPathComponent == "pi"
+    /// The installed CLI is a Node script, so a live agent normally reports `comm` as `node`
+    /// with `pi` only visible in its arguments (`node /Users/…/.local/bin/pi --mode rpc`).
+    /// Matching `comm` alone silently found nothing and made every session look idle.
+    static func isPiProcess(command: String, arguments: String) -> Bool {
+        if (command as NSString).lastPathComponent == "pi" { return true }
+        guard interpreters.contains((command as NSString).lastPathComponent) else { return false }
+        return arguments.split(separator: " ", omittingEmptySubsequences: true).contains { token in
+            // Only a real path to the executable counts, so an unrelated `pi` word in a
+            // command line cannot masquerade as the agent.
+            token.contains("/") && (String(token) as NSString).lastPathComponent == "pi"
+        }
     }
+
+    /// Runtimes the Pi CLI is launched through.
+    private static let interpreters: Set<String> = ["node", "bun", "deno", "npx", "tsx"]
 
     /// `lsof -a -p <pid> -d cwd -Fn`: machine-readable field lines. The cwd is the one line
     /// starting with `n`.

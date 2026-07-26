@@ -3,15 +3,19 @@ import XCTest
 @testable import PiDesktop
 
 final class ProcessSnapshotParserTests: XCTestCase {
-    func testCandidatesMatchOnlyPiExecutables() {
+    func testCandidatesMatchDirectAndInterpreterLaunchedAgents() {
+        // The third line is exactly how the installed CLI reports itself: comm is `node`, and
+        // `pi` only appears in the arguments.
         let output = """
           123 pi              pi --mode rpc
           456 bash             /bin/bash -c ps
           789 /usr/local/bin/pi /usr/local/bin/pi --mode rpc --session foo
+          912 node             node /Users/vince/.local/bin/pi --mode rpc
+          913 node             node /Users/vince/.pi/agent/extensions/helper.mjs
+          914 rg               rg -i "pi --mode"
         """
         let candidates = ProcessSnapshotParser.candidates(fromPSOutput: output)
-        XCTAssertEqual(candidates.map(\.pid), [123, 789])
-        XCTAssertEqual(candidates.map(\.command), ["pi", "/usr/local/bin/pi"])
+        XCTAssertEqual(candidates.map(\.pid), [123, 789, 912])
     }
 
     func testBlankAndMalformedLinesAreIgnored() {
@@ -19,11 +23,15 @@ final class ProcessSnapshotParserTests: XCTestCase {
         XCTAssertTrue(ProcessSnapshotParser.candidates(fromPSOutput: "\n   \nnotapid pi pi\n").isEmpty)
     }
 
-    func testIsPiExecutableAcceptsBareNameOrFullPath() {
-        XCTAssertTrue(ProcessSnapshotParser.isPiExecutable("pi"))
-        XCTAssertTrue(ProcessSnapshotParser.isPiExecutable("/opt/homebrew/bin/pi"))
-        XCTAssertFalse(ProcessSnapshotParser.isPiExecutable("pip"))
-        XCTAssertFalse(ProcessSnapshotParser.isPiExecutable("PiDesktop"))
+    func testPiProcessDetectionAcceptsPathsAndRejectsLookalikes() {
+        XCTAssertTrue(ProcessSnapshotParser.isPiProcess(command: "pi", arguments: "pi --mode rpc"))
+        XCTAssertTrue(ProcessSnapshotParser.isPiProcess(command: "/opt/homebrew/bin/pi", arguments: "/opt/homebrew/bin/pi"))
+        XCTAssertTrue(ProcessSnapshotParser.isPiProcess(command: "bun", arguments: "bun /Users/x/.local/bin/pi --mode rpc"))
+        XCTAssertFalse(ProcessSnapshotParser.isPiProcess(command: "pip", arguments: "pip install x"))
+        XCTAssertFalse(ProcessSnapshotParser.isPiProcess(command: "PiDesktop", arguments: "PiDesktop"))
+        // A bare `pi` word inside an unrelated command line is not the agent.
+        XCTAssertFalse(ProcessSnapshotParser.isPiProcess(command: "node", arguments: "node build.js --name pi"))
+        XCTAssertFalse(ProcessSnapshotParser.isPiProcess(command: "bash", arguments: "/bin/bash /Library/local.pi.caffeinate-lid"))
     }
 
     func testCwdIsParsedFromTheNPrefixedLsofLine() {
