@@ -151,6 +151,24 @@ enum PiFont {
     static let codeNSFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 }
 
+/// Symbols are the other half of the type scale, and they were the half nobody governed: views
+/// picked 8, 9, 10, 10.5, 11, 12 and 13pt glyphs by hand, which is what made the app look like
+/// several apps. Every `Image(systemName:)` in the UI uses one of these four sizes.
+enum PiIcon {
+    /// Chevrons and inline hints that sit inside a line of caption text.
+    static let micro: CGFloat = 9
+    /// The default: row icons in the sidebar, inspector, and transcript.
+    static let small: CGFloat = 11
+    /// Toolbar and composer controls.
+    static let medium: CGFloat = 12
+    /// Empty states and anything meant to be looked at rather than scanned past.
+    static let large: CGFloat = 15
+
+    static func font(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight)
+    }
+}
+
 // MARK: - Surfaces
 
 extension Color {
