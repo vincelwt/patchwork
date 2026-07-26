@@ -164,6 +164,11 @@ struct TranscriptWorkView: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
+        // A turn that starts working again owns its own disclosure once more, so a stale
+        // collapse can never hide live work.
+        .onChange(of: block.isActive) { _, active in
+            if active { userExpanded = nil }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
         .accessibilityValue(isOpen ? "expanded" : "collapsed")
