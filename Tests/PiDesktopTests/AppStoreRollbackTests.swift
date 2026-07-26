@@ -52,6 +52,21 @@ private final class FakeRuntime: PiRuntimeProtocol {
         pending.removeValue(forKey: command)?(.failure(error))
     }
 
+    /// Mirrors `PiRPCClient`'s real ordering on a crash: every pending completion is rejected
+    /// first — classified exactly like `RPCTimeoutPolicy` classifies a timeout for the same
+    /// command, outcome-unknown unless it is a read-only state query — and only then does
+    /// `onExit` fire.
+    func crash(_ message: String) {
+        for command in Array(pending.keys) {
+            let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
+                ? PiRPCError.processExited(message)
+                : PiRPCError.outcomeUnknown(command)
+            pending.removeValue(forKey: command)?(.failure(error))
+        }
+        isRunning = false
+        onExit?(message)
+    }
+
     func succeed(_ command: String, data: JSONValue) {
         pending.removeValue(forKey: command)?(.success(.object([
             "type": .string("response"),
@@ -160,6 +175,74 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
                       "The optimistic message stays: Pi may already be answering it")
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    /// Task 2: a crash mid-turn restores the exact last user message for a one-click resend, and
+    /// — the specific bug this guards — does so exactly once. `crash()` rejects the pending
+    /// "prompt" completion as outcome-unknown (mirroring a real `PiRPCClient`) before calling
+    /// `onExit`, so both `dispatchMessage`'s completion and `handleRuntimeExit` observe the same
+    /// crash; only one of them may ever actually restore the draft.
+    func testCrashDuringAnInFlightPromptRestoresTheDraftExactlyOnceNotTwice() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "fix the crash"
+        store.submitDraft()
+        XCTAssertEqual(store.draft, "", "Sending clears the composer")
+        XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") })
+
+        runtime.crash("Pi exited with status 139.")
+
+        XCTAssertEqual(store.draft, "fix the crash", "Restored exactly once, never concatenated with itself")
+        XCTAssertNotNil(store.runtimeState.lastError, "The failure is persisted, not just a toast that disappears")
+        XCTAssertEqual(store.toast?.style, .error)
+        XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
+                      "The optimistic message stays: Pi may already have accepted it before dying")
+    }
+
+    func testCrashWhileNoPromptWasInFlightNeverTouchesTheDraft() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "not sent yet"
+
+        runtime.crash("Pi exited with status 1.")
+
+        XCTAssertEqual(store.draft, "not sent yet", "Nothing was in flight, so nothing is restored or altered")
+        XCTAssertNotNil(store.runtimeState.lastError)
+    }
+
+    func testCrashAfterNavigatingAwayNeverRestoresIntoTheNewConversation() async throws {
+        let (store, runtime, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "prompt for A"
+        store.submitDraft()
+
+        store.selectSession(sessionB)
+        store.draft = "unrelated text in B"
+
+        runtime.crash("Pi exited with status 139.")
+
+        XCTAssertEqual(store.draft, "unrelated text in B", "A's crash must not inject text into B")
+    }
+
+    func testSettledTurnClearsThePendingPromptSoALaterUnrelatedCrashRestoresNothing() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "first message"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        // A later, unrelated crash (nothing pending any more) must not resurrect the first turn.
+        runtime.crash("Pi exited with status 1.")
+        XCTAssertEqual(store.draft, "", "The settled turn left nothing pending to restore")
     }
 
     func testNewChatRuntimeOffersExactModelAndThinkingMenus() throws {

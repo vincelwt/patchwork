@@ -35,6 +35,18 @@ struct DraftRecovery {
     }
 }
 
+/// The one user-authored message currently in flight, from the moment "prompt" is sent until
+/// its outcome is fully known (accepted-and-settled, or a receive failure that already restored
+/// it). `handleRuntimeExit` is the only place that ever acts on this when it is still set — by
+/// construction the same crash always rejects the pending RPC completion first — so a crash
+/// mid-turn can be recovered exactly once, never duplicated into the draft by two code paths
+/// reacting to the same event.
+private struct PendingUserTurn {
+    let origin: DraftOrigin
+    let text: String
+    let attachments: [ImageAttachment]
+}
+
 /// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
 /// bound across months of use. Recency is tracked purely in memory (never persisted itself);
 /// a dictionary loaded over the cap — e.g. from hand-edited state — is trimmed back into bounds
@@ -167,6 +179,15 @@ final class AppStore: ObservableObject {
     /// Last seen state per tracked session path, purely to detect a running→idle transition for
     /// conversations finishing in another terminal.
     private var previousActivityStates: [String: SessionRunState] = [:]
+    /// Set for the in-flight "prompt" of the currently attached turn; see `PendingUserTurn`.
+    private var activeTurnPrompt: PendingUserTurn?
+    /// Bounded in-memory transcript cache (Task 3): never persisted, purely a warm-start cache
+    /// for the current app run.
+    private let transcriptCache = TranscriptCache()
+    private var prefetchTask: Task<Void, Never>?
+    private static let prefetchLaunchCount = 8
+    private static let prefetchNeighborRadius = 1
+    private static let prefetchConcurrency = 3
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -188,7 +209,11 @@ final class AppStore: ObservableObject {
         self.probeRuntimeFactory = probeRuntimeFactory
         self.notificationService = notificationService ?? NotificationService()
         self.isActiveOverride = isActiveOverride
-        selectedFolder = Self.nowhereFolderURL
+        // Never default to a TCC-protected folder (Desktop/Documents/…): a folder the user has
+        // not chosen yet must not be why a fresh launch prompts for permission. `nowhereFolderURL`
+        // (~/Desktop) is kept only as an explicit, user-requested value elsewhere — never used
+        // automatically. See `defaultWorkingFolder` and `hasOptedIntoGitRefresh`.
+        selectedFolder = Self.defaultWorkingFolder(recentFolders: self.persistence.state.recentFolders)
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
@@ -293,7 +318,7 @@ final class AppStore: ObservableObject {
             guard previous == .running, activity.state == .idle else { continue }
             guard let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
             let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
-            notify(failed ? .turnFailed : .turnFinished, session: session)
+            notify(failed ? .turnFailed : .turnFinished, session: session, preview: activity.preview)
         }
         if previousActivityStates.count > activities.count {
             previousActivityStates = previousActivityStates.filter { activities[$0.key] != nil }
@@ -310,16 +335,20 @@ final class AppStore: ObservableObject {
     /// Single entry point for every notification trigger: applies the "don't tell me about what
     /// I'm already looking at" rule, coalesces bursts, then routes to a toast (frontmost) or a
     /// desktop notification (backgrounded).
-    private func notify(_ trigger: NotificationTrigger, session: SessionSummary?) {
+    private func notify(_ trigger: NotificationTrigger, session: SessionSummary?, preview: String? = nil) {
         guard let session else { return }
         let key = session.fileURL.standardizedFileURL.path
         let focusedKey = isApplicationActive ? selectedSession?.fileURL.standardizedFileURL.path : nil
         guard !NotificationGate.isSuppressed(sessionKey: key, focusedSessionKey: focusedKey) else { return }
         guard notificationCoalescer.shouldEmit(sessionKey: key) else { return }
+        // A finished turn's body shows the beginning of Pi's actual answer when one is available
+        // (a live RPC message, or a cross-terminal heartbeat preview); every other trigger keeps
+        // its fixed, specific summary.
+        let body = (trigger == .turnFinished ? NotificationPreviewFormatter.format(preview) : nil) ?? trigger.summary
         if isApplicationActive {
-            showToast("\(session.displayName): \(trigger.summary)", style: trigger.toastStyle)
+            showToast("\(session.displayName): \(body)", style: trigger.toastStyle)
         } else {
-            notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: trigger.summary)
+            notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: body)
         }
     }
 
@@ -357,6 +386,15 @@ final class AppStore: ObservableObject {
         objectWillChange.send()
     }
 
+    /// A safe folder to preselect before the user has chosen one: the most recently used folder
+    /// (already opted into — the user picked it from the picker) if there is one, else the plain
+    /// home directory, which macOS never gates behind a permission prompt the way Desktop,
+    /// Documents, and Downloads are.
+    private static func defaultWorkingFolder(recentFolders: [String]) -> URL {
+        if let mostRecent = recentFolders.first { return URL(fileURLWithPath: mostRecent, isDirectory: true) }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
     func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
@@ -370,13 +408,16 @@ final class AppStore: ObservableObject {
             }
             await refreshSessions()
             if selectedFolder == nil {
-                selectedFolder = Self.nowhereFolderURL
-                if let selectedFolder { await refreshGit(for: selectedFolder) }
+                selectedFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
             }
+            // Warm the transcript cache after the scan settles, so opening a recent conversation
+            // is instant even before the user selects anything.
+            schedulePrefetch(around: selectedSession)
         }
         startGitRefreshLoop()
         activityMonitor.start()
         refreshExtensionStatuses()
+        installActivityExtensionIfNeeded()
         LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
     }
 
@@ -417,7 +458,7 @@ final class AppStore: ObservableObject {
         attachments = attachmentsByKey[Self.newChatDraftKey] ?? []
         // Release the previous conversation's decoded bitmaps promptly.
         DecodedImageCache.purge()
-        selectedFolder = Self.nowhereFolderURL
+        selectedFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
         refreshSelectedGit()
     }
 
@@ -446,7 +487,7 @@ final class AppStore: ObservableObject {
         conversationLoadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conversation = try await repository.loadConversation(from: session.fileURL)
+                let conversation = try await cachedOrFreshConversation(for: session.fileURL)
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
                 messages = conversation.messages
@@ -460,6 +501,100 @@ final class AppStore: ObservableObject {
                 conversationError = error.localizedDescription
                 isConversationLoading = false
             }
+        }
+        // Warms the neighbours (and keeps the launch-recency set warm) so stepping through the
+        // sidebar stays instant too. Additive only — see `schedulePrefetch`.
+        schedulePrefetch(around: session)
+    }
+
+    /// Reuses a cached parse when the file has not changed since it was cached (Task 3);
+    /// otherwise parses fresh and warms the cache for next time. Callers still apply the same
+    /// generation/route check to the result regardless of which path was taken.
+    private func cachedOrFreshConversation(for fileURL: URL) async throws -> SessionConversation {
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else {
+            return try await repository.loadConversation(from: fileURL)
+        }
+        let path = fileURL.standardizedFileURL.path
+        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
+        if let cached = await transcriptCache.conversation(for: path, fingerprint: fingerprint) { return cached }
+        let conversation = try await repository.loadConversation(from: fileURL)
+        await transcriptCache.store(conversation, for: path, fingerprint: fingerprint)
+        return conversation
+    }
+
+    // MARK: - Prefetch
+
+    /// Warms the transcript cache in the background so opening a recent conversation — or one
+    /// next to the selected one in the sidebar's recency order — never waits on a parse. Strictly
+    /// additive: this can only ever populate `transcriptCache`, never publish into `messages`, so
+    /// a stale or cancelled prefetch can never corrupt what is on screen. Low priority and fully
+    /// cancellable; superseded on every call.
+    private func schedulePrefetch(around session: SessionSummary?) {
+        prefetchTask?.cancel()
+        let candidates = prefetchCandidates(around: session)
+        guard !candidates.isEmpty else { return }
+        prefetchTask = Task(priority: .utility) { [weak self] in
+            await self?.runPrefetch(candidates)
+        }
+    }
+
+    private func prefetchCandidates(around session: SessionSummary?) -> [URL] {
+        var ordered = Array(sessions.filter { !$0.isArchived }.prefix(Self.prefetchLaunchCount).map(\.fileURL))
+        guard let session, let index = sessions.firstIndex(where: { $0.id == session.id }) else { return ordered }
+        for offset in -Self.prefetchNeighborRadius...Self.prefetchNeighborRadius where offset != 0 {
+            let neighborIndex = index + offset
+            guard sessions.indices.contains(neighborIndex) else { continue }
+            ordered.append(sessions[neighborIndex].fileURL)
+        }
+        return ordered
+    }
+
+    private func runPrefetch(_ urls: [URL]) async {
+        let repository = repository
+        let cache = transcriptCache
+        await withTaskGroup(of: Void.self) { group in
+            var iterator = urls.makeIterator()
+            for _ in 0..<min(Self.prefetchConcurrency, urls.count) {
+                guard let url = iterator.next() else { break }
+                group.addTask { await Self.prefetchOne(url, repository: repository, cache: cache) }
+            }
+            while await group.next() != nil {
+                guard let next = iterator.next() else { continue }
+                group.addTask { await Self.prefetchOne(next, repository: repository, cache: cache) }
+            }
+        }
+    }
+
+    private static func prefetchOne(_ url: URL, repository: SessionRepositoryProtocol, cache: TranscriptCache) async {
+        guard !Task.isCancelled else { return }
+        let path = url.standardizedFileURL.path
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
+        let fingerprint = SessionFileFingerprint(url: url, values: values)
+        if await cache.conversation(for: path, fingerprint: fingerprint) != nil { return } // Already warm.
+        guard let conversation = try? await repository.loadConversation(from: url) else { return }
+        guard !Task.isCancelled else { return }
+        await cache.store(conversation, for: path, fingerprint: fingerprint)
+    }
+
+    // MARK: - Activity heartbeat extension
+
+    /// Installs/repairs the heartbeat extension off the main actor (Task 1: blocking file I/O),
+    /// then surfaces a quiet one-time toast only when this launch actually wrote something —
+    /// never on an ordinary launch once it is already current, disabled, or unavailable.
+    private func installActivityExtensionIfNeeded() {
+        guard !ActivityExtensionSettings.isDisabled() else { return }
+        Task.detached(priority: .utility) {
+            let outcome = ActivityExtensionInstaller.run(isDisabled: false)
+            await MainActor.run { [weak self] in self?.handleActivityExtensionOutcome(outcome) }
+        }
+    }
+
+    private func handleActivityExtensionOutcome(_ outcome: ActivityExtensionInstaller.Outcome) {
+        switch outcome {
+        case .installed: showToast("Installed the Pi activity helper extension", style: .info)
+        case .upgraded: showToast("Updated the Pi activity helper extension", style: .info)
+        case .upToDate, .disabled, .skippedUserModified, .sourceUnavailable, .writeFailed:
+            break // Nothing changed on disk; stay quiet.
         }
     }
 
@@ -492,12 +627,12 @@ final class AppStore: ObservableObject {
         toggleArchive(session)
     }
 
+    /// Cwd is no longer needed here: run state comes from activity heartbeats (matched by
+    /// session path) or the file heuristic, never from cross-checking a live process's working
+    /// directory — several sessions can share one, which is exactly what made that cross-check
+    /// unreliable.
     private func syncActivityMonitorPaths() {
         activityMonitor.setTrackedPaths(sessions.map { $0.fileURL.standardizedFileURL.path })
-        activityMonitor.setSessionCwds(Dictionary(
-            sessions.map { ($0.fileURL.standardizedFileURL.path, $0.cwd.standardizedFileURL.path) },
-            uniquingKeysWith: { first, _ in first }
-        ))
     }
 
     // MARK: - Draft persistence
@@ -1050,10 +1185,26 @@ final class AppStore: ObservableObject {
     }
 
     /// One awaited refresh at a time; the caller (menu action or polling loop) never spawns
-    /// overlapping git command chains.
+    /// overlapping git command chains. A session's own cwd is always fair game (Pi already
+    /// reads/writes there); a bare `selectedFolder` with no conversation open yet only refreshes
+    /// once the user has actually opted into it, so the passive default folder shown before any
+    /// chat exists can never trigger a git subprocess — and the TCC prompt a protected directory
+    /// brings with it — on its own.
     private func refreshSelectedGitAndWait() async {
-        guard let cwd = selectedSession?.cwd ?? selectedFolder else { return }
-        await refreshGit(for: cwd)
+        if let session = selectedSession {
+            await refreshGit(for: session.cwd)
+            return
+        }
+        guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else { return }
+        await refreshGit(for: folder)
+    }
+
+    /// A folder counts as opted into once the user has actually done something with it: chosen
+    /// it from the folder picker (which remembers it), or it already backs a real session.
+    private func hasOptedIntoGitRefresh(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        if persistence.state.recentFolders.contains(path) { return true }
+        return sessions.contains { $0.cwd.standardizedFileURL.path == path }
     }
 
     private func ensureRuntime(cwd: URL, sessionPath: URL?, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -1072,6 +1223,9 @@ final class AppStore: ObservableObject {
         clearExtensionDialogs()
         if runtime.isRunning { runtime.stop() }
         runtimeState = RuntimeState()
+        // A fresh attach means whatever the previous runtime was doing has fully ended one way
+        // or another; a stale pending turn from it must never be offered for retry here.
+        activeTurnPrompt = nil
         liveMetrics = TokenMetrics()
         availableModels.removeAll()
         availableThinkingLevels = ["off"]
@@ -1156,6 +1310,11 @@ final class AppStore: ObservableObject {
                 timestamp: Date(), raw: .null
             ))
         }
+        // The message that starts a turn is the one a crash mid-turn must be able to hand back
+        // for a one-click retry; see `PendingUserTurn` and `handleRuntimeExit`.
+        if command == "prompt" {
+            activeTurnPrompt = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
+        }
 
         var payload: [String: JSONValue] = ["message": .string(text)]
         if !sentAttachments.isEmpty { payload["images"] = .array(sentAttachments.map(\.rpcValue)) }
@@ -1178,12 +1337,14 @@ final class AppStore: ObservableObject {
                 return
             }
             // An unconfirmed side-effecting command may already have reached Pi. Rolling the
-            // draft back here would let the user resend and prompt Pi twice.
+            // draft back here would let the user resend and prompt Pi twice, so `activeTurnPrompt`
+            // (when this was the "prompt") is deliberately left set: only a later, definite signal
+            // — the turn settling, or the process actually exiting — ever resolves it from here on.
             if isOutcomeUnknown {
                 showToast(errorText, style: .warning)
                 return
             }
-            if command == "prompt" { runtimeState.isStreaming = wasStreaming }
+            if command == "prompt" { runtimeState.isStreaming = wasStreaming; activeTurnPrompt = nil }
             if let optimisticID { messages.removeAll { $0.id == optimisticID } }
             let restored = restoreDraft(text: originalDraft, attachments: sentAttachments, origin: origin)
             showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
@@ -1283,8 +1444,15 @@ final class AppStore: ObservableObject {
             runtimeState.isRetrying = false
             activeCapability = nil
             streamingMessage = nil
+            // The turn concluded (cleanly or with an in-band error message) with no ambiguity
+            // left: nothing about this dispatch is "pending" any more.
+            activeTurnPrompt = nil
             requestStats()
-            notify(messages.last?.isError == true ? .turnFailed : .turnFinished, session: activeSession())
+            notify(
+                messages.last?.isError == true ? .turnFailed : .turnFinished,
+                session: activeSession(),
+                preview: messages.last?.textContent
+            )
             Task { await refreshSelectedSummary(); if isApplicationActive { refreshSelectedGit() } }
         case "message_update":
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
@@ -1338,11 +1506,21 @@ final class AppStore: ObservableObject {
         case "compaction_start": runtimeState.isCompacting = true
         case "compaction_end":
             runtimeState.isCompacting = false
-            if let error = event["errorMessage"]?.stringValue { showToast(error, style: .error) }
+            // Persisted, not just a toast: a compaction failure otherwise vanishes in 3.5s while
+            // the composer still looks perfectly usable.
+            if let error = event["errorMessage"]?.stringValue {
+                runtimeState.lastError = error
+                showToast(error, style: .error)
+            }
         case "auto_retry_start": runtimeState.isRetrying = true; runtimeState.retryAttempt = event["attempt"]?.intValue
         case "auto_retry_end":
             runtimeState.isRetrying = false
-            if event["success"]?.boolValue == false, let error = event["finalError"]?.stringValue { showToast(error, style: .error) }
+            // Pi's own automatic retries (provider overload/rate limit/5xx) were exhausted:
+            // surface it the same durable way as any other runtime failure.
+            if event["success"]?.boolValue == false, let error = event["finalError"]?.stringValue {
+                runtimeState.lastError = error
+                showToast(error, style: .error)
+            }
         case "extension_ui_request": handleExtensionUI(event)
         case "extension_error": showToast(event["error"]?.stringValue ?? "A Pi extension failed.", style: .error)
         case "turn_end":
@@ -1460,7 +1638,15 @@ final class AppStore: ObservableObject {
             }
         case "notify":
             let style = ToastMessage.Style(rawValue: event["notifyType"]?.stringValue ?? "info") ?? .info
-            showToast(event["message"]?.stringValue ?? "Pi notification", style: style)
+            let message = event["message"]?.stringValue ?? "Pi notification"
+            // Only actionable notices interrupt the user as a toast (a warning or an error).
+            // Purely informational extension chatter — "Ponytail loaded: full" and the like — is
+            // routed to the same bounded event log the inspector already shows instead.
+            if style == .info {
+                logExtensionNotice(message)
+            } else {
+                showToast(message, style: style)
+            }
         case "setStatus":
             guard let key = event["statusKey"]?.stringValue else { return }
             // Extension footers are ANSI-coloured for the TUI; the desktop stores plain text.
@@ -1482,6 +1668,14 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Informational extension chatter is never a toast (see the "notify" case above); it still
+    /// needs to be visible somewhere for debugging, so it shares the inspector's bounded event
+    /// log rather than being silently dropped.
+    private func logExtensionNotice(_ message: String) {
+        unknownRPCEvents.append("[notify] \(message)")
+        if unknownRPCEvents.count > 30 { unknownRPCEvents.removeFirst(unknownRPCEvents.count - 30) }
+    }
+
     private func handleRuntimeExit(_ error: String?) {
         clearExtensionDialogs()
         runtimeState.isConnected = false
@@ -1491,7 +1685,26 @@ final class AppStore: ObservableObject {
         activeCapability = nil
         pendingQuestionnaire = nil
         composerOptionsLoading = false
-        if let error { runtimeState.lastError = error; showToast(error, style: .error) }
+        guard let error else { return }
+
+        // A "prompt" whose outcome was never resolved is handled specially: Pi may already have
+        // accepted the message before dying, so this hands it back for a one-click resend rather
+        // than silently losing it (the `DraftRecovery` intent). `dispatchMessage`'s own
+        // completion always runs first for the very same crash — this fires from `onExit`, which
+        // is queued after `rejectPending` has already delivered to every pending callback — and
+        // only ever leaves `activeTurnPrompt` set when it could not tell whether Pi had received
+        // the message. So this is the single place that ever acts on it, and only once: a crash
+        // can never restore the same text into the draft twice.
+        if let pending = activeTurnPrompt {
+            activeTurnPrompt = nil
+            let restored = restoreDraft(text: pending.text, attachments: pending.attachments, origin: pending.origin)
+            let message = failureMessage(error, restored: restored, origin: pending.origin)
+            runtimeState.lastError = message
+            showToast(message, style: .error)
+        } else {
+            runtimeState.lastError = error
+            showToast(error, style: .error)
+        }
     }
 
     private func upsertMessage(_ message: ChatMessage) {
@@ -1594,6 +1807,7 @@ final class AppStore: ObservableObject {
     deinit {
         gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
+        prefetchTask?.cancel()
         probeRuntime?.stop(); runtime.stop()
     }
 }

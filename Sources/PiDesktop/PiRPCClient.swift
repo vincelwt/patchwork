@@ -175,7 +175,7 @@ final class PiRPCClient: PiRuntimeProtocol {
                         ? nil
                         : "Pi exited with status \(process.terminationStatus).\(detail.isEmpty ? "" : " \(detail)")"
                     currentGeneration.invalidate()
-                    self.rejectPending(with: PiRPCError.processExited(message ?? "Pi exited."))
+                    self.rejectPending(processExitMessage: message ?? "Pi exited.")
                     self.cleanupHandles()
                     self.process = nil
                     DispatchQueue.main.async { [weak self] in self?.onExit?(message) }
@@ -194,7 +194,7 @@ final class PiRPCClient: PiRuntimeProtocol {
             generation.invalidate()
             generationSequence += 1
             generation = RuntimeGeneration(sequence: generationSequence)
-            rejectPending(with: PiRPCError.processExited("Pi was stopped."))
+            rejectPending(processExitMessage: "Pi was stopped.")
             cleanupHandles()
             let dying = process
             process = nil
@@ -319,10 +319,17 @@ final class PiRPCClient: PiRuntimeProtocol {
         }
     }
 
-    /// Terminal rejections are always delivered so every caller completes exactly once,
-    /// even when its generation has just been retired.
-    private func rejectPending(with error: Error) {
-        for callback in pending.drainAll() {
+    /// Terminal rejections are always delivered so every caller completes exactly once, even
+    /// when its generation has just been retired. A command that may already have taken effect
+    /// is reported as outcome-unknown rather than a definite failure — exactly like its RPC
+    /// timeout counterpart (`RPCTimeoutPolicy`) — because the process is gone but Pi may have
+    /// durably accepted the command before it died. Only the read-only state queries, which
+    /// have no side effect to protect, are reported as a definite failure.
+    private func rejectPending(processExitMessage: String) {
+        for (command, callback) in pending.drainAll() {
+            let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
+                ? PiRPCError.processExited(processExitMessage)
+                : PiRPCError.outcomeUnknown(command)
             DispatchQueue.main.async { callback(.failure(error)) }
         }
     }

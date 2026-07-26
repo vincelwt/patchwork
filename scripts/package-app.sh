@@ -19,6 +19,10 @@ chmod +x "$APP/Contents/MacOS/PiDesktop"
 swift scripts/make-icon.swift
 cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
+# Source of truth for the activity-heartbeat extension the app installs into
+# ~/.pi/agent/extensions/; see ActivityExtensionInstaller.swift.
+cp "$ROOT/Resources/pi-desktop-activity.ts" "$APP/Contents/Resources/pi-desktop-activity.ts"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

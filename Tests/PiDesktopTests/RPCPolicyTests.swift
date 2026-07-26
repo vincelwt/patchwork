@@ -83,12 +83,22 @@ final class RPCPendingRegistryTests: XCTestCase {
         for index in 0..<3 {
             registry.register(id: "desktop-1-\(index)", command: "prompt", generation: generation) { _ in count += 1 }
         }
-        let callbacks = registry.drainAll()
-        XCTAssertEqual(callbacks.count, 3)
+        let drained = registry.drainAll()
+        XCTAssertEqual(drained.count, 3)
         XCTAssertEqual(registry.count, 0)
-        for callback in callbacks { callback(.failure(PiRPCError.processExited("stopped"))) }
+        for (_, callback) in drained { callback(.failure(PiRPCError.processExited("stopped"))) }
         XCTAssertEqual(count, 3)
         XCTAssertTrue(registry.drainAll().isEmpty, "A second drain must not re-deliver")
+    }
+
+    func testDrainAllReturnsTheCommandEachCallbackWasRegisteredFor() {
+        let registry = RPCPendingRegistry()
+        let generation = RuntimeGeneration(sequence: 1)
+        registry.register(id: "desktop-1-1", command: "get_state", generation: generation) { _ in }
+        registry.register(id: "desktop-1-2", command: "prompt", generation: generation) { _ in }
+
+        let commands = Set(registry.drainAll().map(\.command))
+        XCTAssertEqual(commands, ["get_state", "prompt"])
     }
 }
 
@@ -163,6 +173,52 @@ final class PiRPCClientProcessTests: XCTestCase {
         // Request IDs carry the runtime generation, so a stale ID can never alias a live one.
         XCTAssertEqual(id.split(separator: "-").count, 3, "IDs are desktop-<generation>-<counter>")
         XCTAssertNotEqual(id, "desktop-1-1", "The replacement runs in a later generation")
+    }
+
+    func testStoppingWhileASideEffectingCommandIsPendingIsOutcomeUnknown() throws {
+        // Stopped before the fake process can answer: models a crash/stop while a "prompt" is in
+        // flight. The pending completion must not be reported as a definite failure, because Pi
+        // may already have durably accepted the message — exactly the ambiguity that must never
+        // be resolved by silently assuming "safe to resend". Reuses the same slow-echo fixture
+        // and stop-while-pending shape as `testStoppedRuntimeNeverPublishesIntoItsReplacement`
+        // above, which is already proven stable under the full suite.
+        let client = self.client(script: Self.slowEchoScript)
+        try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
+
+        var outcome: Result<JSONValue, Error>?
+        let completed = expectation(description: "prompt settles")
+        client.send(type: "prompt", payload: ["message": .string("hi")]) { result in
+            outcome = result
+            completed.fulfill()
+        }
+        client.stop()
+        wait(for: [completed], timeout: 5)
+
+        guard case let .failure(error) = try XCTUnwrap(outcome) else {
+            return XCTFail("A stopped runtime must not report success for an unconfirmed prompt")
+        }
+        XCTAssertTrue(RPCFailureHandling.isOutcomeUnknown(error), "Pi may have already accepted the prompt before the client gave up")
+    }
+
+    func testStoppingWhileAStateQueryIsPendingIsAnAuthoritativeFailure() throws {
+        // A read-only query has no side effect to protect, so its death is a definite failure —
+        // unlike a side-effecting command such as "prompt".
+        let client = self.client(script: Self.slowEchoScript)
+        try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
+
+        var outcome: Result<JSONValue, Error>?
+        let completed = expectation(description: "get_state settles")
+        client.send(type: "get_state", payload: [:]) { result in
+            outcome = result
+            completed.fulfill()
+        }
+        client.stop()
+        wait(for: [completed], timeout: 5)
+
+        guard case let .failure(error) = try XCTUnwrap(outcome) else {
+            return XCTFail("A dead process must not report success")
+        }
+        XCTAssertFalse(RPCFailureHandling.isOutcomeUnknown(error), "A read-only query has no side effect to protect")
     }
 
     func testReapEscalatesToKillForAProcessThatIgnoresSIGTERM() throws {

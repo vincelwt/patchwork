@@ -199,6 +199,105 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertEqual(spy.presented.count, 1, "A repeat idle snapshot without a new transition must not notify again")
     }
 
+    // MARK: - Task 5: notification body shows Pi's actual answer
+
+    func testTurnFinishedBodyShowsTheBeginningOfPisActualAnswerNotAGenericPhrase() {
+        let (store, runtime, spy, session) = makeStore(isActive: false)
+        attachRuntime(store, runtime: runtime, to: session)
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object(["role": .string("assistant"), "content": .string("The fix is in PaymentService.swift, line 42.")])
+        ]))
+        // Backgrounded (isActive: false) already means `notify` never suppresses on focus, so
+        // the session stays selected here — unlike the other tests in this file, `messages` must
+        // still hold the assistant reply when `agent_settled` reads it for the preview.
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(spy.presented.count, 1)
+        XCTAssertTrue(
+            spy.presented.first!.body.contains("The fix is in PaymentService.swift"),
+            "Body: \(spy.presented.first!.body)"
+        )
+    }
+
+    func testTurnFinishedBodyFallsBackToTheGenericPhraseWithNoAnswerText() {
+        let (store, runtime, spy, session) = makeStore(isActive: false)
+        attachRuntime(store, runtime: runtime, to: session)
+        store.openNewChat()
+
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(spy.presented.count, 1)
+        XCTAssertTrue(spy.presented.first!.body.contains("finished"))
+    }
+
+    func testCrossTerminalTurnFinishedUsesTheHeartbeatPreviewWhenOneIsAvailable() async throws {
+        let runtime = FakeRuntime()
+        let spy = SpyNotificationPresenter()
+        let heartbeatDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        let store = AppStore(
+            repository: FakeRepository(),
+            gitService: FakeGitService(),
+            runtime: runtime,
+            persistence: AppPersistence(baseURL: directory),
+            activityPresenter: ActivityPresenter(),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: heartbeatDirectory),
+            notificationService: spy,
+            isActiveOverride: false
+        )
+        let file = directory.appendingPathComponent("cross-terminal.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: file)
+        var session = SessionSummary(
+            id: "cross", fileURL: file, cwd: directory, createdAt: Date(), modifiedAt: Date(),
+            name: "Cross-terminal", preview: "preview", messageCount: 0, metrics: TokenMetrics()
+        )
+        session.prepareSearchKey()
+        store.sessions = [session]
+        store.activityMonitor.setTrackedPaths([file.path])
+
+        try Data("""
+        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))"}
+        """.utf8).write(to: heartbeatDirectory.appendingPathComponent("cross.json"))
+        store.activityMonitor.tickNow()
+        try await waitUntil { store.activityMonitor.activity(forPath: file.path)?.state == .running }
+
+        try Data("""
+        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"Done: renamed the export helper."}
+        """.utf8).write(to: heartbeatDirectory.appendingPathComponent("cross.json"))
+        store.activityMonitor.tickNow()
+        try await waitUntil { !spy.presented.isEmpty }
+
+        XCTAssertTrue(spy.presented.first!.body.contains("Done: renamed the export helper"), "Body: \(spy.presented.first!.body)")
+    }
+
+    // MARK: - Task 5: only actionable extension notices become a toast
+
+    func testInformationalExtensionNoticeIsLoggedNotToasted() {
+        let (store, runtime, spy, session) = makeStore(isActive: true)
+        attachRuntime(store, runtime: runtime, to: session)
+
+        runtime.onEvent?(.object([
+            "type": .string("extension_ui_request"), "method": .string("notify"),
+            "notifyType": .string("info"), "message": .string("Ponytail loaded: full")
+        ]))
+
+        XCTAssertNil(store.toast, "Purely informational extension chatter must never interrupt as a toast")
+        XCTAssertTrue(spy.presented.isEmpty)
+        XCTAssertEqual(store.unknownRPCEvents.last, "[notify] Ponytail loaded: full")
+    }
+
+    func testWarningOrErrorExtensionNoticeStillShowsAToast() {
+        let (store, runtime, _, session) = makeStore(isActive: true)
+        attachRuntime(store, runtime: runtime, to: session)
+
+        runtime.onEvent?(.object([
+            "type": .string("extension_ui_request"), "method": .string("notify"),
+            "notifyType": .string("error"), "message": .string("Extension X crashed")
+        ]))
+
+        XCTAssertEqual(store.toast?.text, "Extension X crashed")
+        XCTAssertEqual(store.toast?.style, .error)
+    }
+
     func testQuestionWaitingNotifiesWhenBackgrounded() {
         let (store, runtime, spy, session) = makeStore(isActive: false)
         attachRuntime(store, runtime: runtime, to: session)

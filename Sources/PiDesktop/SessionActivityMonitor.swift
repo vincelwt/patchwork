@@ -17,10 +17,16 @@ struct SessionActivity: Equatable, Sendable {
     /// The last entry's assistant stop reason, when known. Lets a notification distinguish a
     /// clean finish from an error/abort without re-reading the file.
     var lastStopReason: String?
+    /// A short bounded preview of the last assistant text, when a heartbeat supplied one. Used
+    /// only to enrich a cross-terminal "turn finished" notification; never re-derived by reading
+    /// the whole file.
+    var preview: String?
 }
 
-/// Pure classification of a session's liveness. Sessions started in any terminal are detected
-/// from their JSONL file alone: mtime age plus the last complete entry.
+/// Pure classification of a session's liveness from its JSONL file alone (mtime plus the last
+/// complete entry), used only as a fallback for sessions with no activity heartbeat: an older
+/// session, or one running under a Pi build without the `pi-desktop-activity` extension
+/// installed yet.
 enum SessionActivityClassifier {
     /// A write this recent means Pi is mid-turn, unless the entry itself already says the turn
     /// is over.
@@ -116,24 +122,30 @@ enum SessionActivityClassifier {
             lastStopReason: stopReason(ofLastEntry: entry)
         )
     }
-
-    /// Cross-checks the file heuristic against live `pi` processes: a session can only be
-    /// running if something is actually alive in its working directory. `liveCwds == nil` means
-    /// process inspection is unavailable entirely (no `ps`, sandboxed, every attempt failed) —
-    /// the file heuristic alone decides rather than every session silently going idle.
-    static func resolvedState(fileState: SessionRunState, cwd: String, liveCwds: Set<String>?) -> SessionRunState {
-        guard fileState == .running else { return fileState }
-        guard let liveCwds else { return .running }
-        return liveCwds.contains(cwd) ? .running : .idle
-    }
 }
 
 /// Stat-then-tail activity monitor for every discovered session file. Sessions running in any
 /// terminal drive the sidebar spinner, live modification times, and the menu bar list.
 ///
+/// Run state has two independent sources, resolved fresh every tick:
+///  1. **Activity heartbeats** (`ActivityHeartbeatStore`) — authoritative when present: a
+///     session whose Pi process has the `pi-desktop-activity` extension loaded writes its own
+///     running/idle state, so this needs no guessing at all.
+///  2. **The file heuristic** above — the fallback for sessions with no heartbeat (extension not
+///     installed yet, or an older/ephemeral session).
+///
+/// A session only ever uses one source at a time; there is no second signal layered on top to
+/// second-guess the first (that cross-check — matching live `pi` processes by working directory
+/// — was the previous design and is exactly what caused sessions to flicker between running and
+/// idle: process matching does not work at all against Pi's process title, and cwd matching is
+/// wrong regardless since several sessions can share one directory). When neither source can
+/// produce a confident verdict, the previous resolved state is kept rather than guessing
+/// (`.unknown` is sticky), so a momentary gap in the data can never look like a flip.
+///
 /// Cost control: one shared 2s timer that only runs while the app is active, `stat` for every
-/// tracked path, and a bounded tail read only for files whose fingerprint changed and whose
-/// mtime is recent. Nothing is ever re-read in full and no timer is created per row.
+/// tracked path, one heartbeat-directory scan per tick, and a bounded tail read only for files
+/// whose fingerprint changed and whose mtime is recent. Nothing is ever re-read in full and no
+/// timer is created per row.
 @MainActor
 final class SessionActivityMonitor: ObservableObject {
     @Published private(set) var activities: [String: SessionActivity] = [:]
@@ -148,22 +160,25 @@ final class SessionActivityMonitor: ObservableObject {
     }
 
     private var trackedPaths: [String] = []
-    /// Optional cwd per tracked path, used only for the live-process cross-check. Paths absent
-    /// here (including every caller that never registers one) simply skip the cross-check and
-    /// keep the file-only verdict, exactly as before that check existed.
-    private var cwdByPath: [String: String] = [:]
     private var fingerprints: [String: Fingerprint] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
     private var cancellables: Set<AnyCancellable> = []
     private let isActiveOverride: Bool?
-    private let processInspector: PiProcessInspector
+    private let heartbeatDirectory: URL
+    private let isProcessAlive: @Sendable (Int32) -> Bool
 
     /// `isActiveOverride` keeps the monitor deterministic in tests without an app instance.
-    /// `processInspector` is a test seam only — production always uses the real one.
-    init(isActiveOverride: Bool? = nil, processInspector: PiProcessInspector? = nil) {
+    /// `heartbeatDirectory` and `isProcessAlive` are test seams; production always uses the real
+    /// `~/.pi/agent/desktop-activity` directory and a real `kill(pid, 0)` liveness check.
+    init(
+        isActiveOverride: Bool? = nil,
+        heartbeatDirectory: URL = ActivityHeartbeatStore.defaultDirectory(),
+        isProcessAlive: @escaping @Sendable (Int32) -> Bool = { ActivityHeartbeatClassifier.isProcessAlive(pid: $0) }
+    ) {
         self.isActiveOverride = isActiveOverride
-        self.processInspector = processInspector ?? PiProcessInspector()
+        self.heartbeatDirectory = heartbeatDirectory
+        self.isProcessAlive = isProcessAlive
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in self?.tickNow() }
             .store(in: &cancellables)
@@ -179,14 +194,6 @@ final class SessionActivityMonitor: ObservableObject {
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
         tickNow()
-    }
-
-    /// Session cwd is used only to cross-check against live `pi` processes; call this alongside
-    /// `setTrackedPaths` whenever the caller wants that verification. Sessions live in
-    /// `~/.pi/agent/sessions/<encoded-cwd>/`, and each tracked path's cwd comes from its
-    /// `SessionSummary`.
-    func setSessionCwds(_ cwds: [String: String]) {
-        cwdByPath = cwds
     }
 
     func start() {
@@ -217,25 +224,18 @@ final class SessionActivityMonitor: ObservableObject {
         defer { tickInFlight = false }
 
         let paths = trackedPaths
-        let cwds = cwdByPath
-        // Only ever spawns `ps`/`lsof` when at least one tracked session actually registered a
-        // cwd; a monitor used purely for the file heuristic (or in tests) never shells out.
-        if !cwds.isEmpty { processInspector.refreshIfNeeded() }
-        let liveCwds = cwds.isEmpty ? nil : processInspector.liveCwds
         let known = fingerprints
         let previous = activities
         let limit = Self.tailReadsPerTick
+        let heartbeatDirectory = heartbeatDirectory
+        let isProcessAlive = isProcessAlive
 
         let result = await Task.detached(priority: .utility) { () -> ([String: SessionActivity], [String: Fingerprint]) in
             let now = Date()
+            let heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
             var states: [String: SessionActivity] = [:]
             var stamps: [String: Fingerprint] = [:]
             var tailReads = 0
-
-            func crossChecked(_ fileState: SessionRunState, path: String) -> SessionRunState {
-                guard let cwd = cwds[path] else { return fileState }
-                return SessionActivityClassifier.resolvedState(fileState: fileState, cwd: cwd, liveCwds: liveCwds)
-            }
 
             for path in paths {
                 let url = URL(fileURLWithPath: path)
@@ -246,46 +246,58 @@ final class SessionActivityMonitor: ObservableObject {
                     size: Int64(values.fileSize ?? 0)
                 )
                 stamps[path] = fingerprint
-                let age = now.timeIntervalSince(modifiedAt)
 
-                // An old file is idle from its mtime alone; no read at all.
+                if let heartbeat = heartbeats[path] {
+                    // The heartbeat is authoritative on its own: running requires its own state
+                    // to say so, a fresh timestamp, and a live pid, all at once. No further
+                    // cross-check is layered on top.
+                    let running = ActivityHeartbeatClassifier.isRunning(heartbeat, now: now, isProcessAlive: isProcessAlive)
+                    let resolved: SessionRunState = running ? .running : .idle
+                    states[path] = SessionActivity(
+                        state: resolved,
+                        modifiedAt: modifiedAt,
+                        runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
+                        lastStopReason: heartbeat.stopReason ?? previous[path]?.lastStopReason,
+                        preview: heartbeat.preview ?? previous[path]?.preview
+                    )
+                    continue
+                }
+
+                // No heartbeat for this session: fall back to the file heuristic exactly as
+                // before heartbeats existed.
+                let age = now.timeIntervalSince(modifiedAt)
                 if age > SessionActivityClassifier.idleWindow {
                     states[path] = SessionActivity(state: .idle, modifiedAt: modifiedAt)
                     continue
                 }
 
                 let unchanged = known[path] == fingerprint
-                if unchanged, let cached = previous[path] {
-                    // Re-evaluate the age-based verdict without touching the file again.
-                    let state = SessionActivityClassifier.classify(
-                        lastEntry: nil,
-                        age: age
-                    )
-                    let fileState = state == .unknown ? cached.state : state
-                    let resolved = crossChecked(fileState, path: path)
-                    states[path] = SessionActivity(
-                        state: resolved,
-                        modifiedAt: modifiedAt,
-                        runningSince: resolved == .running ? (cached.runningSince ?? modifiedAt) : nil,
-                        lastStopReason: cached.lastStopReason
-                    )
-                    continue
-                }
-
-                guard tailReads < limit else {
+                let fileState: SessionRunState
+                let entry: JSONValue?
+                if unchanged {
+                    entry = nil
+                    fileState = SessionActivityClassifier.classify(lastEntry: nil, age: age)
+                } else if tailReads < limit {
+                    tailReads += 1
+                    entry = SessionActivityClassifier.readTail(at: url).flatMap(SessionActivityClassifier.lastEntry(inTail:))
+                    fileState = SessionActivityClassifier.classify(lastEntry: entry, age: age)
+                } else {
+                    // Over budget for this tick: keep the last known verdict rather than
+                    // guessing, exactly like the sticky-unknown rule below.
                     states[path] = previous[path] ?? SessionActivity(state: .unknown, modifiedAt: modifiedAt)
                     continue
                 }
-                tailReads += 1
-                let entry = SessionActivityClassifier.readTail(at: url)
-                    .flatMap(SessionActivityClassifier.lastEntry(inTail:))
-                let fileState = SessionActivityClassifier.classify(lastEntry: entry, age: age)
-                let resolved = crossChecked(fileState, path: path)
+
+                // Sticky unknown: an ambiguous read never overrides a previously known verdict,
+                // so a throttled tail read or a file mid-write can never look like a flip
+                // between running and idle.
+                let resolved = fileState == .unknown ? (previous[path]?.state ?? .unknown) : fileState
                 states[path] = SessionActivity(
                     state: resolved,
                     modifiedAt: modifiedAt,
                     runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
-                    lastStopReason: SessionActivityClassifier.stopReason(ofLastEntry: entry)
+                    lastStopReason: unchanged ? previous[path]?.lastStopReason : SessionActivityClassifier.stopReason(ofLastEntry: entry),
+                    preview: previous[path]?.preview
                 )
             }
             return (states, stamps)
