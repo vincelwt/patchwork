@@ -8,17 +8,46 @@ let package = Package(
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "PiDesktop", targets: ["PiDesktop"])
+        .executable(name: "PiDesktop", targets: ["PiDesktop"]),
+        // The headless half: a scheduler/runner daemon and its client CLI. See docs/daemon-api.md.
+        .executable(name: "pi-deskd", targets: ["PiDeskDaemon"]),
+        .executable(name: "pidesk", targets: ["PiDeskCLI"]),
+        .library(name: "PiDeskKit", targets: ["PiDeskKit"])
     ],
     targets: [
+        .target(
+            name: "PiDeskKit",
+            path: "Sources/PiDeskKit"
+        ),
         .executableTarget(
             name: "PiDesktop",
+            dependencies: ["PiDeskKit"],
             path: "Sources/PiDesktop"
+        ),
+        .executableTarget(
+            name: "PiDeskDaemon",
+            dependencies: ["PiDeskKit"],
+            path: "Sources/PiDeskDaemon"
+        ),
+        .executableTarget(
+            name: "PiDeskCLI",
+            dependencies: ["PiDeskKit"],
+            path: "Sources/PiDeskCLI"
         ),
         .testTarget(
             name: "PiDesktopTests",
             dependencies: ["PiDesktop"],
             path: "Tests/PiDesktopTests"
+        ),
+        .testTarget(
+            name: "PiDeskKitTests",
+            dependencies: ["PiDeskKit"],
+            path: "Tests/PiDeskKitTests"
+        ),
+        .testTarget(
+            name: "PiDeskDaemonTests",
+            dependencies: ["PiDeskDaemon", "PiDeskKit"],
+            path: "Tests/PiDeskDaemonTests"
         )
     ]
 )
