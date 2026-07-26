@@ -92,17 +92,18 @@ final class HTTPServer: @unchecked Sendable {
             }
             guard let request else { return } // clean close between requests
 
-            if let authFailure = checkAuthorization(request) {
-                writeResponse(fd: fd, authFailure.response, keepAlive: false)
-                return
-            }
-
-            // The remote UI's shell is static and carries no data, so it is served before the
-            // token check; every `/v1/` call it then makes is authorized normally.
+            // The remote UI's shell is static and carries no session data, so it is served
+            // before the token check — otherwise the browser could never reach the screen that
+            // asks for the token. Every `/v1/` call it then makes is authorized normally.
             if let response = Self.webAssetResponse(for: request) {
                 writeResponse(fd: fd, response, keepAlive: shouldKeepAlive(request))
                 if !shouldKeepAlive(request) { return }
                 continue
+            }
+
+            if let authFailure = checkAuthorization(request) {
+                writeResponse(fd: fd, authFailure.response, keepAlive: false)
+                return
             }
 
             if request.method == "GET", request.path == "/v1/events" {

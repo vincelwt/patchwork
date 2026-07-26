@@ -50,7 +50,13 @@ public enum SessionThreadParser {
                 case "user":
                     if firstUserText == nil, let text = plainText(from: message["content"]), !text.isEmpty { firstUserText = text }
                 case "assistant":
-                    if let text = plainText(from: message["content"]), !text.isEmpty { lastAssistantText = text }
+                    // A preview is what Pi *said*. Reasoning and tool chatter are real content
+                    // but they read as noise in a one-line summary, so prose wins when present.
+                    if let prose = plainText(from: message["content"], proseOnly: true), !prose.isEmpty {
+                        lastAssistantText = prose
+                    } else if lastAssistantText == nil, let text = plainText(from: message["content"]), !text.isEmpty {
+                        lastAssistantText = text
+                    }
                 default:
                     break
                 }
@@ -149,7 +155,7 @@ public enum SessionThreadParser {
     /// Text-only projection of a message's content: a plain string, or the `text` blocks of a
     /// content array joined by newlines, with lightweight markers for the block kinds this
     /// simplified reader does not carry (images, tool calls, thinking).
-    private static func plainText(from content: PiJSONValue?) -> String? {
+    private static func plainText(from content: PiJSONValue?, proseOnly: Bool = false) -> String? {
         guard let content else { return nil }
         if let text = content.stringValue { return bounded(text, max: blockTextLimit) }
         guard let blocks = content.arrayValue else { return nil }
@@ -160,10 +166,13 @@ public enum SessionThreadParser {
             case "text":
                 if let text = block["text"]?.stringValue, !text.isEmpty { parts.append(text) }
             case "thinking":
+                if proseOnly { break }
                 if let text = block["thinking"]?.stringValue, !text.isEmpty { parts.append("[thinking] \(text)") }
             case "image":
+                if proseOnly { break }
                 parts.append("[image]")
             case "toolCall":
+                if proseOnly { break }
                 parts.append("[tool: \(block["name"]?.stringValue ?? "unknown")]")
             default:
                 break

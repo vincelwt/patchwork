@@ -207,3 +207,42 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(parsed, files.count, "every real session file must parse without throwing")
     }
 }
+
+final class ThreadPreviewProseTests: XCTestCase {
+    func testAPreviewShowsWhatPiSaidNotItsReasoning() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-preview-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("2026-07-26T10-00-00-000Z_abc.jsonl")
+        let lines = [
+            #"{"type":"session","id":"s","cwd":"/Users/x/code","timestamp":"2026-07-26T10:00:00.000Z"}"#,
+            #"{"type":"message","id":"u","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+            #"{"type":"message","id":"a","message":{"role":"assistant","content":[{"type":"thinking","thinking":"weighing options"},{"type":"text","text":"Deployed and verified."}]}}"#
+        ]
+        try lines.joined(separator: "\n").appending("\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let thread = try SessionThreadParser.thread(at: file)
+        XCTAssertEqual(thread.preview, "Deployed and verified.")
+        XCTAssertFalse(thread.preview.contains("[thinking]"))
+    }
+
+    func testAReasoningOnlyTurnStillPreviewsSomething() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-preview-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("2026-07-26T10-00-00-000Z_def.jsonl")
+        let lines = [
+            #"{"type":"session","id":"s","cwd":"/Users/x/code","timestamp":"2026-07-26T10:00:00.000Z"}"#,
+            #"{"type":"message","id":"u","message":{"role":"user","content":[{"type":"text","text":"do it"}]}}"#,
+            #"{"type":"message","id":"a","message":{"role":"assistant","content":[{"type":"thinking","thinking":"still working"}]}}"#
+        ]
+        try lines.joined(separator: "\n").appending("\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let thread = try SessionThreadParser.thread(at: file)
+        XCTAssertFalse(thread.preview.isEmpty, "a mid-turn thread must still preview something")
+    }
+}
