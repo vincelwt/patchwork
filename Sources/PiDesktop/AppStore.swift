@@ -566,8 +566,7 @@ final class AppStore: ObservableObject {
         let tail = try await repository.loadConversationTail(from: session.fileURL, limit: Self.tailPreviewMessageLimit)
         try Task.checkCancellation()
         guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
-        messages = tail.conversation.messages
-        activities = activityPresenter.activities(from: tail.conversation.messages)
+        replaceLoadedMessages(with: tail.conversation.messages)
         isConversationLoading = false
 
         if tail.isComplete {
@@ -579,8 +578,7 @@ final class AppStore: ObservableObject {
         let full = try await cachedOrFreshConversation(for: session.fileURL)
         try Task.checkCancellation()
         guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
-        messages = full.messages
-        activities = activityPresenter.activities(from: full.messages)
+        replaceLoadedMessages(with: full.messages)
         await refreshGit(for: session.cwd)
     }
 
@@ -770,6 +768,17 @@ final class AppStore: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func optimisticMessage(text: String, attachments: [ImageAttachment]) -> ChatMessage {
+        ChatMessage(
+            id: "local-\(UUID().uuidString)", role: .user,
+            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))] + attachments.map {
+                let image = ImagePayload(id: $0.id.uuidString, data: $0.data, mimeType: $0.mimeType, fileName: $0.fileName)
+                return MessageBlock(id: image.id, kind: .image(image))
+            },
+            timestamp: Date(), raw: .null
+        )
+    }
+
     func submitDraft(delivery: DeliveryMode = .automatic) {
         let text = Self.sanitizedMessage(draft)
         guard !text.isEmpty || !attachments.isEmpty else { return }
@@ -789,6 +798,14 @@ final class AppStore: ObservableObject {
         let sentText = draft
         let sentAttachments = attachments
         let origin = DraftOrigin(route: route, sessionPath: sessionPath?.standardizedFileURL.path)
+        let optimisticID: String?
+        if delivery == .automatic, !runtimeState.isStreaming {
+            let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
+            optimisticID = message.id
+            messages.append(message)
+        } else {
+            optimisticID = nil
+        }
         draft = ""
         attachments = []
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
@@ -796,8 +813,9 @@ final class AppStore: ObservableObject {
             switch result {
             case .success:
                 dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
-                                delivery: delivery, cwd: cwd)
+                                delivery: delivery, cwd: cwd, optimisticID: optimisticID)
             case let .failure(error):
+                if let optimisticID { messages.removeAll { $0.id == optimisticID } }
                 let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
                 showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
             }
@@ -1369,7 +1387,8 @@ final class AppStore: ObservableObject {
         originalDraft: String,
         attachments sentAttachments: [ImageAttachment],
         delivery: DeliveryMode,
-        cwd: URL
+        cwd: URL,
+        optimisticID: String?
     ) {
         let command: String
         switch delivery {
@@ -1382,19 +1401,7 @@ final class AppStore: ObservableObject {
         // A new chat is promoted to a session route in place, and that is still the same
         // composer, so the origin follows the promotion instead of being treated as a switch.
         let origin = DraftOrigin(route: route, sessionPath: selectedSession?.fileURL.standardizedFileURL.path)
-        var optimisticID: String?
-        if case .session = route, command == "prompt" {
-            let id = "local-\(UUID().uuidString)"
-            optimisticID = id
-            messages.append(ChatMessage(
-                id: id, role: .user,
-                blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))] + sentAttachments.map {
-                    let image = ImagePayload(id: $0.id.uuidString, data: $0.data, mimeType: $0.mimeType, fileName: $0.fileName)
-                    return MessageBlock(id: image.id, kind: .image(image))
-                },
-                timestamp: Date(), raw: .null
-            ))
-        }
+        if command != "prompt", let optimisticID { messages.removeAll { $0.id == optimisticID } }
         // The message that starts a turn is the one a crash mid-turn must be able to hand back
         // for a one-click retry; see `PendingUserTurn` and `handleRuntimeExit`.
         if command == "prompt" {
@@ -1467,8 +1474,23 @@ final class AppStore: ObservableObject {
         route = .session(sessionID)
         activeRuntimePath = url.standardizedFileURL.path
         activeRuntimeStartedForNewChat = false
-        messages = []
         activities = []
+    }
+
+    /// Async history loads must not erase a message already painted at Send time.
+    private func replaceLoadedMessages(with loaded: [ChatMessage]) {
+        let optimistic = messages.filter { $0.id.hasPrefix("local-") }
+        messages = loaded + optimistic.filter { local in
+            !loaded.contains { candidate in
+                guard candidate.role == .user,
+                      candidate.textContent == local.textContent,
+                      candidate.images.count == local.images.count,
+                      let candidateTime = candidate.timestamp,
+                      let localTime = local.timestamp else { return false }
+                return candidateTime >= localTime.addingTimeInterval(-0.01)
+            }
+        }
+        activities = activityPresenter.activities(from: messages)
     }
 
     private func hydrateRuntimeConversationIfNeeded() {
@@ -1476,7 +1498,7 @@ final class AppStore: ObservableObject {
         runtime.send(type: "get_messages", payload: [:]) { [weak self] result in
             guard let self, case let .success(response) = result, responseError(response) == nil else { return }
             let loaded = SessionParser.chatMessages(fromRPCMessages: response["data"]?["messages"])
-            if !loaded.isEmpty { messages = loaded; activities = activityPresenter.activities(from: loaded) }
+            if !loaded.isEmpty { replaceLoadedMessages(with: loaded) }
         }
     }
 

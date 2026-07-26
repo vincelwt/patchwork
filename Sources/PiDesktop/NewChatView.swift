@@ -6,13 +6,21 @@ struct NewChatView: View {
 
     var body: some View {
         VStack(spacing: PiTheme.space6) {
-            Spacer()
-            Text("Start a conversation")
-                .font(PiFont.displayTitle)
-            Text("Pi will work in the folder you choose.")
-                .font(PiFont.body)
-                .foregroundStyle(.secondary)
-            Spacer()
+            if store.messages.isEmpty {
+                Spacer()
+                Text("Start a conversation")
+                    .font(PiFont.displayTitle)
+                Text("Pi will work in the folder you choose.")
+                    .font(PiFont.body)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            } else {
+                MessageScrollView(
+                    messages: store.messages,
+                    streaming: store.streamingMessage,
+                    isRunning: true
+                )
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.piTranscript)

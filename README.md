@@ -17,6 +17,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Recent conversations and the sidebar neighbours of the one you have open are prefetched into a bounded in-memory cache, so reopening them is instant instead of re-parsing
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
+- Messages appear in the transcript immediately on Send, while Pi RPC startup and history hydration continue in the background
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
