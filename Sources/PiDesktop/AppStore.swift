@@ -854,6 +854,11 @@ final class AppStore: ObservableObject {
     }
 
     private func ensureRuntime(cwd: URL, sessionPath: URL?, completion: @escaping (Result<Void, Error>) -> Void) {
+        // The launch-time status probe is intentionally ephemeral. Never let it race a real
+        // route runtime: simultaneous Pi extension startup can delay the route's first get_state
+        // long enough to make model/thinking controls appear unavailable in GUI launches.
+        if probeRuntime != nil { finishProbe() }
+
         let requestedPath = sessionPath?.standardizedFileURL.path
         let matches = runtime.isRunning && ((requestedPath != nil && activeRuntimePath == requestedPath) ||
             (requestedPath == nil && activeRuntimeStartedForNewChat

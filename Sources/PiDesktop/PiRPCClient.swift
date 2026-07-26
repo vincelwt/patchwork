@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 protocol PiRuntimeProtocol: AnyObject {
@@ -59,7 +60,11 @@ enum PiLocator {
             .first { manager.isExecutableFile(atPath: $0.path) }
     }
 
-    static func augmentedEnvironment(piURL: URL, base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+    static func augmentedEnvironment(
+        piURL: URL,
+        cwd: URL? = nil,
+        base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
         var environment = base
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let additions = [
@@ -74,6 +79,10 @@ enum PiLocator {
         ]
         let existing = environment["PATH"]?.split(separator: ":").map(String.init) ?? []
         environment["PATH"] = Array(NSOrderedSet(array: additions + existing)).compactMap { $0 as? String }.joined(separator: ":")
+        // LaunchServices normally gives GUI apps PWD="/". Process.currentDirectoryURL changes
+        // the actual cwd but not this environment value, and Pi extensions commonly consult PWD
+        // for project discovery. Keep both views of the working directory identical.
+        if let cwd { environment["PWD"] = cwd.standardizedFileURL.path }
         return environment
     }
 }
@@ -83,6 +92,10 @@ final class PiRPCClient: PiRuntimeProtocol {
     var onExit: ((String?) -> Void)?
 
     private let ioQueue = DispatchQueue(label: "dev.pi.desktop.rpc", qos: .userInitiated)
+    /// Blocking pipe reads live off the command/state queue. Unlike FileHandle readability
+    /// handlers, these do not depend on a GUI app run loop and consume no CPU while idle.
+    private let outputQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stdout", qos: .userInitiated)
+    private let errorQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stderr", qos: .utility)
     private var process: Process?
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
@@ -144,7 +157,7 @@ final class PiRPCClient: PiRuntimeProtocol {
             arguments += additionalArguments
             process.arguments = arguments
             process.currentDirectoryURL = cwd
-            process.environment = PiLocator.augmentedEnvironment(piURL: piURL, base: baseEnvironment)
+            process.environment = PiLocator.augmentedEnvironment(piURL: piURL, cwd: cwd, base: baseEnvironment)
             process.standardInput = input
             process.standardOutput = output
             process.standardError = error
@@ -154,28 +167,6 @@ final class PiRPCClient: PiRuntimeProtocol {
             errorHandle = error.fileHandleForReading
             self.process = process
 
-            output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self?.ioQueue.async { self?.consume(data, generation: currentGeneration) }
-            }
-            error.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self?.ioQueue.async {
-                    guard let self else { return }
-                    self.stderr.append(String(decoding: data, as: UTF8.self))
-                    if self.stderr.count > 65_536 {
-                        self.stderr.removeFirst(self.stderr.count - 65_536)
-                    }
-                }
-            }
             process.terminationHandler = { [weak self] process in
                 self?.ioQueue.async {
                     guard let self, self.generation === currentGeneration, currentGeneration.isValid else { return }
@@ -192,6 +183,8 @@ final class PiRPCClient: PiRuntimeProtocol {
             }
 
             try process.run()
+            startOutputReader(output.fileHandleForReading, generation: currentGeneration)
+            startErrorReader(error.fileHandleForReading, generation: currentGeneration)
         }
     }
 
@@ -257,6 +250,48 @@ final class PiRPCClient: PiRuntimeProtocol {
         ioQueue.async { [weak self] in
             guard let input = self?.inputHandle, self?.process?.isRunning == true else { return }
             try? input.write(contentsOf: value.encodedLine())
+        }
+    }
+
+    private func startOutputReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
+        outputQueue.async { [weak self] in
+            while currentGeneration.isValid {
+                guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 64 * 1024) else { return }
+                self?.ioQueue.async { [weak self] in
+                    self?.consume(data, generation: currentGeneration)
+                }
+            }
+        }
+    }
+
+    private func startErrorReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
+        errorQueue.async { [weak self] in
+            while currentGeneration.isValid {
+                guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 16 * 1024) else { return }
+                self?.ioQueue.async { [weak self] in
+                    guard let self, currentGeneration.isValid, generation === currentGeneration else { return }
+                    stderr.append(String(decoding: data, as: UTF8.self))
+                    if stderr.count > 65_536 {
+                        stderr.removeFirst(stderr.count - 65_536)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `FileHandle.read(upToCount:)` may return immediately with no bytes for a pipe. POSIX read
+    /// has the semantics this transport needs: block the dedicated reader thread until data,
+    /// EOF, or handle closure, retrying only an interrupted system call.
+    private static func blockingRead(from descriptor: Int32, maximumBytes: Int) -> Data? {
+        var bytes = [UInt8](repeating: 0, count: maximumBytes)
+        while true {
+            let count = bytes.withUnsafeMutableBytes { buffer in
+                Darwin.read(descriptor, buffer.baseAddress, maximumBytes)
+            }
+            if count > 0 { return Data(bytes.prefix(count)) }
+            if count == 0 { return nil }
+            if errno == EINTR { continue }
+            return nil
         }
     }
 

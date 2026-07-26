@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 @main
@@ -6,6 +7,12 @@ struct PiDesktopApp: App {
     @StateObject private var store = AppStore(
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
+
+    init() {
+        // LaunchServices starts GUI apps with cwd="/". Keep the host process on a readable,
+        // ordinary directory before any SwiftUI task launches Pi or a Git subprocess.
+        _ = FileManager.default.changeCurrentDirectoryPath(FileManager.default.homeDirectoryForCurrentUser.path)
+    }
 
     var body: some Scene {
         WindowGroup("Pi Desktop") {

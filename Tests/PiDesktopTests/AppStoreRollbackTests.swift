@@ -242,6 +242,31 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(runtime.uncorrelated.count, 1, "A stale dialog ID must never reach the replacement")
     }
 
+    func testRouteRuntimeStopsTheEphemeralStatusProbeBeforeStarting() {
+        let runtime = FakeRuntime()
+        let probe = FakeRuntime()
+        let store = AppStore(
+            repository: FakeRepository(),
+            gitService: FakeGitService(),
+            runtime: runtime,
+            persistence: AppPersistence(baseURL: temporaryDirectory),
+            activityPresenter: ActivityPresenter(),
+            probeRuntimeFactory: { probe }
+        )
+
+        store.refreshExtensionStatuses()
+        XCTAssertTrue(probe.isRunning)
+        XCTAssertEqual(probe.startCount, 1)
+
+        store.selectedFolder = temporaryDirectory
+        store.prepareComposerOptions()
+
+        XCTAssertFalse(probe.isRunning)
+        XCTAssertEqual(probe.stopCount, 1, "A real route runtime must not race the launch probe")
+        XCTAssertTrue(runtime.isRunning)
+        XCTAssertEqual(runtime.startCount, 1)
+    }
+
     func testRuntimeExitClearsPendingDialogs() async throws {
         let (store, runtime, sessionA, _) = makeStore()
         store.selectSession(sessionA)

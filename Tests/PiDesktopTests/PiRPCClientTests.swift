@@ -3,6 +3,18 @@ import XCTest
 @testable import PiDesktop
 
 final class PiRPCClientTests: XCTestCase {
+    func testChildEnvironmentPinsPWDToTheSelectedWorkingDirectory() {
+        let cwd = URL(fileURLWithPath: "/tmp/Pi Desktop Project", isDirectory: true)
+        let environment = PiLocator.augmentedEnvironment(
+            piURL: URL(fileURLWithPath: "/opt/pi/bin/pi"),
+            cwd: cwd,
+            base: ["HOME": "/tmp/home", "PWD": "/", "PATH": "/usr/bin"]
+        )
+
+        XCTAssertEqual(environment["PWD"], cwd.standardizedFileURL.path)
+        XCTAssertTrue(environment["PATH"]?.hasPrefix("/opt/pi/bin:") == true)
+    }
+
     func testInstalledPiReturnsAvailableModelsWithoutProviderCall() throws {
         guard let piURL = PiLocator.resolve() else {
             throw XCTSkip("Pi CLI is not installed")
