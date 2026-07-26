@@ -41,11 +41,6 @@ struct MessageView: View {
                 }
             }
             blockList(showThinking: true)
-            if isStreaming {
-                PiGridProgressRow {
-                    Text("Pi is working").font(PiFont.caption).foregroundStyle(.tertiary)
-                }
-            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
@@ -62,13 +57,7 @@ struct MessageView: View {
                 ConversationImage(image: image, onOpen: { onImage(image) })
             case let .thinking(text):
                 if showThinking, !text.isEmpty {
-                    DisclosureRow(symbol: "sparkle", title: "Thinking") {
-                        Text(MarkdownInline.plain(text, size: PiFont.bodySize - 1))
-                            .lineSpacing(PiFont.bodyLineSpacing)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    ThinkingBlockView(text: text, streaming: isStreaming)
                 }
             case let .toolCall(call):
                 ToolCallRow(call: call)
@@ -83,6 +72,29 @@ struct MessageView: View {
     private var timestampHelp: String {
         guard let date = message.timestamp else { return message.role == .user ? "You" : "Pi" }
         return date.formatted(date: .abbreviated, time: .standard)
+    }
+}
+
+/// Pi's terminal renders thinking as visible muted Markdown unless the user explicitly hides it.
+/// Desktop follows that default instead of reducing the reasoning to an empty disclosure label.
+private struct ThinkingBlockView: View {
+    let text: String
+    let streaming: Bool
+
+    var body: some View {
+        PiGridRow(symbol: "sparkles", tint: .secondary) {
+            MarkdownBlockView(
+                text: text,
+                streaming: streaming,
+                size: PiFont.bodySize - 1,
+                fillWidth: true
+            )
+            .foregroundStyle(.secondary)
+            .opacity(0.84)
+        }
+        .textSelection(.enabled)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Thinking")
     }
 }
 
@@ -184,7 +196,8 @@ struct TranscriptActivityGroupView: View {
             titleTint: group.hasFailure ? Color.piRed : .secondary,
             trailing: group.progressText,
             symbolTint: group.hasFailure ? Color.piRed : .secondary,
-            showsProgress: group.isActive && !group.hasFailure,
+            // The one canonical live spinner is always the last transcript row.
+            showsProgress: false,
             initiallyExpanded: group.shouldStartExpanded,
             collapseSignal: !group.isActive
         ) {

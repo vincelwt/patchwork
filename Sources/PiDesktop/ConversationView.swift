@@ -52,6 +52,15 @@ struct ConversationView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PiTheme.space6) {
+                    if conversationIsRunning {
+                        PiGridProgressRow {
+                            Text(liveIndicatorText)
+                                .font(PiFont.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(liveIndicatorText)
+                    }
                     if let error = store.runtimeState.lastError, store.isSelectedRuntime { InlineError(text: error) }
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
@@ -67,11 +76,22 @@ struct ConversationView: View {
                 }
                 .frame(maxWidth: PiTheme.composerMaxWidth)
                 .padding(.horizontal, PiTheme.space20)
-                .padding(.top, PiTheme.space8)
-                .padding(.bottom, PiTheme.space16)
+                .padding(.top, PiTheme.space4)
+                .padding(.bottom, PiTheme.space12)
                 .frame(maxWidth: .infinity)
                 .background(Color.piTranscript)
             }
+    }
+
+    private var conversationIsRunning: Bool {
+        guard let session = store.selectedSession else { return false }
+        return store.isRunning(session)
+    }
+
+    private var liveIndicatorText: String {
+        store.isSelectedRuntime && store.runtimeState.isStreaming
+            ? "Pi is working"
+            : "Pi is working in another process"
     }
 
     @ToolbarContentBuilder
@@ -186,15 +206,17 @@ private struct MessageScrollView: View {
                         }
                     }
                     Color.clear
-                        .frame(height: PiTheme.space8)
+                        .frame(height: 1)
                         .id(bottomID)
                         .onAppear { isPinnedToBottom = true }
                         .onDisappear { isPinnedToBottom = false }
                 }
-                .padding(.horizontal, PiTheme.space20)
                 .padding(.top, PiTheme.space24)
-                .padding(.bottom, PiTheme.space20)
-                .frame(maxWidth: PiTheme.transcriptMaxWidth)
+                .padding(.bottom, PiTheme.space8)
+                // Frame the transcript content first, then add the same outer gutter as the
+                // composer. This makes their visible left/right edges identical at every width.
+                .frame(maxWidth: PiTheme.transcriptMaxWidth, alignment: .leading)
+                .padding(.horizontal, PiTheme.space20)
                 .frame(maxWidth: .infinity)
             }
             .scrollDismissesKeyboard(.interactively)
@@ -207,13 +229,7 @@ private struct MessageScrollView: View {
                 withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
             }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in
-                guard isPinnedToBottom else { return }
-                scrollTask?.cancel()
-                scrollTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 90_000_000)
-                    guard !Task.isCancelled, isPinnedToBottom else { return }
-                    reader.scrollTo(bottomID, anchor: .bottom)
-                }
+                scheduleBottomScroll(reader)
             }
             .onDisappear { scrollTask?.cancel() }
             .overlay(alignment: .bottom) {
@@ -236,6 +252,16 @@ private struct MessageScrollView: View {
                     .help("Scroll to the newest message")
                 }
             }
+        }
+    }
+
+    private func scheduleBottomScroll(_ reader: ScrollViewProxy) {
+        guard isPinnedToBottom else { return }
+        scrollTask?.cancel()
+        scrollTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 90_000_000)
+            guard !Task.isCancelled, isPinnedToBottom else { return }
+            reader.scrollTo(bottomID, anchor: .bottom)
         }
     }
 }

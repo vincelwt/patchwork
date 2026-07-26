@@ -53,7 +53,7 @@ final class TranscriptPresenterTests: XCTestCase {
 
         var liveFailure = group
         liveFailure.isActive = true
-        XCTAssertTrue(liveFailure.shouldStartExpanded, "A failure in the live turn is surfaced immediately")
+        XCTAssertFalse(liveFailure.shouldStartExpanded, "Live failures remain high-level until the user expands them")
     }
 
     func testEveryDocumentedToolKindHasAReadableMapping() {
