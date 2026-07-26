@@ -14,13 +14,20 @@ struct SessionActivity: Equatable, Sendable {
     var modifiedAt: Date
     /// When the file last transitioned into `running`, used for the menu bar's elapsed label.
     var runningSince: Date?
+    /// The last entry's assistant stop reason, when known. Lets a notification distinguish a
+    /// clean finish from an error/abort without re-reading the file.
+    var lastStopReason: String?
 }
 
 /// Pure classification of a session's liveness. Sessions started in any terminal are detected
 /// from their JSONL file alone: mtime age plus the last complete entry.
 enum SessionActivityClassifier {
-    /// A write this recent means Pi is mid-turn regardless of what the entry says.
+    /// A write this recent means Pi is mid-turn, unless the entry itself already says the turn
+    /// is over.
     static let recentWriteWindow: TimeInterval = 6
+    /// A non-terminal entry older than this without a further write is presumed stalled (e.g. a
+    /// killed terminal), rather than waiting for the full idle window.
+    static let staleNonTerminalWindow: TimeInterval = 15
     /// Older than this and nothing is running, whatever the last entry looks like.
     static let idleWindow: TimeInterval = 90
     /// Only the tail is read, never the whole file.
@@ -30,26 +37,42 @@ enum SessionActivityClassifier {
 
     static func classify(lastEntry: JSONValue?, age: TimeInterval) -> SessionRunState {
         if age > idleWindow { return .idle }
+        // A killed-and-relaunched terminal can leave a fresh mtime behind an already-settled
+        // turn; the stop reason must win even over a very recent write.
+        if isTerminalStop(lastEntry) { return .idle }
         if age <= recentWriteWindow { return .running }
-        guard let entry = lastEntry else { return .unknown }
+        guard age <= staleNonTerminalWindow else { return .idle }
 
+        guard let entry = lastEntry else { return .unknown }
         let type = entry["type"]?.stringValue
         if type == "bashExecution" { return .running }
 
         guard type == "message", let message = entry["message"] else { return .unknown }
-        let role = message["role"]?.stringValue
-        switch role {
+        switch message["role"]?.stringValue {
         case "user", "toolResult", "bashExecution":
             // Pi has just been handed work, or a tool has just answered: the turn continues.
             return .running
         case "assistant":
-            let stopReason = message["stopReason"]?.stringValue
-            if stopReason == "toolUse" { return .running }
-            if let stopReason, terminalStopReasons.contains(stopReason) { return .idle }
-            return .unknown
+            // A terminal stop reason already returned above; only toolUse or an absent reason
+            // (still streaming) remain.
+            return message["stopReason"]?.stringValue == "toolUse" ? .running : .unknown
         default:
             return .unknown
         }
+    }
+
+    /// The assistant stop reason of the last entry, when there is one. Threaded through
+    /// `SessionActivity` so the monitor and notifications can tell a clean finish from an
+    /// error/abort without re-parsing the tail a second time.
+    static func stopReason(ofLastEntry entry: JSONValue?) -> String? {
+        guard entry?["type"]?.stringValue == "message",
+              let message = entry?["message"], message["role"]?.stringValue == "assistant" else { return nil }
+        return message["stopReason"]?.stringValue
+    }
+
+    private static func isTerminalStop(_ entry: JSONValue?) -> Bool {
+        guard let stopReason = stopReason(ofLastEntry: entry) else { return false }
+        return terminalStopReasons.contains(stopReason)
     }
 
     /// Extracts the last decodable JSONL record from a tail buffer, tolerating a partially
@@ -86,7 +109,22 @@ enum SessionActivityClassifier {
         if age > idleWindow { return SessionActivity(state: .idle, modifiedAt: modifiedAt) }
         let entry = readTail(at: fresh).flatMap(lastEntry(inTail:))
         let state = classify(lastEntry: entry, age: age)
-        return SessionActivity(state: state, modifiedAt: modifiedAt, runningSince: state == .running ? modifiedAt : nil)
+        return SessionActivity(
+            state: state,
+            modifiedAt: modifiedAt,
+            runningSince: state == .running ? modifiedAt : nil,
+            lastStopReason: stopReason(ofLastEntry: entry)
+        )
+    }
+
+    /// Cross-checks the file heuristic against live `pi` processes: a session can only be
+    /// running if something is actually alive in its working directory. `liveCwds == nil` means
+    /// process inspection is unavailable entirely (no `ps`, sandboxed, every attempt failed) —
+    /// the file heuristic alone decides rather than every session silently going idle.
+    static func resolvedState(fileState: SessionRunState, cwd: String, liveCwds: Set<String>?) -> SessionRunState {
+        guard fileState == .running else { return fileState }
+        guard let liveCwds else { return .running }
+        return liveCwds.contains(cwd) ? .running : .idle
     }
 }
 
@@ -110,15 +148,22 @@ final class SessionActivityMonitor: ObservableObject {
     }
 
     private var trackedPaths: [String] = []
+    /// Optional cwd per tracked path, used only for the live-process cross-check. Paths absent
+    /// here (including every caller that never registers one) simply skip the cross-check and
+    /// keep the file-only verdict, exactly as before that check existed.
+    private var cwdByPath: [String: String] = [:]
     private var fingerprints: [String: Fingerprint] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
     private var cancellables: Set<AnyCancellable> = []
     private let isActiveOverride: Bool?
+    private let processInspector: PiProcessInspector
 
     /// `isActiveOverride` keeps the monitor deterministic in tests without an app instance.
-    init(isActiveOverride: Bool? = nil) {
+    /// `processInspector` is a test seam only — production always uses the real one.
+    init(isActiveOverride: Bool? = nil, processInspector: PiProcessInspector? = nil) {
         self.isActiveOverride = isActiveOverride
+        self.processInspector = processInspector ?? PiProcessInspector()
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in self?.tickNow() }
             .store(in: &cancellables)
@@ -134,6 +179,14 @@ final class SessionActivityMonitor: ObservableObject {
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
         tickNow()
+    }
+
+    /// Session cwd is used only to cross-check against live `pi` processes; call this alongside
+    /// `setTrackedPaths` whenever the caller wants that verification. Sessions live in
+    /// `~/.pi/agent/sessions/<encoded-cwd>/`, and each tracked path's cwd comes from its
+    /// `SessionSummary`.
+    func setSessionCwds(_ cwds: [String: String]) {
+        cwdByPath = cwds
     }
 
     func start() {
@@ -164,6 +217,11 @@ final class SessionActivityMonitor: ObservableObject {
         defer { tickInFlight = false }
 
         let paths = trackedPaths
+        let cwds = cwdByPath
+        // Only ever spawns `ps`/`lsof` when at least one tracked session actually registered a
+        // cwd; a monitor used purely for the file heuristic (or in tests) never shells out.
+        if !cwds.isEmpty { processInspector.refreshIfNeeded() }
+        let liveCwds = cwds.isEmpty ? nil : processInspector.liveCwds
         let known = fingerprints
         let previous = activities
         let limit = Self.tailReadsPerTick
@@ -173,6 +231,11 @@ final class SessionActivityMonitor: ObservableObject {
             var states: [String: SessionActivity] = [:]
             var stamps: [String: Fingerprint] = [:]
             var tailReads = 0
+
+            func crossChecked(_ fileState: SessionRunState, path: String) -> SessionRunState {
+                guard let cwd = cwds[path] else { return fileState }
+                return SessionActivityClassifier.resolvedState(fileState: fileState, cwd: cwd, liveCwds: liveCwds)
+            }
 
             for path in paths {
                 let url = URL(fileURLWithPath: path)
@@ -198,11 +261,13 @@ final class SessionActivityMonitor: ObservableObject {
                         lastEntry: nil,
                         age: age
                     )
-                    let resolved = state == .unknown ? cached.state : state
+                    let fileState = state == .unknown ? cached.state : state
+                    let resolved = crossChecked(fileState, path: path)
                     states[path] = SessionActivity(
                         state: resolved,
                         modifiedAt: modifiedAt,
-                        runningSince: resolved == .running ? (cached.runningSince ?? modifiedAt) : nil
+                        runningSince: resolved == .running ? (cached.runningSince ?? modifiedAt) : nil,
+                        lastStopReason: cached.lastStopReason
                     )
                     continue
                 }
@@ -214,11 +279,13 @@ final class SessionActivityMonitor: ObservableObject {
                 tailReads += 1
                 let entry = SessionActivityClassifier.readTail(at: url)
                     .flatMap(SessionActivityClassifier.lastEntry(inTail:))
-                let state = SessionActivityClassifier.classify(lastEntry: entry, age: age)
+                let fileState = SessionActivityClassifier.classify(lastEntry: entry, age: age)
+                let resolved = crossChecked(fileState, path: path)
                 states[path] = SessionActivity(
-                    state: state,
+                    state: resolved,
                     modifiedAt: modifiedAt,
-                    runningSince: state == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil
+                    runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
+                    lastStopReason: SessionActivityClassifier.stopReason(ofLastEntry: entry)
                 )
             }
             return (states, stamps)

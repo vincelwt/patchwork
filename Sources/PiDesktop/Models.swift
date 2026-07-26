@@ -324,6 +324,10 @@ struct PersistedAppState: Codable {
     /// Unread state is also keyed by session-file path so duplicate/migrated IDs cannot collide.
     var lastReadAt: [String: Date] = [:]
     var manuallyUnreadSessionPaths: Set<String> = []
+    /// Per-conversation composer text, keyed by standardized session-file path plus one sentinel
+    /// key for the new-chat route. Bounded and LRU-evicted by `DraftStore`; image attachments
+    /// never appear here.
+    var drafts: [String: String] = [:]
 
     init() {}
 
@@ -340,6 +344,7 @@ struct PersistedAppState: Codable {
         virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
         lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
         manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
+        drafts = try container.decodeIfPresent([String: String].self, forKey: .drafts) ?? [:]
     }
 }
 
