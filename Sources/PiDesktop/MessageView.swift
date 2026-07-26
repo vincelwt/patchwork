@@ -134,18 +134,26 @@ struct TranscriptWorkView: View {
             PiHairline()
 
             if isOpen {
-                VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                    ForEach(block.entries) { entry in
-                        switch entry {
-                        case let .thinking(value):
-                            ThinkingBlockView(text: value.text, streaming: value.streaming)
-                        case let .activity(group):
-                            TranscriptActivityGroupView(group: group, onImage: onImage)
-                        case let .note(message):
-                            WorkNoteView(message: message, onImage: onImage)
+                HStack(alignment: .top, spacing: PiTheme.space12) {
+                    // A quiet rail separates the log from the answer without indenting the
+                    // answer itself.
+                    Rectangle()
+                        .fill(Color.piHairline)
+                        .frame(width: PiTheme.hairline)
+                    VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+                        ForEach(block.entries) { entry in
+                            switch entry {
+                            case let .thinking(value):
+                                ThinkingBlockView(text: value.text, streaming: value.streaming)
+                            case let .activity(group):
+                                TranscriptActivityGroupView(group: group, onImage: onImage)
+                            case let .note(message):
+                                WorkNoteView(message: message, onImage: onImage)
+                            }
                         }
                     }
                 }
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .accessibilityElement(children: .contain)
