@@ -176,6 +176,63 @@ enum WorkspaceOrganization {
         }
         return roots.flatMap { orderedChildren(of: $0, in: folders) }
     }
+
+    // MARK: - Default working directory for a folder-scoped new chat
+
+    /// The working directory offered when starting a chat "inside" a virtual folder (the
+    /// sidebar's `+` and "New Chat Here"), since a virtual folder — unlike a project group — has
+    /// no cwd of its own. Each tier is tried only once the previous one has nothing to offer:
+    /// 1. The cwd shared by the folder's own directly-assigned sessions: their most common cwd,
+    ///    so a folder that already leans toward one project keeps new chats there even if a
+    ///    stray session or two came from elsewhere. Ties break on the most recently modified
+    ///    session, the same recency preference `SidebarSnapshot` sorts groups by.
+    /// 2. The nearest enclosing filesystem project, found by walking up through parent virtual
+    ///    folders — an empty folder nested inside a project should still start there.
+    /// 3. `fallback`: the caller's ordinary default (whatever a plain "New chat" would use).
+    static func defaultWorkingDirectory(
+        forVirtualFolder folderID: String,
+        sessions: [SessionSummary],
+        assignments: [String: String],
+        folders: [VirtualFolder],
+        fallback: URL
+    ) -> URL {
+        if let shared = mostCommonCwd(inVirtualFolder: folderID, sessions: sessions, assignments: assignments) {
+            return shared
+        }
+        if let project = enclosingProjectPath(ofVirtualFolder: folderID, folders: folders) {
+            return URL(fileURLWithPath: project, isDirectory: true)
+        }
+        return fallback
+    }
+
+    private static func mostCommonCwd(
+        inVirtualFolder folderID: String, sessions: [SessionSummary], assignments: [String: String]
+    ) -> URL? {
+        let own = sessions.filter { assignments[$0.fileURL.standardizedFileURL.path] == folderID }
+        guard !own.isEmpty else { return nil }
+        var counts: [String: Int] = [:]
+        for session in own { counts[session.cwd.standardizedFileURL.path, default: 0] += 1 }
+        let topCount = counts.values.max() ?? 0
+        let tiedPaths = Set(counts.filter { $0.value == topCount }.map(\.key))
+        let winner = own
+            .filter { tiedPaths.contains($0.cwd.standardizedFileURL.path) }
+            .max { $0.modifiedAt < $1.modifiedAt }
+        return winner.map { URL(fileURLWithPath: $0.cwd.standardizedFileURL.path, isDirectory: true) }
+    }
+
+    /// Walks up through parent virtual folders — cycle-safe like `effectiveParentID`, which this
+    /// reuses at every step — until it finds a filesystem project parent or runs out of ancestors.
+    private static func enclosingProjectPath(ofVirtualFolder folderID: String, folders: [VirtualFolder]) -> String? {
+        var visited: Set<String> = [folderID]
+        var currentID = folderID
+        while let folder = folders.first(where: { $0.id == currentID }) {
+            guard let parent = effectiveParentID(of: folder, in: folders) else { return nil }
+            guard let parentFolderID = virtualFolderID(fromGroupID: parent) else { return parent }
+            guard visited.insert(parentFolderID).inserted else { return nil }
+            currentID = parentFolderID
+        }
+        return nil
+    }
 }
 
 extension AppPersistence {
@@ -289,6 +346,21 @@ extension AppStore {
     func moveSession(_ session: SessionSummary, toVirtualFolder folderID: String?) {
         persistence.moveSession(path: session.fileURL.path, toVirtualFolder: folderID)
         objectWillChange.send()
+    }
+
+    /// Working directory for a chat started via a virtual folder's `+`/"New Chat Here"; see
+    /// `WorkspaceOrganization.defaultWorkingDirectory` for the exact preference order.
+    /// `selectedFolder` stands in for "the current default" (its last tier): it already holds
+    /// whichever folder a plain "New chat" would use — the most recently used one, or the safe
+    /// home-directory fallback before any folder has ever been chosen.
+    func defaultWorkingDirectory(forVirtualFolder folderID: String) -> URL {
+        WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: folderID,
+            sessions: sessions,
+            assignments: virtualFolderAssignments,
+            folders: virtualFolders,
+            fallback: selectedFolder ?? Self.nowhereFolderURL
+        )
     }
 
     func markRead(_ session: SessionSummary) {

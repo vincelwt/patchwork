@@ -23,7 +23,7 @@ struct SidebarView: View {
             if store.isScanning, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
                 VStack(spacing: PiTheme.space8) {
                     ProgressView().controlSize(.small)
-                    Text("Finding Pi sessions…").font(PiFont.caption).foregroundStyle(.secondary)
+                    Text("Finding Pi sessions…").font(SidebarTypography.status).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let error = store.scanError, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
@@ -78,10 +78,10 @@ private struct SidebarActionRow: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
-                Text(title).font(PiFont.row)
+                Text(title).font(SidebarTypography.conversationTitle(selected: false))
                 Spacer(minLength: PiTheme.space4)
                 if !shortcut.isEmpty {
-                    Text(shortcut).font(PiFont.micro).foregroundStyle(.tertiary)
+                    Text(shortcut).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
                 }
             }
             .padding(.leading, PiTheme.sidebarIconInset)
@@ -105,7 +105,7 @@ private struct SidebarFooter: View {
         HStack(spacing: PiTheme.space6) {
             StatusDot(color: runningCount > 0 ? .piGreen : .secondary, isPulsing: runningCount > 0)
             if let label {
-                Text(label).font(PiFont.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(label).font(SidebarTypography.status).foregroundStyle(.secondary).lineLimit(1)
                     .accessibilityLabel("Session activity")
                     .accessibilityValue(label)
             }
@@ -316,7 +316,7 @@ private struct ArchiveSection: View {
                     Image(systemName: "archivebox")
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
-                    Text("Archived").font(PiFont.captionEmphasis).foregroundStyle(.secondary)
+                    Text("Archived").font(SidebarTypography.folderHeader).foregroundStyle(.secondary)
                     Spacer(minLength: PiTheme.space4)
                 }
                 .padding(.horizontal, PiTheme.space8)
@@ -377,9 +377,10 @@ private struct SessionFolderSection: View {
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
-                        .font(PiFont.captionEmphasis).foregroundStyle(.secondary).lineLimit(1)
+                        .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
                     if hasRunning { StatusDot(color: .piGreen, isPulsing: true) }
                     Spacer(minLength: PiTheme.space4)
+                    newChatButton
                 }
                 .padding(.leading, PiTheme.space8 + indent)
                 .padding(.trailing, PiTheme.space8)
@@ -395,6 +396,7 @@ private struct SessionFolderSection: View {
             .contextMenu {
                 if let id = group.virtualFolderID {
                     Button("New Folder Inside…") { childName = ""; creatingChild = true }
+                    Button("New Chat Here") { newChatHere() }
                     Button("Rename Folder…") { renameValue = group.name; renaming = true }
                     Menu("Move Folder to…") {
                         Button("Top level") { store.reparentVirtualFolder(id: id, to: nil) }
@@ -415,10 +417,7 @@ private struct SessionFolderSection: View {
                     Button("Delete Folder…", role: .destructive) { confirmingDelete = true }
                 } else {
                     Button("New Folder Inside…") { childName = ""; creatingChild = true }
-                    Button("New Chat Here") {
-                        store.openNewChat()
-                        store.chooseFolder(URL(fileURLWithPath: group.path, isDirectory: true))
-                    }
+                    Button("New Chat Here") { newChatHere() }
                 }
             }
             .dropDestination(for: String.self) { paths, _ in
@@ -455,6 +454,45 @@ private struct SessionFolderSection: View {
             }
         } message: {
             Text("Subfolders move up a level and conversations return to their project or Desktop group. Session files are not changed.")
+        }
+    }
+
+    /// Reserves the same fixed slot whether or not it is showing, so hovering a folder never
+    /// shifts its header — mirrors `SessionRow.leadingIcon`'s hover-swap, which does the same for
+    /// the archive button.
+    @ViewBuilder
+    private var newChatButton: some View {
+        if hovering {
+            Image(systemName: "plus")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.folderHeaderHeight, alignment: .center)
+                .contentShape(Rectangle())
+                // Higher priority than the header's own Button, so this click starts a chat
+                // here instead of also toggling the folder open/closed.
+                .highPriorityGesture(TapGesture().onEnded { newChatHere() })
+                .help("New chat in \(group.name)")
+                .accessibilityLabel("New chat in \(group.name)")
+                .accessibilityAddTraits(.isButton)
+        } else {
+            Color.clear
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.folderHeaderHeight)
+                .accessibilityHidden(true)
+        }
+    }
+
+    /// A project group's "folder" is just its cwd, so the new chat can use it immediately. A
+    /// virtual folder has no cwd of its own; see `WorkspaceOrganization.defaultWorkingDirectory`
+    /// for the rule that picks one, and `NewChatFolderIntent` for how the assignment survives
+    /// until Pi actually creates the session.
+    private func newChatHere() {
+        store.openNewChat()
+        if let id = group.virtualFolderID {
+            let cwd = store.defaultWorkingDirectory(forVirtualFolder: id)
+            store.chooseFolder(cwd)
+            NewChatFolderIntent.shared.arm(folderID: id, cwd: cwd, store: store)
+        } else {
+            store.chooseFolder(URL(fileURLWithPath: group.path, isDirectory: true))
         }
     }
 
@@ -496,7 +534,7 @@ private struct SessionRow: View {
             HStack(spacing: PiTheme.space6) {
                 leadingIcon
                 Text(session.displayName)
-                    .font(selected ? PiFont.rowEmphasis : PiFont.row)
+                    .font(SidebarTypography.conversationTitle(selected: selected))
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: PiTheme.space4)
                 trailingAccessory
@@ -566,7 +604,7 @@ private struct SessionRow: View {
         if running {
             ProgressView().controlSize(.mini).help("Pi is working")
         } else if hovering {
-            Text(store.liveModifiedAt(session).relativeShort).font(PiFont.micro).foregroundStyle(.tertiary)
+            Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
         } else if GitIndicatorPolicy.showsBranchIndicator(git) {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9)).foregroundStyle(.tertiary)

@@ -40,7 +40,7 @@ struct QuickSwitcherView: View {
                 .frame(height: 20)
                 if !query.isEmpty {
                     Text("\(matches.count)")
-                        .font(PiFont.micro.monospacedDigit())
+                        .font(SidebarTypography.metadata.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -51,7 +51,7 @@ struct QuickSwitcherView: View {
 
             if matches.isEmpty {
                 Text("No conversations match “\(query)”")
-                    .font(PiFont.caption)
+                    .font(SidebarTypography.status)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, PiTheme.space16)
@@ -147,13 +147,13 @@ private struct QuickSwitchRow: View {
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
             }
             Text(session.displayName)
-                .font(selected ? PiFont.rowEmphasis : PiFont.row)
+                .font(SidebarTypography.conversationTitle(selected: selected))
                 .lineLimit(1)
                 // Wins the tug-of-war for space over the folder tag, so a long title stays
                 // legible and the folder name (secondary, disambiguating info) truncates first.
                 .layoutPriority(1)
             Text(folderName)
-                .font(PiFont.micro)
+                .font(SidebarTypography.metadata)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
             Spacer(minLength: PiTheme.space4)
@@ -161,7 +161,7 @@ private struct QuickSwitchRow: View {
                 ProgressView().controlSize(.mini)
             } else {
                 Text(modifiedAt.relativeShort)
-                    .font(PiFont.micro)
+                    .font(SidebarTypography.metadata)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -205,7 +205,9 @@ private struct PaletteField: NSViewRepresentable {
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = .systemFont(ofSize: 15)
+        // Matches the AppKit body-size constant `ComposerTextView` uses for its own native
+        // text view, rather than an unrelated one-off literal for this palette's own field.
+        field.font = PiFont.composerNSFont
         field.placeholderString = placeholder
         field.lineBreakMode = .byTruncatingTail
         field.cell?.usesSingleLineMode = true
@@ -262,12 +264,12 @@ private struct HintLabel: View {
     var body: some View {
         HStack(spacing: PiTheme.space4) {
             Text(keys)
-                .font(PiFont.micro.weight(.medium))
+                .font(SidebarTypography.metadata.weight(.medium))
                 .padding(.horizontal, PiTheme.space4)
                 .frame(height: 14)
                 .piInset(radius: 3)
             Text(text)
-                .font(PiFont.micro)
+                .font(SidebarTypography.metadata)
                 .foregroundStyle(.tertiary)
         }
     }
