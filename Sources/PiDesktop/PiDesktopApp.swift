@@ -18,6 +18,8 @@ struct PiDesktopApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { store.openNewChat() }
                     .keyboardShortcut("n", modifiers: .command)
+                Button("New Virtual Folder…") { store.newVirtualFolderRequested = true }
+                    .keyboardShortcut("n", modifiers: [.command, .option])
             }
             CommandMenu("Conversation") {
                 Button("Quick Switch…") { store.quickSwitchPresented = true }
@@ -29,6 +31,9 @@ struct PiDesktopApp: App {
                     .keyboardShortcut("a", modifiers: [.command, .shift])
                     .disabled(store.selectedSession == nil)
                 Button("Rename…") { store.renameRequested = true }
+                    .disabled(store.selectedSession == nil)
+                Button("Mark as Unread") { store.markSelectedUnread() }
+                    .keyboardShortcut("u", modifiers: [.command, .option])
                     .disabled(store.selectedSession == nil)
                 Divider()
                 Button("Stop Pi", action: store.abort)
@@ -59,6 +64,7 @@ struct PiDesktopApp: App {
         } label: {
             MenuBarLabelView().environmentObject(store)
         }
+        .menuBarExtraStyle(.window)
     }
 
     private var archiveTitle: String {
@@ -68,9 +74,15 @@ struct PiDesktopApp: App {
 
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var collapseState = SidebarAutoCollapseState()
+    @State private var expectedPolicyVisibility: NavigationSplitViewVisibility?
+    @State private var currentWidth: CGFloat = PiTheme.windowMinimumWidth
+    @State private var newVirtualFolderName = ""
 
     var body: some View {
-        NavigationSplitView {
+        GeometryReader { geometry in
+            NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView()
                 .navigationSplitViewColumnWidth(
                     min: PiTheme.sidebarMinWidth,
@@ -93,13 +105,31 @@ struct RootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 StatusBarView()
             }
-            .frame(minWidth: 640)
+            .frame(minWidth: 500)
         }
         .navigationSplitViewStyle(.balanced)
         // Extension `setTitle` drives the real window title, not just an inspector field.
         .navigationTitle(store.windowTitle)
-        .frame(minWidth: 940, minHeight: 620)
+        .onAppear { updateSidebar(for: geometry.size.width) }
+        .onChange(of: geometry.size.width) { _, width in updateSidebar(for: width) }
+        .onChange(of: columnVisibility) { _, visibility in
+            if expectedPolicyVisibility == visibility {
+                expectedPolicyVisibility = nil
+            } else {
+                collapseState.userChangedVisibility(width: currentWidth, threshold: PiTheme.sidebarAutoCollapseWidth)
+            }
+        }
         .task { store.bootstrap() }
+        .alert("New virtual folder", isPresented: $store.newVirtualFolderRequested) {
+            TextField("Folder name", text: $newVirtualFolderName)
+            Button("Cancel", role: .cancel) { newVirtualFolderName = "" }
+            Button("Create") {
+                _ = store.createVirtualFolder(named: newVirtualFolderName)
+                newVirtualFolderName = ""
+            }
+        } message: {
+            Text("Virtual folders organize conversations without changing files on disk.")
+        }
         .sheet(item: $store.activeDialog) { request in
             ExtensionDialogView(request: request).environmentObject(store)
         }
@@ -118,6 +148,21 @@ struct RootView: View {
                     .zIndex(10)
             }
         }
+        }
+        .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+    }
+
+    private func updateSidebar(for width: CGFloat) {
+        currentWidth = width
+        let visible = columnVisibility != .detailOnly
+        guard let action = collapseState.action(
+            width: width,
+            sidebarVisible: visible,
+            threshold: PiTheme.sidebarAutoCollapseWidth
+        ) else { return }
+        let target: NavigationSplitViewVisibility = action == .collapse ? .detailOnly : .all
+        expectedPolicyVisibility = target
+        columnVisibility = target
     }
 }
 

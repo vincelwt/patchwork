@@ -14,7 +14,8 @@ struct QuickSwitcherView: View {
         QuickSwitchScoring.rank(
             store.sessions.filter { !$0.isArchived },
             query: query,
-            limit: PiTheme.quickSwitchResultLimit
+            limit: PiTheme.quickSwitchResultLimit,
+            folderName: { store.displayFolderName(for: $0) }
         )
     }
 
@@ -65,6 +66,8 @@ struct QuickSwitcherView: View {
                                     session: session,
                                     running: store.isRunning(session),
                                     modifiedAt: store.liveModifiedAt(session),
+                                    folderName: store.displayFolderName(for: session),
+                                    unread: store.isUnread(session),
                                     selected: index == selection
                                 )
                                 .id(index)
@@ -117,18 +120,26 @@ private struct QuickSwitchRow: View {
     let session: SessionSummary
     let running: Bool
     let modifiedAt: Date
+    let folderName: String
+    let unread: Bool
     let selected: Bool
 
     var body: some View {
         HStack(spacing: PiTheme.space8) {
-            Image(systemName: "folder")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
-                .frame(width: PiTheme.gridIconColumn, alignment: .center)
+            if unread {
+                Circle().fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
+            } else {
+                Image(systemName: "folder")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
+            }
             Text(session.displayName)
                 .font(selected ? PiFont.rowEmphasis : PiFont.row)
                 .lineLimit(1)
-            Text(session.folderName)
+            Text(folderName)
                 .font(PiFont.micro)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)

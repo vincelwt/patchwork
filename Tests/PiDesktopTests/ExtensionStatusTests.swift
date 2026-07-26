@@ -40,6 +40,8 @@ final class CodexAccountStatusTests: XCTestCase {
         XCTAssertEqual(value.bankedResetExpiry, "12h")
         XCTAssertEqual(value.tightestWindow?.label, "7d")
         XCTAssertEqual(value.compactRemaining, "7d 57%")
+        XCTAssertEqual(value.compactReset, "reset×2:12h")
+        XCTAssertEqual(value.compactUsage, "5h:78% 7d:57% reset×2:12h")
         XCTAssertFalse(value.isWarning)
     }
 

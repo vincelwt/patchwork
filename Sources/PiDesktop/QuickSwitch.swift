@@ -70,12 +70,23 @@ enum QuickSwitchScoring {
 
     /// Ranks summaries, keeping the input's recent-first order for equal scores.
     static func rank(_ sessions: [SessionSummary], query: String, limit: Int) -> [SessionSummary] {
+        rank(sessions, query: query, limit: limit, folderName: { $0.folderName })
+    }
+
+    static func rank(
+        _ sessions: [SessionSummary],
+        query: String,
+        limit: Int,
+        folderName: (SessionSummary) -> String
+    ) -> [SessionSummary] {
         let scored = sessions.enumerated().compactMap { index, session -> (Int, Int, SessionSummary)? in
+            let folder = folderName(session)
+            let key = session.searchKey + "\n" + folder.lowercased()
             guard let value = score(
                 query: query,
                 title: session.displayName,
-                folder: session.folderName,
-                searchKey: session.searchKey
+                folder: folder,
+                searchKey: key
             ) else { return nil }
             return (value, index, session)
         }
