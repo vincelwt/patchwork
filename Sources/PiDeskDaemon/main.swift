@@ -35,7 +35,13 @@ signal(SIGINT, SIG_IGN)
 let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
 
+// A second SIGTERM/SIGINT while already shutting down (an impatient `kill`, or both signals
+// arriving together) must not race two overlapping `core.stop()`/`exit(0)` calls.
+var isShuttingDown = false
+
 func shutdown() {
+    guard !isShuttingDown else { return }
+    isShuttingDown = true
     logger.info("pi-deskd shutting down")
     server.stop()
     Task {

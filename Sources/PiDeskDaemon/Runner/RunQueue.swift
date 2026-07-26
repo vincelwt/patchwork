@@ -72,6 +72,24 @@ actor RunQueue {
         return before - pending.count
     }
 
+    /// Graceful daemon shutdown (docs/daemon-api.md, "Shutdown"): give whatever is currently
+    /// running up to `graceSeconds` to finish naturally — a scheduled run seconds from completing
+    /// should not be cut off just because the app quit or the daemon received SIGTERM — then
+    /// cancel anything still going. That reuses the exact cooperative-cancellation path
+    /// `/v1/threads/{id}/abort` already uses, so a lingering `pi` child still gets
+    /// `PiRPCSession.stop()`'s SIGTERM-then-SIGKILL treatment and the run is recorded as
+    /// `.timeout` instead of being silently left `running` forever or orphaned when this process
+    /// exits. Never queues anything new; the caller stops the scheduler first.
+    func shutdown(graceSeconds: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(max(0, graceSeconds))
+        while runningCount > 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let stillRunning = runningTasks.values.map(\.task)
+        for task in stillRunning { task.cancel() }
+        for task in stillRunning { await task.value }
+    }
+
     func enqueue(_ job: RunJob) {
         pending.append(job)
         pump()

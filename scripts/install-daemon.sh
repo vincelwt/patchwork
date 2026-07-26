@@ -5,6 +5,11 @@ set -euo pipefail
 # location outside any git worktree (worktrees come and go per scripts/worktree.sh; the running
 # daemon must not depend on one surviving), writes the plist, and (re)loads it.
 #
+# Only needed for always-on use without Pi Desktop.app (e.g. a headless machine): by default the
+# app starts and stops its own bundled pi-deskd as it launches and quits (docs/daemon-api.md,
+# "Lifecycle"). If both are present, the app defers to the LaunchAgent installed here rather than
+# running a second daemon.
+#
 # Usage:
 #   scripts/install-daemon.sh              build, install/update, (re)load
 #   scripts/install-daemon.sh --uninstall  unload and remove everything this script wrote

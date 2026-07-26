@@ -59,8 +59,17 @@ final class DaemonCore: @unchecked Sendable {
         await scheduler.start()
     }
 
-    func stop() async {
+    /// `graceSeconds` bounds how long a run in flight gets to finish naturally before this
+    /// forcibly cancels it — see `RunQueue.shutdown(graceSeconds:)` and docs/daemon-api.md's
+    /// "Shutdown" section for the full contract. The scheduler stops first so nothing new can
+    /// start while the queue is draining.
+    func stop(graceSeconds: TimeInterval = 10) async {
         await scheduler.stop()
+        let running = await runQueue.activeCount()
+        if running > 0 {
+            logger.info("Shutting down with \(running) run(s) in flight; waiting up to \(Int(graceSeconds))s before cancelling.")
+        }
+        await runQueue.shutdown(graceSeconds: graceSeconds)
     }
 
     func health() async -> HealthStatus {

@@ -45,7 +45,8 @@ func runCLI(
     // path here unless it overrides one explicitly — real user state is never touched.
     daemonSettingsPath: URL = makeTempDirectory().appendingPathComponent("daemon.json"),
     tokenFilePath: URL = makeTempDirectory().appendingPathComponent("daemon-token"),
-    logFilePath: URL = makeTempDirectory().appendingPathComponent("daemon.log")
+    logFilePath: URL = makeTempDirectory().appendingPathComponent("daemon.log"),
+    daemonOwnerFilePath: URL = makeTempDirectory().appendingPathComponent("daemon-owner.json")
 ) async -> CLIResult {
     let capture = OutputCapture()
     let host = CLIHost(
@@ -60,7 +61,8 @@ func runCLI(
         readStdin: { max in Data(stdin.prefix(max)) },
         daemonSettingsPath: daemonSettingsPath,
         tokenFilePath: tokenFilePath,
-        logFilePath: logFilePath
+        logFilePath: logFilePath,
+        daemonOwnerFilePath: daemonOwnerFilePath
     )
     let code = await CLIRunner.run(args, host: host)
     return CLIResult(exitCode: code, stdout: capture.stdout, stderr: capture.stderr)

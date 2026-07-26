@@ -1,3 +1,4 @@
+import PiDeskKit
 import XCTest
 @testable import PiDeskCLI
 
@@ -92,31 +93,80 @@ final class DaemonControlUnitTests: XCTestCase {
 }
 
 final class DaemonCommandCLITests: XCTestCase {
+    /// `RecordingShellRunner`'s own default stub reports success for anything, `daemon status`'s
+    /// LaunchAgent probe included — fine for tests that don't care, wrong for every test below
+    /// that asserts a specific mode, so they all supply this explicit "not loaded" double instead.
+    private func notLoadedRunner() -> RecordingShellRunner {
+        let runner = RecordingShellRunner()
+        runner.resultProvider = { _, args in args.contains("print") ? ShellResult(exitCode: 1, stdout: "", stderr: "Could not find service") : ShellResult(exitCode: 0, stdout: "", stderr: "") }
+        return runner
+    }
+
+    private func loadedRunner() -> RecordingShellRunner {
+        let runner = RecordingShellRunner()
+        runner.resultProvider = { _, args in args.contains("print") ? ShellResult(exitCode: 0, stdout: "", stderr: "") : ShellResult(exitCode: 0, stdout: "", stderr: "") }
+        return runner
+    }
+
     func testStatusReachableJSON() async throws {
         let plane = FakeControlPlane()
         plane.healthResult = WireHealth(ok: true, version: "1.2.3", api: 1, startedAt: "2026-01-01T00:00:00Z", runningRuns: 1, queuedRuns: 0, piVersion: "0.82.1", schedulesEnabled: true)
-        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane)
+        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane, shellRunner: notLoadedRunner())
         XCTAssertEqual(result.exitCode, 0)
-        let decoded = try JSONDecoder().decode(WireHealth.self, from: Data(result.stdout.utf8))
-        XCTAssertEqual(decoded.version, "1.2.3")
+        let decoded = try JSONDecoder().decode(DaemonStatusJSON.self, from: Data(result.stdout.utf8))
+        XCTAssertEqual(decoded.health.version, "1.2.3")
+        XCTAssertEqual(decoded.mode, DaemonRunMode.external.rawValue, "reachable with no owner record and no LaunchAgent is an unrecognised, honest \"external\"")
+    }
+
+    func testStatusReachableAndOwnedByAppReportsAppManaged() async throws {
+        let plane = FakeControlPlane()
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ownerFile = dir.appendingPathComponent("daemon-owner.json")
+        try PiDeskFile.writeAtomic(DaemonOwnerRecord(pid: getpid(), startedAt: Date()), to: ownerFile)
+        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane, shellRunner: notLoadedRunner(), daemonOwnerFilePath: ownerFile)
+        XCTAssertEqual(result.exitCode, 0)
+        let decoded = try JSONDecoder().decode(DaemonStatusJSON.self, from: Data(result.stdout.utf8))
+        XCTAssertEqual(decoded.mode, DaemonRunMode.appManaged.rawValue, "this process's own pid is always alive, so a record naming it must read as owned")
+    }
+
+    func testStatusReportsLaunchAgentEvenWhenOwnerFileAlsoPresent() async throws {
+        let plane = FakeControlPlane()
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ownerFile = dir.appendingPathComponent("daemon-owner.json")
+        try PiDeskFile.writeAtomic(DaemonOwnerRecord(pid: getpid(), startedAt: Date()), to: ownerFile)
+        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane, shellRunner: loadedRunner(), daemonOwnerFilePath: ownerFile)
+        let decoded = try JSONDecoder().decode(DaemonStatusJSON.self, from: Data(result.stdout.utf8))
+        XCTAssertEqual(decoded.mode, DaemonRunMode.launchAgent.rawValue, "the LaunchAgent must win even though an app owner record also exists")
     }
 
     func testStatusUnreachableJSONEnvelope() async throws {
         let plane = FakeControlPlane()
         plane.error = ControlPlaneError.unreachable("connection refused")
-        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane)
+        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane, shellRunner: notLoadedRunner())
         XCTAssertEqual(result.exitCode, 3)
         let decoded = try JSONDecoder().decode(JSONErrorEnvelope.self, from: Data(result.stdout.utf8))
         XCTAssertEqual(decoded.ok, false)
         XCTAssertEqual(decoded.error.code, "unreachable")
+        XCTAssertEqual(decoded.mode, DaemonRunMode.notRunning.rawValue)
+    }
+
+    func testStatusUnreachableButLaunchAgentLoadedReportsLaunchAgentMode() async throws {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.unreachable("connection refused")
+        let result = await runCLI(["daemon", "status", "--json"], controlPlane: plane, shellRunner: loadedRunner())
+        let decoded = try JSONDecoder().decode(JSONErrorEnvelope.self, from: Data(result.stdout.utf8))
+        XCTAssertEqual(decoded.mode, DaemonRunMode.launchAgent.rawValue, "loaded-but-not-yet-answering must still say LaunchAgent, not notRunning")
     }
 
     func testStatusUnreachableHumanMessage() async {
         let plane = FakeControlPlane()
         plane.error = ControlPlaneError.unreachable("connection refused")
-        let result = await runCLI(["daemon", "status"], controlPlane: plane)
+        let result = await runCLI(["daemon", "status"], controlPlane: plane, shellRunner: notLoadedRunner())
         XCTAssertEqual(result.exitCode, 3)
         XCTAssertTrue(result.stderr.contains("not reachable"))
+        XCTAssertTrue(result.stdout.contains("mode: not running"))
     }
 
     func testInstallFailsCleanlyWhenBinaryMissing() async {

@@ -41,14 +41,29 @@ the window is closed. The wire contract is `docs/daemon-api.md`; the CLI referen
 | CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
 | Web remote | served by the daemon | Phone-first UI for threads and schedules, bearer-token authenticated |
 
+The daemon starts and stops with the app by default: `Pi Desktop.app` bundles `pi-deskd`/`pidesk`
+in `Contents/Helpers/` and supervises them (start on launch if nothing is already running,
+restart on an unexpected crash with a bounded backoff, stop on quit — never a daemon it did not
+start itself). Turn it off in **Pi Desktop → Settings…** if you'd rather run it yourself; the
+automations panel says plainly when it's off instead of a bare connection error.
+
+For a daemon that runs without the app at all — a headless machine, or automations that must
+survive the app never being opened — install it as a LaunchAgent instead:
+
 ```bash
-swift build -c release --product pi-deskd --product pidesk
-scripts/install-daemon.sh install     # LaunchAgent, starts at login
+swift build -c release --product pi-deskd
+swift build -c release --product pidesk
+scripts/install-daemon.sh              # LaunchAgent, starts at login, restarts on crash
 pidesk threads list
 pidesk schedule add --name "Morning triage" --thread <id> \
     --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
 pidesk remote enable --port 7717      # then reach it through your own SSH/Cloudflare tunnel
 ```
+
+If both are present, the app defers to the LaunchAgent rather than running a second daemon;
+`pidesk daemon status` reports which one (or neither) is actually in play. See docs/daemon-api.md's
+"Lifecycle" section for the full contract, including what happens to a scheduled run in progress
+when the app quits.
 
 Automations are also editable in the window with `⌥⌘S`.
 
@@ -89,7 +104,9 @@ On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-act
 open "dist/Pi Desktop.app"
 ```
 
-The script builds, bundles, and ad-hoc signs the executable. Pi and Node are intentionally not bundled.
+The script builds, bundles, and ad-hoc signs `PiDesktop` plus the `pi-deskd`/`pidesk` helpers it
+starts and stops (`Contents/Helpers/`, each signed individually before the whole-bundle pass so
+`codesign --verify --deep --strict` still passes). Pi and Node are intentionally not bundled.
 
 ## Keyboard and queue behavior
 

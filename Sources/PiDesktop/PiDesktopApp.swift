@@ -7,6 +7,10 @@ struct PiDesktopApp: App {
     @StateObject private var store = AppStore(
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
+    // Owns pi-deskd's lifecycle; see AppDelegate and DaemonSupervisor. Kept on the app delegate
+    // (not a second @StateObject here) so applicationDidFinishLaunching/applicationShouldTerminate
+    // and the Settings scene below always share the exact same instance.
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         // LaunchServices starts GUI apps with cwd="/". Keep the host process on a readable,
@@ -74,6 +78,10 @@ struct PiDesktopApp: App {
             MenuBarLabelView().environmentObject(store)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            DaemonSettingsView().environmentObject(appDelegate.daemonSupervisor)
+        }
     }
 
     private var archiveTitle: String {

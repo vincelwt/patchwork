@@ -22,6 +22,10 @@ struct CLIHost {
     var daemonSettingsPath: URL
     var tokenFilePath: URL
     var logFilePath: URL
+    /// Where Pi Desktop.app records that *it* started the currently-running `pi-deskd`, if it
+    /// did — `daemon status`'s only source for telling "app-managed" apart from "reachable, but
+    /// nobody we recognise started it". See `DaemonSupervisionRules.swift`.
+    var daemonOwnerFilePath: URL
 
     static func live() -> CLIHost {
         CLIHost(
@@ -36,7 +40,8 @@ struct CLIHost {
             readStdin: { maxBytes in FileHandle.standardInput.readData(ofLength: maxBytes) },
             daemonSettingsPath: PiDeskPaths.daemonSettings,
             tokenFilePath: PiDeskPaths.tokenFile,
-            logFilePath: PiDeskPaths.logFile
+            logFilePath: PiDeskPaths.logFile,
+            daemonOwnerFilePath: DaemonOwnership.fileURL()
         )
     }
 }
@@ -54,4 +59,5 @@ struct CommandContext {
     var daemonSettingsPath: URL
     var tokenFilePath: URL
     var logFilePath: URL
+    var daemonOwnerFilePath: URL
 }

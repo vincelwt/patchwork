@@ -52,4 +52,35 @@ final class DaemonCoreTests: XCTestCase {
         await core.stop()
         await core.stop()
     }
+
+    /// The composition-root wiring for graceful shutdown: `stop()` must actually reach
+    /// `RunQueue.shutdown` (unit-tested in depth in `RunQueueTests`), not just stop the
+    /// scheduler's poll loop.
+    func testStopDrainsAnInFlightRunBeforeReturning() async {
+        let gate = Gate()
+        let executor = FakeRunExecutor { _ in
+            await gate.waitForRelease()
+            return RunOutcome(status: .ok, error: nil, summary: "done")
+        }
+        let core = TestSupport.makeCore(in: directory, executor: executor, schedulerPollInterval: 0.05)
+        await core.start()
+        await core.runQueue.enqueue(RunJob(
+            id: "run_stop_test", scheduleId: nil, trigger: .manual,
+            target: .newThread(cwd: "/tmp", namePattern: nil), prompt: "hi", mode: nil,
+            timeoutSeconds: 30, queuedAt: Date()
+        ))
+        var active = await core.runQueue.activeCount()
+        var attempts = 0
+        while active == 0, attempts < 200 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            active = await core.runQueue.activeCount()
+            attempts += 1
+        }
+        XCTAssertEqual(active, 1)
+
+        await gate.release()
+        await core.stop(graceSeconds: 2)
+        let remaining = await core.runQueue.activeCount()
+        XCTAssertEqual(remaining, 0, "stop() must wait for the drained run, not just cancel the scheduler")
+    }
 }
