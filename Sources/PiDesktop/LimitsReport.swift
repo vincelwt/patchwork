@@ -1,17 +1,19 @@
+import AppKit
 import Foundation
 import SwiftUI
 
 /// A parsed `/limits` report. The codex-limits extension prints one indented block per
 /// signed-in account; this turns that text into something the status bar can draw with native
-/// controls instead of showing a monospaced dump.
-struct LimitsReport: Equatable, Sendable {
+/// controls instead of showing a monospaced dump. `Codable` so it can be persisted to disk and
+/// survive a relaunch.
+struct LimitsReport: Equatable, Codable, Sendable {
     var accounts: [LimitsAccount]
     var generatedAt: Date
 
     var isEmpty: Bool { accounts.isEmpty }
 }
 
-struct LimitsAccount: Identifiable, Equatable, Sendable {
+struct LimitsAccount: Identifiable, Equatable, Codable, Sendable {
     var name: String
     var email: String?
     var plan: String?
@@ -29,7 +31,7 @@ struct LimitsAccount: Identifiable, Equatable, Sendable {
     }
 }
 
-struct LimitsWindow: Identifiable, Equatable, Sendable {
+struct LimitsWindow: Identifiable, Equatable, Codable, Sendable {
     var label: String
     var remainingPercent: Int?
     var resets: String?
@@ -122,8 +124,54 @@ enum LimitsReportParser {
     }
 }
 
+/// Persists the last successfully parsed `/limits` report so the popover (main window hover and
+/// menu bar alike) has something to show the instant the app relaunches, before any runtime has
+/// answered a fresh request.
+struct LimitsReportDiskCache {
+    private let fileURL: URL
+
+    init(fileURL: URL? = nil) {
+        let manager = FileManager.default
+        let defaultDirectory = manager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Pi Desktop", isDirectory: true)
+        self.fileURL = fileURL ?? defaultDirectory.appendingPathComponent("limits-report-cache.json")
+    }
+
+    func load() -> LimitsReport? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        return try? JSONDecoder().decode(LimitsReport.self, from: data)
+    }
+
+    func save(_ report: LimitsReport) {
+        guard let data = try? JSONEncoder().encode(report) else { return }
+        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: .atomic)
+    }
+}
+
+/// Pure staleness policy shared by the hover trigger and the periodic background tick: never
+/// while inactive, never without a way to refresh, never more often than the staleness window.
+/// Kept independent of `LimitsReportStore` so every branch is directly testable.
+enum LimitsRefreshPolicy {
+    static func shouldRefresh(
+        now: Date,
+        appActive: Bool,
+        hasRefreshAction: Bool,
+        lastRequestedAt: Date?,
+        reportGeneratedAt: Date?,
+        staleAfter: TimeInterval
+    ) -> Bool {
+        guard hasRefreshAction, appActive else { return false }
+        if let lastRequestedAt, now.timeIntervalSince(lastRequestedAt) < staleAfter { return false }
+        if let reportGeneratedAt, now.timeIntervalSince(reportGeneratedAt) < staleAfter { return false }
+        return true
+    }
+}
+
 /// Holds the latest `/limits` result for the whole app. The refresh action is installed by the
-/// app store once a runtime exists; the view never talks to Pi directly.
+/// app store once a runtime exists; the view never talks to Pi directly. Renders from the
+/// on-disk cache instantly at launch, then refreshes itself periodically in the background —
+/// hovering the account chip or opening the menu bar popover is no longer the only trigger.
 @MainActor
 final class LimitsReportStore: ObservableObject {
     static let shared = LimitsReportStore()
@@ -133,34 +181,86 @@ final class LimitsReportStore: ObservableObject {
     @Published private(set) var lastError: String?
 
     /// Set by `AppStore`. Absent means limits cannot be fetched right now.
-    var refreshAction: (() -> Void)?
-    /// A hover must not fire a command every time the pointer crosses the chip.
-    private static let staleAfter: TimeInterval = 120
-    private var lastRequestedAt: Date?
+    var refreshAction: (() -> Void)? {
+        didSet { if refreshAction != nil { startBackgroundRefresh() } }
+    }
 
-    private init() {}
+    /// Neither a hover nor the background tick fires a command more often than this — a few
+    /// minutes is current enough without spawning a Pi round trip on every pointer crossing or
+    /// timer tick.
+    static let staleAfter: TimeInterval = 300
+    private var lastRequestedAt: Date?
+    private let diskCache: LimitsReportDiskCache
+    private var isAppActive: Bool
+    private(set) var backgroundTask: Task<Void, Never>?
+    private var activationTokens: [NSObjectProtocol] = []
+
+    /// `isActiveOverride` and an explicit `diskCache` let tests drive staleness deterministically
+    /// with an injected clock instead of real notifications or a live timer.
+    init(diskCache: LimitsReportDiskCache = LimitsReportDiskCache(), isActiveOverride: Bool? = nil) {
+        self.diskCache = diskCache
+        self.report = diskCache.load()
+        self.isAppActive = isActiveOverride ?? NSApplication.shared.isActive
+        guard isActiveOverride == nil else { return }
+        let center = NotificationCenter.default
+        activationTokens = [
+            center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.isAppActive = true }
+            },
+            center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.isAppActive = false }
+            }
+        ]
+    }
+
+    deinit {
+        backgroundTask?.cancel()
+        let center = NotificationCenter.default
+        for token in activationTokens { center.removeObserver(token) }
+    }
 
     var canRefresh: Bool { refreshAction != nil }
 
     func refreshIfStale(now: Date = Date()) {
-        guard let refreshAction else { return }
-        if let lastRequestedAt, now.timeIntervalSince(lastRequestedAt) < Self.staleAfter { return }
-        if let report, now.timeIntervalSince(report.generatedAt) < Self.staleAfter { return }
+        guard LimitsRefreshPolicy.shouldRefresh(
+            now: now,
+            appActive: isAppActive,
+            hasRefreshAction: refreshAction != nil,
+            lastRequestedAt: lastRequestedAt,
+            reportGeneratedAt: report?.generatedAt,
+            staleAfter: Self.staleAfter
+        ) else { return }
         lastRequestedAt = now
         isLoading = true
-        refreshAction()
+        refreshAction?()
     }
 
     func apply(text: String, now: Date = Date()) {
         let parsed = LimitsReportParser.parse(text, now: now)
         isLoading = false
         lastError = parsed.isEmpty ? "No accounts reported" : nil
-        report = parsed.isEmpty ? report : parsed
+        guard !parsed.isEmpty else { return }
+        report = parsed
+        diskCache.save(parsed)
     }
 
     func fail(_ message: String) {
         isLoading = false
         lastError = message
+    }
+
+    /// Ticks at the staleness interval and lets `refreshIfStale` decide whether a request is
+    /// actually worth sending — the interval itself is the throttle, this loop just wakes up.
+    private func startBackgroundRefresh() {
+        guard backgroundTask == nil else { return }
+        backgroundTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.staleAfter * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self.refreshIfStale()
+            }
+        }
     }
 }
 

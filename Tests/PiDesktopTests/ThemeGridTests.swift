@@ -50,3 +50,41 @@ final class ThemeGridTests: XCTestCase {
         XCTAssertLessThanOrEqual(PiTheme.menuBarWidth, 320)
     }
 }
+
+/// Context-over-budget colouring: at or under 100% stays neutral everywhere it is still shown
+/// (the inspector, now that the footer bar no longer carries context at all); past 100% the
+/// inspector renders it in `Color.piRed`.
+final class ContextBudgetTests: XCTestCase {
+    func testAtOrUnderOneHundredIsNotOverBudget() {
+        XCTAssertFalse(ContextBudget.isOverBudget(0))
+        XCTAssertFalse(ContextBudget.isOverBudget(99.4))
+        XCTAssertFalse(ContextBudget.isOverBudget(100))
+    }
+
+    func testOverOneHundredIsOverBudget() {
+        XCTAssertTrue(ContextBudget.isOverBudget(100.1))
+        XCTAssertTrue(ContextBudget.isOverBudget(140))
+    }
+
+    func testNilContextIsNeverOverBudget() {
+        XCTAssertFalse(ContextBudget.isOverBudget(nil))
+    }
+}
+
+/// The effort ramp backing the composer's mode slider: one stop per mode, calm to intense, and
+/// no two modes sharing a colour — a copy-paste bug here would silently make two adjacent modes
+/// indistinguishable.
+final class EffortRampTests: XCTestCase {
+    func testRampHasOneStopPerMode() {
+        XCTAssertEqual(PiTheme.effortRamp.count, PiMode.allCases.count)
+    }
+
+    func testEveryModeMapsToADistinctRampColour() {
+        let tints = PiMode.allCases.map(\.piTint)
+        XCTAssertEqual(Set(tints).count, tints.count, "Every mode must read as a visually distinct step")
+    }
+
+    func testUltraAccentDiffersFromItsOwnRampStop() {
+        XCTAssertNotEqual(PiTheme.effortUltraAccent, PiMode.ultra.piTint, "Ultra's glow must add a second colour, not repeat its own stop")
+    }
+}

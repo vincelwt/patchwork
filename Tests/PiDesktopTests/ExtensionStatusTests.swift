@@ -85,10 +85,29 @@ final class CodexAccountStatusTests: XCTestCase {
         XCTAssertEqual(value.windows.map(\.label), ["primary", "secondary"])
     }
 
-    func testLoadingPlaceholderIsRecognized() {
-        let value = try! XCTUnwrap(ExtensionStatusParser.codexAccount("Codex account: loading"))
-        XCTAssertTrue(value.windows.isEmpty)
-        XCTAssertFalse(value.isWarning)
+    /// The extension's loading placeholder is not an account: it must not be shown as though
+    /// it were one, so the caller can fall back to the last known good value instead.
+    func testLoadingPlaceholderIsNotTreatedAsAnAccount() {
+        XCTAssertNil(ExtensionStatusParser.codexAccount("Codex account: loading"))
+        XCTAssertNil(ExtensionStatusParser.codexAccount("CODEX ACCOUNT: LOADING\u{2026}"))
+    }
+
+    /// Any other diagnostic text the extension might emit — not just the one documented
+    /// "loading" string — must degrade the same way: free text with no window data and no
+    /// email-shaped identifier is not distinguishable from an account name, so it is rejected
+    /// rather than risk showing status text as though it were an identity.
+    func testUndocumentedDegradedShapesAreRejectedTheSameWay() {
+        XCTAssertNil(ExtensionStatusParser.codexAccount("initializing"))
+        XCTAssertNil(ExtensionStatusParser.codexAccount("Signed out"))
+        XCTAssertNil(ExtensionStatusParser.codexAccount("Codex account unavailable"))
+    }
+
+    /// Real usage numbers are trustworthy even without a name attached — that is genuine data,
+    /// not a placeholder, so it still resolves (with a neutral label standing in for the name).
+    func testWindowsWithoutAnAccountNameStillParse() {
+        let value = try! XCTUnwrap(ExtensionStatusParser.codexAccount("5h:40% 7d:80%"))
+        XCTAssertEqual(value.account, "Codex account")
+        XCTAssertEqual(value.windows.count, 2)
     }
 
     func testANSIColouredAccountStatusIsStrippedBeforeParsing() {
@@ -163,11 +182,88 @@ final class ExtensionStatusModelTests: XCTestCase {
         XCTAssertEqual(model.genericChips.map(\.value), ["Something happened", "Chrome ready"])
     }
 
+    /// `ponytail` is a real, named extension — not just an arbitrary unknown key — but it has
+    /// never been in `specialKeys`, so it has always been generic-chip-only. Named explicitly
+    /// here because the footer bar stopped rendering any generic chip: this is what proves
+    /// ponytail (and anything else generic) is still reachable for the inspector and nowhere
+    /// else.
+    func testPonytailIsAGenericChipNeverASpecialOne() {
+        let model = ExtensionStatusModel(values: [
+            "codex-account": "a@b.co 5h:78%",
+            "ponytail": "\u{26A1} FULL"
+        ], isLive: true)
+        XCTAssertEqual(model.genericChips.map(\.key), ["ponytail"])
+        XCTAssertFalse(ExtensionStatusParser.specialKeys.contains("ponytail"))
+    }
+
     func testEmptyGenericValuesAreDropped() {
         let model = ExtensionStatusModel(values: ["a": "", "b": "value"], isLive: false)
         XCTAssertEqual(model.genericChips.map(\.key), ["b"])
         XCTAssertFalse(model.isEmpty)
         XCTAssertTrue(ExtensionStatusModel().isEmpty)
+    }
+}
+
+final class CodexAccountResolutionTests: XCTestCase {
+    private let good = CodexAccountStatus(account: "a@b.co", windows: [CodexUsageWindow(label: "5h", remainingPercent: 78)], bankedResetCount: nil, bankedResetExpiry: nil)
+
+    func testFreshDataIsNeverStale() {
+        let resolved = CodexAccountResolution.resolve(raw: "a@b.co 5h:78%", previousGood: nil)
+        XCTAssertEqual(resolved?.status.account, "a@b.co")
+        XCTAssertEqual(resolved?.isStale, false)
+    }
+
+    func testDegradedRawFallsBackToPreviousGoodMarkedStale() {
+        let resolved = CodexAccountResolution.resolve(raw: "Codex account: loading", previousGood: good)
+        XCTAssertEqual(resolved?.status, good)
+        XCTAssertEqual(resolved?.isStale, true)
+    }
+
+    func testMissingRawAlsoFallsBackToPreviousGood() {
+        let resolved = CodexAccountResolution.resolve(raw: nil, previousGood: good)
+        XCTAssertEqual(resolved?.status, good)
+        XCTAssertEqual(resolved?.isStale, true)
+    }
+
+    func testNothingEverKnownResolvesToNilRatherThanAPlaceholder() {
+        XCTAssertNil(CodexAccountResolution.resolve(raw: "Codex account: loading", previousGood: nil))
+        XCTAssertNil(CodexAccountResolution.resolve(raw: nil, previousGood: nil))
+    }
+
+    /// A fresh parse always wins over memory, even if it differs from the last known value —
+    /// the account genuinely changed (e.g. signed into a different one).
+    func testFreshDataOverridesPreviousGood() {
+        let resolved = CodexAccountResolution.resolve(raw: "new@b.co 7d:10%", previousGood: good)
+        XCTAssertEqual(resolved?.status.account, "new@b.co")
+        XCTAssertEqual(resolved?.isStale, false)
+    }
+
+    /// End-to-end through `ExtensionStatusModel`, using an isolated `CodexAccountMemory`
+    /// instance so this test never depends on (or pollutes) the shared singleton other call
+    /// sites use.
+    func testModelRemembersTheLastGoodAccountAcrossAPlaceholderBlip() {
+        let memory = CodexAccountMemory()
+
+        let live = ExtensionStatusModel(values: ["codex-account": "a@b.co 5h:78%"], isLive: true)
+        let liveResolved = live.resolvedCodexAccount(memory: memory)
+        XCTAssertEqual(liveResolved?.status.account, "a@b.co")
+        XCTAssertEqual(liveResolved?.isStale, false)
+        XCTAssertEqual(memory.lastGood?.account, "a@b.co", "A fresh parse is remembered immediately")
+
+        let loading = ExtensionStatusModel(values: ["codex-account": "Codex account: loading"], isLive: true)
+        let loadingResolved = loading.resolvedCodexAccount(memory: memory)
+        XCTAssertEqual(loadingResolved?.status.account, "a@b.co", "Stays on the last real account instead of a placeholder")
+        XCTAssertEqual(loadingResolved?.isStale, true)
+
+        let neverKnown = ExtensionStatusModel(values: ["codex-account": "Codex account: loading"], isLive: true)
+        XCTAssertNil(neverKnown.resolvedCodexAccount(memory: CodexAccountMemory()), "A fresh instance with nothing remembered shows nothing, not a placeholder")
+    }
+
+    func testMemoryRememberOverwritesThePreviousValue() {
+        let memory = CodexAccountMemory(lastGood: good)
+        let newer = CodexAccountStatus(account: "c@d.co", windows: [], bankedResetCount: nil, bankedResetExpiry: nil)
+        memory.remember(newer)
+        XCTAssertEqual(memory.lastGood, newer)
     }
 }
 

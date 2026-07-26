@@ -3,46 +3,25 @@ import SwiftUI
 struct StatusBarView: View {
     @EnvironmentObject private var store: AppStore
 
-    private var metrics: TokenMetrics { store.selectedMetrics }
     private var statuses: ExtensionStatusModel { store.statusModel }
 
     var body: some View {
         HStack(spacing: PiTheme.space10) {
             RuntimeStateLabel()
 
-            // Token counts live in the hover detail; the bar itself carries the number that
-            // actually matters at a glance. A conversation that has not cost anything yet says
-            // nothing at all.
-            if metrics.total > 0 || metrics.cost > 0 {
-                CostLabel(metrics: metrics)
-            }
-
-            if let percent = metrics.contextPercent {
-                HStack(spacing: PiTheme.space4) {
-                    ProgressView(value: min(100, max(0, percent)), total: 100)
-                        .progressViewStyle(.linear)
-                        .frame(width: 44)
-                    Text("\(Int(percent))%")
-                        .font(PiFont.micro.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Context window usage")
-                .accessibilityValue("\(Int(percent)) percent")
-                .help("Context window usage")
-            }
-
             Spacer(minLength: PiTheme.space8)
 
-            // Pi TUI footer parity, driven entirely by verified extension status keys.
-            if let account = statuses.codexAccount {
-                CodexAccountControl(account: account, isLive: statuses.isLive)
+            // Pi TUI footer parity, driven entirely by verified extension status keys. Cost and
+            // the context meter live in the inspector now; the bar's vocabulary stays closed to
+            // state, account, fast-priority, thinking, and model — a generic or unrecognised
+            // chip (ponytail included) never reaches it, only the inspector's full list does.
+            if statuses.values[ExtensionStatusParser.codexAccountKey] != nil {
+                CodexAccountControl(account: statuses.codexAccount, isLive: statuses.isLive, isStale: statuses.codexAccountIsStale)
                 StatusSeparator()
             }
             if let fast = statuses.fastPriority {
                 FastPriorityControl(status: fast, isLive: statuses.isLive)
             }
-            GenericStatusChips(chips: statuses.genericChips, isLive: statuses.isLive)
 
             StatusSeparator()
 
@@ -113,55 +92,6 @@ private struct RuntimeStateLabel: View {
     }
 }
 
-// MARK: - Cost
-
-/// Cost is the headline; the token breakdown is one hover away.
-private struct CostLabel: View {
-    let metrics: TokenMetrics
-
-    var body: some View {
-        Text(NumberFormatting.cost(metrics.cost))
-            .font(PiFont.micro.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Session cost")
-            .accessibilityValue(NumberFormatting.cost(metrics.cost))
-            .hoverPopover {
-                VStack(alignment: .leading, spacing: PiTheme.space6) {
-                    PiSectionHeader(title: "Session", trailing: NumberFormatting.cost(metrics.cost))
-                    MetricDetailRow(title: "Input", value: metrics.input)
-                    MetricDetailRow(title: "Output", value: metrics.output)
-                    MetricDetailRow(title: "Cache read", value: metrics.cacheRead)
-                    MetricDetailRow(title: "Cache write", value: metrics.cacheWrite)
-                    if let hit = metrics.latestCacheHitPercent {
-                        MetricDetailRow(title: "Cache hit", text: "\(Int(hit.rounded()))%")
-                    }
-                    if let percent = metrics.contextPercent {
-                        MetricDetailRow(title: "Context", text: "\(Int(percent.rounded()))%")
-                    }
-                }
-                .padding(PiTheme.space16)
-                .frame(width: 220)
-            }
-    }
-}
-
-private struct MetricDetailRow: View {
-    let title: String
-    var value: Int?
-    var text: String?
-
-    var body: some View {
-        HStack(spacing: PiTheme.space8) {
-            Text(title).font(PiFont.caption).foregroundStyle(.secondary)
-            Spacer(minLength: PiTheme.space8)
-            Text(text ?? NumberFormatting.tokens(value ?? 0))
-                .font(PiFont.caption.monospacedDigit())
-        }
-        .accessibilityElement(children: .combine)
-    }
-}
-
 // MARK: - Hover popover
 
 /// Hover-to-reveal detail that stays open while the pointer travels into it. A plain
@@ -209,28 +139,32 @@ extension View {
 // MARK: - codex-account
 
 private struct CodexAccountControl: View {
-    let account: CodexAccountStatus
+    /// Nil only when the extension key has never once resolved to real data — the neutral
+    /// placeholder case. Loading/degraded wire values fall back to the last known account
+    /// upstream in `ExtensionStatusModel`, so `nil` here specifically means "never known".
+    let account: CodexAccountStatus?
     let isLive: Bool
+    let isStale: Bool
     @State private var showingDetail = false
 
     var body: some View {
         Button { showingDetail = true } label: {
             HStack(spacing: PiTheme.space4) {
-                Image(systemName: account.isLow ? "exclamationmark.triangle.fill" : "person.crop.circle")
+                Image(systemName: symbolName)
                     .font(.system(size: 9, weight: .medium))
-                Text(account.account)
+                Text(account?.account ?? "Codex account")
                     .lineLimit(1)
                     .truncationMode(.middle)
-                if let remaining = account.compactRemaining {
+                if let remaining = account?.compactRemaining {
                     Text(remaining).monospacedDigit()
                 }
-                if let reset = account.compactReset {
+                if let reset = account?.compactReset {
                     Text(reset).monospacedDigit()
                 }
             }
             .font(PiFont.micro)
             .foregroundStyle(tint)
-            .opacity(isLive ? 1 : 0.55)
+            .opacity(isLive && !isStale ? 1 : 0.55)
             .frame(maxWidth: 260, alignment: .trailing)
             .contentShape(Rectangle())
         }
@@ -242,17 +176,25 @@ private struct CodexAccountControl: View {
         }
         .help(helpText)
         .accessibilityLabel("Codex account usage")
-        .accessibilityValue(account.detailLines.joined(separator: ", "))
+        .accessibilityValue(account?.detailLines.joined(separator: ", ") ?? "Not yet available")
+    }
+
+    private var symbolName: String {
+        guard let account else { return "person.crop.circle" }
+        return account.isLow ? "exclamationmark.triangle.fill" : "person.crop.circle"
     }
 
     private var tint: Color {
+        guard let account else { return .secondary }
         if account.isLow { return .piRed }
         if account.isWarning { return .piOrange }
         return .secondary
     }
 
     private var helpText: String {
-        (isLive ? account.detailLines : account.detailLines + ["Last known values"]).joined(separator: "\n")
+        guard let account else { return "Codex account status is not available yet" }
+        let lines = (isLive && !isStale) ? account.detailLines : account.detailLines + ["Last known values"]
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -290,39 +232,6 @@ private struct FastPriorityControl: View {
 }
 
 // MARK: - unknown keys
-
-/// Unknown status keys keep rendering generically, so a newly installed extension is visible
-/// without a code change.
-private struct GenericStatusChips: View {
-    let chips: [(key: String, value: String)]
-    let isLive: Bool
-
-    var body: some View {
-        if !chips.isEmpty {
-            HStack(spacing: PiTheme.space8) {
-                ForEach(chips.prefix(3), id: \.key) { chip in
-                    Text(chip.value)
-                        .font(PiFont.micro)
-                        .foregroundStyle(.secondary)
-                        .opacity(isLive ? 1 : 0.55)
-                        .lineLimit(1)
-                        .help("\(chip.key): \(chip.value)")
-                }
-                if chips.count > 3 {
-                    Menu {
-                        ForEach(chips.dropFirst(3), id: \.key) { chip in
-                            Text("\(chip.key): \(chip.value)")
-                        }
-                    } label: {
-                        Text("+\(chips.count - 3)")
-                            .font(PiFont.micro.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                }
-            }
-        }
-    }
-}
+//
+// Deliberately absent: unknown/generic extension chips (ponytail included) no longer render in
+// the footer. `ExtensionStatusModel.genericChips` still exists for the inspector's full list.

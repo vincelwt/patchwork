@@ -27,8 +27,20 @@ extension AppStore {
         return composerOptionsLoading ? "loading" : "unavailable"
     }
 
+    /// The RPC model list narrowed to what Pi itself has enabled in `settings.json`. Falls
+    /// back to the unfiltered list whenever there is no scoping information to read — degrade
+    /// to "show everything", never to "show nothing".
+    var scopedModels: [AvailableModel] {
+        PiModelScope.scoped(
+            availableModels,
+            by: PiModelScopeCache.shared.current(),
+            currentProvider: currentProviderID,
+            currentModelID: currentModelID
+        )
+    }
+
     var modelPickerPresentation: RuntimePickerPresentation {
-        .model(attached: isCurrentRouteRuntime, models: availableModels, loading: composerOptionsLoading)
+        .model(attached: isCurrentRouteRuntime, models: scopedModels, loading: composerOptionsLoading)
     }
 
     var thinkingPickerPresentation: RuntimePickerPresentation {
@@ -90,7 +102,7 @@ struct ModelPickerControl: View {
             switch store.modelPickerPresentation {
             case .menu:
                 Menu {
-                    ForEach(store.availableModels) { model in
+                    ForEach(store.scopedModels) { model in
                         Button { store.setModel(model) } label: {
                             if model.provider == store.currentProviderID && model.modelID == store.currentModelID {
                                 Label(model.compactLabel, systemImage: "checkmark")
