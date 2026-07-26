@@ -133,6 +133,9 @@ struct ThinkingBlockView: View {
 /// One turn's work: live and open while Pi is working, one quiet “Worked for …” line with a
 /// separator once it has answered. This is the transcript's only rhythm marker between turns.
 struct TranscriptWorkView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload) -> Void
 
@@ -180,21 +183,28 @@ struct TranscriptWorkView: View {
                         .fill(Color.piHairline)
                         .frame(width: PiTheme.hairline)
                     VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                        ForEach(block.entries) { entry in
-                            switch entry {
-                            case let .thinking(value):
-                                ThinkingBlockView(text: value.text, streaming: value.streaming)
-                            case let .activity(group):
-                                TranscriptActivityGroupView(group: group, onImage: onImage)
-                            case let .note(message):
-                                WorkNoteView(message: message, onImage: onImage)
+                        ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
+                            Group {
+                                switch entry {
+                                case let .thinking(value):
+                                    ThinkingBlockView(text: value.text, streaming: value.streaming)
+                                case let .activity(group):
+                                    TranscriptActivityGroupView(group: group, onImage: onImage)
+                                case let .note(message):
+                                    WorkNoteView(message: message, onImage: onImage)
+                                }
                             }
+                            .opacity(entryOpacity(at: index))
+                            .transition(.opacity)
                         }
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
+                .transition(.opacity)
             }
         }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
         // A turn that starts working again owns its own disclosure once more, so a stale
         // collapse can never hide live work.
         .onChange(of: block.isActive) { _, active in
@@ -203,6 +213,11 @@ struct TranscriptWorkView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
         .accessibilityValue(isOpen ? "expanded" : "collapsed")
+    }
+
+    private func entryOpacity(at index: Int) -> Double {
+        guard block.isActive, !reduceTransparency else { return 1 }
+        return max(0.45, 1 - 0.15 * Double(block.entries.count - index - 1))
     }
 
     @ViewBuilder

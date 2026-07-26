@@ -75,6 +75,26 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(group.progressText, "Step 2 of 2")
     }
 
+    func testLiveWorkCollapsesAsAnswerStartsStreaming() throws {
+        let messages = [
+            user(id: "u", text: "Run it", at: nil),
+            assistant(id: "a", blocks: [call("c", "bash", ["command": .string("swift test")])]),
+            result(id: "r", callID: "c", text: "ok")
+        ]
+
+        let items = TranscriptPresenter.items(
+            messages: messages,
+            streaming: assistant(id: "stream", blocks: [text("Everything passes.")])
+        )
+
+        XCTAssertEqual(items.count, 3)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertFalse(block.isActive, "The work log collapses when the answer starts")
+        guard case let .message(answer, streaming) = items[2] else { return XCTFail("Expected the streaming answer") }
+        XCTAssertTrue(streaming)
+        XCTAssertEqual(answer.textContent, "Everything passes.")
+    }
+
     func testFailedResultRemainsVisibleInCollapsedGroupData() throws {
         let messages = [
             assistant(id: "a", blocks: [call("c", "edit", ["path": .string("A.swift")])]),
