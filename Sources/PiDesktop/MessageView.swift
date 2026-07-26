@@ -18,6 +18,8 @@ struct MessageView: View {
     /// and resubmit" affordance next to the existing copy action on answers.
     var onEdit: (() -> Void)? = nil
     @State private var hovering = false
+    /// Reported by the answer's AppKit text view, which owns the pointer while it is over prose.
+    @State private var textHovering = false
 
     var body: some View {
         Group {
@@ -64,7 +66,7 @@ struct MessageView: View {
             blockList(showThinking: true, isAnswer: true)
             if showsActions, !isStreaming, !message.textContent.isEmpty {
                 MessageActionRow(message: message)
-                    .opacity(hovering ? 1 : 0)
+                    .opacity(hovering || textHovering ? 1 : 0)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -84,7 +86,7 @@ struct MessageView: View {
                     // boundaries; every other text use (user bubble, narration, streaming) keeps
                     // the existing per-block SwiftUI renderer.
                     if isAnswer, !isStreaming {
-                        MarkdownAnswerText(text: text)
+                        MarkdownAnswerText(text: text, onHoverChange: { textHovering = $0 })
                     } else {
                         MarkdownBlockView(text: text, streaming: isStreaming, fillWidth: fillWidth)
                     }

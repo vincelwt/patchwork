@@ -24,7 +24,10 @@ enum MarkdownBlock: Equatable, Identifiable, Sendable {
         case let .quote(text): "q:\(text.hashValue)"
         case let .code(language, code): "c\(language ?? "-"):\(code.hashValue)"
         case let .table(header, _, rows): "t:\(header.hashValue):\(rows.count):\(rows.hashValue)"
-        case .rule: "hr:\(UUID().uuidString)"
+        // Deterministic: a fresh UUID here handed SwiftUI a brand-new identity on every single
+        // render, which recycled views mid-layout and left stale text painted over new content.
+        // Uniqueness within a list comes from the position callers pair with this id.
+        case .rule: "hr"
         }
     }
 }

@@ -15,7 +15,7 @@ final class SelectableAnswerTextTests: XCTestCase {
         let blocks: [MarkdownBlock] = [.paragraph("one"), .list(items: [], ordered: false, start: 1), .paragraph("two")]
         let runs = MarkdownAnswerPartitioner.runs(from: blocks)
         XCTAssertEqual(runs.count, 1)
-        guard case let .text(grouped) = runs[0] else { return XCTFail("Expected one text run") }
+        guard case let .text(grouped, _) = runs[0] else { return XCTFail("Expected one text run") }
         XCTAssertEqual(grouped.count, 3)
     }
 
@@ -142,5 +142,29 @@ final class SelectableAnswerTextTests: XCTestCase {
         let built = AnswerAttributedTextBuilder.build(blocks: [], size: PiFont.bodySize)
         XCTAssertEqual(built.attributedString.length, 0)
         XCTAssertTrue(built.codeBlocks.isEmpty)
+    }
+}
+
+final class MarkdownRunIdentityTests: XCTestCase {
+    /// A thematic break used to mint a fresh UUID every time its `id` was read, so SwiftUI saw a
+    /// brand-new view on every render and left stale text painted over new content.
+    func testBlockIdentityIsStableAcrossReads() {
+        let rule = MarkdownBlock.rule
+        XCTAssertEqual(rule.id, rule.id)
+        let paragraph = MarkdownBlock.paragraph("hello")
+        XCTAssertEqual(paragraph.id, MarkdownBlock.paragraph("hello").id)
+    }
+
+    func testRepeatedContentStillGetsDistinctRunIdentities() {
+        let table = MarkdownBlock.table(header: ["a"], alignment: [.leading], rows: [["1"]])
+        let blocks: [MarkdownBlock] = [
+            .paragraph("same"), table, .paragraph("same"), table, .rule, .rule
+        ]
+        let runs = MarkdownAnswerPartitioner.runs(from: blocks)
+        let ids = runs.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "identical content must not collide into one view")
+
+        // And the identity has to be stable when the same blocks are partitioned again.
+        XCTAssertEqual(MarkdownAnswerPartitioner.runs(from: blocks).map(\.id), ids)
     }
 }
