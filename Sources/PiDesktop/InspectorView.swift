@@ -175,25 +175,32 @@ private struct CapabilitySection: View {
 private struct ActivitySection: View {
     let title: String
     let items: [ActivityItem]
-    @State private var showAll = false
+    @State private var showFinished = false
 
     private var active: [ActivityItem] { items.filter { $0.status == .running || $0.status == .waiting || $0.status == .queued } }
-    private var inactive: [ActivityItem] { items.filter { !active.contains($0) } }
-    private var visible: [ActivityItem] {
-        if showAll { return active + inactive }
-        return active + Array(inactive.prefix(max(0, 6 - active.count)))
-    }
+    private var finished: [ActivityItem] { items.filter { !active.contains($0) } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space6) {
-            PiSectionHeader(title: title, trailing: active.isEmpty ? nil : "\(active.count) active")
-            ForEach(visible) { ActivityRow(item: $0) }
-            if items.count > visible.count {
-                MoreButton(title: "Show \(items.count - visible.count) more") { showAll = true }
-            } else if showAll, items.count > 6 {
-                MoreButton(title: "Show less") { showAll = false }
+            // Only what is currently running gets a full section; a finished item collapses into
+            // one quiet summary row instead of padding the inspector with a stale history.
+            if !active.isEmpty {
+                PiSectionHeader(title: title, trailing: "\(active.count) active")
+                ForEach(active) { ActivityRow(item: $0) }
+            }
+            if !finished.isEmpty {
+                DisclosureButton(title: showFinished ? "Hide finished" : summaryTitle, expanded: showFinished) {
+                    showFinished.toggle()
+                }
+                if showFinished { ForEach(finished) { ActivityRow(item: $0) } }
             }
         }
+    }
+
+    /// Nothing running: the summary row carries the section title itself, so an idle section is
+    /// one line instead of a header sitting over an empty list.
+    private var summaryTitle: String {
+        active.isEmpty ? "\(title) \u{b7} \(finished.count) done" : "\(finished.count) done"
     }
 }
 

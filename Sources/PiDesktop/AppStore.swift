@@ -35,6 +35,52 @@ struct DraftRecovery {
     }
 }
 
+/// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
+/// bound across months of use. Recency is tracked purely in memory (never persisted itself);
+/// a dictionary loaded over the cap — e.g. from hand-edited state — is trimmed back into bounds
+/// immediately.
+struct DraftStore {
+    static let maxDraftLength = 20_000
+    static let maxRetainedDrafts = 200
+
+    private(set) var texts: [String: String]
+    private var touchOrder: [String]
+
+    init(texts: [String: String] = [:]) {
+        let order = Array(texts.keys).suffix(Self.maxRetainedDrafts)
+        touchOrder = Array(order)
+        self.texts = Dictionary(uniqueKeysWithValues: order.map { ($0, texts[$0] ?? "") })
+    }
+
+    func text(for key: String) -> String { texts[key] ?? "" }
+
+    /// Empty text removes the entry outright rather than retaining a blank placeholder. Returns
+    /// any keys evicted by this write so the caller can drop their parked attachments too.
+    @discardableResult
+    mutating func set(_ text: String, for key: String) -> [String] {
+        let bounded = text.count <= Self.maxDraftLength ? text : String(text.prefix(Self.maxDraftLength))
+        guard !bounded.isEmpty else {
+            remove(key)
+            return []
+        }
+        texts[key] = bounded
+        touchOrder.removeAll { $0 == key }
+        touchOrder.append(key)
+        var evicted: [String] = []
+        while touchOrder.count > Self.maxRetainedDrafts {
+            let stale = touchOrder.removeFirst()
+            texts.removeValue(forKey: stale)
+            evicted.append(stale)
+        }
+        return evicted
+    }
+
+    mutating func remove(_ key: String) {
+        texts.removeValue(forKey: key)
+        touchOrder.removeAll { $0 == key }
+    }
+}
+
 @MainActor
 final class AppStore: ObservableObject {
     @Published var sessions: [SessionSummary] = []
@@ -107,6 +153,20 @@ final class AppStore: ObservableObject {
     private var probeTask: Task<Void, Never>?
     private var probeStatuses: [String: String] = [:]
     private var appCancellables: Set<AnyCancellable> = []
+    private let notificationService: NotificationPresenting
+    private let isActiveOverride: Bool?
+    /// Sentinel draft key for the new-chat route; every session route keys off its own
+    /// standardized file path instead.
+    private static let newChatDraftKey = "new-chat"
+    private var draftStore: DraftStore
+    /// Per-conversation attachments, restored while the app keeps running but never persisted:
+    /// image bytes must never reach `state.json`.
+    private var attachmentsByKey: [String: [ImageAttachment]] = [:]
+    private var draftPersistTask: Task<Void, Never>?
+    private var notificationCoalescer = NotificationCoalescer()
+    /// Last seen state per tracked session path, purely to detect a running→idle transition for
+    /// conversations finishing in another terminal.
+    private var previousActivityStates: [String: SessionRunState] = [:]
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -115,7 +175,9 @@ final class AppStore: ObservableObject {
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
-        probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil
+        probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil,
+        notificationService: NotificationPresenting? = nil,
+        isActiveOverride: Bool? = nil
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -124,16 +186,37 @@ final class AppStore: ObservableObject {
         self.activityPresenter = activityPresenter
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
         self.probeRuntimeFactory = probeRuntimeFactory
+        self.notificationService = notificationService ?? NotificationService()
+        self.isActiveOverride = isActiveOverride
         selectedFolder = Self.nowhereFolderURL
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
+        draftStore = DraftStore(texts: self.persistence.state.drafts)
+        draft = draftStore.text(for: Self.newChatDraftKey)
 
         runtime.onEvent = { [weak self] value in self?.handleRPCEvent(value) }
         runtime.onExit = { [weak self] error in self?.handleRuntimeExit(error) }
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in self?.refreshSelectedGit() }
             .store(in: &appCancellables)
+        NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .store(in: &appCancellables)
+        NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .store(in: &appCancellables)
         self.activityMonitor.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &appCancellables)
+        self.activityMonitor.$activities
+            .sink { [weak self] activities in self?.handleActivitySnapshot(activities) }
+            .store(in: &appCancellables)
+        self.notificationService.onSelectSession = { [weak self] path in self?.focusSession(atPath: path) }
+        $draft
+            .dropFirst()
+            .sink { [weak self] text in
+                guard let self else { return }
+                persistDraftText(text, for: currentDraftKey)
+            }
             .store(in: &appCancellables)
     }
 
@@ -154,7 +237,8 @@ final class AppStore: ObservableObject {
     }
 
     /// `NSApplication.shared` rather than the `NSApp` global so headless test hosts stay safe.
-    private var isApplicationActive: Bool { NSApplication.shared.isActive }
+    /// `isActiveOverride` keeps notification frontmost/background rules deterministic in tests.
+    private var isApplicationActive: Bool { isActiveOverride ?? NSApplication.shared.isActive }
 
     var isSelectedRuntime: Bool {
         guard let selectedSession else { return false }
@@ -199,6 +283,51 @@ final class AppStore: ObservableObject {
         sessions
             .filter { !$0.isArchived && isRunning($0) }
             .sorted { liveModifiedAt($0) > liveModifiedAt($1) }
+    }
+
+    /// Detects a session transitioning running → idle in another terminal, the one completion
+    /// signal the RPC event stream can never see on its own.
+    private func handleActivitySnapshot(_ activities: [String: SessionActivity]) {
+        for (path, activity) in activities {
+            let previous = previousActivityStates.updateValue(activity.state, forKey: path)
+            guard previous == .running, activity.state == .idle else { continue }
+            guard let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
+            let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
+            notify(failed ? .turnFailed : .turnFinished, session: session)
+        }
+        if previousActivityStates.count > activities.count {
+            previousActivityStates = previousActivityStates.filter { activities[$0.key] != nil }
+        }
+    }
+
+    /// The session behind whichever runtime is currently attached, if any — the only session the
+    /// RPC event stream (as opposed to the file-based monitor) can ever be reporting about.
+    private func activeSession() -> SessionSummary? {
+        guard let activeRuntimePath else { return nil }
+        return sessions.first { $0.fileURL.standardizedFileURL.path == activeRuntimePath }
+    }
+
+    /// Single entry point for every notification trigger: applies the "don't tell me about what
+    /// I'm already looking at" rule, coalesces bursts, then routes to a toast (frontmost) or a
+    /// desktop notification (backgrounded).
+    private func notify(_ trigger: NotificationTrigger, session: SessionSummary?) {
+        guard let session else { return }
+        let key = session.fileURL.standardizedFileURL.path
+        let focusedKey = isApplicationActive ? selectedSession?.fileURL.standardizedFileURL.path : nil
+        guard !NotificationGate.isSuppressed(sessionKey: key, focusedSessionKey: focusedKey) else { return }
+        guard notificationCoalescer.shouldEmit(sessionKey: key) else { return }
+        if isApplicationActive {
+            showToast("\(session.displayName): \(trigger.summary)", style: trigger.toastStyle)
+        } else {
+            notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: trigger.summary)
+        }
+    }
+
+    /// A clicked desktop notification's destination: bring the conversation on screen exactly
+    /// like picking it from the sidebar would.
+    private func focusSession(atPath path: String) {
+        guard let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { return }
+        selectSession(session)
     }
 
     // MARK: - Extension statuses
@@ -273,6 +402,8 @@ final class AppStore: ObservableObject {
 
     func openNewChat() {
         if let selectedSession { markRead(selectedSession) }
+        parkCurrentDraft()
+        flushDraftPersistence()
         cancelConversationLoad()
         route = .newChat
         conversationError = nil
@@ -281,16 +412,17 @@ final class AppStore: ObservableObject {
         activities.removeAll(keepingCapacity: false)
         activeCapability = nil
         pendingQuestionnaire = nil
-        draft = ""
-        attachments = []
+        draft = draftStore.text(for: Self.newChatDraftKey)
+        attachments = attachmentsByKey[Self.newChatDraftKey] ?? []
         // Release the previous conversation's decoded bitmaps promptly.
         DecodedImageCache.purge()
         selectedFolder = Self.nowhereFolderURL
         refreshSelectedGit()
     }
 
-    func selectSession(_ session: SessionSummary, preserveDraft: Bool = false) {
+    func selectSession(_ session: SessionSummary) {
         if let current = selectedSession, current.id != session.id { markRead(current) }
+        parkCurrentDraft()
         cancelConversationLoad()
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
@@ -302,7 +434,10 @@ final class AppStore: ObservableObject {
         activities.removeAll(keepingCapacity: false)
         activeCapability = nil
         pendingQuestionnaire = nil
-        if !preserveDraft { draft = ""; attachments = [] }
+        let draftKey = session.fileURL.standardizedFileURL.path
+        draft = draftStore.text(for: draftKey)
+        attachments = attachmentsByKey[draftKey] ?? []
+        flushDraftPersistence()
         isConversationLoading = true
         DecodedImageCache.purge()
         selectedGit = folderGit[session.cwd.standardizedFileURL.path] ?? .none
@@ -329,7 +464,9 @@ final class AppStore: ObservableObject {
 
     func retryConversationLoad() {
         guard let selectedSession else { return }
-        selectSession(selectedSession, preserveDraft: true)
+        // Reselecting the same session parks and immediately restores the identical draft, so
+        // the composer is left untouched.
+        selectSession(selectedSession)
     }
 
     func chooseFolder(_ url: URL) {
@@ -356,6 +493,52 @@ final class AppStore: ObservableObject {
 
     private func syncActivityMonitorPaths() {
         activityMonitor.setTrackedPaths(sessions.map { $0.fileURL.standardizedFileURL.path })
+        activityMonitor.setSessionCwds(Dictionary(
+            sessions.map { ($0.fileURL.standardizedFileURL.path, $0.cwd.standardizedFileURL.path) },
+            uniquingKeysWith: { first, _ in first }
+        ))
+    }
+
+    // MARK: - Draft persistence
+
+    /// The route's draft key: a session's own standardized path, or the shared new-chat
+    /// sentinel. Computed fresh from `route`/`sessions` so it always matches what is on screen.
+    private var currentDraftKey: String {
+        selectedSession?.fileURL.standardizedFileURL.path ?? Self.newChatDraftKey
+    }
+
+    /// Hands the outgoing route's live composer state to the draft store before switching away,
+    /// so it can be restored later. Attachments are parked in memory only; they never persist.
+    private func parkCurrentDraft() {
+        let key = currentDraftKey
+        persistDraftText(draft, for: key)
+        if attachments.isEmpty { attachmentsByKey.removeValue(forKey: key) } else { attachmentsByKey[key] = attachments }
+    }
+
+    private func persistDraftText(_ text: String, for key: String) {
+        let evicted = draftStore.set(text, for: key)
+        for stale in evicted { attachmentsByKey.removeValue(forKey: stale) }
+        scheduleDraftPersistence()
+    }
+
+    /// Idle typing debounce: writing `state.json` on every keystroke is unacceptable, so a burst
+    /// of edits collapses into one write after typing pauses.
+    private func scheduleDraftPersistence() {
+        draftPersistTask?.cancel()
+        draftPersistTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flushDraftPersistence()
+        }
+    }
+
+    /// Immediate write, used at the points a debounce must not delay: switching conversations,
+    /// the app resigning active, and termination.
+    private func flushDraftPersistence() {
+        draftPersistTask?.cancel()
+        draftPersistTask = nil
+        guard persistence.state.drafts != draftStore.texts else { return }
+        persistence.updateState { $0.drafts = draftStore.texts }
     }
 
     /// Inline composer attachments occupy U+FFFC placeholders in the text view; those never
@@ -1081,6 +1264,7 @@ final class AppStore: ObservableObject {
             activeCapability = nil
             streamingMessage = nil
             requestStats()
+            notify(messages.last?.isError == true ? .turnFailed : .turnFinished, session: activeSession())
             Task { await refreshSelectedSummary(); if isApplicationActive { refreshSelectedGit() } }
         case "message_update":
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
@@ -1095,6 +1279,12 @@ final class AppStore: ObservableObject {
             }
             mergeHistoryActivities()
         case "tool_execution_start":
+            // A question can be waiting in a conversation the user has since navigated away
+            // from; that must still notify even though its capability/questionnaire UI state
+            // (below) is only ever tracked for the selected runtime.
+            if event["toolName"]?.stringValue?.lowercased() == "ask_user_question" {
+                notify(.questionWaiting, session: activeSession())
+            }
             guard selected else { return }
             if let callID = event["toolCallId"]?.stringValue,
                let name = event["toolName"]?.stringValue {
@@ -1235,6 +1425,9 @@ final class AppStore: ObservableObject {
             if activeDialog == nil {
                 activeDialog = request
                 startDialogTimeout(for: request)
+                // `handleQuestionnaireRequest` already returned above for an ask_user_question
+                // dialog, so anything reaching here is a generic approval/permission prompt.
+                notify(.approvalNeeded, session: activeSession())
             }
         case "notify":
             let style = ToastMessage.Style(rawValue: event["notifyType"]?.stringValue ?? "info") ?? .info
@@ -1371,7 +1564,7 @@ final class AppStore: ObservableObject {
 
     deinit {
         gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel()
-        toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel()
+        toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         probeRuntime?.stop(); runtime.stop()
     }
 }
