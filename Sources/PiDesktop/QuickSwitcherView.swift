@@ -96,6 +96,8 @@ struct QuickSwitcherView: View {
             }
             .padding(.horizontal, PiTheme.space16)
             .frame(height: 26)
+            // The shortcuts are already spoken by the field and the rows.
+            .accessibilityHidden(true)
         }
         .frame(width: PiTheme.quickSwitchWidth)
         .background(Color.piTranscript, in: RoundedRectangle(cornerRadius: PiTheme.panelRadius, style: .continuous))
@@ -106,6 +108,9 @@ struct QuickSwitcherView: View {
         .shadow(color: .black.opacity(0.22), radius: 24, y: 10)
         .onChange(of: query) { _, _ in selection = 0 }
         .onExitCommand { isPresented = false }
+        // `contain` rather than a blanket label, otherwise every child inherits the palette
+        // name and VoiceOver repeats it once per hint chip.
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Quick conversation switcher")
     }
 
@@ -160,6 +165,17 @@ private struct QuickSwitchRow: View {
             in: RoundedRectangle(cornerRadius: PiTheme.radiusSmall, style: .continuous)
         )
         .padding(.horizontal, PiTheme.space6)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(selected ? "Selected" : "")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [session.displayName, folderName, modifiedAt.relativeShort]
+        if running { parts.append("running") }
+        if unread { parts.append("unread") }
+        return parts.joined(separator: ", ")
     }
 }
 

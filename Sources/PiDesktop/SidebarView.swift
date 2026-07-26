@@ -70,18 +70,20 @@ private struct SidebarActionRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: PiTheme.space8) {
+            HStack(spacing: PiTheme.space6) {
+                // Sits in the shared icon column, so the title starts on the sidebar text origin.
                 Image(systemName: symbol)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
+                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                 Text(title).font(PiFont.row)
-                Spacer()
+                Spacer(minLength: PiTheme.space4)
                 if !shortcut.isEmpty {
                     Text(shortcut).font(PiFont.micro).foregroundStyle(.tertiary)
                 }
             }
-            .padding(.horizontal, PiTheme.space8)
+            .padding(.leading, PiTheme.sidebarIconInset)
+            .padding(.trailing, PiTheme.space8)
             .frame(height: PiTheme.sidebarRowHeight)
             .contentShape(Rectangle())
             .piRowBackground(selected: false, hovering: hovering)
@@ -104,20 +106,28 @@ private struct SidebarFooter: View {
                 isPulsing: runningCount > 0
             )
             Text(label).font(PiFont.caption).foregroundStyle(.secondary).lineLimit(1)
+                .accessibilityLabel("Session activity")
+                .accessibilityValue(label)
             Spacer(minLength: PiTheme.space4)
             Button { Task { await store.refreshSessions() } } label: {
-                if store.isScanning { ProgressView().controlSize(.mini) }
-                else {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
+                Group {
+                    if store.isScanning { ProgressView().controlSize(.mini) }
+                    else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                // A 22pt square target, so the glyph size does not decide the hit area.
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .frame(width: 18, height: 18)
             .help("Refresh (⌘R)")
+            .accessibilityLabel("Refresh sessions")
         }
-        .padding(.horizontal, PiTheme.space12)
+        .padding(.leading, PiTheme.space12)
+        .padding(.trailing, PiTheme.space6)
         .frame(height: PiTheme.statusBarHeight)
     }
 
@@ -257,9 +267,12 @@ private struct ArchiveSection: View {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PiTheme.space6) {
                     PiChevron(expanded: isOpen)
-                    Image(systemName: "archivebox").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .frame(width: PiTheme.sidebarDisclosureColumn, alignment: .center)
+                    Image(systemName: "archivebox")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text("Archived").font(PiFont.captionEmphasis).foregroundStyle(.secondary)
-                    Spacer()
+                    Spacer(minLength: PiTheme.space4)
                     Text("\(groups.reduce(0) { $0 + $1.sessions.count })")
                         .font(PiFont.micro.monospacedDigit()).foregroundStyle(.tertiary)
                 }
@@ -304,8 +317,10 @@ private struct SessionFolderSection: View {
             } label: {
                 HStack(spacing: PiTheme.space6) {
                     PiChevron(expanded: isOpen)
+                        .frame(width: PiTheme.sidebarDisclosureColumn, alignment: .center)
                     Image(systemName: group.isVirtual ? "folder.fill" : "folder")
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
                         .font(PiFont.captionEmphasis).foregroundStyle(.secondary).lineLimit(1)
                     if hasRunning { StatusDot(color: .piGreen, isPulsing: true) }
@@ -383,16 +398,20 @@ private struct SessionRow: View {
     var body: some View {
         Button { store.selectSession(session) } label: {
             HStack(spacing: PiTheme.space6) {
-                if unread {
-                    Circle().fill(Color.accentColor).frame(width: 6, height: 6).accessibilityHidden(true)
-                }
+                // The unread dot lives in the shared icon column, so a thread title never shifts
+                // sideways when it is read.
+                Circle()
+                    .fill(unread ? Color.accentColor : Color.clear)
+                    .frame(width: 6, height: 6)
+                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
+                    .accessibilityHidden(true)
                 Text(session.displayName)
                     .font(selected ? PiFont.rowEmphasis : PiFont.row)
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: PiTheme.space4)
                 trailingAccessory
             }
-            .padding(.leading, PiTheme.space8 + PiTheme.space12)
+            .padding(.leading, PiTheme.sidebarIconInset)
             .padding(.trailing, PiTheme.space8)
             .frame(height: PiTheme.sidebarRowHeight)
             .contentShape(Rectangle())

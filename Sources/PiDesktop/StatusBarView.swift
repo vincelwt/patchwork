@@ -19,6 +19,9 @@ struct StatusBarView: View {
             Text(NumberFormatting.cost(metrics.cost))
                 .font(PiFont.micro.monospacedDigit())
                 .foregroundStyle(.secondary)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Session cost")
+                .accessibilityValue(NumberFormatting.cost(metrics.cost))
                 .help("Session cost")
 
             if let percent = metrics.contextPercent {
@@ -30,6 +33,9 @@ struct StatusBarView: View {
                         .font(PiFont.micro.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Context window usage")
+                .accessibilityValue("\(Int(percent)) percent")
                 .help("Context window usage")
             }
 
@@ -55,24 +61,9 @@ struct StatusBarView: View {
                     .help("Queued messages")
             }
 
-            Button(action: store.cycleThinkingLevel) {
-                Text(thinking)
-                    .font(PiFont.micro)
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(!store.isSelectedRuntime)
-            .help(store.isSelectedRuntime ? "Cycle thinking level" : "Thinking level")
+            ThinkingPickerControl(font: PiFont.micro)
 
-            Button(action: store.cycleModel) {
-                Text(model)
-                    .font(PiFont.micro)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .buttonStyle(.plain)
-            .disabled(!store.isSelectedRuntime)
-            .help(store.isSelectedRuntime ? "Cycle model" : model)
+            ModelPickerControl(font: PiFont.micro, maxWidth: 150)
         }
         .padding(.horizontal, PiTheme.space12)
         .frame(height: PiTheme.statusBarHeight)
@@ -82,16 +73,6 @@ struct StatusBarView: View {
         .accessibilityLabel("Pi session status")
     }
 
-    private var model: String {
-        if store.isSelectedRuntime {
-            return store.runtimeState.modelName ?? store.runtimeState.modelID ?? "Model"
-        }
-        return store.selectedSession?.model ?? "Model unavailable"
-    }
-    private var thinking: String {
-        if store.isSelectedRuntime { return store.runtimeState.thinkingLevel ?? "off" }
-        return store.selectedSession?.thinkingLevel ?? "off"
-    }
 }
 
 private struct StatusSeparator: View {
@@ -132,7 +113,23 @@ private struct RuntimeStateLabel: View {
                 label("Idle", symbol: "circle", tint: .secondary)
             }
         }
-        .help("Pi starts when you send a message")
+        .help(helpText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Session state")
+        .accessibilityValue(helpText)
+    }
+
+    private var helpText: String {
+        guard store.isSelectedRuntime else {
+            if let session = store.selectedSession, store.isRunning(session) {
+                return "This session is running outside Pi Desktop"
+            }
+            return "Not attached to a Pi runtime"
+        }
+        if store.runtimeState.isCompacting { return "Compacting the context window" }
+        if store.runtimeState.isRetrying { return "Retrying the last provider request" }
+        if store.runtimeState.isStreaming { return "Pi is working on this turn" }
+        return store.runtimeState.isConnected ? "Attached and ready" : "Not attached to a Pi runtime"
     }
 
     private func label(_ text: String, symbol: String, tint: Color) -> some View {
@@ -295,8 +292,9 @@ private struct FastPriorityControl: View {
             .font(PiFont.micro)
             .foregroundStyle(status.isActive ? Color.piGreen : Color.secondary)
             .opacity(isLive ? 1 : 0.55)
-            .padding(.horizontal, PiTheme.space4)
-            .frame(height: 16)
+            .padding(.horizontal, PiTheme.space6)
+            .frame(height: 20)
+            .contentShape(Rectangle())
             .background(
                 hovering ? Color.piHover : Color.clear,
                 in: RoundedRectangle(cornerRadius: PiTheme.radiusSmall, style: .continuous)
@@ -360,6 +358,9 @@ private struct MetricLabel: View {
         }
         .font(PiFont.micro)
         .foregroundStyle(.secondary)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(help)
+        .accessibilityValue(value)
         .help(help)
     }
 }

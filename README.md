@@ -7,15 +7,16 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 ## Features
 
-- Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a floating Environment inspector
+- Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a reserved Environment inspector column
 - Fast native search, app-local non-destructive archive/restore, rename from any idle session, HTML export, reveal, and compaction
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
-- Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, model and thinking controls
+- Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes
 - Input/output/cache-read/cache-write tokens, latest assistant cache-hit percentage, context usage, cost, provider/model, and extension status
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, drop, file attach, preview, remove, open, zoom, and save for images
 - Subagent/background-process lifecycle presentation and Pi extension UI dialogs/status/widgets/title/editor bridge
+- A native `ask_user_question` sheet with option cards, previews, custom answers, and header-chip navigation across buffered questions. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels
 
 No provider request is made when the app launches, browses sessions, inspects Git, or renames a session.

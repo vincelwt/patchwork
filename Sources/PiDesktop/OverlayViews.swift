@@ -150,7 +150,9 @@ private struct QuestionnaireDialogView: View {
                 Text(question.question)
                     .font(PiFont.title)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(question.multiSelect ? "Choose one or more options." : "Choose one option.")
+                Text(question.multiSelect
+                     ? "Choose any number of options, or continue with none selected."
+                     : "Choose one option.")
                     .font(PiFont.caption)
                     .foregroundStyle(.secondary)
             }
@@ -171,7 +173,7 @@ private struct QuestionnaireDialogView: View {
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Back") {
-                    if currentAnswer.isValid { store.saveQuestionnaireAnswer(currentAnswer, move: -1) }
+                    if answerIsValid { store.saveQuestionnaireAnswer(currentAnswer, move: -1) }
                     else { store.moveQuestionnaireBack() }
                 }
                 .disabled(currentIndex == 0)
@@ -179,12 +181,12 @@ private struct QuestionnaireDialogView: View {
                     Button("Next") { store.saveQuestionnaireAnswer(currentAnswer, move: 1) }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!currentAnswer.isValid)
+                        .disabled(!answerIsValid)
                 } else {
                     Button("Submit") { store.submitQuestionnaire(currentAnswer) }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!currentAnswer.isValid || !otherQuestionsAnswered)
+                        .disabled(!answerIsValid || !otherQuestionsAnswered)
                 }
             }
         }
@@ -203,18 +205,32 @@ private struct QuestionnaireDialogView: View {
         .accessibilityLabel("Questionnaire, question \(currentIndex + 1) of \(questionCount)")
     }
 
+    /// Chips move between locally buffered questions only, so the sequential RPC bridge is never
+    /// skipped ahead: forward jumps are offered once every earlier question is answered.
     private var headerTabs: some View {
         HStack(spacing: PiTheme.space6) {
             ForEach(Array(headers.enumerated()), id: \.offset) { index, header in
-                Text(header)
-                    .font(PiFont.micro.weight(index == currentIndex ? .semibold : .regular))
-                    .foregroundStyle(index == currentIndex ? Color.primary : Color.secondary)
-                    .padding(.horizontal, PiTheme.space8)
-                    .frame(height: 24)
-                    .background(index == currentIndex ? Color.piInsetStrong : Color.piInset, in: Capsule())
-                    .accessibilityLabel("\(header), question \(index + 1)\(index == currentIndex ? ", current" : "")")
+                let reachable = store.pendingQuestionnaire?.canNavigate(to: index) ?? false
+                Button { store.moveQuestionnaire(to: index, saving: currentAnswer) } label: {
+                    Text(header)
+                        .font(PiFont.micro.weight(index == currentIndex ? .semibold : .regular))
+                        .foregroundStyle(index == currentIndex ? Color.primary : Color.secondary)
+                        .padding(.horizontal, PiTheme.space8)
+                        .frame(height: 24)
+                        .contentShape(Capsule())
+                        .background(index == currentIndex ? Color.piInsetStrong : Color.piInset, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(!reachable || index == currentIndex)
+                .opacity(reachable || index == currentIndex ? 1 : 0.5)
+                .help(reachable ? "Go to \(header)" : "Answer the earlier questions first")
+                .accessibilityLabel("\(header), question \(index + 1) of \(questionCount)")
+                .accessibilityValue(index == currentIndex ? "Current" : (reachable ? "Available" : "Locked"))
             }
+            Spacer(minLength: 0)
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Questions")
     }
 
     private var choices: some View {
@@ -227,32 +243,52 @@ private struct QuestionnaireDialogView: View {
                 .accessibilityLabel("\(option.label). \(option.description)")
                 .accessibilityValue(selected.contains(option.id) && !usesCustom ? "Selected" : "Not selected")
             }
-            Button {
-                usesCustom = true
-                selected.removeAll()
-                customFocused = true
-                focusedOption = question.options.count
-            } label: {
-                HStack(alignment: .top, spacing: PiTheme.space10) {
-                    selectionSymbol(selected: usesCustom)
-                    VStack(alignment: .leading, spacing: PiTheme.space4) {
-                        Text("Type something.").font(PiFont.rowEmphasis)
-                        TextField("Your answer", text: $customText)
-                            .textFieldStyle(.plain)
-                            .focused($customFocused)
-                            .onTapGesture { usesCustom = true; selected.removeAll() }
-                            .onSubmit { submitOrAdvance() }
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(PiTheme.space10)
-                .contentShape(Rectangle())
-                .background(cardBackground(selected: usesCustom, focused: focusedOption == question.options.count))
+            customCard
+        }
+    }
+
+    /// The text field is a sibling of the activation button rather than nested inside it, so the
+    /// field keeps its own focus ring, caret, and hit area.
+    private var customCard: some View {
+        HStack(alignment: .top, spacing: PiTheme.space10) {
+            Button(action: activateCustom) {
+                selectionSymbol(selected: usesCustom)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Type something. Custom answer")
             .accessibilityValue(usesCustom ? "Selected" : "Not selected")
+
+            VStack(alignment: .leading, spacing: PiTheme.space4) {
+                Text("Type something.")
+                    .font(PiFont.rowEmphasis)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: activateCustom)
+                    .accessibilityHidden(true)
+                TextField("Your answer", text: $customText)
+                    .textFieldStyle(.plain)
+                    .font(PiFont.row)
+                    .focused($customFocused)
+                    .onSubmit { submitOrAdvance() }
+                    .accessibilityLabel("Custom answer text")
+            }
+            Spacer(minLength: 0)
         }
+        .padding(PiTheme.space10)
+        .background(cardBackground(selected: usesCustom, focused: focusedOption == question.options.count))
+        .onChange(of: customFocused) { _, focused in
+            guard focused else { return }
+            usesCustom = true
+            selected.removeAll()
+            focusedOption = question.options.count
+        }
+    }
+
+    private func activateCustom() {
+        usesCustom = true
+        selected.removeAll()
+        focusedOption = question.options.count
+        customFocused = true
     }
 
     private func optionCard(_ option: QuestionnaireOption) -> some View {
@@ -321,24 +357,25 @@ private struct QuestionnaireDialogView: View {
         )
     }
 
+    private var answerIsValid: Bool { currentAnswer.isValid(multiSelect: question.multiSelect) }
+
     private var otherQuestionsAnswered: Bool {
         guard let session = store.pendingQuestionnaire else { return false }
-        return session.answers.enumerated().allSatisfy { index, answer in
-            index == currentIndex || answer?.isValid == true
+        return session.questions.indices.allSatisfy { index in
+            index == currentIndex || session.isAnswerValid(at: index)
         }
     }
 
     private func choose(index: Int) {
         focusedOption = index
         if index == question.options.count {
-            usesCustom = true
-            selected.removeAll()
-            customFocused = true
+            activateCustom()
             return
         }
         guard question.options.indices.contains(index) else { return }
         usesCustom = false
         customText = ""
+        customFocused = false
         if question.multiSelect {
             if selected.contains(index) { selected.remove(index) }
             else { selected.insert(index) }
@@ -357,7 +394,7 @@ private struct QuestionnaireDialogView: View {
     }
 
     private func submitOrAdvance() {
-        guard currentAnswer.isValid else { return }
+        guard answerIsValid else { return }
         if currentIndex + 1 < questionCount { store.saveQuestionnaireAnswer(currentAnswer, move: 1) }
         else if otherQuestionsAnswered { store.submitQuestionnaire(currentAnswer) }
     }
