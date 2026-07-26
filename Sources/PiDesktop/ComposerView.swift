@@ -109,52 +109,13 @@ private struct ComposerToolbar: View {
 
             Spacer(minLength: PiTheme.space8)
 
-            Menu {
-                ForEach(store.availableThinkingLevels, id: \.self) { level in
-                    Button {
-                        store.setThinkingLevel(level)
-                    } label: {
-                        if level == thinkingLabel { Label(level.capitalized, systemImage: "checkmark") }
-                        else { Text(level.capitalized) }
-                    }
-                }
-            } label: {
-                Text(thinkingLabel.capitalized)
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .disabled(store.availableThinkingLevels.isEmpty || store.composerOptionsLoading)
-            .help("Thinking level")
+            ThinkingPickerControl()
 
-            Menu {
-                ForEach(store.availableModels) { model in
-                    Button {
-                        store.setModel(model)
-                    } label: {
-                        if model.provider == currentProvider && model.modelID == currentModelID {
-                            Label(model.compactLabel, systemImage: "checkmark")
-                        } else {
-                            Text(model.compactLabel)
-                        }
-                    }
-                    .help(model.detailLabel)
-                }
-            } label: {
-                Text(modelLabel)
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(maxWidth: 130)
-            }
-            .menuStyle(.borderlessButton)
-            .disabled(store.availableModels.isEmpty || store.composerOptionsLoading)
-            .help(modelHelp)
+            ModelPickerControl()
 
             if isStreaming, let onAbort {
                 IconButton(symbol: "stop.fill", help: "Stop Pi (⌘.)", action: onAbort)
+                    .accessibilityLabel("Stop Pi")
             }
 
             if isStreaming, let onSteer, let onFollowUp {
@@ -170,6 +131,7 @@ private struct ComposerToolbar: View {
                 .menuIndicator(.hidden)
                 .frame(width: 16)
                 .help("Choose delivery mode")
+                .accessibilityLabel("Delivery mode")
             }
 
             Button(action: onSend) {
@@ -182,25 +144,11 @@ private struct ComposerToolbar: View {
             .buttonStyle(.plain)
             .disabled(!canSend)
             .help(isStreaming ? "Steer current run" : "Send")
+            .accessibilityLabel(isStreaming ? "Steer current run" : "Send message")
         }
         .padding(.horizontal, PiTheme.space10)
         .padding(.bottom, PiTheme.space8)
         .padding(.top, PiTheme.space4)
-    }
-
-    private var thinkingLabel: String {
-        store.runtimeState.thinkingLevel ?? store.selectedSession?.thinkingLevel ?? "off"
-    }
-    private var modelLabel: String {
-        store.runtimeState.modelName
-            ?? store.runtimeState.modelID
-            ?? store.selectedSession?.model
-            ?? (store.composerOptionsLoading ? "Loading…" : "Model")
-    }
-    private var currentProvider: String? { store.runtimeState.provider ?? store.selectedSession?.provider }
-    private var currentModelID: String? { store.runtimeState.modelID ?? store.selectedSession?.model }
-    private var modelHelp: String {
-        currentProvider.map { "\($0) · \(modelLabel)" } ?? modelLabel
     }
 }
 

@@ -19,9 +19,20 @@ struct QuestionnaireAnswer: Equatable, Hashable, Sendable {
     var optionIndexes: Set<Int> = []
     var customText: String?
 
-    var isValid: Bool {
-        if let customText { return !customText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        return !optionIndexes.isEmpty
+    /// Custom text only counts once it has non-whitespace content.
+    var trimmedCustomText: String? {
+        guard let customText else { return nil }
+        let trimmed = customText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Validity depends on the question: the installed plugin accepts an intentionally empty
+    /// multi-select ("none of these"), which the bridge encodes as an empty RPC input. A
+    /// single-select answer still needs exactly one option or custom text.
+    func isValid(multiSelect: Bool) -> Bool {
+        if customText != nil { return trimmedCustomText != nil }
+        if multiSelect { return true }
+        return optionIndexes.count == 1
     }
 }
 
@@ -45,7 +56,24 @@ struct QuestionnaireSession: Equatable, Sendable {
     }
 
     var isLastVisibleQuestion: Bool { currentIndex == questions.count - 1 }
-    var allAnswered: Bool { !answers.isEmpty && answers.allSatisfy { $0?.isValid == true } }
+
+    /// A buffered answer is only complete when it satisfies its own question's rules.
+    func isAnswerValid(at index: Int) -> Bool {
+        guard questions.indices.contains(index), answers.indices.contains(index),
+              let answer = answers[index] else { return false }
+        return answer.isValid(multiSelect: questions[index].multiSelect)
+    }
+
+    var allAnswered: Bool { !questions.isEmpty && questions.indices.allSatisfy(isAnswerValid(at:)) }
+
+    /// Header chips navigate inside the locally buffered questionnaire only. Nothing is sent to
+    /// Pi while moving, so the sequential RPC bridge is untouched: going back is always safe,
+    /// and going forward requires every question before the target to already be answered.
+    func canNavigate(to index: Int) -> Bool {
+        guard !submitted, questions.indices.contains(index) else { return false }
+        if index <= currentIndex { return true }
+        return (0..<index).allSatisfy(isAnswerValid(at:))
+    }
 }
 
 enum QuestionnaireParser {
@@ -106,8 +134,8 @@ enum QuestionnaireRPCBridge {
         answer: QuestionnaireAnswer,
         request: ExtensionDialogRequest
     ) -> QuestionnaireResponsePlan? {
-        guard answer.isValid else { return nil }
-        if let custom = answer.customText?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+        guard answer.isValid(multiSelect: question.multiSelect) else { return nil }
+        if let custom = answer.trimmedCustomText {
             if question.multiSelect { return .value(custom) }
             let sentinelIndex = question.options.count
             guard request.options.indices.contains(sentinelIndex) else { return nil }
@@ -117,6 +145,7 @@ enum QuestionnaireRPCBridge {
         let indexes = answer.optionIndexes.sorted()
         guard indexes.allSatisfy({ question.options.indices.contains($0) }) else { return nil }
         if question.multiSelect {
+            // An empty selection encodes as an empty input, which the plugin reads as "none".
             return .value(indexes.map { String($0 + 1) }.joined(separator: ","))
         }
         guard indexes.count == 1, request.options.indices.contains(indexes[0]) else { return nil }

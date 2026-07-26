@@ -58,3 +58,28 @@ enum RuntimePickerState {
         return levels.first ?? "off"
     }
 }
+
+/// How a model/thinking control presents itself. The composer and the status bar share this so
+/// exact choices are discoverable in both places, and neither silently degrades to a mystery
+/// button when Pi has not answered the query-only option RPCs yet.
+enum RuntimePickerPresentation: Equatable {
+    /// Explicit list of choices, applied with the `set_*` RPCs.
+    case menu
+    /// No list available, but the runtime still accepts `cycle_*`.
+    case cycle
+    /// Nothing is attached (or options are still loading): show the label, disabled.
+    case disabled
+
+    static func model(attached: Bool, models: [AvailableModel], loading: Bool) -> RuntimePickerPresentation {
+        guard attached else { return .disabled }
+        if !models.isEmpty { return .menu }
+        return loading ? .disabled : .cycle
+    }
+
+    /// A single known level is not a choice, so the cycle command stays the honest fallback.
+    static func thinking(attached: Bool, levels: [String], loading: Bool) -> RuntimePickerPresentation {
+        guard attached else { return .disabled }
+        if levels.count > 1 { return .menu }
+        return loading ? .disabled : .cycle
+    }
+}

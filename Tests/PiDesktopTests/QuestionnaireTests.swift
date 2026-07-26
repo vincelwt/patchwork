@@ -56,6 +56,55 @@ final class QuestionnaireParserTests: XCTestCase {
         )
     }
 
+    func testEmptyMultiSelectIsValidAndEncodesAnEmptyInput() throws {
+        let session = try XCTUnwrap(QuestionnaireParser.parse(toolCallID: "call-1", arguments: questionnaireArguments))
+        let single = session.questions[0]
+        let multi = session.questions[1]
+        let empty = QuestionnaireAnswer()
+
+        // The installed plugin allows "none of these" for a multi-select only.
+        XCTAssertTrue(empty.isValid(multiSelect: true))
+        XCTAssertFalse(empty.isValid(multiSelect: false))
+        XCTAssertFalse(QuestionnaireAnswer(customText: "   ").isValid(multiSelect: true))
+        XCTAssertFalse(QuestionnaireAnswer(optionIndexes: [0, 1]).isValid(multiSelect: false))
+        XCTAssertTrue(QuestionnaireAnswer(optionIndexes: [0]).isValid(multiSelect: false))
+
+        XCTAssertEqual(
+            QuestionnaireRPCBridge.response(
+                question: multi,
+                answer: empty,
+                request: request(id: "multi-1", method: .input, title: "[Files] Which files?")
+            ),
+            .value("")
+        )
+        XCTAssertNil(
+            QuestionnaireRPCBridge.response(
+                question: single,
+                answer: empty,
+                request: request(id: "select-1", method: .select, title: "[Scope] Which scope?", options: ["a", "b", "c"])
+            )
+        )
+    }
+
+    func testHeaderNavigationOnlyMovesInsideTheBufferedQuestions() throws {
+        var session = try XCTUnwrap(QuestionnaireParser.parse(toolCallID: "call-1", arguments: questionnaireArguments))
+        XCTAssertTrue(session.canNavigate(to: 0))
+        XCTAssertFalse(session.canNavigate(to: 1), "Forward jumps need every earlier answer")
+        XCTAssertFalse(session.canNavigate(to: 5))
+
+        session.answers[0] = QuestionnaireAnswer(optionIndexes: [0])
+        XCTAssertTrue(session.canNavigate(to: 1))
+        XCTAssertFalse(session.allAnswered)
+
+        session.currentIndex = 1
+        session.answers[1] = QuestionnaireAnswer()
+        XCTAssertTrue(session.canNavigate(to: 0), "Going back is always safe")
+        XCTAssertTrue(session.allAnswered, "An empty multi-select counts as answered")
+
+        session.submitted = true
+        XCTAssertFalse(session.canNavigate(to: 0), "Navigation stops once the RPC bridge is draining")
+    }
+
     func testMalformedQuestionnaireIsRejectedDeterministically() {
         XCTAssertNil(QuestionnaireParser.parse(toolCallID: "x", arguments: .object(["questions": .array([])])))
         XCTAssertNil(QuestionnaireParser.parse(toolCallID: "x", arguments: .object([
@@ -149,6 +198,11 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertNotNil(store.questionnaireQuestion(for: try XCTUnwrap(store.activeDialog)))
 
         store.saveQuestionnaireAnswer(QuestionnaireAnswer(optionIndexes: [0]), move: 1)
+        XCTAssertEqual(store.pendingQuestionnaire?.currentIndex, 1)
+        store.moveQuestionnaire(to: 0, saving: QuestionnaireAnswer(optionIndexes: [0, 1]))
+        XCTAssertEqual(store.pendingQuestionnaire?.currentIndex, 0)
+        XCTAssertTrue(runtime.responses.isEmpty, "Navigating buffered questions must not talk to Pi")
+        store.moveQuestionnaire(to: 1)
         store.submitQuestionnaire(QuestionnaireAnswer(optionIndexes: [0, 1]))
         XCTAssertEqual(runtime.responses.last?["value"]?.stringValue, "1. Small — Fast")
         XCTAssertNil(store.activeDialog)
@@ -157,6 +211,35 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertEqual(runtime.responses.last?["id"]?.stringValue, "q2")
         XCTAssertEqual(runtime.responses.last?["value"]?.stringValue, "1,2")
         XCTAssertNil(store.pendingQuestionnaire)
+    }
+
+    func testEmptyMultiSelectSubmitsAnEmptyValueThroughTheSequentialBridge() throws {
+        let (store, runtime, _) = makeStore()
+        runtime.emit(toolStart(arguments: twoQuestions))
+        runtime.emit(selectRequest(id: "q1"))
+
+        store.saveQuestionnaireAnswer(QuestionnaireAnswer(optionIndexes: [1]), move: 1)
+        store.submitQuestionnaire(QuestionnaireAnswer())
+        XCTAssertEqual(runtime.responses.last?["value"]?.stringValue, "2. Large — Complete")
+
+        runtime.emit(multiRequest(id: "q2"))
+        XCTAssertEqual(runtime.responses.last?["id"]?.stringValue, "q2")
+        XCTAssertEqual(runtime.responses.last?["value"]?.stringValue, "")
+        XCTAssertNil(runtime.responses.last?["cancelled"]?.boolValue)
+        XCTAssertNil(store.pendingQuestionnaire)
+    }
+
+    func testSingleSelectStillRequiresAnOptionOrCustomText() throws {
+        let (store, runtime, _) = makeStore()
+        runtime.emit(toolStart(arguments: oneQuestion))
+        runtime.emit(selectRequest(id: "q1"))
+
+        store.submitQuestionnaire(QuestionnaireAnswer())
+        XCTAssertTrue(runtime.responses.isEmpty, "An empty single-select answer must not submit")
+        XCTAssertNotNil(store.activeDialog)
+
+        store.submitQuestionnaire(QuestionnaireAnswer(optionIndexes: [0]))
+        XCTAssertEqual(runtime.responses.last?["value"]?.stringValue, "1. Small — Fast")
     }
 
     func testCustomSingleSelectionAutomaticallyAnswersFollowUpInput() throws {

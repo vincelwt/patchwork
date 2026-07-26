@@ -52,6 +52,14 @@ private final class FakeRuntime: PiRuntimeProtocol {
         pending.removeValue(forKey: command)?(.failure(error))
     }
 
+    func succeed(_ command: String, data: JSONValue) {
+        pending.removeValue(forKey: command)?(.success(.object([
+            "type": .string("response"),
+            "success": .bool(true),
+            "data": data
+        ])))
+    }
+
     func commandCount(_ command: String) -> Int { sent.filter { $0.command == command }.count }
 }
 
@@ -152,6 +160,35 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
                       "The optimistic message stays: Pi may already be answering it")
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testNewChatRuntimeOffersExactModelAndThinkingMenus() throws {
+        let (store, runtime, _, _) = makeStore()
+        store.openNewChat()
+        store.selectedFolder = temporaryDirectory
+
+        store.prepareComposerOptions()
+        XCTAssertTrue(store.isCurrentRouteRuntime)
+        XCTAssertEqual(store.modelPickerPresentation, .disabled, "The picker waits for its query-only RPC")
+
+        runtime.succeed("get_available_models", data: .object([
+            "models": .array([
+                .object([
+                    "provider": .string("openai-codex"),
+                    "id": .string("gpt-5.6"),
+                    "name": .string("GPT-5.6"),
+                    "reasoning": .bool(true)
+                ])
+            ])
+        ]))
+        runtime.succeed("get_available_thinking_levels", data: .object([
+            "levels": .array([.string("off"), .string("xhigh")])
+        ]))
+
+        XCTAssertEqual(store.modelPickerPresentation, .menu)
+        XCTAssertEqual(store.thinkingPickerPresentation, .menu)
+        XCTAssertEqual(store.availableModels.first?.modelID, "gpt-5.6")
+        XCTAssertEqual(store.availableThinkingLevels, ["off", "xhigh"])
     }
 
     func testNewChatPromotionKeepsTheDraftRecoverableInThePromotedSession() async throws {

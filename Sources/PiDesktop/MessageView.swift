@@ -211,9 +211,7 @@ private struct ToolActivityStepRow: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if step.kind == .question {
-                    Text("Answered in the native questionnaire")
-                        .font(PiFont.caption)
-                        .foregroundStyle(.secondary)
+                    QuestionnaireCallSummary(arguments: step.arguments)
                 } else if step.arguments != .object([:]) {
                     Text("Arguments").font(PiFont.micro).foregroundStyle(.tertiary)
                     CodeBlockView(language: nil, code: step.arguments.prettyPrinted(maxLength: 8_000))
@@ -262,12 +260,51 @@ private struct ToolCallRow: View {
     let call: ToolCallPayload
     var body: some View {
         DisclosureRow(symbol: ToolSymbol.forName(call.name), title: displayName, trailing: nil) {
-            CodeBlockView(language: nil, code: call.arguments.prettyPrinted(maxLength: 8_000))
+            if call.name == "ask_user_question" {
+                QuestionnaireCallSummary(arguments: call.arguments)
+            } else {
+                CodeBlockView(language: nil, code: call.arguments.prettyPrinted(maxLength: 8_000))
+            }
         }
     }
 
     private var displayName: String {
         call.name.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord
+    }
+}
+
+/// `ask_user_question` is answered in the native sheet, so the transcript lists the questions
+/// that were asked instead of dumping the tool's raw JSON arguments.
+private struct QuestionnaireCallSummary: View {
+    let arguments: JSONValue
+
+    private var questions: [QuestionnaireQuestion] {
+        QuestionnaireParser.parse(toolCallID: "transcript", arguments: arguments)?.questions ?? []
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space4) {
+            if questions.isEmpty {
+                Text("Asked in the native questionnaire")
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(questions) { question in
+                    HStack(alignment: .firstTextBaseline, spacing: PiTheme.space6) {
+                        Text(question.header)
+                            .font(PiFont.micro.weight(.medium))
+                            .foregroundStyle(.tertiary)
+                        Text(question.question)
+                            .font(PiFont.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Questions asked in the native questionnaire")
     }
 }
 

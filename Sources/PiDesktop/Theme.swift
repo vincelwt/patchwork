@@ -48,6 +48,14 @@ enum PiTheme {
     static let gridGutter: CGFloat = 7
     static var gridTextInset: CGFloat { gridIconColumn + gridGutter }
 
+    /// The sidebar grid. A disclosure gutter that only folders use, then one icon column, then
+    /// the single text origin shared by action rows, folder headers, and conversation rows, so
+    /// the list keeps one edge and stays shallow.
+    static let sidebarDisclosureColumn: CGFloat = 12
+    static let sidebarIconColumn: CGFloat = 14
+    static var sidebarIconInset: CGFloat { space8 + sidebarDisclosureColumn + space6 }
+    static var sidebarTextInset: CGFloat { sidebarIconInset + sidebarIconColumn + space6 }
+
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5
     static let radiusMedium: CGFloat = 8

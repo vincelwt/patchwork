@@ -161,6 +161,11 @@ final class AppStore: ObservableObject {
         return selectedSession.fileURL.standardizedFileURL.path == activeRuntimePath
     }
 
+    /// True for either an attached saved conversation or the query-only runtime prepared for a
+    /// new Desktop chat. Picker controls use this broader route scope; transcript/session actions
+    /// deliberately keep using `isSelectedRuntime`.
+    var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
+
     var selectedMetrics: TokenMetrics {
         isSelectedRuntime && runtimeState.isConnected ? liveMetrics : (selectedSession?.metrics ?? TokenMetrics())
     }
@@ -722,7 +727,9 @@ final class AppStore: ObservableObject {
     }
 
     func saveQuestionnaireAnswer(_ answer: QuestionnaireAnswer, move: Int) {
-        guard var session = pendingQuestionnaire, answer.isValid else { return }
+        guard var session = pendingQuestionnaire, !session.submitted,
+              let question = session.currentQuestion,
+              answer.isValid(multiSelect: question.multiSelect) else { return }
         session.answers[session.currentIndex] = answer
         session.currentIndex = min(session.questions.count - 1, max(0, session.currentIndex + move))
         pendingQuestionnaire = session
@@ -734,11 +741,26 @@ final class AppStore: ObservableObject {
         pendingQuestionnaire = session
     }
 
+    /// Header-chip navigation across the buffered questions. The draft answer is kept when it is
+    /// already valid; no RPC traffic is produced.
+    func moveQuestionnaire(to index: Int, saving answer: QuestionnaireAnswer? = nil) {
+        guard var session = pendingQuestionnaire, !session.submitted else { return }
+        if let answer, let question = session.currentQuestion,
+           answer.isValid(multiSelect: question.multiSelect) {
+            session.answers[session.currentIndex] = answer
+        }
+        guard session.canNavigate(to: index) else { return }
+        session.currentIndex = index
+        pendingQuestionnaire = session
+    }
+
     func submitQuestionnaire(_ answer: QuestionnaireAnswer) {
-        guard var session = pendingQuestionnaire, answer.isValid,
+        guard var session = pendingQuestionnaire, !session.submitted,
+              let question = session.currentQuestion,
+              answer.isValid(multiSelect: question.multiSelect),
               let request = activeDialog else { return }
         session.answers[session.currentIndex] = answer
-        guard session.answers.allSatisfy({ $0?.isValid == true }) else { return }
+        guard session.allAnswered else { return }
         session.submitted = true
         session.currentIndex = 0
         pendingQuestionnaire = session

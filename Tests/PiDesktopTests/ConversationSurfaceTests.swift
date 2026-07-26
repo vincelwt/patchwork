@@ -111,6 +111,26 @@ final class RuntimePickerStateTests: XCTestCase {
         XCTAssertEqual(RuntimePickerState.selectedThinkingLevel(in: levels, current: "max"), "off")
         XCTAssertEqual(RuntimePickerState.thinkingLevels(from: .array([])), ["off"])
     }
+
+    func testPickerPresentationPrefersExactChoicesAndFallsBackToCycle() {
+        let models = [AvailableModel(provider: "openai", modelID: "gpt-5", name: "GPT-5")]
+
+        // Detached: the label stays visible but inert, in the composer and the status bar alike.
+        XCTAssertEqual(RuntimePickerPresentation.model(attached: false, models: models, loading: false), .disabled)
+        XCTAssertEqual(RuntimePickerPresentation.thinking(attached: false, levels: ["off", "high"], loading: false), .disabled)
+
+        // Attached with loaded lists: explicit menus.
+        XCTAssertEqual(RuntimePickerPresentation.model(attached: true, models: models, loading: false), .menu)
+        XCTAssertEqual(RuntimePickerPresentation.thinking(attached: true, levels: ["off", "high"], loading: false), .menu)
+
+        // Attached but the query-only RPCs returned nothing: cycle is the honest fallback.
+        XCTAssertEqual(RuntimePickerPresentation.model(attached: true, models: [], loading: false), .cycle)
+        XCTAssertEqual(RuntimePickerPresentation.thinking(attached: true, levels: ["off"], loading: false), .cycle)
+
+        // Still loading: never offer a control that would be wrong a moment later.
+        XCTAssertEqual(RuntimePickerPresentation.model(attached: true, models: [], loading: true), .disabled)
+        XCTAssertEqual(RuntimePickerPresentation.thinking(attached: true, levels: ["off"], loading: true), .disabled)
+    }
 }
 
 final class CapabilityPresenterTests: XCTestCase {

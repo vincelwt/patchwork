@@ -88,10 +88,37 @@ struct MenuBarContentView: View {
             }
             if let account {
                 Text(account.account).font(PiFont.caption).lineLimit(1).truncationMode(.middle)
-                Text(account.compactUsage ?? "Usage windows unavailable")
-                    .font(PiFont.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.tail)
+                if account.windows.isEmpty {
+                    Text("Usage windows unavailable")
+                        .font(PiFont.caption).foregroundStyle(.secondary)
+                } else {
+                    // Every window, not just the tightest one, so the menu bar answers the
+                    // limits question without opening the app.
+                    ForEach(account.windows, id: \.label) { window in
+                        HStack(spacing: PiTheme.space8) {
+                            Text(window.label)
+                                .font(PiFont.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 30, alignment: .leading)
+                            ProgressView(value: Double(window.remainingPercent), total: 100)
+                                .progressViewStyle(.linear)
+                            Text("\(window.remainingPercent)%")
+                                .font(PiFont.caption.monospacedDigit())
+                                .foregroundStyle(window.remainingPercent <= 15 ? Color.piRed : .secondary)
+                                .frame(width: 34, alignment: .trailing)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("\(window.label) window")
+                        .accessibilityValue("\(window.remainingPercent) percent remaining")
+                    }
+                }
+                if let count = account.bankedResetCount, count > 0 {
+                    Text("\(count) banked reset\(count == 1 ? "" : "s")"
+                         + (account.bankedResetExpiry.map { ", first expires in \($0)" } ?? ""))
+                        .font(PiFont.micro)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.tail)
+                }
             } else {
                 Text("Account limits unavailable")
                     .font(PiFont.caption).foregroundStyle(.secondary)
@@ -99,6 +126,8 @@ struct MenuBarContentView: View {
         }
         .padding(.horizontal, PiTheme.space12)
         .padding(.vertical, PiTheme.space8)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Account limits")
     }
 
     private var runningTitle: String {
