@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Recurring automations, presented with the same restraint as the rest of the app: a flat list,
 /// one editor sheet, and an honest empty state when the background service is not running.
+/// A detail page (see `RootView.detail`), so visiting it never disturbs the selected conversation.
 struct SchedulesView: View {
     @EnvironmentObject private var store: AppStore
     @StateObject private var model: SchedulesModel
@@ -16,7 +17,7 @@ struct SchedulesView: View {
             PiHairline()
             content
         }
-        .frame(width: 560, height: 460)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.piTranscript)
         .task { await model.reload() }
         .sheet(item: $model.editing) { draft in
@@ -78,12 +79,15 @@ struct SchedulesView: View {
                             entry: entry,
                             threadName: threadName(for: entry),
                             onEdit: { model.editing = ScheduleDraft(entry: entry, isNew: false) },
-                            onToggle: { Task { await model.setPaused(entry, paused: entry.enabled) } },
+                            onToggle: { enabled in Task { await model.setPaused(entry, paused: !enabled) } },
                             onRun: { Task { await model.runNow(entry) } },
                             onDelete: { Task { await model.delete(entry) } }
                         )
                     }
                 }
+                // Rows stay readable on a wide window instead of stretching the full detail width.
+                .frame(maxWidth: PiTheme.transcriptMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, PiTheme.space12)
                 .padding(.vertical, PiTheme.space8)
             }
@@ -104,14 +108,13 @@ private struct ScheduleRow: View {
     let entry: ScheduleEntry
     let threadName: String
     let onEdit: () -> Void
-    let onToggle: () -> Void
+    let onToggle: (Bool) -> Void
     let onRun: () -> Void
     let onDelete: () -> Void
     @State private var hovering = false
 
     var body: some View {
         HStack(spacing: PiTheme.space10) {
-            StatusDot(color: entry.enabled ? .piGreen : .secondary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(entry.name).font(PiFont.rowEmphasis).lineLimit(1)
                 Text("\(entry.trigger.summary) · \(threadName)")
@@ -120,26 +123,30 @@ private struct ScheduleRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: PiTheme.space8)
-            if let next = entry.nextRunAt, entry.enabled {
+            if entry.enabled, let next = entry.nextRunAt {
                 Text(next.relativeShort).font(PiFont.micro).foregroundStyle(.tertiary)
+            } else if !entry.enabled {
+                Text("Paused").font(PiFont.micro).foregroundStyle(.tertiary)
             }
-            if hovering {
-                Button(action: onRun) {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: PiIcon.small, weight: .medium))
-                }
-                .buttonStyle(.plain).help("Run now")
-                Button(action: onToggle) {
-                    Image(systemName: entry.enabled ? "pause.fill" : "play.circle")
-                        .font(.system(size: PiIcon.small, weight: .medium))
-                }
-                .buttonStyle(.plain).help(entry.enabled ? "Pause" : "Resume")
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                        .font(.system(size: PiIcon.small, weight: .medium))
-                }
-                .buttonStyle(.plain).help("Delete")
+            Toggle("", isOn: Binding(get: { entry.enabled }, set: onToggle))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .help(entry.enabled ? "Pause" : "Resume")
+                .accessibilityLabel("\(entry.name) enabled")
+            Menu {
+                Button("Edit…", action: onEdit)
+                Button("Run Now", action: onRun)
+                Divider()
+                Button("Delete", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: PiIcon.small, weight: .medium))
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("\(entry.name) actions")
         }
         .foregroundStyle(.secondary)
         .padding(.horizontal, PiTheme.space10)
@@ -148,8 +155,6 @@ private struct ScheduleRow: View {
         .piRowBackground(selected: false, hovering: hovering)
         .onHover { hovering = $0 }
         .onTapGesture(count: 2, perform: onEdit)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(entry.name), \(entry.trigger.summary), \(entry.enabled ? "enabled" : "paused")")
     }
 }
 

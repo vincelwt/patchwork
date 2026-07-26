@@ -474,6 +474,8 @@ final class AppStore: ObservableObject {
         flushDraftPersistence()
         cancelConversationLoad()
         route = .newChat
+        // Automations is a detail page, not a route: standard navigation always leaves it.
+        schedulesPresented = false
         conversationError = nil
         messages.removeAll(keepingCapacity: false)
         streamingMessage = nil
@@ -495,6 +497,7 @@ final class AppStore: ObservableObject {
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
         route = .session(session.id)
+        schedulesPresented = false
         markRead(session)
         conversationError = nil
         streamingMessage = nil

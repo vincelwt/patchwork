@@ -85,6 +85,55 @@ final class SchedulesModelTests: XCTestCase {
     }
 }
 
+/// Automations is a detail page keyed off `schedulesPresented`, deliberately not an `AppRoute`
+/// case — so the page must be left by ordinary navigation, and leaving it must not disturb the
+/// route (or the draft parked against it).
+@MainActor
+final class AutomationsNavigationTests: XCTestCase {
+    private struct QuietGitService: GitStatusProviding {
+        func snapshot(for directory: URL) async -> GitSnapshot { .none }
+    }
+
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiAutomationsNav-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testOpeningNewChatOrSelectingASessionLeavesTheAutomationsPage() throws {
+        let file = directory.appendingPathComponent("thread.jsonl")
+        try Data("{\"type\":\"session\"}\n".utf8).write(to: file)
+        let store = AppStore(
+            gitService: QuietGitService(),
+            persistence: AppPersistence(baseURL: directory),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+        var session = SessionSummary(
+            id: "thread", fileURL: file, cwd: directory, createdAt: Date(), modifiedAt: Date(),
+            name: "thread", preview: "", messageCount: 0, metrics: TokenMetrics()
+        )
+        session.prepareSearchKey()
+        store.sessions = [session]
+
+        store.schedulesPresented = true
+        store.selectSession(session)
+        XCTAssertFalse(store.schedulesPresented, "Selecting a conversation leaves the Automations page")
+        XCTAssertEqual(store.route, .session("thread"))
+
+        store.schedulesPresented = true
+        XCTAssertEqual(store.route, .session("thread"), "Visiting Automations never changes the route")
+
+        store.openNewChat()
+        XCTAssertFalse(store.schedulesPresented, "New chat leaves the Automations page")
+        XCTAssertEqual(store.route, .newChat)
+    }
+}
+
 final class ScheduleWireBridgeTests: XCTestCase {
     func testEveryTriggerAndTargetSurvivesTheRoundTripToTheDaemon() {
         let cases: [ScheduleEntry.Trigger] = [

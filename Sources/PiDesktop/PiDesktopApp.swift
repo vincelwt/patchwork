@@ -56,7 +56,7 @@ struct PiDesktopApp: App {
                 Button("Compact Context", action: store.compact)
                     .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
                 Divider()
-                Button("Automations…") { store.schedulesPresented = true }
+                Button("Automations") { store.schedulesPresented = true }
                     .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Toggle Environment") { store.inspectorVisible.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
@@ -115,18 +115,8 @@ struct RootView: View {
                 )
         } detail: {
             VStack(spacing: 0) {
-                Group {
-                    switch store.route {
-                    case .newChat: NewChatView()
-                    case .session:
-                        if store.selectedSession != nil { ConversationView() }
-                        else {
-                            PiUnavailableView("Conversation not found", systemImage: "bubble.left")
-                                .background(Color.piTranscript)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 StatusBarView()
             }
             .frame(minWidth: 500)
@@ -158,9 +148,6 @@ struct RootView: View {
             ExtensionDialogView(request: request).environmentObject(store)
         }
         .sheet(item: $store.viewedImage) { item in ImageViewerView(payload: item.image) }
-        .sheet(isPresented: $store.schedulesPresented) {
-            SchedulesView(service: store.scheduleService).environmentObject(store)
-        }
         .overlay {
             if store.quickSwitchPresented {
                 QuickSwitchOverlay()
@@ -177,6 +164,25 @@ struct RootView: View {
         }
         }
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+    }
+
+    /// Automations is a page, not an `AppRoute`: `store.route` (and with it the selected
+    /// conversation and its parked draft) survives a visit here untouched.
+    @ViewBuilder
+    private var detail: some View {
+        if store.schedulesPresented {
+            SchedulesView(service: store.scheduleService)
+        } else {
+            switch store.route {
+            case .newChat: NewChatView()
+            case .session:
+                if store.selectedSession != nil { ConversationView() }
+                else {
+                    PiUnavailableView("Conversation not found", systemImage: "bubble.left")
+                        .background(Color.piTranscript)
+                }
+            }
+        }
     }
 
     private func updateSidebar(for width: CGFloat) {
