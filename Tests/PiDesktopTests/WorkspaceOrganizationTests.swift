@@ -365,28 +365,32 @@ final class WorkspaceOrganizationTests: XCTestCase {
     }
 
     @MainActor
-    func testExternalTerminalWriteBecomesUnreadThroughSharedMonitor() async throws {
+    func testExternalTerminalWriteBecomesUnreadOnlyAfterTurnFinishes() async throws {
         let base = temporaryDirectory("ExternalUnread")
         defer { try? FileManager.default.removeItem(at: base) }
         let file = base.appendingPathComponent("thread.jsonl")
-        try Data("{\"type\":\"session\"}\n".utf8).write(to: file)
-        let monitor = SessionActivityMonitor(isActiveOverride: true)
+        try Data("{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-600)], ofItemAtPath: file.path)
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: base.appendingPathComponent("heartbeats")
+        )
         let store = AppStore(persistence: AppPersistence(baseURL: base), activityMonitor: monitor)
         let session = summary(id: "external", cwd: "/tmp", modifiedAt: .distantPast, fileURL: file)
         store.sessions = [session]
         monitor.setTrackedPaths([file.path])
-        try await waitUntil { monitor.activity(forPath: file.path) != nil }
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .idle }
         store.markRead(session)
-        XCTAssertFalse(store.isUnread(session))
 
-        try await Task.sleep(nanoseconds: 20_000_000)
-        let handle = try FileHandle(forWritingTo: file)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data("{\"type\":\"message\"}\n".utf8))
-        try handle.close()
+        try Data("{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
         monitor.tickNow()
-        try await waitUntil { store.isUnread(session) }
-        XCTAssertTrue(store.isUnread(session))
+        try await waitUntil { store.isRunning(session) }
+        XCTAssertFalse(store.isUnread(session), "A running turn is not unread yet")
+
+        try Data("{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        monitor.tickNow()
+        try await waitUntil { !store.isRunning(session) }
+        XCTAssertTrue(store.isUnread(session), "The completed turn becomes unread")
     }
 
     @MainActor

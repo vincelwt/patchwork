@@ -7,11 +7,11 @@ import PiDeskKit
 /// its sole writer \u2014 and tolerates it being absent, mid-write, or from a future app version
 /// with fields this build does not know about.
 ///
-/// `unread` mirrors the app's own `WorkspaceOrganization.isUnread(_:)` (`Sources/PiDesktop/
-/// WorkspaceOrganization.swift`, not importable from here) minus its "currently selected in the
-/// UI" carve-out, which has no daemon equivalent: manually-marked-unread wins, otherwise a
-/// session with no recorded read is unread, otherwise it is unread iff it changed since it was
-/// last read.
+/// `unread` provides the persisted part of the app's own `WorkspaceOrganization.isUnread(_:)`
+/// (`Sources/PiDesktop/WorkspaceOrganization.swift`, not importable from here): a manually marked
+/// unread session wins, otherwise a session with no recorded read is unread, otherwise it is unread iff
+/// it changed since it was last read. `ThreadStore` separately suppresses unread while running;
+/// the "currently selected in the UI" carve-out has no daemon equivalent.
 enum AppStatePeek {
     struct Snapshot: Decodable, Sendable {
         var archivedSessionIDs: Set<String> = []

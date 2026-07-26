@@ -374,6 +374,7 @@ extension AppStore {
     }
 
     func isUnread(_ session: SessionSummary) -> Bool {
+        if isRunning(session) { return false }
         let path = session.fileURL.standardizedFileURL.path
         if persistence.state.manuallyUnreadSessionPaths.contains(path) { return true }
         if selectedSession?.id == session.id { return false }

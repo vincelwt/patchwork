@@ -137,6 +137,7 @@ actor ThreadStore {
                 runningIDs.insert(thread.id)
             }
             thread.running = runningIDs.contains(thread.id)
+            if thread.running { thread.unread = false }
             results.append(thread)
         }
 
