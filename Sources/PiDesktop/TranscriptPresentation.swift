@@ -69,6 +69,9 @@ struct TranscriptActivityGroup: Identifiable, Hashable, Sendable {
     var isActive: Bool
 
     var hasFailure: Bool { steps.contains(where: \.failed) }
+    /// A failure may open the live group so it cannot be missed, but completed turns always
+    /// settle back to the high-level row the user asked for.
+    var shouldStartExpanded: Bool { isActive && hasFailure }
     var completedCount: Int { steps.filter(\.complete).count }
     var currentStep: TranscriptActivityStep? { steps.last(where: { !$0.complete }) ?? steps.last }
 

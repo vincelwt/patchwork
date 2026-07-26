@@ -48,7 +48,12 @@ final class TranscriptPresenterTests: XCTestCase {
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
         guard case let .activity(group) = items.first else { return XCTFail("Expected a rollup") }
         XCTAssertTrue(group.hasFailure)
+        XCTAssertFalse(group.shouldStartExpanded, "A completed turn stays collapsed even when its summary reports failure")
         XCTAssertEqual(group.steps.first?.result?.textContent, "permission denied")
+
+        var liveFailure = group
+        liveFailure.isActive = true
+        XCTAssertTrue(liveFailure.shouldStartExpanded, "A failure in the live turn is surfaced immediately")
     }
 
     func testEveryDocumentedToolKindHasAReadableMapping() {

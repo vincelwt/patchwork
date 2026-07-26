@@ -97,6 +97,8 @@ private struct DisclosureRow<Detail: View>: View {
     var trailing: String?
     var symbolTint: Color = .secondary
     var showsProgress = false
+    /// When this flips true, a disclosure that opened while work was live settles closed.
+    var collapseSignal = false
     @ViewBuilder var detail: () -> Detail
 
     @State private var expanded: Bool
@@ -110,6 +112,7 @@ private struct DisclosureRow<Detail: View>: View {
         symbolTint: Color = .secondary,
         showsProgress: Bool = false,
         initiallyExpanded: Bool = false,
+        collapseSignal: Bool = false,
         @ViewBuilder detail: @escaping () -> Detail
     ) {
         self.symbol = symbol
@@ -118,6 +121,7 @@ private struct DisclosureRow<Detail: View>: View {
         self.trailing = trailing
         self.symbolTint = symbolTint
         self.showsProgress = showsProgress
+        self.collapseSignal = collapseSignal
         self.detail = detail
         _expanded = State(initialValue: initiallyExpanded)
     }
@@ -161,6 +165,9 @@ private struct DisclosureRow<Detail: View>: View {
                     .padding(.leading, PiTheme.gridTextInset)
             }
         }
+        .onChange(of: collapseSignal) { _, shouldCollapse in
+            if shouldCollapse { expanded = false }
+        }
     }
 }
 
@@ -178,7 +185,8 @@ struct TranscriptActivityGroupView: View {
             trailing: group.progressText,
             symbolTint: group.hasFailure ? Color.piRed : .secondary,
             showsProgress: group.isActive && !group.hasFailure,
-            initiallyExpanded: group.hasFailure
+            initiallyExpanded: group.shouldStartExpanded,
+            collapseSignal: !group.isActive
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 ForEach(group.steps) { step in
