@@ -84,3 +84,39 @@ final class SchedulesModelTests: XCTestCase {
         XCTAssertTrue(model.entries.isEmpty)
     }
 }
+
+final class ScheduleWireBridgeTests: XCTestCase {
+    func testEveryTriggerAndTargetSurvivesTheRoundTripToTheDaemon() {
+        let cases: [ScheduleEntry.Trigger] = [
+            .once(at: Date(timeIntervalSince1970: 2_000_000)),
+            .interval(everySeconds: 900),
+            .cron(expression: "0 9 * * 1-5", timeZone: "Europe/Paris"),
+            .heartbeat(everySeconds: 600)
+        ]
+        for trigger in cases {
+            XCTAssertEqual(ScheduleEntry.Trigger(wire: trigger.wire), trigger)
+        }
+
+        let targets: [ScheduleEntry.Target] = [
+            .existingThread(threadID: "t1"),
+            .newThread(cwd: "/Users/x/code", namePattern: "Triage {date}")
+        ]
+        for target in targets {
+            XCTAssertEqual(ScheduleEntry.Target(wire: target.wire), target)
+        }
+    }
+
+    func testAnUnknownTriggerKindDegradesInsteadOfCrashing() {
+        // A newer daemon may describe a trigger this build has never heard of.
+        XCTAssertEqual(ScheduleEntry.Trigger(wire: .other(kind: "lunar")), .interval(everySeconds: 3_600))
+        XCTAssertEqual(ScheduleEntry.Target(wire: .other(kind: "workspace")), .existingThread(threadID: ""))
+        // And an empty target is exactly what the editor refuses to save.
+        let entry = ScheduleEntry(
+            name: "x",
+            target: ScheduleEntry.Target(wire: .other(kind: "workspace")),
+            prompt: "p",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        XCTAssertNotNil(ScheduleValidation.problem(with: entry))
+    }
+}

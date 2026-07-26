@@ -192,11 +192,11 @@ enum ScheduleServiceError: LocalizedError {
 
 @MainActor
 extension AppStore {
-    /// The control-plane client the automations panel uses. Until the daemon client lands this
-    /// is in-memory, so the panel is fully usable and testable and simply forgets on quit.
+    /// The control-plane client the automations panel uses. Schedules live in the daemon, so
+    /// the window, `pidesk`, and the web remote all see the same automations.
     var scheduleService: any ScheduleServing {
         if let existing = cachedScheduleService { return existing }
-        let service = InMemoryScheduleService()
+        let service = DaemonScheduleService()
         cachedScheduleService = service
         return service
     }
