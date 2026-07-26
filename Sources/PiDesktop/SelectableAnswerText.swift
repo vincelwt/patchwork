@@ -72,7 +72,6 @@ enum MarkdownAnswerPartitioner {
 /// app (user bubbles, thinking, narration, tool detail) keep the existing per-block renderer.
 struct MarkdownAnswerText: View {
     let text: String
-    var size: CGFloat = PiFont.bodySize
     /// AppKit text views install their own tracking areas, so SwiftUI's `.onHover` never fires
     /// while the pointer is over the answer body. The view reports it instead.
     var onHoverChange: ((Bool) -> Void)?
@@ -83,10 +82,10 @@ struct MarkdownAnswerText: View {
             ForEach(runs) { run in
                 switch run {
                 case let .text(blocks, _):
-                    SelectableTextRun(blocks: blocks, size: size, onHoverChange: onHoverChange)
+                    SelectableTextRun(blocks: blocks, onHoverChange: onHoverChange)
                 case let .table(block, _):
                     if case let .table(header, alignment, rows) = block {
-                        MarkdownTableView(header: header, alignment: alignment, rows: rows, size: size)
+                        MarkdownTableView(header: header, alignment: alignment, rows: rows)
                     }
                 }
             }
@@ -102,7 +101,6 @@ struct MarkdownAnswerText: View {
 /// the other's internals.
 private struct SelectableTextRun: View {
     let blocks: [MarkdownBlock]
-    let size: CGFloat
     var onHoverChange: ((Bool) -> Void)?
     @State private var height: CGFloat = 20
     @State private var width: CGFloat = 0
@@ -111,7 +109,6 @@ private struct SelectableTextRun: View {
     var body: some View {
         SelectableTextBlock(
             blocks: blocks,
-            size: size,
             // Measuring against the width SwiftUI actually hands us, rather than whatever the
             // AppKit frame happens to be mid-update, is what keeps the reported height honest —
             // an under-reported height lets TextKit draw straight over the next block.
@@ -196,7 +193,6 @@ private struct CodeBlockCopyOverlay: View {
 /// learn a TextKit view's wrapped height ahead of layout.
 private struct SelectableTextBlock: NSViewRepresentable {
     let blocks: [MarkdownBlock]
-    var size: CGFloat = PiFont.bodySize
     /// 0 until SwiftUI has measured the column; the view simply keeps its last layout until then.
     var width: CGFloat = 0
     let onHeightChange: (CGFloat) -> Void
@@ -233,11 +229,11 @@ private struct SelectableTextBlock: NSViewRepresentable {
     private func applyContent(to view: AnswerTextView, context: Context) {
         // Width is part of the key: the same text at a different measure wraps differently, and
         // a stale height there is exactly what causes overlapping draws.
-        let key = blocks.map(\.id).joined(separator: "|") + "@\(size)@\(Int(width.rounded()))"
+        let key = blocks.map(\.id).joined(separator: "|") + "@\(PiFont.size)@\(Int(width.rounded()))"
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key
         view.measuringWidth = width
-        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks, size: size))
+        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -408,7 +404,8 @@ enum AnswerAttributedTextBuilder {
     struct CodeBlockEntry { let id: String; let code: String; let range: NSRange }
     struct Built { let attributedString: NSAttributedString; let codeBlocks: [CodeBlockEntry] }
 
-    static func build(blocks: [MarkdownBlock], size: CGFloat) -> Built {
+    static func build(blocks: [MarkdownBlock]) -> Built {
+        let size = PiFont.size
         let result = NSMutableAttributedString()
         var codeBlocks: [CodeBlockEntry] = []
 
@@ -458,7 +455,7 @@ enum AnswerAttributedTextBuilder {
     /// Plain-text extraction used for tests and as the conceptual model for what a full-answer
     /// ⌘C should read like: block content in order, separated by blank lines.
     static func plainText(blocks: [MarkdownBlock]) -> String {
-        build(blocks: blocks, size: PiFont.bodySize).attributedString.string
+        build(blocks: blocks).attributedString.string
     }
 
     // MARK: Block builders
@@ -538,10 +535,10 @@ enum AnswerAttributedTextBuilder {
         color: NSColor,
         baseFontOverride: NSFont? = nil
     ) -> NSMutableAttributedString {
-        let parsed = MarkdownInline.attributed(text, size: size)
+        let parsed = MarkdownInline.attributed(text)
         let result = NSMutableAttributedString()
         let baseFont = baseFontOverride ?? NSFont.systemFont(ofSize: size)
-        let codeFont = NSFont.monospacedSystemFont(ofSize: max(11, size - 1.5), weight: .regular)
+        let codeFont = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
 
         for run in parsed.runs {
             let substring = String(parsed.characters[run.range])

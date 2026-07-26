@@ -445,7 +445,10 @@ enum MarkdownBlockParser {
 enum MarkdownInline {
     /// Parses inline spans only, preserving the block's own whitespace and newlines. Code spans
     /// are restyled to SF Mono with a recessed background; links stay clickable.
-    static func attributed(_ text: String, size: CGFloat = PiFont.bodySize) -> AttributedString {
+    static func attributed(
+        _ text: String,
+        baseWeight: Font.Weight = .regular
+    ) -> AttributedString {
         var result: AttributedString
         if let parsed = try? AttributedString(
             markdown: text,
@@ -459,23 +462,26 @@ enum MarkdownInline {
         } else {
             result = AttributedString(text)
         }
-        result.font = .system(size: size)
-        styleCodeSpans(in: &result, size: size)
+        result.font = .system(size: PiFont.size, weight: baseWeight)
+        styleCodeSpans(in: &result, weight: baseWeight)
         linkifyBareURLs(in: &result)
         return result
     }
 
     /// Plain fallback used while a message is still streaming (no per-token reparse).
-    static func plain(_ text: String, size: CGFloat = PiFont.bodySize) -> AttributedString {
+    static func plain(_ text: String) -> AttributedString {
         var value = AttributedString(text)
-        value.font = .system(size: size)
+        value.font = PiFont.body
         return value
     }
 
-    private static func styleCodeSpans(in string: inout AttributedString, size: CGFloat) {
+    private static func styleCodeSpans(
+        in string: inout AttributedString,
+        weight: Font.Weight
+    ) {
         for run in string.runs {
             guard run.inlinePresentationIntent?.contains(.code) == true else { continue }
-            string[run.range].font = .system(size: max(PiFont.metaSize, size - 1), design: .monospaced)
+            string[run.range].font = .system(size: PiFont.size, weight: weight, design: .monospaced)
             string[run.range].backgroundColor = .piInset
         }
     }
@@ -511,13 +517,12 @@ struct MarkdownBlockView: View {
     /// Growing streaming text renders as plain preserved-whitespace text; block Markdown is
     /// parsed once the message is final so every token does not re-parse the whole body.
     var streaming = false
-    var size: CGFloat = PiFont.bodySize
     /// User bubbles shrink-wrap their content; the transcript column fills its width.
     var fillWidth = true
 
     var body: some View {
         if streaming {
-            Text(MarkdownInline.plain(text, size: size))
+            Text(MarkdownInline.plain(text))
                 .lineSpacing(PiFont.bodyLineSpacing)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
@@ -525,7 +530,7 @@ struct MarkdownBlockView: View {
         } else {
             VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
                 ForEach(Array(MarkdownBlockParser.blocks(from: text).enumerated()), id: \.offset) { _, block in
-                    MarkdownBlockRow(block: block, size: size, fillWidth: fillWidth)
+                    MarkdownBlockRow(block: block, fillWidth: fillWidth)
                 }
             }
             .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
@@ -535,16 +540,14 @@ struct MarkdownBlockView: View {
 
 private struct MarkdownBlockRow: View {
     let block: MarkdownBlock
-    let size: CGFloat
     var fillWidth = true
 
     var body: some View {
         switch block {
         case let .paragraph(text):
             inline(text)
-        case let .heading(level, text):
-            Text(MarkdownInline.attributed(text, size: size))
-                .font(headingFont(level))
+        case let .heading(_, text):
+            Text(MarkdownInline.attributed(text, baseWeight: .semibold))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, PiTheme.space4)
@@ -553,7 +556,7 @@ private struct MarkdownBlockRow: View {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     HStack(alignment: .firstTextBaseline, spacing: PiTheme.space6) {
                         Text(item.marker)
-                            .font(ordered ? .system(size: size).monospacedDigit() : .system(size: size))
+                            .font(ordered ? PiFont.body.monospacedDigit() : PiFont.body)
                             .foregroundStyle(.secondary)
                             .frame(minWidth: ordered ? 18 : 10, alignment: .trailing)
                         inline(item.text)
@@ -572,28 +575,20 @@ private struct MarkdownBlockRow: View {
         case let .code(language, code):
             CodeBlockView(language: language, code: code)
         case let .table(header, alignment, rows):
-            MarkdownTableView(header: header, alignment: alignment, rows: rows, size: size)
+            MarkdownTableView(header: header, alignment: alignment, rows: rows)
         case .rule:
             PiHairline().padding(.vertical, PiTheme.space4)
         }
     }
 
     private func inline(_ text: String) -> some View {
-        Text(MarkdownInline.attributed(text, size: size))
+        Text(MarkdownInline.attributed(text))
             .lineSpacing(PiFont.bodyLineSpacing)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
     }
 
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: PiFont.heading1
-        case 2: PiFont.heading2
-        case 3: PiFont.heading3
-        default: PiFont.heading4
-        }
-    }
 }
 
 /// Fenced/indented code on a recessed surface, horizontally scrollable, with a copy button that
@@ -662,7 +657,6 @@ struct MarkdownTableView: View {
     let header: [String]
     let alignment: [MarkdownTableAlignment]
     let rows: [[String]]
-    let size: CGFloat
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -701,8 +695,10 @@ struct MarkdownTableView: View {
     }
 
     private func cellText(_ text: String, column: Int, emphasis: Bool) -> some View {
-        Text(MarkdownInline.attributed(text, size: size))
-            .font(emphasis ? PiFont.bodyEmphasis : .system(size: size))
+        Text(MarkdownInline.attributed(
+            text,
+            baseWeight: emphasis ? .medium : .regular
+        ))
             .foregroundStyle(emphasis ? .secondary : .primary)
             .lineSpacing(PiFont.bodyLineSpacing)
             .multilineTextAlignment(textAlignment(column))

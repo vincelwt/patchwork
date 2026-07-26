@@ -333,7 +333,7 @@ private struct QuestionnaireDialogView: View {
         VStack(alignment: .leading, spacing: PiTheme.space8) {
             Text("Preview").font(PiFont.micro.weight(.semibold)).foregroundStyle(.tertiary)
             ScrollView {
-                MarkdownBlockView(text: preview, size: PiFont.bodySize - 1)
+                MarkdownBlockView(text: preview)
                     .padding(PiTheme.space10)
             }
             .frame(maxHeight: 320)
@@ -434,7 +434,7 @@ struct ImageViewerView: View {
                         )
                         .padding(24)
                 } else {
-                    ContentUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
+                    PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
                         .frame(width: 500, height: 400)
                 }
             }

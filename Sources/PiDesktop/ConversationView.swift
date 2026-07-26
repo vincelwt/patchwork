@@ -171,9 +171,13 @@ struct ConversationView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let error = store.conversationError {
-            ContentUnavailableView {
-                Label("Couldn’t open this session", systemImage: "doc.badge.exclamationmark")
-            } description: { Text(error) } actions: { Button("Try Again", action: store.retryConversationLoad) }
+            PiUnavailableView(
+                "Couldn’t open this session",
+                systemImage: "doc.badge.exclamationmark",
+                description: error
+            ) {
+                Button("Try Again", action: store.retryConversationLoad)
+            }
         } else if store.messages.isEmpty && store.streamingMessage == nil {
             VStack(spacing: PiTheme.space6) {
                 Text("Ready for a new turn")
