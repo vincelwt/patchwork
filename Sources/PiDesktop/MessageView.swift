@@ -4,6 +4,9 @@ struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
     let onImage: (ImagePayload) -> Void
+    /// Answers get a hover action row; the same view reused inside a work log does not.
+    var showsActions = false
+    @State private var hovering = false
 
     var body: some View {
         Group {
@@ -41,8 +44,13 @@ struct MessageView: View {
                 }
             }
             blockList(showThinking: true)
+            if showsActions, !isStreaming, !message.textContent.isEmpty {
+                MessageActionRow(message: message)
+                    .opacity(hovering ? 1 : 0)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onHover { hovering = $0 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Message from Pi")
     }
@@ -239,6 +247,42 @@ struct CompactionRowView: View {
         .padding(.vertical, PiTheme.space4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(note.title)
+    }
+}
+
+/// Copy and timestamp, revealed on hover so a settled answer stays clean.
+private struct MessageActionRow: View {
+    let message: ChatMessage
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: PiTheme.space8) {
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(message.textContent, forType: .string)
+                copied = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    copied = false
+                }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(copied ? Color.piGreen : Color.secondary)
+                    .frame(width: 20, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(copied ? "Copied" : "Copy message")
+            .accessibilityLabel("Copy message")
+
+            if let timestamp = message.timestamp {
+                Text(timestamp.formatted(date: .omitted, time: .shortened))
+                    .font(PiFont.micro)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
     }
 }
 

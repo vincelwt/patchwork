@@ -191,8 +191,13 @@ private struct MessageScrollView: View {
                     ForEach(transcriptItems) { item in
                         switch item {
                         case let .message(message, isStreaming):
-                            MessageView(message: message, isStreaming: isStreaming, onImage: store.showImage)
-                                .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
+                            MessageView(
+                                message: message,
+                                isStreaming: isStreaming,
+                                onImage: store.showImage,
+                                showsActions: true
+                            )
+                            .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
                                 .id(item.id)
                         case let .work(block):
                             TranscriptWorkView(block: block, onImage: store.showImage)
