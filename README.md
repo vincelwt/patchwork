@@ -29,6 +29,38 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 No provider request is made when the app launches, browses sessions, inspects Git, or renames a session.
 
+## The headless half
+
+Pi Desktop has a control plane so threads keep running, get scheduled, and can be driven when
+the window is closed. The wire contract is `docs/daemon-api.md`; the CLI reference is
+`docs/cli.md`; remote access is `docs/web-remote.md`.
+
+| Piece | Binary | Role |
+|---|---|---|
+| Daemon | `pi-deskd` | Scheduler, thread runner, control API over a Unix socket (and loopback TCP when enabled) |
+| CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
+| Web remote | served by the daemon | Phone-first UI for threads and schedules, bearer-token authenticated |
+
+```bash
+swift build -c release --product pi-deskd --product pidesk
+scripts/install-daemon.sh install     # LaunchAgent, starts at login
+pidesk threads list
+pidesk schedule add --name "Morning triage" --thread <id> \
+    --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
+pidesk remote enable --port 7717      # then reach it through your own SSH/Cloudflare tunnel
+```
+
+Automations are also editable in the window with `⌥⌘S`.
+
+## Run state
+
+Run state comes from a small Pi extension the app installs into
+`~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes a heartbeat per session to
+`~/.pi/agent/desktop-activity/<sessionId>.json`, and a session counts as running only when the
+heartbeat says so, is fresher than ten seconds, and its process is still alive. Sessions started
+before the extension existed fall back to a bounded file heuristic. Opt out with
+`defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
+
 ## Run during development
 
 Requirements: macOS 14+, Xcode command-line tools, and Pi installed.
@@ -65,6 +97,7 @@ The script builds, bundles, and ad-hoc signs the executable. Pi and Node are int
 |---|---|
 | `⌘N` | New chat |
 | `⌘K` | Quick switch |
+| `⌥⌘S` | Automations |
 | `⌘R` | Refresh sessions and cached Git state |
 | `⌘.` | Stop the active Pi run |
 | `Return` | Send when idle; steer while running |
