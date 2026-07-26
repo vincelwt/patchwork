@@ -162,6 +162,102 @@ final class SessionParserTests: XCTestCase {
         XCTAssertTrue(summary.searchKey.contains("searchable words"), "Search stays useful")
     }
 
+    // MARK: - Task 1: tail-first scan
+
+    func testConversationTailReturnsLastMessagesInOrderAndReportsIncomplete() throws {
+        let file = temporaryDirectory.appendingPathComponent("tail-basic.jsonl")
+        let lines: [[String: Any]] = [
+            ["type": "session", "version": 3, "id": "tail", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "root", "parentId": NSNull(), "message": ["role": "user", "content": "first"]],
+            ["type": "message", "id": "a", "parentId": "root", "message": ["role": "assistant", "content": [["type": "text", "text": "second"]]]],
+            ["type": "message", "id": "b", "parentId": "a", "message": ["role": "user", "content": "third"]],
+            ["type": "message", "id": "c", "parentId": "b", "message": ["role": "assistant", "content": [["type": "text", "text": "fourth"]]]]
+        ]
+        try write(lines: lines, to: file)
+
+        let tail = try SessionParser.conversationTail(at: file, limit: 2)
+        XCTAssertEqual(tail.conversation.messages.map(\.textContent), ["third", "fourth"])
+        XCTAssertFalse(tail.isComplete, "Two of four messages were collected: earlier history remains")
+    }
+
+    func testConversationTailIsCompleteWhenTheLimitCoversTheWholeConversation() throws {
+        let file = temporaryDirectory.appendingPathComponent("tail-complete.jsonl")
+        let lines: [[String: Any]] = [
+            ["type": "session", "version": 3, "id": "tail", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "root", "parentId": NSNull(), "message": ["role": "user", "content": "first"]],
+            ["type": "message", "id": "a", "parentId": "root", "message": ["role": "assistant", "content": [["type": "text", "text": "second"]]]]
+        ]
+        try write(lines: lines, to: file)
+
+        let tail = try SessionParser.conversationTail(at: file, limit: 40)
+        XCTAssertEqual(tail.conversation.messages.map(\.textContent), ["first", "second"])
+        XCTAssertTrue(tail.isComplete, "The backward walk reached the root, so this already is the whole conversation")
+
+        let full = try SessionParser.conversation(at: file)
+        XCTAssertEqual(tail.conversation.messages.map(\.id), full.messages.map(\.id))
+    }
+
+    func testConversationTailSkipsAnAbandonedBranchPhysicallyAdjacentToTheActiveTail() throws {
+        // root -> a -> b (abandoned, written first) -> c (the edit that replaced b, active) -> d -> e (leaf).
+        // b's id is never referenced by anything after it, so it is not on the path from the leaf.
+        let file = temporaryDirectory.appendingPathComponent("tail-abandoned.jsonl")
+        let lines: [[String: Any]] = [
+            ["type": "session", "version": 3, "id": "tail", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "root", "parentId": NSNull(), "message": ["role": "user", "content": "root prompt"]],
+            ["type": "message", "id": "a", "parentId": "root", "message": ["role": "assistant", "content": [["type": "text", "text": "reply a"]]]],
+            ["type": "message", "id": "b", "parentId": "a", "message": ["role": "user", "content": "abandoned follow-up"]],
+            ["type": "message", "id": "c", "parentId": "a", "message": ["role": "user", "content": "edited follow-up"]],
+            ["type": "message", "id": "d", "parentId": "c", "message": ["role": "assistant", "content": [["type": "text", "text": "reply d"]]]]
+        ]
+        try write(lines: lines, to: file)
+
+        let tail = try SessionParser.conversationTail(at: file, limit: 40)
+        XCTAssertTrue(tail.isComplete)
+        XCTAssertEqual(tail.conversation.messages.map(\.id), ["root", "a", "c", "d"], "The abandoned sibling (b) must never appear")
+
+        let full = try SessionParser.conversation(at: file)
+        XCTAssertEqual(tail.conversation.messages.map(\.id), full.messages.map(\.id))
+    }
+
+    func testConversationTailOnAnEmptyFileIsCompleteAndEmpty() throws {
+        let file = temporaryDirectory.appendingPathComponent("tail-empty.jsonl")
+        try Data().write(to: file)
+
+        let tail = try SessionParser.conversationTail(at: file, limit: 10)
+        XCTAssertTrue(tail.conversation.messages.isEmpty)
+        XCTAssertTrue(tail.isComplete)
+    }
+
+    /// A window too small to reach the root must never be mistaken for a complete conversation,
+    /// and the leading (truncated) line inside that window must never leak a corrupt message —
+    /// this is what makes it safe to bound the backward read on a real multi-megabyte session.
+    func testConversationTailWithATinyWindowStaysCorrectAndReportsIncomplete() throws {
+        let file = temporaryDirectory.appendingPathComponent("tail-window.jsonl")
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "tail", "cwd": temporaryDirectory.path]]
+        var parent: Any = NSNull()
+        for index in 0..<30 {
+            let id = "entry-\(index)"
+            lines.append([
+                "type": "message", "id": id, "parentId": parent,
+                "message": ["role": index.isMultiple(of: 2) ? "user" : "assistant", "content": "padding text for entry \(index)"]
+            ])
+            parent = id
+        }
+        try write(lines: lines, to: file)
+
+        let full = try SessionParser.conversation(at: file)
+        let tail = try SessionParser.conversationTail(at: file, limit: 100, windowBytes: 300)
+
+        XCTAssertFalse(tail.isComplete, "300 bytes cannot reach a 30-message chain's root")
+        XCTAssertFalse(tail.conversation.messages.isEmpty, "Some trailing messages must still fit in the window")
+        XCTAssertLessThan(tail.conversation.messages.count, full.messages.count)
+        XCTAssertEqual(
+            tail.conversation.messages.map(\.id),
+            full.messages.suffix(tail.conversation.messages.count).map(\.id),
+            "The partial tail must be an exact suffix of the authoritative parse, not a reordering or a skip"
+        )
+    }
+
     func testInstalledSessionDirectorySmokeWhenRequested() async throws {
         guard ProcessInfo.processInfo.environment["PI_DESKTOP_REAL_SESSION_SMOKE"] == "1" else {
             throw XCTSkip("Set PI_DESKTOP_REAL_SESSION_SMOKE=1 to scan the installed Pi session directory")
@@ -173,6 +269,51 @@ final class SessionParserTests: XCTestCase {
         let sessions = try await repository.discoverSessions(archivedIDs: [])
         XCTAssertFalse(sessions.isEmpty)
         XCTAssertTrue(sessions.allSatisfy { $0.fileURL.deletingLastPathComponent().deletingLastPathComponent() == repository.rootURL })
+    }
+
+    /// Task 1 measurement: actual load latency on the largest real session on this machine,
+    /// never a synthetic fixture — `PI_DESKTOP_REAL_SESSION_SMOKE=1` opts in explicitly since
+    /// this depends on whatever happens to be installed. Reading local JSONL is free; nothing
+    /// here starts Pi or talks to a provider. Reports the three numbers that matter for "instant
+    /// open": a warm `TranscriptCache` hit (what a recent/prefetched selection pays), the
+    /// tail-first scan (what a cold selection paints immediately), and the full two-pass parse
+    /// (what eventually replaces the tail on a cold selection).
+    func testMeasuresParseLatencyOnTheLargestInstalledSession() async throws {
+        guard ProcessInfo.processInfo.environment["PI_DESKTOP_REAL_SESSION_SMOKE"] == "1" else {
+            throw XCTSkip("Set PI_DESKTOP_REAL_SESSION_SMOKE=1 to scan the installed Pi session directory")
+        }
+        let repository = FileSessionRepository()
+        guard FileManager.default.fileExists(atPath: repository.rootURL.path) else {
+            throw XCTSkip("No installed Pi session directory")
+        }
+        let enumerator = FileManager.default.enumerator(at: repository.rootURL, includingPropertiesForKeys: [.fileSizeKey])
+        var largest: (url: URL, size: Int)?
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "jsonl" else { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            if size > (largest?.size ?? 0) { largest = (url, size) }
+        }
+        guard let largest else { throw XCTSkip("No session files found") }
+
+        let clock = ContinuousClock()
+        let fullParseDuration = clock.measure { _ = try? SessionParser.conversation(at: largest.url) }
+        let tailScanDuration = clock.measure { _ = try? SessionParser.conversationTail(at: largest.url, limit: 40) }
+
+        let cache = TranscriptCache()
+        guard let values = try? largest.url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let conversation = try? SessionParser.conversation(at: largest.url) else {
+            throw XCTSkip("Could not fingerprint/parse the largest session")
+        }
+        let fingerprint = SessionFileFingerprint(url: largest.url, values: values)
+        cache.store(conversation, for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
+        let cacheHitDuration = clock.measure {
+            _ = cache.conversation(for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
+        }
+
+        print("""
+        [perf] \(largest.url.lastPathComponent) size=\(largest.size / 1_024)KB messages=\(conversation.messages.count) \
+        cacheHit=\(cacheHitDuration) tailScan(cold)=\(tailScanDuration) fullParse(cold)=\(fullParseDuration)
+        """)
     }
 
     func testRepositoryOnlyFindsDirectSessionFiles() async throws {

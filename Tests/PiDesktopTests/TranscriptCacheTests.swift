@@ -32,107 +32,104 @@ final class TranscriptCacheTests: XCTestCase {
         return SessionConversation(messages: [message], leafID: id, rawEntryCount: 1)
     }
 
-    func testStoreThenHitReturnsTheSameConversationForAMatchingFingerprint() async throws {
+    func testStoreThenHitReturnsTheSameConversationForAMatchingFingerprint() throws {
         let cache = TranscriptCache()
         let fp = try fingerprint(name: "a.jsonl")
         let conversation = conversation(id: "a")
 
-        let miss = await cache.conversation(for: "a", fingerprint: fp)
+        let miss = cache.conversation(for: "a", fingerprint: fp)
         XCTAssertNil(miss, "Nothing cached yet")
-        await cache.store(conversation, for: "a", fingerprint: fp)
-        let hit = await cache.conversation(for: "a", fingerprint: fp)
+        cache.store(conversation, for: "a", fingerprint: fp)
+        let hit = cache.conversation(for: "a", fingerprint: fp)
         XCTAssertEqual(hit?.leafID, "a")
-        let count = await cache.count
-        XCTAssertEqual(count, 1)
+        XCTAssertEqual(cache.count, 1)
     }
 
-    func testStaleFingerprintIsAMissNotStaleData() async throws {
+    /// The whole point of Task 1's fast path: a hit never needs `await` to resolve, so
+    /// `AppStore.selectSession` can check it inline before publishing any loading state.
+    func testConversationLookupIsSynchronousNotAsync() throws {
+        let cache = TranscriptCache()
+        let fp = try fingerprint(name: "sync.jsonl")
+        cache.store(conversation(id: "sync"), for: "sync", fingerprint: fp)
+        let hit: SessionConversation? = cache.conversation(for: "sync", fingerprint: fp) // no `await`
+        XCTAssertEqual(hit?.leafID, "sync")
+    }
+
+    func testStaleFingerprintIsAMissNotStaleData() throws {
         // The file changed on disk (still running in a terminal) since it was cached: serving
         // the old parse would show the user out-of-date content.
         let cache = TranscriptCache()
         let originalFingerprint = try fingerprint(name: "a.jsonl")
-        await cache.store(conversation(id: "a"), for: "a", fingerprint: originalFingerprint)
+        cache.store(conversation(id: "a"), for: "a", fingerprint: originalFingerprint)
 
         try Data("longer content changes size".utf8).write(to: directory.appendingPathComponent("a.jsonl"))
         let values = try directory.appendingPathComponent("a.jsonl").resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let changedFingerprint = SessionFileFingerprint(url: directory.appendingPathComponent("a.jsonl"), values: values)
 
         XCTAssertNotEqual(originalFingerprint, changedFingerprint)
-        let staleHit = await cache.conversation(for: "a", fingerprint: changedFingerprint)
+        let staleHit = cache.conversation(for: "a", fingerprint: changedFingerprint)
         XCTAssertNil(staleHit)
     }
 
-    func testEntryCountCeilingEvictsTheLeastRecentlyUsedEntryFirst() async throws {
+    func testEntryCountCeilingEvictsTheLeastRecentlyUsedEntryFirst() throws {
         let cache = TranscriptCache(entryCapacity: 2, byteCapacity: .max)
         let fpA = try fingerprint(name: "a.jsonl")
         let fpB = try fingerprint(name: "b.jsonl")
         let fpC = try fingerprint(name: "c.jsonl")
 
-        await cache.store(conversation(id: "a"), for: "a", fingerprint: fpA)
-        await cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
+        cache.store(conversation(id: "a"), for: "a", fingerprint: fpA)
+        cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
         // A third entry over the cap evicts "a" (the least recently touched), not "b".
-        await cache.store(conversation(id: "c"), for: "c", fingerprint: fpC)
+        cache.store(conversation(id: "c"), for: "c", fingerprint: fpC)
 
-        let count = await cache.count
-        let hasA = await cache.contains("a")
-        let hasB = await cache.contains("b")
-        let hasC = await cache.contains("c")
-        XCTAssertEqual(count, 2)
-        XCTAssertFalse(hasA)
-        XCTAssertTrue(hasB)
-        XCTAssertTrue(hasC)
+        XCTAssertEqual(cache.count, 2)
+        XCTAssertFalse(cache.contains("a"))
+        XCTAssertTrue(cache.contains("b"))
+        XCTAssertTrue(cache.contains("c"))
     }
 
-    func testTouchingAnEntryProtectsItFromTheNextEviction() async throws {
+    func testTouchingAnEntryProtectsItFromTheNextEviction() throws {
         let cache = TranscriptCache(entryCapacity: 2, byteCapacity: .max)
         let fpA = try fingerprint(name: "a.jsonl")
         let fpB = try fingerprint(name: "b.jsonl")
         let fpC = try fingerprint(name: "c.jsonl")
 
-        await cache.store(conversation(id: "a"), for: "a", fingerprint: fpA)
-        await cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
+        cache.store(conversation(id: "a"), for: "a", fingerprint: fpA)
+        cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
         // Re-reading "a" makes it the most recently used, so "b" is evicted instead.
-        _ = await cache.conversation(for: "a", fingerprint: fpA)
-        await cache.store(conversation(id: "c"), for: "c", fingerprint: fpC)
+        _ = cache.conversation(for: "a", fingerprint: fpA)
+        cache.store(conversation(id: "c"), for: "c", fingerprint: fpC)
 
-        let hasA = await cache.contains("a")
-        let hasB = await cache.contains("b")
-        let hasC = await cache.contains("c")
-        XCTAssertTrue(hasA, "Touched entries survive the next eviction")
-        XCTAssertFalse(hasB)
-        XCTAssertTrue(hasC)
+        XCTAssertTrue(cache.contains("a"), "Touched entries survive the next eviction")
+        XCTAssertFalse(cache.contains("b"))
+        XCTAssertTrue(cache.contains("c"))
     }
 
-    func testByteCostCeilingEvictsEvenUnderTheEntryCountLimit() async throws {
+    func testByteCostCeilingEvictsEvenUnderTheEntryCountLimit() throws {
         // A tiny byte budget forces eviction well before the (generous) entry-count ceiling.
         let cache = TranscriptCache(entryCapacity: 100, byteCapacity: 25)
         let fpA = try fingerprint(name: "a.jsonl")
         let fpB = try fingerprint(name: "b.jsonl")
 
-        await cache.store(conversation(id: "a", textByteCount: 20), for: "a", fingerprint: fpA)
-        let hasAInitially = await cache.contains("a")
-        XCTAssertTrue(hasAInitially)
-        await cache.store(conversation(id: "b", textByteCount: 20), for: "b", fingerprint: fpB)
+        cache.store(conversation(id: "a", textByteCount: 20), for: "a", fingerprint: fpA)
+        XCTAssertTrue(cache.contains("a"))
+        cache.store(conversation(id: "b", textByteCount: 20), for: "b", fingerprint: fpB)
 
-        let hasA = await cache.contains("a")
-        let hasB = await cache.contains("b")
-        XCTAssertFalse(hasA, "Over the byte budget: the older entry is evicted")
-        XCTAssertTrue(hasB)
+        XCTAssertFalse(cache.contains("a"), "Over the byte budget: the older entry is evicted")
+        XCTAssertTrue(cache.contains("b"))
     }
 
-    func testRemoveAndRemoveAllDropEntriesAndTheirCost() async throws {
+    func testRemoveAndRemoveAllDropEntriesAndTheirCost() throws {
         let cache = TranscriptCache()
         let fpA = try fingerprint(name: "a.jsonl")
-        await cache.store(conversation(id: "a", textByteCount: 50), for: "a", fingerprint: fpA)
-        await cache.remove("a")
-        let hasA = await cache.contains("a")
-        XCTAssertFalse(hasA)
+        cache.store(conversation(id: "a", textByteCount: 50), for: "a", fingerprint: fpA)
+        cache.remove("a")
+        XCTAssertFalse(cache.contains("a"))
 
         let fpB = try fingerprint(name: "b.jsonl")
-        await cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
-        await cache.removeAll()
-        let count = await cache.count
-        XCTAssertEqual(count, 0)
+        cache.store(conversation(id: "b"), for: "b", fingerprint: fpB)
+        cache.removeAll()
+        XCTAssertEqual(cache.count, 0)
     }
 
     func testEstimatedCostSumsTextAndImageBytesPlusAFlatChargeForStructuredBlocks() {
@@ -144,5 +141,28 @@ final class TranscriptCacheTests: XCTestCase {
         )
         let conversation = SessionConversation(messages: [text, image], leafID: "m2", rawEntryCount: 2)
         XCTAssertEqual(TranscriptCache.estimatedCost(of: conversation), 5 + 100)
+    }
+
+    /// Concurrent readers/writers (main-actor selection reads, background prefetch writes) must
+    /// never corrupt the LRU bookkeeping now that it is lock-based instead of actor-isolated.
+    /// Values are precomputed and captured by the task closures instead of `self`, since a
+    /// `@Sendable` closure cannot capture the (non-`Sendable`) test case.
+    func testConcurrentStoresFromMultipleThreadsNeverCorruptBookkeeping() async throws {
+        let cache = TranscriptCache(entryCapacity: 8, byteCapacity: .max)
+        let fingerprints = try (0..<8).map { try fingerprint(name: "p\($0).jsonl") }
+        let conversations = (0..<8).map { conversation(id: "p\($0)") }
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<64 {
+                let slot = index % 8
+                let fp = fingerprints[slot]
+                let convo = conversations[slot]
+                group.addTask {
+                    cache.store(convo, for: "p\(slot)", fingerprint: fp)
+                    _ = cache.conversation(for: "p\(slot)", fingerprint: fp)
+                }
+            }
+        }
+        XCTAssertLessThanOrEqual(cache.count, 8)
     }
 }

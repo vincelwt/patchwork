@@ -2,6 +2,27 @@ import Foundation
 
 protocol GitStatusProviding {
     func snapshot(for directory: URL) async -> GitSnapshot
+    /// Whether `directory` resolves inside a *linked* git worktree rather than the main
+    /// checkout, and which one. `nil` when the folder is not a repository, is the main checkout,
+    /// or detection otherwise fails — always a silent degrade, never a surfaced error.
+    func worktreeInfo(for directory: URL) async -> GitWorktreeInfo?
+}
+
+/// Defaulted so existing conformers (test fakes that only exercise `snapshot(for:)`) never need
+/// to change for a feature they do not test.
+extension GitStatusProviding {
+    func worktreeInfo(for directory: URL) async -> GitWorktreeInfo? { nil }
+}
+
+/// Present only when the session's cwd is a linked worktree. `name`/`mainName` are last path
+/// components, sized for a compact inspector row; `path`/`mainWorktreePath` back its tooltip.
+struct GitWorktreeInfo: Hashable, Sendable {
+    let path: String
+    let branch: String?
+    let mainWorktreePath: String
+
+    var name: String { URL(fileURLWithPath: path).lastPathComponent }
+    var mainName: String { URL(fileURLWithPath: mainWorktreePath).lastPathComponent }
 }
 
 struct GitService: GitStatusProviding {
@@ -16,6 +37,83 @@ struct GitService: GitStatusProviding {
         } onCancel: {
             worker.cancel()
         }
+    }
+
+    /// Cancellation is propagated the same way `snapshot(for:)` does.
+    func worktreeInfo(for directory: URL) async -> GitWorktreeInfo? {
+        let worker = Task.detached(priority: .utility) {
+            Self.readWorktreeInfo(for: directory)
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    /// `git rev-parse --git-dir` differing from `--git-common-dir` is the one reliable signal for
+    /// "this is a linked worktree, not the main checkout": every worktree of a repo shares one
+    /// common dir, but a linked worktree's own git-dir lives under
+    /// `<main>/.git/worktrees/<name>`, while the main checkout (or a repo that has never used
+    /// worktrees) reports the same path for both. `worktree list --porcelain` then supplies the
+    /// human-facing path/branch once that signal fires.
+    private static func readWorktreeInfo(for directory: URL) -> GitWorktreeInfo? {
+        guard !Task.isCancelled, FileManager.default.fileExists(atPath: directory.path) else { return nil }
+        let gitDirResult = run(["-C", directory.path, "rev-parse", "--git-dir"])
+        let commonDirResult = run(["-C", directory.path, "rev-parse", "--git-common-dir"])
+        guard gitDirResult.status == 0, commonDirResult.status == 0 else { return nil } // Not a repository.
+
+        let gitDir = resolvedGitPath(gitDirResult.output, relativeTo: directory)
+        let commonDir = resolvedGitPath(commonDirResult.output, relativeTo: directory)
+        guard gitDir != commonDir else { return nil } // Main checkout, or a repo with no worktrees.
+
+        let mainWorktreePath = URL(fileURLWithPath: commonDir).deletingLastPathComponent().path
+        guard !Task.isCancelled else { return nil }
+        let list = run(["-C", directory.path, "worktree", "list", "--porcelain"])
+        guard list.status == 0, let entry = matchingWorktreeEntry(in: list.output, containing: directory) else {
+            // We know it is a worktree (the dirs differ) but could not pin down its registered
+            // root; fall back to the cwd itself rather than dropping the indicator entirely.
+            return GitWorktreeInfo(path: directory.resolvingSymlinksInPath().path, branch: nil, mainWorktreePath: mainWorktreePath)
+        }
+        return GitWorktreeInfo(path: entry.path, branch: entry.branch, mainWorktreePath: mainWorktreePath)
+    }
+
+    /// `--git-dir`/`--git-common-dir` can come back relative (e.g. `../../.git`) or absolute
+    /// depending on how deep `directory` is inside the checkout, and git itself always resolves
+    /// symlinks in what it reports; resolving them here too keeps the equality check honest even
+    /// when `directory` was reached through a symlinked ancestor (e.g. macOS's `/tmp`).
+    private static func resolvedGitPath(_ raw: String, relativeTo directory: URL) -> String {
+        URL(fileURLWithPath: raw.trimmed, relativeTo: directory).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Parses `git worktree list --porcelain` (records are `worktree <path>` / `HEAD <sha>` /
+    /// either `branch refs/heads/<name>` or `detached`, separated by a blank line) and returns
+    /// the record whose path is `directory` itself or an ancestor of it — the session's cwd can
+    /// be a subdirectory of the worktree root rather than the root. Exposed (not private) so it
+    /// can be exercised directly against literal porcelain text, not only through a real repo.
+    static func matchingWorktreeEntry(in porcelain: String, containing directory: URL) -> (path: String, branch: String?)? {
+        let target = directory.resolvingSymlinksInPath().path
+        var best: (path: String, branch: String?)?
+        var candidatePath: String?
+        var candidateBranch: String?
+
+        func flush() {
+            defer { candidatePath = nil; candidateBranch = nil }
+            guard let path = candidatePath, target == path || target.hasPrefix(path + "/") else { return }
+            if path.count > (best?.path.count ?? -1) { best = (path, candidateBranch) }
+        }
+
+        for line in porcelain.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.isEmpty {
+                flush()
+            } else if line.hasPrefix("worktree ") {
+                candidatePath = URL(fileURLWithPath: String(line.dropFirst("worktree ".count))).resolvingSymlinksInPath().path
+            } else if line.hasPrefix("branch refs/heads/") {
+                candidateBranch = String(line.dropFirst("branch refs/heads/".count))
+            }
+        }
+        flush()
+        return best
     }
 
     private static func readSnapshot(for directory: URL) -> GitSnapshot {

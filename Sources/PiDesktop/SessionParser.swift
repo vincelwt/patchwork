@@ -163,6 +163,88 @@ struct SessionParser {
         return SessionConversation(messages: messages, leafID: lastEntryID, rawEntryCount: rawEntryCount)
     }
 
+    /// Bytes read backward from EOF for the tail-first preview (Task 1). Large enough that a
+    /// realistic tail of `AppStore`'s preview limit almost always resolves from one window,
+    /// small enough that even a 25 MB session only ever pays for a few MB of it.
+    static let tailScanWindowBytes = 4 * 1_024 * 1_024
+
+    struct TailScan {
+        let conversation: SessionConversation
+        /// True once the backward walk reached the conversation's root: the tail *is* the whole
+        /// active conversation, so no further full parse is needed to "fill in the rest".
+        let isComplete: Bool
+    }
+
+    /// Reconstructs just the tail of the active conversation without reading the rest of the
+    /// file, so a cache miss can paint something at the bottom before the full two-pass parse
+    /// (which must still touch the whole file) finishes. Reads one fixed-size window from EOF,
+    /// then walks the real parent-pointer chain backward through it exactly like `conversation
+    /// (at:)` walks it forward: a line only counts if it is genuinely on the active path, so an
+    /// abandoned branch physically adjacent to the tail (left behind by an earlier edit) is
+    /// skipped rather than mistaken for recent history.
+    ///
+    /// The window may cut a large abandoned branch short without ever reaching the root; when
+    /// that happens `isComplete` is false and the caller is expected to follow up with a full
+    /// `conversation(at:)` parse. Images decode against a budget scoped to just this preview, so
+    /// on an image-heavy conversation whose earlier images would have exhausted the aggregate
+    /// budget, an image shown here can be replaced by a placeholder once that full parse lands —
+    /// an accepted, self-correcting tradeoff for painting instantly.
+    /// `windowBytes` defaults to `tailScanWindowBytes`; tests inject a tiny window instead of
+    /// allocating real megabytes to exercise truncation deterministically.
+    static func conversationTail(at url: URL, limit: Int, windowBytes: Int = SessionParser.tailScanWindowBytes) throws -> TailScan {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let fileSize = try handle.seekToEnd()
+        guard fileSize > 0 else {
+            return TailScan(conversation: SessionConversation(messages: [], leafID: nil, rawEntryCount: 0), isComplete: true)
+        }
+
+        let windowSize = min(fileSize, UInt64(windowBytes))
+        let readEntireFile = windowSize == fileSize
+        try handle.seek(toOffset: fileSize - windowSize)
+        let window = try handle.read(upToCount: Int(windowSize)) ?? Data()
+
+        // Split into complete lines. When the window does not start at byte 0, its leading
+        // fragment (before the first newline) is a truncated record and must be discarded.
+        var lines = window.split(separator: 0x0A, omittingEmptySubsequences: true)
+        if !readEntireFile, !lines.isEmpty { lines.removeFirst() }
+
+        let decoder = JSONDecoder()
+        var expectedID: String?
+        var leafID: String?
+        var sawAnyEntry = false
+        var reachedRoot = false
+        var collected: [ChatMessage] = []
+        var budget = ImageBudget()
+
+        for line in lines.reversed() {
+            try Task.checkCancellation()
+            let record = Data(line)
+            guard let header = try? decoder.decode(EntryHeader.self, from: record) else { continue }
+            if header.type == "session" { reachedRoot = true; break }
+            guard let id = header.id else { continue }
+            if sawAnyEntry {
+                guard id == expectedID else { continue } // An abandoned branch, not our path.
+            } else {
+                sawAnyEntry = true
+                leafID = id
+            }
+            if let raw = try? JSONValue.decode(record) {
+                let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
+                if let message = chatMessage(from: entry, budget: &budget) { collected.append(message) }
+            }
+            expectedID = header.parentId
+            guard expectedID != nil else { reachedRoot = true; break }
+            if collected.count >= limit { break }
+        }
+
+        collected.reverse()
+        return TailScan(
+            conversation: SessionConversation(messages: collected, leafID: leafID, rawEntryCount: collected.count),
+            isComplete: reachedRoot
+        )
+    }
+
     static func chatMessages(fromRPCMessages value: JSONValue?) -> [ChatMessage] {
         // One shared budget across the whole hydration, not per message.
         var budget = ImageBudget()
