@@ -62,6 +62,31 @@ final class SidebarPresentationTests: XCTestCase {
     }
 }
 
+/// Task 2: the sidebar's whole type scale collapses onto three named roles (see
+/// `SidebarTypography.swift`), each a direct alias of a `Theme.swift` `PiFont` constant —
+/// mirrors the metric-pinning style of `ThemeGridTests.swift`, but for type instead of layout.
+final class SidebarTypographyTests: XCTestCase {
+    func testConversationTitleUsesRowWeightBySelection() {
+        XCTAssertEqual(SidebarTypography.conversationTitle(selected: false), PiFont.row)
+        XCTAssertEqual(SidebarTypography.conversationTitle(selected: true), PiFont.rowEmphasis)
+    }
+
+    func testFolderHeaderConversationRowAndMetadataAreThreeDistinctSizes() {
+        let conversationRow = SidebarTypography.conversationTitle(selected: false)
+        XCTAssertNotEqual(SidebarTypography.folderHeader, conversationRow, "Folder headers and conversation rows must read as distinct sizes")
+        XCTAssertNotEqual(SidebarTypography.folderHeader, SidebarTypography.metadata, "Folder headers and metadata must read as distinct sizes")
+        XCTAssertNotEqual(conversationRow, SidebarTypography.metadata, "Conversation rows and metadata must read as distinct sizes")
+    }
+
+    func testEveryRoleResolvesToATypeScaleConstantNotAnAdHocLiteral() {
+        // Pins each role to the exact shared constant the SidebarView.swift/QuickSwitcherView.swift
+        // audit standardized on, so a future edit cannot quietly reintroduce a bespoke size.
+        XCTAssertEqual(SidebarTypography.folderHeader, PiFont.captionEmphasis)
+        XCTAssertEqual(SidebarTypography.metadata, PiFont.micro)
+        XCTAssertEqual(SidebarTypography.status, PiFont.caption)
+    }
+}
+
 final class GitIndicatorPolicyTests: XCTestCase {
     private func dirtySnapshot(branch: String?, detached: Bool = false) -> GitSnapshot {
         var snapshot = GitSnapshot(isRepository: true)

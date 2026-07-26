@@ -219,6 +219,91 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertEqual(Set(entries.map(\.folder.id)), Set([inProject.id, top.id]))
     }
 
+    // MARK: - Default working directory for a folder-scoped new chat
+
+    func testDefaultWorkingDirectoryPrefersTheFolderSSharedCwd() {
+        let folder = VirtualFolder(id: "focus", name: "Focus")
+        let a = summary(id: "a", cwd: "/tmp/project-a")
+        let b = summary(id: "b", cwd: "/tmp/project-a")
+        let assignments = [
+            a.fileURL.standardizedFileURL.path: folder.id,
+            b.fileURL.standardizedFileURL.path: folder.id
+        ]
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: folder.id, sessions: [a, b], assignments: assignments,
+            folders: [folder], fallback: URL(fileURLWithPath: "/tmp/fallback")
+        )
+        XCTAssertEqual(cwd.standardizedFileURL.path, "/tmp/project-a")
+    }
+
+    func testDefaultWorkingDirectoryIgnoresSessionsAssignedToADifferentFolder() {
+        let focus = VirtualFolder(id: "focus", name: "Focus")
+        let other = VirtualFolder(id: "other", name: "Other")
+        let inFocus = summary(id: "a", cwd: "/tmp/project-a")
+        let inOther = summary(id: "b", cwd: "/tmp/project-b")
+        let assignments = [
+            inFocus.fileURL.standardizedFileURL.path: focus.id,
+            inOther.fileURL.standardizedFileURL.path: other.id
+        ]
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: focus.id, sessions: [inFocus, inOther], assignments: assignments,
+            folders: [focus, other], fallback: URL(fileURLWithPath: "/tmp/fallback")
+        )
+        XCTAssertEqual(cwd.standardizedFileURL.path, "/tmp/project-a", "A sibling folder's sessions must never leak into this one's cwd guess")
+    }
+
+    func testDefaultWorkingDirectoryBreaksATieOnTheMostRecentlyModifiedSession() {
+        let folder = VirtualFolder(id: "mixed", name: "Mixed")
+        let older = summary(id: "older", cwd: "/tmp/project-a", modifiedAt: Date(timeIntervalSince1970: 100))
+        let newer = summary(id: "newer", cwd: "/tmp/project-b", modifiedAt: Date(timeIntervalSince1970: 200))
+        let assignments = [
+            older.fileURL.standardizedFileURL.path: folder.id,
+            newer.fileURL.standardizedFileURL.path: folder.id
+        ]
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: folder.id, sessions: [older, newer], assignments: assignments,
+            folders: [folder], fallback: URL(fileURLWithPath: "/tmp/fallback")
+        )
+        XCTAssertEqual(cwd.standardizedFileURL.path, "/tmp/project-b", "A 1-1 tie breaks toward the most recently modified session")
+    }
+
+    func testDefaultWorkingDirectoryFallsBackToTheEnclosingProjectWhenTheFolderIsEmpty() throws {
+        var folders: [VirtualFolder] = []
+        let empty = try XCTUnwrap(WorkspaceOrganization.create(named: "Empty", parentID: "/tmp/project-a", in: &folders))
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: empty.id, sessions: [], assignments: [:],
+            folders: folders, fallback: URL(fileURLWithPath: "/tmp/fallback")
+        )
+        XCTAssertEqual(cwd.standardizedFileURL.path, "/tmp/project-a")
+    }
+
+    func testDefaultWorkingDirectoryWalksUpThroughEmptyParentFoldersToFindTheProject() throws {
+        var folders: [VirtualFolder] = []
+        let mid = try XCTUnwrap(WorkspaceOrganization.create(named: "Mid", parentID: "/tmp/project-a", in: &folders))
+        let leaf = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Leaf", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: mid.id), in: &folders
+        ))
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: leaf.id, sessions: [], assignments: [:],
+            folders: folders, fallback: URL(fileURLWithPath: "/tmp/fallback")
+        )
+        XCTAssertEqual(
+            cwd.standardizedFileURL.path, "/tmp/project-a",
+            "An empty folder nested inside another empty folder still finds the enclosing project"
+        )
+    }
+
+    func testDefaultWorkingDirectoryFallsBackToTheCallerSDefaultWhenNothingElseApplies() throws {
+        var folders: [VirtualFolder] = []
+        let topLevel = try XCTUnwrap(WorkspaceOrganization.create(named: "TopLevel", in: &folders))
+        let fallback = URL(fileURLWithPath: "/tmp/fallback", isDirectory: true)
+        let cwd = WorkspaceOrganization.defaultWorkingDirectory(
+            forVirtualFolder: topLevel.id, sessions: [], assignments: [:],
+            folders: folders, fallback: fallback
+        )
+        XCTAssertEqual(cwd.standardizedFileURL.path, fallback.standardizedFileURL.path, "A top-level, empty folder has no project to fall back to")
+    }
+
     func testSidebarSnapshotRendersNestedFoldersAndProjectsEverySessionOnce() throws {
         var folders: [VirtualFolder] = []
         let projectPath = "/tmp/project-a"
