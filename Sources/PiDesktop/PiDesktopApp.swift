@@ -155,11 +155,19 @@ struct RootView: View {
         }
         .overlay(alignment: .top) {
             if let toast = store.toast {
-                ToastView(toast: toast)
-                    // Clears the unified toolbar so the toast is never hidden behind it.
-                    .padding(.top, PiTheme.space32 + PiTheme.space24)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(10)
+                Group {
+                    if toast.sessionPath == nil {
+                        ToastView(toast: toast)
+                    } else {
+                        Button { store.openToast(toast) } label: { ToastView(toast: toast) }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Open conversation")
+                    }
+                }
+                // Clears the unified toolbar so the toast is never hidden behind it.
+                .padding(.top, PiTheme.space32 + PiTheme.space24)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(10)
             }
         }
         }

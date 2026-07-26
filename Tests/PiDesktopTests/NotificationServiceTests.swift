@@ -176,6 +176,20 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertTrue(store.toast?.text.contains(session.displayName) == true)
     }
 
+    func testOpeningAnInAppBannerSelectsItsConversation() throws {
+        let (store, runtime, _, session) = makeStore(isActive: true)
+        attachRuntime(store, runtime: runtime, to: session)
+        store.openNewChat()
+
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        let toast = try XCTUnwrap(store.toast)
+        XCTAssertEqual(toast.sessionPath, session.fileURL.standardizedFileURL.path)
+
+        store.openToast(toast)
+        XCTAssertEqual(store.selectedSession?.id, session.id)
+        XCTAssertNil(store.toast)
+    }
+
     /// Drives the real `SessionActivityMonitor` (no fake snapshot injection needed here, since
     /// nothing shells out) so the running→idle transition reaches `AppStore` exactly as it does
     /// in the app: through the monitor's own published `activities`.
