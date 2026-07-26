@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import PiDeskKit
+import PiDeskWeb
 
 enum HTTPParseError: Error { case malformed(String); case connectionClosed }
 
@@ -96,6 +97,14 @@ final class HTTPServer: @unchecked Sendable {
                 return
             }
 
+            // The remote UI's shell is static and carries no data, so it is served before the
+            // token check; every `/v1/` call it then makes is authorized normally.
+            if let response = Self.webAssetResponse(for: request) {
+                writeResponse(fd: fd, response, keepAlive: shouldKeepAlive(request))
+                if !shouldKeepAlive(request) { return }
+                continue
+            }
+
             if request.method == "GET", request.path == "/v1/events" {
                 writeSSEHead(fd: fd)
                 streamEvents(fd: fd)
@@ -107,6 +116,29 @@ final class HTTPServer: @unchecked Sendable {
             writeResponse(fd: fd, response, keepAlive: keepAlive)
             if !keepAlive { return }
         }
+    }
+
+    /// Serves the bundled web remote for any non-API path. `PiDeskWeb` owns traversal safety,
+    /// MIME typing, and ETags; this only speaks HTTP.
+    static func webAssetResponse(for request: HTTPRequest) -> HTTPResponse? {
+        guard request.method == "GET" || request.method == "HEAD" else { return nil }
+        guard let asset = PiDeskWeb.asset(for: request.path) else { return nil }
+
+        var headers = [
+            "Content-Type": asset.contentType,
+            "ETag": asset.etag,
+            "Cache-Control": "no-cache"
+        ]
+        if let match = request.header("if-none-match"), match == asset.etag {
+            headers["Content-Length"] = "0"
+            return HTTPResponse(status: 304, statusText: HTTPResponse.statusText(304), headers: headers, body: Data())
+        }
+        return HTTPResponse(
+            status: 200,
+            statusText: HTTPResponse.statusText(200),
+            headers: headers,
+            body: request.method == "HEAD" ? Data() : asset.data
+        )
     }
 
     private func checkAuthorization(_ request: HTTPRequest) -> DaemonHTTPError? {

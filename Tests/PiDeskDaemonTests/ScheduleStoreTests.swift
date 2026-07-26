@@ -107,3 +107,30 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(permissions, 0o600)
     }
 }
+
+final class WebAssetServingTests: XCTestCase {
+    private func request(_ path: String, method: String = "GET", headers: [String: String] = [:]) -> HTTPRequest {
+        HTTPRequest(method: method, path: path, query: [:], headers: headers, body: Data(), origin: .tcp)
+    }
+
+    func testTheShellIsServedAndTheAPIIsLeftToTheRouter() throws {
+        let index = try XCTUnwrap(HTTPServer.webAssetResponse(for: request("/")))
+        XCTAssertEqual(index.status, 200)
+        XCTAssertTrue(index.headers["Content-Type"]?.contains("text/html") == true)
+        XCTAssertFalse(index.body.isEmpty)
+
+        // Client-side routes fall back to the shell, API paths never do.
+        XCTAssertEqual(HTTPServer.webAssetResponse(for: request("/threads/abc"))?.status, 200)
+        XCTAssertNil(HTTPServer.webAssetResponse(for: request("/v1/threads")))
+        XCTAssertNil(HTTPServer.webAssetResponse(for: request("/v1/events")))
+        XCTAssertNil(HTTPServer.webAssetResponse(for: request("/", method: "POST")))
+    }
+
+    func testAMatchingETagAnswers304WithoutABody() throws {
+        let first = try XCTUnwrap(HTTPServer.webAssetResponse(for: request("/")))
+        let etag = try XCTUnwrap(first.headers["ETag"])
+        let second = try XCTUnwrap(HTTPServer.webAssetResponse(for: request("/", headers: ["if-none-match": etag])))
+        XCTAssertEqual(second.status, 304)
+        XCTAssertTrue(second.body.isEmpty)
+    }
+}

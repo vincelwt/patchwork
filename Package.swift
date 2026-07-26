@@ -27,7 +27,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "PiDeskDaemon",
-            dependencies: ["PiDeskKit"],
+            dependencies: ["PiDeskKit", "PiDeskWeb"],
             path: "Sources/PiDeskDaemon"
         ),
         .executableTarget(
