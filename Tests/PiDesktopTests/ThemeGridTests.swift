@@ -5,14 +5,12 @@ import XCTest
 /// transcript, the status bar, and the sidebar footer on one set of edges.
 final class ThemeGridTests: XCTestCase {
     func testSidebarRowsShareOneTextOriginAndOneIconColumn() {
-        // Action rows and conversation rows both start at the icon inset and then reserve the
-        // same icon column, so their titles land on the folder-name origin.
+        // Action rows, conversation rows, and folder headers all start at the same base inset
+        // (there is no reserved disclosure gutter) and then the same icon column, so every
+        // title lands on one shared origin regardless of row kind.
         let actionRowTextOrigin = PiTheme.sidebarIconInset + PiTheme.sidebarIconColumn + PiTheme.space6
         let conversationRowTextOrigin = PiTheme.sidebarIconInset + PiTheme.sidebarIconColumn + PiTheme.space6
-        // A folder header spends the disclosure gutter first, then the same icon column.
-        let folderHeaderTextOrigin = PiTheme.space8
-            + PiTheme.sidebarDisclosureColumn + PiTheme.space6
-            + PiTheme.sidebarIconColumn + PiTheme.space6
+        let folderHeaderTextOrigin = PiTheme.space8 + PiTheme.sidebarIconColumn + PiTheme.space6
 
         XCTAssertEqual(actionRowTextOrigin, PiTheme.sidebarTextInset)
         XCTAssertEqual(conversationRowTextOrigin, PiTheme.sidebarTextInset)
