@@ -12,7 +12,8 @@ let package = Package(
         // The headless half: a scheduler/runner daemon and its client CLI. See docs/daemon-api.md.
         .executable(name: "pi-deskd", targets: ["PiDeskDaemon"]),
         .executable(name: "pidesk", targets: ["PiDeskCLI"]),
-        .library(name: "PiDeskKit", targets: ["PiDeskKit"])
+        .library(name: "PiDeskKit", targets: ["PiDeskKit"]),
+        .library(name: "PiDeskWeb", targets: ["PiDeskWeb"])
     ],
     targets: [
         .target(
@@ -34,6 +35,13 @@ let package = Package(
             dependencies: ["PiDeskKit"],
             path: "Sources/PiDeskCLI"
         ),
+        // The remote web UI, embedded as resources so the daemon serves it without a build step.
+        .target(
+            name: "PiDeskWeb",
+            dependencies: ["PiDeskKit"],
+            path: "Sources/PiDeskWeb",
+            resources: [.copy("Site")]
+        ),
         .testTarget(
             name: "PiDesktopTests",
             dependencies: ["PiDesktop"],
@@ -48,6 +56,16 @@ let package = Package(
             name: "PiDeskDaemonTests",
             dependencies: ["PiDeskDaemon", "PiDeskKit"],
             path: "Tests/PiDeskDaemonTests"
+        ),
+        .testTarget(
+            name: "PiDeskCLITests",
+            dependencies: ["PiDeskCLI", "PiDeskKit"],
+            path: "Tests/PiDeskCLITests"
+        ),
+        .testTarget(
+            name: "PiDeskWebTests",
+            dependencies: ["PiDeskWeb"],
+            path: "Tests/PiDeskWebTests"
         )
     ]
 )
