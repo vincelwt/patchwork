@@ -52,15 +52,6 @@ struct ConversationView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PiTheme.space6) {
-                    if conversationIsRunning {
-                        PiGridProgressRow {
-                            Text(liveIndicatorText)
-                                .font(PiFont.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(liveIndicatorText)
-                    }
                     if let error = store.runtimeState.lastError, store.isSelectedRuntime { InlineError(text: error) }
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
@@ -83,15 +74,11 @@ struct ConversationView: View {
             }
     }
 
+    /// Working, whether this app's runtime drives the turn or a terminal does.
     private var conversationIsRunning: Bool {
+        if store.isSelectedRuntime, store.runtimeState.isStreaming { return true }
         guard let session = store.selectedSession else { return false }
         return store.isRunning(session)
-    }
-
-    private var liveIndicatorText: String {
-        store.isSelectedRuntime && store.runtimeState.isStreaming
-            ? "Pi is working"
-            : "Pi is working in another process"
     }
 
     @ToolbarContentBuilder
@@ -166,7 +153,11 @@ struct ConversationView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            MessageScrollView(messages: store.messages, streaming: store.streamingMessage)
+            MessageScrollView(
+                messages: store.messages,
+                streaming: store.streamingMessage,
+                isRunning: conversationIsRunning
+            )
         }
     }
 }
@@ -175,6 +166,8 @@ private struct MessageScrollView: View {
     @EnvironmentObject private var store: AppStore
     let messages: [ChatMessage]
     let streaming: ChatMessage?
+    /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
+    let isRunning: Bool
     @State private var scrollTask: Task<Void, Never>?
     /// Tracked by a bottom sentinel appearing/disappearing, which works on macOS 14 without
     /// scroll-position APIs. Auto-scroll only happens while the user is pinned at the bottom.
@@ -185,7 +178,7 @@ private struct MessageScrollView: View {
         TranscriptPresenter.items(
             messages: messages,
             streaming: streaming,
-            isRunning: store.isSelectedRuntime && store.runtimeState.isStreaming
+            isRunning: isRunning || (store.isSelectedRuntime && store.runtimeState.isStreaming)
         )
     }
 
@@ -194,14 +187,20 @@ private struct MessageScrollView: View {
             ScrollView {
                 // A single small gap between entries keeps consecutive tool rows on an even
                 // rhythm; paragraphs get their breathing room from the block renderer.
-                LazyVStack(alignment: .leading, spacing: PiTheme.space10) {
+                LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
                     ForEach(transcriptItems) { item in
                         switch item {
                         case let .message(message, isStreaming):
                             MessageView(message: message, isStreaming: isStreaming, onImage: store.showImage)
+                                .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
                                 .id(item.id)
-                        case let .activity(group):
-                            TranscriptActivityGroupView(group: group, onImage: store.showImage)
+                        case let .work(block):
+                            TranscriptWorkView(block: block, onImage: store.showImage)
+                                .padding(.top, PiTheme.space6)
+                                .id(item.id)
+                        case let .compaction(note):
+                            CompactionRowView(note: note)
+                                .padding(.vertical, PiTheme.space6)
                                 .id(item.id)
                         }
                     }

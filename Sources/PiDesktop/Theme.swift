@@ -56,9 +56,15 @@ enum PiTheme {
     static var sidebarIconInset: CGFloat { space8 + sidebarDisclosureColumn + space6 }
     static var sidebarTextInset: CGFloat { sidebarIconInset + sidebarIconColumn + space6 }
 
+    /// Transcript rhythm: the gap between entries inside one turn, and the larger gap that
+    /// separates one turn from the next.
+    static let transcriptEntrySpacing: CGFloat = 10
+    static let transcriptTurnSpacing: CGFloat = 22
+
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5
     static let radiusMedium: CGFloat = 8
+    static let userBubbleRadius: CGFloat = 14
     static let composerRadius: CGFloat = 12
     static let panelRadius: CGFloat = 10
 
@@ -344,6 +350,16 @@ enum NumberFormatting {
 
     static func cost(_ value: Double) -> String {
         value < 0.01 ? String(format: "$%.4f", value) : String(format: "$%.2f", value)
+    }
+
+    /// `4m 1s` style duration for turn headers. Seconds are dropped past an hour, where they
+    /// stop carrying information.
+    static func duration(_ interval: TimeInterval) -> String {
+        let total = max(0, Int(interval.rounded()))
+        if total < 60 { return "\(total)s" }
+        if total < 3_600 { return "\(total / 60)m \(total % 60)s" }
+        let hours = total / 3_600
+        return "\(hours)h \((total % 3_600) / 60)m"
     }
 
     /// Compact elapsed/duration label for the menu bar and activity rows.

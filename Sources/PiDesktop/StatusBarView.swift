@@ -10,19 +10,9 @@ struct StatusBarView: View {
         HStack(spacing: PiTheme.space10) {
             RuntimeStateLabel()
 
-            StatusSeparator()
-
-            MetricLabel(symbol: "arrow.up", value: NumberFormatting.tokens(metrics.input), help: "Input tokens")
-            MetricLabel(symbol: "arrow.down", value: NumberFormatting.tokens(metrics.output), help: "Output tokens")
-            MetricLabel(symbol: "bolt.horizontal", value: NumberFormatting.tokens(metrics.cacheRead), help: "Cache read tokens")
-
-            Text(NumberFormatting.cost(metrics.cost))
-                .font(PiFont.micro.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Session cost")
-                .accessibilityValue(NumberFormatting.cost(metrics.cost))
-                .help("Session cost")
+            // Token counts live in the hover detail; the bar itself carries the number that
+            // actually matters at a glance.
+            CostLabel(metrics: metrics)
 
             if let percent = metrics.contextPercent {
                 HStack(spacing: PiTheme.space4) {
@@ -46,7 +36,6 @@ struct StatusBarView: View {
                 CodexAccountControl(account: account, isLive: statuses.isLive)
                 StatusSeparator()
             }
-            ModeControl(mode: statuses.mode, isLive: statuses.isLive)
             if let fast = statuses.fastPriority {
                 FastPriorityControl(status: fast, isLive: statuses.isLive)
             }
@@ -86,57 +75,131 @@ private struct StatusSeparator: View {
 private struct RuntimeStateLabel: View {
     @EnvironmentObject private var store: AppStore
 
+    /// Idle is the normal state and needs no words: the bar only speaks while Pi is busy.
+    private var activity: (text: String, help: String)? {
+        if store.isSelectedRuntime, store.runtimeState.isCompacting {
+            return ("Compacting", "Compacting the context window")
+        }
+        if store.isSelectedRuntime, store.runtimeState.isRetrying {
+            return ("Retry \(store.runtimeState.retryAttempt ?? 1)", "Retrying the last provider request")
+        }
+        if store.isSelectedRuntime, store.runtimeState.isStreaming {
+            return ("Working", "Pi is working on this turn")
+        }
+        if let session = store.selectedSession, store.isRunning(session) {
+            return ("Working", "This conversation is working")
+        }
+        return nil
+    }
+
     var body: some View {
-        Group {
-            if store.isSelectedRuntime, store.runtimeState.isCompacting {
-                label("Compacting", symbol: "arrow.triangle.2.circlepath", tint: Color.piPurple)
-            } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
-                label("Retry \(store.runtimeState.retryAttempt ?? 1)", symbol: "arrow.clockwise", tint: Color.piOrange)
-            } else if store.isSelectedRuntime, store.runtimeState.isStreaming {
-                HStack(spacing: PiTheme.space4) {
-                    ProgressView().controlSize(.mini)
-                    Text("Working")
-                }
-                .font(PiFont.micro)
-                .foregroundStyle(.secondary)
-            } else if store.isSelectedRuntime, store.runtimeState.isConnected {
-                label("Ready", symbol: "circle.fill", tint: Color.piGreen)
-            } else if let session = store.selectedSession, store.isRunning(session) {
-                // Running in a terminal outside this app.
-                HStack(spacing: PiTheme.space4) {
-                    ProgressView().controlSize(.mini)
-                    Text("Running elsewhere")
-                }
-                .font(PiFont.micro)
-                .foregroundStyle(.secondary)
-            } else {
-                label("Idle", symbol: "circle", tint: .secondary)
+        if let activity {
+            HStack(spacing: PiTheme.space4) {
+                ProgressView().controlSize(.mini)
+                Text(activity.text)
+                    .font(PiFont.micro)
+                    .foregroundStyle(.secondary)
             }
+            .help(activity.help)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Session state")
+            .accessibilityValue(activity.help)
+
+            StatusSeparator()
         }
-        .help(helpText)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Session state")
-        .accessibilityValue(helpText)
+    }
+}
+
+// MARK: - Cost
+
+/// Cost is the headline; the token breakdown is one hover away.
+private struct CostLabel: View {
+    let metrics: TokenMetrics
+
+    var body: some View {
+        Text(NumberFormatting.cost(metrics.cost))
+            .font(PiFont.micro.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Session cost")
+            .accessibilityValue(NumberFormatting.cost(metrics.cost))
+            .hoverPopover {
+                VStack(alignment: .leading, spacing: PiTheme.space6) {
+                    PiSectionHeader(title: "Session", trailing: NumberFormatting.cost(metrics.cost))
+                    MetricDetailRow(title: "Input", value: metrics.input)
+                    MetricDetailRow(title: "Output", value: metrics.output)
+                    MetricDetailRow(title: "Cache read", value: metrics.cacheRead)
+                    MetricDetailRow(title: "Cache write", value: metrics.cacheWrite)
+                    if let hit = metrics.latestCacheHitPercent {
+                        MetricDetailRow(title: "Cache hit", text: "\(Int(hit.rounded()))%")
+                    }
+                    if let percent = metrics.contextPercent {
+                        MetricDetailRow(title: "Context", text: "\(Int(percent.rounded()))%")
+                    }
+                }
+                .padding(PiTheme.space16)
+                .frame(width: 220)
+            }
+    }
+}
+
+private struct MetricDetailRow: View {
+    let title: String
+    var value: Int?
+    var text: String?
+
+    var body: some View {
+        HStack(spacing: PiTheme.space8) {
+            Text(title).font(PiFont.caption).foregroundStyle(.secondary)
+            Spacer(minLength: PiTheme.space8)
+            Text(text ?? NumberFormatting.tokens(value ?? 0))
+                .font(PiFont.caption.monospacedDigit())
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Hover popover
+
+/// Hover-to-reveal detail that stays open while the pointer travels into it. A plain
+/// `.popover` bound to `onHover` closes the instant the popover takes the mouse.
+private struct HoverPopoverModifier<PopoverContent: View>: ViewModifier {
+    @ViewBuilder let popoverContent: () -> PopoverContent
+
+    @State private var presented = false
+    @State private var anchorHovering = false
+    @State private var contentHovering = false
+    @State private var work: Task<Void, Never>?
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { hovering in
+                anchorHovering = hovering
+                schedule(open: hovering)
+            }
+            .popover(isPresented: $presented, arrowEdge: .bottom) {
+                popoverContent()
+                    .onHover { hovering in
+                        contentHovering = hovering
+                        schedule(open: hovering)
+                    }
+            }
+            .onDisappear { work?.cancel() }
     }
 
-    private var helpText: String {
-        guard store.isSelectedRuntime else {
-            if let session = store.selectedSession, store.isRunning(session) {
-                return "This session is running outside Pi Desktop"
-            }
-            return "Not attached to a Pi runtime"
+    private func schedule(open: Bool) {
+        work?.cancel()
+        work = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: open ? 320_000_000 : 220_000_000)
+            guard !Task.isCancelled else { return }
+            presented = open ? true : (anchorHovering || contentHovering)
         }
-        if store.runtimeState.isCompacting { return "Compacting the context window" }
-        if store.runtimeState.isRetrying { return "Retrying the last provider request" }
-        if store.runtimeState.isStreaming { return "Pi is working on this turn" }
-        return store.runtimeState.isConnected ? "Attached and ready" : "Not attached to a Pi runtime"
     }
+}
 
-    private func label(_ text: String, symbol: String, tint: Color) -> some View {
-        HStack(spacing: PiTheme.space4) {
-            Image(systemName: symbol).font(.system(size: 7, weight: .bold)).foregroundStyle(tint)
-            Text(text).font(PiFont.micro).foregroundStyle(.secondary)
-        }
+extension View {
+    func hoverPopover<Content: View>(@ViewBuilder content: @escaping () -> Content) -> some View {
+        modifier(HoverPopoverModifier(popoverContent: content))
     }
 }
 
@@ -166,13 +229,17 @@ private struct CodexAccountControl: View {
             .foregroundStyle(tint)
             .opacity(isLive ? 1 : 0.55)
             .frame(maxWidth: 260, alignment: .trailing)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Hover reveals every signed-in account, the same report `/limits` prints.
+        .hoverPopover { LimitsPopoverView(fallback: account) }
         .popover(isPresented: $showingDetail, arrowEdge: .bottom) {
-            CodexAccountDetail(account: account, isLive: isLive)
+            LimitsPopoverView(fallback: account)
         }
         .help(helpText)
         .accessibilityLabel("Codex account usage")
+        .accessibilityValue(account.detailLines.joined(separator: ", "))
     }
 
     private var tint: Color {
@@ -183,95 +250,6 @@ private struct CodexAccountControl: View {
 
     private var helpText: String {
         (isLive ? account.detailLines : account.detailLines + ["Last known values"]).joined(separator: "\n")
-    }
-}
-
-private struct CodexAccountDetail: View {
-    @EnvironmentObject private var store: AppStore
-    let account: CodexAccountStatus
-    let isLive: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space10) {
-            PiSectionHeader(title: "Codex account", trailing: isLive ? nil : "cached")
-            Text(account.account)
-                .font(PiFont.rowEmphasis)
-                .textSelection(.enabled)
-
-            if account.windows.isEmpty {
-                Text("Usage windows are not loaded yet.")
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: PiTheme.space6) {
-                    ForEach(account.windows, id: \.label) { window in
-                        HStack(spacing: PiTheme.space8) {
-                            Text(window.label)
-                                .font(PiFont.caption.monospacedDigit())
-                                .frame(width: 34, alignment: .leading)
-                            ProgressView(value: Double(window.remainingPercent), total: 100)
-                                .progressViewStyle(.linear)
-                            Text("\(window.remainingPercent)%")
-                                .font(PiFont.caption.monospacedDigit())
-                                .foregroundStyle(window.remainingPercent <= 15 ? Color.piRed : .secondary)
-                                .frame(width: 34, alignment: .trailing)
-                        }
-                    }
-                }
-            }
-
-            if let count = account.bankedResetCount, count > 0 {
-                Text("\(count) banked reset\(count == 1 ? "" : "s")"
-                     + (account.bankedResetExpiry.map { ", first expires in \($0)" } ?? ""))
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            PiHairline()
-
-            Button("Show full limits…") { store.showLimits() }
-                .buttonStyle(.plain)
-                .font(PiFont.caption)
-                .foregroundStyle(Color.accentColor)
-                .help("Runs /limits, which reports through the extension dialog")
-        }
-        .padding(PiTheme.space16)
-        .frame(width: 280)
-    }
-}
-
-// MARK: - mode
-
-private struct ModeControl: View {
-    @EnvironmentObject private var store: AppStore
-    let mode: PiMode?
-    let isLive: Bool
-
-    var body: some View {
-        Menu {
-            ForEach(PiMode.allCases) { candidate in
-                Button {
-                    store.setMode(candidate)
-                } label: {
-                    if candidate == mode { Text("✓ \(candidate.label) — \(candidate.detail)") }
-                    else { Text("\(candidate.label) — \(candidate.detail)") }
-                }
-            }
-        } label: {
-            HStack(spacing: PiTheme.space4) {
-                Image(systemName: "dial.medium")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.secondary)
-                Text(mode?.label ?? "mode")
-                    .font(PiFont.micro)
-                    .foregroundColor(.secondary)
-            }
-            .opacity(mode == nil ? 0.55 : (isLive ? 1 : 0.55))
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help(mode.map { "Mode \($0.label) · \($0.detail)" } ?? "Switch Pi mode (/mode)")
     }
 }
 
@@ -343,24 +321,5 @@ private struct GenericStatusChips: View {
                 }
             }
         }
-    }
-}
-
-private struct MetricLabel: View {
-    let symbol: String
-    let value: String
-    let help: String
-
-    var body: some View {
-        HStack(spacing: PiTheme.space2) {
-            Image(systemName: symbol).font(.system(size: 7, weight: .semibold))
-            Text(value).monospacedDigit()
-        }
-        .font(PiFont.micro)
-        .foregroundStyle(.secondary)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(help)
-        .accessibilityValue(value)
-        .help(help)
     }
 }
