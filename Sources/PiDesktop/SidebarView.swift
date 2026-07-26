@@ -18,6 +18,11 @@ struct SidebarView: View {
                 title: "New folder", symbol: "folder.badge.plus", shortcut: "",
                 action: { store.newVirtualFolderRequested = true }
             )
+            SidebarActionRow(
+                title: "Automations", symbol: "clock.arrow.2.circlepath", shortcut: "⌥⌘S",
+                action: { store.schedulesPresented = true },
+                selected: store.schedulesPresented
+            )
             .padding(.bottom, PiTheme.space6)
 
             if store.isScanning, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
@@ -68,6 +73,7 @@ private struct SidebarActionRow: View {
     let symbol: String
     let shortcut: String
     let action: () -> Void
+    var selected = false
     @State private var hovering = false
 
     var body: some View {
@@ -78,7 +84,7 @@ private struct SidebarActionRow: View {
                     .font(.system(size: PiIcon.small, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
-                Text(title).font(SidebarTypography.conversationTitle(selected: false))
+                Text(title).font(SidebarTypography.conversationTitle(selected: selected))
                 Spacer(minLength: PiTheme.space4)
                 if !shortcut.isEmpty {
                     Text(shortcut).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
@@ -88,12 +94,13 @@ private struct SidebarActionRow: View {
             .padding(.trailing, PiTheme.space8)
             .frame(height: PiTheme.sidebarRowHeight)
             .contentShape(Rectangle())
-            .piRowBackground(selected: false, hovering: hovering)
+            .piRowBackground(selected: selected, hovering: hovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .padding(.horizontal, PiTheme.space6)
         .help(shortcut.isEmpty ? title : "\(title) (\(shortcut))")
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
@@ -521,6 +528,7 @@ private struct SessionRow: View {
     @State private var renameValue = ""
 
     private var selected: Bool {
+        guard !store.schedulesPresented else { return false }
         if case let .session(id) = store.route { return id == session.id }
         return false
     }

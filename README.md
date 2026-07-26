@@ -45,7 +45,7 @@ The daemon starts and stops with the app by default: `Pi Desktop.app` bundles `p
 in `Contents/Helpers/` and supervises them (start on launch if nothing is already running,
 restart on an unexpected crash with a bounded backoff, stop on quit — never a daemon it did not
 start itself). Turn it off in **Pi Desktop → Settings…** if you'd rather run it yourself; the
-automations panel says plainly when it's off instead of a bare connection error.
+automations page says plainly when it's off instead of a bare connection error.
 
 For a daemon that runs without the app at all — a headless machine, or automations that must
 survive the app never being opened — install it as a LaunchAgent instead:
@@ -65,7 +65,9 @@ If both are present, the app defers to the LaunchAgent rather than running a sec
 "Lifecycle" section for the full contract, including what happens to a scheduled run in progress
 when the app quits.
 
-Automations are also editable in the window with `⌥⌘S`.
+Automations also have their own page in the window: pick **Automations** in the sidebar or press
+`⌥⌘S`. It opens in the detail area, so the selected conversation and its draft stay put; pausing
+and resuming is the switch on each row.
 
 ## Run state
 
@@ -114,7 +116,7 @@ starts and stops (`Contents/Helpers/`, each signed individually before the whole
 |---|---|
 | `⌘N` | New chat |
 | `⌘K` | Quick switch |
-| `⌥⌘S` | Automations |
+| `⌥⌘S` | Automations page |
 | `⌘R` | Refresh sessions and cached Git state |
 | `⌘.` | Stop the active Pi run |
 | `Return` | Send when idle; steer while running |
