@@ -11,8 +11,10 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
 - Codex-style turns: reasoning and tool activity stay open while Pi works, then collapse into one “Worked for 4m 1s” line above the answer. Compaction and branch summaries are shown as their own transcript events.
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
-- Desktop notifications when the app is in the background and in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. The conversation you are looking at never notifies.
-- Run state verified against live `pi` processes, so a finished or killed terminal turn stops showing as running
+- Desktop notifications when the app is in the background and in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
+- Run state verified against a small Pi extension (`pi-desktop-activity`) that reports each session's own running/idle state directly, so a finished or killed terminal turn stops showing as running without flicker; sessions without the extension fall back to a file heuristic
+- A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
+- Recent conversations and the sidebar neighbours of the one you have open are prefetched into a bounded in-memory cache, so reopening them is instant instead of re-parsing
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
@@ -46,6 +48,8 @@ Pi Desktop searches for Pi in this order:
 
 The child process receives an augmented `PATH`, so Pi's `#!/usr/bin/env node` launcher also works from Finder. Set `PI_CODING_AGENT_SESSION_DIR` to use a non-default session directory.
 
+On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-activity.ts` (source of truth: `Resources/pi-desktop-activity.ts`) so every Pi session — terminal or RPC — reports its own run state. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
+
 ## Package a local app
 
 ```bash
@@ -72,10 +76,12 @@ While Pi is running, the delivery menu explicitly offers **Steer current run** a
 
 - **`FileSessionRepository` / `SessionSummaryCache`** — discovers direct project session files, excludes nested subagent sessions, and maintains a versioned atomic cache keyed by standardized path, file size, and modification time. Archive flags are applied after lookup; missing files are pruned.
 - **`SessionParser`** — summary projection plus a two-pass conversation parser. The first pass retains only entry identity/parent/type; the second decodes only the final active chain. Known messages discard duplicate raw JSON/base64 trees after projection; unknown fallbacks are bounded strings.
-- **`PiRuntimeProtocol` / `PiRPCClient`** — one subprocess, strict LF JSONL framing, correlated commands, and forward-compatible event delivery.
+- **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of parsed transcripts, warmed on launch and around the selected session, never persisted.
+- **`PiRuntimeProtocol` / `PiRPCClient`** — one subprocess, strict LF JSONL framing, correlated commands, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, and exact small untracked-text LOC classification.
+- **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run-state detection. The bundled `pi-desktop-activity` extension (installed into `~/.pi/agent/extensions/`) reports each session's own running/idle state via a small heartbeat file; the monitor trusts it when fresh and the pid is alive, and falls back to a file-mtime-and-tail heuristic otherwise. An ambiguous read never overrides an already-known verdict.
 - **`ActivityPresenting` / `ActivityPresenter`** — stable process/run identity where Pi provides `processId`, `runId`, or `id`.
-- **`AppStore`** — main-actor route/RPC coordinator, cancellable generation-checked conversation loading, draft rollback, queue state, bounded extension state, and modest active-app Git refresh.
+- **`AppStore`** — main-actor route/RPC coordinator, cancellable generation-checked conversation loading, draft rollback and crash-mid-turn retry, queue state, bounded extension state, background prefetch, and modest active-app Git refresh.
 - **SwiftUI views** — `LazyVStack` history plus a separate streaming row and bottom sentinel; disclosure details format only when expanded. `NativeComposerTextView` supplies Return/Shift-Return and paste/drop semantics.
 
 App-owned archive and recent-folder metadata lives at:
@@ -87,7 +93,13 @@ App-owned archive and recent-folder metadata lives at:
 The summary index lives under:
 
 ```text
-~/Library/Caches/Pi Desktop/session-summaries-v2.json
+~/Library/Caches/Pi Desktop/session-summaries-v3.json
+```
+
+Activity heartbeats (app/extension-owned, never Pi session data) live under:
+
+```text
+~/.pi/agent/desktop-activity/<sessionId>.json
 ```
 
 Archiving never moves or edits a Pi JSONL file.
@@ -99,8 +111,9 @@ Archiving never moves or edits a Pi JSONL file.
 - Abandoned branches are not retained as full JSON. Known projected messages do not retain a duplicate raw payload.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
 - Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; auto-scroll is coalesced.
-- Git refresh pauses while the app is inactive, refreshes the selected folder at a modest interval, and avoids a full session rescan/reload after every settled turn.
+- Git refresh pauses while the app is inactive, refreshes the selected folder at a modest interval, and avoids a full session rescan/reload after every settled turn. A folder shown only as the passive pre-selection default (not yet chosen by the user, and not backing any real session) never triggers a refresh at all, so a fresh launch never touches a TCC-protected folder like Desktop just to draw the New Chat screen.
 - Image imports are limited to 8 images, 16 MB each and 64 MB total, with decoded `NSImage` reuse.
+- The transcript cache bounds both entry count and estimated byte cost (text length plus already-budgeted image bytes), evicting least-recently-used entries first.
 
 ## Verification
 
@@ -110,7 +123,7 @@ swift test
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, active-branch reconstruction, large abandoned image/payload exclusion, no duplicate known-message raw tree, versioned summary-cache warm hits/invalidation/pruning, direct-session discovery, exact Git LOC/empty-text classification, turn/work-log projection, folder-tree nesting and cycle rejection, draft persistence and eviction, live-process run-state verification, notification triggers and coalescing, `/limits` parsing, and an installed-Pi `get_state` smoke test that never prompts a provider. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan.
+Tests cover JSONL framing, active-branch reconstruction, large abandoned image/payload exclusion, no duplicate known-message raw tree, versioned summary-cache warm hits/invalidation/pruning, direct-session discovery, exact Git LOC/empty-text classification, turn/work-log projection, folder-tree nesting and cycle rejection, draft persistence and eviction, activity-heartbeat freshness/staleness/dead-pid classification and its file-heuristic fallback, sticky-unknown run state, transcript-cache eviction, crash/outcome-unknown RPC classification and single-shot draft retry, notification triggers/coalescing/preview text, extension-notice toast filtering, safe folder defaults, `/limits` parsing, and an installed-Pi `get_state` smoke test that never prompts a provider. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan.
 
 ## Current limitations
 

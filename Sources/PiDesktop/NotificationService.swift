@@ -28,6 +28,20 @@ enum NotificationTrigger: Equatable {
     }
 }
 
+/// Formats a notification body from raw message/preview text: bounded, sanitized to a single
+/// line, never a generic phrase when real content is available.
+enum NotificationPreviewFormatter {
+    static let limit = 140
+
+    static func format(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let collapsed = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+        return collapsed.count <= limit ? collapsed : String(collapsed.prefix(limit)) + "…"
+    }
+}
+
 /// The one case that must never notify: the app is frontmost and the user is already looking at
 /// the exact conversation the event is about. Everything else (a different conversation, or the
 /// app not frontmost at all) is real signal.

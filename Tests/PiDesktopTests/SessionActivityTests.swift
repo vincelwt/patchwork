@@ -236,54 +236,147 @@ final class SessionActivityClassifierTests: XCTestCase {
         let url = URL(fileURLWithPath: "/tmp/pi-desktop-does-not-exist-\(UUID().uuidString).jsonl")
         XCTAssertNil(SessionActivityClassifier.classifyFile(at: url))
     }
+}
 
-    // MARK: Live-process cross-check (the matching rule)
+// MARK: - Heartbeat classification (the matching rule)
 
-    func testRunningFileWithNoLiveProcessForItsCwdIsIdle() {
-        XCTAssertEqual(
-            SessionActivityClassifier.resolvedState(fileState: .running, cwd: "/tmp/project-a", liveCwds: ["/tmp/project-b"]),
-            .idle
-        )
-        XCTAssertEqual(
-            SessionActivityClassifier.resolvedState(fileState: .running, cwd: "/tmp/project-a", liveCwds: []),
-            .idle
-        )
-    }
-
-    func testRunningFileWithALiveProcessForItsCwdStaysRunning() {
-        XCTAssertEqual(
-            SessionActivityClassifier.resolvedState(fileState: .running, cwd: "/tmp/project-a", liveCwds: ["/tmp/project-a"]),
-            .running
+final class ActivityHeartbeatClassifierTests: XCTestCase {
+    private func heartbeat(
+        state: String = "running",
+        pid: Int32 = 111,
+        updatedSecondsAgo: TimeInterval = 0,
+        now: Date = Date()
+    ) -> ActivityHeartbeat {
+        ActivityHeartbeat(
+            sessionId: "s1", sessionFile: "/tmp/s1.jsonl", sessionDir: "/tmp", pid: pid, state: state,
+            updatedAt: ISO8601DateFormatter.piShared.string(from: now.addingTimeInterval(-updatedSecondsAgo)),
+            preview: nil, stopReason: nil
         )
     }
 
-    func testResolvedStateFallsBackToTheFileHeuristicWhenProcessInspectionIsUnavailable() {
-        // `nil` means every attempt at inspection failed; a real running session must not be
-        // hidden just because `ps`/`lsof` could not be consulted.
-        XCTAssertEqual(SessionActivityClassifier.resolvedState(fileState: .running, cwd: "/tmp/project-a", liveCwds: nil), .running)
-        XCTAssertEqual(SessionActivityClassifier.resolvedState(fileState: .idle, cwd: "/tmp/project-a", liveCwds: nil), .idle)
+    func testFreshRunningHeartbeatWithALivePidIsRunning() {
+        let now = Date()
+        XCTAssertTrue(
+            ActivityHeartbeatClassifier.isRunning(heartbeat(updatedSecondsAgo: 1, now: now), now: now, isProcessAlive: { _ in true })
+        )
     }
 
-    func testResolvedStateNeverPromotesAnIdleFileEvenWithALiveProcess() {
-        XCTAssertEqual(
-            SessionActivityClassifier.resolvedState(fileState: .idle, cwd: "/tmp/project-a", liveCwds: ["/tmp/project-a"]),
-            .idle,
-            "A settled turn stays settled regardless of what else is running in that folder"
+    func testStaleRunningHeartbeatIsNotRunningEvenWithALivePid() {
+        // A crashed process leaves "running" behind forever unless freshness is enforced.
+        let now = Date()
+        XCTAssertFalse(
+            ActivityHeartbeatClassifier.isRunning(
+                heartbeat(updatedSecondsAgo: ActivityHeartbeatClassifier.freshnessWindow + 1, now: now),
+                now: now,
+                isProcessAlive: { _ in true }
+            )
         )
+    }
+
+    func testJustInsideTheFreshnessBoundaryIsStillRunning() {
+        // Not exactly at the boundary: ISO8601's millisecond-precision round trip can truncate a
+        // handful of microseconds, which would make an exact-boundary comparison flaky.
+        let now = Date()
+        XCTAssertTrue(
+            ActivityHeartbeatClassifier.isRunning(
+                heartbeat(updatedSecondsAgo: ActivityHeartbeatClassifier.freshnessWindow - 0.5, now: now),
+                now: now,
+                isProcessAlive: { _ in true }
+            )
+        )
+    }
+
+    func testFreshRunningHeartbeatWithADeadPidIsNotRunning() {
+        // The process crashed just after its last beat: fresh timestamp, but nothing is alive.
+        let now = Date()
+        XCTAssertFalse(
+            ActivityHeartbeatClassifier.isRunning(heartbeat(updatedSecondsAgo: 1, now: now), now: now, isProcessAlive: { _ in false })
+        )
+    }
+
+    func testIdleStateIsNeverRunningRegardlessOfFreshnessOrPid() {
+        let now = Date()
+        XCTAssertFalse(
+            ActivityHeartbeatClassifier.isRunning(
+                heartbeat(state: "idle", updatedSecondsAgo: 0, now: now), now: now, isProcessAlive: { _ in true }
+            )
+        )
+    }
+
+    func testUnparseableTimestampIsNotRunning() {
+        let now = Date()
+        let malformed = ActivityHeartbeat(
+            sessionId: "s1", sessionFile: "/tmp/s1.jsonl", sessionDir: "/tmp", pid: 1, state: "running",
+            updatedAt: "not-a-date", preview: nil, stopReason: nil
+        )
+        XCTAssertFalse(ActivityHeartbeatClassifier.isRunning(malformed, now: now, isProcessAlive: { _ in true }))
+    }
+
+    func testResolvedSessionPathPrefersSessionFileThenFallsBackToSessionDirAndId() {
+        let withFile = ActivityHeartbeat(
+            sessionId: "abc", sessionFile: "/tmp/project/abc.jsonl", sessionDir: "/tmp/other",
+            pid: 1, state: "idle", updatedAt: "x", preview: nil, stopReason: nil
+        )
+        XCTAssertEqual(withFile.resolvedSessionPath, "/tmp/project/abc.jsonl")
+
+        let withoutFile = ActivityHeartbeat(
+            sessionId: "abc", sessionFile: nil, sessionDir: "/tmp/project",
+            pid: 1, state: "idle", updatedAt: "x", preview: nil, stopReason: nil
+        )
+        XCTAssertEqual(withoutFile.resolvedSessionPath, "/tmp/project/abc.jsonl")
+
+        let neither = ActivityHeartbeat(
+            sessionId: "abc", sessionFile: nil, sessionDir: nil,
+            pid: 1, state: "idle", updatedAt: "x", preview: nil, stopReason: nil
+        )
+        XCTAssertNil(neither.resolvedSessionPath)
+    }
+
+    func testProcessAlivenessDoesNotShellOut() {
+        // This exercises the real `kill(pid, 0)`-based default directly: no `ps`/`lsof` process.
+        XCTAssertTrue(ActivityHeartbeatClassifier.isProcessAlive(pid: ProcessInfo.processInfo.processIdentifier))
+        XCTAssertFalse(ActivityHeartbeatClassifier.isProcessAlive(pid: 0))
+        XCTAssertFalse(ActivityHeartbeatClassifier.isProcessAlive(pid: -1))
     }
 }
 
-/// A fixed snapshot, never a real process. `ps`/`lsof` are never shelled out to in tests.
-private struct FakeProcessSnapshotProvider: ProcessSnapshotProviding {
-    var ps: String?
-    var cwds: [Int32: String] = [:]
+final class ActivityHeartbeatStoreTests: XCTestCase {
+    private func write(_ json: String, name: String, in directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(json.utf8).write(to: directory.appendingPathComponent(name))
+    }
 
-    func psOutput() -> String? { ps }
-    func cwd(forPID pid: Int32) -> String? { cwds[pid] }
+    func testScanDecodesValidRecordsAndSkipsMalformedOnes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try write(
+            """
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z"}
+            """, name: "a.json", in: directory
+        )
+        try write("not json at all", name: "b.json", in: directory)
+        try write("ignored, wrong extension", name: "c.txt", in: directory)
+
+        let result = ActivityHeartbeatStore.scan(directory: directory)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result["/tmp/a.jsonl"]?.sessionId, "a")
+    }
+
+    func testScanOfAMissingDirectoryIsEmptyNotAnError() {
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-missing-\(UUID().uuidString)")
+        XCTAssertTrue(ActivityHeartbeatStore.scan(directory: missing).isEmpty)
+    }
 }
 
 @MainActor
 final class SessionActivityMonitorTests: XCTestCase {
+    /// An empty, isolated directory: every test in this file must never read the real
+    /// `~/.pi/agent/desktop-activity` on the machine running the tests.
+    private func emptyHeartbeatDirectory() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-empty-\(UUID().uuidString)")
+    }
+
     func testMonitorClassifiesTrackedPathsAndDropsRemovedOnes() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
@@ -300,7 +393,7 @@ final class SessionActivityMonitorTests: XCTestCase {
         )
 
         // `isActiveOverride` avoids depending on a foreground test host.
-        let monitor = SessionActivityMonitor(isActiveOverride: true)
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: emptyHeartbeatDirectory())
         monitor.setTrackedPaths([running.path, idle.path])
         try await waitUntil { monitor.activities.count == 2 }
 
@@ -311,54 +404,54 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertNil(monitor.activity(forPath: running.path), "Untracked paths are released immediately")
     }
 
-    func testRunningFileIsDemotedToIdleWhenNoLiveProcessOwnsItsCwd() async throws {
+    func testHeartbeatOverridesAStaleLookingFileToStayRunning() async throws {
+        // The file itself looks long-idle (old mtime, terminal stop reason), but a fresh
+        // heartbeat with a live pid says otherwise — e.g. Pi is mid-tool-call and has not
+        // touched the JSONL in a while. The heartbeat wins outright.
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let file = directory.appendingPathComponent("running.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: file)
+        let file = directory.appendingPathComponent("session.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-600)], ofItemAtPath: file.path)
 
-        let inspector = PiProcessInspector(snapshotProvider: FakeProcessSnapshotProvider(
-            ps: "4242 pi pi --mode rpc",
-            cwds: [4242: "/completely/unrelated/cwd"]
-        ))
-        let monitor = SessionActivityMonitor(isActiveOverride: true, processInspector: inspector)
-        monitor.setSessionCwds([file.path: directory.standardizedFileURL.path])
+        let heartbeatDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":4242,"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))"}
+        """.utf8).write(to: heartbeatDirectory.appendingPathComponent("s.json"))
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in true }
+        )
         monitor.setTrackedPaths([file.path])
-
-        // The very first tick can race the inspector's own async refresh and falls back to the
-        // file heuristic; wait for the cache to warm, then tick again so the cross-check
-        // actually applies rather than passing on the fallback alone.
-        try await waitUntil { inspector.liveCwds != nil }
-        monitor.tickNow()
-        try await waitUntil { monitor.activity(forPath: file.path)?.state == .idle }
-    }
-
-    func testRunningFileStaysRunningWhenALiveProcessOwnsItsCwd() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let file = directory.appendingPathComponent("running.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: file)
-
-        let inspector = PiProcessInspector(snapshotProvider: FakeProcessSnapshotProvider(
-            ps: "4242 pi pi --mode rpc",
-            cwds: [4242: directory.standardizedFileURL.path]
-        ))
-        let monitor = SessionActivityMonitor(isActiveOverride: true, processInspector: inspector)
-        monitor.setSessionCwds([file.path: directory.standardizedFileURL.path])
-        monitor.setTrackedPaths([file.path])
-
-        try await waitUntil { inspector.liveCwds != nil }
-        monitor.tickNow()
         try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
     }
 
-    func testMonitorNeverConsultsTheProcessInspectorWithoutARegisteredCwd() async throws {
+    func testHeartbeatWithADeadPidReportsIdleEvenIfFresh() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("session.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
+
+        let heartbeatDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":9999,"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))"}
+        """.utf8).write(to: heartbeatDirectory.appendingPathComponent("s.json"))
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in false }
+        )
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .idle }
+    }
+
+    func testNoHeartbeatFallsBackToTheFileHeuristic() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -367,14 +460,12 @@ final class SessionActivityMonitorTests: XCTestCase {
         let file = directory.appendingPathComponent("running.jsonl")
         try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: file)
 
-        // A snapshot that would demote everything if it were ever consulted.
-        let inspector = PiProcessInspector(snapshotProvider: FakeProcessSnapshotProvider(ps: ""))
-        let monitor = SessionActivityMonitor(isActiveOverride: true, processInspector: inspector)
+        // An empty heartbeat directory: nothing to consult, so the file heuristic alone decides.
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: emptyHeartbeatDirectory())
         monitor.setTrackedPaths([file.path])
 
         try await waitUntil { monitor.activity(forPath: file.path) != nil }
-        XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "No cwd registered: the file heuristic alone decides")
-        XCTAssertNil(inspector.liveCwds, "Never triggered: nothing asked for the cross-check")
+        XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "No heartbeat: the file heuristic alone decides")
     }
 
     func testInactiveApplicationNeverPolls() async throws {
@@ -386,10 +477,37 @@ final class SessionActivityMonitorTests: XCTestCase {
         let file = directory.appendingPathComponent("s.jsonl")
         try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
 
-        let monitor = SessionActivityMonitor(isActiveOverride: false)
+        let monitor = SessionActivityMonitor(isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory())
         monitor.setTrackedPaths([file.path])
         try await Task.sleep(nanoseconds: 250_000_000)
         XCTAssertTrue(monitor.activities.isEmpty, "A background app must not stat or read session files")
+    }
+
+    /// The exact flicker the user reported: an ambiguous tail read (no heartbeat, and the file
+    /// heuristic itself returns `.unknown`) must never overwrite an already-known verdict.
+    func testAmbiguousFileReadIsStickyAndNeverFlipsAnAlreadyKnownState() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("session.jsonl")
+        // A user entry at a mid-range age: unambiguously running.
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-10)], ofItemAtPath: file.path)
+
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: emptyHeartbeatDirectory())
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+
+        // Now make the last entry ambiguous (an assistant message with no stop reason at all,
+        // i.e. still-decoding/unknown) without changing its age bucket.
+        try Data("{\"type\":\"message\",\"id\":\"2\",\"message\":{\"role\":\"assistant\"}}\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-10)], ofItemAtPath: file.path)
+        monitor.tickNow()
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "An unknown read must stay on the last known verdict")
     }
 
     private func waitUntil(timeout: TimeInterval = 3, _ condition: @MainActor () -> Bool) async throws {

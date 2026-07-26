@@ -128,12 +128,14 @@ final class RPCPendingRegistry {
         entries.removeValue(forKey: id)?.callback
     }
 
-    /// Drains every pending callback. Terminal rejections are always delivered so callers
-    /// complete exactly once, even for a generation that has just been retired.
-    func drainAll() -> [Callback] {
-        let callbacks = entries.values.map(\.callback)
+    /// Drains every pending callback paired with the command it was registered for, so a caller
+    /// rejecting them all (a stop or a crash) can classify each one instead of reporting every
+    /// in-flight command with the same blunt error. Terminal rejections are always delivered so
+    /// callers complete exactly once, even for a generation that has just been retired.
+    func drainAll() -> [(command: String, callback: Callback)] {
+        let drained = entries.values.map { (command: $0.command, callback: $0.callback) }
         entries.removeAll()
-        return callbacks
+        return drained
     }
 }
 
