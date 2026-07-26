@@ -304,6 +304,7 @@ struct ToastMessage: Identifiable, Hashable {
     let id = UUID()
     let text: String
     let style: Style
+    let sessionPath: String?
 }
 
 struct ViewedImage: Identifiable { let id = UUID(); let image: ImagePayload }

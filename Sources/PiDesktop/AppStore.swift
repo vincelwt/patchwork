@@ -363,7 +363,7 @@ final class AppStore: ObservableObject {
         // its fixed, specific summary.
         let body = (trigger == .turnFinished ? NotificationPreviewFormatter.format(preview) : nil) ?? trigger.summary
         if isApplicationActive {
-            showToast("\(session.displayName): \(body)", style: trigger.toastStyle)
+            showToast("\(session.displayName): \(body)", style: trigger.toastStyle, sessionPath: key)
         } else {
             notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: body)
         }
@@ -374,6 +374,13 @@ final class AppStore: ObservableObject {
     private func focusSession(atPath path: String) {
         guard let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { return }
         selectSession(session)
+    }
+
+    func openToast(_ toast: ToastMessage) {
+        guard let path = toast.sessionPath else { return }
+        toastTask?.cancel()
+        withAnimation(.easeIn(duration: 0.2)) { self.toast = nil }
+        focusSession(atPath: path)
     }
 
     // MARK: - Extension statuses
@@ -1900,9 +1907,11 @@ final class AppStore: ObservableObject {
         isConversationLoading = false
     }
 
-    private func showToast(_ text: String, style: ToastMessage.Style) {
+    private func showToast(_ text: String, style: ToastMessage.Style, sessionPath: String? = nil) {
         toastTask?.cancel()
-        withAnimation(.easeOut(duration: 0.2)) { toast = ToastMessage(text: text, style: style) }
+        withAnimation(.easeOut(duration: 0.2)) {
+            toast = ToastMessage(text: text, style: style, sessionPath: sessionPath)
+        }
         toastTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 3_500_000_000)
             guard !Task.isCancelled else { return }
