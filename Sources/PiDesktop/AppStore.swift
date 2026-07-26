@@ -134,6 +134,9 @@ final class AppStore: ObservableObject {
     /// Shared request surface: sidebar and application menu present the same creation alert.
     @Published var newVirtualFolderRequested = false
     @Published var schedulesPresented = false
+    /// Messages the user queued while Pi was working, still editable until they are flushed to
+    /// Pi at the boundary Pi would have delivered them anyway. See `Outbox.swift`.
+    @Published var outbox: [OutboxEntry] = []
     /// Lazily created so the panel keeps one service for the app's lifetime.
     var cachedScheduleService: (any ScheduleServing)?
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
@@ -146,7 +149,9 @@ final class AppStore: ObservableObject {
 
     private let repository: SessionRepositoryProtocol
     private let gitService: GitStatusProviding
-    private let runtime: PiRuntimeProtocol
+    /// Internal rather than private so focused extensions (the outbox, message editing) can
+    /// speak to the runtime without this file growing every feature that needs it.
+    let runtime: PiRuntimeProtocol
     let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
     /// Creates the short-lived `--no-session` runtime used only to refresh extension statuses.
@@ -1460,6 +1465,7 @@ final class AppStore: ObservableObject {
             runtimeState.isRetrying = false
             activeCapability = nil
             streamingMessage = nil
+            flushOutbox(.followUp)
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
             // left: nothing about this dispatch is "pending" any more.
             activeTurnPrompt = nil
@@ -1542,6 +1548,9 @@ final class AppStore: ObservableObject {
         case "turn_end":
             activeCapability = nil
             pendingQuestionnaire = nil
+            // Pi delivers steering at exactly this boundary, so holding it until now costs
+            // nothing and keeps it editable for as long as possible.
+            flushOutbox(.steer)
         case "agent_end", "turn_start", "message_start", "bash_execution_update",
              "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished": break
         default:
