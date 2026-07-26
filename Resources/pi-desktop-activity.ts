@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 1
+// pi-desktop-activity-version: 3
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it only reports whether a session is
 // active so the desktop app can show accurate run state without matching `ps`/`lsof` output
@@ -7,7 +7,7 @@
 // version comment above is bumped by a newer release, and even then only a file that still
 // starts with a recognized, older `pi-desktop-activity-version:` marker is ever replaced.
 //
-// Writes one small JSON file per session to ~/.pi/agent/desktop-activity/<sessionId>.json:
+// Writes one small JSON file per process to ~/.pi/agent/desktop-activity/<sessionId>-<pid>.json:
 //   { sessionId, sessionFile, sessionDir, cwd, pid, state: "running" | "idle",
 //     startedAt, updatedAt, preview, stopReason }
 // Every write is atomic (temp file + rename) and every handler below is wrapped in try/catch:
@@ -34,6 +34,8 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   let preview: string | undefined;
   let stopReason: string | undefined;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let agentRunning = false;
+  const backgroundAgents = new Set<string>();
 
   function clearTimer(): void {
     if (timer) {
@@ -77,6 +79,25 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     }
   }
 
+  function syncHeartbeat(): void {
+    const running = agentRunning || backgroundAgents.size > 0;
+    write(running ? "running" : "idle");
+    if (running && !timer) {
+      timer = setInterval(() => write(agentRunning || backgroundAgents.size > 0 ? "running" : "idle"), HEARTBEAT_INTERVAL_MS);
+      timer.unref?.();
+    } else if (!running) {
+      clearTimer();
+    }
+  }
+
+  function updateBackgroundAgent(data: unknown, running: boolean): void {
+    const id = data && typeof data === "object" ? (data as { id?: unknown }).id : undefined;
+    if (typeof id !== "string") return;
+    if (running) backgroundAgents.add(id);
+    else backgroundAgents.delete(id);
+    syncHeartbeat();
+  }
+
   function extractPreview(content: unknown): string | undefined {
     let text = "";
     if (typeof content === "string") {
@@ -101,32 +122,26 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       startedAt = new Date().toISOString();
       preview = undefined;
       stopReason = undefined;
+      // Several processes can attach to one session. A reader must see every writer so an idle
+      // RPC attachment cannot overwrite a terminal that is still working.
       heartbeatPath = sessionId
-        ? path.join(os.homedir(), ".pi", "agent", "desktop-activity", `${sessionId}.json`)
+        ? path.join(os.homedir(), ".pi", "agent", "desktop-activity", `${sessionId}-${process.pid}.json`)
         : null;
-      write(ctx.isIdle() ? "idle" : "running");
+      agentRunning = !ctx.isIdle();
+      syncHeartbeat();
     } catch {
       // No heartbeat for this session; the desktop app falls back to its file heuristic.
     }
   });
 
   pi.on("agent_start", async () => {
-    try {
-      clearTimer();
-      write("running");
-      timer = setInterval(() => write("running"), HEARTBEAT_INTERVAL_MS);
-      timer.unref?.();
-    } catch {
-      // Best effort only.
-    }
+    agentRunning = true;
+    syncHeartbeat();
   });
 
   pi.on("turn_start", async () => {
-    try {
-      write("running");
-    } catch {
-      // Best effort only.
-    }
+    agentRunning = true;
+    syncHeartbeat();
   });
 
   pi.on("turn_end", async (event) => {
@@ -137,36 +152,33 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         preview = extractPreview(message.content) ?? preview;
         stopReason = typeof message.stopReason === "string" ? message.stopReason : stopReason;
       }
-      write("running");
+      syncHeartbeat();
     } catch {
       // Best effort only.
     }
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    try {
-      write(ctx.isIdle() ? "idle" : "running");
-    } catch {
-      // Best effort only.
-    }
+    agentRunning = !ctx.isIdle();
+    syncHeartbeat();
   });
 
   pi.on("agent_settled", async () => {
-    try {
-      clearTimer();
-      write("idle");
-    } catch {
-      // Best effort only.
-    }
+    agentRunning = false;
+    syncHeartbeat();
   });
 
+  // Background subagents outlive the parent agent run. Keep the session working until the
+  // subagent manager reports every started or queued agent complete.
+  pi.events.on("subagents:created", (data) => updateBackgroundAgent(data, true));
+  pi.events.on("subagents:started", (data) => updateBackgroundAgent(data, true));
+  pi.events.on("subagents:completed", (data) => updateBackgroundAgent(data, false));
+  pi.events.on("subagents:failed", (data) => updateBackgroundAgent(data, false));
+
   pi.on("session_shutdown", async () => {
-    try {
-      clearTimer();
-      remove();
-    } catch {
-      // Best effort only.
-    }
+    clearTimer();
+    backgroundAgents.clear();
+    remove();
   });
 
   // Covers a clean process exit; a crash is instead caught by the desktop app's freshness/pid
