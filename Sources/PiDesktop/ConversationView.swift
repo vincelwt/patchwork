@@ -210,6 +210,14 @@ private struct MessageScrollView: View {
     /// Tracked by a bottom sentinel appearing/disappearing, which works on macOS 14 without
     /// scroll-position APIs. Auto-scroll only happens while the user is pinned at the bottom.
     @State private var isPinnedToBottom = true
+    /// This view instance can outlive a single conversation: switching from one already-loaded
+    /// session straight to another never leaves the `else` branch in `messageArea`, so SwiftUI
+    /// reuses the same `MessageScrollView` rather than remounting it. These two let the scroll
+    /// handler tell "a different conversation just replaced this one" (always snap to bottom)
+    /// apart from "the same conversation grew" (animate a genuine live append, but snap when
+    /// Task 1's tail-first backfill only prepends earlier history above an unchanged tail).
+    @State private var loadedRouteKey: AppRoute?
+    @State private var lastKnownTailID: String?
     private let bottomID = "conversation-bottom"
 
     private var transcriptItems: [TranscriptItem] {
@@ -267,11 +275,36 @@ private struct MessageScrollView: View {
             .scrollDismissesKeyboard(.interactively)
             .onAppear {
                 isPinnedToBottom = true
+                loadedRouteKey = store.route
+                lastKnownTailID = transcriptItems.last?.id
+                reader.scrollTo(bottomID, anchor: .bottom)
+            }
+            .onChange(of: store.route) { _, newRoute in
+                // A different conversation was just selected: always resume at the bottom,
+                // ignoring whatever scroll position the previous conversation was left at, and
+                // never animate a jump the user did not cause (Task 1).
+                loadedRouteKey = newRoute
+                lastKnownTailID = transcriptItems.last?.id
+                isPinnedToBottom = true
                 reader.scrollTo(bottomID, anchor: .bottom)
             }
             .onChange(of: transcriptItems.count) { _, _ in
-                guard isPinnedToBottom else { return }
-                withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
+                // A route change above already snapped to the bottom for this same swap; do not
+                // also animate here just because the message count happened to change too.
+                guard loadedRouteKey == store.route else { return }
+                guard isPinnedToBottom else {
+                    lastKnownTailID = transcriptItems.last?.id
+                    return
+                }
+                let tailChanged = transcriptItems.last?.id != lastKnownTailID
+                lastKnownTailID = transcriptItems.last?.id
+                if tailChanged {
+                    withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
+                } else {
+                    // Same tail, more (earlier) history filled in above it — Task 1's cache-miss
+                    // backfill. Snap instantly: nothing the user is looking at should move.
+                    reader.scrollTo(bottomID, anchor: .bottom)
+                }
             }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in
                 scheduleBottomScroll(reader)

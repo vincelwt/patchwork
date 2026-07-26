@@ -119,6 +119,11 @@ final class AppStore: ObservableObject {
 
     @Published var folderGit: [String: GitSnapshot] = [:]
     @Published var selectedGit = GitSnapshot.none
+    /// Present only for a cwd that resolves to a linked git worktree; refreshed on the exact
+    /// same cadence and cache keys as `folderGit`/`selectedGit` (Task 2), just kept in a sibling
+    /// dictionary instead of a field on `GitSnapshot`. Absent entirely for a plain checkout.
+    @Published var folderWorktrees: [String: GitWorktreeInfo] = [:]
+    @Published var selectedWorktree: GitWorktreeInfo?
     @Published var activities: [ActivityItem] = []
     @Published var extensionStatuses: [String: String] = [:]
     @Published var extensionWidgets: [String: ExtensionWidget] = [:]
@@ -196,6 +201,10 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
+    /// How many trailing messages the tail-first scan reconstructs before the full parse lands
+    /// (Task 1). Generous enough to fill a typical window without scrolling, small enough that
+    /// even a giant conversation's tail decodes in effectively zero time.
+    private static let tailPreviewMessageLimit = 40
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -488,29 +497,44 @@ final class AppStore: ObservableObject {
         route = .session(session.id)
         markRead(session)
         conversationError = nil
-        messages.removeAll(keepingCapacity: false)
         streamingMessage = nil
-        activities.removeAll(keepingCapacity: false)
         activeCapability = nil
         pendingQuestionnaire = nil
         let draftKey = session.fileURL.standardizedFileURL.path
         draft = draftStore.text(for: draftKey)
         attachments = attachmentsByKey[draftKey] ?? []
         flushDraftPersistence()
-        isConversationLoading = true
         DecodedImageCache.purge()
-        selectedGit = folderGit[session.cwd.standardizedFileURL.path] ?? .none
+        let cwdPath = session.cwd.standardizedFileURL.path
+        selectedGit = folderGit[cwdPath] ?? .none
+        selectedWorktree = folderWorktrees[cwdPath]
+
+        // A synchronous cache hit (Task 1): `transcriptCache` is a plain lock-protected cache,
+        // not an actor, precisely so this check never suspends. Nothing async runs between
+        // clearing the previous conversation and painting the new one, so there is no frame in
+        // which a spinner — or even a blank transcript — could ever be drawn.
+        if let cached = cachedConversation(for: session.fileURL) {
+            messages = cached.messages
+            activities = activityPresenter.activities(from: cached.messages)
+            isConversationLoading = false
+            conversationLoadTask = Task { [weak self] in await self?.refreshGit(for: session.cwd) }
+            schedulePrefetch(around: session)
+            return
+        }
+
+        // Cache miss: parse from the end so the tail paints immediately, already at the bottom,
+        // instead of an empty spinner that reflows once the (possibly multi-megabyte) file
+        // finishes parsing. The scroll never has to move for this: the tail renders at the
+        // bottom from the first frame, and any earlier history is filled in above it once the
+        // full parse lands.
+        isConversationLoading = true
+        messages.removeAll(keepingCapacity: false)
+        activities.removeAll(keepingCapacity: false)
 
         conversationLoadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let conversation = try await cachedOrFreshConversation(for: session.fileURL)
-                try Task.checkCancellation()
-                guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
-                messages = conversation.messages
-                activities = activityPresenter.activities(from: conversation.messages)
-                isConversationLoading = false
-                await refreshGit(for: session.cwd)
+                try await loadConversationProgressively(session, generation: generation)
             } catch is CancellationError {
                 // Never publish stale cancellation over a newer selection.
             } catch {
@@ -524,19 +548,53 @@ final class AppStore: ObservableObject {
         schedulePrefetch(around: session)
     }
 
-    /// Reuses a cached parse when the file has not changed since it was cached (Task 3);
-    /// otherwise parses fresh and warms the cache for next time. Callers still apply the same
-    /// generation/route check to the result regardless of which path was taken.
-    private func cachedOrFreshConversation(for fileURL: URL) async throws -> SessionConversation {
-        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else {
-            return try await repository.loadConversation(from: fileURL)
+    /// The tail-first load for a cache miss: an immediate partial paint that is already the true
+    /// tail (so the transcript never has to re-scroll), then the authoritative full parse fills
+    /// in earlier history — or, when the tail scan already reached the conversation's root,
+    /// there is no earlier history and the tail stands as the final result.
+    private func loadConversationProgressively(_ session: SessionSummary, generation: Int) async throws {
+        let tail = try await repository.loadConversationTail(from: session.fileURL, limit: Self.tailPreviewMessageLimit)
+        try Task.checkCancellation()
+        guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
+        messages = tail.conversation.messages
+        activities = activityPresenter.activities(from: tail.conversation.messages)
+        isConversationLoading = false
+
+        if tail.isComplete {
+            cacheConversation(tail.conversation, for: session.fileURL)
+            await refreshGit(for: session.cwd)
+            return
         }
-        let path = fileURL.standardizedFileURL.path
-        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
-        if let cached = await transcriptCache.conversation(for: path, fingerprint: fingerprint) { return cached }
+
+        let full = try await cachedOrFreshConversation(for: session.fileURL)
+        try Task.checkCancellation()
+        guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
+        messages = full.messages
+        activities = activityPresenter.activities(from: full.messages)
+        await refreshGit(for: session.cwd)
+    }
+
+    /// Reuses a cached parse when the file has not changed since it was cached; otherwise parses
+    /// fresh and warms the cache for next time. Callers still apply the same generation/route
+    /// check to the result regardless of which path was taken.
+    private func cachedOrFreshConversation(for fileURL: URL) async throws -> SessionConversation {
+        if let cached = cachedConversation(for: fileURL) { return cached }
         let conversation = try await repository.loadConversation(from: fileURL)
-        await transcriptCache.store(conversation, for: path, fingerprint: fingerprint)
+        cacheConversation(conversation, for: fileURL)
         return conversation
+    }
+
+    /// Synchronous, zero-suspension cache probe (Task 1) — see `TranscriptCache`.
+    private func cachedConversation(for fileURL: URL) -> SessionConversation? {
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return nil }
+        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
+        return transcriptCache.conversation(for: fileURL.standardizedFileURL.path, fingerprint: fingerprint)
+    }
+
+    private func cacheConversation(_ conversation: SessionConversation, for fileURL: URL) {
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
+        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
+        transcriptCache.store(conversation, for: fileURL.standardizedFileURL.path, fingerprint: fingerprint)
     }
 
     // MARK: - Prefetch
@@ -587,10 +645,10 @@ final class AppStore: ObservableObject {
         let path = url.standardizedFileURL.path
         guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
         let fingerprint = SessionFileFingerprint(url: url, values: values)
-        if await cache.conversation(for: path, fingerprint: fingerprint) != nil { return } // Already warm.
+        if cache.conversation(for: path, fingerprint: fingerprint) != nil { return } // Already warm.
         guard let conversation = try? await repository.loadConversation(from: url) else { return }
         guard !Task.isCancelled else { return }
-        await cache.store(conversation, for: path, fingerprint: fingerprint)
+        cache.store(conversation, for: path, fingerprint: fingerprint)
     }
 
     // MARK: - Activity heartbeat extension
@@ -1779,17 +1837,21 @@ final class AppStore: ObservableObject {
     private func refreshFolderGitSnapshots() async {
         let paths = Array(Set(sessions.map { $0.cwd.standardizedFileURL.path }))
         let service = gitService
-        await withTaskGroup(of: (String, GitSnapshot).self) { group in
+        await withTaskGroup(of: (String, GitSnapshot, GitWorktreeInfo?).self) { group in
             var iterator = paths.makeIterator()
             for _ in 0..<min(3, paths.count) {
                 guard let path = iterator.next() else { break }
-                group.addTask { (path, await service.snapshot(for: URL(fileURLWithPath: path, isDirectory: true))) }
+                group.addTask { await Self.fetchGitState(path, service: service) }
             }
-            while let (path, snapshot) = await group.next() {
+            while let (path, snapshot, worktree) = await group.next() {
                 folderGit[path] = snapshot
-                if selectedSession?.cwd.standardizedFileURL.path == path { selectedGit = snapshot }
+                folderWorktrees[path] = worktree
+                if selectedSession?.cwd.standardizedFileURL.path == path {
+                    selectedGit = snapshot
+                    selectedWorktree = worktree
+                }
                 if let next = iterator.next() {
-                    group.addTask { (next, await service.snapshot(for: URL(fileURLWithPath: next, isDirectory: true))) }
+                    group.addTask { await Self.fetchGitState(next, service: service) }
                 }
             }
         }
@@ -1797,10 +1859,23 @@ final class AppStore: ObservableObject {
 
     private func refreshGit(for url: URL) async {
         let normalized = url.standardizedFileURL
-        let snapshot = await gitService.snapshot(for: normalized)
+        let (_, snapshot, worktree) = await Self.fetchGitState(normalized.path, service: gitService)
         folderGit[normalized.path] = snapshot
+        folderWorktrees[normalized.path] = worktree
         let selectedPath = selectedSession?.cwd.standardizedFileURL.path ?? selectedFolder?.standardizedFileURL.path
-        if selectedPath == normalized.path { selectedGit = snapshot }
+        if selectedPath == normalized.path {
+            selectedGit = snapshot
+            selectedWorktree = worktree
+        }
+    }
+
+    /// Fetches the status snapshot and the (optional) worktree indicator together, in parallel,
+    /// so the worktree check (Task 2) never adds serial latency to the existing Git refresh.
+    private static func fetchGitState(_ path: String, service: GitStatusProviding) async -> (String, GitSnapshot, GitWorktreeInfo?) {
+        let directory = URL(fileURLWithPath: path, isDirectory: true)
+        async let snapshot = service.snapshot(for: directory)
+        async let worktree = service.worktreeInfo(for: directory)
+        return await (path, snapshot, worktree)
     }
 
     private func startGitRefreshLoop() {

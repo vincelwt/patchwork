@@ -8,10 +8,20 @@ protocol SessionRepositoryProtocol {
     /// Sidebar hydration: everything the persisted summary cache already knows, with no disk
     /// scan and no JSONL parsing, so the first paint is immediate.
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary]
+    /// Fast partial parse for the "instant tail" first paint on a cache miss (Task 1): the last
+    /// `limit` renderable messages, read backward from EOF so latency does not scale with total
+    /// file size. `isComplete` reports whether this already *is* the whole conversation.
+    func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan
 }
 
 extension SessionRepositoryProtocol {
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary] { [] }
+    /// Defaulted to a full load reported as already-complete: fakes/tests that never override
+    /// this behave exactly as if every selection were a full-file parse in one step, which is
+    /// what they already exercise today.
+    func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
+        SessionParser.TailScan(conversation: try await loadConversation(from: fileURL), isComplete: true)
+    }
 }
 
 struct FileSessionRepository: SessionRepositoryProtocol {
@@ -107,6 +117,13 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         try await Self.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try SessionParser.conversation(at: fileURL)
+        }
+    }
+
+    func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
+        try await Self.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try SessionParser.conversationTail(at: fileURL, limit: limit)
         }
     }
 

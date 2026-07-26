@@ -88,6 +88,16 @@ private struct GitSection: View {
             }
             .help(snapshot.statusHint ?? "Git worktree")
 
+            // Honest, at-a-glance signal that this thread runs in a linked worktree rather than
+            // the main checkout — easy to miss otherwise since the branch row above looks the
+            // same either way.
+            if let worktree = store.selectedWorktree {
+                InspectorRow(symbol: "arrow.branch", title: "Worktree") {
+                    Text(worktree.name)
+                }
+                .help("Linked from \(worktree.mainName) \u{b7} \(worktree.path)")
+            }
+
             if snapshot.isDirty {
                 DisclosureButton(title: expanded ? "Hide files" : "\(snapshot.files.count) changed files", expanded: expanded) {
                     expanded.toggle()
