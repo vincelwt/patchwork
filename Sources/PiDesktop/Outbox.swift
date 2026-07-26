@@ -99,12 +99,9 @@ enum OutboxPresentation {
     /// The strip must be entirely absent, not merely empty, when there is nothing queued
     /// anywhere — checked separately from `rows` so the view can skip building rows at all.
     ///
-    /// `outbox` and `runtimeState`'s queues both live on `AppStore` itself, not per conversation,
-    /// because only one runtime is ever attached at a time. `isSelectedRuntime` is how every
-    /// other runtime-derived control in the composer (see `QueueMenu` in `ComposerView.swift`)
-    /// already avoids showing conversation A's live state while conversation B is on screen —
-    /// without it, switching away from a busy conversation would leak its queued messages (and
-    /// let you "remove" one that is not actually queued against what you are looking at).
+    /// `AppStore` publishes only the selected runtime's outbox and Pi queues; parked runtimes keep
+    /// their own snapshots. `isSelectedRuntime` still prevents the brief route-switch interval
+    /// from showing conversation A's queued messages in conversation B.
     static func isEmpty(
         outbox: [OutboxEntry],
         steeringQueue: [String],
@@ -172,9 +169,17 @@ extension AppStore {
 
     private func dispatchOutboxEntry(_ entry: OutboxEntry) {
         let command = entry.delivery == .steer ? "steer" : "follow_up"
-        runtime.send(type: command, payload: ["message": JSONValue.string(entry.text)]) { [weak self] result in
-            guard let self, case let .failure(error) = result else { return }
-            runtimeState.lastError = "Queued message could not be delivered: \(error.localizedDescription)"
+        let target = runtime
+        let token = beginOutboxDispatch()
+        var payload: [String: JSONValue] = ["message": .string(entry.text)]
+        if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
+        target.send(type: command, payload: payload) { [weak self] result in
+            self?.finishOutboxDispatch(
+                owner: token.owner,
+                dispatch: token.dispatch,
+                delivery: entry.delivery,
+                result: result
+            )
         }
     }
 }
