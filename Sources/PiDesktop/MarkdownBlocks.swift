@@ -475,7 +475,7 @@ enum MarkdownInline {
     private static func styleCodeSpans(in string: inout AttributedString, size: CGFloat) {
         for run in string.runs {
             guard run.inlinePresentationIntent?.contains(.code) == true else { continue }
-            string[run.range].font = .system(size: max(11, size - 1.5), design: .monospaced)
+            string[run.range].font = .system(size: max(PiFont.metaSize, size - 1), design: .monospaced)
             string[run.range].backgroundColor = .piInset
         }
     }
@@ -626,7 +626,7 @@ struct CodeBlockView: View {
                 if hovering || copied {
                     Button(action: copy) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: PiIcon.small, weight: .medium))
                             .foregroundStyle(copied ? Color.piGreen : Color.secondary)
                             .frame(width: 20, height: 18)
                             .piInset(radius: PiTheme.radiusSmall, strong: true)

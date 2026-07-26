@@ -1,11 +1,10 @@
 import SwiftUI
 
-/// The transcript's single expanded-content size, shared by thinking, narration, and
-/// custom/system detail so they read as one family instead of each row picking its own offset
-/// from the body size. Tool call/result payloads are deliberately a separate, monospaced
-/// `PiFont.code` — that is real code/JSON, not prose, so it is not part of this unification.
+/// Expanded transcript content — thinking, narration, custom/system detail — is the same size
+/// as an answer. It is quieter because it is grey, not because it is smaller: shrinking it was
+/// half of what made the transcript look like three different apps stacked vertically.
 extension PiFont {
-    static let rowDetail: CGFloat = bodySize - 1
+    static let rowDetail: CGFloat = bodySize
 }
 
 struct MessageView: View {

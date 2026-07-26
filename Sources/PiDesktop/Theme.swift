@@ -116,8 +116,15 @@ enum PiTheme {
 
 /// A deliberate SF Pro (non-rounded) scale. Semibold is reserved for real titles.
 enum PiFont {
-    /// Transcript body: 14.5pt with a 1.45 line height (≈6.5pt extra leading).
-    static let bodySize: CGFloat = 14.5
+    /// Two text sizes carry the entire app.
+    ///
+    /// It previously had eight — 14.5 transcript prose, 13 sidebar rows, 12 section titles, 11.5
+    /// captions, 10.5 micro labels, and a separate heading ramp — which is exactly why the
+    /// window read as several different apps side by side. Everything a person reads is now
+    /// `bodySize`; everything that annotates it is `metaSize`. Titles are the only exception,
+    /// and there are two of them.
+    static let bodySize: CGFloat = 13.5
+    static let metaSize: CGFloat = 11.5
     static let bodyLineHeight: CGFloat = 1.45
     static var bodyLineSpacing: CGFloat { (bodyLineHeight - 1) * bodySize }
 
@@ -127,37 +134,40 @@ enum PiFont {
     /// Section and window titles.
     static let title = Font.system(size: 15, weight: .semibold)
     /// The one oversized label in the app: an empty state's headline.
-    static let displayTitle = Font.system(size: 21, weight: .semibold)
-    static let sectionTitle = Font.system(size: 12, weight: .semibold)
+    static let displayTitle = Font.system(size: 20, weight: .semibold)
+    static let sectionTitle = Font.system(size: metaSize, weight: .semibold)
 
-    /// Sidebar and inspector rows.
-    static let row = Font.system(size: 13, weight: .regular)
-    static let rowEmphasis = Font.system(size: 13, weight: .medium)
+    /// Sidebar, inspector, and transcript rows — the same size as prose, because they are read
+    /// the same way.
+    static let row = Font.system(size: bodySize, weight: .regular)
+    static let rowEmphasis = Font.system(size: bodySize, weight: .medium)
 
-    /// Captions, metadata, footers.
-    static let caption = Font.system(size: 11.5, weight: .regular)
-    static let captionEmphasis = Font.system(size: 11.5, weight: .medium)
-    static let micro = Font.system(size: 10.5, weight: .regular)
+    /// Captions, metadata, footers. `micro` is kept as a name for the tightest chrome, but it is
+    /// deliberately the same size: weight and colour separate them, not scale.
+    static let caption = Font.system(size: metaSize, weight: .regular)
+    static let captionEmphasis = Font.system(size: metaSize, weight: .medium)
+    static let micro = Font.system(size: metaSize, weight: .regular)
 
-    /// SF Mono for code and tool output.
-    static let code = Font.system(size: 12, design: .monospaced)
-    static let codeSmall = Font.system(size: 11, design: .monospaced)
+    /// SF Mono for code and tool output, one step down from prose so it optically matches it.
+    static let codeSize: CGFloat = bodySize - 1
+    static let code = Font.system(size: codeSize, design: .monospaced)
+    static let codeSmall = Font.system(size: metaSize, design: .monospaced)
 
-    static var codeLineSpacing: CGFloat { 12 * 0.4 }
+    static var codeLineSpacing: CGFloat { codeSize * 0.4 }
 
-    // Markdown heading ramp, anchored on the body size. Sizes are named because both the
-    // SwiftUI renderer and the AppKit answer view have to draw the same ramp.
-    static let heading1Size: CGFloat = 19
-    static let heading2Size: CGFloat = 17
-    static let heading3Size: CGFloat = 15
+    // Markdown heading ramp. Tight on purpose: a heading inside an answer is still body copy,
+    // not a poster.
+    static let heading1Size: CGFloat = 17
+    static let heading2Size: CGFloat = 15
+    static let heading3Size: CGFloat = bodySize
     static let heading1 = Font.system(size: heading1Size, weight: .semibold)
     static let heading2 = Font.system(size: heading2Size, weight: .semibold)
     static let heading3 = Font.system(size: heading3Size, weight: .semibold)
     static let heading4 = Font.system(size: bodySize, weight: .semibold)
 
-    // AppKit equivalents for the native composer text view.
+    // AppKit equivalents for the native composer and answer text views.
     static let composerNSFont = NSFont.systemFont(ofSize: bodySize, weight: .regular)
-    static let codeNSFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    static let codeNSFont = NSFont.monospacedSystemFont(ofSize: codeSize, weight: .regular)
 }
 
 /// Symbols are the other half of the type scale, and they were the half nobody governed: views
@@ -171,7 +181,7 @@ enum PiIcon {
     /// Toolbar and composer controls.
     static let medium: CGFloat = 12
     /// Empty states and anything meant to be looked at rather than scanned past.
-    static let large: CGFloat = 14
+    static let large: CGFloat = 13
 
     static func font(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight)

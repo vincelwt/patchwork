@@ -11,31 +11,28 @@ import XCTest
 /// so it pins the shared constant and its relationship to the rest of the type scale instead,
 /// which is what would catch a future call site reintroducing its own ad-hoc offset.
 final class TranscriptRowMetricsTests: XCTestCase {
-    func testRowDetailIsOneNamedConstantBetweenCaptionAndBody() {
-        // The exact value is a deliberate one-step-under-body offset, not one more magic number:
-        // pinning the relationship (not just the literal) is what makes a future drive-by
-        // `bodySize - 1` at a new call site show up as a behavioral change instead of quietly
-        // matching by coincidence.
-        XCTAssertEqual(PiFont.rowDetail, PiFont.bodySize - 1)
-        XCTAssertLessThan(PiFont.rowDetail, PiFont.bodySize, "Expanded detail stays a step under the answer body")
-        // PiFont.caption is Theme.swift's 11.5pt title size; rowDetail (prose content) must still
-        // read larger than a row title.
-        XCTAssertGreaterThan(PiFont.rowDetail, 11.5)
+    func testExpandedDetailIsTheSameSizeAsAnAnswer() {
+        // Detail used to be a step smaller than prose, which is half of why the transcript read
+        // as several different apps stacked vertically. It is now the same size and separated by
+        // colour instead.
+        XCTAssertEqual(PiFont.rowDetail, PiFont.bodySize)
+        XCTAssertGreaterThan(PiFont.rowDetail, PiFont.metaSize)
     }
 
     func testExactlyOneCaptionSizeBacksEveryRowTitle() {
         // Work-log header, activity rows, tool steps, custom/system/unknown rows, and the
         // compaction marker all title themselves in `PiFont.caption` — this pins that single
         // value so a title never silently grows/shrinks relative to its siblings.
-        XCTAssertEqual(PiFont.caption, Font.system(size: 11.5, weight: .regular))
+        XCTAssertEqual(PiFont.caption, Font.system(size: PiFont.metaSize, weight: .regular))
     }
 
     func testCodeDetailStaysASingleDistinctMonospacedSizeFromProseDetail() {
         // Tool call/result payloads are deliberately not part of the prose-detail unification
         // (task 3 keeps them monospaced, at the shared text origin, un-carded) — this just pins
         // that the two "detail" tracks (prose vs. code) remain exactly two named sizes, not more.
-        XCTAssertEqual(PiFont.code, Font.system(size: 12, design: .monospaced))
-        XCTAssertNotEqual(PiFont.code, Font.system(size: PiFont.rowDetail))
+        XCTAssertEqual(PiFont.code, Font.system(size: PiFont.codeSize, design: .monospaced))
+        // Monospaced runs one step under prose so the two optically match rather than clash.
+        XCTAssertEqual(PiFont.codeSize, PiFont.bodySize - 1)
     }
 
     func testSharedGridColumnStillBacksEveryIconBearingRow() {
@@ -57,9 +54,8 @@ final class TranscriptRowMetricsTests: XCTestCase {
             .appendingPathComponent("Sources/PiDesktop/MessageView.swift")
         let contents = try String(contentsOf: sourceURL, encoding: .utf8)
         let occurrences = contents.components(separatedBy: "bodySize - 1").count - 1
-        // Exactly one: the shared constant's own definition. Any more means a call site went
-        // back to computing its own offset instead of referencing `PiFont.rowDetail`.
-        XCTAssertEqual(occurrences, 1, "Only PiFont.rowDetail's own definition may compute bodySize - 1")
+        // Nothing in the transcript computes its own offset from the body size any more.
+        XCTAssertEqual(occurrences, 0, "Row sizes come from PiFont, never from an ad-hoc offset")
         XCTAssertTrue(contents.contains("static let rowDetail"), "The shared constant must still be defined exactly once")
     }
 }

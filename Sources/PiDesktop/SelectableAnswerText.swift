@@ -166,7 +166,7 @@ private struct CodeBlockCopyOverlay: View {
                 if hovering || copied {
                     Button(action: copy) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: PiIcon.small, weight: .medium))
                             .foregroundStyle(copied ? Color.piGreen : Color.secondary)
                             .frame(width: 20, height: 18)
                             .piInset(radius: PiTheme.radiusSmall, strong: true)
@@ -520,7 +520,7 @@ enum AnswerAttributedTextBuilder {
         style.paragraphSpacingBefore = PiTheme.space8
         style.paragraphSpacing = PiTheme.space8
         return NSAttributedString(string: code, attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .font: NSFont.monospacedSystemFont(ofSize: PiFont.codeSize, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor,
             .paragraphStyle: style,
             .piAnswerBlockKind: AnswerBlockKind.code.rawValue
