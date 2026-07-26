@@ -29,22 +29,7 @@ struct MenuBarContentView: View {
                 ScrollView {
                     VStack(spacing: PiTheme.space2) {
                         ForEach(running.prefix(12)) { session in
-                            Button { activate(session) } label: {
-                                HStack(spacing: PiTheme.space8) {
-                                    ProgressView().controlSize(.mini)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(session.displayName)
-                                            .font(PiFont.row).lineLimit(1).truncationMode(.tail)
-                                        Text("\(store.displayFolderName(for: session)) · \(state(for: session))")
-                                            .font(PiFont.micro).foregroundStyle(.tertiary).lineLimit(1)
-                                    }
-                                    Spacer(minLength: 0)
-                                }
-                                .padding(.horizontal, PiTheme.space8)
-                                .frame(height: 38)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                            RunningSessionRow(session: session)
                         }
                         if running.count > 12 {
                             Text("\(running.count - 12) more running")
@@ -57,88 +42,75 @@ struct MenuBarContentView: View {
             }
 
             PiHairline()
-            accountSection
+            // The same all-account `/limits` report the main window's account chip shows on
+            // hover — cached instantly, refreshed periodically in the background by
+            // `LimitsReportStore`, never fetched directly by this view.
+            ScrollView { LimitsPopoverView(fallback: account) }
+                .frame(maxHeight: 320)
             PiHairline()
 
             VStack(spacing: PiTheme.space2) {
-                menuButton("Open Pi Desktop", symbol: "macwindow") { MenuBarActivation.activateMainWindow() }
-                menuButton("New Chat", symbol: "square.and.pencil") {
+                MenuBarActionRow(title: "New Chat", symbol: "square.and.pencil") {
                     MenuBarActivation.activateMainWindow(); store.openNewChat()
                 }
-                menuButton("New Virtual Folder…", symbol: "folder.badge.plus") {
-                    MenuBarActivation.activateMainWindow(); store.newVirtualFolderRequested = true
-                }
-                menuButton("Refresh Sessions", symbol: "arrow.clockwise") { Task { await store.refreshSessions() } }
-                menuButton("Quit Pi Desktop", symbol: "power") { NSApplication.shared.terminate(nil) }
+                MenuBarActionRow(title: "Quit Pi Desktop", symbol: "power") { NSApplication.shared.terminate(nil) }
             }
             .padding(PiTheme.space4)
         }
         .frame(width: PiTheme.menuBarWidth)
     }
 
-    @ViewBuilder
-    private var accountSection: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space4) {
-            HStack {
-                Text("ACCOUNT LIMITS").font(PiFont.micro.weight(.semibold)).foregroundStyle(.tertiary)
-                Spacer()
-                if !store.statusModel.isLive {
-                    Text(account == nil ? "unknown" : "cached").font(PiFont.micro).foregroundStyle(.tertiary)
-                }
-            }
-            if let account {
-                Text(account.account).font(PiFont.caption).lineLimit(1).truncationMode(.middle)
-                if account.windows.isEmpty {
-                    Text("Usage windows unavailable")
-                        .font(PiFont.caption).foregroundStyle(.secondary)
-                } else {
-                    // Every window, not just the tightest one, so the menu bar answers the
-                    // limits question without opening the app.
-                    ForEach(account.windows, id: \.label) { window in
-                        HStack(spacing: PiTheme.space8) {
-                            Text(window.label)
-                                .font(PiFont.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                                .frame(width: 30, alignment: .leading)
-                            ProgressView(value: Double(window.remainingPercent), total: 100)
-                                .progressViewStyle(.linear)
-                            Text("\(window.remainingPercent)%")
-                                .font(PiFont.caption.monospacedDigit())
-                                .foregroundStyle(window.remainingPercent <= 15 ? Color.piRed : .secondary)
-                                .frame(width: 34, alignment: .trailing)
-                        }
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel("\(window.label) window")
-                        .accessibilityValue("\(window.remainingPercent) percent remaining")
-                    }
-                }
-                if let count = account.bankedResetCount, count > 0 {
-                    Text("\(count) banked reset\(count == 1 ? "" : "s")"
-                         + (account.bankedResetExpiry.map { ", first expires in \($0)" } ?? ""))
-                        .font(PiFont.micro)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1).truncationMode(.tail)
-                }
-            } else {
-                Text("Account limits unavailable")
-                    .font(PiFont.caption).foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, PiTheme.space12)
-        .padding(.vertical, PiTheme.space8)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Account limits")
-    }
-
     private var runningTitle: String {
         running.isEmpty ? "Ready" : "\(running.count) running"
     }
+}
 
-    private func state(for session: SessionSummary) -> String {
+/// One running-session row with real hover feedback (previously none) and a click that brings
+/// the conversation on screen, matching every other row list in the app.
+private struct RunningSessionRow: View {
+    @EnvironmentObject private var store: AppStore
+    let session: SessionSummary
+    @State private var hovering = false
+
+    var body: some View {
+        Button { activate() } label: {
+            HStack(spacing: PiTheme.space8) {
+                ProgressView().controlSize(.mini)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(session.displayName)
+                        .font(PiFont.row).lineLimit(1).truncationMode(.tail)
+                    Text("\(store.displayFolderName(for: session)) \u{b7} \(state)")
+                        .font(PiFont.micro).foregroundStyle(.tertiary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, PiTheme.space8)
+            .frame(height: 38)
+            .contentShape(Rectangle())
+            .piRowBackground(selected: false, hovering: hovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    private var state: String {
         store.runningSince(session).map { "working \(NumberFormatting.elapsed(since: $0))" } ?? "working"
     }
 
-    private func menuButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+    private func activate() {
+        MenuBarActivation.activateMainWindow()
+        store.selectSession(session)
+    }
+}
+
+/// One bottom-of-menu action row, also with the standard hover treatment.
+private struct MenuBarActionRow: View {
+    let title: String
+    let symbol: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
         Button(action: action) {
             HStack(spacing: PiTheme.space8) {
                 Image(systemName: symbol).frame(width: PiTheme.gridIconColumn)
@@ -149,27 +121,68 @@ struct MenuBarContentView: View {
             .padding(.horizontal, PiTheme.space8)
             .frame(height: 27)
             .contentShape(Rectangle())
+            .piRowBackground(selected: false, hovering: hovering)
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// The menu bar's single glyph state, and the one place its precedence is decided: any running
+/// thread wins (green, filled), otherwise any unread thread (blue, filled), otherwise an empty
+/// outline. Exactly one case is ever shown — there is nothing to combine at the view layer.
+enum MenuBarCircleState: Equatable {
+    case running
+    case unread
+    case idle
+
+    static func resolve(runningCount: Int, unreadCount: Int) -> MenuBarCircleState {
+        if runningCount > 0 { return .running }
+        if unreadCount > 0 { return .unread }
+        return .idle
     }
 
-    private func activate(_ session: SessionSummary) {
-        MenuBarActivation.activateMainWindow()
-        store.selectSession(session)
+    var symbolName: String { self == .idle ? "circle" : "circle.fill" }
+
+    /// Idle stays a template image so AppKit tints it correctly against any menu bar background
+    /// (light, dark, or a translucent wallpaper tint). The two active states carry real colour,
+    /// which requires opting out of template rendering.
+    var usesOriginalColor: Bool { self != .idle }
+
+    var tint: Color {
+        switch self {
+        case .running: return .piGreen
+        case .unread: return .piBlue
+        case .idle: return .primary
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .running: return "Pi Desktop, sessions running"
+        case .unread: return "Pi Desktop, unread sessions"
+        case .idle: return "Pi Desktop, idle"
+        }
     }
 }
 
 struct MenuBarLabelView: View {
     @EnvironmentObject private var store: AppStore
 
+    private var unreadCount: Int {
+        store.sessions.filter { !$0.isArchived && store.isUnread($0) }.count
+    }
+
+    private var state: MenuBarCircleState {
+        MenuBarCircleState.resolve(runningCount: store.runningSessions.count, unreadCount: unreadCount)
+    }
+
     var body: some View {
-        let count = store.runningSessions.count
-        HStack(spacing: 3) {
-            if count > 0 { ProgressView().controlSize(.mini) }
-            else { Image(systemName: "circle") }
-            if count > 0 { Text("\(count)") }
-        }
-        .accessibilityLabel(count == 0 ? "Pi Desktop, nothing running" : "Pi Desktop, \(count) running")
+        Image(systemName: state.symbolName)
+            .renderingMode(state.usesOriginalColor ? .original : .template)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(state.tint)
+            .accessibilityLabel(state.accessibilityLabel)
     }
 }
 

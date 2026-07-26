@@ -159,10 +159,9 @@ enum ExtensionStatusParser {
     static func codexAccount(_ rawValue: String) -> CodexAccountStatus? {
         let value = ANSI.strip(rawValue)
         guard !value.isEmpty else { return nil }
-        // The extension emits this placeholder before the usage endpoint answers.
-        if value.lowercased().hasPrefix("codex account: loading") {
-            return CodexAccountStatus(account: "Codex account", windows: [], bankedResetCount: nil, bankedResetExpiry: nil)
-        }
+        // The extension emits this before the usage endpoint answers; treat it as "not yet
+        // known" rather than inventing an account literally named "loading".
+        if value.lowercased().hasPrefix("codex account: loading") { return nil }
 
         var tokens = value.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         guard !tokens.isEmpty else { return nil }
@@ -193,7 +192,12 @@ enum ExtensionStatusParser {
         tokens.removeAll()
 
         let account = accountTokens.joined(separator: " ")
-        guard !account.isEmpty || !windows.isEmpty else { return nil }
+        // Real usage data (a window) is trustworthy even without a name. Free text alone —
+        // "loading", "signed out", a future diagnostic message the extension has not sent
+        // before — is not distinguishable from an account name unless it looks like one (an
+        // email, the documented format). Anything else degrades to nil rather than showing
+        // status text as though it were an identity.
+        guard !windows.isEmpty || account.contains("@") else { return nil }
         return CodexAccountStatus(
             account: account.isEmpty ? "Codex account" : account,
             windows: windows,
@@ -250,6 +254,48 @@ enum ExtensionStatusParser {
     }
 }
 
+/// What actually belongs in the account chip: fresh wire data when `codex-account` currently
+/// parses, or the last value that *did* parse (kept while the extension is loading or in a
+/// shape this build has never seen), or nothing at all the first time an install has never
+/// reported an account. Pure and independent of any shared cache, so it is fully testable with
+/// explicit inputs instead of the process-wide memory below.
+enum CodexAccountResolution {
+    struct Resolved: Equatable {
+        let status: CodexAccountStatus
+        /// False once this is served from memory rather than the current wire value.
+        let isStale: Bool
+    }
+
+    static func resolve(raw: String?, previousGood: CodexAccountStatus?) -> Resolved? {
+        if let raw, let parsed = ExtensionStatusParser.codexAccount(raw) {
+            return Resolved(status: parsed, isStale: false)
+        }
+        guard let previousGood else { return nil }
+        return Resolved(status: previousGood, isStale: true)
+    }
+}
+
+/// Cross-render memory for the last codex-account payload that actually parsed. A fresh
+/// `ExtensionStatusModel` is rebuilt on every status change, so this is the one piece of state
+/// that survives the gap while the extension is between updates (e.g. right after a runtime
+/// attaches, before its first real status arrives) — shared across the main window and the menu
+/// bar, which both render an account chip from independent view hierarchies.
+final class CodexAccountMemory: @unchecked Sendable {
+    static let shared = CodexAccountMemory()
+
+    private(set) var lastGood: CodexAccountStatus?
+
+    /// Non-shared instances exist purely so tests can exercise the fallback without depending on
+    /// (or polluting) global state.
+    init(lastGood: CodexAccountStatus? = nil) {
+        self.lastGood = lastGood
+    }
+
+    func remember(_ status: CodexAccountStatus) {
+        lastGood = status
+    }
+}
+
 /// The desktop's view of every extension status, live or cached, ready for the status bar.
 struct ExtensionStatusModel: Equatable {
     /// Raw (already ANSI-stripped) values keyed by status key.
@@ -257,8 +303,28 @@ struct ExtensionStatusModel: Equatable {
     /// False when the values come from the persisted cache rather than an attached runtime.
     var isLive = false
 
+    /// Resolves against the shared memory: fresh data when codex-account currently parses, else
+    /// the last known good account (see `codexAccountIsStale`), else nil the first time this
+    /// install has ever seen the extension.
     var codexAccount: CodexAccountStatus? {
-        values[ExtensionStatusParser.codexAccountKey].flatMap(ExtensionStatusParser.codexAccount)
+        resolvedCodexAccount(memory: CodexAccountMemory.shared)?.status
+    }
+
+    /// True once `codexAccount` is the last known value rather than what the wire says right
+    /// now — the chip should read as "last known", not as a live number.
+    var codexAccountIsStale: Bool {
+        resolvedCodexAccount(memory: CodexAccountMemory.shared)?.isStale ?? false
+    }
+
+    /// Exposed with an explicit memory parameter so tests resolve deterministically instead of
+    /// through the shared singleton.
+    func resolvedCodexAccount(memory: CodexAccountMemory) -> CodexAccountResolution.Resolved? {
+        let resolved = CodexAccountResolution.resolve(
+            raw: values[ExtensionStatusParser.codexAccountKey],
+            previousGood: memory.lastGood
+        )
+        if let resolved, !resolved.isStale { memory.remember(resolved.status) }
+        return resolved
     }
 
     var mode: PiMode? {

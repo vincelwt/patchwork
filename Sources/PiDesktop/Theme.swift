@@ -204,6 +204,7 @@ extension Color {
     static let piRed = Color(nsColor: .systemRed)
     static let piOrange = Color(nsColor: .systemOrange)
     static let piPurple = Color(nsColor: .systemPurple)
+    static let piBlue = Color(nsColor: .systemBlue)
 }
 
 // MARK: - Shared building blocks
@@ -343,6 +344,50 @@ enum ConversationLayout {
     static func showsInspector(requested: Bool, totalWidth: CGFloat) -> Bool {
         guard requested else { return false }
         return totalWidth - inspectorColumnWidth >= PiTheme.conversationMinimumWidth
+    }
+}
+
+// MARK: - Context budget
+
+/// Whether the context meter reads as over budget. Anything at or under 100% is the normal
+/// run-up the compaction UI already handles; past 100% the window is provably showing the model
+/// less than it needs, which is the one state worth alarming red for — in the inspector only,
+/// since the footer bar no longer carries cost or context at all.
+enum ContextBudget {
+    static func isOverBudget(_ percent: Double?) -> Bool {
+        guard let percent else { return false }
+        return percent > 100
+    }
+}
+
+// MARK: - Effort ramp
+
+/// The `/mode` ladder reads as an intensity dial, not a flat list of names: colour warms from a
+/// calm teal at `xfast` to a hot pink at `ultra`, so the composer's effort control communicates
+/// "how hard is this about to work" before anyone reads the label. Ordered by both hue and
+/// value/temperature so the ramp still reads correctly for colour-blind users.
+extension PiTheme {
+    static let effortRamp: [Color] = [
+        Color(nsColor: .systemTeal),   // xfast — calm
+        Color(nsColor: .systemBlue),   // fast
+        Color(nsColor: .systemOrange), // smart
+        Color(nsColor: .systemPink)    // ultra — intense
+    ]
+    /// The far end of `ultra`'s glow: pushes past the ramp's pink into red so the strongest mode
+    /// gets a genuinely distinctive treatment instead of just another flat colour stop.
+    static let effortUltraAccent = Color(nsColor: .systemRed)
+
+    static let effortTrackHeight: CGFloat = 5
+    static let effortTrackWidth: CGFloat = 84
+    static let effortKnobDiameter: CGFloat = 14
+    static let effortUltraKnobDiameter: CGFloat = 17
+}
+
+extension PiMode {
+    /// The ramp stop for this mode. `ComposerView.swift` can apply this directly (e.g. via
+    /// `.tint`) even without adopting the full `PiEffortTrack` view.
+    var piTint: Color {
+        PiTheme.effortRamp[Self.allCases.firstIndex(of: self) ?? 0]
     }
 }
 

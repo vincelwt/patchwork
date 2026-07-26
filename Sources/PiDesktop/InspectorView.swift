@@ -274,12 +274,27 @@ private struct MetricsSection: View {
                 }
             }
             if let percent = metrics.contextPercent {
+                // Past 100% the window is provably over what the model can see — the one
+                // context state worth alarming red for, everywhere else stays neutral.
+                let overBudget = ContextBudget.isOverBudget(percent)
                 HStack(spacing: PiTheme.space6) {
-                    Text("Context").font(PiFont.micro).foregroundStyle(.secondary)
-                    ProgressView(value: min(100, max(0, percent)), total: 100).progressViewStyle(.linear)
-                    Text("\(Int(percent.rounded()))%").font(PiFont.micro.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("Context").font(PiFont.micro).foregroundStyle(overBudget ? Color.piRed : .secondary)
+                    Group {
+                        if overBudget {
+                            ProgressView(value: min(100, max(0, percent)), total: 100).tint(Color.piRed)
+                        } else {
+                            ProgressView(value: min(100, max(0, percent)), total: 100)
+                        }
+                    }
+                    .progressViewStyle(.linear)
+                    Text("\(Int(percent.rounded()))%")
+                        .font(PiFont.micro.monospacedDigit())
+                        .foregroundStyle(overBudget ? Color.piRed : .secondary)
                 }
                 .frame(height: PiTheme.inspectorRowHeight)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Context window usage")
+                .accessibilityValue(overBudget ? "\(Int(percent.rounded())) percent, over budget" : "\(Int(percent.rounded())) percent")
             }
         }
     }
