@@ -160,37 +160,20 @@ private struct ComposerToolbar: View {
 /// differ (model, thinking level, subagents). Unknown or missing status degrades to a label.
 struct ModeSlider: View {
     @EnvironmentObject private var store: AppStore
-    @State private var dragging: Double?
 
     private var mode: PiMode? { store.statusModel.mode }
-    private var index: Double {
-        dragging ?? Double(PiMode.allCases.firstIndex(of: mode ?? .smart) ?? 0)
-    }
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
             Text(mode?.label ?? "mode")
-                .font(PiFont.caption)
-                .foregroundStyle(mode == nil ? .tertiary : .secondary)
+                .font(mode == .ultra ? PiFont.captionEmphasis : PiFont.caption)
+                .foregroundStyle(mode.map { $0.piTint } ?? Color.secondary)
                 .frame(width: 34, alignment: .trailing)
 
-            Slider(
-                value: Binding(
-                    get: { index },
-                    set: { value in
-                        dragging = value
-                        let candidate = PiMode.allCases[min(PiMode.allCases.count - 1, max(0, Int(value.rounded())))]
-                        if candidate != mode { store.setMode(candidate) }
-                    }
-                ),
-                in: 0...Double(PiMode.allCases.count - 1),
-                step: 1
-            ) { editing in
-                if !editing { dragging = nil }
-            }
-            .controlSize(.mini)
-            .frame(width: 84)
-            .disabled(mode == nil)
+            // AppKit's slider cannot be restyled, so effort gets its own calm-to-hot track.
+            PiEffortTrack(mode: mode) { store.setMode($0) }
+                .frame(width: PiTheme.effortTrackWidth, height: PiTheme.effortUltraKnobDiameter)
+                .disabled(mode == nil)
         }
         .opacity(mode == nil ? 0.55 : 1)
         .help(mode.map { "Mode \($0.label) · \($0.detail)" } ?? "The mode extension is not loaded")
