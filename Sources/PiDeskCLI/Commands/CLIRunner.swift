@@ -34,7 +34,8 @@ enum CLIRunner {
             out: out,
             daemonSettingsPath: host.daemonSettingsPath,
             tokenFilePath: host.tokenFilePath,
-            logFilePath: host.logFilePath
+            logFilePath: host.logFilePath,
+            daemonOwnerFilePath: host.daemonOwnerFilePath
         )
 
         if rawArgs.isEmpty {

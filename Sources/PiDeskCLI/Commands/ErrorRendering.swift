@@ -37,10 +37,16 @@ private func failure(for error: ControlPlaneError) -> CLIFailure {
 
 /// The JSON shape for a failed `daemon status --json`, distinct from a thrown `CLIFailure`
 /// because that command's whole job is to report reachability, not just error out silently.
+/// `mode` is additive alongside the original `ok`/`error` fields — unreachable does not mean
+/// "unknown": a LaunchAgent between restarts is still reported as such.
 struct JSONErrorEnvelope: Codable, Equatable {
     var ok = false
+    var mode: String
     var error: Detail
     struct Detail: Codable, Equatable { var code: String; var message: String }
 
-    init(code: String, message: String) { error = Detail(code: code, message: message) }
+    init(code: String, message: String, mode: String) {
+        self.mode = mode
+        error = Detail(code: code, message: message)
+    }
 }

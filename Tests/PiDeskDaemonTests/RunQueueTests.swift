@@ -173,6 +173,66 @@ final class RunQueueTests: XCTestCase {
         let aborted = await queue.abort(threadId: "no-such-thread")
         XCTAssertFalse(aborted)
     }
+
+    // MARK: - Graceful shutdown
+
+    func testShutdownWithNoRunsReturnsImmediately() async {
+        let (queue, _, _, _) = makeQueue()
+        let start = Date()
+        await queue.shutdown(graceSeconds: 5)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.5, "nothing in flight must never wait out the grace period")
+    }
+
+    func testShutdownLetsAnInFlightRunFinishWithinTheGracePeriod() async {
+        let (queue, history, _, _) = makeQueue { _ in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            return RunOutcome(status: .ok, error: nil, summary: "done")
+        }
+        await queue.enqueue(job(id: "run-6", thread: "t6"))
+        let started = await poll { await history.get(id: "run-6")?.status == .running }
+        XCTAssertTrue(started)
+
+        await queue.shutdown(graceSeconds: 2)
+
+        let run = await history.get(id: "run-6")
+        XCTAssertEqual(run?.status, .ok, "a run that finishes inside the grace period must not be cut off")
+        let active = await queue.activeCount()
+        XCTAssertEqual(active, 0)
+    }
+
+    func testShutdownCancelsAndResolvesAsTimeoutPastTheGracePeriod() async {
+        let (queue, history, _, _) = makeQueue(behavior: FakeRunExecutor.hanging())
+        await queue.enqueue(job(id: "run-7", thread: "t7"))
+        let started = await poll { await history.get(id: "run-7")?.status == .running }
+        XCTAssertTrue(started)
+
+        let start = Date()
+        await queue.shutdown(graceSeconds: 0.3)
+        let elapsed = Date().timeIntervalSince(start)
+
+        let run = await history.get(id: "run-7")
+        XCTAssertEqual(run?.status, .timeout, "abandoned past the grace period, recorded honestly rather than left running forever")
+        XCTAssertLessThan(elapsed, 5, "must not block past the grace period plus a bounded cooperative unwind")
+        let active = await queue.activeCount()
+        XCTAssertEqual(active, 0, "no run may still read as active once shutdown returns")
+    }
+
+    func testShutdownDrainsEveryConcurrentRunNotJustOne() async {
+        let (queue, history, _, _) = makeQueue(concurrency: 3, behavior: FakeRunExecutor.hanging())
+        await queue.enqueue(job(id: "run-8", thread: "t8"))
+        await queue.enqueue(job(id: "run-9", thread: "t9"))
+        let bothStarted = await poll { await queue.activeCount() == 2 }
+        XCTAssertTrue(bothStarted)
+
+        await queue.shutdown(graceSeconds: 0.2)
+
+        let first = await history.get(id: "run-8")
+        let second = await history.get(id: "run-9")
+        XCTAssertEqual(first?.status, .timeout)
+        XCTAssertEqual(second?.status, .timeout)
+        let active = await queue.activeCount()
+        XCTAssertEqual(active, 0)
+    }
 }
 
 /// A tiny async gate so tests can hold a fake run "in flight" deterministically instead of

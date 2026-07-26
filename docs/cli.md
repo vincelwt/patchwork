@@ -70,8 +70,11 @@ start it with `pidesk daemon start` (or `pidesk daemon install` to run at login)
     `--wait` was given, so the key set never changes based on flags.
   - `threads watch --json` / `daemon logs -f --json`: one line per event, each
     `{"event":"...", "data":{...}, "receivedAt":"..."}` for watch, or `{"line":"..."}` for logs.
-  - `daemon status --json` when unreachable: `{"ok":false,"error":{"code":"unreachable",
-    "message":"..."}}`, mirroring the API's own error envelope shape.
+  - `daemon status --json`: `{"mode":"appManaged|launchAgent|external|notRunning",
+    "modeDetail":"...","health":Health}` when reachable, or `{"ok":false,"mode":"...",
+    "error":{"code":"unreachable","message":"..."}}` when not — `mode` is this CLI's own
+    knowledge (which of the two lifecycle modes in daemon-api.md is in play, or neither), so it
+    wraps the raw `GET /v1/health` shape rather than being merged into it.
   - `daemon start|stop|restart|install|uninstall --json`: `{"ok":true,"action":"...",
     "detail":...}` — these are local process actions, not API calls.
   - `remote enable|disable|url --json`: `{"enabled":bool,"port":N,"url":"...","token":...}`.
@@ -180,11 +183,17 @@ pidesk daemon logs [-f] [--lines N] [--json]
 
 `pidesk daemon status` reports reachability itself — when the daemon is down this is expected
 output, not a crash, but it still exits `3` (consistent with every other command) so scripts can
-branch on it. `install` registers `pi-deskd` as a LaunchAgent (`dev.pi.desktop.daemon`, starts at
-login, restarts on crash but not on a clean exit); `start`/`stop`/`restart` drive that LaunchAgent
-via `launchctl`. If it was never installed, `start` falls back to a direct, non-persistent spawn
-(logged to the same log file) so a one-off local session still works; `stop`/`restart` in that
-case tell you so rather than pretending to manage a process they never tracked.
+branch on it. It also reports **mode**: `app-managed` (Pi Desktop.app's own bundled daemon, the
+default — see daemon-api.md's "Lifecycle"), `LaunchAgent` (installed with `install` below or
+`scripts/install-daemon.sh`), reachable-but-neither ("external" — started by hand, or by
+`daemon start`'s own fallback), or not running at all. `install` registers `pi-deskd` as a
+LaunchAgent (`dev.pi.desktop.daemon`, starts at login, restarts on crash but not on a clean
+exit); `start`/`stop`/`restart` drive that LaunchAgent via `launchctl`. If it was never installed,
+`start` falls back to a direct, non-persistent spawn (logged to the same log file) so a one-off
+local session still works; `stop`/`restart` in that case tell you so rather than pretending to
+manage a process they never tracked — including a process Pi Desktop.app itself is managing,
+which `pidesk daemon stop` never touches (quit the app, or turn off its background-service
+setting, to stop that one).
 
 `logs` shows the last 100 lines by default (bounded read from the tail of the file, never the
 whole file); `-f` follows new output.

@@ -54,6 +54,13 @@ enum DaemonControl {
     static func guiDomain() -> String { "gui/\(getuid())" }
     static func guiService() -> String { "\(guiDomain())/\(label)" }
 
+    /// `launchctl print` exits 0 only while the service is actually bootstrapped into the gui
+    /// domain — the one true "is the LaunchAgent path in play" signal `daemon status` and Pi
+    /// Desktop.app's own supervisor both need, matching `scripts/install-daemon.sh`'s `is_loaded`.
+    static func isLoaded(runner: ShellRunning) -> Bool {
+        (try? runner.run("/bin/launchctl", ["print", guiService()]))?.exitCode == 0
+    }
+
     /// Looks next to the running `pidesk` binary first (the common case: both are built/installed
     /// together), then a couple of conventional install locations.
     static func resolveBinaryPath(
@@ -150,7 +157,8 @@ enum DaemonControl {
             throw CLIFailure(
                 exitCode: .requestFailed,
                 message: "daemon is not installed as a LaunchAgent; nothing to stop via launchctl",
-                hint: "if you started it with `pidesk daemon start` before installing, stop it manually (e.g. pkill pi-deskd)"
+                hint: "if Pi Desktop.app started it, quit the app (or turn off its \"background service\" setting) to stop it; " +
+                    "if you started it yourself with `pidesk daemon start`, stop it manually (e.g. pkill pi-deskd)"
             )
         }
         let result = try runner.run("/bin/launchctl", ["kill", "SIGTERM", guiService()])

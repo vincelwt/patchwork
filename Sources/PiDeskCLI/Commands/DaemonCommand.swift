@@ -42,21 +42,31 @@ enum DaemonCommand {
             let commandSpecs = GlobalFlag.merged(into: statusHelp.flags)
             let parsed = try parseArgs(args, specs: commandSpecs)
             let global = try GlobalOptions.resolve(parsed, environment: context.environment, commandOwnsTimeout: false)
+
+            // Computed once, before the health probe, so both the reachable and unreachable
+            // branches below report the same mode from the same snapshot in time.
+            let launchAgentLoaded = DaemonControl.isLoaded(runner: context.shellRunner)
+            let ownedByApp = DaemonOwnership.isLive(DaemonOwnership.read(from: context.daemonOwnerFilePath))
+
             do {
                 let health = try await context.makeControlPlane(global).health()
+                let mode = DaemonModeClassifier.classify(launchAgentLoaded: launchAgentLoaded, healthReachable: true, ownedByApp: ownedByApp)
                 if global.jsonOutput {
-                    context.out.json(health)
+                    context.out.json(DaemonStatusJSON(mode: mode.rawValue, modeDetail: modeDetail(for: mode), health: health))
                 } else {
+                    context.out.line("mode: \(modeSummary(for: mode))")
                     context.out.line("pi-deskd is running (v\(health.version ?? "?"), api \(health.api.map(String.init) ?? "?"))")
                     context.out.line("pi: \(health.piVersion ?? "-")   running runs: \(health.runningRuns ?? 0)   queued: \(health.queuedRuns ?? 0)")
                     context.out.line("schedules enabled: \(health.schedulesEnabled == true ? "yes" : "no")   started at: \(FlexibleDate.displayLocal(health.startedAt))")
                 }
                 return ExitCode.ok.rawValue
             } catch let error as ControlPlaneError {
+                let mode = DaemonModeClassifier.classify(launchAgentLoaded: launchAgentLoaded, healthReachable: false, ownedByApp: ownedByApp)
                 let failure = asFailure(error)
                 if global.jsonOutput {
-                    context.out.json(JSONErrorEnvelope(code: "unreachable", message: failure.message))
+                    context.out.json(JSONErrorEnvelope(code: "unreachable", message: failure.message, mode: mode.rawValue))
                 } else {
+                    context.out.line("mode: \(modeSummary(for: mode))")
                     context.out.errorLine("pi-deskd is not reachable: \(failure.message)")
                     if let hint = failure.hint { context.out.errorLine(hint) }
                 }
@@ -67,6 +77,21 @@ enum DaemonCommand {
             context.out.errorLine("pidesk: \(failure.message)")
             return failure.exitCode.rawValue
         }
+    }
+
+    /// Human-readable line for every mode `DaemonModeClassifier` can produce — kept exhaustive
+    /// (no `default:`) so a new case is a compile error here, not a silently blank status line.
+    private static func modeSummary(for mode: DaemonRunMode) -> String {
+        switch mode {
+        case .appManaged: "app-managed (started by Pi Desktop.app)"
+        case .launchAgent: "LaunchAgent (\(DaemonControl.label), starts at login)"
+        case .external: "running, but not managed by Pi Desktop.app or the LaunchAgent"
+        case .notRunning: "not running"
+        }
+    }
+
+    private static func modeDetail(for mode: DaemonRunMode) -> String? {
+        mode == .notRunning ? nil : modeSummary(for: mode)
     }
 
     // MARK: - start / stop / restart
@@ -185,4 +210,13 @@ struct DaemonActionResult: Codable, Equatable {
     var ok: Bool
     var action: String
     var detail: String?
+}
+
+/// `daemon status --json`'s reachable shape: `mode`/`modeDetail` are this CLI's own knowledge
+/// (docs/cli.md's "a few shapes are this CLI's own"), wrapped around — not merged into — the raw
+/// `GET /v1/health` payload so the API's own contract stays untouched by CLI-local concerns.
+struct DaemonStatusJSON: Codable, Equatable {
+    var mode: String
+    var modeDetail: String?
+    var health: WireHealth
 }

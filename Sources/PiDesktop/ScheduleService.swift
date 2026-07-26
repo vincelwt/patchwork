@@ -185,7 +185,13 @@ enum ScheduleServiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notFound: "That automation no longer exists."
-        case .daemonUnavailable: "The Pi Desktop background service is not running."
+        case .daemonUnavailable:
+            // Honest about *why* rather than a single generic sentence: a user who turned the
+            // service off in Settings needs a different next step than one whose daemon just
+            // hasn't started yet or crashed — see DaemonSupervisor.swift.
+            DaemonSupervisorSettings.autoManageEnabled()
+                ? "The Pi Desktop background service is not running."
+                : "The Pi Desktop background service is turned off. Turn it on in Settings to use automations."
         }
     }
 }
