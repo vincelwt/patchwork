@@ -12,6 +12,10 @@ struct InspectorView: View {
                     GitSection(snapshot: store.selectedGit)
                 }
 
+                if let capability = store.activeCapability {
+                    CapabilitySection(capability: capability)
+                }
+
                 let agents = store.activities.filter { $0.kind == .subagent }
                 if !agents.isEmpty {
                     ActivitySection(title: "Subagents", items: agents)
@@ -138,6 +142,31 @@ private struct GitFileRow: View {
         if file.isBinary { return "\(file.path) · binary" }
         if file.linesUnavailable { return "\(file.path) · text, LOC unavailable (file too large to count)" }
         return "\(file.path) · +\(file.additions) −\(file.deletions)"
+    }
+}
+
+// MARK: - Current capability
+
+private struct CapabilitySection: View {
+    let capability: ToolCapability
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space6) {
+            PiSectionHeader(title: capability.kind.rawValue, trailing: "active")
+            InspectorRow(symbol: capability.kind.symbol, title: capability.title) {
+                ProgressView().controlSize(.mini)
+            }
+            if let target = capability.target {
+                Text(target)
+                    .font(PiFont.micro)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Target: \(target)")
+            }
+        }
     }
 }
 

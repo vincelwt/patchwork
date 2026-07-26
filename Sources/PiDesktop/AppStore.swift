@@ -53,6 +53,11 @@ final class AppStore: ObservableObject {
     @Published var selectedFolder: URL?
     @Published var runtimeState = RuntimeState()
     @Published var liveMetrics = TokenMetrics()
+    @Published private(set) var availableModels: [AvailableModel] = []
+    @Published private(set) var availableThinkingLevels: [String] = ["off"]
+    @Published private(set) var composerOptionsLoading = false
+    @Published private(set) var activeCapability: ToolCapability?
+    @Published private(set) var pendingQuestionnaire: QuestionnaireSession?
 
     @Published var folderGit: [String: GitSnapshot] = [:]
     @Published var selectedGit = GitSnapshot.none
@@ -87,6 +92,9 @@ final class AppStore: ObservableObject {
     private var bootstrapped = false
     private var activeRuntimePath: String?
     private var activeRuntimeCwd: String?
+    /// Distinguishes a runtime intentionally opened for New Chat from an attached session in
+    /// the same folder; otherwise a new prompt could accidentally resume the previous session.
+    private var activeRuntimeStartedForNewChat = false
     private var gitRefreshTask: Task<Void, Never>?
     private var selectedGitTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
@@ -262,6 +270,8 @@ final class AppStore: ObservableObject {
         messages.removeAll(keepingCapacity: false)
         streamingMessage = nil
         activities.removeAll(keepingCapacity: false)
+        activeCapability = nil
+        pendingQuestionnaire = nil
         draft = ""
         attachments = []
         // Release the previous conversation's decoded bitmaps promptly.
@@ -279,6 +289,8 @@ final class AppStore: ObservableObject {
         messages.removeAll(keepingCapacity: false)
         streamingMessage = nil
         activities.removeAll(keepingCapacity: false)
+        activeCapability = nil
+        pendingQuestionnaire = nil
         if !preserveDraft { draft = ""; attachments = [] }
         isConversationLoading = true
         DecodedImageCache.purge()
@@ -514,8 +526,59 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Starts or attaches the route's RPC runtime and loads picker choices. These are query-only
+    /// commands: opening a composer never sends a provider prompt.
+    func prepareComposerOptions() {
+        let cwd = selectedSession?.cwd ?? selectedFolder
+        guard let cwd else { return }
+        let sessionPath = selectedSession?.fileURL
+        composerOptionsLoading = true
+        ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
+            guard let self else { return }
+            guard case .success = result else {
+                composerOptionsLoading = false
+                return
+            }
+            requestComposerOptions()
+        }
+    }
+
+    func setModel(_ model: AvailableModel) {
+        guard runtimeMatchesCurrentRoute else { return }
+        runtime.send(type: "set_model", payload: [
+            "provider": .string(model.provider),
+            "modelId": .string(model.modelID)
+        ]) { [weak self] result in
+            guard let self, runtimeMatchesCurrentRoute else { return }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                let value = response["data"]
+                runtimeState.modelID = value?["id"]?.stringValue ?? model.modelID
+                runtimeState.modelName = value?["name"]?.stringValue ?? model.name
+                runtimeState.provider = value?["provider"]?.stringValue ?? model.provider
+                refreshRuntimeStateAfterPickerChange()
+            case let .success(response): showToast(responseError(response) ?? "Pi rejected the model.", style: .error)
+            case let .failure(error): showToast(error.localizedDescription, style: .error)
+            }
+        }
+    }
+
+    func setThinkingLevel(_ level: String) {
+        guard runtimeMatchesCurrentRoute, availableThinkingLevels.contains(level) else { return }
+        runtime.send(type: "set_thinking_level", payload: ["level": .string(level)]) { [weak self] result in
+            guard let self, runtimeMatchesCurrentRoute else { return }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                runtimeState.thinkingLevel = level
+            case let .success(response): showToast(responseError(response) ?? "Pi rejected the thinking level.", style: .error)
+            case let .failure(error): showToast(error.localizedDescription, style: .error)
+            }
+        }
+    }
+
+    // Kept for menu/status-bar compatibility; composer controls use the explicit RPC setters.
     func cycleModel() {
-        guard isSelectedRuntime else { return }
+        guard runtimeMatchesCurrentRoute else { return }
         runtime.send(type: "cycle_model", payload: [:]) { [weak self] result in
             guard case let .success(response) = result, self?.responseError(response) == nil else { return }
             if let model = response["data"]?["model"] {
@@ -524,14 +587,59 @@ final class AppStore: ObservableObject {
                 self?.runtimeState.provider = model["provider"]?.stringValue
             }
             self?.runtimeState.thinkingLevel = response["data"]?["thinkingLevel"]?.stringValue ?? self?.runtimeState.thinkingLevel
+            self?.requestComposerOptions()
         }
     }
 
     func cycleThinkingLevel() {
-        guard isSelectedRuntime else { return }
+        guard runtimeMatchesCurrentRoute else { return }
         runtime.send(type: "cycle_thinking_level", payload: [:]) { [weak self] result in
             guard case let .success(response) = result, self?.responseError(response) == nil else { return }
             self?.runtimeState.thinkingLevel = response["data"]?["level"]?.stringValue ?? self?.runtimeState.thinkingLevel
+        }
+    }
+
+    private var runtimeMatchesCurrentRoute: Bool {
+        guard runtime.isRunning else { return false }
+        if let selectedSession {
+            return activeRuntimePath == selectedSession.fileURL.standardizedFileURL.path
+        }
+        guard let selectedFolder else { return false }
+        return activeRuntimeStartedForNewChat
+            && activeRuntimeCwd == selectedFolder.standardizedFileURL.path
+    }
+
+    private func requestComposerOptions() {
+        guard runtimeMatchesCurrentRoute else { composerOptionsLoading = false; return }
+        composerOptionsLoading = true
+        runtime.send(type: "get_available_models", payload: [:]) { [weak self] result in
+            guard let self, runtimeMatchesCurrentRoute else { return }
+            if case let .success(response) = result, responseError(response) == nil {
+                availableModels = AvailableModel.parse(response["data"]?["models"])
+            }
+            requestThinkingOptions()
+        }
+    }
+
+    private func requestThinkingOptions() {
+        runtime.send(type: "get_available_thinking_levels", payload: [:]) { [weak self] result in
+            guard let self, runtimeMatchesCurrentRoute else { return }
+            if case let .success(response) = result, responseError(response) == nil {
+                availableThinkingLevels = RuntimePickerState.thinkingLevels(from: response["data"]?["levels"])
+                runtimeState.thinkingLevel = RuntimePickerState.selectedThinkingLevel(
+                    in: availableThinkingLevels,
+                    current: runtimeState.thinkingLevel
+                )
+            }
+            composerOptionsLoading = false
+        }
+    }
+
+    private func refreshRuntimeStateAfterPickerChange() {
+        runtime.send(type: "get_state", payload: [:]) { [weak self] result in
+            guard let self, runtimeMatchesCurrentRoute else { return }
+            if case let .success(response) = result, responseError(response) == nil { applyState(response["data"]) }
+            requestThinkingOptions()
         }
     }
 
@@ -596,13 +704,59 @@ final class AppStore: ObservableObject {
 
     func respondToExtensionDialog(value: String? = nil, confirmed: Bool? = nil, cancelled: Bool = false) {
         guard let request = activeDialog else { return }
+        sendExtensionResponse(request: request, value: value, confirmed: confirmed, cancelled: cancelled)
+        advanceDialogQueue()
+    }
+
+    func questionnaireQuestion(for request: ExtensionDialogRequest) -> QuestionnaireQuestion? {
+        guard let session = pendingQuestionnaire, !session.submitted,
+              let first = session.questions.first,
+              QuestionnaireRPCBridge.matches(request, question: first) else { return nil }
+        return session.currentQuestion
+    }
+
+    func saveQuestionnaireAnswer(_ answer: QuestionnaireAnswer, move: Int) {
+        guard var session = pendingQuestionnaire, answer.isValid else { return }
+        session.answers[session.currentIndex] = answer
+        session.currentIndex = min(session.questions.count - 1, max(0, session.currentIndex + move))
+        pendingQuestionnaire = session
+    }
+
+    func moveQuestionnaireBack() {
+        guard var session = pendingQuestionnaire, session.currentIndex > 0 else { return }
+        session.currentIndex -= 1
+        pendingQuestionnaire = session
+    }
+
+    func submitQuestionnaire(_ answer: QuestionnaireAnswer) {
+        guard var session = pendingQuestionnaire, answer.isValid,
+              let request = activeDialog else { return }
+        session.answers[session.currentIndex] = answer
+        guard session.answers.allSatisfy({ $0?.isValid == true }) else { return }
+        session.submitted = true
+        session.currentIndex = 0
+        pendingQuestionnaire = session
+        sendQuestionnaireResponse(request: request, questionIndex: 0, queued: true)
+    }
+
+    func cancelQuestionnaire() {
+        guard pendingQuestionnaire != nil else { return }
+        pendingQuestionnaire = nil
+        respondToExtensionDialog(cancelled: true)
+    }
+
+    private func sendExtensionResponse(
+        request: ExtensionDialogRequest,
+        value: String? = nil,
+        confirmed: Bool? = nil,
+        cancelled: Bool = false
+    ) {
         var response: [String: JSONValue] = ["type": .string("extension_ui_response"), "id": .string(request.id)]
         if cancelled { response["cancelled"] = .bool(true) }
         else if let confirmed { response["confirmed"] = .bool(confirmed) }
         else if let value { response["value"] = .string(value) }
         else { response["cancelled"] = .bool(true) }
         runtime.sendUncorrelated(.object(response))
-        advanceDialogQueue()
     }
 
     /// Pops the answered/expired dialog and presents the next queued one, so a burst of
@@ -621,6 +775,7 @@ final class AppStore: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(timeout) * 1_000_000)
             guard !Task.isCancelled, let self, activeDialog?.id == request.id else { return }
             // Pi owns the extension-side timeout; the desktop only stops blocking the queue.
+            if questionnaireQuestion(for: request) != nil { pendingQuestionnaire = nil }
             advanceDialogQueue()
         }
     }
@@ -632,6 +787,7 @@ final class AppStore: ObservableObject {
         dialogTimeoutTask = nil
         dialogQueue.removeAll()
         activeDialog = nil
+        pendingQuestionnaire = nil
     }
 
     func addAttachments(_ values: [ImageAttachment]) {
@@ -672,7 +828,8 @@ final class AppStore: ObservableObject {
     private func ensureRuntime(cwd: URL, sessionPath: URL?, completion: @escaping (Result<Void, Error>) -> Void) {
         let requestedPath = sessionPath?.standardizedFileURL.path
         let matches = runtime.isRunning && ((requestedPath != nil && activeRuntimePath == requestedPath) ||
-            (requestedPath == nil && activeRuntimePath == nil && activeRuntimeCwd == cwd.standardizedFileURL.path))
+            (requestedPath == nil && activeRuntimeStartedForNewChat
+                && activeRuntimeCwd == cwd.standardizedFileURL.path))
         if matches { completion(.success(())); return }
         if runtimeState.isBusy { completion(.failure(PiRPCError.processExited("The current Pi run is still working."))); return }
 
@@ -680,10 +837,15 @@ final class AppStore: ObservableObject {
         if runtime.isRunning { runtime.stop() }
         runtimeState = RuntimeState()
         liveMetrics = TokenMetrics()
+        availableModels.removeAll()
+        availableThinkingLevels = ["off"]
+        composerOptionsLoading = false
+        activeCapability = nil
         extensionStatuses.removeAll()
         extensionWidgets.removeAll()
         activeRuntimePath = requestedPath
         activeRuntimeCwd = cwd.standardizedFileURL.path
+        activeRuntimeStartedForNewChat = requestedPath == nil
 
         do {
             try runtime.start(cwd: cwd, sessionPath: sessionPath)
@@ -692,6 +854,7 @@ final class AppStore: ObservableObject {
             runtimeState.lastError = error.localizedDescription
             activeRuntimePath = nil
             activeRuntimeCwd = nil
+            activeRuntimeStartedForNewChat = false
             completion(.failure(error))
             return
         }
@@ -706,6 +869,7 @@ final class AppStore: ObservableObject {
                     runtime.stop()
                     activeRuntimePath = nil
                     activeRuntimeCwd = nil
+                    activeRuntimeStartedForNewChat = false
                     completion(.failure(PiRPCError.processExited(error)))
                     return
                 }
@@ -719,6 +883,7 @@ final class AppStore: ObservableObject {
                 runtime.stop()
                 activeRuntimePath = nil
                 activeRuntimeCwd = nil
+                activeRuntimeStartedForNewChat = false
                 completion(.failure(error))
             }
         }
@@ -819,6 +984,7 @@ final class AppStore: ObservableObject {
         sessions.insert(provisional, at: 0)
         route = .session(sessionID)
         activeRuntimePath = url.standardizedFileURL.path
+        activeRuntimeStartedForNewChat = false
         messages = []
         activities = []
     }
@@ -879,6 +1045,7 @@ final class AppStore: ObservableObject {
         case "agent_settled":
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
+            activeCapability = nil
             streamingMessage = nil
             requestStats()
             Task { await refreshSelectedSummary(); if isApplicationActive { refreshSelectedGit() } }
@@ -895,18 +1062,33 @@ final class AppStore: ObservableObject {
             }
             mergeHistoryActivities()
         case "tool_execution_start":
-            guard selected, let item = ActivityPresenter.activityForToolStart(event: event) else { return }
-            upsertActivity(item)
+            guard selected else { return }
+            if let callID = event["toolCallId"]?.stringValue,
+               let name = event["toolName"]?.stringValue {
+                let arguments = event["args"] ?? .object([:])
+                activeCapability = CapabilityPresenter.capability(
+                    toolName: name,
+                    callID: callID,
+                    arguments: arguments
+                ) ?? activeCapability
+                if name.lowercased() == "ask_user_question" {
+                    pendingQuestionnaire = QuestionnaireParser.parse(toolCallID: callID, arguments: arguments)
+                }
+            }
+            if let item = ActivityPresenter.activityForToolStart(event: event) { upsertActivity(item) }
         case "tool_execution_update":
             guard selected, let id = event["toolCallId"]?.stringValue,
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
             activities[index].detail = extractResultText(event["partialResult"])?.suffixString(900)
         case "tool_execution_end":
-            guard selected, let id = event["toolCallId"]?.stringValue,
-                  let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
-            activities[index].status = event["isError"]?.boolValue == true ? .failed : .succeeded
-            activities[index].endedAt = Date()
-            activities[index].detail = extractResultText(event["result"])?.suffixString(900)
+            guard selected, let id = event["toolCallId"]?.stringValue else { return }
+            if activeCapability?.sourceID == id { activeCapability = nil }
+            if pendingQuestionnaire?.toolCallID == id { pendingQuestionnaire = nil }
+            if let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) {
+                activities[index].status = event["isError"]?.boolValue == true ? .failed : .succeeded
+                activities[index].endedAt = Date()
+                activities[index].detail = extractResultText(event["result"])?.suffixString(900)
+            }
         case "queue_update":
             runtimeState.steeringQueue = queueStrings(event["steering"])
             runtimeState.followUpQueue = queueStrings(event["followUp"])
@@ -920,7 +1102,10 @@ final class AppStore: ObservableObject {
             if event["success"]?.boolValue == false, let error = event["finalError"]?.stringValue { showToast(error, style: .error) }
         case "extension_ui_request": handleExtensionUI(event)
         case "extension_error": showToast(event["error"]?.stringValue ?? "A Pi extension failed.", style: .error)
-        case "agent_end", "turn_start", "turn_end", "message_start", "bash_execution_update",
+        case "turn_end":
+            activeCapability = nil
+            pendingQuestionnaire = nil
+        case "agent_end", "turn_start", "message_start", "bash_execution_update",
              "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished": break
         default:
             unknownRPCEvents.append(event.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
@@ -935,6 +1120,56 @@ final class AppStore: ObservableObject {
             if let content = item["content"]?.stringValue { return content.suffixString(1_000) }
             return item.prettyPrinted(maxLength: 1_000)
         }
+    }
+
+    private func handleQuestionnaireRequest(_ request: ExtensionDialogRequest) -> Bool {
+        guard var session = pendingQuestionnaire else { return false }
+
+        if let customText = session.awaitingCustomText, request.method == .input {
+            sendExtensionResponse(request: request, value: customText)
+            session.awaitingCustomText = nil
+            session.nextRPCQuestionIndex += 1
+            pendingQuestionnaire = session.nextRPCQuestionIndex >= session.questions.count ? nil : session
+            return true
+        }
+
+        guard session.questions.indices.contains(session.nextRPCQuestionIndex) else {
+            pendingQuestionnaire = nil
+            return false
+        }
+        let question = session.questions[session.nextRPCQuestionIndex]
+        guard QuestionnaireRPCBridge.matches(request, question: question) else { return false }
+        guard session.submitted else { return false } // The first request owns the native sheet.
+        sendQuestionnaireResponse(request: request, questionIndex: session.nextRPCQuestionIndex, queued: false)
+        return true
+    }
+
+    private func sendQuestionnaireResponse(request: ExtensionDialogRequest, questionIndex: Int, queued: Bool) {
+        guard var session = pendingQuestionnaire,
+              session.questions.indices.contains(questionIndex),
+              session.answers.indices.contains(questionIndex),
+              let answer = session.answers[questionIndex],
+              let plan = QuestionnaireRPCBridge.response(
+                question: session.questions[questionIndex],
+                answer: answer,
+                request: request
+              ) else {
+            pendingQuestionnaire = nil
+            if queued { respondToExtensionDialog(cancelled: true) }
+            return
+        }
+
+        switch plan {
+        case let .value(value):
+            sendExtensionResponse(request: request, value: value)
+            session.nextRPCQuestionIndex = questionIndex + 1
+            pendingQuestionnaire = session.nextRPCQuestionIndex >= session.questions.count ? nil : session
+        case let .custom(sentinel, text):
+            sendExtensionResponse(request: request, value: sentinel)
+            session.awaitingCustomText = text
+            pendingQuestionnaire = session
+        }
+        if queued { advanceDialogQueue() }
     }
 
     private func handleExtensionUI(_ event: JSONValue) {
@@ -952,6 +1187,7 @@ final class AppStore: ObservableObject {
                 timeoutMilliseconds: event["timeout"]?.intValue,
                 raw: event.boundedFallback(maxLength: PiTheme.unknownPayloadLimit)
             )
+            if handleQuestionnaireRequest(request) { return }
             guard dialogQueue.count < Self.dialogQueueLimit else {
                 // Never silently swallow a request the extension is waiting on.
                 runtime.sendUncorrelated(.object([
@@ -997,6 +1233,9 @@ final class AppStore: ObservableObject {
         runtimeState.isStreaming = false
         runtimeState.isCompacting = false
         runtimeState.isRetrying = false
+        activeCapability = nil
+        pendingQuestionnaire = nil
+        composerOptionsLoading = false
         if let error { runtimeState.lastError = error; showToast(error, style: .error) }
     }
 

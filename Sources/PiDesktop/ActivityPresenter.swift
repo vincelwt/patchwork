@@ -60,14 +60,11 @@ struct ActivityPresenter: ActivityPresenting {
 
     static func activityForToolCall(_ call: ToolCallPayload, timestamp: Date?) -> ActivityItem? {
         let normalized = call.name.lowercased()
+        let readableKind = ToolActivityKind.classify(toolName: call.name)
         let kind: ActivityKind
-        if normalized == "subagent" || normalized == "subagent_wait" {
-            kind = .subagent
-        } else if normalized == "process" {
-            kind = .process
-        } else {
-            return nil
-        }
+        if readableKind == .agents { kind = .subagent }
+        else if readableKind == .processes { kind = .process }
+        else { kind = .tool }
 
         let action = call.arguments["action"]?.stringValue
         var title: String
@@ -78,20 +75,24 @@ struct ActivityPresenter: ActivityPresenting {
         case .subagent:
             let agent = call.arguments["agent"]?.stringValue
                 ?? call.arguments["tasks"]?.arrayValue?.first?["agent"]?.stringValue
-            if normalized == "subagent_wait" {
+            if normalized.contains("wait") || normalized == "get_subagent_result" {
                 title = "Waiting for agents"
                 status = .waiting
             } else {
-                title = agent.map { "\($0.capitalized) agent" } ?? "Subagent run"
+                title = agent.map { "\($0.capitalized) agent" } ?? readableKind.rawValue
             }
             subtitle = action ?? call.arguments["task"]?.stringValue?.condensedPrefix(110)
         case .process:
             title = call.arguments["name"]?.stringValue
                 ?? call.arguments["processName"]?.stringValue
-                ?? "Background process"
+                ?? readableKind.rawValue
             subtitle = action ?? call.arguments["command"]?.stringValue?.condensedPrefix(110)
         case .tool:
-            return nil
+            title = readableKind.rawValue
+            subtitle = action
+                ?? call.arguments["title"]?.stringValue?.condensedPrefix(110)
+                ?? call.arguments["command"]?.stringValue?.condensedPrefix(110)
+                ?? call.arguments["path"]?.stringValue?.condensedPrefix(110)
         }
 
         let stableID = call.arguments["processId"]?.stringValue

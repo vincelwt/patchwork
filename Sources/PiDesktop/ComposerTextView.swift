@@ -48,6 +48,8 @@ final class ComposerImageAttachment: NSTextAttachment {
 struct NativeComposerTextView: NSViewRepresentable {
     @Binding var content: ComposerContent
     let bridge: ComposerBridge
+    var placeholder = ""
+    var autofocus = false
     let onSubmit: () -> Void
     /// Applies the image budgets and returns the accepted subset.
     let admitImages: ([ImageAttachment], [ImageAttachment]) -> [ImageAttachment]
@@ -83,6 +85,8 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
+        textView.placeholder = placeholder
+        textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
         textView.onHeightChange = onHeightChange
         textView.setAccessibilityLabel("Message")
@@ -107,6 +111,8 @@ struct NativeComposerTextView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let textView = scroll.documentView as? ComposerTextView else { return }
         context.coordinator.parent = self
+        textView.placeholder = placeholder
+        textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
         textView.onHeightChange = onHeightChange
         // Only rebuild when the model diverges from what the view last published, so typing is
@@ -145,8 +151,11 @@ struct NativeComposerTextView: NSViewRepresentable {
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onHeightChange: ((CGFloat) -> Void)?
+    var placeholder = "" { didSet { needsDisplay = true } }
+    var autofocusOnWindow = false
     weak var coordinator: NativeComposerTextView.Coordinator?
     private var reportedHeight: CGFloat = 0
+    private var didAutofocus = false
     /// Attachments currently represented by an inline placeholder, keyed by identity.
     private var known: [UUID: ImageAttachment] = [:]
 
@@ -205,7 +214,47 @@ final class ComposerTextView: NSTextView {
         typingAttributes = Self.baseAttributes
         let location = min(selection.location, result.length)
         setSelectedRange(NSRange(location: location, length: 0))
+        needsDisplay = true
         reportHeight()
+    }
+
+    // MARK: Placeholder and focus
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, window?.firstResponder !== self, !placeholder.isEmpty else { return }
+        let fragmentPadding = textContainer?.lineFragmentPadding ?? 0
+        let origin = NSPoint(
+            x: textContainerInset.width + fragmentPadding,
+            y: textContainerInset.height
+        )
+        placeholder.draw(at: origin, withAttributes: [
+            .font: PiFont.composerNSFont,
+            .foregroundColor: NSColor.placeholderTextColor,
+            .paragraphStyle: Self.paragraphStyle
+        ])
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { needsDisplay = true }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted { needsDisplay = true }
+        return accepted
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard autofocusOnWindow, !didAutofocus, window != nil else { return }
+        didAutofocus = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.window?.makeFirstResponder(self)
+        }
     }
 
     // MARK: Intrinsic height
@@ -222,6 +271,7 @@ final class ComposerTextView: NSTextView {
 
     override func didChangeText() {
         super.didChangeText()
+        needsDisplay = true
         reportHeight()
     }
 

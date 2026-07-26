@@ -161,19 +161,29 @@ private struct MessageScrollView: View {
     @State private var isPinnedToBottom = true
     private let bottomID = "conversation-bottom"
 
+    private var transcriptItems: [TranscriptItem] {
+        TranscriptPresenter.items(
+            messages: messages,
+            streaming: streaming,
+            isRunning: store.isSelectedRuntime && store.runtimeState.isStreaming
+        )
+    }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView {
                 // A single small gap between entries keeps consecutive tool rows on an even
                 // rhythm; paragraphs get their breathing room from the block renderer.
                 LazyVStack(alignment: .leading, spacing: PiTheme.space10) {
-                    ForEach(messages) { message in
-                        MessageView(message: message, isStreaming: false, onImage: store.showImage)
-                            .id(message.id)
-                    }
-                    if let streaming {
-                        MessageView(message: streaming, isStreaming: true, onImage: store.showImage)
-                            .id("streaming-\(streaming.id)")
+                    ForEach(transcriptItems) { item in
+                        switch item {
+                        case let .message(message, isStreaming):
+                            MessageView(message: message, isStreaming: isStreaming, onImage: store.showImage)
+                                .id(item.id)
+                        case let .activity(group):
+                            TranscriptActivityGroupView(group: group, onImage: store.showImage)
+                                .id(item.id)
+                        }
                     }
                     Color.clear
                         .frame(height: PiTheme.space8)
@@ -192,7 +202,7 @@ private struct MessageScrollView: View {
                 isPinnedToBottom = true
                 reader.scrollTo(bottomID, anchor: .bottom)
             }
-            .onChange(of: messages.count) { _, _ in
+            .onChange(of: transcriptItems.count) { _, _ in
                 guard isPinnedToBottom else { return }
                 withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
             }
