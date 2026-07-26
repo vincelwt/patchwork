@@ -9,7 +9,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 - Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a reserved Environment inspector column
 - App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
-- Codex-style turns: reasoning and tool activity stay open while Pi works, then collapse into one “Worked for 4m 1s” line above the answer. Compaction and branch summaries are shown as their own transcript events.
+- Codex-style turns: streamed reasoning stays visible, tool calls roll up into fading live activity, and the work log smoothly collapses into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Clicking a banner opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
 - Run state verified against a small Pi extension (`pi-desktop-activity`) that reports each session's own running/idle state directly, so a finished or killed terminal turn stops showing as running without flicker and its unread dot appears only after it is idle; sessions without the extension fall back to a file heuristic

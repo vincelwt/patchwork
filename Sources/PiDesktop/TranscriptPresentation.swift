@@ -252,7 +252,7 @@ private struct TurnBuilder {
     }
 
     mutating func finish() -> [TranscriptItem] {
-        closeTurn(active: isLive)
+        closeTurn(active: isLive && trailing.isEmpty)
         return result
     }
 
