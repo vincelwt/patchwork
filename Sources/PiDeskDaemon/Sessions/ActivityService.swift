@@ -22,6 +22,14 @@ struct ActivityService {
         let activeInDaemon = await daemonActiveThreadIDs()
 
         var running: [RunningThread] = []
+        // Sessions started before the heartbeat extension existed still have to be reported
+        // correctly, so their files are classified with the same rules the window applies.
+        let heartbeatIDs = Set(heartbeats.map(\.sessionId))
+        for thread in await threadStore.threadsWithoutHeartbeat(excluding: heartbeatIDs) {
+            guard FileRunStateFallback.isRunning(sessionFile: URL(fileURLWithPath: thread.path), now: now) else { continue }
+            let source: ActivitySource = await leaseStore.isLeased(threadId: thread.id, now: now) ? .app : .terminal
+            running.append(RunningThread(threadId: thread.id, since: thread.updatedAt, source: source))
+        }
         for heartbeat in heartbeats where ActivityReader.isRunning(heartbeat, now: now) {
             let threadId = heartbeat.sessionId
             let source: ActivitySource

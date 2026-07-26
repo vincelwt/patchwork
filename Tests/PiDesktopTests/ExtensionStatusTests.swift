@@ -175,7 +175,7 @@ final class ExtensionStatusModelTests: XCTestCase {
             "brand-new-extension": "Something happened"
         ], isLive: true)
 
-        XCTAssertEqual(model.mode, .ultra)
+        XCTAssertEqual(model.mode, PiMode.ultra)
         XCTAssertEqual(model.fastPriority?.isActive, true)
         XCTAssertEqual(model.codexAccount?.account, "a@b.co")
         XCTAssertEqual(model.genericChips.map(\.key), ["brand-new-extension", "chrome"])
@@ -273,5 +273,15 @@ final class MessageSanitizationTests: XCTestCase {
         XCTAssertEqual(AppStore.sanitizedMessage("\u{FFFC}\u{FFFC}"), "")
         XCTAssertEqual(AppStore.sanitizedMessage("  text  "), "text")
         XCTAssertEqual(AppStore.sanitizedMessage("a\u{FFFC}b"), "ab")
+    }
+}
+
+final class CachedAccountProbeTests: XCTestCase {
+    func testTheRealCachedStatusStringResolvesToAnAccount() throws {
+        let raw = "vince+openai@cldstart.com 7d:22% reset×3:5h"
+        let model = ExtensionStatusModel(values: ["codex-account": raw], isLive: false)
+        let account = try XCTUnwrap(model.codexAccount, "the cached status must still resolve to an account")
+        XCTAssertTrue(account.account.contains("@"))
+        XCTAssertEqual(account.windows.first?.remainingPercent, 22)
     }
 }

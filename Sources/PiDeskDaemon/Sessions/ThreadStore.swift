@@ -71,6 +71,12 @@ actor ThreadStore {
         await allThreadsSorted().filter(\.unread).count
     }
 
+    /// Threads the heartbeat extension has never reported on — sessions that started before it
+    /// was installed. Their run state has to come from their file instead.
+    func threadsWithoutHeartbeat(excluding heartbeatIDs: Set<String>) async -> [PiThread] {
+        await allThreadsSorted().filter { !heartbeatIDs.contains($0.id) && !$0.archived }
+    }
+
     /// `POST /v1/threads/{id}/archive`. Returns the thread with the change already applied.
     @discardableResult
     func setArchived(_ archived: Bool, idOrPath: String) async throws -> PiThread {
@@ -93,7 +99,9 @@ actor ThreadStore {
         let files = SessionScanner.discoverSessionFiles(rootURL: rootURL)
         let appState = AppStatePeek.load()
         let overlayState = await overlay.snapshot()
-        let runningIDs = Set(ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger).filter { ActivityReader.isRunning($0) }.map(\.sessionId))
+        let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
+        let heartbeatIDs = Set(heartbeats.map(\.sessionId))
+        var runningIDs = Set(heartbeats.filter { ActivityReader.isRunning($0) }.map(\.sessionId))
 
         var results: [PiThread] = []
         results.reserveCapacity(files.count)
@@ -121,6 +129,13 @@ actor ThreadStore {
             thread.archived = appState.isArchived(sessionID: thread.id) || overlayState.isArchived(thread.id)
             thread.unread = overlayState.unreadOverride(path: thread.path, updatedAt: thread.updatedAt)
                 ?? appState.isUnread(path: thread.path, modifiedAt: thread.updatedAt)
+            // A session the extension has never seen still has to report honestly, so its file
+            // decides. Freshly written files are the only ones worth reading a tail for.
+            if !heartbeatIDs.contains(thread.id),
+               Date().timeIntervalSince(thread.updatedAt) <= FileRunStateFallback.idleAfter,
+               FileRunStateFallback.isRunning(sessionFile: standardizedURL) {
+                runningIDs.insert(thread.id)
+            }
             thread.running = runningIDs.contains(thread.id)
             results.append(thread)
         }

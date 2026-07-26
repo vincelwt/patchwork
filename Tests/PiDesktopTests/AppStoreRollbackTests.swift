@@ -428,3 +428,41 @@ final class AppStoreRollbackTests: XCTestCase {
         return value
     }
 }
+
+@MainActor
+final class StatusCacheMergeTests: XCTestCase {
+    func testAPartialLiveUpdateNeverErasesTheKnownAccount() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let persistence = AppPersistence(baseURL: directory)
+        persistence.cacheExtensionStatuses([
+            "codex-account": "vince@example.com 7d:22% reset\u{d7}3:5h",
+            "fast-priority": "fast"
+        ])
+        let runtime = FakeRuntime()
+        let store = AppStore(
+            repository: FakeRepository(),
+            gitService: FakeGitService(),
+            runtime: runtime,
+            persistence: persistence,
+            activityPresenter: ActivityPresenter()
+        )
+
+        // A runtime that has only reported `mode` so far must not blank the rest of the bar.
+        let event: JSONValue = .object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string("mode"),
+            "statusText": .string("mode:ultra")
+        ])
+        store.handleRPCEventForTesting(event)
+
+        let model = store.statusModel
+        XCTAssertEqual(model.mode, PiMode.ultra)
+        XCTAssertEqual(model.codexAccount?.account, "vince@example.com", "the known account must survive")
+        XCTAssertNotNil(model.fastPriority)
+    }
+}

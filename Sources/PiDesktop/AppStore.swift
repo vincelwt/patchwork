@@ -365,11 +365,20 @@ final class AppStore: ObservableObject {
     // MARK: - Extension statuses
 
     var statusModel: ExtensionStatusModel {
+        // Live values win per key, but a key the current runtime has not reported yet keeps its
+        // last known value instead of vanishing, so no chip ever flips to a placeholder while a
+        // session is attached.
         if !extensionStatuses.isEmpty {
-            return ExtensionStatusModel(values: extensionStatuses, isLive: true)
+            return ExtensionStatusModel(
+                values: cachedStatuses.merging(extensionStatuses) { _, live in live },
+                isLive: true
+            )
         }
         if !probeStatuses.isEmpty {
-            return ExtensionStatusModel(values: probeStatuses, isLive: isProbingStatuses)
+            return ExtensionStatusModel(
+                values: cachedStatuses.merging(probeStatuses) { _, probe in probe },
+                isLive: isProbingStatuses
+            )
         }
         return ExtensionStatusModel(values: cachedStatuses, isLive: false)
     }
@@ -844,8 +853,8 @@ final class AppStore: ObservableObject {
         probe.stop()
         isProbingStatuses = false
         if !probeStatuses.isEmpty {
-            cachedStatuses = probeStatuses
-            persistence.cacheExtensionStatuses(probeStatuses)
+            cachedStatuses.merge(probeStatuses) { _, fresh in fresh }
+            persistence.cacheExtensionStatuses(cachedStatuses)
         }
     }
 
@@ -1437,6 +1446,10 @@ final class AppStore: ObservableObject {
         if let path = runtimeState.sessionFile { activeRuntimePath = URL(fileURLWithPath: path).standardizedFileURL.path }
     }
 
+    /// Lets tests drive the exact event path a live runtime uses, rather than reaching into
+    /// private state and asserting on a shape the runtime never actually produces.
+    func handleRPCEventForTesting(_ event: JSONValue) { handleRPCEvent(event) }
+
     private func handleRPCEvent(_ event: JSONValue) {
         let type = event["type"]?.stringValue ?? "unknown"
         let selected = isSelectedRuntime
@@ -1655,11 +1668,14 @@ final class AppStore: ObservableObject {
             // Extension footers are ANSI-coloured for the TUI; the desktop stores plain text.
             if let value = event["statusText"]?.stringValue, !ANSI.strip(value).isEmpty {
                 extensionStatuses[key] = ANSI.strip(value).suffixString(500)
+                // Merge, never replace: a runtime that has only reported `mode` so far must not
+                // erase the last known `codex-account`, which is what made the status bar fall
+                // back to a bare “Codex account” placeholder mid-session.
+                cachedStatuses[key] = extensionStatuses[key]
             } else {
                 extensionStatuses.removeValue(forKey: key)
             }
-            cachedStatuses = extensionStatuses
-            persistence.cacheExtensionStatuses(extensionStatuses)
+            persistence.cacheExtensionStatuses(cachedStatuses)
         case "setWidget":
             guard let key = event["widgetKey"]?.stringValue else { return }
             let lines = (event["widgetLines"]?.arrayValue?.compactMap(\.stringValue) ?? []).prefix(100).map { $0.suffixString(2_000) }

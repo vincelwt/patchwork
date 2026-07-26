@@ -191,3 +191,24 @@ final class ScheduleEngineTests: XCTestCase {
         XCTAssertNil(ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false }))
     }
 }
+
+final class FileRunStateFallbackTests: XCTestCase {
+    private func entry(role: String, stopReason: String? = nil) -> PiJSONValue {
+        var message: [String: PiJSONValue] = ["role": .string(role)]
+        if let stopReason { message["stopReason"] = .string(stopReason) }
+        return .object(["type": .string("message"), "message": .object(message)])
+    }
+
+    func testTheDaemonAndTheWindowClassifyAPreHeartbeatSessionIdentically() {
+        // Work just handed to Pi, written moments ago: running.
+        XCTAssertTrue(FileRunStateFallback.isRunning(lastEntry: entry(role: "toolResult"), age: 2))
+        XCTAssertTrue(FileRunStateFallback.isRunning(lastEntry: entry(role: "assistant", stopReason: "toolUse"), age: 2))
+        // The same entry, stalled: whatever wrote it is gone.
+        XCTAssertFalse(FileRunStateFallback.isRunning(lastEntry: entry(role: "toolResult"), age: 40))
+        // A terminal stop reason wins even for a write from a moment ago.
+        XCTAssertFalse(FileRunStateFallback.isRunning(lastEntry: entry(role: "assistant", stopReason: "stop"), age: 1))
+        XCTAssertFalse(FileRunStateFallback.isRunning(lastEntry: entry(role: "assistant", stopReason: "aborted"), age: 1))
+        // Anything genuinely old is idle regardless.
+        XCTAssertFalse(FileRunStateFallback.isRunning(lastEntry: entry(role: "user"), age: 600))
+    }
+}
