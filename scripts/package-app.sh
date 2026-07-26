@@ -15,6 +15,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/PiDesktop" "$APP/Contents/MacOS/PiDesktop"
 chmod +x "$APP/Contents/MacOS/PiDesktop"
 
+# Keep the vector SVG as the source of truth and regenerate a complete iconset.
+swift scripts/make-icon.swift
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,6 +34,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>dev.pi.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>Pi Desktop</string>
     <key>CFBundlePackageType</key>

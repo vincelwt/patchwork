@@ -24,7 +24,7 @@ swift run PiDesktop         # run from source
 ## Parallel work with worktrees
 
 ```bash
-scripts/worktree.sh new inline-images     # ../pi-desktop-worktrees/inline-images on wt/inline-images
+scripts/worktree.sh new inline-images     # ../pi-desktop-worktrees/inline-images on feat/inline-images
 scripts/worktree.sh list
 scripts/worktree.sh rm inline-images
 ```

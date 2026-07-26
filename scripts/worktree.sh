@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manage git worktrees for parallel Pi Desktop work.
 #
-#   scripts/worktree.sh new <name> [base-ref]   create ../pi-desktop-worktrees/<name> on wt/<name>
+#   scripts/worktree.sh new <name> [base-ref]   create ../pi-desktop-worktrees/<name> on feat/<name>
 #   scripts/worktree.sh list                    show worktrees and their branches
 #   scripts/worktree.sh rm <name> [--force]     remove the worktree (keeps the branch)
 #   scripts/worktree.sh clean                   prune stale worktree metadata
@@ -14,7 +14,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKTREE_ROOT="${PI_DESKTOP_WORKTREE_ROOT:-$(dirname "$ROOT")/pi-desktop-worktrees}"
-BRANCH_PREFIX="wt"
+BRANCH_PREFIX="feat"
 
 cd "$ROOT"
 
