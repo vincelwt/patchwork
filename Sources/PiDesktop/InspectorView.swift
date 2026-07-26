@@ -67,7 +67,7 @@ private struct GitSection: View {
                 PiSectionHeader(title: "Environment")
                 Button(action: store.refreshSelectedGit) {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: PiIcon.micro, weight: .medium))
                         .foregroundStyle(.tertiary)
                 }
                 .buttonStyle(.plain)
@@ -261,7 +261,7 @@ private struct ActivityRow: View {
     }
 
     private func symbol(_ name: String, _ tint: Color) -> some View {
-        Image(systemName: name).font(.system(size: 10)).foregroundStyle(tint)
+        Image(systemName: name).font(.system(size: PiIcon.small)).foregroundStyle(tint)
     }
 }
 
@@ -382,7 +382,7 @@ private struct InspectorRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: PiTheme.space6) {
             Image(systemName: symbol)
-                .font(.system(size: 9))
+                .font(.system(size: PiIcon.micro))
                 .foregroundStyle(.tertiary)
                 .frame(width: 13, alignment: .center)
             Text(title)

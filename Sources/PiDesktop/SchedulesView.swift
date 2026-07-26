@@ -132,7 +132,7 @@ private struct ScheduleRow: View {
                     .buttonStyle(.plain).help("Delete")
             }
         }
-        .font(.system(size: 10, weight: .medium))
+        .font(.system(size: PiIcon.small, weight: .medium))
         .foregroundStyle(.secondary)
         .padding(.horizontal, PiTheme.space10)
         .frame(height: 40)

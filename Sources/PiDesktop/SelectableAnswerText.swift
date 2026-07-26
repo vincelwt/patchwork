@@ -79,7 +79,7 @@ struct MarkdownAnswerText: View {
 
     var body: some View {
         let runs = MarkdownAnswerPartitioner.runs(from: MarkdownBlockParser.blocks(from: text))
-        VStack(alignment: .leading, spacing: PiTheme.space10) {
+        VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
             ForEach(runs) { run in
                 switch run {
                 case let .text(blocks, _):
@@ -408,7 +408,11 @@ enum AnswerAttributedTextBuilder {
         var codeBlocks: [CodeBlockEntry] = []
 
         for block in blocks {
-            if result.length > 0 { result.append(NSAttributedString(string: "\n\n")) }
+            // The separator stays two real newlines so ⌘C copies paragraphs the way they were
+            // written, but it is drawn as a 1pt line plus explicit spacing — otherwise the blank
+            // line renders a full body line tall and settled answers breathe differently from
+            // every other block of text in the app.
+            if result.length > 0 { result.append(blockSeparator()) }
             switch block {
             case let .paragraph(text):
                 result.append(inline(text, size: size, color: .labelColor))
@@ -435,6 +439,17 @@ enum AnswerAttributedTextBuilder {
         return Built(attributedString: result, codeBlocks: codeBlocks)
     }
 
+    /// A visually exact `PiTheme.space10` gap that still copies as a blank line.
+    private static func blockSeparator() -> NSAttributedString {
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = 0
+        style.paragraphSpacing = PiTheme.transcriptBlockSpacing - 1
+        return NSAttributedString(string: "\n\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 1),
+            .paragraphStyle: style
+        ])
+    }
+
     /// Plain-text extraction used for tests and as the conceptual model for what a full-answer
     /// ⌘C should read like: block content in order, separated by blank lines.
     static func plainText(blocks: [MarkdownBlock]) -> String {
@@ -445,9 +460,9 @@ enum AnswerAttributedTextBuilder {
 
     private static func heading(_ text: String, level: Int, size: CGFloat) -> NSAttributedString {
         let headingSize: CGFloat = switch level {
-        case 1: 19
-        case 2: 17
-        case 3: 15
+        case 1: PiFont.heading1Size
+        case 2: PiFont.heading2Size
+        case 3: PiFont.heading3Size
         default: size
         }
         let base = NSFont.systemFont(ofSize: headingSize, weight: .semibold)
@@ -461,7 +476,7 @@ enum AnswerAttributedTextBuilder {
             // A uniform indent (not a hanging indent relative to the marker) keeps a lazily
             // continued line's indent correct with zero extra bookkeeping, at the small cost of
             // the marker not visually "hanging" left of wrapped text.
-            let indent: CGFloat = 8 + CGFloat(item.depth) * 16
+            let indent: CGFloat = PiTheme.space8 + CGFloat(item.depth) * PiTheme.space16
             let style = NSMutableParagraphStyle()
             style.headIndent = indent
             style.firstLineHeadIndent = indent
@@ -483,8 +498,8 @@ enum AnswerAttributedTextBuilder {
 
     private static func quote(_ text: String, size: CGFloat) -> NSAttributedString {
         let style = NSMutableParagraphStyle()
-        style.headIndent = 14
-        style.firstLineHeadIndent = 14
+        style.headIndent = PiTheme.space12
+        style.firstLineHeadIndent = PiTheme.space12
         style.lineSpacing = PiFont.bodyLineSpacing
         let piece = inline(text, size: size, color: .secondaryLabelColor)
         piece.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: piece.length))
@@ -495,10 +510,10 @@ enum AnswerAttributedTextBuilder {
     private static func codeAttributedString(_ code: String, size: CGFloat) -> NSAttributedString {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = PiFont.codeLineSpacing
-        style.headIndent = 12
-        style.firstLineHeadIndent = 12
-        style.paragraphSpacingBefore = 8
-        style.paragraphSpacing = 8
+        style.headIndent = PiTheme.space12
+        style.firstLineHeadIndent = PiTheme.space12
+        style.paragraphSpacingBefore = PiTheme.space8
+        style.paragraphSpacing = PiTheme.space8
         return NSAttributedString(string: code, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor,

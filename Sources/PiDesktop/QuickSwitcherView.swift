@@ -24,7 +24,7 @@ struct QuickSwitcherView: View {
         VStack(spacing: 0) {
             HStack(spacing: PiTheme.space8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: PiIcon.medium, weight: .medium))
                     .foregroundStyle(.tertiary)
                 // A native field so arrow keys and Return are intercepted before the text
                 // field turns them into caret movement.
@@ -142,7 +142,7 @@ private struct QuickSwitchRow: View {
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
             } else {
                 Image(systemName: "folder")
-                    .font(.system(size: 10))
+                    .font(.system(size: PiIcon.small))
                     .foregroundStyle(.tertiary)
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
             }

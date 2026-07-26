@@ -111,7 +111,7 @@ struct ConversationView: View {
             // toolbar's centered principal item.
             HStack(spacing: PiTheme.space6) {
                 Image(systemName: "folder")
-                    .font(.system(size: 10))
+                    .font(.system(size: PiIcon.small))
                     .foregroundStyle(.tertiary)
                 Text(store.selectedSession?.displayName ?? "Conversation")
                     .font(PiFont.rowEmphasis)
@@ -140,7 +140,7 @@ struct ConversationView: View {
                         if let file = store.selectedSession?.fileURL { NSWorkspace.shared.activateFileViewerSelecting([file]) }
                     }
                 } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 11, weight: .medium))
+                    Image(systemName: "ellipsis").font(.system(size: PiIcon.small, weight: .medium))
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
@@ -156,7 +156,7 @@ struct ConversationView: View {
 
         ToolbarItem(placement: .primaryAction) {
             Button { withAnimation(.easeOut(duration: 0.16)) { store.inspectorVisible.toggle() } } label: {
-                Image(systemName: "sidebar.right").font(.system(size: 12, weight: .regular))
+                Image(systemName: "sidebar.right").font(.system(size: PiIcon.medium, weight: .regular))
             }
             .help("Toggle Environment inspector (⌥⌘I)")
         }
@@ -394,7 +394,7 @@ private struct EditingMessageBanner: View {
     var body: some View {
         HStack(spacing: PiTheme.space8) {
             Image(systemName: "pencil")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: PiIcon.small, weight: .medium))
                 .foregroundStyle(.secondary)
             Text("Editing your last message")
                 .font(PiFont.caption)
@@ -417,7 +417,7 @@ private struct InlineError: View {
     var body: some View {
         HStack(spacing: PiTheme.space8) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 10))
+                .font(.system(size: PiIcon.small))
                 .foregroundStyle(Color.piRed)
             Text(text).font(PiFont.caption).lineLimit(2)
             Spacer()

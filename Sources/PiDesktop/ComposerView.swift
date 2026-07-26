@@ -184,7 +184,7 @@ private struct ComposerToolbar: View {
                     Divider()
                     QueueModeControls()
                 } label: {
-                    Image(systemName: "chevron.up").font(.system(size: 10, weight: .semibold))
+                    Image(systemName: "chevron.up").font(.system(size: PiIcon.small, weight: .semibold))
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
@@ -195,7 +195,7 @@ private struct ComposerToolbar: View {
 
             Button(action: onSend) {
                 Image(systemName: isStreaming ? "arrow.turn.up.right" : "arrow.up")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: PiIcon.small, weight: .semibold))
                     .foregroundStyle(canSend ? Color(nsColor: .textBackgroundColor) : Color.secondary)
                     .frame(width: 24, height: 24)
                     .background(canSend ? Color.primary : Color.piInsetStrong, in: Circle())
@@ -255,7 +255,7 @@ struct IconButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: PiIcon.small, weight: .medium))
                 .foregroundStyle(tint)
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())

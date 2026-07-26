@@ -33,7 +33,7 @@ struct ExtensionDialogView: View {
         VStack(alignment: .leading, spacing: PiTheme.space16) {
             HStack(alignment: .top, spacing: PiTheme.space10) {
                 Image(systemName: "puzzlepiece.extension.fill")
-                    .font(.system(size: 15))
+                    .font(.system(size: PiIcon.large))
                     .foregroundStyle(Color.piPurple)
                 VStack(alignment: .leading, spacing: PiTheme.space4) {
                     Text(request.title)
@@ -315,7 +315,7 @@ private struct QuestionnaireDialogView: View {
         Image(systemName: question.multiSelect
               ? (selected ? "checkmark.square.fill" : "square")
               : (selected ? "largecircle.fill.circle" : "circle"))
-            .font(.system(size: 13))
+            .font(.system(size: PiIcon.medium))
             .foregroundStyle(selected ? Color.accentColor : Color.secondary)
             .frame(width: 16, height: 18)
     }
@@ -469,7 +469,7 @@ struct ToastView: View {
     var body: some View {
         HStack(spacing: PiTheme.space8) {
             Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: PiIcon.small, weight: .medium))
                 .foregroundStyle(tint)
             Text(toast.text)
                 .font(PiFont.caption)

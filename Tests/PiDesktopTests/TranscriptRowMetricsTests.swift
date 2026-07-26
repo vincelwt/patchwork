@@ -63,3 +63,35 @@ final class TranscriptRowMetricsTests: XCTestCase {
         XCTAssertTrue(contents.contains("static let rowDetail"), "The shared constant must still be defined exactly once")
     }
 }
+
+final class TranscriptRhythmTests: XCTestCase {
+    /// The whole conversation column is built from four spacing steps and four glyph sizes.
+    /// Anything outside them is what made the app look like several apps stitched together.
+    func testTheTranscriptUsesOneSpacingLadder() {
+        let ladder = [
+            PiTheme.transcriptRowSpacing,
+            PiTheme.transcriptBlockSpacing,
+            PiTheme.transcriptEntrySpacing,
+            PiTheme.transcriptTurnSpacing
+        ]
+        XCTAssertEqual(ladder, ladder.sorted(), "the ladder must ascend: row < block < entry < turn")
+        XCTAssertEqual(Set(ladder).count, ladder.count, "each step is distinct")
+        // Every step stays on the 2pt grid the rest of the theme uses.
+        XCTAssertTrue(ladder.allSatisfy { $0.truncatingRemainder(dividingBy: 2) == 0 })
+    }
+
+    func testGlyphSizesComeFromOneScale() {
+        let scale = [PiIcon.micro, PiIcon.small, PiIcon.medium, PiIcon.large]
+        XCTAssertEqual(scale, scale.sorted())
+        XCTAssertEqual(Set(scale).count, scale.count)
+        // Icons must never out-shout the body text they sit beside.
+        XCTAssertLessThanOrEqual(PiIcon.large, PiFont.bodySize)
+    }
+
+    func testBothMarkdownRenderersShareOneLineHeight() {
+        // The streaming SwiftUI renderer and the settled AppKit answer draw the same prose; a
+        // different line height between them makes a message visibly reflow when it settles.
+        XCTAssertEqual(PiFont.bodyLineSpacing, (PiFont.bodyLineHeight - 1) * PiFont.bodySize, accuracy: 0.001)
+        XCTAssertGreaterThan(PiFont.bodyLineSpacing, 0)
+    }
+}

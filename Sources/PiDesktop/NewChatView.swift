@@ -8,7 +8,7 @@ struct NewChatView: View {
         VStack(spacing: PiTheme.space6) {
             Spacer()
             Text("Start a conversation")
-                .font(.system(size: 21, weight: .semibold))
+                .font(PiFont.displayTitle)
             Text("Pi will work in the folder you choose.")
                 .font(PiFont.body)
                 .foregroundStyle(.secondary)
@@ -41,7 +41,7 @@ struct NewChatView: View {
     private var folderContext: some View {
         HStack(spacing: PiTheme.space8) {
             Image(systemName: "folder")
-                .font(.system(size: 11))
+                .font(.system(size: PiIcon.small))
                 .foregroundStyle(.tertiary)
             VStack(alignment: .leading, spacing: 0) {
                 Text(store.selectedFolder?.lastPathComponent ?? "Choose a working folder")

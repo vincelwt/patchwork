@@ -114,7 +114,7 @@ private struct MenuBarActionRow: View {
         Button(action: action) {
             HStack(spacing: PiTheme.space8) {
                 Image(systemName: symbol).frame(width: PiTheme.gridIconColumn)
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .font(.system(size: PiIcon.small)).foregroundStyle(.secondary)
                 Text(title).font(PiFont.row).lineLimit(1)
                 Spacer()
             }
@@ -180,7 +180,7 @@ struct MenuBarLabelView: View {
     var body: some View {
         Image(systemName: state.symbolName)
             .renderingMode(state.usesOriginalColor ? .original : .template)
-            .font(.system(size: 13, weight: .semibold))
+            .font(.system(size: PiIcon.medium, weight: .semibold))
             .foregroundStyle(state.tint)
             .accessibilityLabel(state.accessibilityLabel)
     }

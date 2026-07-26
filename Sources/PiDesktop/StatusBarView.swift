@@ -151,7 +151,7 @@ private struct CodexAccountControl: View {
         Button { showingDetail = true } label: {
             HStack(spacing: PiTheme.space4) {
                 Image(systemName: symbolName)
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: PiIcon.micro, weight: .medium))
                 Text(account?.account ?? "Codex account")
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -209,7 +209,7 @@ private struct FastPriorityControl: View {
     var body: some View {
         Button { store.toggleFastPriority() } label: {
             HStack(spacing: PiTheme.space4) {
-                Image(systemName: "bolt.fill").font(.system(size: 8, weight: .bold))
+                Image(systemName: "bolt.fill").font(.system(size: PiIcon.micro, weight: .bold))
                 Text("fast")
             }
             .font(PiFont.micro)

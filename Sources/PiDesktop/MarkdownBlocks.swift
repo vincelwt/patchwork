@@ -523,7 +523,7 @@ struct MarkdownBlockView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
         } else {
-            VStack(alignment: .leading, spacing: PiTheme.space10) {
+            VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
                 ForEach(Array(MarkdownBlockParser.blocks(from: text).enumerated()), id: \.offset) { _, block in
                     MarkdownBlockRow(block: block, size: size, fillWidth: fillWidth)
                 }

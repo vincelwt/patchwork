@@ -75,7 +75,7 @@ private struct SidebarActionRow: View {
             HStack(spacing: PiTheme.space6) {
                 // Sits in the shared icon column, so the title starts on the sidebar text origin.
                 Image(systemName: symbol)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: PiIcon.small, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                 Text(title).font(SidebarTypography.conversationTitle(selected: false))
@@ -115,7 +115,7 @@ private struct SidebarFooter: View {
                     if store.isScanning { ProgressView().controlSize(.mini) }
                     else {
                         Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.system(size: PiIcon.small, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -314,7 +314,7 @@ private struct ArchiveSection: View {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PiTheme.space6) {
                     Image(systemName: "archivebox")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .font(.system(size: PiIcon.small)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text("Archived").font(SidebarTypography.folderHeader).foregroundStyle(.secondary)
                     Spacer(minLength: PiTheme.space4)
@@ -374,7 +374,7 @@ private struct SessionFolderSection: View {
                     // No chevron column: the icon itself carries open/closed state, and the
                     // whole row (not a disclosure glyph) is the click target.
                     Image(systemName: isOpen ? "folder.fill" : "folder")
-                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .font(.system(size: PiIcon.small)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
                         .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
@@ -464,7 +464,7 @@ private struct SessionFolderSection: View {
     private var newChatButton: some View {
         if hovering {
             Image(systemName: "plus")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: PiIcon.small, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.folderHeaderHeight, alignment: .center)
                 .contentShape(Rectangle())
@@ -580,7 +580,7 @@ private struct SessionRow: View {
     private var leadingIcon: some View {
         if hovering {
             Image(systemName: archived ? "tray.and.arrow.up" : "archivebox")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: PiIcon.small, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight, alignment: .center)
                 .contentShape(Rectangle())
@@ -607,7 +607,7 @@ private struct SessionRow: View {
             Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
         } else if GitIndicatorPolicy.showsBranchIndicator(git) {
             Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: 9)).foregroundStyle(.tertiary)
+                .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
                 .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
         }
     }

@@ -63,10 +63,13 @@ enum PiTheme {
     static var sidebarIconInset: CGFloat { space8 }
     static var sidebarTextInset: CGFloat { sidebarIconInset + sidebarIconColumn + space6 }
 
-    /// Transcript rhythm: the gap between entries inside one turn, and the larger gap that
-    /// separates one turn from the next.
-    static let transcriptEntrySpacing: CGFloat = 10
-    static let transcriptTurnSpacing: CGFloat = 22
+    /// Transcript rhythm. Four steps, and everything in a conversation uses one of them: text
+    /// blocks inside a message, rows inside a group, entries in the work log, and the larger
+    /// break between turns. Views must not invent a fifth.
+    static let transcriptBlockSpacing: CGFloat = 10
+    static let transcriptRowSpacing: CGFloat = 6
+    static let transcriptEntrySpacing: CGFloat = 12
+    static let transcriptTurnSpacing: CGFloat = 24
 
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5
@@ -123,6 +126,8 @@ enum PiFont {
 
     /// Section and window titles.
     static let title = Font.system(size: 15, weight: .semibold)
+    /// The one oversized label in the app: an empty state's headline.
+    static let displayTitle = Font.system(size: 21, weight: .semibold)
     static let sectionTitle = Font.system(size: 12, weight: .semibold)
 
     /// Sidebar and inspector rows.
@@ -140,10 +145,14 @@ enum PiFont {
 
     static var codeLineSpacing: CGFloat { 12 * 0.4 }
 
-    // Markdown heading ramp, anchored on the body size.
-    static let heading1 = Font.system(size: 19, weight: .semibold)
-    static let heading2 = Font.system(size: 17, weight: .semibold)
-    static let heading3 = Font.system(size: 15, weight: .semibold)
+    // Markdown heading ramp, anchored on the body size. Sizes are named because both the
+    // SwiftUI renderer and the AppKit answer view have to draw the same ramp.
+    static let heading1Size: CGFloat = 19
+    static let heading2Size: CGFloat = 17
+    static let heading3Size: CGFloat = 15
+    static let heading1 = Font.system(size: heading1Size, weight: .semibold)
+    static let heading2 = Font.system(size: heading2Size, weight: .semibold)
+    static let heading3 = Font.system(size: heading3Size, weight: .semibold)
     static let heading4 = Font.system(size: bodySize, weight: .semibold)
 
     // AppKit equivalents for the native composer text view.
@@ -162,7 +171,7 @@ enum PiIcon {
     /// Toolbar and composer controls.
     static let medium: CGFloat = 12
     /// Empty states and anything meant to be looked at rather than scanned past.
-    static let large: CGFloat = 15
+    static let large: CGFloat = 14
 
     static func font(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight)

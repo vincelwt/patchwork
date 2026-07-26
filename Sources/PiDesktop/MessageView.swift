@@ -39,7 +39,7 @@ struct MessageView: View {
         VStack(alignment: .trailing, spacing: PiTheme.space4) {
             HStack {
                 Spacer(minLength: PiTheme.space32 * 2)
-                VStack(alignment: .leading, spacing: PiTheme.space8) { blockList(showThinking: false, fillWidth: false) }
+                VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) { blockList(showThinking: false, fillWidth: false) }
                     .padding(.horizontal, PiTheme.space16)
                     .padding(.vertical, PiTheme.space10)
                     .background(Color.piUserBubble, in: RoundedRectangle(cornerRadius: PiTheme.userBubbleRadius, style: .continuous))
@@ -57,7 +57,7 @@ struct MessageView: View {
     }
 
     private var assistantMessage: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space8) {
+        VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
             if message.isError {
                 PiGridRow(symbol: "exclamationmark.circle.fill", tint: Color.piRed, symbolWeight: .medium) {
                     Text("Pi error").font(PiFont.caption).foregroundStyle(Color.piRed)
@@ -167,7 +167,7 @@ struct TranscriptWorkView: View {
                         Text("· failed").font(PiFont.caption).foregroundStyle(Color.piRed)
                     }
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: PiIcon.micro, weight: .semibold))
                         .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isOpen ? 90 : 0))
                         .opacity(hovering || isOpen ? 1 : 0.4)
@@ -258,18 +258,18 @@ struct CompactionRowView: View {
     @State private var hovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space6) {
+        VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PiTheme.space8) {
                     PiHairline()
                     HStack(spacing: PiTheme.space4) {
                         Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 9, weight: .medium))
+                            .font(.system(size: PiIcon.micro, weight: .medium))
                         Text(note.title)
                             .font(PiFont.caption)
                         if !note.summary.isEmpty {
                             Image(systemName: "chevron.right")
-                                .font(.system(size: 8, weight: .semibold))
+                                .font(.system(size: PiIcon.micro, weight: .semibold))
                                 .rotationEffect(.degrees(expanded ? 90 : 0))
                                 .opacity(hovering || expanded ? 1 : 0.4)
                         }
@@ -308,7 +308,7 @@ private struct UserMessageActionRow: View {
             Spacer(minLength: 0)
             Button(action: onEdit) {
                 Image(systemName: "pencil")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: PiIcon.small, weight: .medium))
                     .foregroundStyle(Color.secondary)
                     .frame(width: 20, height: 18)
                     .contentShape(Rectangle())
@@ -337,7 +337,7 @@ private struct MessageActionRow: View {
                 }
             } label: {
                 Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.system(size: PiIcon.small, weight: .medium))
                     .foregroundStyle(copied ? Color.piGreen : Color.secondary)
                     .frame(width: 20, height: 18)
                     .contentShape(Rectangle())
@@ -402,14 +402,14 @@ private struct DisclosureRow<Detail: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space6) {
+        VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
             Button { expanded.toggle() } label: {
                 HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
                     Group {
                         if showsProgress { ProgressView().controlSize(.mini) }
                         else {
                             Image(systemName: symbol)
-                                .font(.system(size: 11, weight: .regular))
+                                .font(.system(size: PiIcon.small, weight: .regular))
                                 .foregroundStyle(symbolTint)
                         }
                     }
@@ -488,7 +488,7 @@ struct TranscriptActivityGroupView: View {
             initiallyExpanded: group.shouldStartExpanded,
             collapseSignal: !group.isActive
         ) {
-            VStack(alignment: .leading, spacing: PiTheme.space8) {
+            VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
                 ForEach(group.steps) { step in
                     ToolActivityStepRow(step: step, isLive: group.isActive, onImage: onImage)
                 }
