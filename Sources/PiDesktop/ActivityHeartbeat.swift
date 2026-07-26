@@ -66,20 +66,20 @@ enum ActivityHeartbeatStore {
             .appendingPathComponent(".pi/agent/desktop-activity", isDirectory: true)
     }
 
-    /// Keyed by the resolved session-file path, matching how the monitor already keys every
-    /// other per-session lookup. A missing directory (extension never installed, nothing has
-    /// run yet) is simply an empty result, not an error.
-    static func scan(directory: URL) -> [String: ActivityHeartbeat] {
+    /// Grouped by resolved session-file path. Multiple Pi processes can attach to the same
+    /// session, so each writer is retained; the monitor reports running when any writer is live.
+    /// A missing directory (extension never installed, nothing has run yet) is simply empty.
+    static func scan(directory: URL) -> [String: [ActivityHeartbeat]] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
         ) else { return [:] }
 
-        var result: [String: ActivityHeartbeat] = [:]
+        var result: [String: [ActivityHeartbeat]] = [:]
         for url in entries.prefix(maxFilesPerScan) where url.pathExtension == "json" {
             guard let data = try? Data(contentsOf: url),
                   let heartbeat = try? JSONDecoder().decode(ActivityHeartbeat.self, from: data),
                   let path = heartbeat.resolvedSessionPath else { continue }
-            result[path] = heartbeat
+            result[path, default: []].append(heartbeat)
         }
         return result
     }

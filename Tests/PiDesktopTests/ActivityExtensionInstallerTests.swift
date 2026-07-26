@@ -83,11 +83,13 @@ final class ActivityExtensionInstallerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), handEdited)
     }
 
-    func testBundledSourceCarriesARealVersionMarker() throws {
-        // Guards against the resource file itself losing its marker, which would make every
-        // future upgrade silently no-op.
+    func testBundledSourcePreservesExternalRunState() throws {
+        // An idle RPC attachment or a background subagent must not make its parent look idle.
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertNotNil(ActivityExtensionInstaller.version(of: bundled))
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(ActivityExtensionInstaller.version(of: bundled)), 3)
+        XCTAssertTrue(bundled.contains("${sessionId}-${process.pid}.json"))
+        XCTAssertTrue(bundled.contains("subagents:created"))
+        XCTAssertTrue(bundled.contains("subagents:completed"))
     }
 
     // MARK: - Disable setting

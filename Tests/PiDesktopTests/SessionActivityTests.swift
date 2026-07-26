@@ -355,12 +355,18 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
             {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z"}
             """, name: "a.json", in: directory
         )
+        try write(
+            """
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":2,"state":"idle","updatedAt":"2024-01-01T00:00:01.000Z"}
+            """, name: "a-2.json", in: directory
+        )
         try write("not json at all", name: "b.json", in: directory)
         try write("ignored, wrong extension", name: "c.txt", in: directory)
 
         let result = ActivityHeartbeatStore.scan(directory: directory)
         XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result["/tmp/a.jsonl"]?.sessionId, "a")
+        XCTAssertEqual(result["/tmp/a.jsonl"]?.count, 2)
+        XCTAssertEqual(Set(result["/tmp/a.jsonl"]?.map(\.pid) ?? []), [1, 2])
     }
 
     func testScanOfAMissingDirectoryIsEmptyNotAnError() {
@@ -425,6 +431,29 @@ final class SessionActivityMonitorTests: XCTestCase {
 
         let monitor = SessionActivityMonitor(
             isActiveOverride: true, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in true }
+        )
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+    }
+
+    func testLiveWriterWinsOverAnIdleAttachmentForTheSameSession() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("session.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        let now = ISO8601DateFormatter.piShared.string(from: Date())
+        try Data("{\"sessionId\":\"s\",\"sessionFile\":\"\(file.path)\",\"pid\":1,\"state\":\"running\",\"updatedAt\":\"\(now)\"}".utf8)
+            .write(to: heartbeats.appendingPathComponent("s-1.json"))
+        try Data("{\"sessionId\":\"s\",\"sessionFile\":\"\(file.path)\",\"pid\":2,\"state\":\"idle\",\"updatedAt\":\"\(now)\"}".utf8)
+            .write(to: heartbeats.appendingPathComponent("s-2.json"))
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true, heartbeatDirectory: heartbeats, isProcessAlive: { $0 == 1 }
         )
         monitor.setTrackedPaths([file.path])
         try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }

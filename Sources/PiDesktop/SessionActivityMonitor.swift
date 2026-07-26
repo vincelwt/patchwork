@@ -247,18 +247,23 @@ final class SessionActivityMonitor: ObservableObject {
                 )
                 stamps[path] = fingerprint
 
-                if let heartbeat = heartbeats[path] {
-                    // The heartbeat is authoritative on its own: running requires its own state
-                    // to say so, a fresh timestamp, and a live pid, all at once. No further
-                    // cross-check is layered on top.
-                    let running = ActivityHeartbeatClassifier.isRunning(heartbeat, now: now, isProcessAlive: isProcessAlive)
+                if let writers = heartbeats[path] {
+                    // An attached RPC process is idle while the terminal that owns the same
+                    // session may still be working. Heartbeats are per writer, so any fresh,
+                    // live "running" writer wins; an idle attachment cannot erase it.
+                    let running = writers.contains {
+                        ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+                    }
+                    let newest = writers.max {
+                        (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
+                    }
                     let resolved: SessionRunState = running ? .running : .idle
                     states[path] = SessionActivity(
                         state: resolved,
                         modifiedAt: modifiedAt,
                         runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
-                        lastStopReason: heartbeat.stopReason ?? previous[path]?.lastStopReason,
-                        preview: heartbeat.preview ?? previous[path]?.preview
+                        lastStopReason: newest?.stopReason ?? previous[path]?.lastStopReason,
+                        preview: newest?.preview ?? previous[path]?.preview
                     )
                     continue
                 }

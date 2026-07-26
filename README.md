@@ -13,7 +13,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Independent live runtimes per working conversation, so starting or revisiting another task never stops the runs already in progress
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Clicking a banner opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
-- Run state verified against a small Pi extension (`pi-desktop-activity`) that reports each session's own running/idle state directly, so a finished or killed terminal turn stops showing as running without flicker and its unread dot appears only after it is idle; sessions without the extension fall back to a file heuristic
+- Run state verified against a small Pi extension (`pi-desktop-activity`) that reports each process's running/idle state directly, so an idle RPC attachment cannot hide a terminal still working; finished or killed terminal turns stop showing as running without flicker and their unread dots appear only after idle; sessions without the extension fall back to a file heuristic
 - A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
 - Recent conversations and the sidebar neighbours of the one you have open are prefetched into a bounded in-memory cache, so reopening them is instant instead of re-parsing
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
@@ -74,8 +74,8 @@ and resuming is the switch on each row.
 ## Run state
 
 Run state comes from a small Pi extension the app installs into
-`~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes a heartbeat per session to
-`~/.pi/agent/desktop-activity/<sessionId>.json`, and a session counts as running only when the
+`~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes one heartbeat per process to
+`~/.pi/agent/desktop-activity/<sessionId>-<pid>.json`; a session counts as running when any
 heartbeat says so, is fresher than ten seconds, and its process is still alive. Sessions started
 before the extension existed fall back to a bounded file heuristic. Opt out with
 `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
@@ -133,7 +133,7 @@ While Pi is running, the delivery menu explicitly offers **Steer current run** a
 - **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of parsed transcripts, warmed on launch and around the selected session, never persisted. Lock-protected rather than actor-isolated so a hit resolves with no `await`, letting `AppStore.selectSession` publish a cached transcript in the same tick as the selection instead of flashing a loading state first.
 - **`PiRuntimeProtocol` / `PiRPCClient`** — one subprocess, strict LF JSONL framing, correlated commands, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, exact small untracked-text LOC classification, and linked-worktree detection (`git rev-parse --git-dir` vs `--git-common-dir`, detailed via `git worktree list --porcelain`).
-- **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run-state detection. The bundled `pi-desktop-activity` extension (installed into `~/.pi/agent/extensions/`) reports each session's own running/idle state via a small heartbeat file; the monitor trusts it when fresh and the pid is alive, and falls back to a file-mtime-and-tail heuristic otherwise. An ambiguous read never overrides an already-known verdict.
+- **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run-state detection. The bundled `pi-desktop-activity` extension (installed into `~/.pi/agent/extensions/`) reports each process's running/idle state via a small heartbeat file; the monitor reports running when any fresh heartbeat's pid is alive, and falls back to a file-mtime-and-tail heuristic otherwise. An ambiguous read never overrides an already-known verdict.
 - **`ActivityPresenting` / `ActivityPresenter`** — stable process/run identity where Pi provides `processId`, `runId`, or `id`.
 - **`AppStore`** — main-actor route/RPC coordinator, cancellable generation-checked conversation loading, draft rollback and crash-mid-turn retry, queue state, bounded extension state, background prefetch, and modest active-app Git refresh.
 - **SwiftUI views** — `LazyVStack` history plus a separate streaming row and bottom sentinel; disclosure details format only when expanded. `NativeComposerTextView` supplies Return/Shift-Return and paste/drop semantics.
