@@ -8,11 +8,17 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 ## Features
 
 - Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a reserved Environment inspector column
-- Fast native search, app-local non-destructive archive/restore, rename from any idle session, HTML export, reveal, and compaction
+- App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
+- Codex-style turns: reasoning and tool activity stay open while Pi works, then collapse into one “Worked for 4m 1s” line above the answer. Compaction and branch summaries are shown as their own transcript events.
+- Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
+- Desktop notifications when the app is in the background and in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. The conversation you are looking at never notifies.
+- Run state verified against live `pi` processes, so a finished or killed terminal turn stops showing as running
+- Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes
-- Input/output/cache-read/cache-write tokens, latest assistant cache-hit percentage, context usage, cost, provider/model, and extension status
+- A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
+- One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, drop, file attach, preview, remove, open, zoom, and save for images
 - Subagent/background-process lifecycle presentation and Pi extension UI dialogs/status/widgets/title/editor bridge
@@ -54,6 +60,7 @@ The script builds, bundles, and ad-hoc signs the executable. Pi and Node are int
 | Shortcut | Action |
 |---|---|
 | `⌘N` | New chat |
+| `⌘K` | Quick switch |
 | `⌘R` | Refresh sessions and cached Git state |
 | `⌘.` | Stop the active Pi run |
 | `Return` | Send when idle; steer while running |
@@ -103,7 +110,7 @@ swift test
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, active-branch reconstruction, large abandoned image/payload exclusion, no duplicate known-message raw tree, versioned summary-cache warm hits/invalidation/pruning, direct-session discovery, exact Git LOC/empty-text classification, draft restoration, and an installed-Pi `get_state` smoke test that never prompts a provider. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan.
+Tests cover JSONL framing, active-branch reconstruction, large abandoned image/payload exclusion, no duplicate known-message raw tree, versioned summary-cache warm hits/invalidation/pruning, direct-session discovery, exact Git LOC/empty-text classification, turn/work-log projection, folder-tree nesting and cycle rejection, draft persistence and eviction, live-process run-state verification, notification triggers and coalescing, `/limits` parsing, and an installed-Pi `get_state` smoke test that never prompts a provider. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan.
 
 ## Current limitations
 
