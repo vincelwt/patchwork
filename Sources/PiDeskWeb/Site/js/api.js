@@ -1,0 +1,132 @@
+// Fetch wrapper for the daemon's control API (docs/daemon-api.md). Every request is same-origin
+// (the daemon serves both this site and /v1/*), carries `Authorization: Bearer <token>`, and
+// never logs the token — it is read from storage right before each request and never assigned to
+// a variable that outlives the call.
+
+const TOKEN_KEY = "pi-desktop-web-token";
+
+export function getToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return ""; // private browsing / storage disabled: behave as signed out
+  }
+}
+
+export function setToken(token) {
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    // Storage unavailable: the token still works for this page load, it just will not persist.
+  }
+}
+
+export function clearToken() {
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* nothing to clear */
+  }
+}
+
+export function hasToken() {
+  return getToken().length > 0;
+}
+
+/** A well-formed `{"error":{"code","message"}}` response, or a bare non-2xx status. */
+export class ApiError extends Error {
+  constructor(status, code, message) {
+    super(message || `Request failed (${status})`);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** `fetch` itself failed: offline, DNS, daemon/tunnel down. Distinct from a well-formed error. */
+export class NetworkError extends Error {}
+
+/** A short, user-facing message for anything this module can throw. Never includes the token. */
+export function describeError(err) {
+  if (err instanceof NetworkError) return "Can\u2019t reach the daemon. Check your connection or tunnel.";
+  if (err instanceof ApiError) return err.message;
+  return "Something went wrong.";
+}
+
+/**
+ * Fires `pi:unauthorized` on the window for a 401 so app.js can return to the token screen from
+ * one place, regardless of which call triggered it.
+ */
+async function request(path, options = {}) {
+  const headers = { Authorization: `Bearer ${getToken()}`, ...(options.headers || {}) };
+  if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers });
+  } catch (err) {
+    throw new NetworkError(err instanceof Error ? err.message : "Network request failed");
+  }
+
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("pi:unauthorized"));
+    throw new ApiError(401, "unauthorized", "Sign in again.");
+  }
+  if (!response.ok) {
+    let code = "error";
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = await response.json();
+      if (body && body.error) {
+        code = body.error.code || code;
+        message = body.error.message || message;
+      }
+    } catch {
+      /* body was not JSON; keep the generic message */
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+function toQuery(params) {
+  const usp = new URLSearchParams();
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null && value !== "") usp.set(key, value);
+  }
+  const qs = usp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+function post(path, body) {
+  return request(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
+}
+
+// One method per documented endpoint (docs/daemon-api.md "Endpoints (v1)"). Thread and schedule
+// URLs always use `id` (never the JSONL `path`, which can contain slashes) — the API accepts
+// either, and `id` keeps client-side routing a single path segment.
+export const api = {
+  health: () => request("/v1/health"),
+
+  threads: (params) => request(`/v1/threads${toQuery(params)}`),
+  thread: (id, messages) => request(`/v1/threads/${encodeURIComponent(id)}${toQuery({ messages })}`),
+  createThread: (body) => post("/v1/threads", body),
+  sendMessage: (id, body) => post(`/v1/threads/${encodeURIComponent(id)}/messages`, body),
+  abortThread: (id) => post(`/v1/threads/${encodeURIComponent(id)}/abort`),
+  archiveThread: (id, archived) => post(`/v1/threads/${encodeURIComponent(id)}/archive`, { archived }),
+  renameThread: (id, name) => post(`/v1/threads/${encodeURIComponent(id)}/name`, { name }),
+  markThreadRead: (id, unread) => post(`/v1/threads/${encodeURIComponent(id)}/read`, { unread }),
+
+  activity: () => request("/v1/activity"),
+
+  schedules: () => request("/v1/schedules"),
+  schedule: (id) => request(`/v1/schedules/${encodeURIComponent(id)}`),
+  createSchedule: (body) => post("/v1/schedules", body),
+  updateSchedule: (id, patch) => request(`/v1/schedules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteSchedule: (id) => request(`/v1/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  runScheduleNow: (id) => post(`/v1/schedules/${encodeURIComponent(id)}/run`),
+  pauseSchedule: (id, paused) => post(`/v1/schedules/${encodeURIComponent(id)}/pause`, { paused }),
+
+  limits: () => request("/v1/limits")
+};
