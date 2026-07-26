@@ -1,0 +1,268 @@
+import AppKit
+import SwiftUI
+import XCTest
+@testable import PiDesktop
+
+/// A minimal `NSDraggingInfo` so the Finder drop entry point can be exercised deterministically
+/// instead of choreographing a real drag.
+private final class FakeDraggingInfo: NSObject, NSDraggingInfo {
+    let pasteboard: NSPasteboard
+    var draggingLocation: NSPoint
+
+    init(pasteboard: NSPasteboard, location: NSPoint) {
+        self.pasteboard = pasteboard
+        self.draggingLocation = location
+    }
+
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggedImageLocation: NSPoint { draggingLocation }
+    var draggedImage: NSImage? { nil }
+    var draggingPasteboard: NSPasteboard { pasteboard }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    var animatesToDestination: Bool = false
+    var numberOfValidItemsForDrop: Int = 1
+    var draggingFormation: NSDraggingFormation = .default
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+    func enumerateDraggingItems(
+        options enumOpts: NSDraggingItemEnumerationOptions,
+        for view: NSView?,
+        classes classArray: [AnyClass],
+        searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+        using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void
+    ) {}
+    func resetSpringLoading() {}
+}
+
+@MainActor
+final class ComposerInlineImageTests: XCTestCase {
+    private var directory: URL!
+    private var contentBox: ComposerContent = .empty
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiComposer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        contentBox = .empty
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    // MARK: - Helpers
+
+    private func writePNG(named name: String, width: Int = 8, height: Int = 8) throws -> URL {
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.lockFocus()
+        NSColor.systemBlue.setFill()
+        NSRect(x: 0, y: 0, width: width, height: height).fill()
+        image.unlockFocus()
+        let representation = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(image.tiffRepresentation)))
+        let data = try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+        let url = directory.appendingPathComponent(name)
+        try data.write(to: url)
+        return url
+    }
+
+    /// A text view wired the same way `NativeComposerTextView.makeNSView` wires it.
+    private func makeTextView() -> ComposerTextView {
+        let textView = ComposerTextView()
+        textView.isRichText = true
+        textView.importsGraphics = true
+        textView.font = PiFont.composerNSFont
+        textView.typingAttributes = ComposerTextView.baseAttributes
+        textView.frame = NSRect(x: 0, y: 0, width: 400, height: 80)
+
+        let binding = Binding<ComposerContent>(
+            get: { [unowned self] in contentBox },
+            set: { [unowned self] value in contentBox = value }
+        )
+        let representable = NativeComposerTextView(
+            content: binding,
+            bridge: ComposerBridge(),
+            onSubmit: {},
+            // The real store applies the same budgets; the composer only needs the accepted set.
+            admitImages: { candidates, existing in
+                Array(candidates.prefix(max(0, PiTheme.imageCountLimit - existing.count)))
+            },
+            onHeightChange: { _ in }
+        )
+        let coordinator = NativeComposerTextView.Coordinator(representable)
+        coordinator.textView = textView
+        textView.coordinator = coordinator
+        textView.delegate = coordinator
+        return textView
+    }
+
+    // MARK: - Import
+
+    func testFileURLsBecomeAttachments() throws {
+        let url = try writePNG(named: "one.png")
+        let attachments = ImageImportService.attachments(from: [url])
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments.first?.fileName, "one.png")
+        XCTAssertEqual(attachments.first?.mimeType, "image/png")
+        XCTAssertNotNil(attachments.first?.image)
+    }
+
+    func testNonImageFilesAreIgnored() throws {
+        let url = directory.appendingPathComponent("notes.txt")
+        try Data("hello".utf8).write(to: url)
+        XCTAssertTrue(ImageImportService.attachments(from: [url]).isEmpty)
+    }
+
+    func testPasteboardPNGBecomesAnAttachment() throws {
+        let url = try writePNG(named: "clip.png")
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("PiDesktopTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setData(try Data(contentsOf: url), forType: .png)
+
+        XCTAssertTrue(ImageImportService.canReadImages(from: pasteboard))
+        let attachments = ImageImportService.attachments(from: pasteboard)
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments.first?.fileName, "Pasted image.png")
+    }
+
+    // MARK: - Inline placeholders
+
+    func testInsertedImagesBecomeInlinePlaceholdersInReadingOrder() throws {
+        let textView = makeTextView()
+        textView.string = ""
+        textView.insertText("look at this: ", replacementRange: NSRange(location: 0, length: 0))
+
+        let first = try writePNG(named: "a.png", width: 6, height: 6)
+        let second = try writePNG(named: "b.png", width: 10, height: 10)
+        let attachments = ImageImportService.attachments(from: [first, second])
+        XCTAssertEqual(attachments.count, 2)
+        textView.insertImages(attachments, at: nil)
+
+        // The text view holds one U+FFFC per image…
+        let raw = textView.string
+        XCTAssertEqual(raw.filter { $0 == "\u{FFFC}" }.count, 2)
+
+        // …and the projected content strips them while preserving inline order.
+        let content = textView.currentContent()
+        XCTAssertEqual(content.text, "look at this: ")
+        XCTAssertEqual(content.attachments.map(\.fileName), ["a.png", "b.png"])
+        XCTAssertFalse(content.text.contains("\u{FFFC}"))
+    }
+
+    func testImagesInsertedAtTheCaretKeepDocumentOrderNotInsertionOrder() throws {
+        let textView = makeTextView()
+        textView.insertText("start end", replacementRange: NSRange(location: 0, length: 0))
+
+        let tail = try writePNG(named: "tail.png")
+        textView.insertImages(ImageImportService.attachments(from: [tail]), at: 9)
+        let head = try writePNG(named: "head.png")
+        textView.insertImages(ImageImportService.attachments(from: [head]), at: 0)
+
+        // head.png was inserted second but sits first in the document.
+        XCTAssertEqual(textView.currentContent().attachments.map(\.fileName), ["head.png", "tail.png"])
+        XCTAssertEqual(textView.currentContent().text, "start end")
+    }
+
+    func testDeletingThePlaceholderRemovesTheAttachment() throws {
+        let textView = makeTextView()
+        let url = try writePNG(named: "drop.png")
+        textView.insertImages(ImageImportService.attachments(from: [url]), at: nil)
+        XCTAssertEqual(textView.currentContent().attachments.count, 1)
+
+        // Exactly what Backspace over the attachment character does.
+        let length = textView.string.utf16.count
+        textView.textStorage?.replaceCharacters(in: NSRange(location: length - 1, length: 1), with: "")
+        XCTAssertTrue(textView.currentContent().attachments.isEmpty)
+        XCTAssertEqual(textView.currentContent().text, "")
+    }
+
+    func testApplyingModelContentRebuildsInlineAttachments() throws {
+        let textView = makeTextView()
+        let url = try writePNG(named: "restored.png")
+        let attachment = try XCTUnwrap(ImageImportService.attachments(from: [url]).first)
+
+        textView.apply(content: ComposerContent(text: "restored draft", attachments: [attachment]))
+        let content = textView.currentContent()
+        XCTAssertEqual(content.text, "restored draft")
+        XCTAssertEqual(content.attachments.map(\.id), [attachment.id])
+        XCTAssertEqual(textView.string.filter { $0 == "\u{FFFC}" }.count, 1)
+    }
+
+    // MARK: - Finder drop
+
+    func testFinderDropInsertsInlineAttachments() throws {
+        let textView = makeTextView()
+        textView.insertText("before", replacementRange: NSRange(location: 0, length: 0))
+
+        let url = try writePNG(named: "dragged.png")
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("PiDesktopDrop-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.writeObjects([url as NSURL])
+
+        let info = FakeDraggingInfo(pasteboard: pasteboard, location: NSPoint(x: 10, y: 10))
+        XCTAssertEqual(textView.draggingEntered(info), .copy, "An image drag must be accepted")
+        XCTAssertTrue(textView.performDragOperation(info))
+
+        let content = textView.currentContent()
+        XCTAssertEqual(content.attachments.map(\.fileName), ["dragged.png"])
+        XCTAssertEqual(content.text, "before")
+    }
+
+    func testDroppingANonImageIsNotHandledAsAnImage() throws {
+        let textView = makeTextView()
+        let url = directory.appendingPathComponent("plain.txt")
+        try Data("nope".utf8).write(to: url)
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("PiDesktopDrop-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.writeObjects([url as NSURL])
+
+        let info = FakeDraggingInfo(pasteboard: pasteboard, location: .zero)
+        XCTAssertFalse(ImageImportService.canReadImages(from: pasteboard))
+        _ = textView.performDragOperation(info)
+        XCTAssertTrue(textView.currentContent().attachments.isEmpty)
+    }
+
+    // MARK: - Budgets
+
+    func testCountBudgetIsAppliedToInlineInsertion() throws {
+        let textView = makeTextView()
+        var urls: [URL] = []
+        for index in 0..<(PiTheme.imageCountLimit + 3) {
+            urls.append(try writePNG(named: "img\(index).png"))
+        }
+        // ImageImportService already caps a single import at the count limit.
+        let attachments = ImageImportService.attachments(from: urls)
+        XCTAssertEqual(attachments.count, PiTheme.imageCountLimit)
+
+        textView.insertImages(attachments, at: nil)
+        XCTAssertEqual(textView.currentContent().attachments.count, PiTheme.imageCountLimit)
+
+        // One more must be refused by the admission closure rather than appended.
+        let extra = try writePNG(named: "extra.png")
+        textView.insertImages(ImageImportService.attachments(from: [extra]), at: nil)
+        XCTAssertEqual(textView.currentContent().attachments.count, PiTheme.imageCountLimit)
+    }
+
+    func testRPCPayloadOrderFollowsInlineOrder() throws {
+        let textView = makeTextView()
+        let first = try writePNG(named: "1.png", width: 4, height: 4)
+        let second = try writePNG(named: "2.png", width: 5, height: 5)
+        textView.insertImages(ImageImportService.attachments(from: [first, second]), at: nil)
+
+        let attachments = textView.currentContent().attachments
+        let payload = JSONValue.array(attachments.map(\.rpcValue))
+        let items = try XCTUnwrap(payload.arrayValue)
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items.map { $0["type"]?.stringValue }, ["image", "image"])
+        XCTAssertEqual(items.map { $0["mimeType"]?.stringValue }, ["image/png", "image/png"])
+        // Distinct payloads, in the order they appear in the composer.
+        XCTAssertNotEqual(items[0]["data"]?.stringValue, items[1]["data"]?.stringValue)
+        XCTAssertEqual(
+            items[0]["data"]?.stringValue,
+            attachments[0].data.base64EncodedString()
+        )
+    }
+}
