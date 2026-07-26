@@ -1,11 +1,22 @@
 import SwiftUI
 
+/// The transcript's single expanded-content size, shared by thinking, narration, and
+/// custom/system detail so they read as one family instead of each row picking its own offset
+/// from the body size. Tool call/result payloads are deliberately a separate, monospaced
+/// `PiFont.code` — that is real code/JSON, not prose, so it is not part of this unification.
+extension PiFont {
+    static let rowDetail: CGFloat = bodySize - 1
+}
+
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
     let onImage: (ImagePayload) -> Void
     /// Answers get a hover action row; the same view reused inside a work log does not.
     var showsActions = false
+    /// Set only for the conversation's most recent user message, this reveals the hover "edit
+    /// and resubmit" affordance next to the existing copy action on answers.
+    var onEdit: (() -> Void)? = nil
     @State private var hovering = false
 
     var body: some View {
@@ -23,13 +34,20 @@ struct MessageView: View {
     }
 
     private var userMessage: some View {
-        HStack {
-            Spacer(minLength: PiTheme.space32 * 2)
-            VStack(alignment: .leading, spacing: PiTheme.space8) { blockList(showThinking: false, fillWidth: false) }
-                .padding(.horizontal, PiTheme.space16)
-                .padding(.vertical, PiTheme.space10)
-                .background(Color.piUserBubble, in: RoundedRectangle(cornerRadius: PiTheme.userBubbleRadius, style: .continuous))
+        VStack(alignment: .trailing, spacing: PiTheme.space4) {
+            HStack {
+                Spacer(minLength: PiTheme.space32 * 2)
+                VStack(alignment: .leading, spacing: PiTheme.space8) { blockList(showThinking: false, fillWidth: false) }
+                    .padding(.horizontal, PiTheme.space16)
+                    .padding(.vertical, PiTheme.space10)
+                    .background(Color.piUserBubble, in: RoundedRectangle(cornerRadius: PiTheme.userBubbleRadius, style: .continuous))
+            }
+            if showsActions, let onEdit {
+                UserMessageActionRow(onEdit: onEdit)
+                    .opacity(hovering ? 1 : 0)
+            }
         }
+        .onHover { hovering = $0 }
         // `.contain` keeps the role announcement while leaving image and disclosure controls
         // inside the bubble individually reachable by VoiceOver.
         .accessibilityElement(children: .contain)
@@ -43,7 +61,7 @@ struct MessageView: View {
                     Text("Pi error").font(PiFont.caption).foregroundStyle(Color.piRed)
                 }
             }
-            blockList(showThinking: true)
+            blockList(showThinking: true, isAnswer: true)
             if showsActions, !isStreaming, !message.textContent.isEmpty {
                 MessageActionRow(message: message)
                     .opacity(hovering ? 1 : 0)
@@ -56,11 +74,21 @@ struct MessageView: View {
     }
 
     @ViewBuilder
-    private func blockList(showThinking: Bool, fillWidth: Bool = true) -> some View {
+    private func blockList(showThinking: Bool, fillWidth: Bool = true, isAnswer: Bool = false) -> some View {
         ForEach(message.blocks) { block in
             switch block.kind {
             case let .text(text):
-                if !text.isEmpty { MarkdownBlockView(text: text, streaming: isStreaming, fillWidth: fillWidth) }
+                if !text.isEmpty {
+                    // The settled answer renders as one continuous, AppKit-backed selectable run
+                    // (see SelectableAnswerText.swift) so a drag can cross paragraph/list/code
+                    // boundaries; every other text use (user bubble, narration, streaming) keeps
+                    // the existing per-block SwiftUI renderer.
+                    if isAnswer, !isStreaming {
+                        MarkdownAnswerText(text: text)
+                    } else {
+                        MarkdownBlockView(text: text, streaming: isStreaming, fillWidth: fillWidth)
+                    }
+                }
             case let .image(image):
                 ConversationImage(image: image, onOpen: { onImage(image) })
             case let .thinking(text):
@@ -85,19 +113,23 @@ struct MessageView: View {
 
 /// Pi's terminal renders thinking as visible muted Markdown unless the user explicitly hides it.
 /// Desktop follows that default instead of reducing the reasoning to an empty disclosure label.
+/// It still gets the shared grid treatment — an icon in the same column every other row uses —
+/// so reasoning lines up with tool calls and narration instead of sitting flush at the margin.
 struct ThinkingBlockView: View {
     let text: String
     let streaming: Bool
 
     var body: some View {
-        MarkdownBlockView(
-            text: text,
-            streaming: streaming,
-            size: PiFont.bodySize - 1,
-            fillWidth: true
-        )
-        .foregroundStyle(.secondary)
-        .textSelection(.enabled)
+        PiGridRow(symbol: "ellipsis.bubble") {
+            MarkdownBlockView(
+                text: text,
+                streaming: streaming,
+                size: PiFont.rowDetail,
+                fillWidth: true
+            )
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Thinking")
     }
@@ -120,10 +152,16 @@ struct TranscriptWorkView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
             Button { userExpanded = !isOpen } label: {
-                HStack(spacing: PiTheme.space6) {
-                    if block.isActive { ProgressView().controlSize(.mini) }
+                HStack(spacing: PiTheme.gridGutter) {
+                    // The icon column is always reserved — spinner while live, empty once
+                    // settled — so the headline's text starts at the exact same origin as every
+                    // row inside the log below it, active or not.
+                    Group {
+                        if block.isActive { ProgressView().controlSize(.mini) }
+                    }
+                    .frame(width: PiTheme.gridIconColumn, alignment: .center)
                     headline
-                    if block.hasFailure, !isOpen {
+                    if block.answerFailed, !isOpen {
                         Text("· failed").font(PiFont.caption).foregroundStyle(Color.piRed)
                     }
                     Image(systemName: "chevron.right")
@@ -199,9 +237,11 @@ private struct WorkNoteView: View {
 
     var body: some View {
         if message.role == .assistant {
-            MarkdownBlockView(text: message.textContent, size: PiFont.bodySize - 1)
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("Pi narration")
+            PiGridRow(symbol: "text.bubble") {
+                MarkdownBlockView(text: message.textContent, size: PiFont.rowDetail)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("Pi narration")
         } else {
             MessageView(message: message, isStreaming: false, onImage: onImage)
         }
@@ -243,7 +283,7 @@ struct CompactionRowView: View {
             .disabled(note.summary.isEmpty)
 
             if expanded, !note.summary.isEmpty {
-                MarkdownBlockView(text: note.summary, size: PiFont.bodySize - 1)
+                MarkdownBlockView(text: note.summary, size: PiFont.rowDetail)
                     .foregroundStyle(.secondary)
                     .padding(PiTheme.space10)
                     .piInset()
@@ -252,6 +292,29 @@ struct CompactionRowView: View {
         .padding(.vertical, PiTheme.space4)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(note.title)
+    }
+}
+
+/// The last user message's hover action: loads its text (and images) back into the composer for
+/// editing and resubmission, mirroring the answer's copy action one-for-one in placement and
+/// visual weight.
+private struct UserMessageActionRow: View {
+    let onEdit: () -> Void
+
+    var body: some View {
+        HStack(spacing: PiTheme.space8) {
+            Spacer(minLength: 0)
+            Button(action: onEdit) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 20, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Edit and resubmit")
+            .accessibilityLabel("Edit and resubmit this message")
+        }
     }
 }
 
@@ -302,6 +365,9 @@ private struct DisclosureRow<Detail: View>: View {
     var trailing: String?
     var symbolTint: Color = .secondary
     var showsProgress = false
+    /// A web/browser step's target site, shown as a small favicon right after the title — the
+    /// same treatment Codex gives a link reference. `nil` for every non-web row.
+    var favicon: URL?
     /// When this flips true, a disclosure that opened while work was live settles closed.
     var collapseSignal = false
     @ViewBuilder var detail: () -> Detail
@@ -316,6 +382,7 @@ private struct DisclosureRow<Detail: View>: View {
         trailing: String? = nil,
         symbolTint: Color = .secondary,
         showsProgress: Bool = false,
+        favicon: URL? = nil,
         initiallyExpanded: Bool = false,
         collapseSignal: Bool = false,
         @ViewBuilder detail: @escaping () -> Detail
@@ -326,6 +393,7 @@ private struct DisclosureRow<Detail: View>: View {
         self.trailing = trailing
         self.symbolTint = symbolTint
         self.showsProgress = showsProgress
+        self.favicon = favicon
         self.collapseSignal = collapseSignal
         self.detail = detail
         _expanded = State(initialValue: initiallyExpanded)
@@ -349,6 +417,9 @@ private struct DisclosureRow<Detail: View>: View {
                         .font(PiFont.caption)
                         .foregroundStyle(titleTint)
                         .lineLimit(1)
+                    if let favicon {
+                        FaviconView(url: favicon, size: 12)
+                    }
                     if let trailing {
                         Text(trailing)
                             .font(PiFont.caption)
@@ -373,6 +444,27 @@ private struct DisclosureRow<Detail: View>: View {
         .onChange(of: collapseSignal) { _, shouldCollapse in
             if shouldCollapse { expanded = false }
         }
+    }
+}
+
+/// Expanded tool call/result payload: plain monospaced text sitting directly in the flow at the
+/// shared text origin. Earlier this reused `CodeBlockView`, which put every argument/result on a
+/// recessed `piInset` card — fine for a fenced code block in an answer, but it made routine tool
+/// detail read like a block quote nested inside the already-indented disclosure row. This has no
+/// card, no tint, and wraps instead of scrolling, so it just sits there. Content itself is still
+/// bounded/truncated upstream (`prettyPrinted(maxLength:)`, `SessionParser`'s own caps), which is
+/// unchanged by this view.
+private struct ToolDetailText: View {
+    let code: String
+
+    var body: some View {
+        Text(code)
+            .font(PiFont.code)
+            .foregroundStyle(.secondary)
+            .lineSpacing(PiFont.codeLineSpacing)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -423,6 +515,7 @@ private struct ToolActivityStepRow: View {
             trailing: step.failed ? "failed" : (step.complete ? nil : (isLive ? "running" : "no result")),
             symbolTint: step.failed ? Color.piRed : .secondary,
             showsProgress: !step.complete && isLive,
+            favicon: WebActivityLink.url(for: step),
             initiallyExpanded: step.failed
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
@@ -430,14 +523,14 @@ private struct ToolActivityStepRow: View {
                     QuestionnaireCallSummary(arguments: step.arguments)
                 } else if step.arguments != .object([:]) {
                     Text("Arguments").font(PiFont.micro).foregroundStyle(.tertiary)
-                    CodeBlockView(language: nil, code: step.arguments.prettyPrinted(maxLength: 8_000))
+                    ToolDetailText(code: step.arguments.prettyPrinted(maxLength: 8_000))
                 }
                 if let result = step.result {
                     Text("Result").font(PiFont.micro).foregroundStyle(.tertiary)
                     ForEach(result.blocks) { block in
                         switch block.kind {
                         case let .text(text):
-                            if !text.isEmpty { CodeBlockView(language: nil, code: text) }
+                            if !text.isEmpty { ToolDetailText(code: text) }
                         case let .image(image):
                             ConversationImage(image: image, onOpen: { onImage(image) })
                         default:
@@ -479,7 +572,7 @@ private struct ToolCallRow: View {
             if call.name == "ask_user_question" {
                 QuestionnaireCallSummary(arguments: call.arguments)
             } else {
-                CodeBlockView(language: nil, code: call.arguments.prettyPrinted(maxLength: 8_000))
+                ToolDetailText(code: call.arguments.prettyPrinted(maxLength: 8_000))
             }
         }
     }
@@ -539,7 +632,7 @@ private struct ToolResultRow: View {
                 ForEach(message.blocks) { block in
                     switch block.kind {
                     case let .text(text):
-                        if !text.isEmpty { CodeBlockView(language: nil, code: text) }
+                        if !text.isEmpty { ToolDetailText(code: text) }
                     case let .image(image):
                         ConversationImage(image: image, onOpen: { onImage(image) })
                     default: EmptyView()
@@ -567,7 +660,7 @@ private struct CustomMessageRow: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if !message.textContent.isEmpty {
-                    MarkdownBlockView(text: message.textContent, size: PiFont.bodySize - 1)
+                    MarkdownBlockView(text: message.textContent, size: PiFont.rowDetail)
                         .foregroundStyle(.secondary)
                 }
                 ForEach(message.images) { image in
@@ -584,7 +677,7 @@ private struct SystemMessageRow: View {
     var body: some View {
         DisclosureRow(symbol: "text.append", title: title) {
             Text(detail)
-                .font(PiFont.caption)
+                .font(.system(size: PiFont.rowDetail))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)

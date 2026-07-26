@@ -9,6 +9,9 @@ struct ComposerView: View {
     var isStreaming: Bool
     var placeholder = "Ask Pi anything…"
     var autofocus = false
+    /// Bumped by the parent whenever content is programmatically loaded into the composer (the
+    /// edit-and-resubmit affordance) so focus follows it back to the text view.
+    var focusSignal = 0
     var onSend: () -> Void
     var onSteer: (() -> Void)?
     var onFollowUp: (() -> Void)?
@@ -58,6 +61,7 @@ struct ComposerView: View {
                 .stroke(Color.piHairline, lineWidth: PiTheme.hairline)
         }
         .task(id: optionsContextID) { store.prepareComposerOptions() }
+        .onChange(of: focusSignal) { _, _ in bridge.focus?() }
     }
 
     private var optionsContextID: String {

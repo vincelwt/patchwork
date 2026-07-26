@@ -94,12 +94,19 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     var isActive: Bool
     var startedAt: Date?
     var endedAt: Date?
+    /// True only when the turn's own answer failed (an error/aborted assistant message) — never
+    /// merely because some tool call inside the log failed. A failed grep or a retried command
+    /// is routine mid-turn noise; the collapsed header should only alarm the user when the
+    /// response itself did not come back.
+    var answerFailed = false
 
     var activities: [TranscriptActivityGroup] {
         entries.compactMap { if case let .activity(group) = $0 { return group } else { return nil } }
     }
 
     var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }
+    /// At least one tool step failed somewhere in the log. Individual steps still show red where
+    /// they are, but this alone must never drive the collapsed header's "· failed" label.
     var hasFailure: Bool { activities.contains(where: \.hasFailure) }
 
     var duration: TimeInterval? {
@@ -214,6 +221,9 @@ private struct TurnBuilder {
     private var turnStart: Date?
     private var lastTimestamp: Date?
     private var turnIndex = 0
+    /// The last assistant message's error state seen so far this turn — overwritten, not OR'd,
+    /// so a transient error Pi auto-retried past does not leave the settled turn flagged failed.
+    private var turnAnswerFailed = false
 
     init(isLive: Bool) { self.isLive = isLive }
 
@@ -252,6 +262,7 @@ private struct TurnBuilder {
         // Blocks are handled in order, so narration that precedes a tool call stays above it in
         // the work log instead of being reordered after it.
         var prose: [MessageBlock] = []
+        turnAnswerFailed = message.isError
 
         func proseMessage() -> ChatMessage? {
             let hasContent = prose.contains { block in
@@ -371,12 +382,14 @@ private struct TurnBuilder {
                 entries: entries,
                 isActive: active,
                 startedAt: turnStart,
-                endedAt: lastTimestamp
+                endedAt: lastTimestamp,
+                answerFailed: turnAnswerFailed
             )))
         }
         result.append(contentsOf: trailing)
         entries.removeAll(keepingCapacity: true)
         trailing.removeAll(keepingCapacity: true)
         turnIndex += 1
+        turnAnswerFailed = false
     }
 }

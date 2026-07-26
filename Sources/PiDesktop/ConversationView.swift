@@ -1,10 +1,20 @@
 import AppKit
 import SwiftUI
 
+/// The toolbar title pill's own bound, distinct from the transcript/composer measure — it shares
+/// a toolbar with window traffic lights and the inspector toggle, so it needs a cap well short of
+/// `PiTheme.transcriptMaxWidth`.
+extension PiTheme {
+    static let conversationTitlePillMaxWidth: CGFloat = 280
+}
+
 struct ConversationView: View {
     @EnvironmentObject private var store: AppStore
     @State private var renamePresented = false
     @State private var renameValue = ""
+    /// Bumped whenever the last message's edit affordance fires, so the composer (which owns the
+    /// actual `NSTextView`) knows to reclaim first responder after its content is replaced.
+    @State private var composerFocusTick = 0
 
     var body: some View {
         GeometryReader { proxy in
@@ -53,12 +63,23 @@ struct ConversationView: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PiTheme.space6) {
                     if let error = store.runtimeState.lastError, store.isSelectedRuntime { InlineError(text: error) }
+                    if store.isEditingLastMessage {
+                        EditingMessageBanner {
+                            store.cancelEditingLastMessage()
+                            store.draft = ""
+                            store.attachments = []
+                        }
+                    }
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
                         text: $store.draft,
                         attachments: $store.attachments,
                         isStreaming: store.isSelectedRuntime && store.runtimeState.isStreaming,
-                        onSend: { store.submitDraft(delivery: .automatic) },
+                        focusSignal: composerFocusTick,
+                        onSend: {
+                            if store.isEditingLastMessage { store.resubmitEditedMessage() }
+                            else { store.submitDraft(delivery: .automatic) }
+                        },
                         onSteer: { store.submitDraft(delivery: .steer) },
                         onFollowUp: { store.submitDraft(delivery: .followUp) },
                         onAbort: store.abort
@@ -84,6 +105,10 @@ struct ConversationView: View {
     @ToolbarContentBuilder
     private var conversationToolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) {
+            // Explicit padding, a bounded width with truncation, and a `.contentShape` matching
+            // the pill's own drawn bounds — the bare `HStack` this replaced had none of the
+            // three, so it rendered flush against its own content and could clip inside the
+            // toolbar's centered principal item.
             HStack(spacing: PiTheme.space6) {
                 Image(systemName: "folder")
                     .font(.system(size: 10))
@@ -91,6 +116,7 @@ struct ConversationView: View {
                 Text(store.selectedSession?.displayName ?? "Conversation")
                     .font(PiFont.rowEmphasis)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 if let session = store.selectedSession, store.isRunning(session) {
                     ProgressView().controlSize(.mini)
                 }
@@ -120,6 +146,11 @@ struct ConversationView: View {
                 .menuIndicator(.hidden)
                 .frame(width: 16)
             }
+            .padding(.horizontal, PiTheme.space10)
+            .padding(.vertical, PiTheme.space4)
+            .frame(maxWidth: PiTheme.conversationTitlePillMaxWidth, alignment: .leading)
+            .background(Color.piInset, in: Capsule())
+            .contentShape(Capsule())
             .help(store.selectedSession?.cwd.path ?? "Conversation actions")
         }
 
@@ -156,7 +187,11 @@ struct ConversationView: View {
             MessageScrollView(
                 messages: store.messages,
                 streaming: store.streamingMessage,
-                isRunning: conversationIsRunning
+                isRunning: conversationIsRunning,
+                onEditLastMessage: {
+                    store.beginEditingLastMessage()
+                    composerFocusTick += 1
+                }
             )
         }
     }
@@ -168,6 +203,9 @@ private struct MessageScrollView: View {
     let streaming: ChatMessage?
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
+    /// Wired only to the conversation's single most recent user message; every earlier turn's
+    /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
+    var onEditLastMessage: (() -> Void)?
     @State private var scrollTask: Task<Void, Never>?
     /// Tracked by a bottom sentinel appearing/disappearing, which works on macOS 14 without
     /// scroll-position APIs. Auto-scroll only happens while the user is pinned at the bottom.
@@ -182,6 +220,8 @@ private struct MessageScrollView: View {
         )
     }
 
+    private var lastUserMessageID: String? { messages.last(where: { $0.role == .user })?.id }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView {
@@ -195,7 +235,8 @@ private struct MessageScrollView: View {
                                 message: message,
                                 isStreaming: isStreaming,
                                 onImage: store.showImage,
-                                showsActions: true
+                                showsActions: true,
+                                onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
                             )
                             .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
                                 .id(item.id)
@@ -309,6 +350,32 @@ struct ExtensionWidgetStrip: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Extension widgets \(placement == .aboveEditor ? "above" : "below") the composer")
         }
+    }
+}
+
+/// Shown above the composer while an edit is armed, so it is obvious the next Send replaces the
+/// last turn instead of starting a new one, with an explicit way out.
+private struct EditingMessageBanner: View {
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: PiTheme.space8) {
+            Image(systemName: "pencil")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("Editing your last message")
+                .font(PiFont.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: PiTheme.space8)
+            Button("Cancel", action: onCancel)
+                .buttonStyle(.plain)
+                .font(PiFont.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, PiTheme.space10)
+        .padding(.vertical, PiTheme.space6)
+        .background(Color.piInset, in: RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 }
 

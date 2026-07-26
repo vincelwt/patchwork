@@ -89,6 +89,53 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(group.steps.first?.result?.textContent, "permission denied")
     }
 
+    // MARK: - "failed" reflects the turn's answer, not any one step
+
+    func testHeaderHidesFailedWhenOnlyAToolStepFailedButTheAnswerSucceeded() throws {
+        let messages = [
+            user(id: "u", text: "try", at: nil),
+            assistant(id: "a1", blocks: [call("c1", "grep", ["pattern": .string("TODO")])]),
+            result(id: "r1", callID: "c1", text: "no matches", failed: true),
+            assistant(id: "a2", blocks: [text("Nothing found, but that's fine.")])
+        ]
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertTrue(block.hasFailure, "A failed step is still tracked for the in-log red styling")
+        XCTAssertFalse(block.answerFailed, "A successful answer must not flag the collapsed header failed")
+    }
+
+    func testHeaderShowsFailedWhenTheFinalAnswerErrored() throws {
+        var errorMessage = assistant(id: "a2", blocks: [text("Something went wrong.")])
+        errorMessage.isError = true
+        let messages = [
+            user(id: "u", text: "try", at: nil),
+            assistant(id: "a1", blocks: [call("c1", "bash", ["command": .string("swift build")])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            errorMessage
+        ]
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertFalse(block.hasFailure, "No individual step failed")
+        XCTAssertTrue(block.answerFailed, "The turn's own answer failed")
+    }
+
+    func testEarlierErrorThatPiRecoveredFromDoesNotFlagTheSettledTurn() throws {
+        // A turn where an assistant message errored but a *later* assistant message in the same
+        // turn (e.g. after an internal retry) went on to answer normally must not be flagged.
+        var recovered = assistant(id: "a1", blocks: [text("transient hiccup")])
+        recovered.isError = true
+        let messages = [
+            user(id: "u", text: "try", at: nil),
+            recovered,
+            assistant(id: "a2", blocks: [call("c1", "bash", ["command": .string("swift build")])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            assistant(id: "a3", blocks: [text("All good now.")])
+        ]
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertFalse(block.answerFailed, "The turn's final answer is what matters, not an earlier retried error")
+    }
+
     func testCompactionIsShownAsItsOwnTranscriptEvent() throws {
         let compaction = ChatMessage(
             id: "compaction-1",
