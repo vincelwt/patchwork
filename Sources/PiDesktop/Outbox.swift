@@ -60,6 +60,77 @@ enum OutboxPolicy {
     }
 }
 
+/// What the strip above the composer actually shows. Every entry the app is holding is listed
+/// as editable (its text can change, its delivery kind can change, and it can be withdrawn);
+/// whatever Pi itself already reports as queued (`queue_update`, possibly from another client)
+/// is listed too, so nothing queued anywhere is hidden, but strictly read-only — Pi's RPC has no
+/// command to change or cancel something it has already accepted.
+enum OutboxPresentation {
+    struct Row: Identifiable, Hashable {
+        enum Source: Hashable {
+            case app(OutboxEntry)
+            case runtime(Int)
+        }
+
+        let source: Source
+        let delivery: OutboxEntry.Delivery
+        let text: String
+        let attachmentCount: Int
+
+        var id: String {
+            switch source {
+            case let .app(entry): "app-\(entry.id.uuidString)"
+            case let .runtime(index): "runtime-\(delivery.rawValue)-\(index)"
+            }
+        }
+
+        /// Only an app-held entry can be edited or withdrawn from the strip.
+        var isEditable: Bool {
+            if case .app = source { true } else { false }
+        }
+
+        /// The full entry backing an app-held row (attachments, exact text) — nil for anything
+        /// reported by the runtime, which never carries attachments of its own here.
+        var entry: OutboxEntry? {
+            if case let .app(entry) = source { entry } else { nil }
+        }
+    }
+
+    /// The strip must be entirely absent, not merely empty, when there is nothing queued
+    /// anywhere — checked separately from `rows` so the view can skip building rows at all.
+    ///
+    /// `outbox` and `runtimeState`'s queues both live on `AppStore` itself, not per conversation,
+    /// because only one runtime is ever attached at a time. `isSelectedRuntime` is how every
+    /// other runtime-derived control in the composer (see `QueueMenu` in `ComposerView.swift`)
+    /// already avoids showing conversation A's live state while conversation B is on screen —
+    /// without it, switching away from a busy conversation would leak its queued messages (and
+    /// let you "remove" one that is not actually queued against what you are looking at).
+    static func isEmpty(
+        outbox: [OutboxEntry],
+        steeringQueue: [String],
+        followUpQueue: [String],
+        isSelectedRuntime: Bool
+    ) -> Bool {
+        guard isSelectedRuntime else { return true }
+        return outbox.isEmpty && steeringQueue.isEmpty && followUpQueue.isEmpty
+    }
+
+    /// Pi's own queue first — it is already committed on Pi's side — then the app's outbox in
+    /// the order it will flush (oldest queued first, matching `OutboxPolicy.due`).
+    static func rows(
+        outbox: [OutboxEntry],
+        steeringQueue: [String],
+        followUpQueue: [String],
+        isSelectedRuntime: Bool
+    ) -> [Row] {
+        guard isSelectedRuntime else { return [] }
+        var rows = steeringQueue.enumerated().map { Row(source: .runtime($0), delivery: .steer, text: $1, attachmentCount: 0) }
+        rows += followUpQueue.enumerated().map { Row(source: .runtime($0), delivery: .followUp, text: $1, attachmentCount: 0) }
+        rows += outbox.map { Row(source: .app($0), delivery: $0.delivery, text: $0.text, attachmentCount: $0.attachments.count) }
+        return rows
+    }
+}
+
 @MainActor
 extension AppStore {
     /// Queues a message locally instead of handing it to Pi immediately.

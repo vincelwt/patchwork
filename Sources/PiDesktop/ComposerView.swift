@@ -2,6 +2,25 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Whether a composer submission can reach Pi directly, or has to wait in the outbox because Pi
+/// is mid-turn and its RPC has no way to edit or withdraw something already sent. An armed
+/// edit-and-resubmit (`isEditingLastMessage`) always goes direct regardless of streaming state:
+/// it replaces the turn in place rather than queuing alongside it.
+enum ComposerSubmitRoute: Equatable {
+    case direct
+    case queue(OutboxEntry.Delivery)
+
+    static func decide(
+        intent: OutboxEntry.Delivery,
+        isStreaming: Bool,
+        isEditingLastMessage: Bool,
+        canSend: Bool
+    ) -> ComposerSubmitRoute {
+        guard canSend, isStreaming, !isEditingLastMessage else { return .direct }
+        return .queue(intent)
+    }
+}
+
 struct ComposerView: View {
     @EnvironmentObject private var store: AppStore
     @Binding var text: String
@@ -32,12 +51,14 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            OutboxStrip()
+
             NativeComposerTextView(
                 content: content,
                 bridge: bridge,
                 placeholder: placeholder,
                 autofocus: autofocus,
-                onSubmit: onSend,
+                onSubmit: handleSend,
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )
@@ -49,9 +70,9 @@ struct ComposerView: View {
                 isStreaming: isStreaming,
                 canSend: canSend,
                 onAttach: chooseImages,
-                onSend: onSend,
-                onSteer: onSteer,
-                onFollowUp: onFollowUp,
+                onSend: handleSend,
+                onSteer: onSteer.map { _ in handleSteer },
+                onFollowUp: onFollowUp.map { _ in handleFollowUp },
                 onAbort: onAbort
             )
         }
@@ -87,6 +108,40 @@ struct ComposerView: View {
         // Routed through the text view so the + button previews inline at the caret too.
         bridge.insertImages?(ImageImportService.attachments(from: panel.urls))
         bridge.focus?()
+    }
+
+    // MARK: - Outbox routing
+
+    /// The round "send" affordance always means "steer" once a turn is in progress (matching the
+    /// delivery `submitDraft(delivery: .automatic)` already picks), so it queues as steering.
+    private func handleSend() { route(intent: .steer, direct: onSend) }
+
+    private func handleSteer() {
+        guard let onSteer else { return }
+        route(intent: .steer, direct: onSteer)
+    }
+
+    private func handleFollowUp() {
+        guard let onFollowUp else { return }
+        route(intent: .followUp, direct: onFollowUp)
+    }
+
+    /// Pi's RPC has no command to edit or withdraw a message once it is sent, which is exactly
+    /// why a mid-turn submission is held in the outbox instead — see `Outbox.swift`.
+    private func route(intent: OutboxEntry.Delivery, direct: () -> Void) {
+        switch ComposerSubmitRoute.decide(
+            intent: intent,
+            isStreaming: isStreaming,
+            isEditingLastMessage: store.isEditingLastMessage,
+            canSend: canSend
+        ) {
+        case .direct:
+            direct()
+        case let .queue(delivery):
+            store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments)
+            text = ""
+            attachments = []
+        }
     }
 }
 
