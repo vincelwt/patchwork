@@ -146,6 +146,9 @@ final class AppStoreRollbackTests: XCTestCase {
                       "The notification names the other conversation")
         XCTAssertTrue(toast.text.contains("Pi crashed in A"))
         XCTAssertEqual(runtime.commandCount("prompt"), 1, "A failure must never resubmit the prompt")
+
+        store.selectSession(sessionA)
+        XCTAssertEqual(store.draft, "prompt for A", "The failed draft waits in its own conversation")
     }
 
     func testMessageAppearsBeforeRuntimeStartupFinishesAndSurvivesHistoryHydration() throws {
@@ -348,7 +351,7 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.draft, "first prompt of a new chat")
     }
 
-    func testSwitchingRuntimeClearsExtensionDialogsSoStaleIDsAreNeverAnswered() async throws {
+    func testSwitchingRuntimeParksExtensionDialogsWithTheirOwningConversation() async throws {
         let (store, runtime, sessionA, sessionB) = makeStore()
 
         store.selectSession(sessionA)
@@ -369,18 +372,21 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.activeDialog?.id, "dialog-2", "The queue advances after a response")
         XCTAssertEqual(runtime.uncorrelated.count, 1)
 
-        // Switching to a different session replaces the runtime; the queued dialog must go away
-        // rather than being answered into the replacement.
+        // B gets its own runtime. A's unanswered dialog is hidden, not answered through B.
         store.selectSession(sessionB)
-        runtime.sessionFile = sessionB.fileURL.path
-        runtime.sessionID = sessionB.id
         store.draft = "start B"
         store.submitDraft()
 
-        XCTAssertEqual(runtime.stopCount, 1, "Switching sessions replaces the runtime")
-        XCTAssertNil(store.activeDialog, "Old-runtime dialogs are cleared before switching")
+        XCTAssertEqual(runtime.stopCount, 0, "A stays alive while its dialog is waiting")
+        XCTAssertNil(store.activeDialog)
         store.respondToExtensionDialog(value: "should not be sent")
-        XCTAssertEqual(runtime.uncorrelated.count, 1, "A stale dialog ID must never reach the replacement")
+        XCTAssertEqual(runtime.uncorrelated.count, 1)
+
+        store.selectSession(sessionA)
+        store.prepareComposerOptions()
+        XCTAssertEqual(store.activeDialog?.id, "dialog-2")
+        store.respondToExtensionDialog(value: "answer-2")
+        XCTAssertEqual(runtime.uncorrelated.count, 2, "The answer returns to A's runtime")
     }
 
     func testRouteRuntimeStopsTheEphemeralStatusProbeBeforeStarting() {
@@ -461,6 +467,7 @@ final class AppStoreRollbackTests: XCTestCase {
             repository: FakeRepository(),
             gitService: FakeGitService(),
             runtime: runtime,
+            runtimeFactory: { FakeRuntime() },
             persistence: AppPersistence(baseURL: temporaryDirectory),
             activityPresenter: ActivityPresenter()
         )

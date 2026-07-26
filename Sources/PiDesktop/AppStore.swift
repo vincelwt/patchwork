@@ -47,6 +47,44 @@ private struct PendingUserTurn {
     let attachments: [ImageAttachment]
 }
 
+/// One independent Pi process plus the route-visible state that must follow it when the user
+/// switches conversations mid-turn. Idle processes are still reused; only live work is parked.
+private final class RuntimeSlot {
+    let id = UUID()
+    let runtime: PiRuntimeProtocol
+    var sessionPath: String?
+    var cwd: String?
+    var startedForNewChat = false
+    var state = RuntimeState()
+    var metrics = TokenMetrics()
+    var models: [AvailableModel] = []
+    var thinkingLevels = ["off"]
+    var optionsLoading = false
+    var capability: ToolCapability?
+    var questionnaire: QuestionnaireSession?
+    var statuses: [String: String] = [:]
+    var widgets: [String: ExtensionWidget] = [:]
+    var windowTitle = "Pi Desktop"
+    var dialogs: [ExtensionDialogRequest] = []
+    var outbox: [OutboxEntry] = []
+    var streamingMessage: ChatMessage?
+    var lastAssistantText: String?
+    var lastAssistantWasError = false
+    var pendingTurn: PendingUserTurn?
+    var outboxDispatches: Set<UUID> = []
+    var deferredEvents: [JSONValue] = []
+    var isReady = false
+    var isStarting = false
+    var readyWaiters: [(Result<RuntimeSlot, Error>) -> Void] = []
+
+    init(runtime: PiRuntimeProtocol) { self.runtime = runtime }
+}
+
+private enum RuntimeRouteKey: Hashable {
+    case session(String)
+    case newChat(String)
+}
+
 /// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
 /// bound across months of use. Recency is tracked purely in memory (never persisted itself);
 /// a dictionary loaded over the cap — e.g. from hand-edited state — is trimmed back into bounds
@@ -155,19 +193,32 @@ final class AppStore: ObservableObject {
     private let repository: SessionRepositoryProtocol
     private let gitService: GitStatusProviding
     /// Internal rather than private so focused extensions (the outbox, message editing) can
-    /// speak to the runtime without this file growing every feature that needs it.
-    let runtime: PiRuntimeProtocol
+    /// speak to whichever selected conversation owns the current runtime.
+    var runtime: PiRuntimeProtocol { activeRuntimeSlot.runtime }
     let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
+    private let runtimeFactory: () -> PiRuntimeProtocol
+    private var activeRuntimeSlot: RuntimeSlot
+    private var activePresentationDetached = false
+    private var parkedRuntimes: [RuntimeRouteKey: RuntimeSlot] = [:]
     /// Creates the short-lived `--no-session` runtime used only to refresh extension statuses.
     /// `nil` disables probing entirely (tests never spawn a process).
     private let probeRuntimeFactory: (() -> PiRuntimeProtocol)?
     private var bootstrapped = false
-    private var activeRuntimePath: String?
-    private var activeRuntimeCwd: String?
+    private var activeRuntimePath: String? {
+        get { activeRuntimeSlot.sessionPath }
+        set { activeRuntimeSlot.sessionPath = newValue }
+    }
+    private var activeRuntimeCwd: String? {
+        get { activeRuntimeSlot.cwd }
+        set { activeRuntimeSlot.cwd = newValue }
+    }
     /// Distinguishes a runtime intentionally opened for New Chat from an attached session in
     /// the same folder; otherwise a new prompt could accidentally resume the previous session.
-    private var activeRuntimeStartedForNewChat = false
+    private var activeRuntimeStartedForNewChat: Bool {
+        get { activeRuntimeSlot.startedForNewChat }
+        set { activeRuntimeSlot.startedForNewChat = newValue }
+    }
     private var gitRefreshTask: Task<Void, Never>?
     private var selectedGitTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
@@ -193,7 +244,10 @@ final class AppStore: ObservableObject {
     /// conversations finishing in another terminal.
     private var previousActivityStates: [String: SessionRunState] = [:]
     /// Set for the in-flight "prompt" of the currently attached turn; see `PendingUserTurn`.
-    private var activeTurnPrompt: PendingUserTurn?
+    private var activeTurnPrompt: PendingUserTurn? {
+        get { activeRuntimeSlot.pendingTurn }
+        set { activeRuntimeSlot.pendingTurn = newValue }
+    }
     /// Bounded in-memory transcript cache (Task 3): never persisted, purely a warm-start cache
     /// for the current app run.
     private let transcriptCache = TranscriptCache()
@@ -210,6 +264,7 @@ final class AppStore: ObservableObject {
         repository: SessionRepositoryProtocol = FileSessionRepository(),
         gitService: GitStatusProviding = GitService(),
         runtime: PiRuntimeProtocol = PiRPCClient(),
+        runtimeFactory: @escaping () -> PiRuntimeProtocol = { PiRPCClient() },
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
@@ -219,7 +274,8 @@ final class AppStore: ObservableObject {
     ) {
         self.repository = repository
         self.gitService = gitService
-        self.runtime = runtime
+        self.runtimeFactory = runtimeFactory
+        activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
         self.activityPresenter = activityPresenter
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
@@ -235,8 +291,7 @@ final class AppStore: ObservableObject {
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
 
-        runtime.onEvent = { [weak self] value in self?.handleRPCEvent(value) }
-        runtime.onExit = { [weak self] error in self?.handleRuntimeExit(error) }
+        bindRuntime(activeRuntimeSlot)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in self?.refreshSelectedGit() }
             .store(in: &appCancellables)
@@ -262,6 +317,169 @@ final class AppStore: ObservableObject {
             .store(in: &appCancellables)
     }
 
+    private func bindRuntime(_ slot: RuntimeSlot) {
+        slot.runtime.onEvent = { [weak self, weak slot] value in
+            guard let slot else { return }
+            self?.handleRPCEvent(value, from: slot)
+        }
+        slot.runtime.onExit = { [weak self, weak slot] error in
+            guard let slot else { return }
+            self?.handleRuntimeExit(error, from: slot)
+        }
+    }
+
+    private func runtimeKey(cwd: URL, sessionPath: URL?) -> RuntimeRouteKey {
+        if let sessionPath { return .session(sessionPath.standardizedFileURL.path) }
+        return .newChat(cwd.standardizedFileURL.path)
+    }
+
+    private func runtimeKey(for slot: RuntimeSlot) -> RuntimeRouteKey? {
+        if slot.startedForNewChat, let cwd = slot.cwd { return .newChat(cwd) }
+        if let path = slot.sessionPath { return .session(path) }
+        return nil
+    }
+
+    private func removeParkedReference(to slot: RuntimeSlot) {
+        parkedRuntimes = parkedRuntimes.filter { $0.value !== slot }
+    }
+
+    private func state(for slot: RuntimeSlot) -> RuntimeState {
+        slot === activeRuntimeSlot ? runtimeState : slot.state
+    }
+
+    private func updateState(for slot: RuntimeSlot, _ update: (inout RuntimeState) -> Void) {
+        if slot === activeRuntimeSlot {
+            update(&runtimeState)
+            slot.state = runtimeState
+        } else {
+            update(&slot.state)
+        }
+    }
+
+    func beginOutboxDispatch() -> (owner: UUID, dispatch: UUID) {
+        beginOutboxDispatch(for: activeRuntimeSlot)
+    }
+
+    private func beginOutboxDispatch(for slot: RuntimeSlot) -> (owner: UUID, dispatch: UUID) {
+        let dispatch = UUID()
+        slot.outboxDispatches.insert(dispatch)
+        return (slot.id, dispatch)
+    }
+
+    func finishOutboxDispatch(
+        owner: UUID,
+        dispatch: UUID,
+        delivery: OutboxEntry.Delivery,
+        result: Result<JSONValue, Error>
+    ) {
+        guard let slot = runtimeSlot(id: owner) else { return }
+        let error: String?
+        switch result {
+        case let .success(response): error = responseError(response)
+        case let .failure(value): error = value.localizedDescription
+        }
+        if delivery == .steer || error != nil { slot.outboxDispatches.remove(dispatch) }
+        guard let error else { return }
+        updateState(for: slot) { $0.lastError = "Queued message could not be delivered: \(error)" }
+        if slot !== activeRuntimeSlot, !slot.state.isBusy, slot.outbox.isEmpty,
+           slot.outboxDispatches.isEmpty, slot.dialogs.isEmpty, slot.deferredEvents.isEmpty {
+            retireBackgroundRuntime(slot)
+        }
+    }
+
+    private func runtimeSlot(id: UUID) -> RuntimeSlot? {
+        if activeRuntimeSlot.id == id { return activeRuntimeSlot }
+        return parkedRuntimes.values.first { $0.id == id }
+    }
+
+    private func saveActiveRuntimePresentation() {
+        guard !activePresentationDetached else { return }
+        let slot = activeRuntimeSlot
+        slot.state = runtimeState
+        slot.metrics = liveMetrics
+        slot.models = availableModels
+        slot.thinkingLevels = availableThinkingLevels
+        slot.optionsLoading = composerOptionsLoading
+        slot.capability = activeCapability
+        slot.questionnaire = pendingQuestionnaire
+        slot.statuses = extensionStatuses
+        slot.widgets = extensionWidgets
+        slot.windowTitle = windowTitle
+        slot.dialogs = dialogQueue
+        slot.outbox = outbox
+        slot.streamingMessage = streamingMessage
+        dialogTimeoutTask?.cancel()
+        dialogTimeoutTask = nil
+    }
+
+    private func restoreRuntimePresentation(_ slot: RuntimeSlot) {
+        activePresentationDetached = false
+        runtimeState = slot.state
+        liveMetrics = slot.metrics
+        availableModels = slot.models
+        availableThinkingLevels = slot.thinkingLevels
+        composerOptionsLoading = slot.optionsLoading
+        activeCapability = slot.capability
+        pendingQuestionnaire = slot.questionnaire
+        extensionStatuses = slot.statuses
+        extensionWidgets = slot.widgets
+        windowTitle = slot.windowTitle
+        dialogQueue = slot.dialogs
+        activeDialog = dialogQueue.first
+        outbox = slot.outbox
+        streamingMessage = slot.streamingMessage
+        if let activeDialog { startDialogTimeout(for: activeDialog) }
+
+        let deferred = slot.deferredEvents
+        slot.deferredEvents.removeAll(keepingCapacity: true)
+        for event in deferred { handleRPCEvent(event) }
+    }
+
+    private func detachActiveRuntimePresentation() {
+        guard activeRuntimeSlot.runtime.isRunning, !activePresentationDetached else { return }
+        saveActiveRuntimePresentation()
+        activePresentationDetached = true
+        clearExtensionDialogs()
+        liveMetrics = TokenMetrics()
+        availableModels.removeAll()
+        availableThinkingLevels = ["off"]
+        composerOptionsLoading = false
+        activeCapability = nil
+        extensionStatuses.removeAll()
+        extensionWidgets.removeAll()
+        windowTitle = "Pi Desktop"
+        outbox.removeAll()
+        streamingMessage = nil
+    }
+
+    private func shouldPark(_ slot: RuntimeSlot) -> Bool {
+        let presentation = state(for: slot)
+        let dialogs = slot === activeRuntimeSlot && !activePresentationDetached ? dialogQueue : slot.dialogs
+        let queued = slot === activeRuntimeSlot && !activePresentationDetached ? outbox : slot.outbox
+        return slot.runtime.isRunning && (slot.isStarting || presentation.isBusy || slot.pendingTurn != nil
+            || !dialogs.isEmpty || !queued.isEmpty || !slot.outboxDispatches.isEmpty)
+    }
+
+    private func activateRuntime(_ slot: RuntimeSlot) {
+        guard slot !== activeRuntimeSlot else {
+            restoreRuntimePresentation(slot)
+            return
+        }
+
+        let previous = activeRuntimeSlot
+        saveActiveRuntimePresentation()
+        if shouldPark(previous), let key = runtimeKey(for: previous) {
+            parkedRuntimes[key] = previous
+        } else {
+            previous.runtime.stop()
+            removeParkedReference(to: previous)
+        }
+
+        removeParkedReference(to: slot)
+        activeRuntimeSlot = slot
+        restoreRuntimePresentation(slot)
+    }
+
     /// Statuses persisted from the last live runtime or probe, shown dimmed when nothing is
     /// attached.
     private var cachedStatuses: [String: String] = [:]
@@ -283,7 +501,7 @@ final class AppStore: ObservableObject {
     private var isApplicationActive: Bool { isActiveOverride ?? NSApplication.shared.isActive }
 
     var isSelectedRuntime: Bool {
-        guard let selectedSession else { return false }
+        guard !activePresentationDetached, let selectedSession else { return false }
         return selectedSession.fileURL.standardizedFileURL.path == activeRuntimePath
     }
 
@@ -296,9 +514,13 @@ final class AppStore: ObservableObject {
         isSelectedRuntime && runtimeState.isConnected ? liveMetrics : (selectedSession?.metrics ?? TokenMetrics())
     }
 
-    var runningSessionID: String? {
-        guard runtimeState.isBusy, let activeRuntimePath else { return nil }
-        return sessions.first { $0.fileURL.standardizedFileURL.path == activeRuntimePath }?.id
+    private var runningRuntimePaths: Set<String> {
+        var paths: Set<String> = []
+        if runtimeState.isBusy, let activeRuntimePath { paths.insert(activeRuntimePath) }
+        for slot in parkedRuntimes.values where slot.state.isBusy {
+            if let path = slot.sessionPath { paths.insert(path) }
+        }
+        return paths
     }
 
     // MARK: - Cross-terminal activity
@@ -306,8 +528,9 @@ final class AppStore: ObservableObject {
     /// True when this session is working, whether it was started by this app or by any terminal.
     /// The app's own runtime state wins, then the file-based monitor.
     func isRunning(_ session: SessionSummary) -> Bool {
-        if runningSessionID == session.id { return true }
-        return activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.state == .running
+        let path = session.fileURL.standardizedFileURL.path
+        if runningRuntimePaths.contains(path) { return true }
+        return activityMonitor.activity(forPath: path)?.state == .running
     }
 
     /// The freshest modification time available: the monitor's live stat, else the summary.
@@ -480,6 +703,10 @@ final class AppStore: ObservableObject {
         parkCurrentDraft()
         flushDraftPersistence()
         cancelConversationLoad()
+        let newFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+        if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
+            detachActiveRuntimePresentation()
+        }
         route = .newChat
         // Automations is a detail page, not a route: standard navigation always leaves it.
         schedulesPresented = false
@@ -493,7 +720,7 @@ final class AppStore: ObservableObject {
         attachments = attachmentsByKey[Self.newChatDraftKey] ?? []
         // Release the previous conversation's decoded bitmaps promptly.
         DecodedImageCache.purge()
-        selectedFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+        selectedFolder = newFolder
         refreshSelectedGit()
     }
 
@@ -501,6 +728,8 @@ final class AppStore: ObservableObject {
         if let current = selectedSession, current.id != session.id { markRead(current) }
         parkCurrentDraft()
         cancelConversationLoad()
+        let targetKey = RuntimeRouteKey.session(session.fileURL.standardizedFileURL.path)
+        if runtimeKey(for: activeRuntimeSlot) != targetKey { detachActiveRuntimePresentation() }
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
         route = .session(session.id)
@@ -689,7 +918,11 @@ final class AppStore: ObservableObject {
     }
 
     func chooseFolder(_ url: URL) {
-        selectedFolder = url.standardizedFileURL
+        let folder = url.standardizedFileURL
+        if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(folder.path) {
+            detachActiveRuntimePresentation()
+        }
+        selectedFolder = folder
         persistence.rememberFolder(url)
         refreshSelectedGit()
     }
@@ -789,17 +1022,11 @@ final class AppStore: ObservableObject {
         else if let selectedFolder { cwd = selectedFolder; sessionPath = nil }
         else { showToast("Choose a working folder first", style: .warning); return }
 
-        if runtime.isRunning, runtimeState.isBusy,
-           activeRuntimePath != sessionPath?.standardizedFileURL.path {
-            showToast("Pi is working in another conversation. Finish or stop it first.", style: .warning)
-            return
-        }
-
         let sentText = draft
         let sentAttachments = attachments
         let origin = DraftOrigin(route: route, sessionPath: sessionPath?.standardizedFileURL.path)
         let optimisticID: String?
-        if delivery == .automatic, !runtimeState.isStreaming {
+        if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
             let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
             optimisticID = message.id
             messages.append(message)
@@ -811,9 +1038,10 @@ final class AppStore: ObservableObject {
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success:
+            case let .success(slot):
                 dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
-                                delivery: delivery, cwd: cwd, optimisticID: optimisticID)
+                                delivery: delivery, cwd: cwd, optimisticID: optimisticID,
+                                submissionOrigin: origin, slot: slot)
             case let .failure(error):
                 if let optimisticID { messages.removeAll { $0.id == optimisticID } }
                 let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
@@ -838,11 +1066,11 @@ final class AppStore: ObservableObject {
 
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             guard let self else { return }
-            if case let .failure(error) = result {
-                showToast(error.localizedDescription, style: .error)
+            guard case let .success(slot) = result else {
+                if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
                 return
             }
-            runtime.send(type: "prompt", payload: ["message": .string(clean)]) { [weak self] result in
+            slot.runtime.send(type: "prompt", payload: ["message": .string(clean)]) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case let .success(response):
@@ -880,7 +1108,7 @@ final class AppStore: ObservableObject {
 
     /// Only ever driven by an explicit hover: this must not spawn a Pi process on its own.
     func refreshLimits() {
-        guard runtime.isRunning else {
+        guard runtimeMatchesCurrentRoute else {
             LimitsReportStore.shared.fail("Open a conversation to load the full report")
             return
         }
@@ -950,7 +1178,7 @@ final class AppStore: ObservableObject {
     }
 
     func abort() {
-        guard runtime.isRunning, runtimeState.isStreaming else { return }
+        guard runtimeMatchesCurrentRoute, runtimeState.isStreaming else { return }
         runtime.send(type: "abort", payload: [:]) { [weak self] result in
             if case let .failure(error) = result { self?.showToast(error.localizedDescription, style: .error) }
         }
@@ -984,31 +1212,28 @@ final class AppStore: ObservableObject {
         let cwd = selectedSession?.cwd ?? selectedFolder
         guard let cwd else { return }
         let sessionPath = selectedSession?.fileURL
-        composerOptionsLoading = true
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             guard let self else { return }
-            guard case .success = result else {
-                composerOptionsLoading = false
-                return
-            }
+            guard case let .success(slot) = result, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             requestComposerOptions()
         }
     }
 
     func setModel(_ model: AvailableModel) {
         guard runtimeMatchesCurrentRoute else { return }
-        runtime.send(type: "set_model", payload: [
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: "set_model", payload: [
             "provider": .string(model.provider),
             "modelId": .string(model.modelID)
-        ]) { [weak self] result in
-            guard let self, runtimeMatchesCurrentRoute else { return }
+        ]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             switch result {
             case let .success(response) where responseError(response) == nil:
                 let value = response["data"]
                 runtimeState.modelID = value?["id"]?.stringValue ?? model.modelID
                 runtimeState.modelName = value?["name"]?.stringValue ?? model.name
                 runtimeState.provider = value?["provider"]?.stringValue ?? model.provider
-                refreshRuntimeStateAfterPickerChange()
+                refreshRuntimeStateAfterPickerChange(slot: slot)
             case let .success(response): showToast(responseError(response) ?? "Pi rejected the model.", style: .error)
             case let .failure(error): showToast(error.localizedDescription, style: .error)
             }
@@ -1017,8 +1242,9 @@ final class AppStore: ObservableObject {
 
     func setThinkingLevel(_ level: String) {
         guard runtimeMatchesCurrentRoute, availableThinkingLevels.contains(level) else { return }
-        runtime.send(type: "set_thinking_level", payload: ["level": .string(level)]) { [weak self] result in
-            guard let self, runtimeMatchesCurrentRoute else { return }
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: "set_thinking_level", payload: ["level": .string(level)]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             switch result {
             case let .success(response) where responseError(response) == nil:
                 runtimeState.thinkingLevel = level
@@ -1031,28 +1257,32 @@ final class AppStore: ObservableObject {
     // Kept for menu/status-bar compatibility; composer controls use the explicit RPC setters.
     func cycleModel() {
         guard runtimeMatchesCurrentRoute else { return }
-        runtime.send(type: "cycle_model", payload: [:]) { [weak self] result in
-            guard case let .success(response) = result, self?.responseError(response) == nil else { return }
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: "cycle_model", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute,
+                  case let .success(response) = result, responseError(response) == nil else { return }
             if let model = response["data"]?["model"] {
-                self?.runtimeState.modelID = model["id"]?.stringValue
-                self?.runtimeState.modelName = model["name"]?.stringValue
-                self?.runtimeState.provider = model["provider"]?.stringValue
+                runtimeState.modelID = model["id"]?.stringValue
+                runtimeState.modelName = model["name"]?.stringValue
+                runtimeState.provider = model["provider"]?.stringValue
             }
-            self?.runtimeState.thinkingLevel = response["data"]?["thinkingLevel"]?.stringValue ?? self?.runtimeState.thinkingLevel
-            self?.requestComposerOptions()
+            runtimeState.thinkingLevel = response["data"]?["thinkingLevel"]?.stringValue ?? runtimeState.thinkingLevel
+            requestComposerOptions(slot: slot)
         }
     }
 
     func cycleThinkingLevel() {
         guard runtimeMatchesCurrentRoute else { return }
-        runtime.send(type: "cycle_thinking_level", payload: [:]) { [weak self] result in
-            guard case let .success(response) = result, self?.responseError(response) == nil else { return }
-            self?.runtimeState.thinkingLevel = response["data"]?["level"]?.stringValue ?? self?.runtimeState.thinkingLevel
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: "cycle_thinking_level", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute,
+                  case let .success(response) = result, responseError(response) == nil else { return }
+            runtimeState.thinkingLevel = response["data"]?["level"]?.stringValue ?? runtimeState.thinkingLevel
         }
     }
 
     private var runtimeMatchesCurrentRoute: Bool {
-        guard runtime.isRunning else { return false }
+        guard !activePresentationDetached, runtime.isRunning else { return false }
         if let selectedSession {
             return activeRuntimePath == selectedSession.fileURL.standardizedFileURL.path
         }
@@ -1061,47 +1291,54 @@ final class AppStore: ObservableObject {
             && activeRuntimeCwd == selectedFolder.standardizedFileURL.path
     }
 
-    private func requestComposerOptions() {
-        guard runtimeMatchesCurrentRoute else { composerOptionsLoading = false; return }
+    private func requestComposerOptions(slot: RuntimeSlot? = nil) {
+        let slot = slot ?? activeRuntimeSlot
+        guard slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { composerOptionsLoading = false; return }
         composerOptionsLoading = true
-        runtime.send(type: "get_available_models", payload: [:]) { [weak self] result in
-            guard let self, runtimeMatchesCurrentRoute else { return }
+        slot.runtime.send(type: "get_available_models", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             if case let .success(response) = result, responseError(response) == nil {
                 availableModels = AvailableModel.parse(response["data"]?["models"])
+                slot.models = availableModels
             }
-            requestThinkingOptions()
+            requestThinkingOptions(slot: slot)
         }
     }
 
-    private func requestThinkingOptions() {
-        runtime.send(type: "get_available_thinking_levels", payload: [:]) { [weak self] result in
-            guard let self, runtimeMatchesCurrentRoute else { return }
+    private func requestThinkingOptions(slot: RuntimeSlot) {
+        slot.runtime.send(type: "get_available_thinking_levels", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             if case let .success(response) = result, responseError(response) == nil {
                 availableThinkingLevels = RuntimePickerState.thinkingLevels(from: response["data"]?["levels"])
                 runtimeState.thinkingLevel = RuntimePickerState.selectedThinkingLevel(
                     in: availableThinkingLevels,
                     current: runtimeState.thinkingLevel
                 )
+                slot.thinkingLevels = availableThinkingLevels
             }
             composerOptionsLoading = false
+            slot.optionsLoading = false
         }
     }
 
-    private func refreshRuntimeStateAfterPickerChange() {
-        runtime.send(type: "get_state", payload: [:]) { [weak self] result in
-            guard let self, runtimeMatchesCurrentRoute else { return }
-            if case let .success(response) = result, responseError(response) == nil { applyState(response["data"]) }
-            requestThinkingOptions()
+    private func refreshRuntimeStateAfterPickerChange(slot: RuntimeSlot) {
+        slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            if case let .success(response) = result, responseError(response) == nil { applyState(response["data"], to: slot) }
+            requestThinkingOptions(slot: slot)
         }
     }
 
     func setQueueMode(steering: Bool, mode: String) {
         guard isSelectedRuntime, ["all", "one-at-a-time"].contains(mode) else { return }
         let command = steering ? "set_steering_mode" : "set_follow_up_mode"
-        runtime.send(type: command, payload: ["mode": .string(mode)]) { [weak self] result in
-            guard let self else { return }
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: command, payload: ["mode": .string(mode)]) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
             if case let .success(response) = result, responseError(response) == nil {
-                if steering { runtimeState.steeringMode = mode } else { runtimeState.followUpMode = mode }
+                updateState(for: slot) { state in
+                    if steering { state.steeringMode = mode } else { state.followUpMode = mode }
+                }
             } else {
                 let message: String
                 if case let .failure(error) = result { message = error.localizedDescription }
@@ -1121,22 +1358,24 @@ final class AppStore: ObservableObject {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         let requestedPath = session.fileURL.standardizedFileURL.path
-        if runtimeState.isBusy {
-            let location = activeRuntimePath == requestedPath ? "this conversation" : "another conversation"
-            showToast("Pi is working in \(location). Rename when it becomes idle.", style: .warning)
+        let targetIsBusy = activeRuntimePath == requestedPath
+            ? runtimeState.isBusy
+            : parkedRuntimes[.session(requestedPath)]?.state.isBusy == true
+        if targetIsBusy {
+            showToast("Pi is working in this conversation. Rename when it becomes idle.", style: .warning)
             return
         }
         ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
             guard let self else { return }
-            guard case .success = result else {
+            guard case let .success(slot) = result else {
                 if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
                 return
             }
-            runtime.send(type: "set_session_name", payload: ["name": .string(clean)]) { [weak self] result in
+            slot.runtime.send(type: "set_session_name", payload: ["name": .string(clean)]) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case let .success(response) where responseError(response) == nil:
-                    runtimeState.sessionName = clean
+                    updateState(for: slot) { $0.sessionName = clean }
                     if let index = sessions.firstIndex(where: { $0.id == session.id }) {
                         sessions[index].name = clean
                         sessions[index].prepareSearchKey()
@@ -1310,76 +1549,125 @@ final class AppStore: ObservableObject {
         return sessions.contains { $0.cwd.standardizedFileURL.path == path }
     }
 
-    private func ensureRuntime(cwd: URL, sessionPath: URL?, completion: @escaping (Result<Void, Error>) -> Void) {
+    private func ensureRuntime(
+        cwd: URL,
+        sessionPath: URL?,
+        completion: @escaping (Result<RuntimeSlot, Error>) -> Void
+    ) {
         // The launch-time status probe is intentionally ephemeral. Never let it race a real
-        // route runtime: simultaneous Pi extension startup can delay the route's first get_state
-        // long enough to make model/thinking controls appear unavailable in GUI launches.
+        // route runtime: simultaneous Pi extension startup can delay the route's first get_state.
         if probeRuntime != nil { finishProbe() }
 
-        let requestedPath = sessionPath?.standardizedFileURL.path
-        let matches = runtime.isRunning && ((requestedPath != nil && activeRuntimePath == requestedPath) ||
-            (requestedPath == nil && activeRuntimeStartedForNewChat
-                && activeRuntimeCwd == cwd.standardizedFileURL.path))
-        if matches { completion(.success(())); return }
-        if runtimeState.isBusy { completion(.failure(PiRPCError.processExited("The current Pi run is still working."))); return }
+        let key = runtimeKey(cwd: cwd, sessionPath: sessionPath)
+        if let parked = parkedRuntimes[key] {
+            if parked.runtime.isRunning {
+                activateRuntime(parked)
+                if parked.isReady { completion(.success(parked)) }
+                else { parked.readyWaiters.append(completion) }
+                return
+            }
+            parkedRuntimes.removeValue(forKey: key)
+        }
 
-        clearExtensionDialogs()
-        if runtime.isRunning { runtime.stop() }
-        runtimeState = RuntimeState()
-        // A fresh attach means whatever the previous runtime was doing has fully ended one way
-        // or another; a stale pending turn from it must never be offered for retry here.
-        activeTurnPrompt = nil
-        liveMetrics = TokenMetrics()
-        availableModels.removeAll()
-        availableThinkingLevels = ["off"]
-        composerOptionsLoading = false
-        activeCapability = nil
-        extensionStatuses.removeAll()
-        extensionWidgets.removeAll()
-        activeRuntimePath = requestedPath
-        activeRuntimeCwd = cwd.standardizedFileURL.path
-        activeRuntimeStartedForNewChat = requestedPath == nil
-
-        do {
-            try runtime.start(cwd: cwd, sessionPath: sessionPath)
-            runtimeState.isConnected = true
-        } catch {
-            runtimeState.lastError = error.localizedDescription
-            activeRuntimePath = nil
-            activeRuntimeCwd = nil
-            activeRuntimeStartedForNewChat = false
-            completion(.failure(error))
+        if runtime.isRunning, runtimeKey(for: activeRuntimeSlot) == key {
+            if activePresentationDetached { restoreRuntimePresentation(activeRuntimeSlot) }
+            if activeRuntimeSlot.isReady { completion(.success(activeRuntimeSlot)) }
+            else { activeRuntimeSlot.readyWaiters.append(completion) }
             return
         }
 
-        runtime.send(type: "get_state", payload: [:]) { [weak self] result in
-            guard let self else { return }
+        let slot: RuntimeSlot
+        if shouldPark(activeRuntimeSlot) {
+            guard let currentKey = runtimeKey(for: activeRuntimeSlot) else {
+                completion(.failure(PiRPCError.processExited("Could not preserve the current Pi run.")))
+                return
+            }
+            saveActiveRuntimePresentation()
+            parkedRuntimes[currentKey] = activeRuntimeSlot
+            slot = RuntimeSlot(runtime: runtimeFactory())
+            bindRuntime(slot)
+            activeRuntimeSlot = slot
+        } else {
+            let reusableRuntime = activeRuntimeSlot.runtime
+            if reusableRuntime.isRunning { reusableRuntime.stop() }
+            removeParkedReference(to: activeRuntimeSlot)
+            slot = RuntimeSlot(runtime: reusableRuntime)
+            bindRuntime(slot)
+            activeRuntimeSlot = slot
+        }
+
+        clearExtensionDialogs()
+        slot.sessionPath = sessionPath?.standardizedFileURL.path
+        slot.cwd = cwd.standardizedFileURL.path
+        slot.startedForNewChat = sessionPath == nil
+        slot.state = RuntimeState()
+        slot.metrics = TokenMetrics()
+        slot.models.removeAll()
+        slot.thinkingLevels = ["off"]
+        slot.optionsLoading = false
+        slot.capability = nil
+        slot.questionnaire = nil
+        slot.statuses.removeAll()
+        slot.widgets.removeAll()
+        slot.windowTitle = "Pi Desktop"
+        slot.dialogs.removeAll()
+        slot.outbox.removeAll()
+        slot.streamingMessage = nil
+        slot.lastAssistantText = nil
+        slot.lastAssistantWasError = false
+        slot.pendingTurn = nil
+        slot.outboxDispatches.removeAll()
+        slot.deferredEvents.removeAll()
+        slot.isReady = false
+        slot.isStarting = true
+        slot.readyWaiters = [completion]
+        restoreRuntimePresentation(slot)
+
+        do {
+            try slot.runtime.start(cwd: cwd, sessionPath: sessionPath)
+            updateState(for: slot) { $0.isConnected = true }
+        } catch {
+            updateState(for: slot) { $0.lastError = error.localizedDescription }
+            finishRuntimeStart(slot, result: .failure(error))
+            return
+        }
+
+        slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
             switch result {
             case let .success(response):
                 if let error = responseError(response) {
-                    runtimeState.lastError = error
-                    runtimeState.isConnected = false
-                    runtime.stop()
-                    activeRuntimePath = nil
-                    activeRuntimeCwd = nil
-                    activeRuntimeStartedForNewChat = false
-                    completion(.failure(PiRPCError.processExited(error)))
+                    updateState(for: slot) { state in
+                        state.lastError = error
+                        state.isConnected = false
+                    }
+                    slot.runtime.stop()
+                    finishRuntimeStart(slot, result: .failure(PiRPCError.processExited(error)))
                     return
                 }
-                applyState(response["data"])
-                hydrateRuntimeConversationIfNeeded()
-                requestStats()
-                completion(.success(()))
+                applyState(response["data"], to: slot)
+                if slot === activeRuntimeSlot {
+                    hydrateRuntimeConversationIfNeeded()
+                    requestStats()
+                }
+                finishRuntimeStart(slot, result: .success(slot))
             case let .failure(error):
-                runtimeState.lastError = error.localizedDescription
-                runtimeState.isConnected = false
-                runtime.stop()
-                activeRuntimePath = nil
-                activeRuntimeCwd = nil
-                activeRuntimeStartedForNewChat = false
-                completion(.failure(error))
+                updateState(for: slot) { state in
+                    state.lastError = error.localizedDescription
+                    state.isConnected = false
+                }
+                slot.runtime.stop()
+                finishRuntimeStart(slot, result: .failure(error))
             }
         }
+    }
+
+    private func finishRuntimeStart(_ slot: RuntimeSlot, result: Result<RuntimeSlot, Error>) {
+        slot.isStarting = false
+        if case .success = result { slot.isReady = true }
+        let waiters = slot.readyWaiters
+        slot.readyWaiters.removeAll()
+        for waiter in waiters { waiter(result) }
     }
 
     private func dispatchMessage(
@@ -1388,33 +1676,31 @@ final class AppStore: ObservableObject {
         attachments sentAttachments: [ImageAttachment],
         delivery: DeliveryMode,
         cwd: URL,
-        optimisticID: String?
+        optimisticID: String?,
+        submissionOrigin: DraftOrigin,
+        slot: RuntimeSlot
     ) {
         let command: String
         switch delivery {
         case .steer: command = "steer"
         case .followUp: command = "follow_up"
-        case .automatic: command = runtimeState.isStreaming ? "steer" : "prompt"
+        case .automatic: command = state(for: slot).isStreaming ? "steer" : "prompt"
         }
 
-        ensureProvisionalSession(cwd: cwd, prompt: text)
-        // A new chat is promoted to a session route in place, and that is still the same
-        // composer, so the origin follows the promotion instead of being treated as a switch.
-        let origin = DraftOrigin(route: route, sessionPath: selectedSession?.fileURL.standardizedFileURL.path)
+        let promotedOrigin = ensureProvisionalSession(cwd: cwd, prompt: text, slot: slot)
+        let origin = promotedOrigin ?? submissionOrigin
         if command != "prompt", let optimisticID { messages.removeAll { $0.id == optimisticID } }
-        // The message that starts a turn is the one a crash mid-turn must be able to hand back
-        // for a one-click retry; see `PendingUserTurn` and `handleRuntimeExit`.
         if command == "prompt" {
-            activeTurnPrompt = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
+            slot.pendingTurn = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
         }
 
         var payload: [String: JSONValue] = ["message": .string(text)]
         if !sentAttachments.isEmpty { payload["images"] = .array(sentAttachments.map(\.rpcValue)) }
-        let wasStreaming = runtimeState.isStreaming
-        if command == "prompt" { runtimeState.isStreaming = true }
+        let wasStreaming = state(for: slot).isStreaming
+        if command == "prompt" { updateState(for: slot) { $0.isStreaming = true } }
 
-        runtime.send(type: command, payload: payload) { [weak self] result in
-            guard let self else { return }
+        slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
             let errorText: String?
             var isOutcomeUnknown = false
             switch result {
@@ -1428,18 +1714,20 @@ final class AppStore: ObservableObject {
                 if command == "follow_up" { showToast("Follow-up queued", style: .info) }
                 return
             }
-            // An unconfirmed side-effecting command may already have reached Pi. Rolling the
-            // draft back here would let the user resend and prompt Pi twice, so `activeTurnPrompt`
-            // (when this was the "prompt") is deliberately left set: only a later, definite signal
-            // — the turn settling, or the process actually exiting — ever resolves it from here on.
+            // An unconfirmed side-effecting command may already have reached Pi. Only settle or
+            // process exit can safely resolve it without risking a duplicate prompt.
             if isOutcomeUnknown {
                 showToast(errorText, style: .warning)
                 return
             }
-            if command == "prompt" { runtimeState.isStreaming = wasStreaming; activeTurnPrompt = nil }
+            if command == "prompt" {
+                updateState(for: slot) { $0.isStreaming = wasStreaming }
+                slot.pendingTurn = nil
+            }
             if let optimisticID { messages.removeAll { $0.id == optimisticID } }
             let restored = restoreDraft(text: originalDraft, attachments: sentAttachments, origin: origin)
             showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
+            if slot !== activeRuntimeSlot, !state(for: slot).isBusy { retireBackgroundRuntime(slot) }
         }
     }
 
@@ -1448,33 +1736,57 @@ final class AppStore: ObservableObject {
     @discardableResult
     private func restoreDraft(text: String, attachments sent: [ImageAttachment], origin: DraftOrigin) -> Bool {
         let currentPath = selectedSession?.fileURL.standardizedFileURL.path
-        guard DraftOrigin.shouldRestoreDraft(origin: origin, currentRoute: route, currentSessionPath: currentPath) else {
-            return false
+        if DraftOrigin.shouldRestoreDraft(origin: origin, currentRoute: route, currentSessionPath: currentPath) {
+            draft = DraftRecovery.restoredText(sent: text, current: draft)
+            attachments = DraftRecovery.restoredAttachments(sent: sent, current: attachments)
+            return true
         }
-        draft = DraftRecovery.restoredText(sent: text, current: draft)
-        attachments = DraftRecovery.restoredAttachments(sent: sent, current: attachments)
-        return true
+
+        let key = origin.sessionPath ?? Self.newChatDraftKey
+        persistDraftText(DraftRecovery.restoredText(sent: text, current: draftStore.text(for: key)), for: key)
+        let restoredAttachments = DraftRecovery.restoredAttachments(
+            sent: sent,
+            current: attachmentsByKey[key] ?? []
+        )
+        if restoredAttachments.isEmpty { attachmentsByKey.removeValue(forKey: key) }
+        else { attachmentsByKey[key] = restoredAttachments }
+        return false
     }
 
     private func failureMessage(_ error: String, restored: Bool, origin: DraftOrigin) -> String {
         restored ? error : "\(origin.conversationDescription.capitalizedFirst): \(error)"
     }
 
-    private func ensureProvisionalSession(cwd: URL, prompt: String) {
-        guard case .newChat = route, let sessionID = runtimeState.sessionID, let file = runtimeState.sessionFile else { return }
-        let url = URL(fileURLWithPath: file)
+    @discardableResult
+    private func ensureProvisionalSession(cwd: URL, prompt: String, slot: RuntimeSlot) -> DraftOrigin? {
+        let slotState = state(for: slot)
+        guard slot.startedForNewChat,
+              let sessionID = slotState.sessionID, !sessionID.isEmpty,
+              let file = slotState.sessionFile, !file.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: file).standardizedFileURL
+        let path = url.path
         let title = prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(74)
-        var provisional = SessionSummary(
-            id: sessionID, fileURL: url, cwd: cwd, createdAt: Date(), modifiedAt: Date(),
-            name: title.isEmpty ? "New conversation" : String(title), preview: prompt,
-            messageCount: 0, metrics: TokenMetrics()
-        )
-        provisional.prepareSearchKey()
-        sessions.insert(provisional, at: 0)
-        route = .session(sessionID)
-        activeRuntimePath = url.standardizedFileURL.path
-        activeRuntimeStartedForNewChat = false
-        activities = []
+        if !sessions.contains(where: { $0.fileURL.standardizedFileURL.path == path }) {
+            var provisional = SessionSummary(
+                id: sessionID, fileURL: url, cwd: cwd, createdAt: Date(), modifiedAt: Date(),
+                name: title.isEmpty ? "New conversation" : String(title), preview: prompt,
+                messageCount: 0, metrics: TokenMetrics()
+            )
+            provisional.prepareSearchKey()
+            sessions.insert(provisional, at: 0)
+            syncActivityMonitorPaths()
+        }
+
+        removeParkedReference(to: slot)
+        slot.sessionPath = path
+        slot.startedForNewChat = false
+        if slot !== activeRuntimeSlot { parkedRuntimes[.session(path)] = slot }
+
+        if slot === activeRuntimeSlot, case .newChat = route {
+            route = .session(sessionID)
+            activities = []
+        }
+        return DraftOrigin(route: .session(sessionID), sessionPath: path)
     }
 
     /// Async history loads must not erase a message already painted at Send time.
@@ -1495,17 +1807,20 @@ final class AppStore: ObservableObject {
 
     private func hydrateRuntimeConversationIfNeeded() {
         guard isSelectedRuntime else { return }
-        runtime.send(type: "get_messages", payload: [:]) { [weak self] result in
-            guard let self, case let .success(response) = result, responseError(response) == nil else { return }
+        let slot = activeRuntimeSlot
+        slot.runtime.send(type: "get_messages", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, isSelectedRuntime,
+                  case let .success(response) = result, responseError(response) == nil else { return }
             let loaded = SessionParser.chatMessages(fromRPCMessages: response["data"]?["messages"])
             if !loaded.isEmpty { replaceLoadedMessages(with: loaded) }
         }
     }
 
     private func requestStats() {
-        guard runtime.isRunning else { return }
-        runtime.send(type: "get_session_stats", payload: [:]) { [weak self] result in
-            guard let self, case let .success(response) = result, responseError(response) == nil,
+        let slot = activeRuntimeSlot
+        guard slot.runtime.isRunning else { return }
+        slot.runtime.send(type: "get_session_stats", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, case let .success(response) = result, responseError(response) == nil,
                   let data = response["data"] else { return }
             var metrics = TokenMetrics()
             let tokens = data["tokens"]
@@ -1517,28 +1832,222 @@ final class AppStore: ObservableObject {
             metrics.contextTokens = data["contextUsage"]?["tokens"]?.intValue
             metrics.contextWindow = data["contextUsage"]?["contextWindow"]?.intValue
             metrics.contextPercent = data["contextUsage"]?["percent"]?.doubleValue
-            metrics.latestCacheHitPercent = liveMetrics.latestCacheHitPercent
-            liveMetrics = metrics
+            metrics.latestCacheHitPercent = slot === activeRuntimeSlot
+                ? liveMetrics.latestCacheHitPercent
+                : slot.metrics.latestCacheHitPercent
+            slot.metrics = metrics
+            if slot === activeRuntimeSlot { liveMetrics = metrics }
         }
     }
 
-    private func applyState(_ data: JSONValue?) {
+    private func applyState(_ data: JSONValue?, to target: RuntimeSlot? = nil) {
         guard let data else { return }
-        runtimeState.isConnected = true
-        runtimeState.isStreaming = data["isStreaming"]?.boolValue ?? false
-        runtimeState.isCompacting = data["isCompacting"]?.boolValue ?? false
-        runtimeState.thinkingLevel = data["thinkingLevel"]?.stringValue
-        runtimeState.sessionFile = data["sessionFile"]?.stringValue
-        runtimeState.sessionID = data["sessionId"]?.stringValue
-        runtimeState.sessionName = data["sessionName"]?.stringValue
-        runtimeState.modelID = data["model"]?["id"]?.stringValue
-        runtimeState.modelName = data["model"]?["name"]?.stringValue
-        runtimeState.provider = data["model"]?["provider"]?.stringValue
-        runtimeState.steeringMode = data["steeringMode"]?.stringValue ?? runtimeState.steeringMode
-        runtimeState.followUpMode = data["followUpMode"]?.stringValue ?? runtimeState.followUpMode
-        runtimeState.steeringQueue = queueStrings(data["steeringQueue"] ?? data["steering"])
-        runtimeState.followUpQueue = queueStrings(data["followUpQueue"] ?? data["followUp"])
-        if let path = runtimeState.sessionFile { activeRuntimePath = URL(fileURLWithPath: path).standardizedFileURL.path }
+        let slot = target ?? activeRuntimeSlot
+        updateState(for: slot) { state in
+            state.isConnected = true
+            state.isStreaming = data["isStreaming"]?.boolValue ?? false
+            state.isCompacting = data["isCompacting"]?.boolValue ?? false
+            state.thinkingLevel = data["thinkingLevel"]?.stringValue
+            state.sessionFile = data["sessionFile"]?.stringValue
+            state.sessionID = data["sessionId"]?.stringValue
+            state.sessionName = data["sessionName"]?.stringValue
+            state.modelID = data["model"]?["id"]?.stringValue
+            state.modelName = data["model"]?["name"]?.stringValue
+            state.provider = data["model"]?["provider"]?.stringValue
+            state.steeringMode = data["steeringMode"]?.stringValue ?? state.steeringMode
+            state.followUpMode = data["followUpMode"]?.stringValue ?? state.followUpMode
+            state.steeringQueue = queueStrings(data["steeringQueue"] ?? data["steering"])
+            state.followUpQueue = queueStrings(data["followUpQueue"] ?? data["followUp"])
+        }
+        if let path = state(for: slot).sessionFile, !path.isEmpty {
+            slot.sessionPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        }
+    }
+
+    private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
+        if slot === activeRuntimeSlot, !activePresentationDetached {
+            handleRPCEvent(event)
+        } else {
+            handleBackgroundRPCEvent(event, slot: slot)
+        }
+    }
+
+    private func handleBackgroundRPCEvent(_ event: JSONValue, slot: RuntimeSlot) {
+        let type = event["type"]?.stringValue ?? "unknown"
+        switch type {
+        case "agent_start":
+            slot.outboxDispatches.removeAll()
+            updateState(for: slot) { $0.isStreaming = true }
+        case "agent_settled":
+            updateState(for: slot) { state in
+                state.isStreaming = false
+                state.isRetrying = false
+            }
+            slot.capability = nil
+            slot.questionnaire = nil
+            slot.streamingMessage = nil
+            slot.pendingTurn = nil
+            let startedFollowUp = flushBackgroundOutbox(.followUp, slot: slot)
+            let session = session(for: slot)
+            notify(
+                slot.lastAssistantWasError ? .turnFailed : .turnFinished,
+                session: session,
+                preview: slot.lastAssistantText
+            )
+            if let session { Task { await self.refreshSummary(for: session) } }
+            if !startedFollowUp, slot.outbox.isEmpty, slot.outboxDispatches.isEmpty,
+               slot.dialogs.isEmpty, slot.deferredEvents.isEmpty {
+                retireBackgroundRuntime(slot)
+            }
+        case "message_update":
+            if let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
+                slot.streamingMessage = parsed
+            }
+        case "message_end":
+            slot.streamingMessage = nil
+            if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw),
+               parsed.role == .assistant {
+                slot.lastAssistantText = String(parsed.textContent.prefix(4_000))
+                slot.lastAssistantWasError = parsed.isError
+            }
+        case "tool_execution_start":
+            if let callID = event["toolCallId"]?.stringValue,
+               let name = event["toolName"]?.stringValue,
+               name.lowercased() == "ask_user_question" {
+                let arguments = event["args"] ?? .object([:])
+                slot.capability = CapabilityPresenter.capability(
+                    toolName: name,
+                    callID: callID,
+                    arguments: arguments
+                )
+                slot.questionnaire = QuestionnaireParser.parse(toolCallID: callID, arguments: arguments)
+                if slot === activeRuntimeSlot, !activePresentationDetached {
+                    activeCapability = slot.capability
+                    pendingQuestionnaire = slot.questionnaire
+                }
+                notify(.questionWaiting, session: session(for: slot))
+            }
+        case "queue_update":
+            updateState(for: slot) { state in
+                state.steeringQueue = queueStrings(event["steering"])
+                state.followUpQueue = queueStrings(event["followUp"])
+            }
+        case "compaction_start":
+            updateState(for: slot) { $0.isCompacting = true }
+        case "compaction_end":
+            updateState(for: slot) { state in
+                state.isCompacting = false
+                if let error = event["errorMessage"]?.stringValue { state.lastError = error }
+            }
+        case "auto_retry_start":
+            updateState(for: slot) { state in
+                state.isRetrying = true
+                state.retryAttempt = event["attempt"]?.intValue
+            }
+        case "auto_retry_end":
+            updateState(for: slot) { state in
+                state.isRetrying = false
+                if event["success"]?.boolValue == false { state.lastError = event["finalError"]?.stringValue }
+            }
+        case "extension_ui_request":
+            handleBackgroundExtensionUI(event, slot: slot)
+        case "extension_error":
+            updateState(for: slot) { $0.lastError = event["error"]?.stringValue ?? "A Pi extension failed." }
+        case "tool_execution_end":
+            if let id = event["toolCallId"]?.stringValue {
+                if slot.capability?.sourceID == id { slot.capability = nil }
+                if slot.questionnaire?.toolCallID == id { slot.questionnaire = nil }
+            }
+        case "turn_end":
+            slot.capability = nil
+            slot.questionnaire = nil
+            _ = flushBackgroundOutbox(.steer, slot: slot)
+        case "agent_end", "turn_start", "message_start", "tool_execution_update",
+             "bash_execution_update", "summarization_retry_scheduled", "summarization_retry_attempt_start",
+             "summarization_retry_finished":
+            break
+        default:
+            unknownRPCEvents.append(event.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
+            if unknownRPCEvents.count > 30 { unknownRPCEvents.removeFirst(unknownRPCEvents.count - 30) }
+        }
+    }
+
+    private func handleBackgroundExtensionUI(_ event: JSONValue, slot: RuntimeSlot) {
+        guard let method = event["method"]?.stringValue else { return }
+        switch method {
+        case "select", "confirm", "input", "editor", "set_editor_text":
+            deferEvent(event, for: slot)
+            if method != "set_editor_text" { notify(.approvalNeeded, session: session(for: slot)) }
+        case "setStatus":
+            guard let key = event["statusKey"]?.stringValue else { return }
+            if let value = event["statusText"]?.stringValue, !ANSI.strip(value).isEmpty {
+                let clean = ANSI.strip(value).suffixString(500)
+                slot.statuses[key] = clean
+                cachedStatuses[key] = clean
+                persistence.cacheExtensionStatuses(cachedStatuses)
+            } else {
+                slot.statuses.removeValue(forKey: key)
+            }
+            if slot === activeRuntimeSlot, !activePresentationDetached { extensionStatuses = slot.statuses }
+        case "setWidget":
+            guard let key = event["widgetKey"]?.stringValue else { return }
+            let lines = (event["widgetLines"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+                .prefix(100).map { $0.suffixString(2_000) }
+            if lines.isEmpty { slot.widgets.removeValue(forKey: key) }
+            else { slot.widgets[key] = ExtensionWidget(key: key, lines: lines, placement: event["widgetPlacement"]?.stringValue ?? "aboveEditor") }
+            if slot === activeRuntimeSlot, !activePresentationDetached { extensionWidgets = slot.widgets }
+        case "setTitle":
+            slot.windowTitle = event["title"]?.stringValue?.suffixString(500) ?? "Pi Desktop"
+            if slot === activeRuntimeSlot, !activePresentationDetached { windowTitle = slot.windowTitle }
+        case "notify":
+            let style = ToastMessage.Style(rawValue: event["notifyType"]?.stringValue ?? "info") ?? .info
+            let message = event["message"]?.stringValue ?? "Pi notification"
+            if style == .info { logExtensionNotice(message) }
+            else { showToast(message, style: style) }
+        default:
+            break
+        }
+    }
+
+    private func deferEvent(_ event: JSONValue, for slot: RuntimeSlot) {
+        slot.deferredEvents.append(event.boundedProjection())
+        if slot.deferredEvents.count > 32 { slot.deferredEvents.removeFirst(slot.deferredEvents.count - 32) }
+    }
+
+    @discardableResult
+    private func flushBackgroundOutbox(_ boundary: OutboxEntry.Delivery, slot: RuntimeSlot) -> Bool {
+        let due = OutboxPolicy.due(slot.outbox, at: boundary)
+        guard !due.isEmpty, slot.runtime.isRunning else { return false }
+        slot.outbox = OutboxPolicy.removing(boundary, from: slot.outbox)
+        for entry in due {
+            let command = entry.delivery == .steer ? "steer" : "follow_up"
+            let token = beginOutboxDispatch(for: slot)
+            var payload: [String: JSONValue] = ["message": .string(entry.text)]
+            if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
+            slot.runtime.send(type: command, payload: payload) { [weak self] result in
+                self?.finishOutboxDispatch(
+                    owner: token.owner,
+                    dispatch: token.dispatch,
+                    delivery: entry.delivery,
+                    result: result
+                )
+            }
+        }
+        return true
+    }
+
+    private func session(for slot: RuntimeSlot) -> SessionSummary? {
+        guard let path = slot.sessionPath else { return nil }
+        return sessions.first { $0.fileURL.standardizedFileURL.path == path }
+    }
+
+    private func retireBackgroundRuntime(_ slot: RuntimeSlot) {
+        guard slot !== activeRuntimeSlot, !slot.state.isBusy, slot.outbox.isEmpty,
+              slot.outboxDispatches.isEmpty, slot.dialogs.isEmpty, slot.deferredEvents.isEmpty else { return }
+        removeParkedReference(to: slot)
+        slot.runtime.onEvent = nil
+        slot.runtime.onExit = nil
+        slot.runtime.stop()
     }
 
     /// Lets tests drive the exact event path a live runtime uses, rather than reaching into
@@ -1549,7 +2058,9 @@ final class AppStore: ObservableObject {
         let type = event["type"]?.stringValue ?? "unknown"
         let selected = isSelectedRuntime
         switch type {
-        case "agent_start": runtimeState.isStreaming = true
+        case "agent_start":
+            activeRuntimeSlot.outboxDispatches.removeAll()
+            runtimeState.isStreaming = true
         case "agent_settled":
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
@@ -1560,12 +2071,16 @@ final class AppStore: ObservableObject {
             // left: nothing about this dispatch is "pending" any more.
             activeTurnPrompt = nil
             requestStats()
+            let settledSession = activeSession()
             notify(
                 messages.last?.isError == true ? .turnFailed : .turnFinished,
-                session: activeSession(),
+                session: settledSession,
                 preview: messages.last?.textContent
             )
-            Task { await refreshSelectedSummary(); if isApplicationActive { refreshSelectedGit() } }
+            Task {
+                if let settledSession { await refreshSummary(for: settledSession) }
+                if isApplicationActive, selectedSession?.id == settledSession?.id { refreshSelectedGit() }
+            }
         case "message_update":
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
             streamingMessage = parsed
@@ -1574,18 +2089,21 @@ final class AppStore: ObservableObject {
             upsertMessage(parsed)
             streamingMessage = nil
             if parsed.role == .assistant {
+                activeRuntimeSlot.lastAssistantText = String(parsed.textContent.prefix(4_000))
+                activeRuntimeSlot.lastAssistantWasError = parsed.isError
                 var latest = TokenMetrics(); latest.addUsage(parsed.usage)
                 liveMetrics.latestCacheHitPercent = latest.latestCacheHitPercent
             }
             mergeHistoryActivities()
         case "tool_execution_start":
-            // A question can be waiting in a conversation the user has since navigated away
-            // from; that must still notify even though its capability/questionnaire UI state
-            // (below) is only ever tracked for the selected runtime.
-            if event["toolName"]?.stringValue?.lowercased() == "ask_user_question" {
+            // A question can be waiting in a conversation the user has since navigated away.
+            if selected, event["toolName"]?.stringValue?.lowercased() == "ask_user_question" {
                 notify(.questionWaiting, session: activeSession())
             }
-            guard selected else { return }
+            guard selected else {
+                handleBackgroundRPCEvent(event, slot: activeRuntimeSlot)
+                return
+            }
             if let callID = event["toolCallId"]?.stringValue,
                let name = event["toolName"]?.stringValue {
                 let arguments = event["args"] ?? .object([:])
@@ -1633,7 +2151,9 @@ final class AppStore: ObservableObject {
                 runtimeState.lastError = error
                 showToast(error, style: .error)
             }
-        case "extension_ui_request": handleExtensionUI(event)
+        case "extension_ui_request":
+            if selected { handleExtensionUI(event) }
+            else { handleBackgroundExtensionUI(event, slot: activeRuntimeSlot) }
         case "extension_error": showToast(event["error"]?.stringValue ?? "A Pi extension failed.", style: .error)
         case "turn_end":
             activeCapability = nil
@@ -1794,33 +2314,45 @@ final class AppStore: ObservableObject {
         if unknownRPCEvents.count > 30 { unknownRPCEvents.removeFirst(unknownRPCEvents.count - 30) }
     }
 
-    private func handleRuntimeExit(_ error: String?) {
-        clearExtensionDialogs()
-        runtimeState.isConnected = false
-        runtimeState.isStreaming = false
-        runtimeState.isCompacting = false
-        runtimeState.isRetrying = false
-        activeCapability = nil
-        pendingQuestionnaire = nil
-        composerOptionsLoading = false
+    private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
+        slot.outboxDispatches.removeAll()
+        if slot === activeRuntimeSlot {
+            clearExtensionDialogs()
+            updateState(for: slot) { state in
+                state.isConnected = false
+                state.isStreaming = false
+                state.isCompacting = false
+                state.isRetrying = false
+            }
+            activeCapability = nil
+            pendingQuestionnaire = nil
+            composerOptionsLoading = false
+        } else {
+            updateState(for: slot) { state in
+                state.isConnected = false
+                state.isStreaming = false
+                state.isCompacting = false
+                state.isRetrying = false
+            }
+            slot.capability = nil
+            slot.questionnaire = nil
+            slot.optionsLoading = false
+            slot.dialogs.removeAll()
+            slot.deferredEvents.removeAll()
+            removeParkedReference(to: slot)
+        }
         guard let error else { return }
 
-        // A "prompt" whose outcome was never resolved is handled specially: Pi may already have
-        // accepted the message before dying, so this hands it back for a one-click resend rather
-        // than silently losing it (the `DraftRecovery` intent). `dispatchMessage`'s own
-        // completion always runs first for the very same crash — this fires from `onExit`, which
-        // is queued after `rejectPending` has already delivered to every pending callback — and
-        // only ever leaves `activeTurnPrompt` set when it could not tell whether Pi had received
-        // the message. So this is the single place that ever acts on it, and only once: a crash
-        // can never restore the same text into the draft twice.
-        if let pending = activeTurnPrompt {
-            activeTurnPrompt = nil
+        // Pending prompt rejection is delivered before onExit. Outcome-unknown deliberately
+        // leaves this value set, so this remains the one place that can restore it, exactly once.
+        if let pending = slot.pendingTurn {
+            slot.pendingTurn = nil
             let restored = restoreDraft(text: pending.text, attachments: pending.attachments, origin: pending.origin)
             let message = failureMessage(error, restored: restored, origin: pending.origin)
-            runtimeState.lastError = message
+            updateState(for: slot) { $0.lastError = message }
             showToast(message, style: .error)
         } else {
-            runtimeState.lastError = error
+            updateState(for: slot) { $0.lastError = error }
             showToast(error, style: .error)
         }
     }
@@ -1852,11 +2384,6 @@ final class AppStore: ObservableObject {
 
     private func responseError(_ response: JSONValue) -> String? {
         response["success"]?.boolValue == false ? (response["error"]?.stringValue ?? "Pi rejected the command.") : nil
-    }
-
-    private func refreshSelectedSummary() async {
-        guard let session = selectedSession else { return }
-        await refreshSummary(for: session)
     }
 
     private func refreshSummary(for session: SessionSummary) async {
@@ -1945,7 +2472,9 @@ final class AppStore: ObservableObject {
         gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel()
-        probeRuntime?.stop(); runtime.stop()
+        probeRuntime?.stop()
+        for slot in parkedRuntimes.values { slot.runtime.stop() }
+        activeRuntimeSlot.runtime.stop()
     }
 }
 
