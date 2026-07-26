@@ -39,21 +39,27 @@ struct SidebarView: View {
                         ForEach(snapshot.activeGroups) { group in
                             SessionFolderSection(group: group, forceExpanded: snapshot.isFiltering)
                         }
-                        if !snapshot.archivedGroups.isEmpty {
-                            ArchiveSection(groups: snapshot.archivedGroups, expanded: $archiveExpanded,
-                                           forceExpanded: snapshot.isFiltering)
-                        }
                     }
                     .padding(.horizontal, PiTheme.space6)
                     .padding(.bottom, PiTheme.space12)
                 }
                 .scrollIndicators(.automatic)
+
+                // Pinned below the scroller instead of living inside it, so Archived always
+                // sits in the same quiet spot above the footer instead of floating mid-list.
+                if !snapshot.archivedGroups.isEmpty {
+                    PiHairline()
+                    ArchiveSection(groups: snapshot.archivedGroups, expanded: $archiveExpanded,
+                                   forceExpanded: snapshot.isFiltering)
+                        .padding(.horizontal, PiTheme.space6)
+                }
             }
 
             PiHairline()
             SidebarFooter()
         }
-        .searchable(text: $store.searchText, placement: .sidebar, prompt: "Search chats")
+        // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
+        // filtering it drives below) stays wired for when a query is ever supplied again.
     }
 }
 
@@ -291,12 +297,17 @@ struct SessionFolderGroup: Identifiable {
     }
 }
 
+/// Caps the pinned, expanded archive so a long archive grows in place instead of crowding out
+/// the active list above it or pushing the footer out of the sidebar.
+private let archiveExpandedMaxHeight: CGFloat = 220
+
 private struct ArchiveSection: View {
     let groups: [SessionFolderGroup]
     @Binding var expanded: Bool
     let forceExpanded: Bool
     @State private var hovering = false
     private var isOpen: Bool { expanded || forceExpanded }
+    private var totalCount: Int { groups.reduce(0) { $0 + $1.sessions.count } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space2) {
@@ -307,8 +318,6 @@ private struct ArchiveSection: View {
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text("Archived").font(PiFont.captionEmphasis).foregroundStyle(.secondary)
                     Spacer(minLength: PiTheme.space4)
-                    Text("\(groups.reduce(0) { $0 + $1.sessions.count })")
-                        .font(PiFont.micro.monospacedDigit()).foregroundStyle(.tertiary)
                 }
                 .padding(.horizontal, PiTheme.space8)
                 .frame(height: PiTheme.folderHeaderHeight)
@@ -317,12 +326,19 @@ private struct ArchiveSection: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
+            // The count no longer has an on-screen home, but VoiceOver still gets it.
+            .accessibilityLabel("Archived, \(totalCount) conversations")
             .accessibilityValue(isOpen ? "expanded" : "collapsed")
 
             if isOpen {
-                ForEach(groups) { group in
-                    SessionFolderSection(group: group, archived: true, forceExpanded: forceExpanded)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: PiTheme.space2) {
+                        ForEach(groups) { group in
+                            SessionFolderSection(group: group, archived: true, forceExpanded: forceExpanded)
+                        }
+                    }
                 }
+                .frame(maxHeight: archiveExpandedMaxHeight)
             }
         }
         .padding(.top, PiTheme.space8)
@@ -364,8 +380,6 @@ private struct SessionFolderSection: View {
                         .font(PiFont.captionEmphasis).foregroundStyle(.secondary).lineLimit(1)
                     if hasRunning { StatusDot(color: .piGreen, isPulsing: true) }
                     Spacer(minLength: PiTheme.space4)
-                    Text("\(group.sessions.count)")
-                        .font(PiFont.micro.monospacedDigit()).foregroundStyle(.tertiary)
                 }
                 .padding(.leading, PiTheme.space8 + indent)
                 .padding(.trailing, PiTheme.space8)
@@ -553,10 +567,26 @@ private struct SessionRow: View {
             ProgressView().controlSize(.mini).help("Pi is working")
         } else if hovering {
             Text(store.liveModifiedAt(session).relativeShort).font(PiFont.micro).foregroundStyle(.tertiary)
-        } else if git.isRepository, git.isDirty {
+        } else if GitIndicatorPolicy.showsBranchIndicator(git) {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9)).foregroundStyle(.tertiary)
                 .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
         }
+    }
+}
+
+/// A branch indicator only earns its place on a dirty checkout that has actually drifted from
+/// the trunk; `main`/`master` are where the user expects to be, so they render nothing.
+enum GitIndicatorPolicy {
+    static let defaultBranchNames: Set<String> = ["main", "master"]
+
+    static func showsBranchIndicator(_ snapshot: GitSnapshot) -> Bool {
+        guard snapshot.isRepository, snapshot.isDirty else { return false }
+        // Detached HEAD has no branch name but is never "on trunk" either, so it still qualifies.
+        if snapshot.isDetached { return true }
+        guard let branch = snapshot.branch?.trimmingCharacters(in: .whitespacesAndNewlines), !branch.isEmpty else {
+            return false
+        }
+        return !defaultBranchNames.contains(branch.lowercased())
     }
 }

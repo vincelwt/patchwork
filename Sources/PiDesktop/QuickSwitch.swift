@@ -73,13 +73,21 @@ enum QuickSwitchScoring {
         rank(sessions, query: query, limit: limit, folderName: { $0.folderName })
     }
 
+    /// Scores every candidate, then keeps only the best-scoring instance per session file path.
+    /// `AppStore.sessions` can legitimately hand this the same conversation twice — a
+    /// provisional entry inserted before a rescan folds in the parsed file, or (since
+    /// `SessionSummary.id` is read from the JSONL's own `session` event) two distinct files
+    /// whose content id collides. The file path is the one identity Pi guarantees is unique, so
+    /// it is what ⌘K de-duplicates on rather than the session's own id. Ties keep the earlier
+    /// (more recent, since callers pass recency-sorted input) instance.
     static func rank(
         _ sessions: [SessionSummary],
         query: String,
         limit: Int,
         folderName: (SessionSummary) -> String
     ) -> [SessionSummary] {
-        let scored = sessions.enumerated().compactMap { index, session -> (Int, Int, SessionSummary)? in
+        var bestByPath: [String: (score: Int, index: Int, session: SessionSummary)] = [:]
+        for (index, session) in sessions.enumerated() {
             let folder = folderName(session)
             let key = session.searchKey + "\n" + folder.lowercased()
             guard let value = score(
@@ -87,12 +95,25 @@ enum QuickSwitchScoring {
                 title: session.displayName,
                 folder: folder,
                 searchKey: key
-            ) else { return nil }
-            return (value, index, session)
+            ) else { continue }
+            let path = session.fileURL.standardizedFileURL.path
+            if let existing = bestByPath[path], existing.score >= value { continue }
+            bestByPath[path] = (value, index, session)
         }
-        return scored
-            .sorted { lhs, rhs in lhs.0 == rhs.0 ? lhs.1 < rhs.1 : lhs.0 > rhs.0 }
+        return bestByPath.values
+            .sorted { lhs, rhs in lhs.score == rhs.score ? lhs.index < rhs.index : lhs.score > rhs.score }
             .prefix(limit)
-            .map(\.2)
+            .map(\.session)
+    }
+}
+
+/// Pure selection-index math for the ⌘K list, kept apart from the AppKit field wiring in
+/// `QuickSwitcherView` so arrow-key movement is unit-testable without a window.
+enum QuickSwitchNavigation {
+    /// Clamps `current + delta` into `0..<count`, so Up/Down never selects past either end of
+    /// the (possibly just-filtered) result list and an empty list always resolves to 0.
+    static func move(_ current: Int, by delta: Int, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        return min(max(0, current + delta), count - 1)
     }
 }
