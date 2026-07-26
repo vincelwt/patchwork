@@ -24,8 +24,13 @@ final class ThemeGridTests: XCTestCase {
         XCTAssertEqual(PiTheme.statusBarHeight, 26)
     }
 
-    func testTranscriptRowsShareOneTextOrigin() {
+    func testTranscriptRowsShareOneTextOriginAndComposerMeasure() {
         XCTAssertEqual(PiTheme.gridTextInset, PiTheme.gridIconColumn + PiTheme.gridGutter)
+        XCTAssertEqual(
+            PiTheme.transcriptMaxWidth,
+            PiTheme.composerMaxWidth,
+            "Transcript content and composer must share the same visible measure"
+        )
     }
 
     func testInspectorColumnStaysInsideTheNativeRange() {
