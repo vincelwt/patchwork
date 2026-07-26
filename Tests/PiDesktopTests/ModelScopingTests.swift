@@ -134,3 +134,12 @@ final class PiModelScopeCacheTests: XCTestCase {
         XCTAssertNil(PiModelScopeCache.shared.current())
     }
 }
+
+final class ModelNamingTests: XCTestCase {
+    func testRawIdentifiersReadLikeTheirProductNames() {
+        XCTAssertEqual(ModelNaming.pretty("gpt-5.6-sol"), "GPT 5.6 Sol")
+        XCTAssertEqual(ModelNaming.pretty("openai-codex/gpt-5.6-terra"), "GPT 5.6 Terra")
+        XCTAssertEqual(ModelNaming.pretty("anthropic/claude-opus-5"), "Claude Opus 5")
+        XCTAssertEqual(ModelNaming.pretty(""), "")
+    }
+}

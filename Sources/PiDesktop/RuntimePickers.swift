@@ -8,10 +8,11 @@ extension AppStore {
     var currentModelID: String? { runtimeState.modelID ?? selectedSession?.model }
 
     var currentModelLabel: String {
-        runtimeState.modelName
-            ?? runtimeState.modelID
-            ?? selectedSession?.model
-            ?? (composerOptionsLoading ? "Loading…" : "Model")
+        if let name = runtimeState.modelName { return name }
+        // Falling back to a raw id (`gpt-5.6-sol`) is honest but shouty in a status bar, so it
+        // is presented the way the provider writes it.
+        if let id = runtimeState.modelID ?? selectedSession?.model { return ModelNaming.pretty(id) }
+        return composerOptionsLoading ? "Loading…" : "Model"
     }
 
     var currentThinkingLabel: String {
@@ -88,6 +89,27 @@ struct ThinkingPickerControl: View {
         }
         .accessibilityLabel("Thinking level")
         .accessibilityValue(label)
+    }
+}
+
+/// Turns a provider's model id into the name people actually use for it.
+enum ModelNaming {
+    private static let acronyms: Set<String> = ["gpt", "api", "ai", "llm", "xai", "o1", "o3"]
+
+    static func pretty(_ identifier: String) -> String {
+        let tail = identifier.split(separator: "/").last.map(String.init) ?? identifier
+        guard !tail.isEmpty else { return identifier }
+        return tail
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .map { part -> String in
+                let value = String(part)
+                // Version-ish fragments stay as written, known acronyms shout, the rest are
+                // ordinary words. Guessing by length would turn "sol" into "SOL".
+                if value.first?.isNumber == true { return value }
+                if acronyms.contains(value.lowercased()) { return value.uppercased() }
+                return value.prefix(1).uppercased() + value.dropFirst()
+            }
+            .joined(separator: " ")
     }
 }
 
