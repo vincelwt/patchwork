@@ -2,21 +2,42 @@ import SwiftUI
 import XCTest
 @testable import PiDesktop
 
-/// Pins the transcript row type scale as a policy, the same way `ThemeGridTests` (not owned by
-/// this change) pins the shared grid constants: `MessageView.swift` row types no longer compute
-/// their own `PiFont.bodySize - 1` literal per call site (thinking, narration, compaction detail,
-/// custom detail, and system detail all used to each spell that out independently, and system
-/// detail had drifted to `PiFont.caption` entirely) — they all reference `PiFont.rowDetail`. This
-/// cannot inspect what a live `Text` actually renders with (there is no snapshot harness here),
-/// so it pins the shared constant and its relationship to the rest of the type scale instead,
-/// which is what would catch a future call site reintroducing its own ad-hoc offset.
+/// Pins the one-size text policy. Semantic roles may change weight or design, but never point
+/// size; transcript detail uses the shared body role rather than maintaining a parallel scale.
 final class TranscriptRowMetricsTests: XCTestCase {
-    func testExpandedDetailIsTheSameSizeAsAnAnswer() {
-        // Detail used to be a step smaller than prose, which is half of why the transcript read
-        // as several different apps stacked vertically. It is now the same size and separated by
-        // colour instead.
-        XCTAssertEqual(PiFont.rowDetail, PiFont.bodySize)
-        XCTAssertGreaterThan(PiFont.rowDetail, PiFont.metaSize)
+    func testEverySemanticTextRoleUsesOneLiteralPointSize() {
+        let sizes = [
+            PiFont.bodySize,
+            PiFont.metaSize,
+            PiFont.codeSize,
+            PiFont.heading1Size,
+            PiFont.heading2Size,
+            PiFont.heading3Size
+        ]
+        XCTAssertEqual(Set(sizes), [PiFont.size])
+        XCTAssertEqual(PiFont.size, NSFont.systemFontSize)
+        XCTAssertEqual(PiFont.composerNSFont.pointSize, PiFont.size)
+        XCTAssertEqual(PiFont.codeNSFont.pointSize, PiFont.size)
+    }
+
+    func testProductSourcesCannotReintroduceScaledTextOrSystemEmptyStates() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop", isDirectory: true)
+        let files = try FileManager.default.contentsOfDirectory(
+            at: sourceRoot,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "swift" }
+
+        for file in files {
+            let source = try String(contentsOf: file, encoding: .utf8)
+            XCTAssertFalse(source.contains("ContentUnavailableView("), "\(file.lastPathComponent) bypasses PiFont")
+            XCTAssertFalse(source.contains("bodySize -"), "\(file.lastPathComponent) derives a smaller text size")
+            XCTAssertFalse(source.contains("metaSize -"), "\(file.lastPathComponent) derives a smaller text size")
+            XCTAssertFalse(source.contains("codeSize -"), "\(file.lastPathComponent) derives a smaller text size")
+        }
     }
 
     func testExactlyOneCaptionSizeBacksEveryRowTitle() {
@@ -26,13 +47,9 @@ final class TranscriptRowMetricsTests: XCTestCase {
         XCTAssertEqual(PiFont.caption, Font.system(size: PiFont.metaSize, weight: .regular))
     }
 
-    func testCodeDetailStaysASingleDistinctMonospacedSizeFromProseDetail() {
-        // Tool call/result payloads are deliberately not part of the prose-detail unification
-        // (task 3 keeps them monospaced, at the shared text origin, un-carded) — this just pins
-        // that the two "detail" tracks (prose vs. code) remain exactly two named sizes, not more.
-        XCTAssertEqual(PiFont.code, Font.system(size: PiFont.codeSize, design: .monospaced))
-        // Monospaced runs one step under prose so the two optically match rather than clash.
-        XCTAssertEqual(PiFont.codeSize, PiFont.bodySize - 1)
+    func testCodeDiffersByDesignNotSize() {
+        XCTAssertEqual(PiFont.code, Font.system(size: PiFont.size, design: .monospaced))
+        XCTAssertEqual(PiFont.codeSize, PiFont.bodySize)
     }
 
     func testSharedGridColumnStillBacksEveryIconBearingRow() {
@@ -42,10 +59,7 @@ final class TranscriptRowMetricsTests: XCTestCase {
         XCTAssertEqual(PiTheme.gridTextInset, PiTheme.gridIconColumn + PiTheme.gridGutter)
     }
 
-    func testMessageViewSourceHasNoRemainingAdHocBodySizeOffset() throws {
-        // Belt-and-suspenders: read the actual source so a future edit that reintroduces a
-        // scattered `PiFont.bodySize - 1` (instead of the shared `PiFont.rowDetail`) fails a test
-        // immediately rather than only in code review.
+    func testMessageViewSourceHasNoParallelDetailScale() throws {
         let thisFile = URL(fileURLWithPath: #filePath)
         let sourceURL = thisFile
             .deletingLastPathComponent() // TranscriptRowMetricsTests.swift
@@ -53,10 +67,8 @@ final class TranscriptRowMetricsTests: XCTestCase {
             .deletingLastPathComponent() // Tests
             .appendingPathComponent("Sources/PiDesktop/MessageView.swift")
         let contents = try String(contentsOf: sourceURL, encoding: .utf8)
-        let occurrences = contents.components(separatedBy: "bodySize - 1").count - 1
-        // Nothing in the transcript computes its own offset from the body size any more.
-        XCTAssertEqual(occurrences, 0, "Row sizes come from PiFont, never from an ad-hoc offset")
-        XCTAssertTrue(contents.contains("static let rowDetail"), "The shared constant must still be defined exactly once")
+        XCTAssertFalse(contents.contains("bodySize -"), "Transcript rows never derive a smaller font")
+        XCTAssertFalse(contents.contains("rowDetail"), "Transcript rows do not maintain a parallel size role")
     }
 }
 

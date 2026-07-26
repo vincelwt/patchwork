@@ -20,7 +20,10 @@ struct PiDesktopApp: App {
 
     var body: some Scene {
         WindowGroup("Pi Desktop") {
-            RootView().environmentObject(store)
+            RootView()
+                .environmentObject(store)
+                // Also governs any plain Text/Button labels that do not choose a semantic role.
+                .font(PiFont.body)
         }
         .defaultSize(width: 1_280, height: 840)
         .windowResizability(.contentMinSize)
@@ -73,14 +76,18 @@ struct PiDesktopApp: App {
         }
 
         MenuBarExtra {
-            MenuBarContentView().environmentObject(store)
+            MenuBarContentView()
+                .environmentObject(store)
+                .font(PiFont.body)
         } label: {
             MenuBarLabelView().environmentObject(store)
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            DaemonSettingsView().environmentObject(appDelegate.daemonSupervisor)
+            DaemonSettingsView()
+                .environmentObject(appDelegate.daemonSupervisor)
+                .font(PiFont.body)
         }
     }
 
@@ -114,7 +121,7 @@ struct RootView: View {
                     case .session:
                         if store.selectedSession != nil { ConversationView() }
                         else {
-                            ContentUnavailableView("Conversation not found", systemImage: "bubble.left")
+                            PiUnavailableView("Conversation not found", systemImage: "bubble.left")
                                 .background(Color.piTranscript)
                         }
                     }

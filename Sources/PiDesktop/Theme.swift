@@ -114,60 +114,46 @@ enum PiTheme {
 
 // MARK: - Typography
 
-/// A deliberate SF Pro (non-rounded) scale. Semibold is reserved for real titles.
+/// One literal SF Pro point size across the product. Hierarchy comes from weight, colour, and
+/// spacing—not from shrinking metadata or enlarging titles. Keeping the semantic names makes
+/// call sites readable while ensuring the sidebar, transcript, inspector, composer, status bar,
+/// dialogs, code, and Markdown all sit on the same baseline scale.
 enum PiFont {
-    /// Two text sizes carry the entire app.
-    ///
-    /// It previously had eight — 14.5 transcript prose, 13 sidebar rows, 12 section titles, 11.5
-    /// captions, 10.5 micro labels, and a separate heading ramp — which is exactly why the
-    /// window read as several different apps side by side. Everything a person reads is now
-    /// `bodySize`; everything that annotates it is `metaSize`. Titles are the only exception,
-    /// and there are two of them.
-    static let bodySize: CGFloat = 13.5
-    static let metaSize: CGFloat = 11.5
+    /// Matches AppKit's native menu/control font, so OS-drawn pickers and menus align too.
+    static let size: CGFloat = NSFont.systemFontSize
+
+    // Compatibility aliases are intentionally equal. No semantic text role gets a private size.
+    static let bodySize: CGFloat = size
+    static let metaSize: CGFloat = size
+    static let codeSize: CGFloat = size
+    static let heading1Size: CGFloat = size
+    static let heading2Size: CGFloat = size
+    static let heading3Size: CGFloat = size
+
     static let bodyLineHeight: CGFloat = 1.45
-    static var bodyLineSpacing: CGFloat { (bodyLineHeight - 1) * bodySize }
+    static var bodyLineSpacing: CGFloat { (bodyLineHeight - 1) * size }
+    static var codeLineSpacing: CGFloat { size * 0.4 }
 
-    static let body = Font.system(size: bodySize, weight: .regular)
-    static let bodyEmphasis = Font.system(size: bodySize, weight: .medium)
-
-    /// Section and window titles.
-    static let title = Font.system(size: 15, weight: .semibold)
-    /// The one oversized label in the app: an empty state's headline.
-    static let displayTitle = Font.system(size: 20, weight: .semibold)
-    static let sectionTitle = Font.system(size: metaSize, weight: .semibold)
-
-    /// Sidebar, inspector, and transcript rows — the same size as prose, because they are read
-    /// the same way.
-    static let row = Font.system(size: bodySize, weight: .regular)
-    static let rowEmphasis = Font.system(size: bodySize, weight: .medium)
-
-    /// Captions, metadata, footers. `micro` is kept as a name for the tightest chrome, but it is
-    /// deliberately the same size: weight and colour separate them, not scale.
-    static let caption = Font.system(size: metaSize, weight: .regular)
-    static let captionEmphasis = Font.system(size: metaSize, weight: .medium)
-    static let micro = Font.system(size: metaSize, weight: .regular)
-
-    /// SF Mono for code and tool output, one step down from prose so it optically matches it.
-    static let codeSize: CGFloat = bodySize - 1
-    static let code = Font.system(size: codeSize, design: .monospaced)
-    static let codeSmall = Font.system(size: metaSize, design: .monospaced)
-
-    static var codeLineSpacing: CGFloat { codeSize * 0.4 }
-
-    // Markdown heading ramp. Tight on purpose: a heading inside an answer is still body copy,
-    // not a poster.
-    static let heading1Size: CGFloat = 17
-    static let heading2Size: CGFloat = 15
-    static let heading3Size: CGFloat = bodySize
-    static let heading1 = Font.system(size: heading1Size, weight: .semibold)
-    static let heading2 = Font.system(size: heading2Size, weight: .semibold)
-    static let heading3 = Font.system(size: heading3Size, weight: .semibold)
-    static let heading4 = Font.system(size: bodySize, weight: .semibold)
+    static let body = Font.system(size: size, weight: .regular)
+    static let bodyEmphasis = Font.system(size: size, weight: .medium)
+    static let title = Font.system(size: size, weight: .semibold)
+    static let displayTitle = Font.system(size: size, weight: .semibold)
+    static let sectionTitle = Font.system(size: size, weight: .semibold)
+    static let row = Font.system(size: size, weight: .regular)
+    static let rowEmphasis = Font.system(size: size, weight: .medium)
+    static let caption = Font.system(size: size, weight: .regular)
+    static let captionEmphasis = Font.system(size: size, weight: .medium)
+    static let micro = Font.system(size: size, weight: .regular)
+    static let code = Font.system(size: size, design: .monospaced)
+    static let codeSmall = Font.system(size: size, design: .monospaced)
+    static let heading1 = Font.system(size: size, weight: .semibold)
+    static let heading2 = Font.system(size: size, weight: .semibold)
+    static let heading3 = Font.system(size: size, weight: .semibold)
+    static let heading4 = Font.system(size: size, weight: .semibold)
 
     // AppKit equivalents for the native composer and answer text views.
-    static let composerNSFont = NSFont.systemFont(ofSize: bodySize, weight: .regular)
-    static let codeNSFont = NSFont.monospacedSystemFont(ofSize: codeSize, weight: .regular)
+    static let composerNSFont = NSFont.systemFont(ofSize: size, weight: .regular)
+    static let codeNSFont = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
 }
 
 /// Symbols are the other half of the type scale, and they were the half nobody governed: views
@@ -293,7 +279,7 @@ struct PiGridRow<Content: View>: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
             Image(systemName: symbol)
-                .font(.system(size: 11, weight: symbolWeight))
+                .font(.system(size: PiIcon.small, weight: symbolWeight))
                 .foregroundStyle(tint)
                 .frame(width: PiTheme.gridIconColumn, alignment: .center)
             content()
@@ -322,10 +308,57 @@ struct PiChevron: View {
     let expanded: Bool
     var body: some View {
         Image(systemName: "chevron.right")
-            .font(.system(size: 9, weight: .semibold))
+            .font(.system(size: PiIcon.micro, weight: .semibold))
             .foregroundStyle(.tertiary)
             .rotationEffect(.degrees(expanded ? 90 : 0))
             .animation(.easeOut(duration: 0.12), value: expanded)
+    }
+}
+
+/// A one-size replacement for `ContentUnavailableView`, whose private title/description scale
+/// ignores the surrounding SwiftUI font environment.
+struct PiUnavailableView<Actions: View>: View {
+    let title: String
+    let systemImage: String
+    let description: String?
+    private let actions: Actions
+
+    init(
+        _ title: String,
+        systemImage: String,
+        description: String? = nil,
+        @ViewBuilder actions: () -> Actions
+    ) {
+        self.title = title
+        self.systemImage = systemImage
+        self.description = description
+        self.actions = actions()
+    }
+
+    var body: some View {
+        VStack(spacing: PiTheme.space8) {
+            Image(systemName: systemImage)
+                .font(.system(size: PiIcon.large, weight: .regular))
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(PiFont.bodyEmphasis)
+            if let description, !description.isEmpty {
+                Text(description)
+                    .font(PiFont.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            actions
+                .font(PiFont.body)
+        }
+        .padding(PiTheme.space16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+extension PiUnavailableView where Actions == EmptyView {
+    init(_ title: String, systemImage: String, description: String? = nil) {
+        self.init(title, systemImage: systemImage, description: description) { EmptyView() }
     }
 }
 

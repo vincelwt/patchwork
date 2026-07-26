@@ -27,9 +27,13 @@ struct SidebarView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let error = store.scanError, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
-                ContentUnavailableView("Sessions unavailable", systemImage: "exclamationmark.triangle", description: Text(error))
+                PiUnavailableView(
+                    "Sessions unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: error
+                )
             } else if snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
-                ContentUnavailableView(
+                PiUnavailableView(
                     store.searchText.isEmpty ? "No conversations yet" : "No matches",
                     systemImage: store.searchText.isEmpty ? "bubble.left" : "magnifyingglass"
                 )

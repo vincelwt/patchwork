@@ -63,7 +63,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testBoldSpanGetsABoldFontTrait() throws {
         let blocks = MarkdownBlockParser.blocks(from: "plain **bold** plain")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         let string = built.attributedString.string
         let range = try XCTUnwrap(string.range(of: "bold"))
         let nsRange = NSRange(range, in: string)
@@ -74,7 +74,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testMarkdownLinkCarriesItsURLAttribute() throws {
         let blocks = MarkdownBlockParser.blocks(from: "See [docs](https://pi.dev/docs) now")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         let string = built.attributedString.string
         let range = try XCTUnwrap(string.range(of: "docs"))
         let nsRange = NSRange(range, in: string)
@@ -84,7 +84,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testBareURLIsAutolinkedInTheBuiltAttributedString() throws {
         let blocks = MarkdownBlockParser.blocks(from: "Visit https://pi.dev/docs today")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         let string = built.attributedString.string
         let range = try XCTUnwrap(string.range(of: "https://pi.dev/docs"))
         let nsRange = NSRange(range, in: string)
@@ -94,7 +94,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testStrikethroughSpanCarriesTheStrikethroughAttribute() throws {
         let blocks = MarkdownBlockParser.blocks(from: "before ~~gone~~ after")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         let string = built.attributedString.string
         let range = try XCTUnwrap(string.range(of: "gone"))
         let nsRange = NSRange(range, in: string)
@@ -104,7 +104,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testCodeBlockIsRecordedWithItsExactSourceAndAMonospacedFont() throws {
         let blocks = MarkdownBlockParser.blocks(from: "Before\n\n```swift\nlet x = 1\n```\n\nAfter")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         XCTAssertEqual(built.codeBlocks.count, 1)
         let entry = try XCTUnwrap(built.codeBlocks.first)
         XCTAssertEqual(entry.code, "let x = 1")
@@ -118,7 +118,7 @@ final class SelectableAnswerTextTests: XCTestCase {
 
     func testInlineCodeSpanIsAlsoMonospacedDistinctFromABlockCode() throws {
         let blocks = MarkdownBlockParser.blocks(from: "Run `swift build` now")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         XCTAssertTrue(built.codeBlocks.isEmpty, "An inline code span is not a fenced code block")
         let string = built.attributedString.string
         let range = try XCTUnwrap(string.range(of: "swift build"))
@@ -127,19 +127,21 @@ final class SelectableAnswerTextTests: XCTestCase {
         XCTAssertTrue(font.fontDescriptor.symbolicTraits.contains(.monoSpace))
     }
 
-    func testHeadingRendersLargerThanBody() throws {
+    func testHeadingUsesWeightRatherThanASpecialSize() throws {
         let blocks = MarkdownBlockParser.blocks(from: "# Title\n\nBody text")
-        let built = AnswerAttributedTextBuilder.build(blocks: blocks, size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
         let string = built.attributedString.string
         let titleRange = NSRange((try XCTUnwrap(string.range(of: "Title"))), in: string)
         let bodyRange = NSRange((try XCTUnwrap(string.range(of: "Body text"))), in: string)
         let titleFont = try XCTUnwrap(built.attributedString.attribute(.font, at: titleRange.location, effectiveRange: nil) as? NSFont)
         let bodyFont = try XCTUnwrap(built.attributedString.attribute(.font, at: bodyRange.location, effectiveRange: nil) as? NSFont)
-        XCTAssertGreaterThan(titleFont.pointSize, bodyFont.pointSize)
+        XCTAssertEqual(titleFont.pointSize, bodyFont.pointSize)
+        XCTAssertTrue(titleFont.fontDescriptor.symbolicTraits.contains(.bold))
+        XCTAssertFalse(bodyFont.fontDescriptor.symbolicTraits.contains(.bold))
     }
 
     func testEmptyBlockListProducesEmptyAttributedString() {
-        let built = AnswerAttributedTextBuilder.build(blocks: [], size: PiFont.bodySize)
+        let built = AnswerAttributedTextBuilder.build(blocks: [])
         XCTAssertEqual(built.attributedString.length, 0)
         XCTAssertTrue(built.codeBlocks.isEmpty)
     }

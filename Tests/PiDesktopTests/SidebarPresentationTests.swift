@@ -62,20 +62,17 @@ final class SidebarPresentationTests: XCTestCase {
     }
 }
 
-/// Task 2: the sidebar's whole type scale collapses onto three named roles (see
-/// `SidebarTypography.swift`), each a direct alias of a `Theme.swift` `PiFont` constant —
-/// mirrors the metric-pinning style of `ThemeGridTests.swift`, but for type instead of layout.
+/// The sidebar retains semantic roles for weight and colour, but all roles resolve to the app's
+/// one literal point size.
 final class SidebarTypographyTests: XCTestCase {
     func testConversationTitleUsesRowWeightBySelection() {
         XCTAssertEqual(SidebarTypography.conversationTitle(selected: false), PiFont.row)
         XCTAssertEqual(SidebarTypography.conversationTitle(selected: true), PiFont.rowEmphasis)
     }
 
-    func testFolderHeaderConversationRowAndMetadataAreThreeDistinctSizes() {
-        let conversationRow = SidebarTypography.conversationTitle(selected: false)
-        XCTAssertNotEqual(SidebarTypography.folderHeader, conversationRow, "Folder headers and conversation rows must read as distinct sizes")
-        XCTAssertNotEqual(SidebarTypography.folderHeader, SidebarTypography.metadata, "Folder headers and metadata must read as distinct sizes")
-        XCTAssertNotEqual(conversationRow, SidebarTypography.metadata, "Conversation rows and metadata must read as distinct sizes")
+    func testFolderHeaderConversationAndMetadataShareOnePointSize() {
+        XCTAssertEqual(PiFont.bodySize, PiFont.size)
+        XCTAssertEqual(PiFont.metaSize, PiFont.size)
     }
 
     func testEveryRoleResolvesToATypeScaleConstantNotAnAdHocLiteral() {

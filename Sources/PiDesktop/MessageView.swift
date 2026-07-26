@@ -1,12 +1,5 @@
 import SwiftUI
 
-/// Expanded transcript content — thinking, narration, custom/system detail — is the same size
-/// as an answer. It is quieter because it is grey, not because it is smaller: shrinking it was
-/// half of what made the transcript look like three different apps stacked vertically.
-extension PiFont {
-    static let rowDetail: CGFloat = bodySize
-}
-
 struct MessageView: View {
     let message: ChatMessage
     let isStreaming: Bool
@@ -125,7 +118,6 @@ struct ThinkingBlockView: View {
             MarkdownBlockView(
                 text: text,
                 streaming: streaming,
-                size: PiFont.rowDetail,
                 fillWidth: true
             )
             .foregroundStyle(.secondary)
@@ -239,7 +231,7 @@ private struct WorkNoteView: View {
     var body: some View {
         if message.role == .assistant {
             PiGridRow(symbol: "text.bubble") {
-                MarkdownBlockView(text: message.textContent, size: PiFont.rowDetail)
+                MarkdownBlockView(text: message.textContent)
                     .foregroundStyle(.secondary)
             }
             .accessibilityLabel("Pi narration")
@@ -284,7 +276,7 @@ struct CompactionRowView: View {
             .disabled(note.summary.isEmpty)
 
             if expanded, !note.summary.isEmpty {
-                MarkdownBlockView(text: note.summary, size: PiFont.rowDetail)
+                MarkdownBlockView(text: note.summary)
                     .foregroundStyle(.secondary)
                     .padding(PiTheme.space10)
                     .piInset()
@@ -554,7 +546,7 @@ private struct ConversationImage: View {
         Button(action: onOpen) {
             Group {
                 if let nsImage = image.nsImage { Image(nsImage: nsImage).resizable().scaledToFit() }
-                else { ContentUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark") }
+                else { PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark") }
             }
             .frame(maxWidth: PiTheme.transcriptImageMaxWidth, maxHeight: PiTheme.transcriptImageMaxHeight)
             .clipShape(RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous))
@@ -661,7 +653,7 @@ private struct CustomMessageRow: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if !message.textContent.isEmpty {
-                    MarkdownBlockView(text: message.textContent, size: PiFont.rowDetail)
+                    MarkdownBlockView(text: message.textContent)
                         .foregroundStyle(.secondary)
                 }
                 ForEach(message.images) { image in
@@ -678,7 +670,7 @@ private struct SystemMessageRow: View {
     var body: some View {
         DisclosureRow(symbol: "text.append", title: title) {
             Text(detail)
-                .font(.system(size: PiFont.rowDetail))
+                .font(PiFont.body)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)

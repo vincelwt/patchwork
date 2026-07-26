@@ -57,18 +57,18 @@ struct SchedulesView: View {
     @ViewBuilder
     private var content: some View {
         if let error = model.error {
-            ContentUnavailableView {
-                Label("Automations unavailable", systemImage: "clock.badge.exclamationmark")
-            } description: {
-                Text(error)
-            } actions: {
+            PiUnavailableView(
+                "Automations unavailable",
+                systemImage: "clock.badge.exclamationmark",
+                description: error
+            ) {
                 Button("Try Again") { Task { await model.reload() } }
             }
         } else if model.entries.isEmpty {
-            ContentUnavailableView(
+            PiUnavailableView(
                 "No automations yet",
                 systemImage: "clock.arrow.2.circlepath",
-                description: Text("Run a prompt on a schedule: once, every few minutes, on a cron, or whenever a conversation is idle.")
+                description: "Run a prompt on a schedule: once, every few minutes, on a cron, or whenever a conversation is idle."
             )
         } else {
             ScrollView {
@@ -124,15 +124,23 @@ private struct ScheduleRow: View {
                 Text(next.relativeShort).font(PiFont.micro).foregroundStyle(.tertiary)
             }
             if hovering {
-                Button(action: onRun) { Image(systemName: "play.fill") }
-                    .buttonStyle(.plain).help("Run now")
-                Button(action: onToggle) { Image(systemName: entry.enabled ? "pause.fill" : "play.circle") }
-                    .buttonStyle(.plain).help(entry.enabled ? "Pause" : "Resume")
-                Button(action: onDelete) { Image(systemName: "trash") }
-                    .buttonStyle(.plain).help("Delete")
+                Button(action: onRun) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: PiIcon.small, weight: .medium))
+                }
+                .buttonStyle(.plain).help("Run now")
+                Button(action: onToggle) {
+                    Image(systemName: entry.enabled ? "pause.fill" : "play.circle")
+                        .font(.system(size: PiIcon.small, weight: .medium))
+                }
+                .buttonStyle(.plain).help(entry.enabled ? "Pause" : "Resume")
+                Button(action: onDelete) {
+                    Image(systemName: "trash")
+                        .font(.system(size: PiIcon.small, weight: .medium))
+                }
+                .buttonStyle(.plain).help("Delete")
             }
         }
-        .font(.system(size: PiIcon.small, weight: .medium))
         .foregroundStyle(.secondary)
         .padding(.horizontal, PiTheme.space10)
         .frame(height: 40)
