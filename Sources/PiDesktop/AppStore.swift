@@ -161,6 +161,11 @@ final class AppStore: ObservableObject {
         return selectedSession.fileURL.standardizedFileURL.path == activeRuntimePath
     }
 
+    /// True for either an attached saved conversation or the query-only runtime prepared for a
+    /// new Desktop chat. Picker controls use this broader route scope; transcript/session actions
+    /// deliberately keep using `isSelectedRuntime`.
+    var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
+
     var selectedMetrics: TokenMetrics {
         isSelectedRuntime && runtimeState.isConnected ? liveMetrics : (selectedSession?.metrics ?? TokenMetrics())
     }

@@ -94,7 +94,7 @@ struct MenuBarContentView: View {
                 } else {
                     // Every window, not just the tightest one, so the menu bar answers the
                     // limits question without opening the app.
-                    ForEach(account.windows.prefix(4), id: \.label) { window in
+                    ForEach(account.windows, id: \.label) { window in
                         HStack(spacing: PiTheme.space8) {
                             Text(window.label)
                                 .font(PiFont.caption.monospacedDigit())

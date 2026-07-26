@@ -28,11 +28,11 @@ extension AppStore {
     }
 
     var modelPickerPresentation: RuntimePickerPresentation {
-        .model(attached: isSelectedRuntime, models: availableModels, loading: composerOptionsLoading)
+        .model(attached: isCurrentRouteRuntime, models: availableModels, loading: composerOptionsLoading)
     }
 
     var thinkingPickerPresentation: RuntimePickerPresentation {
-        .thinking(attached: isSelectedRuntime, levels: availableThinkingLevels, loading: composerOptionsLoading)
+        .thinking(attached: isCurrentRouteRuntime, levels: availableThinkingLevels, loading: composerOptionsLoading)
     }
 }
 
