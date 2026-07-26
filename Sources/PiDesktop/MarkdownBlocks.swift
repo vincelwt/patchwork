@@ -13,6 +13,7 @@ enum MarkdownBlock: Equatable, Identifiable, Sendable {
     case list(items: [MarkdownListItem], ordered: Bool, start: Int)
     case quote(String)
     case code(language: String?, code: String)
+    case table(header: [String], alignment: [MarkdownTableAlignment], rows: [[String]])
     case rule
 
     var id: String {
@@ -22,9 +23,15 @@ enum MarkdownBlock: Equatable, Identifiable, Sendable {
         case let .list(items, ordered, start): "l\(ordered ? "o" : "u")\(start):\(items.hashValue)"
         case let .quote(text): "q:\(text.hashValue)"
         case let .code(language, code): "c\(language ?? "-"):\(code.hashValue)"
+        case let .table(header, _, rows): "t:\(header.hashValue):\(rows.count):\(rows.hashValue)"
         case .rule: "hr:\(UUID().uuidString)"
         }
     }
+}
+
+/// Column alignment from a table's delimiter row (`:---`, `:---:`, `---:`, or plain `---`).
+enum MarkdownTableAlignment: Equatable, Sendable {
+    case none, leading, center, trailing
 }
 
 struct MarkdownListItem: Equatable, Hashable, Sendable {
@@ -53,7 +60,11 @@ enum MarkdownBlockParser {
 
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
-            let text = paragraph.joined(separator: "\n")
+            // A lone trailing backslash is CommonMark's hard-break marker: the newline it sits
+            // on already renders as a visible break in this renderer (every embedded newline
+            // does, by design - see the type comment), so the marker itself must be consumed
+            // instead of showing up as a stray literal "\" before the break.
+            let text = paragraph.map(stripTrailingHardBreakMarker).joined(separator: "\n")
             if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 blocks.append(.paragraph(text))
             }
@@ -68,6 +79,36 @@ enum MarkdownBlockParser {
             if trimmed.isEmpty {
                 flushParagraph()
                 index += 1
+                continue
+            }
+
+            // Setext heading: an in-progress paragraph line immediately underlined by a run of
+            // `=` (H1) or `-` (H2). This must be checked before the thematic-break case below,
+            // since a bare `---` right after text closes a heading, not a rule - and before the
+            // table case, since a bare `---` never looks like a table delimiter row anyway.
+            if !paragraph.isEmpty, let level = setextLevel(trimmed) {
+                let text = paragraph.map(stripTrailingHardBreakMarker).joined(separator: "\n")
+                paragraph.removeAll(keepingCapacity: true)
+                blocks.append(.heading(level: level, text: text))
+                index += 1
+                continue
+            }
+
+            // GFM pipe table: a header row immediately followed by a validating delimiter row
+            // (`|---|:---:|---:|`). Both must contain a pipe, so this can never misfire on a
+            // setext underline or an ordinary paragraph line.
+            if let header = splitTableRow(trimmed), index + 1 < lines.count,
+               let alignments = tableDelimiterAlignment(lines[index + 1], columns: header.count) {
+                flushParagraph()
+                var rows: [[String]] = []
+                index += 2
+                while index < lines.count {
+                    let candidateTrimmed = lines[index].trimmingCharacters(in: .whitespaces)
+                    guard !candidateTrimmed.isEmpty, let cells = splitTableRow(candidateTrimmed) else { break }
+                    rows.append(normalizeRow(cells, to: header.count))
+                    index += 1
+                }
+                blocks.append(.table(header: normalizeRow(header, to: header.count), alignment: alignments, rows: rows))
                 continue
             }
 
@@ -131,14 +172,21 @@ enum MarkdownBlockParser {
                 var ordered = false
                 var start = 1
                 var first = true
+                var baseIndent = 0
                 while index < lines.count {
                     let candidate = lines[index]
                     if let marker = listMarker(candidate) {
                         if first {
                             ordered = marker.ordered
                             start = marker.number ?? 1
+                            baseIndent = marker.indent
                             first = false
-                        } else if marker.ordered != ordered {
+                        } else if marker.ordered != ordered, marker.indent <= baseIndent {
+                            // A different marker type back at (or above) the list's own indent is
+                            // a sibling list of the other kind, not a nested continuation of this
+                            // one. A deeper-indented marker of the other kind (e.g. a bullet
+                            // nested under an ordered item) still folds in below instead of
+                            // splitting the list in two.
                             break
                         }
                         items.append(MarkdownListItem(
@@ -243,6 +291,85 @@ enum MarkdownBlockParser {
         return (hashes.count, text.trimmingCharacters(in: .whitespaces))
     }
 
+    /// A setext underline is a run of only `=` (H1) or only `-` (H2); the caller only consults
+    /// this while a paragraph is in progress, so a document-initial `---`/`===` never matches.
+    private static func setextLevel(_ trimmed: String) -> Int? {
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.allSatisfy({ $0 == "=" }) { return 1 }
+        if trimmed.allSatisfy({ $0 == "-" }) { return 2 }
+        return nil
+    }
+
+    /// Drops one lone trailing backslash (CommonMark's explicit hard-break marker). A trailing
+    /// pair (`\\`) is an escaped backslash meant to stay visible, not a break marker, so only an
+    /// odd run is stripped, and only its final character.
+    private static func stripTrailingHardBreakMarker(_ line: String) -> String {
+        guard line.hasSuffix("\\") else { return line }
+        let trailingBackslashes = line.reversed().prefix { $0 == "\\" }.count
+        guard trailingBackslashes % 2 == 1 else { return line }
+        return String(line.dropLast())
+    }
+
+    /// Splits one table row on unescaped, non-code-span pipes. A single optional leading and
+    /// trailing pipe (the usual `| a | b |` framing) is stripped first so a genuinely empty edge
+    /// cell (`| a | |`) is never confused with the optional outer framing. Returns `nil` for a
+    /// line that cannot be a table row at all (no pipe outside a code span).
+    private static func splitTableRow(_ trimmed: String) -> [String]? {
+        guard trimmed.contains("|") else { return nil }
+        var body = Substring(trimmed)
+        if body.hasPrefix("|") { body = body.dropFirst() }
+        if body.hasSuffix("|"), !body.hasSuffix("\\|") { body = body.dropLast() }
+        guard !body.isEmpty else { return nil }
+
+        var cells: [String] = []
+        var current = ""
+        var inCode = false
+        var chars = Substring(body)[...]
+        while let ch = chars.first {
+            if ch == "\\", chars.count >= 2 {
+                current.append(ch)
+                current.append(chars[chars.index(after: chars.startIndex)])
+                chars = chars.dropFirst(2)
+                continue
+            }
+            if ch == "`" { inCode.toggle() }
+            if ch == "|", !inCode {
+                cells.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+                chars = chars.dropFirst()
+                continue
+            }
+            current.append(ch)
+            chars = chars.dropFirst()
+        }
+        cells.append(current.trimmingCharacters(in: .whitespaces))
+        return cells
+    }
+
+    /// Validates a delimiter row (`---`, `:---`, `---:`, `:---:` per cell) and reports each
+    /// column's alignment. `nil` means "not a table": either the cell count does not match the
+    /// header, or some cell is not a pure dash run.
+    private static func tableDelimiterAlignment(_ line: String, columns: Int) -> [MarkdownTableAlignment]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let cells = splitTableRow(trimmed), cells.count == columns else { return nil }
+        var alignments: [MarkdownTableAlignment] = []
+        for cell in cells {
+            let left = cell.hasPrefix(":")
+            let right = cell.hasSuffix(":")
+            let core = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            guard !core.isEmpty, core.allSatisfy({ $0 == "-" }) else { return nil }
+            alignments.append(left && right ? .center : right ? .trailing : left ? .leading : .none)
+        }
+        return alignments
+    }
+
+    /// Ragged body rows are padded or truncated to the header's column count, per GFM.
+    private static func normalizeRow(_ cells: [String], to columns: Int) -> [String] {
+        if cells.count == columns { return cells }
+        if cells.count > columns { return Array(cells.prefix(columns)) }
+        return cells + Array(repeating: "", count: columns - cells.count)
+    }
+
     private struct ListMarker {
         let ordered: Bool
         let number: Int?
@@ -331,6 +458,7 @@ enum MarkdownInline {
         }
         result.font = .system(size: size)
         styleCodeSpans(in: &result, size: size)
+        linkifyBareURLs(in: &result)
         return result
     }
 
@@ -346,6 +474,29 @@ enum MarkdownInline {
             guard run.inlinePresentationIntent?.contains(.code) == true else { continue }
             string[run.range].font = .system(size: max(11, size - 1.5), design: .monospaced)
             string[run.range].backgroundColor = .piInset
+        }
+    }
+
+    /// Apple's Markdown parser links `[text](url)` and `<url>` but not a bare "https://…" typed
+    /// straight into prose, which is how Pi and users both write URLs most of the time. This
+    /// finds `http(s)://` runs Apple's parser left as plain text (never inside an existing link
+    /// or a code span) and turns them into real links using the same `.link` attribute, so they
+    /// render with the identical styling `Text` already gives markdown-authored links.
+    private static func linkifyBareURLs(in string: inout AttributedString) {
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return }
+        let plain = String(string.characters)
+        guard !plain.isEmpty else { return }
+        let matches = detector.matches(in: plain, range: NSRange(plain.startIndex..., in: plain))
+        for match in matches {
+            guard let url = match.url, let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+                  let stringRange = Range(match.range, in: plain) else { continue }
+            guard let lower = AttributedString.Index(stringRange.lowerBound, within: string),
+                  let upper = AttributedString.Index(stringRange.upperBound, within: string) else { continue }
+            let range = lower..<upper
+            // Never override a real markdown link or relabel a code span as a link.
+            guard string[range].link == nil,
+                  string[range].runs.allSatisfy({ $0.inlinePresentationIntent?.contains(.code) != true }) else { continue }
+            string[range].link = url
         }
     }
 }
@@ -417,6 +568,8 @@ private struct MarkdownBlockRow: View {
             }
         case let .code(language, code):
             CodeBlockView(language: language, code: code)
+        case let .table(header, alignment, rows):
+            MarkdownTableView(header: header, alignment: alignment, rows: rows, size: size)
         case .rule:
             PiHairline().padding(.vertical, PiTheme.space4)
         }
@@ -495,4 +648,83 @@ struct CodeBlockView: View {
             copied = false
         }
     }
+}
+
+/// A GFM pipe table rendered as a real native table: a quiet (secondary, medium-weight, not
+/// heavy/bold) header, one hairline under it, per-column alignment, and no per-cell borders —
+/// row rhythm comes from spacing, not ruled lines, so it reads like part of this UI rather than
+/// an imported HTML table. Wrapped in a horizontal `ScrollView` so a wide table scrolls instead
+/// of compressing its columns or blowing out the fixed transcript width.
+struct MarkdownTableView: View {
+    let header: [String]
+    let alignment: [MarkdownTableAlignment]
+    let rows: [[String]]
+    let size: CGFloat
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .topLeading, horizontalSpacing: PiTheme.space16, verticalSpacing: PiTheme.space6) {
+                GridRow {
+                    ForEach(Array(header.enumerated()), id: \.offset) { index, cell in
+                        cellText(cell, column: index, emphasis: true)
+                    }
+                }
+                Divider()
+                    .gridCellColumns(max(1, header.count))
+                    .overlay(Color.piHairline)
+                ForEach(Array(normalizedRows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(Array(row.enumerated()), id: \.offset) { index, cell in
+                            cellText(cell, column: index, emphasis: false)
+                        }
+                    }
+                }
+            }
+            .padding(.trailing, PiTheme.space4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Table, \(header.count) columns, \(rows.count) rows")
+    }
+
+    /// Defensive against ragged rows even if a caller builds `.table` directly (the parser
+    /// already normalizes), since `Grid` expects one cell per column in every `GridRow`.
+    private var normalizedRows: [[String]] {
+        rows.map { row -> [String] in
+            if row.count == header.count { return row }
+            if row.count > header.count { return Array(row.prefix(header.count)) }
+            return row + Array(repeating: "", count: header.count - row.count)
+        }
+    }
+
+    private func cellText(_ text: String, column: Int, emphasis: Bool) -> some View {
+        Text(MarkdownInline.attributed(text, size: size))
+            .font(emphasis ? PiFont.bodyEmphasis : .system(size: size))
+            .foregroundStyle(emphasis ? .secondary : .primary)
+            .lineSpacing(PiFont.bodyLineSpacing)
+            .multilineTextAlignment(textAlignment(column))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: true, vertical: true)
+            .gridColumnAlignment(horizontalAlignment(column))
+    }
+
+    private func horizontalAlignment(_ column: Int) -> HorizontalAlignment {
+        switch alignment[safe: column] ?? .none {
+        case .center: .center
+        case .trailing: .trailing
+        case .leading, .none: .leading
+        }
+    }
+
+    private func textAlignment(_ column: Int) -> TextAlignment {
+        switch alignment[safe: column] ?? .none {
+        case .center: .center
+        case .trailing: .trailing
+        case .leading, .none: .leading
+        }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }

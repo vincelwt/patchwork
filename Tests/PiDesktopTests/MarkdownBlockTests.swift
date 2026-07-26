@@ -209,4 +209,177 @@ final class MarkdownBlockTests: XCTestCase {
         let blocks = MarkdownBlockParser.blocks(from: source)
         XCTAssertEqual(blocks.count, 5_000)
     }
+
+    // MARK: - Tables
+
+    func testBasicTableParsesHeaderAlignmentAndRows() {
+        let source = """
+        | Name | Age | City |
+        |:-----|:---:|-----:|
+        | Ada  | 30  | NYC  |
+        | Grace | 40 | DC |
+        """
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        XCTAssertEqual(blocks.count, 1)
+        guard case let .table(header, alignment, rows) = blocks[0] else { return XCTFail("Expected a table") }
+        XCTAssertEqual(header, ["Name", "Age", "City"])
+        XCTAssertEqual(alignment, [.leading, .center, .trailing])
+        XCTAssertEqual(rows, [["Ada", "30", "NYC"], ["Grace", "40", "DC"]])
+    }
+
+    func testTableWithoutOuterPipesStillParses() {
+        let source = "Name | Score\n--- | ---\nAda | 9"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        guard case let .table(header, alignment, rows) = blocks.first else { return XCTFail("Expected a table") }
+        XCTAssertEqual(header, ["Name", "Score"])
+        XCTAssertEqual(alignment, [.none, .none])
+        XCTAssertEqual(rows, [["Ada", "9"]])
+    }
+
+    func testRaggedRowsArePaddedAndTruncatedToHeaderWidth() {
+        let source = "| A | B | C |\n|---|---|---|\n| short |\n| too | many | cells | here |"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        guard case let .table(_, _, rows) = blocks.first else { return XCTFail("Expected a table") }
+        XCTAssertEqual(rows, [["short", "", ""], ["too", "many", "cells"]])
+    }
+
+    func testEscapedPipeDoesNotSplitACell() {
+        let source = "| A | B |\n|---|---|\n| a \\| b | plain |"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        guard case let .table(_, _, rows) = blocks.first else { return XCTFail("Expected a table") }
+        XCTAssertEqual(rows, [["a \\| b", "plain"]])
+    }
+
+    func testPipeInsideCodeSpanDoesNotSplitACell() {
+        let source = "| A | B |\n|---|---|\n| `a\\|b` | plain |"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        guard case let .table(_, _, rows) = blocks.first else { return XCTFail("Expected a table") }
+        XCTAssertEqual(rows.first?.first, "`a\\|b`")
+    }
+
+    func testTableCellsCarryInlineSpans() {
+        let source = "| A |\n|---|\n| **bold** and `code` |"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        guard case let .table(_, _, rows) = blocks.first else { return XCTFail("Expected a table") }
+        let attributed = MarkdownInline.attributed(rows[0][0])
+        XCTAssertEqual(String(attributed.characters), "bold and code")
+        XCTAssertTrue(attributed.runs.contains { $0.inlinePresentationIntent?.contains(.code) == true })
+    }
+
+    func testInvalidDelimiterRowFallsBackToParagraphs() {
+        // Column count mismatch: not a table, so both lines stay ordinary paragraph text.
+        let blocks = MarkdownBlockParser.blocks(from: "A | B\n---|---|---")
+        XCTAssertEqual(blocks, [.paragraph("A | B\n---|---|---")])
+    }
+
+    func testTableWithoutPipesIsNotDetected() {
+        // No pipe anywhere: this is the classic setext-heading shape, not a one-column table.
+        guard case .heading = MarkdownBlockParser.blocks(from: "Title\n---").first else {
+            return XCTFail("A pipe-less pair must not become a table")
+        }
+    }
+
+    func testTableCanInterruptAParagraphWithoutABlankLine() {
+        let blocks = MarkdownBlockParser.blocks(from: "Intro\n| A | B |\n|---|---|\n| 1 | 2 |")
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(blocks[0], .paragraph("Intro"))
+        guard case .table = blocks[1] else { return XCTFail("Expected a table") }
+    }
+
+    // MARK: - Setext headings
+
+    func testSetextHeadingsProduceH1AndH2() {
+        XCTAssertEqual(MarkdownBlockParser.blocks(from: "Title\n====="), [.heading(level: 1, text: "Title")])
+        XCTAssertEqual(MarkdownBlockParser.blocks(from: "Subtitle\n---"), [.heading(level: 2, text: "Subtitle")])
+    }
+
+    func testSetextHeadingCanSpanAMultiLineParagraph() {
+        XCTAssertEqual(
+            MarkdownBlockParser.blocks(from: "Line one\nLine two\n==="),
+            [.heading(level: 1, text: "Line one\nLine two")]
+        )
+    }
+
+    func testLoneUnderlineWithoutAPrecedingParagraphStaysARule() {
+        // Regression guard: setext must never hijack a standalone thematic break.
+        XCTAssertEqual(MarkdownBlockParser.blocks(from: "---"), [.rule])
+        XCTAssertEqual(MarkdownBlockParser.blocks(from: "Body\n\n---"), [.paragraph("Body"), .rule])
+    }
+
+    // MARK: - Nested/mixed list continuation
+
+    func testBulletNestedUnderAnOrderedItemFoldsIntoOneList() {
+        let blocks = MarkdownBlockParser.blocks(from: "1. First\n   - nested\n2. Second")
+        XCTAssertEqual(blocks.count, 1, "A same-type sibling after a nested nested item must not split the list")
+        guard case let .list(items, ordered, _) = blocks[0] else { return XCTFail("Expected one list") }
+        XCTAssertTrue(ordered, "The list's own type follows its first item")
+        XCTAssertEqual(items.map(\.text), ["First", "nested", "Second"])
+        XCTAssertEqual(items.map(\.marker), ["1.", "•", "2."])
+        XCTAssertEqual(items.map(\.depth), [0, 1, 0])
+    }
+
+    func testSiblingListOfADifferentTypeAtTopLevelStillStartsANewBlock() {
+        let blocks = MarkdownBlockParser.blocks(from: "1. First\n- bullet")
+        XCTAssertEqual(blocks.count, 2, "An unindented marker of the other kind ends the first list")
+        guard case let .list(first, firstOrdered, _) = blocks[0] else { return XCTFail("Expected a list") }
+        XCTAssertTrue(firstOrdered)
+        XCTAssertEqual(first.map(\.text), ["First"])
+        guard case let .list(second, secondOrdered, _) = blocks[1] else { return XCTFail("Expected a second list") }
+        XCTAssertFalse(secondOrdered)
+        XCTAssertEqual(second.map(\.text), ["bullet"])
+    }
+
+    // MARK: - Strikethrough
+
+    func testStrikethroughIsRecognizedAsAPresentationIntent() {
+        let attributed = MarkdownInline.attributed("~~gone~~ stays")
+        let plain = String(attributed.characters)
+        XCTAssertEqual(plain, "gone stays")
+        let struck = attributed.runs.contains { $0.inlinePresentationIntent?.contains(.strikethrough) == true }
+        XCTAssertTrue(struck, "~~text~~ must carry a strikethrough presentation intent")
+    }
+
+    // MARK: - Autolinks
+
+    func testBareHTTPURLBecomesAClickableLink() {
+        let attributed = MarkdownInline.attributed("See https://pi.dev/docs for more")
+        let links = attributed.runs.compactMap(\.link)
+        XCTAssertEqual(links.map(\.absoluteString), ["https://pi.dev/docs"])
+        XCTAssertEqual(String(attributed.characters), "See https://pi.dev/docs for more", "The visible text is untouched")
+    }
+
+    func testAngleBracketAutolinkIsClickable() {
+        let attributed = MarkdownInline.attributed("<https://pi.dev>")
+        let links = attributed.runs.compactMap(\.link)
+        XCTAssertEqual(links.map(\.absoluteString), ["https://pi.dev"])
+    }
+
+    func testBareURLInsideAnExistingMarkdownLinkIsNotDoubleLinked() {
+        let attributed = MarkdownInline.attributed("[docs](https://pi.dev/docs)")
+        let links = attributed.runs.compactMap(\.link)
+        XCTAssertEqual(links.count, 1)
+        XCTAssertEqual(links.first?.absoluteString, "https://pi.dev/docs")
+    }
+
+    // MARK: - Hard line breaks
+
+    func testTrailingBackslashHardBreakIsConsumedNotShownLiterally() {
+        let blocks = MarkdownBlockParser.blocks(from: "line one\\\nline two")
+        XCTAssertEqual(blocks, [.paragraph("line one\nline two")], "The break marker itself must not remain visible")
+    }
+
+    func testEscapedTrailingBackslashPairIsKeptLiteral() {
+        let blocks = MarkdownBlockParser.blocks(from: "line one\\\\\nline two")
+        XCTAssertEqual(blocks, [.paragraph("line one\\\\\nline two")], "An even run is a literal escaped backslash, not a break marker")
+    }
+
+    // MARK: - Inline code containing backticks
+
+    func testInlineCodeSpanCanContainABacktickUsingADoubleBacktickFence() {
+        let attributed = MarkdownInline.attributed("Use `` `quoted` `` here")
+        let codeRuns = attributed.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }
+        XCTAssertFalse(codeRuns.isEmpty, "A double-backtick fence must still produce a code span")
+        let codeText = codeRuns.map { String(attributed.characters[$0.range]) }.joined()
+        XCTAssertTrue(codeText.contains("`quoted`"), "The inner backticks are content, not delimiters")
+    }
 }
