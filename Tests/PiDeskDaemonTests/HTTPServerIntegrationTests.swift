@@ -86,6 +86,28 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertTrue(readResult.thread.unread)
     }
 
+    func testRunningThreadBecomesUnreadOnlyAfterItFinishes() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-running", cwd: "/tmp/project")
+        let heartbeatURL = directory.appendingPathComponent("activity/sess-running.json")
+        let writeHeartbeat: (String) throws -> Void = { state in
+            try """
+            {"sessionId":"sess-running","pid":\(getpid()),"state":"\(state)","updatedAt":"\(PiDeskDate.string(from: Date()))"}
+            """.write(to: heartbeatURL, atomically: true, encoding: .utf8)
+        }
+
+        try writeHeartbeat("running")
+        let runningList = try await client.listThreads()
+        let runningThread = try XCTUnwrap(runningList.threads.first)
+        XCTAssertTrue(runningThread.running)
+        XCTAssertFalse(runningThread.unread, "A running turn is not unread yet")
+
+        try writeHeartbeat("idle")
+        let idleList = try await client.listThreads()
+        let idleThread = try XCTUnwrap(idleList.threads.first)
+        XCTAssertFalse(idleThread.running)
+        XCTAssertTrue(idleThread.unread, "The completed turn becomes unread")
+    }
+
     func testSendMessageEnqueuesAFakeRunAndItCompletes() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-3", cwd: "/tmp/project")
         let sent = try await client.sendMessage(threadId: "sess-3", SendMessageRequest(text: "do the thing"))
