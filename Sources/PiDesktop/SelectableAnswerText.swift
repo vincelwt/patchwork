@@ -121,6 +121,7 @@ private struct SelectableTextRun: View {
             onHoverChange: onHoverChange
         )
         .frame(height: height)
+        .clipped()
         .background(
             GeometryReader { proxy in
                 Color.clear.preference(key: AnswerWidthKey.self, value: proxy.size.width)
@@ -295,6 +296,13 @@ final class AnswerTextView: NSTextView {
         onHoverChange?(false)
     }
 
+    /// The only measurement that is ever right: after AppKit has laid the view out, when the
+    /// container's width finally matches the column the text actually wraps into.
+    override func layout() {
+        super.layout()
+        reportGeometry()
+    }
+
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         // Width changes rewrap the text, which changes both the intrinsic height and every code
@@ -304,9 +312,6 @@ final class AnswerTextView: NSTextView {
 
     private func reportGeometry() {
         guard let container = textContainer, let manager = layoutManager else { return }
-        if measuringWidth > 1, abs(container.size.width - measuringWidth) > 0.5 {
-            container.size = CGSize(width: measuringWidth, height: .greatestFiniteMagnitude)
-        }
         manager.ensureLayout(for: container)
         let height = manager.usedRect(for: container).height.rounded(.up)
         if abs(height - reportedHeight) > 0.5 {
