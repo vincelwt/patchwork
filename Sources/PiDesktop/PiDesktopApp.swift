@@ -49,6 +49,8 @@ struct PiDesktopApp: App {
                 Button("Compact Context", action: store.compact)
                     .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
                 Divider()
+                Button("Automations…") { store.schedulesPresented = true }
+                    .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Toggle Environment") { store.inspectorVisible.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
             }
@@ -141,6 +143,9 @@ struct RootView: View {
             ExtensionDialogView(request: request).environmentObject(store)
         }
         .sheet(item: $store.viewedImage) { item in ImageViewerView(payload: item.image) }
+        .sheet(isPresented: $store.schedulesPresented) {
+            SchedulesView(service: store.scheduleService).environmentObject(store)
+        }
         .overlay {
             if store.quickSwitchPresented {
                 QuickSwitchOverlay()

@@ -133,6 +133,9 @@ final class AppStore: ObservableObject {
     @Published var quickSwitchPresented = false
     /// Shared request surface: sidebar and application menu present the same creation alert.
     @Published var newVirtualFolderRequested = false
+    @Published var schedulesPresented = false
+    /// Lazily created so the panel keeps one service for the app's lifetime.
+    var cachedScheduleService: (any ScheduleServing)?
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
     /// True only while the ephemeral status probe runtime is attached.
