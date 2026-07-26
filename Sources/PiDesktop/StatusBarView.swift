@@ -161,11 +161,14 @@ private struct CodexAccountControl: View {
                 if let remaining = account.compactRemaining {
                     Text(remaining).monospacedDigit()
                 }
+                if let reset = account.compactReset {
+                    Text(reset).monospacedDigit()
+                }
             }
             .font(PiFont.micro)
             .foregroundStyle(tint)
             .opacity(isLive ? 1 : 0.55)
-            .frame(maxWidth: 210, alignment: .trailing)
+            .frame(maxWidth: 260, alignment: .trailing)
         }
         .buttonStyle(.plain)
         .popover(isPresented: $showingDetail, arrowEdge: .bottom) {

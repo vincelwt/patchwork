@@ -93,6 +93,17 @@ struct CodexAccountStatus: Equatable, Sendable {
         return "\(window.label) \(window.remainingPercent)%"
     }
 
+    var compactReset: String? {
+        guard let count = bankedResetCount, count > 0 else { return nil }
+        return "reset×\(count)" + (bankedResetExpiry.map { ":\($0)" } ?? "")
+    }
+
+    /// Exact extension-style summary used where percentages and reset detail must stay visible.
+    var compactUsage: String? {
+        let parts = windows.map { "\($0.label):\($0.remainingPercent)%" } + [compactReset].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
     var detailLines: [String] {
         var lines = [account]
         for window in windows { lines.append("\(window.label) window · \(window.remainingPercent)% remaining") }

@@ -68,6 +68,8 @@ final class AppStore: ObservableObject {
     @Published var windowTitle = "Pi Desktop"
     @Published var inspectorVisible = true
     @Published var quickSwitchPresented = false
+    /// Shared request surface: sidebar and application menu present the same creation alert.
+    @Published var newVirtualFolderRequested = false
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
     /// True only while the ephemeral status probe runtime is attached.
@@ -79,7 +81,7 @@ final class AppStore: ObservableObject {
     private let repository: SessionRepositoryProtocol
     private let gitService: GitStatusProviding
     private let runtime: PiRuntimeProtocol
-    private let persistence: AppPersistence
+    let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
     /// Creates the short-lived `--no-session` runtime used only to refresh extension statuses.
     /// `nil` disables probing entirely (tests never spawn a process).
@@ -114,6 +116,7 @@ final class AppStore: ObservableObject {
         self.activityPresenter = activityPresenter
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
         self.probeRuntimeFactory = probeRuntimeFactory
+        selectedFolder = Self.nowhereFolderURL
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
 
         runtime.onEvent = { [weak self] value in self?.handleRPCEvent(value) }
@@ -225,7 +228,7 @@ final class AppStore: ObservableObject {
             }
             await refreshSessions()
             if selectedFolder == nil {
-                selectedFolder = recentFolders.first
+                selectedFolder = Self.nowhereFolderURL
                 if let selectedFolder { await refreshGit(for: selectedFolder) }
             }
         }
@@ -256,6 +259,7 @@ final class AppStore: ObservableObject {
     }
 
     func openNewChat() {
+        if let selectedSession { markRead(selectedSession) }
         cancelConversationLoad()
         route = .newChat
         conversationError = nil
@@ -266,15 +270,17 @@ final class AppStore: ObservableObject {
         attachments = []
         // Release the previous conversation's decoded bitmaps promptly.
         DecodedImageCache.purge()
-        if selectedFolder == nil { selectedFolder = recentFolders.first }
+        selectedFolder = Self.nowhereFolderURL
         refreshSelectedGit()
     }
 
     func selectSession(_ session: SessionSummary, preserveDraft: Bool = false) {
+        if let current = selectedSession, current.id != session.id { markRead(current) }
         cancelConversationLoad()
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
         route = .session(session.id)
+        markRead(session)
         conversationError = nil
         messages.removeAll(keepingCapacity: false)
         streamingMessage = nil

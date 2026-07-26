@@ -22,6 +22,9 @@ enum PiTheme {
     static let sidebarIdealWidth: CGFloat = 268
     static let sidebarMinWidth: CGFloat = 232
     static let sidebarMaxWidth: CGFloat = 340
+    static let windowMinimumWidth: CGFloat = 700
+    static let windowMinimumHeight: CGFloat = 520
+    static let sidebarAutoCollapseWidth: CGFloat = 860
     static let transcriptMaxWidth: CGFloat = 780
     static let composerMaxWidth: CGFloat = 780
     static let inspectorWidth: CGFloat = 272
@@ -81,6 +84,7 @@ enum PiTheme {
     /// Quick switcher.
     static let quickSwitchWidth: CGFloat = 560
     static let quickSwitchRowHeight: CGFloat = 34
+    static let menuBarWidth: CGFloat = 320
     static let quickSwitchResultLimit = 60
 }
 

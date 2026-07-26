@@ -132,28 +132,34 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     private static func sessionCandidates(rootURL: URL) throws -> [Candidate] {
         let manager = FileManager.default
         guard manager.fileExists(atPath: rootURL.path) else { return [] }
-        let folderKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
-        let folders = try manager.contentsOfDirectory(
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
+        let rootItems = try manager.contentsOfDirectory(
             at: rootURL,
-            includingPropertiesForKeys: Array(folderKeys),
-            options: [.skipsHiddenFiles]
-        ).filter { (try? $0.resourceValues(forKeys: folderKeys).isDirectory) == true }
+            includingPropertiesForKeys: Array(keys),
+            options: []
+        )
 
-        var candidates: [Candidate] = []
-        for folder in folders {
+        // Pi stores one project directory below the session root. Only JSONLs directly in the
+        // root or those project directories are user threads; deeper session.jsonl files are
+        // subagent/process artifacts and must not be promoted into the sidebar.
+        var files = rootItems.filter { $0.pathExtension.lowercased() == "jsonl" }
+        for folder in rootItems where (try? folder.resourceValues(forKeys: keys).isDirectory) == true {
             try Task.checkCancellation()
-            let files = (try? manager.contentsOfDirectory(
+            files += (try? manager.contentsOfDirectory(
                 at: folder,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
-            for file in files where file.pathExtension.lowercased() == "jsonl" {
-                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
-                      values.isRegularFile == true else { continue }
-                candidates.append(Candidate(url: file.standardizedFileURL, fingerprint: SessionFileFingerprint(url: file, values: values)))
-            }
+                includingPropertiesForKeys: Array(keys),
+                options: []
+            ).filter { $0.pathExtension.lowercased() == "jsonl" }) ?? []
         }
-        return candidates
+
+        var seen: Set<String> = []
+        return files.compactMap { file in
+            let normalized = file.standardizedFileURL
+            guard seen.insert(normalized.path).inserted,
+                  let values = try? normalized.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else { return nil }
+            return Candidate(url: normalized, fingerprint: SessionFileFingerprint(url: normalized, values: values))
+        }
     }
 }
 
@@ -206,6 +212,11 @@ final class AppPersistence {
         state.recentFolders.removeAll { $0 == path }
         state.recentFolders.insert(path, at: 0)
         state.recentFolders = Array(state.recentFolders.prefix(8))
+        save()
+    }
+
+    func updateState(_ update: (inout PersistedAppState) -> Void) {
+        update(&state)
         save()
     }
 

@@ -318,6 +318,12 @@ struct PersistedAppState: Codable {
     /// Last known extension statuses (already ANSI-stripped) so the footer is populated before
     /// any runtime attaches.
     var cachedExtensionStatuses: [String: String] = [:]
+    /// App-only organization. Keys are standardized session-file paths, never Pi JSONL IDs.
+    var virtualFolders: [VirtualFolder] = []
+    var virtualFolderAssignments: [String: String] = [:]
+    /// Unread state is also keyed by session-file path so duplicate/migrated IDs cannot collide.
+    var lastReadAt: [String: Date] = [:]
+    var manuallyUnreadSessionPaths: Set<String> = []
 
     init() {}
 
@@ -330,6 +336,10 @@ struct PersistedAppState: Codable {
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
+        virtualFolders = try container.decodeIfPresent([VirtualFolder].self, forKey: .virtualFolders) ?? []
+        virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
+        lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
+        manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
     }
 }
 
