@@ -48,6 +48,11 @@ let package = Package(
             name: "PiDeskDaemonTests",
             dependencies: ["PiDeskDaemon", "PiDeskKit"],
             path: "Tests/PiDeskDaemonTests"
+        ),
+        .testTarget(
+            name: "PiDeskCLITests",
+            dependencies: ["PiDeskCLI", "PiDeskKit"],
+            path: "Tests/PiDeskCLITests"
         )
     ]
 )
