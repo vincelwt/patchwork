@@ -56,16 +56,20 @@ struct SidebarView: View {
 
                 // Pinned below the scroller instead of living inside it, so Archived always
                 // sits in the same quiet spot above the footer instead of floating mid-list.
-                if !snapshot.archivedGroups.isEmpty {
+                // Disclosure now lives in the status bar; the list only exists while open.
+                if !snapshot.archivedGroups.isEmpty, archiveExpanded || snapshot.isFiltering {
                     PiHairline()
-                    ArchiveSection(groups: snapshot.archivedGroups, expanded: $archiveExpanded,
-                                   forceExpanded: snapshot.isFiltering)
+                    ArchiveSection(groups: snapshot.archivedGroups, forceExpanded: snapshot.isFiltering)
                         .padding(.horizontal, PiTheme.space6)
                 }
             }
 
             PiHairline()
-            SidebarFooter()
+            SidebarFooter(
+                archivedCount: snapshot.all.filter(\.isArchived).count,
+                archiveExpanded: $archiveExpanded,
+                archiveForcedOpen: snapshot.isFiltering
+            )
         }
         // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
         // filtering it drives below) stays wired for when a query is ever supplied again.
@@ -110,7 +114,11 @@ private struct SidebarActionRow: View {
 
 private struct SidebarFooter: View {
     @EnvironmentObject private var store: AppStore
+    let archivedCount: Int
+    @Binding var archiveExpanded: Bool
+    let archiveForcedOpen: Bool
     private var runningCount: Int { store.runningSessions.count }
+    private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
@@ -121,6 +129,19 @@ private struct SidebarFooter: View {
                     .accessibilityValue(label)
             }
             Spacer(minLength: PiTheme.space4)
+            if archivedCount > 0 {
+                Button { archiveExpanded.toggle() } label: {
+                    Image(systemName: "archivebox")
+                        .font(.system(size: PiIcon.small, weight: .medium))
+                        .foregroundStyle(archiveOpen ? Color.accentColor : .secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(archiveOpen ? "Hide archived (\(archivedCount))" : "Show archived (\(archivedCount))")
+                .accessibilityLabel("Archived, \(archivedCount) conversations")
+                .accessibilityValue(archiveOpen ? "expanded" : "collapsed")
+            }
             Button { Task { await store.refreshSessions() } } label: {
                 Group {
                     if store.isScanning { ProgressView().controlSize(.mini) }
@@ -314,44 +335,17 @@ private let archiveExpandedMaxHeight: CGFloat = 220
 
 private struct ArchiveSection: View {
     let groups: [SessionFolderGroup]
-    @Binding var expanded: Bool
     let forceExpanded: Bool
-    @State private var hovering = false
-    private var isOpen: Bool { expanded || forceExpanded }
-    private var totalCount: Int { groups.reduce(0) { $0 + $1.sessions.count } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: PiTheme.space2) {
-            Button { expanded.toggle() } label: {
-                HStack(spacing: PiTheme.space6) {
-                    Image(systemName: "archivebox")
-                        .font(.system(size: PiIcon.small)).foregroundStyle(.tertiary)
-                        .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
-                    Text("Archived").font(SidebarTypography.folderHeader).foregroundStyle(.secondary)
-                    Spacer(minLength: PiTheme.space4)
+        ScrollView {
+            VStack(alignment: .leading, spacing: PiTheme.space2) {
+                ForEach(groups) { group in
+                    SessionFolderSection(group: group, archived: true, forceExpanded: forceExpanded)
                 }
-                .padding(.horizontal, PiTheme.space8)
-                .frame(height: PiTheme.folderHeaderHeight)
-                .contentShape(Rectangle())
-                .piRowBackground(selected: false, hovering: hovering)
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering = $0 }
-            // The count no longer has an on-screen home, but VoiceOver still gets it.
-            .accessibilityLabel("Archived, \(totalCount) conversations")
-            .accessibilityValue(isOpen ? "expanded" : "collapsed")
-
-            if isOpen {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: PiTheme.space2) {
-                        ForEach(groups) { group in
-                            SessionFolderSection(group: group, archived: true, forceExpanded: forceExpanded)
-                        }
-                    }
-                }
-                .frame(maxHeight: archiveExpandedMaxHeight)
             }
         }
+        .frame(maxHeight: archiveExpandedMaxHeight)
         .padding(.top, PiTheme.space8)
     }
 }
