@@ -1315,10 +1315,13 @@ final class AppStore: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func optimisticMessage(text: String) -> ChatMessage {
+    private static func optimisticMessage(text: String, attachments: [ImageAttachment]) -> ChatMessage {
         ChatMessage(
             id: "local-\(UUID().uuidString)", role: .user,
-            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))],
+            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))] + attachments.map {
+                let image = ImagePayload(id: $0.id.uuidString, data: $0.data, mimeType: $0.mimeType, fileName: $0.fileName)
+                return MessageBlock(id: image.id, kind: .image(image))
+            },
             timestamp: Date(), raw: .null
         )
     }
@@ -1326,8 +1329,6 @@ final class AppStore: ObservableObject {
     func submitDraft(delivery: DeliveryMode = .automatic) {
         let text = Self.sanitizedMessage(draft)
         guard !text.isEmpty || !attachments.isEmpty else { return }
-        let prompt = ImageAttachment.prompt(text: text, attachments: attachments)
-
         let cwd: URL
         let sessionPath: URL?
         if let selectedSession { cwd = selectedSession.cwd; sessionPath = selectedSession.fileURL }
@@ -1339,7 +1340,7 @@ final class AppStore: ObservableObject {
         let origin = DraftOrigin(route: route, sessionPath: sessionPath?.standardizedFileURL.path)
         let optimisticID: String?
         if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
-            let message = Self.optimisticMessage(text: prompt)
+            let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
             optimisticID = message.id
             messages = enforcingLoadedImageBudget(messages + [message])
         } else {
@@ -2377,7 +2378,8 @@ final class AppStore: ObservableObject {
             slot.pendingTurn = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
         }
 
-        let payload: [String: JSONValue] = ["message": .string(prompt)]
+        var payload: [String: JSONValue] = ["message": .string(prompt)]
+        if !sentAttachments.isEmpty { payload["images"] = .array(sentAttachments.map(\.rpcValue)) }
         let wasStreaming = state(for: slot).isStreaming
         let previousPhase = state(for: slot).phase
         if command == "prompt" {
@@ -2846,9 +2848,10 @@ final class AppStore: ObservableObject {
         for entry in due {
             let command = entry.delivery == .steer ? "steer" : "follow_up"
             let token = beginOutboxDispatch(for: slot)
-            let payload: [String: JSONValue] = [
+            var payload: [String: JSONValue] = [
                 "message": .string(ImageAttachment.prompt(text: entry.text, attachments: entry.attachments))
             ]
+            if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
             slot.runtime.send(type: command, payload: payload) { [weak self] result in
                 self?.finishOutboxDispatch(
                     owner: token.owner,

@@ -262,6 +262,28 @@ final class TranscriptPresenterTests: XCTestCase {
                       "The nested tool detail must not render a second copy of the image")
     }
 
+    func testReadDoesNotRepeatTheUserImageInWorkOutput() throws {
+        let image = ImagePayload(id: "user-image", data: Data([0]), mimeType: "image/png", fileName: nil)
+        let user = ChatMessage(
+            id: "user", role: .user,
+            blocks: [MessageBlock(id: "user-image-block", kind: .image(image))],
+            timestamp: nil, raw: .null
+        )
+        let result = ChatMessage(
+            id: "read-result", role: .tool,
+            blocks: [MessageBlock(id: "read-image-block", kind: .image(image))],
+            timestamp: nil, toolCallID: "read-call", raw: .null
+        )
+        let items = TranscriptPresenter.items(messages: [
+            user,
+            assistant(id: "read", blocks: [call("read-call", "read", [:])]),
+            result
+        ], streaming: nil)
+
+        guard case let .work(work) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertTrue(work.prominentSteps.isEmpty)
+    }
+
     // MARK: - "failed" reflects the turn's answer, not any one step
 
     func testHeaderHidesFailedWhenOnlyAToolStepFailedButTheAnswerSucceeded() throws {
