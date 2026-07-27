@@ -56,6 +56,14 @@ final class DaemonScheduleService: ScheduleServing {
         }
     }
 
+    func loadRuns(scheduleID: String) async throws -> [Run] {
+        do {
+            return try await client.listRuns(scheduleId: scheduleID, limit: PiTheme.runHistoryLimit).runs
+        } catch {
+            throw Self.surfaced(error)
+        }
+    }
+
     /// A missing daemon is the common case on a fresh install, so it gets a sentence a person
     /// can act on instead of a socket error.
     private static func surfaced(_ error: Error) -> Error {
