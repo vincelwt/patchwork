@@ -142,7 +142,7 @@ export function renderNewThread(state, actions) {
     h(
       "header",
       { class: "topbar" },
-      h("button", { class: "icon-btn", "aria-label": "Back", onclick: () => actions.navigate("/") }, "\u2039"),
+      h("button", { class: "icon-btn icon-btn-back", type: "button", "aria-label": "Back", onclick: () => actions.navigate("/") }, "\u2039"),
       h("h1", { tabindex: "-1" }, "New thread")
     ),
     h("div", { class: "scroll" }, form)

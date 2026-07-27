@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pi-desktop-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-17",
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY", "class_name": "Relay" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Relay"] }
+  ],
+  "ratelimits": [
+    { "name": "CONNECTION_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 120, "period": 60 } },
+    { "name": "ENROLLMENT_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 3, "period": 60 } },
+    { "name": "FRAME_RATE_LIMITER", "namespace_id": "1003", "simple": { "limit": 1200, "period": 60 } }
+  ],
+  "assets": {
+    "directory": "../Sources/PiDeskWeb/Site",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/relay/*"]
+  },
+  "routes": [
+    { "pattern": "remote.ai.gloom.sh", "custom_domain": true }
+  ]
+}

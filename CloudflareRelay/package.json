@@ -1,0 +1,17 @@
+{
+  "name": "pi-desktop-cloudflare-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit",
+    "test": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/test/*.test.js"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.114.0"
+  }
+}

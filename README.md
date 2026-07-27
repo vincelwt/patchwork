@@ -44,7 +44,11 @@ the window is closed. The wire contract is `docs/daemon-api.md`; the CLI referen
 |---|---|---|
 | Daemon | `pi-deskd` | Scheduler, thread runner, control API over a Unix socket (and loopback TCP when enabled) |
 | CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
-| Web remote | served by the daemon | Phone-first UI for threads and schedules, bearer-token authenticated |
+| Web remote | `remote.ai.gloom.sh` | QR-paired, end-to-end encrypted phone UI for threads and schedules |
+
+Click the phone button in the sidebar footer to pair a browser. The hosted relay starts with the
+daemon and needs no VPN, inbound port, or tunnel; each browser stays paired until its site data
+is cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
 
 The daemon starts and stops with the app by default: `Pi Desktop.app` bundles `pi-deskd`/`pidesk`
 in `Contents/Helpers/` and supervises them (start on launch if nothing is already running,
@@ -62,7 +66,7 @@ scripts/install-daemon.sh              # LaunchAgent, starts at login, restarts 
 pidesk threads list
 pidesk schedule add --name "Morning triage" --thread <id> \
     --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
-pidesk remote enable --port 7717      # then reach it through your own SSH/Cloudflare tunnel
+pidesk remote enable --port 7717      # optional legacy loopback/tunnel listener
 ```
 
 If both are present, the app defers to the LaunchAgent rather than running a second daemon;

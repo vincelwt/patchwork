@@ -148,6 +148,27 @@ public final class PiDeskClient: Sendable {
 
     public func limits() async throws -> LimitsSnapshot { try await get("/v1/limits") }
 
+    // MARK: - Hosted remote
+
+    public func remoteAccessStatus() async throws -> RemoteAccessStatus {
+        try await get("/v1/remote")
+    }
+
+    public func createRemotePairing() async throws -> RemotePairingOffer {
+        try await post("/v1/remote/pairings", body: Optional<Empty>.none)
+    }
+
+    public func decideRemotePairing(id: String, approved: Bool) async throws -> RemoteAccessStatus {
+        try await post(
+            "/v1/remote/pairings/\(pathComponent: id)",
+            body: RemotePairingDecisionRequest(approved: approved)
+        )
+    }
+
+    public func revokeRemoteDevice(id: String) async throws -> RemoteDeletedResponse {
+        try await send("DELETE", "/v1/remote/devices/\(pathComponent: id)", body: Optional<Empty>.none)
+    }
+
     // MARK: - Events (SSE)
 
     /// Consumes `GET /v1/events` for as long as the caller keeps iterating. Ends the stream

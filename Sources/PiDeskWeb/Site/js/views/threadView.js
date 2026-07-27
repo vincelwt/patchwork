@@ -5,6 +5,12 @@ import { clockTime } from "../time.mjs";
 
 const INITIAL_MESSAGE_COUNT = 50;
 const REFRESH_DEBOUNCE_MS = 700;
+const NEAR_BOTTOM_PX = 120;
+
+// A physical keyboard means Enter should send and Shift+Enter should break the line, the way
+// every desktop chat client behaves. On a touch keyboard Enter stays a newline — the Send button
+// is right there, and a mistyped Return should not fire a prompt at the model.
+const hasPointer = window.matchMedia("(pointer: fine)").matches;
 
 /**
  * A single thread: messages plus compose/abort/archive/rename. Message text is untrusted model
@@ -19,28 +25,52 @@ export function renderThreadView(state, actions, threadId) {
   let thread = state.threads.find((t) => t.id === threadId) || null;
   let refetchTimer = null;
   let fetchingMessages = false;
+  let refetchQueued = false;
+  let renderedCount = 0;
+  let loadedOnce = false;
+  let lastRunSignature = "";
 
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
-  const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true" });
+  const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
   const cwdEl = h("div", { class: "cwd" });
-  const runningBadge = h("span", { class: "spinner", role: "status", "aria-label": "Running", hidden: true });
   const archiveBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Archive thread", onclick: onToggleArchive }, "\u2298");
-  const abortBtn = h("button", { class: "icon-btn btn-danger", type: "button", "aria-label": "Abort run", hidden: true, onclick: onAbort }, "\u25a0");
 
   const messagesEl = h("div", { class: "messages" });
   const loadEarlierBtn = h("button", { class: "btn btn-block", type: "button", onclick: onLoadEarlier, hidden: true }, "Load earlier");
-  const scroll = h("div", { class: "scroll content-pad" }, loadEarlierBtn, messagesEl);
+  // Focus target for the router (see app.js): the thread's title lives in an editable button
+  // that has to stay in the tab order, so the labelled message region announces the screen.
+  const scroll = h("div", { class: "scroll content-pad", tabindex: "-1", "aria-label": "Thread" }, loadEarlierBtn, messagesEl);
 
-  const textarea = h("textarea", { rows: "1", "aria-label": "Message", placeholder: "Message", oninput: autoGrow });
-  const sendBtn = h("button", { class: "btn btn-primary", type: "submit" }, "Send");
-  const composerError = h("div", { class: "inline-error", role: "alert", hidden: true });
-  const menuToggle = h("button", { class: "icon-btn", type: "button", "aria-label": "More send options", "aria-expanded": "false", onclick: onToggleMenu }, "\u22ef");
+  const textarea = h("textarea", {
+    rows: "1",
+    "aria-label": "Message",
+    placeholder: "Message",
+    autocapitalize: "sentences",
+    oninput: onInput,
+    onkeydown: onComposerKeydown,
+    onfocus: () => scrollToBottom("auto")
+  });
+  const sendBtn = h("button", { class: "btn btn-primary", type: "submit", disabled: true }, "Send");
+  const composerError = h("div", { class: "inline-error composer-error", role: "alert", hidden: true });
+  const menuToggle = h(
+    "button",
+    { class: "icon-btn", type: "button", "aria-label": "More send options", "aria-expanded": "false", onclick: toggleMenu },
+    "\u22ef"
+  );
   const composerForm = h("form", { class: "composer", onsubmit: (e) => onSend(e, "auto") }, textarea, menuToggle, sendBtn);
   const composerMenu = h(
     "div",
-    { class: "composer-menu", hidden: true },
+    { class: "composer-menu", hidden: true, onkeydown: (e) => e.key === "Escape" && closeMenu(true) },
     h("button", { class: "link-btn", type: "button", onclick: () => onSend(null, "followUp") }, "Send as follow-up"),
     h("button", { class: "link-btn", type: "button", onclick: () => onSend(null, "steer") }, "Send as steer (interrupt)")
+  );
+
+  const runStatus = h(
+    "div",
+    { class: "run-status", role: "status", hidden: true },
+    h("span", { class: "spinner" }),
+    h("span", null, "Pi is working\u2026"),
+    h("button", { class: "link-btn btn-danger", type: "button", onclick: onAbort }, "Stop")
   );
 
   const node = h(
@@ -49,31 +79,50 @@ export function renderThreadView(state, actions, threadId) {
     h(
       "header",
       { class: "topbar" },
-      h("button", { class: "icon-btn", "aria-label": "Back to threads", onclick: () => actions.navigate("/") }, "\u2039"),
+      h("button", { class: "icon-btn icon-btn-back", type: "button", "aria-label": "Back to threads", onclick: () => actions.navigate("/") }, "\u2039"),
       h("div", { class: "thread-header" }, h("div", null, titleBtn, titleInput), cwdEl),
-      runningBadge,
-      archiveBtn,
-      abortBtn
+      archiveBtn
     ),
     scroll,
-    composerError,
-    composerMenu,
-    composerForm
+    h("div", { class: "composer-dock" }, runStatus, composerError, composerMenu, composerForm)
   );
 
   paintHeader();
+  paintSkeleton();
   loadMessages();
   actions.markRead(threadId);
 
-  function autoGrow() {
+  function onInput() {
+    // Height is set from the content and clamped by the stylesheet's max-height, so the growth
+    // ceiling stays a layout concern rather than a magic number here.
     textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 160)}px`;
+    textarea.style.height = `${textarea.scrollHeight}px`;
+    sendBtn.disabled = textarea.value.trim().length === 0;
   }
 
-  function onToggleMenu() {
-    const open = composerMenu.hidden;
-    composerMenu.hidden = !open;
-    menuToggle.setAttribute("aria-expanded", String(open));
+  function onComposerKeydown(event) {
+    if (event.key !== "Enter") return;
+    const send = (event.metaKey || event.ctrlKey) || (hasPointer && !event.shiftKey && !event.altKey);
+    if (!send) return;
+    event.preventDefault();
+    onSend(null, "auto");
+  }
+
+  function toggleMenu() {
+    if (composerMenu.hidden) {
+      composerMenu.hidden = false;
+      menuToggle.setAttribute("aria-expanded", "true");
+      composerMenu.querySelector("button")?.focus();
+    } else {
+      closeMenu(true);
+    }
+  }
+
+  function closeMenu(restoreFocus) {
+    if (composerMenu.hidden) return;
+    composerMenu.hidden = true;
+    menuToggle.setAttribute("aria-expanded", "false");
+    if (restoreFocus) menuToggle.focus();
   }
 
   function onSend(event, delivery) {
@@ -82,13 +131,14 @@ export function renderThreadView(state, actions, threadId) {
     if (!text) return;
     composerError.hidden = true;
     sendBtn.disabled = true;
+    sendBtn.textContent = "Sending\u2026";
     actions
       .sendMessage(threadId, { text, delivery })
       .then(() => {
         textarea.value = "";
-        autoGrow();
-        composerMenu.hidden = true;
-        menuToggle.setAttribute("aria-expanded", "false");
+        onInput();
+        closeMenu(false);
+        scrollToBottom();
         return loadMessages();
       })
       .catch((err) => {
@@ -96,23 +146,41 @@ export function renderThreadView(state, actions, threadId) {
         composerError.textContent = describeError(err);
       })
       .finally(() => {
-        sendBtn.disabled = false;
+        sendBtn.textContent = "Send";
+        sendBtn.disabled = textarea.value.trim().length === 0;
       });
   }
 
   function onAbort() {
-    abortBtn.disabled = true;
-    actions.abortThread(threadId).catch(() => {}).finally(() => {
-      abortBtn.disabled = false;
-    });
+    const stopBtn = runStatus.querySelector("button");
+    stopBtn.disabled = true;
+    actions
+      .abortThread(threadId)
+      .catch((err) => {
+        composerError.hidden = false;
+        composerError.textContent = describeError(err);
+      })
+      .finally(() => {
+        stopBtn.disabled = false;
+      });
   }
 
   function onToggleArchive() {
     if (!thread) return;
-    actions.archiveThread(threadId, !thread.archived).then((updated) => {
-      thread = updated;
-      paintHeader();
-    });
+    archiveBtn.disabled = true;
+    actions
+      .archiveThread(threadId, !thread.archived)
+      .then((updated) => {
+        thread = updated;
+        paintHeader();
+      })
+      .catch((err) => {
+        composerError.hidden = false;
+        composerError.textContent = describeError(err);
+      })
+      .finally(() => {
+        archiveBtn.disabled = false;
+      });
   }
 
   function onRenameStart() {
@@ -149,50 +217,98 @@ export function renderThreadView(state, actions, threadId) {
 
   function onLoadEarlier() {
     messageLimit += INITIAL_MESSAGE_COUNT;
+    loadEarlierBtn.disabled = true;
     loadEarlierBtn.textContent = "Loading\u2026";
     loadMessages();
   }
 
   function paintHeader() {
-    titleBtn.textContent = thread?.name || "Untitled";
+    const name = thread?.name || "Untitled";
+    titleBtn.textContent = name;
+    scroll.setAttribute("aria-label", name);
     cwdEl.textContent = thread?.cwd || "";
-    runningBadge.hidden = !thread?.running;
-    abortBtn.hidden = !thread?.running;
+    cwdEl.hidden = !thread?.cwd;
+    runStatus.hidden = !thread?.running;
     archiveBtn.setAttribute("aria-pressed", String(!!thread?.archived));
     archiveBtn.setAttribute("aria-label", thread?.archived ? "Unarchive thread" : "Archive thread");
   }
 
   function loadMessages() {
-    if (fetchingMessages) return Promise.resolve();
+    if (fetchingMessages) {
+      // A refresh that arrives mid-flight would otherwise be dropped and the newest message
+      // would sit invisible until the next event.
+      refetchQueued = true;
+      return Promise.resolve();
+    }
     fetchingMessages = true;
-    const nearBottom = isScrolledNearBottom();
+    const nearBottom = !loadedOnce || isScrolledNearBottom();
+    const distanceFromBottom = scroll.scrollHeight - scroll.scrollTop;
     return api
       .thread(threadId, messageLimit)
       .then(({ thread: freshThread, messages }) => {
         thread = freshThread;
+        loadedOnce = true;
         paintHeader();
         paintMessages(messages);
         loadEarlierBtn.hidden = messages.length < messageLimit;
+        loadEarlierBtn.disabled = false;
         loadEarlierBtn.textContent = "Load earlier";
-        if (nearBottom) scroll.scrollTop = scroll.scrollHeight;
+        if (nearBottom) scrollToBottom(renderedCount ? "smooth" : "auto");
+        // Older messages were prepended: hold the reading position instead of jumping.
+        else scroll.scrollTop = scroll.scrollHeight - distanceFromBottom;
       })
       .catch((err) => {
         mount(messagesEl, h("div", { class: "inline-error", role: "alert" }, describeError(err)));
+        renderedCount = 0;
       })
       .finally(() => {
         fetchingMessages = false;
+        if (refetchQueued) {
+          refetchQueued = false;
+          loadMessages();
+        }
       });
   }
 
   function isScrolledNearBottom() {
-    return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 120;
+    return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < NEAR_BOTTOM_PX;
+  }
+
+  function scrollToBottom(behavior = "smooth") {
+    requestAnimationFrame(() => {
+      scroll.scrollTo({ top: scroll.scrollHeight, behavior });
+    });
+  }
+
+  function paintSkeleton() {
+    mount(
+      messagesEl,
+      Array.from({ length: 3 }, () =>
+        h(
+          "div",
+          { class: "msg msg-skeleton", "aria-hidden": "true" },
+          h("div", { class: "skeleton" }),
+          h("div", { class: "skeleton" }),
+          h("div", { class: "skeleton" })
+        )
+      )
+    );
   }
 
   function paintMessages(messages) {
+    if (!messages.length) {
+      mount(messagesEl, h("div", { class: "empty-state" }, h("p", { class: "empty-body" }, "No messages yet. Send the first one below.")));
+      renderedCount = 0;
+      return;
+    }
+    // Only genuinely new trailing messages animate in; a plain refresh of the same list must not
+    // flash the whole transcript.
+    const firstNew = renderedCount && messages.length > renderedCount ? renderedCount : messages.length;
     mount(
       messagesEl,
-      messages.map((message) => renderMessage(message))
+      messages.map((message, index) => renderMessage(message, index >= firstNew))
     );
+    renderedCount = messages.length;
   }
 
   function scheduleRefetch() {
@@ -206,6 +322,15 @@ export function renderThreadView(state, actions, threadId) {
   return {
     node,
     onStateChange(next) {
+      const run = next.lastRunEvent;
+      const runSignature = run ? `${run.id}:${run.status}:${run.finishedAt || ""}` : "";
+      if (run?.threadId === threadId && runSignature !== lastRunSignature) {
+        lastRunSignature = runSignature;
+        thread = { ...thread, running: run.status === "running" };
+        paintHeader();
+        scheduleRefetch();
+      }
+
       const event = next.lastThreadEvent;
       if (!event || (event.id !== threadId && event.path !== thread?.path)) return;
       const wasUpdatedAt = thread?.updatedAt;
@@ -216,14 +341,16 @@ export function renderThreadView(state, actions, threadId) {
   };
 }
 
-function renderMessage(message) {
+function renderMessage(message, isNew) {
   const role = ["user", "assistant", "toolResult", "system"].includes(message.role) ? message.role : "system";
   const roleClass = { user: "msg-user", assistant: "msg-assistant", toolResult: "msg-tool", system: "msg-system" }[role];
-  const wrapClass = message.isError ? `msg ${roleClass} msg-error` : `msg ${roleClass}`;
+  const classes = ["msg", roleClass];
+  if (message.isError) classes.push("msg-error");
+  if (isNew) classes.push("msg-new");
   const bodyClass = role === "user" ? "bubble" : "prose";
   return h(
     "div",
-    { class: wrapClass },
+    { class: classes.join(" ") },
     h("div", { class: "msg-meta" }, `${roleLabel(role)} \u00b7 ${clockTime(message.at)}`),
     h("div", { class: bodyClass, html: renderMarkdown(message.text || "") })
   );
