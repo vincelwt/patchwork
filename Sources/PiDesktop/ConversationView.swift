@@ -246,6 +246,14 @@ struct MessageScrollView: View {
         store.activeQuestionnaireSession.map { "\($0.toolCallID):\($0.currentIndex)" }
     }
 
+    /// An image can arrive inside an existing work block without changing the transcript count.
+    private var prominentImageIDs: [String] {
+        transcriptItems.flatMap { item -> [String] in
+            guard case let .work(block) = item else { return [] }
+            return block.prominentSteps.flatMap { $0.result?.images.map(\.id) ?? [] }
+        }
+    }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView {
@@ -323,6 +331,9 @@ struct MessageScrollView: View {
                 }
             }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in
+                scheduleBottomScroll(reader)
+            }
+            .onChange(of: prominentImageIDs) { _, _ in
                 scheduleBottomScroll(reader)
             }
             // Only when already pinned (`scheduleBottomScroll` checks): a question appearing must
