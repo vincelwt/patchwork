@@ -13,6 +13,10 @@ struct ConversationScrollMetrics: Equatable {
     var isNearBottom: Bool {
         documentHeight - (originY + viewportHeight) <= PiTheme.transcriptScrollEdgeThreshold
     }
+    var isUnderfilled: Bool {
+        documentHeight > 1 && viewportHeight > 1 && documentHeight <= viewportHeight + 1
+    }
+    var shouldRequestEarlierHistory: Bool { isNearTop && (direction == .up || isUnderfilled) }
 }
 
 @MainActor
@@ -92,7 +96,10 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         func attach(from view: NSView) {
             guard let candidate = view.enclosingScrollView else { return }
-            guard candidate !== scrollView else { return }
+            if candidate === scrollView {
+                publish()
+                return
+            }
             detach()
             scrollView = candidate
             candidate.contentView.postsBoundsChangedNotifications = true

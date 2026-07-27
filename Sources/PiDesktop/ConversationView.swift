@@ -296,14 +296,21 @@ struct MessageScrollView: View {
     @State private var prependPending = false
     @State private var didRestoreInitialAnchor = false
     @State private var autoPageAttempts = 0
+    @State private var underfillPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
     @State private var initialDefaultScrollAnchor: UnitPoint?
     @State private var projectionCache = TranscriptProjectionCache()
     private let bottomID = "conversation-bottom"
     private let coordinateSpaceName = "conversation-scroll"
 
+    static func unseenTargetID(_ sourceID: String?, in items: [TranscriptItem]) -> String? {
+        guard let sourceID else { return nil }
+        return items.first(where: { $0.sourceMessageID == sourceID })?.id
+    }
+
     private func requestedDefaultScrollAnchor(items: [TranscriptItem]) -> UnitPoint {
-        if unseenMessageID != nil { return .top }
+        if unseenMessageID != nil,
+           store.isConversationLoading || Self.unseenTargetID(unseenMessageID, in: items) != nil { return .top }
         if let restoredAnchorID, restoredAnchorID != bottomID,
            items.contains(where: { $0.id == restoredAnchorID }) { return .top }
         return .bottom
@@ -347,7 +354,7 @@ struct MessageScrollView: View {
                             .frame(maxWidth: .infinity)
                             .accessibilityLabel("Loading earlier messages")
                     } else if store.hasEarlierMessages {
-                        Button("Load earlier messages", action: requestEarlierMessages)
+                        Button("Load earlier messages") { requestEarlierMessages() }
                             .buttonStyle(.plain)
                             .font(PiFont.caption)
                             .foregroundStyle(.secondary)
@@ -432,6 +439,9 @@ struct MessageScrollView: View {
                 restoreInitialAnchorIfPossible(items: items, reader: reader)
                 if didRestoreInitialAnchor, isPinnedToBottom, !prependPending { scheduleBottomScroll(reader) }
             }
+            .onChange(of: store.isConversationLoading) { wasLoading, isLoading in
+                if wasLoading, !isLoading { restoreInitialAnchorIfPossible(items: items, reader: reader) }
+            }
             .onChange(of: messages.last?.id) { _, _ in scheduleBottomScroll(reader) }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in scheduleBottomScroll(reader) }
             .onChange(of: imageIDs) { _, _ in scheduleBottomScroll(reader) }
@@ -479,22 +489,36 @@ struct MessageScrollView: View {
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
         if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
         if metrics.isNearBottom { onVisibleAnchorChange(bottomID) }
-        if metrics.direction == .up, metrics.isNearTop { requestEarlierMessages() }
+        guard didRestoreInitialAnchor, metrics.shouldRequestEarlierHistory else { return }
+        if metrics.isUnderfilled {
+            guard underfillPageAttempts < 2 else { return }
+            if requestEarlierMessages() { underfillPageAttempts += 1 }
+        } else {
+            requestEarlierMessages()
+        }
     }
 
-    private func requestEarlierMessages() {
-        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !prependPending else { return }
+    @discardableResult
+    private func requestEarlierMessages() -> Bool {
+        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !prependPending else { return false }
         prependPending = true
         scrollBridge.captureBeforePrepend()
         store.loadEarlierMessages()
+        return true
     }
 
     private func restoreInitialAnchorIfPossible(items: [TranscriptItem], reader: ScrollViewProxy) {
         guard !didRestoreInitialAnchor else { return }
         let target: String?
-        if let unseenMessageID {
-            target = items.first(where: { $0.sourceMessageID == unseenMessageID })?.id
-            guard target != nil else { return }
+        if unseenMessageID != nil {
+            if let unseenTarget = Self.unseenTargetID(unseenMessageID, in: items) {
+                target = unseenTarget
+            } else if store.isConversationLoading {
+                return
+            } else {
+                // Empty/error completions can fold into a work row and have no standalone target.
+                target = bottomID
+            }
         } else if let restoredAnchorID {
             if restoredAnchorID == bottomID || items.contains(where: { $0.id == restoredAnchorID }) {
                 target = restoredAnchorID

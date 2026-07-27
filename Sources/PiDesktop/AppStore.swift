@@ -297,8 +297,8 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
-    /// Explicit ceiling for a user-expanded transcript window. The newest page is 50 messages;
-    /// older pages remain on demand without allowing a long browsing session to retain forever.
+    /// Explicit ceiling for a user-expanded transcript window. Pages target 50 messages and may
+    /// finish the current turn; older pages stay on demand without retaining history forever.
     private static let loadedMessageLimit = 1_000
 
     init(
