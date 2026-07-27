@@ -9,14 +9,14 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 - Minimal three-column workspace: global conversations under **Recents**, folder-grouped project sessions, a centered transcript/composer, and a reserved Environment inspector column
 - New conversations start globally (Pi uses `~/Desktop` as its neutral cwd); **Choose…** lists only projects already known from sidebar conversations
-- App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
+- App-owned folders created from the sidebar context menu, nesting at any depth inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
 - Codex-style turns: running work stays collapsed to a fading latest-reasoning line with a spinner, expands into borderless details on demand, and settles into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
 - Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
-- Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening shows the latest 50 messages and scrolling upward pages through the active JSONL branch without an eager full-history parse
+- Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening reads at least 50 messages through the current turn boundary, fills a short viewport automatically, and pages upward through the active JSONL branch without an eager full-history parse
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename even while Pi is working, HTML export, reveal, and compaction
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
 - Sidebar rows carry their status on the trailing edge: a pulsing green dot while Pi is working, a blue dot when unread, and a clock when any automation (running or paused) targets that conversation. The composer takes focus as soon as a conversation opens.
@@ -29,7 +29,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. The composer grows around inline image previews so its text stays visible. Composer images are sent to Pi as local file paths instead of embedded base64, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
 - Subagent/background-process lifecycle presentation, with compact agent type, model, tool-call count, and runtime metadata, plus Pi extension UI dialogs/status/widgets/title/editor bridge
-- A native `ask_user_question` questionnaire rendered inline in the transcript outside nested tool disclosures instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. While unanswered it stays visible even when the work log is collapsed, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
+- A native `ask_user_question` questionnaire rendered inline in the transcript outside nested tool disclosures instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. While unanswered it stays visible even when the work log is collapsed, its thread uses a purple sidebar status dot, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels
 
 No provider request is made when the app launches, browses sessions, inspects Git, or renames a session.
@@ -145,7 +145,7 @@ While Pi is running, the delivery menu explicitly offers **Steer current run** a
 ## Architecture
 
 - **`FileSessionRepository` / `SessionSummaryCache`** — discovers direct project session files, excludes nested subagent sessions, and maintains a versioned atomic cache keyed by standardized path, file size, and modification time. Archive flags are applied after lookup; missing files are pruned.
-- **`SessionParser`** — bounded reverse JSONL paging over the final active parent chain. The newest and older-page APIs project 50 messages at a time, ignore an unterminated final line until its LF arrives, traverse compaction/branch entries without retaining raw history, and cap each scan at 64 MiB / 20,000 records with a 32 MiB single-record ceiling. Legacy full parsing remains only for compatibility and diagnostics, not conversation opening.
+- **`SessionParser`** — bounded reverse JSONL paging over the final active parent chain. Pages meet a 50-message target and finish at a user-turn or compaction boundary (with a 1,000-message hard ceiling), ignore an unterminated final line until its LF arrives, traverse compaction/branch entries without retaining raw history, and cap each scan at 64 MiB / 20,000 records with a 32 MiB single-record ceiling. Legacy full parsing remains only for compatibility and diagnostics, not conversation opening.
 - **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of projected page windows and their older cursors, warmed on launch and around the selected session, never persisted. Lock protection keeps a hit synchronous so selection can publish it in the same tick.
 - **`PiRuntimeProtocol` / `PiRPCClient`** — strict LF JSONL framing, correlated commands, same-folder idle-process session switching, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, exact small untracked-text LOC classification, and linked-worktree detection (`git rev-parse --git-dir` vs `--git-common-dir`, detailed via `git worktree list --porcelain`).
@@ -177,7 +177,7 @@ Archiving never moves or edits a Pi JSONL file.
 ## Performance and memory
 
 - Warm scans do not reparse unchanged JSONL files; warm page hits publish synchronously.
-- Cold opens read the newest 50 active-branch messages only. Older pages load on upward intent, prepend without moving the viewport, and stop retaining at 1,000 displayed messages.
+- Cold opens read the newest bounded turn-aligned page. Short pages automatically pull enough earlier history to fill the viewport; later pages load on upward intent, prepend without moving the viewport, and stop retaining at 1,000 displayed messages.
 - Rapid route changes cancel newest-page, older-page, and activity-projection work and reject stale publications.
 - Abandoned branches and raw/base64 trees are not retained. A torn final JSONL line is invisible until complete.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
@@ -187,7 +187,7 @@ Archiving never moves or edits a Pi JSONL file.
 - The transcript cache bounds both entry count and estimated byte cost (text plus already-budgeted image bytes), evicting least-recently-used windows first.
 - Opening uses SwiftUI's native bottom anchor plus one explicit settled-position restore. TextKit supplies a nonzero first-pass measure even before SwiftUI proposes a width. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
 - Instruments points-of-interest mark newest-page read, first publish, first text paint, activity projection, prepend, viewport restore, RPC ready, and first model output.
-- The current 25.8 MiB largest-session gate reads its newest page in about 32 ms (5.5 MiB scanned) versus about 1.05 s for the legacy full parse, so no sidecar index is justified yet; add one only if measured page latency stops meeting the sub-50 ms target.
+- The current 25.8 MiB largest-session gate reads a warm 50-message page in about 35–39 ms (5.5 MiB scanned); extending a cold page to a 140-message turn boundary took about 51 ms, versus 1.1–1.2 s for the legacy full parse. No sidecar index is justified by those measurements.
 
 ## Verification
 

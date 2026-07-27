@@ -15,10 +15,6 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
             SidebarActionRow(
-                title: "New folder", symbol: "folder.badge.plus", shortcut: "",
-                action: { store.newVirtualFolderRequested = true }
-            )
-            SidebarActionRow(
                 title: "Automations", symbol: "clock.arrow.2.circlepath", shortcut: "⌥⌘S",
                 action: { store.schedulesPresented = true },
                 selected: store.schedulesPresented
@@ -70,6 +66,9 @@ struct SidebarView: View {
                 archiveExpanded: $archiveExpanded,
                 archiveForcedOpen: snapshot.isFiltering
             )
+        }
+        .contextMenu {
+            Button("New Folder…") { store.newVirtualFolderRequested = true }
         }
         // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
         // filtering it drives below) stays wired for when a query is ever supplied again.
@@ -555,6 +554,7 @@ private struct SessionRow: View {
         }
         return false
     }
+    private var waitingForQuestion: Bool { store.isWaitingForQuestion(session) }
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
     private var scheduled: Bool { store.scheduledThreadIDs.contains(session.id) }
@@ -603,7 +603,7 @@ private struct SessionRow: View {
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
         .help(session.cwd.path)
-        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
+        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
     /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
@@ -630,8 +630,8 @@ private struct SessionRow: View {
     }
 
     /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
-    /// running outranks unread, because "working now" is the more urgent of the two. One explicit
-    /// stack, so the pair is always grouped and ordered on the trailing edge.
+    /// waiting for an answer outranks running, which outranks unread. One explicit stack keeps
+    /// the pair grouped and ordered on the trailing edge.
     private var trailingAccessory: some View {
         HStack(spacing: PiTheme.space6) {
             if hovering {
@@ -646,7 +646,9 @@ private struct SessionRow: View {
                     .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
                     .help("Runs on a schedule")
             }
-            if running {
+            if waitingForQuestion {
+                StatusDot(color: .piPurple).help("Waiting for your answer")
+            } else if running {
                 StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
             } else if unread {
                 StatusDot(color: .piBlue).help("Unread")

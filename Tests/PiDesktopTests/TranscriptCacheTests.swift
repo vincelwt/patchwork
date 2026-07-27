@@ -63,7 +63,7 @@ final class TranscriptCacheTests: XCTestCase {
         {"type":"message","id":"two","parentId":"one","message":{"role":"assistant","content":"two"}}
 
         """.utf8).write(to: url)
-        let page = try SessionParser.conversationPage(at: url, target: 1)
+        let page = try SessionParser.conversationPage(at: url, target: 1, alignToTurnBoundary: false)
         let fp = try SessionFileFingerprint(
             url: url,
             values: url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
