@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="Pi Desktop"
 APP="$ROOT/dist/$APP_NAME.app"
+INSTALLED_APP="/Applications/$APP_NAME.app"
 
 cd "$ROOT"
 echo "Building release binaries…"
@@ -85,6 +86,10 @@ if command -v codesign >/dev/null 2>&1; then
     codesign --verify --deep --strict "$APP"
 fi
 
+rm -rf "$INSTALLED_APP"
+ditto "$APP" "$INSTALLED_APP"
+
 echo "Created: $APP"
-echo "Run with: open '$APP'"
+echo "Installed: $INSTALLED_APP"
+echo "Run with: open '$INSTALLED_APP'"
 echo "Bundled helpers: Contents/Helpers/pi-deskd, Contents/Helpers/pidesk"
