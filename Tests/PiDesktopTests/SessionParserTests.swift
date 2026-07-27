@@ -258,6 +258,143 @@ final class SessionParserTests: XCTestCase {
         )
     }
 
+    // MARK: - Bounded conversation paging
+
+    func testRepositoryPagesTheActiveBranchWithoutDuplicates() async throws {
+        let file = temporaryDirectory.appendingPathComponent("paged-branch.jsonl")
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "paged", "cwd": temporaryDirectory.path]]
+        var parent: Any = NSNull()
+        var activeIDs: [String] = []
+        for index in 0..<125 {
+            if index == 60 {
+                lines.append(["type": "message", "id": "abandoned-1", "parentId": parent,
+                              "message": ["role": "user", "content": "abandoned one"]])
+                lines.append(["type": "message", "id": "abandoned-2", "parentId": "abandoned-1",
+                              "message": ["role": "assistant", "content": "abandoned two"]])
+            }
+            let id = "entry-\(index)"
+            lines.append(["type": "message", "id": id, "parentId": parent,
+                          "message": ["role": index.isMultiple(of: 2) ? "user" : "assistant", "content": "active \(index)"]])
+            activeIDs.append(id)
+            parent = id
+        }
+        try write(lines: lines, to: file)
+
+        let repository = FileSessionRepository(rootURL: temporaryDirectory)
+        var pages = [try await repository.loadNewestConversationPage(from: file)]
+        while let cursor = pages.last?.olderCursor {
+            pages.append(try await repository.loadOlderConversationPage(from: file, cursor: cursor))
+        }
+
+        XCTAssertEqual(pages.map(\.messages.count), [50, 50, 25])
+        XCTAssertTrue(pages.last?.hasNoMoreHistory == true)
+        XCTAssertTrue(pages.allSatisfy { $0.leafID == "entry-124" })
+        let pagedIDs = pages.reversed().flatMap { $0.messages.map(\.id) }
+        XCTAssertEqual(pagedIDs, activeIDs)
+        XCTAssertEqual(Set(pagedIDs).count, pagedIDs.count)
+        XCTAssertFalse(pagedIDs.contains("abandoned-1"))
+        XCTAssertGreaterThan(pages[1].scannedEntryCount, pages[1].rawEntryCount,
+                             "The bounded scan may inspect abandoned records without projecting them")
+    }
+
+    func testOlderPageCrossesCompactionAndKeepsPreCompactionHistory() async throws {
+        let file = temporaryDirectory.appendingPathComponent("paged-compaction.jsonl")
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "compact", "cwd": temporaryDirectory.path]]
+        var parent: Any = NSNull()
+        for index in 0..<20 {
+            let id = "before-\(index)"
+            lines.append(["type": "message", "id": id, "parentId": parent,
+                          "message": ["role": "user", "content": "before \(index)"]])
+            parent = id
+        }
+        lines.append(["type": "compaction", "id": "compact-1", "parentId": parent, "summary": "bounded summary"])
+        parent = "compact-1"
+        for index in 0..<50 {
+            let id = "after-\(index)"
+            lines.append(["type": "message", "id": id, "parentId": parent,
+                          "message": ["role": "assistant", "content": "after \(index)"]])
+            parent = id
+        }
+        try write(lines: lines, to: file)
+
+        let repository = FileSessionRepository(rootURL: temporaryDirectory)
+        let newest = try await repository.loadNewestConversationPage(from: file)
+        XCTAssertEqual(newest.messages.map(\.id), (0..<50).map { "after-\($0)" })
+        let cursor = try XCTUnwrap(newest.olderCursor)
+        let older = try await repository.loadOlderConversationPage(from: file, cursor: cursor)
+
+        XCTAssertEqual(older.messages.first?.id, "before-0")
+        XCTAssertEqual(older.messages.last?.id, "compact-1")
+        XCTAssertTrue(older.messages.last?.textContent.contains("bounded summary") == true)
+        XCTAssertTrue(older.hasNoMoreHistory)
+        XCTAssertEqual(older.leafID, "after-49")
+    }
+
+    func testTornFinalLineIsIgnoredThenAppearsAfterRepair() async throws {
+        let file = temporaryDirectory.appendingPathComponent("torn.jsonl")
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "torn", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "root", "parentId": NSNull(),
+             "message": ["role": "user", "content": "complete root"]]
+        ], to: file)
+        let tail = try JSONSerialization.data(withJSONObject: [
+            "type": "message", "id": "tail", "parentId": "root",
+            "message": ["role": "assistant", "content": "repaired tail"]
+        ])
+        let split = tail.count / 2
+        let writer = try FileHandle(forWritingTo: file)
+        try writer.seekToEnd()
+        try writer.write(contentsOf: tail.prefix(split))
+        try writer.close()
+
+        let repository = FileSessionRepository(rootURL: temporaryDirectory)
+        let torn = try await repository.loadNewestConversationPage(from: file)
+        XCTAssertEqual(torn.messages.map(\.id), ["root"])
+        XCTAssertEqual(torn.leafID, "root")
+        XCTAssertEqual(try SessionParser.conversation(at: file).messages.map(\.id), ["root"])
+
+        let repair = try FileHandle(forWritingTo: file)
+        try repair.seekToEnd()
+        try repair.write(contentsOf: tail.suffix(from: split))
+        try repair.write(contentsOf: Data([0x0A]))
+        try repair.close()
+
+        let repaired = try await repository.loadNewestConversationPage(from: file)
+        XCTAssertEqual(repaired.messages.map(\.id), ["root", "tail"])
+        XCTAssertEqual(repaired.leafID, "tail")
+        XCTAssertEqual(try SessionParser.conversation(at: file).messages.map(\.id), ["root", "tail"])
+    }
+
+    func testPagingProjectsHugeKnownAndUnknownPayloadsWithinExplicitBounds() throws {
+        let file = temporaryDirectory.appendingPathComponent("paged-huge.jsonl")
+        let huge = String(repeating: "payload", count: 300_000)
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "huge", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "known", "parentId": NSNull(),
+             "message": ["role": "user", "content": huge]],
+            ["type": "future_entry", "id": "unknown", "parentId": "known", "futurePayload": huge]
+        ], to: file)
+
+        let page = try SessionParser.conversationPage(at: file)
+        XCTAssertEqual(page.messages.map(\.id), ["known", "unknown"])
+        XCTAssertLessThanOrEqual(page.messages[0].textContent.count, 160_002)
+        XCTAssertEqual(page.messages[0].raw, .null)
+        XCTAssertLessThanOrEqual(page.messages[1].raw.stringValue?.count ?? .max, PiTheme.unknownPayloadLimit + 2)
+        XCTAssertLessThanOrEqual(page.scannedByteCount, SessionParser.PageLimits.default.maxScanBytes)
+
+        let tinyLimits = SessionParser.PageLimits(
+            maxScanBytes: 64 * 1_024,
+            maxEntries: 20,
+            maxRecordBytes: 32 * 1_024,
+            chunkBytes: 8 * 1_024
+        )
+        let capped = try SessionParser.conversationPage(at: file, limits: tinyLimits)
+        XCTAssertTrue(capped.isTruncated)
+        XCTAssertFalse(capped.hasNoMoreHistory)
+        XCTAssertLessThanOrEqual(capped.scannedByteCount, tinyLimits.maxScanBytes)
+        XCTAssertLessThanOrEqual(capped.scannedEntryCount, tinyLimits.maxEntries)
+    }
+
     func testInstalledSessionDirectorySmokeWhenRequested() async throws {
         guard ProcessInfo.processInfo.environment["PI_DESKTOP_REAL_SESSION_SMOKE"] == "1" else {
             throw XCTSkip("Set PI_DESKTOP_REAL_SESSION_SMOKE=1 to scan the installed Pi session directory")

@@ -4,6 +4,8 @@ protocol SessionRepositoryProtocol {
     var rootURL: URL { get }
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary]
     func loadConversation(from fileURL: URL) async throws -> SessionConversation
+    func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage
+    func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage
     func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary
     /// Sidebar hydration: everything the persisted summary cache already knows, with no disk
     /// scan and no JSONL parsing, so the first paint is immediate.
@@ -21,6 +23,26 @@ extension SessionRepositoryProtocol {
     /// what they already exercise today.
     func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
         SessionParser.TailScan(conversation: try await loadConversation(from: fileURL), isComplete: true)
+    }
+
+    // Legacy-only fakes keep compiling. Production's file repository overrides both methods with
+    // the bounded JSONL scanner below.
+    func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage {
+        let conversation = try await loadConversation(from: fileURL)
+        let truncated = conversation.messages.count > ConversationPage.defaultMessageTarget
+        return ConversationPage(
+            messages: Array(conversation.messages.suffix(ConversationPage.defaultMessageTarget)),
+            olderCursor: nil,
+            leafID: conversation.leafID,
+            rawEntryCount: conversation.rawEntryCount,
+            scannedEntryCount: conversation.rawEntryCount,
+            scannedByteCount: 0,
+            isTruncated: truncated
+        )
+    }
+
+    func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        throw ConversationPagingError.unsupported
     }
 }
 
@@ -124,6 +146,18 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         try await Self.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try SessionParser.conversationTail(at: fileURL, limit: limit)
+        }
+    }
+
+    func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage {
+        try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(at: fileURL)
+        }
+    }
+
+    func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(at: fileURL, cursor: cursor)
         }
     }
 
