@@ -122,7 +122,9 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     var shouldStartExpanded: Bool { false }
 
     var latestThinkingText: String? {
-        for case let .thinking(thinking) in entries.reversed() { return thinking.text }
+        for case let .thinking(thinking) in entries.reversed() {
+            return thinking.text.replacingOccurrences(of: "**", with: "")
+        }
         return nil
     }
 

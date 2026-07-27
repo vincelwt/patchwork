@@ -343,7 +343,6 @@ struct MessageScrollView: View {
     var body: some View {
         let items = transcriptItems
         let imageIDs = prominentImageIDs(in: items)
-        let activeQuestionnaire = store.activeQuestionnaireSession
         ScrollViewReader { reader in
             ScrollView {
                 // A single small gap between entries keeps consecutive tool rows on an even
@@ -374,7 +373,6 @@ struct MessageScrollView: View {
                                     message: message,
                                     isStreaming: isStreaming,
                                     onImage: store.showImage,
-                                    activeQuestionnaire: activeQuestionnaire,
                                     showsActions: true,
                                     onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
                                 )
@@ -383,8 +381,7 @@ struct MessageScrollView: View {
                             case let .work(block):
                                 TranscriptWorkView(
                                     block: block,
-                                    onImage: store.showImage,
-                                    activeQuestionnaire: activeQuestionnaire
+                                    onImage: store.showImage
                                 )
                                 .equatable()
                                 .padding(.top, PiTheme.space6)

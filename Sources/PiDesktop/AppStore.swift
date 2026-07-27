@@ -630,6 +630,21 @@ final class AppStore: ObservableObject {
         return activityMonitor.activity(forPath: path)?.state == .running
     }
 
+    /// True only once this runtime has issued the extension request that makes its buffered
+    /// questionnaire answerable. This includes questions parked while another thread is open.
+    func isWaitingForQuestion(_ session: SessionSummary) -> Bool {
+        let path = session.fileURL.standardizedFileURL.path
+        let slot = activeRuntimePath == path ? activeRuntimeSlot : parkedRuntimes[.session(path)]
+        guard let slot else { return false }
+
+        let usesLivePresentation = slot === activeRuntimeSlot && !activePresentationDetached
+        guard let questionnaire = usesLivePresentation ? pendingQuestionnaire : slot.questionnaire,
+              !questionnaire.submitted else { return false }
+        let requests = usesLivePresentation ? dialogQueue : slot.dialogs
+        return requests.contains { questionnaireRequest($0, belongsTo: questionnaire) }
+            || slot.deferredEvents.contains { deferredRequest($0, belongsTo: questionnaire) }
+    }
+
     /// The freshest modification time available: the monitor's live stat, else the summary.
     func liveModifiedAt(_ session: SessionSummary) -> Date {
         let observed = activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.modifiedAt
@@ -1961,6 +1976,7 @@ final class AppStore: ObservableObject {
     /// deferred events that have never reached `handleExtensionUI`.
     private func discardQuestionnaire(from slot: RuntimeSlot) {
         guard let session = slot.questionnaire else { return }
+        objectWillChange.send()
         slot.questionnaire = nil
         slot.dialogs.removeAll { questionnaireRequest($0, belongsTo: session) }
         slot.deferredEvents.removeAll { deferredRequest($0, belongsTo: session) }
@@ -2814,6 +2830,10 @@ final class AppStore: ObservableObject {
     }
 
     private func deferEvent(_ event: JSONValue, for slot: RuntimeSlot) {
+        if let questionnaire = slot.questionnaire,
+           deferredRequest(event, belongsTo: questionnaire) {
+            objectWillChange.send()
+        }
         slot.deferredEvents.append(event.boundedProjection())
         if slot.deferredEvents.count > 32 { slot.deferredEvents.removeFirst(slot.deferredEvents.count - 32) }
     }
