@@ -92,7 +92,7 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.lastPayload("steer")?["message"]?.stringValue, "steer me")
     }
 
-    func testQueuedImagesFlushAsFilePathsWithoutRPCImageData() {
+    func testQueuedImagesFlushAsFilePathsAndRPCImageData() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
         let imageURL = directory.appendingPathComponent("queued image.png")
@@ -111,7 +111,7 @@ final class AppStoreOutboxTests: XCTestCase {
             runtime.lastPayload("steer")?["message"]?.stringValue,
             "Use this\n\nAttached image file paths:\n- \(imageURL.path)"
         )
-        XCTAssertNil(runtime.lastPayload("steer")?["images"])
+        XCTAssertEqual(runtime.lastPayload("steer")?["images"]?.arrayValue?.count, 1)
     }
 
     func testAgentSettledFlushesOnlyFollowUpEntries() {

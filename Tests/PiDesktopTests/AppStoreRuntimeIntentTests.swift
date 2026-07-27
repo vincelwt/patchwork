@@ -199,7 +199,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("prompt"), 1)
     }
 
-    func testImageAttachmentsAreSentAsFilePathsInsteadOfRPCImages() throws {
+    func testImageAttachmentsStayVisibleOnTheUserMessage() throws {
         let runtime = IntentRuntime()
         let store = makeStore(runtime: runtime)
         let session = summary("a", cwd: root)
@@ -208,9 +208,10 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.composerContentDidChange()
 
         let imageURL = root.appendingPathComponent("reference image.png")
+        let imageData = Data("pixels".utf8)
         store.draft = "Build this"
         store.attachments = [ImageAttachment(
-            data: Data("pixels".utf8),
+            data: imageData,
             mimeType: "image/png",
             fileName: imageURL.lastPathComponent,
             fileURL: imageURL
@@ -222,8 +223,9 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
             payload["message"]?.stringValue,
             "Build this\n\nAttached image file paths:\n- \(imageURL.path)"
         )
-        XCTAssertNil(payload["images"])
-        XCTAssertTrue(store.messages.last?.images.isEmpty == true)
+        XCTAssertEqual(payload["images"]?.arrayValue?.count, 1)
+        XCTAssertEqual(store.messages.last?.textContent, "Build this")
+        XCTAssertEqual(store.messages.last?.images.map(\.data), [imageData])
     }
 
     func testIdleSameCwdProcessSwitchesSavedAndNewRoutesButCrossCwdColdStarts() throws {

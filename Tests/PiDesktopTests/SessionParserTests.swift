@@ -38,6 +38,20 @@ final class SessionParserTests: XCTestCase {
         XCTAssertEqual(conversation.messages.last?.role, .unknown)
     }
 
+    func testUserImagePromptHidesThePathFooter() throws {
+        let imageData = Data("pixels".utf8)
+        let message = SessionParser.chatMessage(fromAgentMessage: .object([
+            "role": .string("user"),
+            "content": .array([
+                .object(["type": .string("text"), "text": .string("Build this\n\nAttached image file paths:\n- /tmp/image.png")]),
+                .object(["type": .string("image"), "data": .string(imageData.base64EncodedString()), "mimeType": .string("image/png")])
+            ])
+        ]))
+
+        XCTAssertEqual(message?.textContent, "Build this")
+        XCTAssertEqual(message?.images.map(\.data), [imageData])
+    }
+
     func testTwoPassParserSkipsLargeAbandonedPayloadAndDiscardsKnownRawTrees() throws {
         let file = temporaryDirectory.appendingPathComponent("large-branch.jsonl")
         let smallImage = Data("active-image".utf8).base64EncodedString()

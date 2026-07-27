@@ -576,6 +576,12 @@ struct SessionParser {
         if let attachments = message["attachments"]?.arrayValue {
             blocks.append(contentsOf: attachmentBlocks(attachments, baseID: stableID, budget: &budget))
         }
+        if role == .user, blocks.contains(where: { if case .image = $0.kind { return true }; return false }) {
+            blocks = blocks.map { block in
+                guard case let .text(text) = block.kind else { return block }
+                return MessageBlock(id: block.id, kind: .text(ImageAttachment.visibleText(from: text)))
+            }
+        }
         if let error = message["errorMessage"]?.stringValue,
            !blocks.contains(where: { if case .text = $0.kind { return true }; return false }) {
             blocks.append(MessageBlock(id: "\(stableID)-error", kind: .text(bounded(error, max: 8_000))))
@@ -734,10 +740,13 @@ struct SessionParser {
     private static func extractText(from content: JSONValue?) -> String? {
         guard let content else { return nil }
         if let string = content.stringValue { return string }
-        return (content.arrayValue?.compactMap { block -> String? in
+        let blocks = content.arrayValue ?? []
+        let text = blocks.compactMap { block -> String? in
             guard block["type"]?.stringValue == "text" else { return nil }
             return block["text"]?.stringValue
-        } ?? []).joined(separator: "\n").nonEmpty
+        }.joined(separator: "\n")
+        let hasImage = blocks.contains { $0["type"]?.stringValue == "image" }
+        return (hasImage ? ImageAttachment.visibleText(from: text) : text).nonEmpty
     }
 
     private static func date(from value: JSONValue?) -> Date? {
