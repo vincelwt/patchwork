@@ -118,6 +118,14 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     }
 
     var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }
+    /// Live details are opt-in; the collapsed row carries the latest thought instead.
+    var shouldStartExpanded: Bool { false }
+
+    var latestThinkingText: String? {
+        for case let .thinking(thinking) in entries.reversed() { return thinking.text }
+        return nil
+    }
+
     /// At least one tool step failed somewhere in the log. Individual steps still show red where
     /// they are, but this alone must never drive the collapsed header's "· failed" label.
     var hasFailure: Bool { activities.contains(where: \.hasFailure) }

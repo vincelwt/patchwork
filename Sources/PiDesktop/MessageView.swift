@@ -204,8 +204,8 @@ struct ThinkingBlockView: View {
 
 // MARK: - Turn work log
 
-/// One turn's work: live and open while Pi is working; its details settle behind one quiet
-/// “Worked for …” line while visual results and unanswered questions remain in the transcript.
+/// One turn's work: live reasoning stays collapsed behind its latest thought unless the user
+/// opens it; settled details become one quiet “Worked for …” line while prominent output remains.
 struct TranscriptWorkView: View, Equatable {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -223,7 +223,7 @@ struct TranscriptWorkView: View, Equatable {
             && lhs.activeQuestionnaire == rhs.activeQuestionnaire
     }
 
-    private var isOpen: Bool { userExpanded ?? block.isActive }
+    private var isOpen: Bool { userExpanded ?? block.shouldStartExpanded }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
@@ -256,31 +256,24 @@ struct TranscriptWorkView: View, Equatable {
             PiHairline()
 
             if isOpen {
-                HStack(alignment: .top, spacing: PiTheme.space12) {
-                    // A quiet rail separates the log from the answer without indenting the
-                    // answer itself.
-                    Rectangle()
-                        .fill(Color.piHairline)
-                        .frame(width: PiTheme.hairline)
-                    VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                        ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
-                            Group {
-                                switch entry {
-                                case let .thinking(value):
-                                    ThinkingBlockView(text: value.text, streaming: value.streaming)
-                                case let .activity(group):
-                                    TranscriptActivityGroupView(group: group, activeQuestionnaire: activeQuestionnaire)
-                                case let .note(message):
-                                    WorkNoteView(
-                                        message: message,
-                                        onImage: onImage,
-                                        activeQuestionnaire: activeQuestionnaire
-                                    )
-                                }
+                VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+                    ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
+                        Group {
+                            switch entry {
+                            case let .thinking(value):
+                                ThinkingBlockView(text: value.text, streaming: value.streaming)
+                            case let .activity(group):
+                                TranscriptActivityGroupView(group: group, activeQuestionnaire: activeQuestionnaire)
+                            case let .note(message):
+                                WorkNoteView(
+                                    message: message,
+                                    onImage: onImage,
+                                    activeQuestionnaire: activeQuestionnaire
+                                )
                             }
-                            .opacity(entryOpacity(at: index))
-                            .transition(.opacity)
                         }
+                        .opacity(entryOpacity(at: index))
+                        .transition(.opacity)
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -299,9 +292,9 @@ struct TranscriptWorkView: View, Equatable {
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
+        .animation(reduceMotion || reduceTransparency ? nil : .easeOut(duration: 0.18), value: block.latestThinkingText)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
-        // A turn that starts working again owns its own disclosure once more, so a stale
-        // collapse can never hide live work.
+        // A resumed turn returns to the same collapsed latest-thought default as a new one.
         .onChange(of: block.isActive) { _, active in
             if active { userExpanded = nil }
         }
@@ -315,21 +308,13 @@ struct TranscriptWorkView: View, Equatable {
         return max(0.45, 1 - 0.15 * Double(block.entries.count - index - 1))
     }
 
-    @ViewBuilder
     private var headline: some View {
-        if block.isActive, let startedAt = block.startedAt {
-            // One timer, and only while a turn is actually in flight.
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text("Working for \(NumberFormatting.duration(context.date.timeIntervalSince(startedAt)))")
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-        } else {
-            Text(block.isActive ? "Working" : block.title)
-                .font(PiFont.caption)
-                .foregroundStyle(.secondary)
-        }
+        Text(block.isActive ? (block.latestThinkingText ?? "Working") : block.title)
+            .font(PiFont.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.head)
+            .contentTransition(.opacity)
     }
 }
 
