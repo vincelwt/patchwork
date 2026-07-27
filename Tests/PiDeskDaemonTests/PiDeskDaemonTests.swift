@@ -25,6 +25,7 @@ final class DaemonCoreTests: XCTestCase {
         XCTAssertEqual(health.runningRuns, 0)
         XCTAssertEqual(health.queuedRuns, 0)
         XCTAssertTrue(health.schedulesEnabled)
+        XCTAssertTrue(health.scheduleIdempotency)
         XCTAssertTrue(health.issues.isEmpty)
     }
 

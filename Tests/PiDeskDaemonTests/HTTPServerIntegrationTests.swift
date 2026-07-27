@@ -182,6 +182,50 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertTrue(afterDelete.schedules.isEmpty)
     }
 
+    func testScheduleCreationIsIdempotentAcrossAnUnconfirmedRetry() async throws {
+        let key = "0123456789abcdef0123456789abcdef"
+        let request = ScheduleCreateRequest(
+            idempotencyKey: key,
+            name: "Retry-safe",
+            target: .existingThread(threadId: "thread-x"),
+            prompt: "Run once",
+            trigger: .interval(everySeconds: 900, startAt: nil)
+        )
+        let first = try await client.createSchedule(request)
+        let retried = try await client.createSchedule(request)
+        XCTAssertEqual(retried.schedule.id, first.schedule.id)
+        let schedules = try await client.listSchedules()
+        XCTAssertEqual(schedules.schedules.count, 1)
+
+        do {
+            _ = try await client.createSchedule(ScheduleCreateRequest(
+                idempotencyKey: key,
+                name: "Different request",
+                target: .existingThread(threadId: "thread-x"),
+                prompt: "Run once",
+                trigger: .interval(everySeconds: 900, startAt: nil)
+            ))
+            XCTFail("expected an idempotency conflict")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "idempotency_conflict")
+        }
+    }
+
+    func testInvalidScheduleIdempotencyKeyIsRejected() async throws {
+        do {
+            _ = try await client.createSchedule(ScheduleCreateRequest(
+                idempotencyKey: "too-short",
+                name: "Invalid key",
+                target: .existingThread(threadId: "thread-x"),
+                prompt: "Run once",
+                trigger: .heartbeat(everySeconds: 900)
+            ))
+            XCTFail("expected an invalid key error")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "invalid_idempotency_key")
+        }
+    }
+
     func testCreatingAScheduleWithAnUnparseableCronIsRejected() async throws {
         do {
             _ = try await client.createSchedule(ScheduleCreateRequest(

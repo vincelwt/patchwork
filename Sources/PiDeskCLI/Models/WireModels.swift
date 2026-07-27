@@ -120,6 +120,7 @@ struct WireSchedule: Codable, Equatable {
 }
 
 struct WireScheduleCreateRequest: Codable {
+    var idempotencyKey: String? = nil
     var name: String
     var enabled: Bool?
     var target: WireScheduleTarget
@@ -171,6 +172,7 @@ struct WireHealth: Codable, Equatable {
     var queuedRuns: Int?
     var piVersion: String?
     var schedulesEnabled: Bool?
+    var scheduleIdempotency: Bool? = nil
 }
 
 struct WireLimits: Codable, Equatable {

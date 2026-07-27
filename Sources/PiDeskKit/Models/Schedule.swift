@@ -229,6 +229,8 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
 // MARK: - Request/response wrappers
 
 public struct ScheduleCreateRequest: Codable, Sendable {
+    /// Optional stable key for callers that may retry after an unconfirmed response.
+    public var idempotencyKey: String?
     public var name: String
     public var enabled: Bool?
     public var target: ScheduleTarget
@@ -238,6 +240,7 @@ public struct ScheduleCreateRequest: Codable, Sendable {
     public var policy: SchedulePolicy?
 
     public init(
+        idempotencyKey: String? = nil,
         name: String,
         enabled: Bool? = nil,
         target: ScheduleTarget,
@@ -246,6 +249,7 @@ public struct ScheduleCreateRequest: Codable, Sendable {
         trigger: ScheduleTrigger,
         policy: SchedulePolicy? = nil
     ) {
+        self.idempotencyKey = idempotencyKey
         self.name = name
         self.enabled = enabled
         self.target = target

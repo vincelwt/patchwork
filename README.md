@@ -69,11 +69,14 @@ when the app quits.
 
 Automations also have their own page in the window: pick **Automations** in the sidebar or press
 `⌥⌘S`. It opens in the detail area, so the selected conversation and its draft stay put; pausing
-and resuming is the switch on each row.
+and resuming is the switch on each row. When the background service is reachable, compatible
+scheduling requests from a thread use this same durable store, so they appear on the page and
+survive that Pi process exiting. The Agent extension's session-local scheduler remains the fallback
+for specialized subagent jobs or when the service is off.
 
 ## Run state
 
-Run state comes from a small Pi extension the app installs into
+Run state and thread-to-automation routing come from a small Pi extension the app installs into
 `~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes one heartbeat per process to
 `~/.pi/agent/desktop-activity/<sessionId>-<pid>.json`; a session counts as running when any
 heartbeat says so, is fresher than ten seconds, and its process is still alive. Sessions started
