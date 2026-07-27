@@ -48,11 +48,13 @@ struct NewChatView: View {
             .background(Color.piTranscript)
         }
         .contentShape(Rectangle())
-        .dropDestination(for: URL.self) { urls, _ in
-            let images = ImageImportService.attachments(from: urls)
-            guard !images.isEmpty else { return false }
-            store.addAttachments(images)
-            return true
+        .onDrop(of: ImageImportService.dropTypes, isTargeted: nil) { providers in
+            let route = store.route
+            let folder = store.selectedFolder?.standardizedFileURL
+            return ImageImportService.loadDroppedAttachments(from: providers) { images in
+                guard store.route == route, store.selectedFolder?.standardizedFileURL == folder else { return }
+                store.addAttachments(images)
+            }
         }
     }
 

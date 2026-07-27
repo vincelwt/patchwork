@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import XCTest
 @testable import PiDesktop
 
@@ -280,6 +281,25 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertTrue(textView.currentContent().attachments.isEmpty)
     }
 
+    func testFullConversationDropLoadsFileAndRawImageProvidersInOrder() async throws {
+        let source = try writePNG(named: "provider.png")
+        let fileProvider = NSItemProvider(item: source as NSURL, typeIdentifier: UTType.fileURL.identifier)
+        let rawProvider = NSItemProvider(
+            item: try Data(contentsOf: source) as NSData,
+            typeIdentifier: UTType.png.identifier
+        )
+        let attachments = await withCheckedContinuation { continuation in
+            XCTAssertTrue(ImageImportService.loadDroppedAttachments(from: [fileProvider, rawProvider]) {
+                continuation.resume(returning: $0)
+            })
+        }
+
+        XCTAssertEqual(attachments.count, 2)
+        XCTAssertEqual(attachments[0].fileURL, source.standardizedFileURL)
+        XCTAssertEqual(attachments[1].mimeType, "image/png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachments[1].fileURL.path))
+    }
+
     func testExistingAndNewConversationAreasRegisterImageFileDropTargets() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -290,11 +310,8 @@ final class ComposerInlineImageTests: XCTestCase {
                 contentsOf: root.appendingPathComponent("Sources/PiDesktop/\(file)"),
                 encoding: .utf8
             )
-            XCTAssertTrue(
-                source.contains(".contentShape(Rectangle())\n                    .dropDestination(for: URL.self)")
-                    || source.contains(".contentShape(Rectangle())\n        .dropDestination(for: URL.self)"),
-                file
-            )
+            XCTAssertTrue(source.contains(".contentShape(Rectangle())"), file)
+            XCTAssertTrue(source.contains(".onDrop(of: ImageImportService.dropTypes"), file)
             XCTAssertTrue(source.contains("store.addAttachments(images)"), file)
         }
     }
