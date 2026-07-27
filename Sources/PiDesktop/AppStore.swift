@@ -201,6 +201,10 @@ final class AppStore: ObservableObject {
     @Published var outbox: [OutboxEntry] = []
     /// Lazily created so the panel keeps one service for the app's lifetime.
     var cachedScheduleService: (any ScheduleServing)?
+    /// Thread IDs any automation targets, so the sidebar can mark them. IDs only, capped — the
+    /// automations panel still owns the schedules themselves. See `ScheduleService.swift`.
+    @Published private(set) var scheduledThreadIDs: Set<String> = []
+    private static let scheduledThreadIDLimit = 500
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
     /// True only while the ephemeral status probe runtime is attached.
@@ -788,6 +792,14 @@ final class AppStore: ObservableObject {
             // is instant even before the user selects anything.
             schedulePrefetch(around: selectedSession)
         }
+        // The daemon can still be spawning/binding its socket while the window comes up (see
+        // DaemonSupervisor), so the first load can lose that race. One retry covers it; anything
+        // longer is the automations panel's or the refresh button's job, not a polling loop.
+        Task {
+            if await refreshScheduledThreads() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await refreshScheduledThreads()
+        }
         startGitRefreshLoop()
         activityMonitor.start()
         installActivityExtensionIfNeeded()
@@ -814,6 +826,30 @@ final class AppStore: ObservableObject {
             scanError = error.localizedDescription
         }
         isScanning = false
+    }
+
+    /// Loads the automations only to learn which conversations they target. A failure keeps the
+    /// previous set: a daemon that is briefly down must not erase clocks from the sidebar.
+    /// Returns whether the load succeeded, so a caller can decide to try once more.
+    @discardableResult
+    func refreshScheduledThreads() async -> Bool {
+        guard let entries = try? await scheduleService.loadSchedules() else { return false }
+        updateScheduledThreads(from: entries)
+        return true
+    }
+
+    /// Called by the automations panel whenever its list changes, so an edit shows up in the
+    /// sidebar without a second round trip. A paused automation still counts — the conversation
+    /// is still associated with one — and a new-thread target marks no existing row.
+    func updateScheduledThreads(from entries: [ScheduleEntry]) {
+        var ids: Set<String> = []
+        for entry in entries {
+            guard case let .existingThread(threadID) = entry.target, !threadID.isEmpty else { continue }
+            ids.insert(threadID)
+            // A display hint, not a copy of the schedule list.
+            if ids.count >= Self.scheduledThreadIDLimit { break }
+        }
+        scheduledThreadIDs = ids
     }
 
     func openNewChat() {

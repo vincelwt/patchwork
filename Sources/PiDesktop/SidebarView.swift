@@ -142,7 +142,7 @@ private struct SidebarFooter: View {
                 .accessibilityLabel("Archived, \(archivedCount) conversations")
                 .accessibilityValue(archiveOpen ? "expanded" : "collapsed")
             }
-            Button { Task { await store.refreshSessions() } } label: {
+            Button { Task { await store.refreshSessions(); await store.refreshScheduledThreads() } } label: {
                 Group {
                     if store.isScanning { ProgressView().controlSize(.mini) }
                     else {
@@ -534,6 +534,7 @@ private struct SessionRow: View {
     }
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
+    private var scheduled: Bool { store.scheduledThreadIDs.contains(session.id) }
     private var git: GitSnapshot { store.folderGit[session.cwd.standardizedFileURL.path] ?? .none }
     private var indent: CGFloat { CGFloat(min(depth, PiTheme.sidebarMaxFolderDepth)) * PiTheme.sidebarIndentStep }
 
@@ -579,11 +580,11 @@ private struct SessionRow: View {
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
         .help(session.cwd.path)
-        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")")
+        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
-    /// The unread dot and the hover archive/restore button share this one column, so a thread
-    /// title never shifts sideways when the row is hovered or read.
+    /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
+    /// so this column stays empty until the pointer arrives and the title never shifts sideways.
     @ViewBuilder
     private var leadingIcon: some View {
         if hovering {
@@ -599,24 +600,34 @@ private struct SessionRow: View {
                 .accessibilityLabel(archived ? "Restore conversation" : "Archive conversation")
                 .accessibilityAddTraits(.isButton)
         } else {
-            Circle()
-                .fill(unread ? Color.accentColor : Color.clear)
-                .frame(width: 6, height: 6)
-                .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
+            Color.clear
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight)
                 .accessibilityHidden(true)
         }
     }
 
-    @ViewBuilder
+    /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
+    /// running outranks unread, because "working now" is the more urgent of the two. One explicit
+    /// stack, so the pair is always grouped and ordered on the trailing edge.
     private var trailingAccessory: some View {
-        if running {
-            StatusDot(color: .piGreen).help("Pi is working")
-        } else if hovering {
-            Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
-        } else if GitIndicatorPolicy.showsBranchIndicator(git) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
-                .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
+        HStack(spacing: PiTheme.space6) {
+            if hovering {
+                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
+            } else if GitIndicatorPolicy.showsBranchIndicator(git) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
+                    .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
+            }
+            if scheduled {
+                Image(systemName: "clock")
+                    .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
+                    .help("Runs on a schedule")
+            }
+            if running {
+                StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
+            } else if unread {
+                StatusDot(color: .piBlue).help("Unread")
+            }
         }
     }
 }

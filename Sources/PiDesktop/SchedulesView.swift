@@ -24,7 +24,15 @@ struct SchedulesView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.piTranscript)
-        .task { await model.reload() }
+        .task {
+            await model.reload()
+            // A load that succeeded is authoritative even when it returns nothing: schedules
+            // deleted elsewhere must clear the sidebar's clocks, and `.onChange` never fires
+            // when an empty list reloads to an empty list. A failed load keeps the prior set.
+            if model.error == nil { store.updateScheduledThreads(from: model.entries) }
+        }
+        // The sidebar's clock lives on `AppStore`; this is the one place the list is authoritative.
+        .onChange(of: model.entries) { _, entries in store.updateScheduledThreads(from: entries) }
         .sheet(item: $model.editing) { draft in
             ScheduleEditor(draft: draft) { saved in
                 Task { await model.save(saved) }

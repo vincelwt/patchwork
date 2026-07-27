@@ -110,6 +110,9 @@ struct ConversationView: View {
         .toolbar { conversationToolbar }
         // Without this the transcript scrolls visibly under a transparent toolbar.
         .toolbarBackground(.visible, for: .windowToolbar)
+        // Switching conversations keeps the already-mounted composer first responder: the row's
+        // `autofocus` only fires on first mount, so the same focus signal covers the rest.
+        .onChange(of: store.route) { _, _ in composerFocusTick += 1 }
         .onChange(of: store.renameRequested) { _, requested in
             guard requested else { return }
             renameValue = store.selectedSession?.displayName ?? ""
@@ -144,6 +147,7 @@ struct ConversationView: View {
                         text: $store.draft,
                         attachments: $store.attachments,
                         isStreaming: store.isSelectedRuntime && store.runtimeState.isStreaming,
+                        autofocus: true,
                         focusSignal: composerFocusTick,
                         onSend: {
                             if store.isEditingLastMessage { store.resubmitEditedMessage() }
