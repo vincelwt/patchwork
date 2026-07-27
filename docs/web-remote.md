@@ -123,3 +123,61 @@ The hosted relay does not use this listener or token and does not expose a port 
 `PiDeskWeb.asset(for:)` bundles it for loopback use, while Wrangler serves the same directory on
 the hosted origin. Local mode uses HTTP + authenticated SSE; hosted mode swaps only the transport
 for the encrypted relay WebSocket. The views and `/v1` response contract are shared.
+
+Pure logic lives in `.mjs` modules with no DOM (`markdown`, `time`, `trigger`, `relayCrypto`,
+`pending`, `folders`) and is tested directly with `node --test docs/js-checks/*.test.mjs`. The
+`.js` view files are the only ones that touch the DOM.
+
+## Sending a message
+
+A send is optimistic. `POST /v1/threads/{id}/messages` only *accepts* the text; Pi appends the
+user entry to its session file seconds later. The composer therefore clears immediately and the
+text moves into a pending bubble carrying an honest status — sending, queued, working, steering,
+or failed — which is removed only when the real parsed message appears in a refetch, or when the
+message's run finishes successfully. A failed send keeps its text with **Retry** and **Dismiss**;
+nothing is silently lost, and a duplicate bubble is impossible because each pending entry is
+reconciled against a count of identical user messages recorded when it was submitted. At most
+eight unconfirmed messages are held, and they are scoped to the open screen rather than persisted.
+
+The composer's overflow menu offers **Send as follow-up** and **Send as steer**. Both are real:
+the daemon delivers them into the live Pi turn. When no daemon-owned turn is running there is
+nothing to interrupt, the daemon reports `delivery: auto`, and the bubble says the message is
+queued rather than pretending it steered anything.
+
+## Questions and approvals
+
+When a daemon run blocks on a dialog — an `ask_user_question` step, a permission prompt — it
+appears at the bottom of the thread and can be answered from the phone:
+
+- **Single select** renders as a radio group: one tap selects, **Submit** sends. A mis-tap is
+  recoverable, unlike a list of buttons that answer on contact.
+- **Multi select** renders as checkboxes plus a free-text field for "none of these" or an answer
+  that is not on the list.
+- **Typed answer / editor** renders a text field or textarea, prefilled when Pi supplied one.
+- **Confirm** renders Yes / No / Cancel.
+- A dialog kind this build cannot render still appears, says it needs the Mac app, and offers
+  Cancel — Pi is blocked until it gets an answer, so it is never silently skipped.
+
+Nothing is answered automatically. `Question 2 of 3` is shown when the dialog is matched to a
+questionnaire, and answering advances to the next one. **Going back to a previous question is not
+possible from the web remote**: Pi's bridge is sequential and has already consumed the earlier
+answer. Use the Mac app when a questionnaire needs revisiting.
+
+## Images
+
+Assistant and tool-result inline images render as responsive thumbnails; tapping one opens a
+focus-trapped lightbox with a download link. Bytes are fetched per image from
+`GET /v1/threads/{id}/images/{imageId}` rather than embedded in the thread detail, which is what
+keeps a screenshot-heavy conversation inside the relay's 1.5 MB per-payload ceiling. An image that
+is too large (over 1 MB decoded), unreadable, or past the per-view budget of 40 shows a labelled
+placeholder instead of disappearing.
+
+## Folders
+
+The thread list mirrors the Mac app's sidebar: threads filed into a virtual folder appear there,
+everything else groups under its project directory, and folders nest inside projects or other
+folders. Group headers are disclosure buttons with subtree counts and unread/running markers;
+indentation is capped so a deep tree still leaves room for a title on a phone. Folders are
+read-only here — they are created, renamed, and rearranged in the Mac app. A machine with a single
+project and no folders keeps the flat list, and a daemon that predates `GET /v1/folders` falls
+back to project grouping rather than showing an error.

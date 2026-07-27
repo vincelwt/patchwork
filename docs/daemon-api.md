@@ -140,13 +140,40 @@ POST /v1/threads
 
 POST /v1/threads/{id}/messages
      {"text":"…","delivery":"auto|steer|followUp","attachments":[]}
-→ {"runId":"…","queued":false}
+→ {"runId":"…","queued":false,"delivery":"auto|steer|followUp"}
 
 POST /v1/threads/{id}/abort           → {"aborted":true}
 POST /v1/threads/{id}/archive         {"archived":true} → {"thread":Thread}
 POST /v1/threads/{id}/name            {"name":"…"}      → {"thread":Thread}
 POST /v1/threads/{id}/read            {"unread":false}  → {"thread":Thread}
+
+GET  /v1/threads/{id}/images/{imageId}
+→ {"id":"…","mimeType":"image/png","byteCount":8321,"fileName":"shot.png","data":"<base64>"}
 ```
+
+**Delivery is reported, not assumed.** `delivery` in the *response* says what actually happened,
+which is not always what was asked:
+
+- `steer` / `followUp` are delivered into the live Pi turn by sending Pi's own `steer` /
+  `follow_up` command to the session the daemon already has open for that thread. They are never
+  turned into a queued prompt behind the current run.
+- If there is no daemon-owned turn in flight, there is nothing to interrupt: the text runs as an
+  ordinary prompt and the response says `"delivery":"auto"`.
+- If Pi rejects the command, the request fails with `409 delivery_rejected` — it is not quietly
+  re-queued.
+- If the write reached Pi but no acknowledgement arrived in time, the message is reported as
+  delivered and **never resent**. Re-queueing is the one failure mode that could prompt Pi twice,
+  which is worse than an unconfirmed delivery.
+- A thread the *app* has leased still returns `409 thread_leased`; the app owns that runtime.
+
+**Inline images** are metadata in the transcript and bytes on demand. `Message.images` carries
+`{id, mimeType, byteCount, fileName, status, note}` and never base64, because one screenshot-heavy
+thread detail would otherwise exceed the hosted relay's per-payload ceiling. `status` is `ok`,
+`omitted` (past this view's image budget), `tooLarge`, or `invalid`; anything other than `ok`
+carries a `note` a client shows in place of the picture rather than dropping it silently. Bounds:
+at most 8 images per message, 40 fetchable per `GET /v1/threads/{id}` (newest first), 1 MB decoded
+per image. `imageId` is `"<jsonlRecordOrdinal>-c<blockIndex>"` for a `content` block or `…-a<n>`
+for an `attachments` entry; Pi only appends, so an id stays valid for the life of the file.
 
 ```jsonc
 // Thread
@@ -159,8 +186,26 @@ POST /v1/threads/{id}/read            {"unread":false}  → {"thread":Thread}
   "cost": 12.34, "contextPercent": 61.0
 }
 // Message
-{ "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false }
+{ "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false,
+  "images":[{"id":"12-c1","mimeType":"image/png","byteCount":8321,"fileName":"shot.png",
+             "status":"ok|omitted|tooLarge|invalid","note":null}] }
 ```
+
+### Folders
+
+```
+GET /v1/folders
+→ {"folders":[{"id":"…","name":"Review","parentId":null,"depth":0}],
+   "assignments":{"/Users/x/.pi/agent/sessions/…/….jsonl":"<folderId>"}}
+```
+
+Read-only projection of the app's own virtual folders from `state.json`. The daemon never writes
+that file. `parentId` uses the app's group-id scheme — `null` for top level, a filesystem project
+path, or `"virtual:<uuid>"` — and is always the *effective* parent: a cycle or a dangling parent is
+already resolved to top level, and folders past a depth of 24 are dropped, so a client renders the
+list without any cycle logic of its own. Assignments naming a folder that did not survive are
+dropped for the same reason. Missing, legacy (pre-nesting), or malformed state yields an empty
+tree, never an error.
 
 ### Activity
 
@@ -241,6 +286,53 @@ GET /v1/runs/{id}                            → {"run":Run}
 GET /v1/limits → {"report":{…parsed /limits…},"generatedAt":"…","stale":false}
 ```
 
+### Interactions
+
+A daemon run can block on a dialog Pi raises over `extension_ui_request` — an
+`ask_user_question` step, a permission prompt, an editor request. These endpoints are how a remote
+client sees and answers them.
+
+```
+GET  /v1/interactions?threadId=          → {"interactions":[PendingInteraction]}
+POST /v1/interactions/{id}/respond
+     {"value":"…"} | {"confirmed":true} | {"cancelled":true}
+→ {"accepted":true}
+```
+
+```jsonc
+// PendingInteraction
+{ "id":"…", "runId":"run_…", "threadId":"…",
+  "method":"select|confirm|input|editor", "title":"…", "message":"…",
+  "options":["Alpha","Beta"],            // the exact strings Pi offered
+  "placeholder":null, "prefill":null,
+  "createdAt":"…", "expiresAt":"…", "resolvedAt":null,
+  // Present only when the dialog was matched to an ask_user_question tool call in the same run:
+  "header":"Auth", "multiSelect":false, "questionIndex":0, "questionCount":2,
+  "choices":[{"id":0,"value":"Alpha","label":"OAuth","description":"…","preview":"…"}] }
+```
+
+Rules this endpoint holds to:
+
+- **`GET` is authoritative.** The `interaction` SSE event is only a hint that something changed; a
+  client that reconnected, was backgrounded, or missed a frame re-reads this list rather than
+  trusting accumulated state.
+- **Nothing is ever auto-answered.** A `select` response must be one of `options` verbatim, or the
+  request is rejected with `400 invalid_option`. A body with no `value` and no `confirmed` is
+  rejected too; only an explicit `{"cancelled":true}` declines.
+- **`choices[].value` is what to submit.** Single-select values are Pi's raw option strings;
+  multi-select (which the questionnaire plugin models as a typed `input`) uses the 1-based index
+  encoding, so a client never reconstructs an option format.
+- **Bounded.** At most 16 pending dialogs; past that the daemon cancels the new request outright
+  rather than leaving Pi blocked on something nobody will see. Each dialog expires (Pi's own
+  `timeout`, else 10 minutes, capped at 30) and expiry sends Pi an explicit *cancellation* — never
+  an invented answer — so the run unwinds instead of burning its whole timeout.
+- **Cleared on every exit.** Answering, expiry, and the run ending all retire the dialog; a
+  finished run never leaves an unanswerable prompt on a phone.
+- Only the four blocking methods above are surfaced. `notify`, `setStatus`, `setWidget`,
+  `setTitle` and anything unrecognised expect no reply, exactly as the app treats them, and are
+  not turned into dialogs. A client that cannot render a surfaced method must still show it and
+  offer Cancel.
+
 ### Hosted remote management (local Unix socket only)
 
 ```
@@ -257,10 +349,11 @@ but cannot approve another browser.
 
 ```
 GET /v1/events            // text/event-stream
-event: thread    data: {Thread}
-event: activity  data: {…GET /v1/activity payload…}
-event: run       data: {Run}
-event: schedule  data: {Schedule}
+event: thread      data: {Thread}
+event: activity    data: {…GET /v1/activity payload…}
+event: run         data: {Run}
+event: schedule    data: {Schedule}
+event: interaction data: {PendingInteraction}   // resolvedAt set = it is no longer answerable
 : keep-alive every 20s
 ```
 
@@ -297,6 +390,14 @@ touching the files, so there is exactly one writer.
 - The daemon must not run a scheduled prompt while the same thread is attached to the app's own
   runtime — the app announces its attachment through the API (`POST /v1/threads/{id}/lease`).
 - Every run is recorded in `runs.jsonl` with its status and a bounded summary.
+- While a run's turn is in flight, its session is published in a live registry keyed by thread and
+  generation-checked by run id, which is what makes `delivery: steer|followUp` possible. It is
+  registered only after Pi accepts the prompt and removed on every exit path, so a settling run
+  can never retire its successor's registration.
+- Pi's stdin has exactly one writer lock (request ids and whole JSONL lines are written under it)
+  and its stdout exactly one drainer (the run's own event loop). A steer delivered from an HTTP
+  handler collects its acknowledgement from the bounded response cache that loop fills; it never
+  reads the pipe itself.
 
 ## CLI surface
 

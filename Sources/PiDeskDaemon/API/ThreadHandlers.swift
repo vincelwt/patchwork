@@ -23,6 +23,26 @@ enum ThreadHandlers {
                 return .json(ThreadDetailResponse(thread: thread, messages: messages))
             },
 
+            // Image bytes never travel inside a thread detail: one screenshot-heavy transcript
+            // would blow past the hosted relay's 1.5 MB encrypted-payload ceiling. `Message.images`
+            // carries metadata, and each image is fetched here, one bounded response at a time.
+            Route("GET", "/v1/threads/:id/images/:imageId") { _, params in
+                let thread = try await requireThread(core, params)
+                guard let imageId = params["imageId"], !imageId.isEmpty else {
+                    throw DaemonHTTPError.badRequest(code: "missing_image_id", message: "Missing image id.")
+                }
+                let image = (try? SessionThreadParser.image(at: URL(fileURLWithPath: thread.path), imageId: imageId)) ?? nil
+                guard let image else { throw DaemonHTTPError.notFound("Image \(imageId)") }
+                return .json(image)
+            },
+
+            // Read-only projection of the app's own `state.json` folders. The daemon never writes
+            // that file; a folder tree that is missing, legacy, or cyclic degrades to a flat or
+            // empty list rather than an error.
+            Route("GET", "/v1/folders") { _, _ in
+                .json(AppStatePeek.load(from: core.appStateURL).folderTree)
+            },
+
             Route("POST", "/v1/threads") { request, _ in
                 let body = try request.decodeJSON(CreateThreadRequest.self)
                 let cwd = (body.cwd as NSString).expandingTildeInPath
@@ -70,6 +90,24 @@ enum ThreadHandlers {
                     throw DaemonHTTPError.conflict(code: "thread_leased", message: "The app is currently attached to this thread's runtime.")
                 }
 
+                // An explicit steer/follow-up is delivered into the live Pi turn or not at all: it
+                // is never quietly turned into a queued prompt, because "steer" that actually
+                // waits for the current run to finish is exactly the lie this endpoint used to
+                // tell. When nothing is live the response says so (`delivery: auto`) and the text
+                // becomes an ordinary prompt.
+                if let command = liveCommand(for: body.delivery),
+                   let delivered = await core.liveSessions.deliver(threadID: thread.id, command: command, message: text) {
+                    switch delivered.result {
+                    case let .rejected(reason):
+                        throw DaemonHTTPError.conflict(code: "delivery_rejected", message: reason)
+                    case .acknowledged, .unacknowledged:
+                        // `.unacknowledged` means the write reached Pi's stdin but no ack arrived
+                        // in time. Re-queueing here is the one thing that could prompt Pi twice,
+                        // so it is reported as delivered and never resent.
+                        return .json(SendMessageResponse(runId: delivered.runID, queued: false, delivery: body.delivery))
+                    }
+                }
+
                 let alreadyBusy = await core.runQueue.isThreadBusy(thread.id)
                 let job = RunJob(
                     id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
@@ -77,10 +115,7 @@ enum ThreadHandlers {
                     prompt: text, mode: nil, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
                 )
                 await core.runQueue.enqueue(job)
-                // Real steering into an already-running daemon session is not implemented (see
-                // the top-level report): a busy thread's message queues behind the current run
-                // rather than interrupting it, regardless of `delivery`.
-                return .json(SendMessageResponse(runId: job.id, queued: alreadyBusy))
+                return .json(SendMessageResponse(runId: job.id, queued: alreadyBusy, delivery: .auto))
             },
 
             Route("POST", "/v1/threads/:id/abort") { _, params in
@@ -147,6 +182,16 @@ enum ThreadHandlers {
             throw DaemonHTTPError.notFound("Thread \(id)")
         }
         return thread
+    }
+
+    /// Pi's own RPC verb for a delivery mode, or `nil` when the caller did not ask for one (so
+    /// the message is an ordinary prompt and belongs in the queue).
+    private static func liveCommand(for delivery: DeliveryMode?) -> String? {
+        switch delivery {
+        case .steer: "steer"
+        case .followUp: "follow_up"
+        case .auto, nil: nil
+        }
     }
 
     private static func parseBool(_ text: String) -> Bool? {

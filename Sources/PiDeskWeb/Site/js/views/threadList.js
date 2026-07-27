@@ -1,8 +1,12 @@
 import { h, mount } from "../dom.js";
 import { relativeTime } from "../time.mjs";
 import { attachPullToRefresh } from "../pulltorefresh.js";
+import { buildThreadTree, flattenTree, isFlatList } from "../folders.mjs";
 
 const SKELETON_ROWS = 6;
+// Indentation stops growing past this depth so a deeply nested folder still leaves usable room
+// for a title on a narrow phone; the disclosure triangles keep the structure readable.
+const MAX_INDENT_STEPS = 4;
 
 /**
  * The Threads tab: list + pull-to-refresh + refresh button + live updates. `onStateChange` only
@@ -65,10 +69,54 @@ function paintList(container, state, actions) {
     mount(container, state.threadsLoading ? skeletonList() : emptyState(actions));
     return;
   }
+  // Grouping is worth its own chrome only when there is structure to show. A machine with one
+  // project and no folders keeps the flat list it always had.
+  const groups = buildThreadTree(state.threads, state.folders);
+  const rows = isFlatList(groups)
+    ? state.threads.map((thread) => renderRow(thread, actions, 0))
+    : flattenTree(groups, state.collapsedGroups).map((row) =>
+        row.kind === "group" ? renderGroup(row, actions) : renderRow(row.thread, actions, row.depth)
+      );
+
   mount(container, [
     state.threadsError ? h("div", { class: "banner banner-error", role: "status" }, state.threadsError) : null,
-    ...state.threads.map((thread) => renderRow(thread, actions))
+    ...rows
   ]);
+}
+
+function indentStyle(depth) {
+  return `--depth:${Math.min(depth, MAX_INDENT_STEPS)}`;
+}
+
+/**
+ * A folder or project header. It is a real disclosure button (`aria-expanded`) rather than a
+ * styled div, so a screen reader announces the collapsed state and a keyboard can toggle it.
+ */
+function renderGroup(row, actions) {
+  const { group, depth, collapsed } = row;
+  const counts = [
+    group.total === 1 ? "1 thread" : `${group.total} threads`,
+    group.unread ? `${group.unread} unread` : null,
+    group.running ? `${group.running} running` : null
+  ].filter(Boolean);
+
+  return h(
+    "button",
+    {
+      class: `group-row${group.kind === "virtual" ? " group-virtual" : ""}`,
+      type: "button",
+      style: indentStyle(depth),
+      "aria-expanded": String(!collapsed),
+      "aria-label": `${group.name}, ${counts.join(", ")}`,
+      onclick: () => actions.toggleGroup(group.id)
+    },
+    h("span", { class: "group-caret", "aria-hidden": "true" }, collapsed ? "\u203a" : "\u2304"),
+    h("span", { class: "group-glyph", "aria-hidden": "true" }, group.kind === "virtual" ? "\u25c8" : "\u25b8"),
+    h("span", { class: "group-name", "aria-hidden": "true" }, group.name),
+    group.unread ? h("span", { class: "dot", "aria-hidden": "true" }) : null,
+    group.running ? h("span", { class: "spinner", "aria-hidden": "true" }) : null,
+    h("span", { class: "group-count", "aria-hidden": "true" }, String(group.total))
+  );
 }
 
 function skeletonList() {
@@ -93,13 +141,14 @@ function emptyState(actions) {
   );
 }
 
-function renderRow(thread, actions) {
+function renderRow(thread, actions, depth = 0) {
   const title = thread.name || "Untitled";
   return h(
     "button",
     {
       class: thread.unread ? "row row-unread" : "row",
       type: "button",
+      style: indentStyle(depth),
       // The row's own children carry punctuation and abbreviations that read badly aloud, so
       // the whole control gets one clean label instead.
       "aria-label": [title, thread.folder, thread.unread ? "unread" : null, thread.running ? "running" : null]

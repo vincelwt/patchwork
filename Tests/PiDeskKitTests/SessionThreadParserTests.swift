@@ -206,6 +206,124 @@ final class SessionThreadParserTests: XCTestCase {
         }
         XCTAssertEqual(parsed, files.count, "every real session file must parse without throwing")
     }
+    // MARK: - Inline images
+
+    /// A 1x1 PNG: small, real, and decodable, so the round trip proves actual bytes rather than
+    /// an opaque string being handed back.
+    private static let tinyPNG =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+    private func imageContentLine(id: String, role: String = "assistant", data: String, mime: String = "image/png", fileName: String? = nil) -> String {
+        let name = fileName.map { #","fileName":"\#($0)""# } ?? ""
+        return """
+        {"type":"message","id":"\(id)","message":{"role":"\(role)","timestamp":1,"content":[{"type":"text","text":"see this"},{"type":"image","mimeType":"\(mime)","data":"\(data)"\(name)}]}}
+        """
+    }
+
+    func testAssistantContentImageIsProjectedAsFetchableMetadataNotBase64() throws {
+        let url = write([imageContentLine(id: "m1", data: Self.tinyPNG, fileName: "shot.png")])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+
+        XCTAssertEqual(messages.count, 1)
+        let image = try XCTUnwrap(messages[0].images.first)
+        XCTAssertEqual(image.status, .ok)
+        XCTAssertEqual(image.mimeType, "image/png")
+        XCTAssertEqual(image.fileName, "shot.png")
+        XCTAssertGreaterThan(image.byteCount, 0)
+        XCTAssertEqual(image.id, "0-c1", "record ordinal plus the content block index")
+
+        // The transcript itself must stay small: no payload travels inside the message.
+        let encoded = try PiDeskJSON.encoder.encode(messages)
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains(Self.tinyPNG))
+    }
+
+    func testToolResultAttachmentImagesAreProjectedToo() throws {
+        let url = write([
+            """
+            {"type":"message","id":"m1","message":{"role":"toolResult","timestamp":1,"content":"screenshot taken","attachments":[{"type":"image","mimeType":"image/png","content":"\(Self.tinyPNG)"}]}}
+            """
+        ])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].images.map(\.id), ["0-a0"])
+        XCTAssertEqual(messages[0].images.first?.status, .ok)
+    }
+
+    func testImageRoundTripsThroughTheByIDLookup() throws {
+        let url = write([imageContentLine(id: "m1", data: Self.tinyPNG, fileName: "shot.png")])
+        let image = try XCTUnwrap(SessionThreadParser.image(at: url, imageId: "0-c1"))
+        XCTAssertEqual(image.mimeType, "image/png")
+        XCTAssertEqual(image.fileName, "shot.png")
+        XCTAssertEqual(Data(base64Encoded: image.data), Data(base64Encoded: Self.tinyPNG))
+        XCTAssertEqual(image.byteCount, Data(base64Encoded: Self.tinyPNG)?.count)
+    }
+
+    func testUnknownOrMalformedImageIDsResolveToNilRatherThanThrowing() throws {
+        let url = write([imageContentLine(id: "m1", data: Self.tinyPNG)])
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "0-c9"), "no such block")
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "0-c0"), "that block is text, not an image")
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "99-c1"), "no such record")
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "garbage"))
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "-1-c0"))
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: ""))
+    }
+
+    func testAnEmptyOrUndecodableImageStaysVisibleAsAnInvalidPlaceholder() throws {
+        let url = write([
+            imageContentLine(id: "m1", data: ""),
+            imageContentLine(id: "m2", data: "!!!!not base64!!!!")
+        ])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].images.first?.status, .invalid)
+        XCTAssertNotNil(messages[0].images.first?.note, "a placeholder must say why")
+        // Undecodable but small: listed as ok, and the fetch is what refuses it.
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "1-c1"))
+    }
+
+    func testAnOversizedImageIsReportedAsTooLargeAndIsNeverServed() throws {
+        let oversized = String(repeating: "A", count: (SessionThreadParser.imageByteLimit / 3 * 4) + 1_024)
+        let url = write([imageContentLine(id: "m1", data: oversized)])
+
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].images.first?.status, .tooLarge)
+        XCTAssertNotNil(messages[0].images.first?.note)
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "0-c1"), "the bound is enforced on the way out too")
+    }
+
+    func testImagesPerMessageAreCapped() throws {
+        let blocks = (0..<(SessionThreadParser.imagesPerMessageLimit + 4))
+            .map { _ in #"{"type":"image","mimeType":"image/png","data":"\#(Self.tinyPNG)"}"# }
+            .joined(separator: ",")
+        let url = write([#"{"type":"message","id":"m1","message":{"role":"assistant","timestamp":1,"content":[\#(blocks)]}}"#])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].images.count, SessionThreadParser.imagesPerMessageLimit)
+    }
+
+    func testPerRequestImageBudgetKeepsTheNewestAndMarksTheRestOmitted() throws {
+        let lines = (0..<12).map { index in
+            let blocks = (0..<6).map { _ in #"{"type":"image","mimeType":"image/png","data":"\#(Self.tinyPNG)"}"# }.joined(separator: ",")
+            return #"{"type":"message","id":"m\#(index)","message":{"role":"assistant","timestamp":1,"content":[\#(blocks)]}}"#
+        }
+        let url = write(lines)
+        let messages = try SessionThreadParser.messages(at: url, limit: 50)
+
+        let all = messages.flatMap(\.images)
+        XCTAssertEqual(all.count, 72, "every image is still listed")
+        XCTAssertEqual(all.filter { $0.status == .ok }.count, SessionThreadParser.imagesPerRequestLimit)
+        XCTAssertTrue(all.filter { $0.status == .omitted }.allSatisfy { $0.note != nil })
+        XCTAssertTrue(messages.last?.images.allSatisfy { $0.status == MessageImageStatus.ok } ?? false, "the newest images win")
+        XCTAssertTrue(messages.first?.images.allSatisfy { $0.status == MessageImageStatus.omitted } ?? false)
+    }
+
+    func testAMessageWithNoImagesCarriesAnEmptyArray() throws {
+        let url = write([messageLine(role: "assistant", text: "just text")])
+        XCTAssertEqual(try SessionThreadParser.messages(at: url, limit: 10)[0].images, [])
+    }
+
+    func testDecodingAMessageFromAnOlderDaemonWithNoImagesFieldSucceeds() throws {
+        let json = Data(#"{"id":"m1","role":"assistant","text":"hi","at":"2026-01-01T00:00:00.000Z"}"#.utf8)
+        let message = try PiDeskJSON.decoder.decode(Message.self, from: json)
+        XCTAssertEqual(message.images, [])
+    }
 }
 
 final class ThreadPreviewProseTests: XCTestCase {

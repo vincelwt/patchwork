@@ -1,4 +1,5 @@
 import XCTest
+import PiDeskKit
 @testable import PiDeskDaemon
 
 final class PiRPCSessionTests: XCTestCase {
@@ -41,5 +42,119 @@ final class PiRPCSessionTests: XCTestCase {
 
         let event = try await session.receiveNext(timeout: 1)
         XCTAssertEqual(event?["type"]?.stringValue, "extension_ui_request")
+    }
+
+    /// An echo `pi`: records every request line it receives and answers each one. Enough to prove
+    /// the write path stays intact under concurrency without ever running the real CLI.
+    private func makeEchoPi(recordingTo transcript: URL) throws -> URL {
+        let executable = directory.appendingPathComponent("echo-pi")
+        try """
+        #!/bin/sh
+        while IFS= read -r line; do
+          printf '%s\\n' "$line" >> "$PI_TEST_TRANSCRIPT"
+          id=$(printf '%s' "$line" | /usr/bin/sed -E 's/.*"id":"([^"]+)".*/\\1/')
+          printf '{"type":"response","id":"%s","success":true}\\n' "$id"
+        done
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        FileManager.default.createFile(atPath: transcript.path, contents: nil)
+        return executable
+    }
+
+    /// Prompts come from the run's own task while steer/follow-up deliveries and dialog answers
+    /// arrive from HTTP handlers on others. Two interleaved partial lines would corrupt Pi's
+    /// stdin, so every write is serialized and every request id stays unique.
+    func testConcurrentWritesProduceWholeDistinctJSONLLines() async throws {
+        let transcript = directory.appendingPathComponent("stdin.jsonl")
+        let executable = try makeEchoPi(recordingTo: transcript)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PI_TEST_TRANSCRIPT"] = transcript.path
+
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: executable, environment: environment
+        )
+        defer { session.stop() }
+
+        let writes = 16
+        let ids = try await withThrowingTaskGroup(of: String.self) { group in
+            for index in 0..<writes {
+                group.addTask {
+                    // A mix of the three writers that really do overlap in production.
+                    if index % 3 == 0 { return try session.send(type: "steer", payload: ["message": .string("s\(index)")]) }
+                    if index % 3 == 1 { return try session.send(type: "follow_up", payload: ["message": .string("f\(index)")]) }
+                    try session.sendRaw([
+                        "type": .string("extension_ui_response"), "id": .string("dialog-\(index)"), "cancelled": .bool(true)
+                    ])
+                    return "dialog-\(index)"
+                }
+            }
+            var collected: [String] = []
+            for try await id in group { collected.append(id) }
+            return collected
+        }
+
+        XCTAssertEqual(Set(ids).count, writes, "every correlated request gets a distinct id")
+
+        // Give the echo process time to consume everything it was sent.
+        let deadline = Date().addingTimeInterval(5)
+        var lines: [String] = []
+        while Date() < deadline {
+            lines = ((try? String(contentsOf: transcript, encoding: .utf8)) ?? "")
+                .split(separator: "\n").map(String.init)
+            if lines.count >= writes { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        XCTAssertEqual(lines.count, writes, "no write was lost or merged into another")
+        for line in lines {
+            let value = try XCTUnwrap(try? PiJSONValue.decode(Data(line.utf8)), "a torn line would not parse: \(line)")
+            XCTAssertNotNil(value["type"]?.stringValue)
+            XCTAssertNotNil(value["id"]?.stringValue)
+        }
+    }
+
+    /// A steer delivered from an HTTP handler collects its acknowledgement from the cache the
+    /// run's own drain loop fills, so the two never read the pipe at the same time.
+    func testAnAcknowledgementIsReadableByANonDrainingCaller() async throws {
+        let transcript = directory.appendingPathComponent("stdin.jsonl")
+        let executable = try makeEchoPi(recordingTo: transcript)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PI_TEST_TRANSCRIPT"] = transcript.path
+
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: executable, environment: environment
+        )
+        defer { session.stop() }
+
+        let steerID = try session.send(type: "steer", payload: ["message": .string("stop")])
+
+        // Stand in for `consumeUntilSettled`: the only reader of stdout.
+        let drain = Task { while (try? await session.receiveNext(timeout: 1)) != nil, !Task.isCancelled {} }
+        defer { drain.cancel() }
+
+        let response = await session.awaitCachedResponse(id: steerID, timeout: 5)
+        XCTAssertEqual(response?["id"]?.stringValue, steerID)
+        XCTAssertEqual(response?["success"]?.boolValue, true)
+
+        let again = await session.awaitCachedResponse(id: steerID, timeout: 0.2)
+        XCTAssertNil(again, "an acknowledgement is consumed once, so the cache cannot grow")
+    }
+
+    func testAwaitingAnAcknowledgementThatNeverArrivesReportsUnknownRatherThanHanging() async throws {
+        let executable = directory.appendingPathComponent("silent-pi")
+        try """
+        #!/bin/sh
+        /bin/sleep 10
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: executable, environment: ProcessInfo.processInfo.environment
+        )
+        defer { session.stop() }
+
+        let id = try session.send(type: "steer", payload: ["message": .string("x")])
+        let response = await session.awaitCachedResponse(id: id, timeout: 0.3)
+        XCTAssertNil(response, "callers treat this as outcome-unknown, never as \"not delivered\"")
     }
 }

@@ -18,9 +18,17 @@ final class DaemonCore: @unchecked Sendable {
     let limitsCache: LimitsCache
     let relay: RelayService
     let settings: DaemonSettings
+    /// Dialogs daemon runs are currently blocked on. Shared with the executor, which is built
+    /// before this type exists, so it is injected rather than created here.
+    let interactions: InteractionRegistry
+    /// Threads with a daemon-owned Pi turn in flight, for `delivery: steer|followUp`.
+    let liveSessions: LiveSessionRegistry
     let startedAt = Date()
     let version = "1.0.0"
     let piVersion: String?
+    /// The app's `state.json`, read-only, for the folder tree `GET /v1/folders` exposes. A
+    /// parameter purely so tests point at a throwaway file instead of the real one.
+    let appStateURL: URL
 
     init(
         settings: DaemonSettings,
@@ -34,14 +42,21 @@ final class DaemonCore: @unchecked Sendable {
         relayIdentityFileURL: URL = PiDeskPaths.relayIdentity,
         relayWebSocketOrigin: String = RelayService.websocketOrigin,
         schedulerPollInterval: TimeInterval = 1,
-        piVersion: String? = nil
+        piVersion: String? = nil,
+        interactions: InteractionRegistry = InteractionRegistry(),
+        liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
+        appStateURL: URL = AppStatePeek.defaultURL()
     ) {
         self.settings = settings
         self.logger = logger
         self.piVersion = piVersion
+        self.interactions = interactions
+        self.liveSessions = liveSessions
+        self.appStateURL = appStateURL
 
         let bus = EventBus(logger: logger)
         self.bus = bus
+        interactions.attach(bus: bus)
         relay = RelayService(
             identityFileURL: relayIdentityFileURL,
             websocketOrigin: relayWebSocketOrigin,

@@ -2,6 +2,16 @@ import { h, mount } from "../dom.js";
 import { api, describeError } from "../api.js";
 import { renderMarkdown } from "../markdown.mjs";
 import { clockTime } from "../time.mjs";
+import {
+  addPending,
+  applyRunEvent,
+  markAccepted,
+  markFailed,
+  reconcile,
+  removePending,
+  statusLabel
+} from "../pending.mjs";
+import { renderInteraction } from "./interaction.js";
 
 const INITIAL_MESSAGE_COUNT = 50;
 const REFRESH_DEBOUNCE_MS = 700;
@@ -29,6 +39,16 @@ export function renderThreadView(state, actions, threadId) {
   let renderedCount = 0;
   let loadedOnce = false;
   let lastRunSignature = "";
+  // Messages accepted by the daemon but not yet visible in Pi's own session file. See
+  // js/pending.mjs for why this exists and how entries are reconciled away.
+  let pending = [];
+  let pendingSeq = 0;
+  let lastMessages = [];
+  let interactions = [];
+  let fetchingInteractions = false;
+  let interactionsQueued = false;
+  let lastInteraction = null;
+  let renderedInteractionSignature = null;
 
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
   const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
@@ -36,10 +56,22 @@ export function renderThreadView(state, actions, threadId) {
   const archiveBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Archive thread", onclick: onToggleArchive }, "\u2298");
 
   const messagesEl = h("div", { class: "messages" });
+  // Unconfirmed messages live in their own container after the transcript, so `paintMessages`'s
+  // "only animate genuinely new trailing messages" bookkeeping stays about real messages only
+  // and a pending bubble can never be mistaken for one.
+  const pendingEl = h("div", { class: "messages messages-pending" });
+  const interactionsEl = h("div", { class: "interactions" });
   const loadEarlierBtn = h("button", { class: "btn btn-block", type: "button", onclick: onLoadEarlier, hidden: true }, "Load earlier");
   // Focus target for the router (see app.js): the thread's title lives in an editable button
   // that has to stay in the tab order, so the labelled message region announces the screen.
-  const scroll = h("div", { class: "scroll content-pad", tabindex: "-1", "aria-label": "Thread" }, loadEarlierBtn, messagesEl);
+  const scroll = h(
+    "div",
+    { class: "scroll content-pad", tabindex: "-1", "aria-label": "Thread" },
+    loadEarlierBtn,
+    messagesEl,
+    pendingEl,
+    interactionsEl
+  );
 
   const textarea = h("textarea", {
     rows: "1",
@@ -90,6 +122,7 @@ export function renderThreadView(state, actions, threadId) {
   paintHeader();
   paintSkeleton();
   loadMessages();
+  loadInteractions();
   actions.markRead(threadId);
 
   function onInput() {
@@ -130,25 +163,39 @@ export function renderThreadView(state, actions, threadId) {
     const text = textarea.value.trim();
     if (!text) return;
     composerError.hidden = true;
-    sendBtn.disabled = true;
-    sendBtn.textContent = "Sending\u2026";
-    actions
-      .sendMessage(threadId, { text, delivery })
-      .then(() => {
-        textarea.value = "";
-        onInput();
-        closeMenu(false);
-        scrollToBottom();
-        return loadMessages();
-      })
-      .catch((err) => {
-        composerError.hidden = false;
-        composerError.textContent = describeError(err);
-      })
-      .finally(() => {
-        sendBtn.textContent = "Send";
-        sendBtn.disabled = textarea.value.trim().length === 0;
-      });
+    closeMenu(false);
+    // The composer empties now, not after the response: the text is not lost, it has moved into
+    // the pending bubble below, where it stays visible (and retryable) even if the send fails.
+    textarea.value = "";
+    onInput();
+    submit(text, delivery);
+  }
+
+  function submit(text, delivery) {
+    const key = `p${++pendingSeq}`;
+    pending = addPending(pending, { key, text, messages: lastMessages });
+    paintPending();
+    scrollToBottom();
+    // Only the send itself may mark the bubble failed. A refetch that fails afterwards is a
+    // display problem, not a delivery one, and must never claim a message was not sent.
+    actions.sendMessage(threadId, { text, delivery }).then(
+      (response) => {
+        pending = markAccepted(pending, key, {
+          runId: response?.runId ?? null,
+          queued: response?.queued === true,
+          // Older daemons omit `delivery`; assume they did what was asked rather than inventing
+          // a downgrade the server never reported.
+          delivery: response?.delivery ?? delivery ?? null
+        });
+        paintPending();
+        loadMessages();
+        loadInteractions();
+      },
+      (err) => {
+        pending = markFailed(pending, key, describeError(err));
+        paintPending();
+      }
+    );
   }
 
   function onAbort() {
@@ -248,8 +295,11 @@ export function renderThreadView(state, actions, threadId) {
       .then(({ thread: freshThread, messages }) => {
         thread = freshThread;
         loadedOnce = true;
+        lastMessages = messages;
         paintHeader();
         paintMessages(messages);
+        pending = reconcile(pending, messages);
+        paintPending();
         loadEarlierBtn.hidden = messages.length < messageLimit;
         loadEarlierBtn.disabled = false;
         loadEarlierBtn.textContent = "Load earlier";
@@ -295,6 +345,74 @@ export function renderThreadView(state, actions, threadId) {
     );
   }
 
+  function paintPending() {
+    mount(
+      pendingEl,
+      pending.map((entry) =>
+        renderPendingMessage(entry, {
+          onRetry: () => {
+            pending = removePending(pending, entry.key);
+            submit(entry.text, entry.delivery);
+          },
+          onDismiss: () => {
+            pending = removePending(pending, entry.key);
+            paintPending();
+          }
+        })
+      )
+    );
+  }
+
+  // Always re-read the list rather than accumulating SSE frames: `interaction` events are a hint
+  // that something changed, and a phone that was backgrounded or missed a frame must not be left
+  // showing a dialog Pi has already stopped waiting on.
+  function loadInteractions() {
+    if (fetchingInteractions) {
+      interactionsQueued = true;
+      return Promise.resolve();
+    }
+    fetchingInteractions = true;
+    return api
+      .interactions(threadId)
+      .then((response) => {
+        interactions = response?.interactions || [];
+        paintInteractions();
+      })
+      // A daemon without the endpoint, or a transient failure, simply means "nothing to answer
+      // here"; the thread itself stays usable.
+      .catch(() => {
+        interactions = [];
+        paintInteractions();
+      })
+      .finally(() => {
+        fetchingInteractions = false;
+        if (interactionsQueued) {
+          interactionsQueued = false;
+          loadInteractions();
+        }
+      });
+  }
+
+  function paintInteractions() {
+    // Repaint only when the *set* of pending dialogs changed. A poll triggered by some other
+    // thread's interaction event must not wipe a half-typed answer or a selected option.
+    const signature = interactions.map((interaction) => interaction.id).join("|");
+    if (signature === renderedInteractionSignature) return;
+    renderedInteractionSignature = signature;
+
+    const wasEmpty = !interactionsEl.childElementCount;
+    mount(
+      interactionsEl,
+      interactions.map((interaction) =>
+        renderInteraction(interaction, {
+          respond: (body) => actions.respondInteraction(interaction.id, body).then(() => loadInteractions()),
+          describeError
+        })
+      )
+    );
+    if (wasEmpty && interactions.length) scrollToBottom();
+  }
+
   function paintMessages(messages) {
     if (!messages.length) {
       mount(messagesEl, h("div", { class: "empty-state" }, h("p", { class: "empty-body" }, "No messages yet. Send the first one below.")));
@@ -306,7 +424,7 @@ export function renderThreadView(state, actions, threadId) {
     const firstNew = renderedCount && messages.length > renderedCount ? renderedCount : messages.length;
     mount(
       messagesEl,
-      messages.map((message, index) => renderMessage(message, index >= firstNew))
+      messages.map((message, index) => renderMessage(message, index >= firstNew, threadId))
     );
     renderedCount = messages.length;
   }
@@ -324,11 +442,24 @@ export function renderThreadView(state, actions, threadId) {
     onStateChange(next) {
       const run = next.lastRunEvent;
       const runSignature = run ? `${run.id}:${run.status}:${run.finishedAt || ""}` : "";
-      if (run?.threadId === threadId && runSignature !== lastRunSignature) {
+      if (run && runSignature !== lastRunSignature) {
         lastRunSignature = runSignature;
-        thread = { ...thread, running: run.status === "running" };
-        paintHeader();
-        scheduleRefetch();
+        // A run event is matched by id as well as by thread: a steer answers with the *live* run,
+        // whose `threadId` is already known here, and a brand-new thread's run reports its id
+        // before the thread event lands.
+        const before = pending;
+        pending = applyRunEvent(pending, run);
+        if (pending !== before) paintPending();
+        if (run.threadId === threadId) {
+          thread = { ...thread, running: run.status === "running" };
+          paintHeader();
+          scheduleRefetch();
+        }
+      }
+
+      if (next.lastInteractionEvent && next.lastInteractionEvent !== lastInteraction) {
+        lastInteraction = next.lastInteractionEvent;
+        loadInteractions();
       }
 
       const event = next.lastThreadEvent;
@@ -341,18 +472,159 @@ export function renderThreadView(state, actions, threadId) {
   };
 }
 
-function renderMessage(message, isNew) {
+function renderMessage(message, isNew, threadId) {
   const role = ["user", "assistant", "toolResult", "system"].includes(message.role) ? message.role : "system";
   const roleClass = { user: "msg-user", assistant: "msg-assistant", toolResult: "msg-tool", system: "msg-system" }[role];
   const classes = ["msg", roleClass];
   if (message.isError) classes.push("msg-error");
   if (isNew) classes.push("msg-new");
   const bodyClass = role === "user" ? "bubble" : "prose";
+  const images = Array.isArray(message.images) ? message.images : [];
   return h(
     "div",
     { class: classes.join(" ") },
     h("div", { class: "msg-meta" }, `${roleLabel(role)} \u00b7 ${clockTime(message.at)}`),
-    h("div", { class: bodyClass, html: renderMarkdown(message.text || "") })
+    message.text ? h("div", { class: bodyClass, html: renderMarkdown(message.text) }) : null,
+    images.length ? h("div", { class: "msg-images" }, images.map((image) => renderImage(image, threadId))) : null
+  );
+}
+
+/**
+ * A responsive thumbnail that loads its bytes only when tapped/opened, since the transcript
+ * carries metadata only. Anything the daemon refused to serve (too large, unreadable, past the
+ * per-view image budget) stays visible as a labelled placeholder instead of disappearing.
+ */
+function renderImage(image, threadId) {
+  const label = image.fileName || "Image";
+  if (image.status && image.status !== "ok") {
+    return h(
+      "div",
+      { class: "img-placeholder", role: "note" },
+      h("span", { class: "img-glyph", "aria-hidden": "true" }, "\u25a3"),
+      h("span", null, image.note || `${label} is not available here.`)
+    );
+  }
+
+  const img = h("img", { class: "thumb", alt: label, loading: "lazy", decoding: "async", hidden: true });
+  const status = h("span", { class: "img-loading" }, `${label} \u00b7 ${formatBytes(image.byteCount)}`);
+  const figure = h("button", { class: "img-tile", type: "button", "aria-label": `Open ${label}`, onclick: open }, img, status);
+
+  let source = null;
+  let loading = null;
+
+  function load() {
+    if (source) return Promise.resolve(source);
+    if (loading) return loading;
+    loading = api
+      .threadImage(threadId, image.id)
+      .then((payload) => {
+        source = `data:${payload.mimeType || "image/png"};base64,${payload.data}`;
+        img.src = source;
+        img.hidden = false;
+        status.remove();
+        return source;
+      })
+      .catch((err) => {
+        status.textContent = describeError(err);
+        status.classList.add("img-failed");
+        loading = null;
+        throw err;
+      });
+    return loading;
+  }
+
+  function open() {
+    load().then((src) => openLightbox(src, label)).catch(() => {});
+  }
+
+  // Thumbnails fetch as soon as they exist; the bytes are already bounded server-side and a
+  // transcript is capped at a small number of images per view.
+  load().catch(() => {});
+  return figure;
+}
+
+/**
+ * A focus-trapped overlay with the full image plus a download link. Dismissed by Escape, by the
+ * backdrop, or by the close button — all three, because a phone has no keyboard and a desktop
+ * browser has no back gesture.
+ */
+function openLightbox(src, label) {
+  const previouslyFocused = document.activeElement;
+  const closeBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Close image", onclick: close }, "\u2715");
+  const overlay = h(
+    "div",
+    {
+      class: "lightbox",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": label,
+      onclick: (event) => {
+        if (event.target === overlay) close();
+      }
+    },
+    h(
+      "div",
+      { class: "lightbox-bar" },
+      h("span", { class: "lightbox-title" }, label),
+      // No `target="_blank"`: a top-level `data:` navigation is blocked by browsers, and the
+      // `download` attribute is what actually saves the file.
+      h("a", { class: "link-btn", href: src, download: label }, "Download"),
+      closeBtn
+    ),
+    h("img", { class: "lightbox-img", src, alt: label })
+  );
+
+  function onKeydown(event) {
+    if (event.key === "Escape") close();
+    else if (event.key === "Tab") {
+      // Two focusables only; keeping the ring inside them is the whole trap.
+      const focusable = overlay.querySelectorAll("a, button");
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  function close() {
+    document.removeEventListener("keydown", onKeydown, true);
+    overlay.remove();
+    if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
+  }
+
+  document.addEventListener("keydown", onKeydown, true);
+  document.body.appendChild(overlay);
+  closeBtn.focus();
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** A message the daemon has accepted but Pi has not yet written into the session file. */
+function renderPendingMessage(entry, { onRetry, onDismiss }) {
+  const failed = entry.status === "failed";
+  return h(
+    "div",
+    { class: `msg msg-user msg-pending${failed ? " msg-error" : ""}` },
+    h("div", { class: "msg-meta" }, "You"),
+    h("div", { class: "bubble" }, entry.text),
+    h(
+      "div",
+      { class: "msg-pending-status", role: "status" },
+      failed ? null : h("span", { class: "spinner", "aria-hidden": "true" }),
+      h("span", null, statusLabel(entry)),
+      failed ? h("button", { class: "link-btn", type: "button", onclick: onRetry }, "Retry") : null,
+      failed ? h("button", { class: "link-btn", type: "button", onclick: onDismiss }, "Dismiss") : null
+    )
   );
 }
 

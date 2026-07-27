@@ -60,6 +60,7 @@ final class EventBus: @unchecked Sendable {
         case let .activity(value): payload = (try? PiDeskJSON.encoder.encode(value)) ?? Data()
         case let .run(value): payload = (try? PiDeskJSON.encoder.encode(value)) ?? Data()
         case let .schedule(value): payload = (try? PiDeskJSON.encoder.encode(value)) ?? Data()
+        case let .interaction(value): payload = (try? PiDeskJSON.encoder.encode(value)) ?? Data()
         case let .unknown(_, data): payload = (try? PiDeskJSON.encoder.encode(data)) ?? Data()
         }
         guard !payload.isEmpty else { return }

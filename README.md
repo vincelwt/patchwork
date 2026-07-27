@@ -50,6 +50,24 @@ Click the phone button in the sidebar footer to pair a browser. The hosted relay
 daemon and needs no VPN, inbound port, or tunnel; each browser stays paired until its site data
 is cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
 
+The phone UI covers the daily loop, not just reading:
+
+- **Sending is optimistic and honest.** The composer clears immediately and the message shows as
+  queued / working / steering / failed until Pi's own session file confirms it. A failed send
+  keeps its text with Retry.
+- **Steering and follow-ups are real.** Both are delivered into the live Pi turn with Pi's own
+  `steer` / `follow_up` command. With no daemon-owned turn running there is nothing to interrupt,
+  and the UI says the message was queued instead of claiming it steered.
+- **Questions can be answered from the phone.** An `ask_user_question` step or permission prompt
+  raised by a daemon run appears in the thread with accessible single-select, multi-select, typed,
+  and confirm forms. Nothing is ever auto-answered; an unsupported dialog says so and offers
+  Cancel.
+- **Assistant and tool screenshots render inline** as responsive thumbnails with a tap-to-open
+  lightbox and download, fetched per image so a screenshot-heavy thread stays inside the relay's
+  payload budget.
+- **The thread list mirrors the sidebar's folder tree**, read-only, with collapsible groups and
+  unread/running markers.
+
 The daemon starts and stops with the app by default: `Pi Desktop.app` bundles `pi-deskd`/`pidesk`
 in `Contents/Helpers/` and supervises them (start on launch if nothing is already running,
 restart on an unexpected crash with a bounded backoff, stop on quit — never a daemon it did not
@@ -194,11 +212,15 @@ Archiving never moves or edits a Pi JSONL file.
 ```bash
 swift build
 swift test
+node --test docs/js-checks/*.test.mjs      # pure web-remote logic, no DOM, no network
+(cd CloudflareRelay && npm test && npm run typecheck)
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
+Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. The remote-parity work adds coverage for optimistic pending-message reconciliation, folder-tree cycle/depth/legacy handling on both sides, inline-image projection and bounded retrieval, the interaction registry's bounds and expiry-cancels-never-answers rule, live steer/follow-up delivery outcomes, and concurrent stdin writes against a fake `pi`. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
 
 ## Current limitations
 
 Pi Desktop keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed transcript window retains at most 1,000 messages; a page scan reports an explicit bounded-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
+
+On the web remote: steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited — Pi's dialog bridge is sequential, so there is no Back. Unconfirmed messages live with the open screen and are not restored after a reload. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone.
