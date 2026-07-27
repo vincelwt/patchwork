@@ -109,6 +109,35 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(group.steps.first?.result?.textContent, "permission denied")
     }
 
+    func testWorkBlockIdentifiesImagesAndQuestionnairesForTurnLevelPresentation() throws {
+        let image = ImagePayload(id: "generated-image", data: Data([0]), mimeType: "image/png", fileName: nil)
+        let imageResult = ChatMessage(
+            id: "image-result",
+            role: .tool,
+            blocks: [MessageBlock(id: "image-block", kind: .image(image))],
+            timestamp: nil,
+            toolCallID: "image-call",
+            raw: .null
+        )
+        let messages = [
+            assistant(id: "a1", blocks: [call("read-call", "read", [:])]),
+            result(id: "read-result", callID: "read-call", text: "plain text"),
+            assistant(id: "a2", blocks: [call("image-call", "computer_js", [:])]),
+            imageResult,
+            assistant(id: "a3", blocks: [call("question-call", "ask_user_question", [:])]),
+            result(id: "question-result", callID: "question-call", text: "answered"),
+            assistant(id: "done", blocks: [text("Done.")])
+        ]
+
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .work(block) = items.first else { return XCTFail("Expected a work block") }
+        XCTAssertFalse(block.isActive)
+        XCTAssertEqual(block.prominentSteps.map(\.id), ["image-call", "question-call"])
+        XCTAssertEqual(block.prominentSteps.first?.result?.images.map(\.id), ["generated-image"])
+        XCTAssertTrue(block.prominentSteps.first?.resultTextBlocks.isEmpty == true,
+                      "The nested tool detail must not render a second copy of the image")
+    }
+
     // MARK: - "failed" reflects the turn's answer, not any one step
 
     func testHeaderHidesFailedWhenOnlyAToolStepFailedButTheAnswerSucceeded() throws {

@@ -58,6 +58,14 @@ struct TranscriptActivityStep: Identifiable, Hashable, Sendable {
     var failed: Bool { result?.isError == true }
     var complete: Bool { result != nil }
 
+    /// Tool detail stays textual; visual results are rendered once at the turn level.
+    var resultTextBlocks: [MessageBlock] {
+        result?.blocks.filter {
+            guard case let .text(text) = $0.kind else { return false }
+            return !text.isEmpty
+        } ?? []
+    }
+
     var displayName: String {
         name.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord
     }
@@ -87,7 +95,7 @@ enum TranscriptWorkEntry: Identifiable, Hashable, Sendable {
     }
 }
 
-/// A turn's work log: expanded while Pi is working, collapsed to one line once it has answered.
+/// A turn's work log: details collapse once Pi answers, while prominent outputs remain visible.
 struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     let id: String
     var entries: [TranscriptWorkEntry]
@@ -102,6 +110,11 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
 
     var activities: [TranscriptActivityGroup] {
         entries.compactMap { if case let .activity(group) = $0 { return group } else { return nil } }
+    }
+
+    /// Steps with turn-level output: images stay visible, and live questionnaires are actionable.
+    var prominentSteps: [TranscriptActivityStep] {
+        activities.flatMap(\.steps).filter { $0.kind == .question || !($0.result?.images.isEmpty ?? true) }
     }
 
     var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }

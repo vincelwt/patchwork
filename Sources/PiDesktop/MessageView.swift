@@ -130,8 +130,8 @@ struct ThinkingBlockView: View {
 
 // MARK: - Turn work log
 
-/// One turn's work: live and open while Pi is working, one quiet “Worked for …” line with a
-/// separator once it has answered. This is the transcript's only rhythm marker between turns.
+/// One turn's work: live and open while Pi is working; its details settle behind one quiet
+/// “Worked for …” line while visual results and unanswered questions remain in the transcript.
 struct TranscriptWorkView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -144,13 +144,7 @@ struct TranscriptWorkView: View {
     @State private var userExpanded: Bool?
     @State private var hovering = false
 
-    /// A question Pi is waiting on must never be hidden under a collapsed work log.
-    private var holdsActiveQuestion: Bool {
-        guard let id = store.activeQuestionnaireSession?.toolCallID else { return false }
-        return block.activities.contains { $0.steps.contains { $0.id == id } }
-    }
-
-    private var isOpen: Bool { holdsActiveQuestion || (userExpanded ?? block.isActive) }
+    private var isOpen: Bool { userExpanded ?? block.isActive }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
@@ -196,7 +190,7 @@ struct TranscriptWorkView: View {
                                 case let .thinking(value):
                                     ThinkingBlockView(text: value.text, streaming: value.streaming)
                                 case let .activity(group):
-                                    TranscriptActivityGroupView(group: group, onImage: onImage)
+                                    TranscriptActivityGroupView(group: group)
                                 case let .note(message):
                                     WorkNoteView(message: message, onImage: onImage)
                                 }
@@ -209,6 +203,15 @@ struct TranscriptWorkView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .transition(.opacity)
             }
+
+            ForEach(block.prominentSteps) { step in
+                if step.kind == .question, let questionnaire = store.activeQuestionnaire(for: step.id) {
+                    InlineQuestionnaire(session: questionnaire, arguments: step.arguments)
+                }
+                ForEach(step.result?.images ?? []) { image in
+                    ConversationImage(image: image, onOpen: { onImage(image) })
+                }
+            }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
@@ -219,7 +222,7 @@ struct TranscriptWorkView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
-        .accessibilityValue(isOpen ? "expanded" : "collapsed")
+        .accessibilityValue(isOpen ? "work details expanded" : "work details collapsed")
     }
 
     private func entryOpacity(at index: Int) -> Double {
@@ -493,14 +496,7 @@ private struct ToolDetailText: View {
 // MARK: - Activity rollup
 
 struct TranscriptActivityGroupView: View {
-    @EnvironmentObject private var store: AppStore
     let group: TranscriptActivityGroup
-    let onImage: (ImagePayload) -> Void
-
-    private var holdsActiveQuestion: Bool {
-        guard let id = store.activeQuestionnaireSession?.toolCallID else { return false }
-        return group.steps.contains { $0.id == id }
-    }
 
     var body: some View {
         DisclosureRow(
@@ -512,12 +508,11 @@ struct TranscriptActivityGroupView: View {
             // The one canonical live spinner is always the last transcript row.
             showsProgress: false,
             initiallyExpanded: group.shouldStartExpanded,
-            collapseSignal: !group.isActive,
-            forceExpanded: holdsActiveQuestion
+            collapseSignal: !group.isActive
         ) {
             VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
                 ForEach(group.steps) { step in
-                    ToolActivityStepRow(step: step, isLive: group.isActive, onImage: onImage)
+                    ToolActivityStepRow(step: step, isLive: group.isActive)
                 }
             }
         }
@@ -536,10 +531,8 @@ private struct ToolActivityStepRow: View {
     let step: TranscriptActivityStep
     /// A step left unfinished by a killed run must not spin forever in a historical transcript.
     let isLive: Bool
-    let onImage: (ImagePayload) -> Void
 
     var body: some View {
-        let questionnaire = store.activeQuestionnaire(for: step.id)
         DisclosureRow(
             symbol: step.failed ? "xmark.circle" : (step.complete ? "checkmark.circle" : step.kind.symbol),
             title: step.displayName,
@@ -547,27 +540,21 @@ private struct ToolActivityStepRow: View {
             symbolTint: step.failed ? Color.piRed : .secondary,
             showsProgress: !step.complete && isLive,
             favicon: WebActivityLink.url(for: step),
-            initiallyExpanded: step.failed,
-            forceExpanded: questionnaire != nil
+            initiallyExpanded: step.failed
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if step.kind == .question {
-                    InlineQuestionnaire(session: questionnaire, arguments: step.arguments)
+                    if store.activeQuestionnaire(for: step.id) == nil {
+                        QuestionnaireCallSummary(arguments: step.arguments)
+                    }
                 } else if step.arguments != .object([:]) {
                     Text("Arguments").font(PiFont.micro).foregroundStyle(.tertiary)
                     ToolDetailText(code: step.arguments.prettyPrinted(maxLength: 8_000))
                 }
-                if let result = step.result {
+                if !step.resultTextBlocks.isEmpty {
                     Text("Result").font(PiFont.micro).foregroundStyle(.tertiary)
-                    ForEach(result.blocks) { block in
-                        switch block.kind {
-                        case let .text(text):
-                            if !text.isEmpty { ToolDetailText(code: text) }
-                        case let .image(image):
-                            ConversationImage(image: image, onOpen: { onImage(image) })
-                        default:
-                            EmptyView()
-                        }
+                    ForEach(step.resultTextBlocks) { block in
+                        if case let .text(text) = block.kind { ToolDetailText(code: text) }
                     }
                 }
             }
