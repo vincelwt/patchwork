@@ -115,8 +115,24 @@ enum PiTheme {
     /// Quick switcher.
     static let quickSwitchWidth: CGFloat = 560
     static let quickSwitchRowHeight: CGFloat = 34
-    static let menuBarWidth: CGFloat = 320
     static let quickSwitchResultLimit = 60
+
+    // Menu bar panel.
+    static let menuBarWidth: CGFloat = 320
+    static let menuBarHeaderHeight: CGFloat = 38
+    static let menuBarSessionRowHeight: CGFloat = 38
+    static let menuBarEmptyStateHeight: CGFloat = 32
+    static let menuBarActionRowHeight: CGFloat = 27
+    static let menuBarSessionsIdealHeight: CGFloat = 480
+    static let menuBarSessionsMinHeight: CGFloat = 76
+    static let menuBarLimitsIdealHeight: CGFloat = 320
+    static let menuBarLimitsMinHeight: CGFloat = 120
+    static let menuBarScreenMargin: CGFloat = 24
+    static let menuBarFallbackScreenHeight: CGFloat = 800
+
+    static var menuBarFixedHeight: CGFloat {
+        menuBarHeaderHeight + 3 * hairline + 2 * menuBarActionRowHeight + space2 + 2 * space4
+    }
 }
 
 // MARK: - Typography

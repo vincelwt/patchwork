@@ -41,3 +41,26 @@ final class MenuBarCircleStateTests: XCTestCase {
         XCTAssertNotEqual(MenuBarCircleState.running.tint, MenuBarCircleState.unread.tint)
     }
 }
+
+final class MenuBarPanelLayoutTests: XCTestCase {
+    func testScrollableRegionsFitCommonDisplayHeights() {
+        for available in [300, 600, 875, 1440] as [CGFloat] {
+            let heights = MenuBarPanelLayout.heights(availableHeight: available)
+            let total = PiTheme.menuBarFixedHeight + heights.sessions + heights.limits
+
+            XCTAssertLessThanOrEqual(total, available - PiTheme.menuBarScreenMargin)
+            XCTAssertGreaterThanOrEqual(
+                heights.limits,
+                min(PiTheme.menuBarLimitsMinHeight, max(0, available - PiTheme.menuBarScreenMargin - PiTheme.menuBarFixedHeight))
+            )
+            XCTAssertLessThan(
+                heights.sessions,
+                CGFloat(MenuBarPanelLayout.sessionDisplayLimit) * PiTheme.menuBarSessionRowHeight
+            )
+        }
+
+        let roomy = MenuBarPanelLayout.heights(availableHeight: 1440)
+        XCTAssertEqual(roomy.sessions, PiTheme.menuBarSessionsIdealHeight)
+        XCTAssertEqual(roomy.limits, PiTheme.menuBarLimitsIdealHeight)
+    }
+}

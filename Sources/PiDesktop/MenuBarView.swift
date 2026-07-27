@@ -1,11 +1,33 @@
 import AppKit
 import SwiftUI
 
+/// Budgets the panel's two scrollable regions so account limits and actions stay on-screen.
+enum MenuBarPanelLayout {
+    static let sessionDisplayLimit = 50
+
+    static var availableScreenHeight: CGFloat {
+        NSScreen.main?.visibleFrame.height ?? PiTheme.menuBarFallbackScreenHeight
+    }
+
+    static func heights(availableHeight: CGFloat) -> (sessions: CGFloat, limits: CGFloat) {
+        let budget = max(0, availableHeight - PiTheme.menuBarScreenMargin - PiTheme.menuBarFixedHeight)
+        let limits = min(
+            PiTheme.menuBarLimitsIdealHeight,
+            max(min(PiTheme.menuBarLimitsMinHeight, budget), budget - PiTheme.menuBarSessionsMinHeight)
+        )
+        let sessions = min(PiTheme.menuBarSessionsIdealHeight, max(0, budget - limits))
+        return (sessions, limits)
+    }
+}
+
 /// Reuses the shared activity monitor; the menu bar never starts its own timer or file poll.
 struct MenuBarContentView: View {
     @EnvironmentObject private var store: AppStore
     private var running: [SessionSummary] { store.runningSessions }
     private var account: CodexAccountStatus? { store.statusModel.codexAccount }
+    private var heights: (sessions: CGFloat, limits: CGFloat) {
+        MenuBarPanelLayout.heights(availableHeight: MenuBarPanelLayout.availableScreenHeight)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -16,7 +38,7 @@ struct MenuBarContentView: View {
                 Text("Pi Desktop").font(PiFont.micro).foregroundStyle(.tertiary)
             }
             .padding(.horizontal, PiTheme.space12)
-            .frame(height: 38)
+            .frame(height: PiTheme.menuBarHeaderHeight)
 
             PiHairline()
 
@@ -24,21 +46,21 @@ struct MenuBarContentView: View {
                 Text("No sessions running")
                     .font(PiFont.caption).foregroundStyle(.secondary)
                     .padding(.horizontal, PiTheme.space12)
-                    .frame(height: 32)
+                    .frame(height: PiTheme.menuBarEmptyStateHeight)
             } else {
                 ScrollView {
                     VStack(spacing: PiTheme.space2) {
-                        ForEach(running.prefix(12)) { session in
+                        ForEach(running.prefix(MenuBarPanelLayout.sessionDisplayLimit)) { session in
                             RunningSessionRow(session: session)
                         }
-                        if running.count > 12 {
-                            Text("\(running.count - 12) more running")
+                        if running.count > MenuBarPanelLayout.sessionDisplayLimit {
+                            Text("\(running.count - MenuBarPanelLayout.sessionDisplayLimit) more running")
                                 .font(PiFont.micro).foregroundStyle(.tertiary)
                         }
                     }
                     .padding(PiTheme.space4)
                 }
-                .frame(maxHeight: 12 * 40)
+                .frame(maxHeight: heights.sessions)
             }
 
             PiHairline()
@@ -46,7 +68,7 @@ struct MenuBarContentView: View {
             // hover — cached instantly, refreshed periodically in the background by
             // `LimitsReportStore`, never fetched directly by this view.
             ScrollView { LimitsPopoverView(fallback: account) }
-                .frame(maxHeight: 320)
+                .frame(maxHeight: heights.limits)
             PiHairline()
 
             VStack(spacing: PiTheme.space2) {
@@ -85,7 +107,7 @@ private struct RunningSessionRow: View {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, PiTheme.space8)
-            .frame(height: 38)
+            .frame(height: PiTheme.menuBarSessionRowHeight)
             .contentShape(Rectangle())
             .piRowBackground(selected: false, hovering: hovering)
         }
@@ -119,7 +141,7 @@ private struct MenuBarActionRow: View {
                 Spacer()
             }
             .padding(.horizontal, PiTheme.space8)
-            .frame(height: 27)
+            .frame(height: PiTheme.menuBarActionRowHeight)
             .contentShape(Rectangle())
             .piRowBackground(selected: false, hovering: hovering)
         }
