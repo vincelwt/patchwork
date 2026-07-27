@@ -922,6 +922,37 @@ details.advanced[open] summary { color: var(--text); }
   padding: 0.15em 0.4em;
   overflow-wrap: anywhere;
 }
+.pairing-screen { align-items: center; }
+.pairing-mark {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-l);
+  background: var(--text);
+  color: var(--bg);
+  font-family: Georgia, serif;
+  font-size: 34px;
+  line-height: 1;
+}
+.pairing-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+}
+.pairing-code {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--fs-large);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  font-variant-numeric: tabular-nums;
+}
+.pairing-body .muted { color: var(--text-tertiary); }
 
 /* ---------- Desktop ---------- */
 

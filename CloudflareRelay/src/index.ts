@@ -15,6 +15,7 @@ import {
   isRequestID,
   isSignature,
   isToken,
+  p256PublicKey,
   publicJwk,
   randomBase64url,
   relayRoute,
@@ -32,7 +33,7 @@ type Device = {
   id: string;
   name: string;
   authPublicKey: PublicJwk;
-  ecdhPublicKey: PublicJwk;
+  ecdhPublicKey: string;
   pairedAt: number;
   lastSeenAt: number;
 };
@@ -44,8 +45,8 @@ type PendingPairing = {
   verificationCode: string;
   requestedAt: number;
   authPublicKey: PublicJwk;
-  ecdhPublicKey: PublicJwk;
-  hostPublicKey: PublicJwk;
+  ecdhPublicKey: string;
+  hostPublicKey: string;
 };
 
 type SocketAttachment =
@@ -126,7 +127,15 @@ export class Relay {
 
     const sockets = this.state.getWebSockets();
     const oldHosts = route.role === "host" ? this.hostSockets() : [];
-    if (sockets.length - oldHosts.length >= MAX_SOCKETS) return response(429, "Too many relay connections");
+    if (route.role === "device" && sockets.length >= MAX_SOCKETS) return response(429, "Too many relay connections");
+    if (route.role === "host" && sockets.length - oldHosts.length >= MAX_SOCKETS) {
+      const unauthenticated = this.deviceSockets().find((socket) => {
+        const attachment = this.attachment(socket);
+        return attachment?.role === "device" && !attachment.authenticated;
+      });
+      if (unauthenticated) this.close(unauthenticated, 1013, "Host connection has priority");
+      else return response(429, "Too many relay connections");
+    }
 
     if (route.role === "host") {
       const match = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(request.headers.get("Authorization") ?? "");
@@ -203,30 +212,24 @@ export class Relay {
   }
 
   webSocketClose(socket: WebSocket): void {
-    const attachment = this.attachment(socket);
-    if (attachment?.role === "host" && !this.hostOnline()) {
-      broadcastHostPresence(this.authenticatedDeviceSockets(), false, (deviceSocket, message) => this.send(deviceSocket, message));
-    }
+    this.socketEnded(socket);
   }
 
   webSocketError(socket: WebSocket): void {
-    const attachment = this.attachment(socket);
-    if (attachment?.role === "host" && !this.hostOnline()) {
-      broadcastHostPresence(this.authenticatedDeviceSockets(), false, (deviceSocket, message) => this.send(deviceSocket, message));
-    }
+    this.socketEnded(socket);
   }
 
   private async handleHost(socket: WebSocket, message: Record<string, unknown>): Promise<void> {
     switch (message.type) {
       case "pairOffer": {
         if (!onlyKeys(message, ["type", "id", "ticketHash", "expiresAt", "hostPublicKey"]) || !isRequestID(message.id) || !isToken(message.ticketHash) || !Number.isSafeInteger(message.expiresAt) || (message.expiresAt as number) <= Date.now()) return this.invalid(socket);
-        const hostPublicKey = publicJwk(message.hostPublicKey);
+        const hostPublicKey = p256PublicKey(message.hostPublicKey);
         if (!hostPublicKey) return this.invalid(socket);
         this.sql.exec(
           "INSERT OR REPLACE INTO pair_offer (singleton, ticket_hash, expires_at, host_public_key) VALUES (1, ?, ?, ?)",
           message.ticketHash,
           message.expiresAt as number,
-          JSON.stringify(hostPublicKey),
+          hostPublicKey,
         );
         this.send(socket, { type: "ack", id: message.id, ok: true });
         return;
@@ -244,7 +247,7 @@ export class Relay {
           return;
         }
         if (!message.approved) {
-          this.send(pendingSocket, { type: "pairDenied" });
+          this.send(pendingSocket, { type: "pairRejected", reason: "denied" });
           this.close(pendingSocket, 1008, "Pairing denied");
           this.send(socket, { type: "ack", id: message.id, ok: true });
           return;
@@ -261,7 +264,7 @@ export class Relay {
           pairing.deviceId,
           pairing.name,
           JSON.stringify(pairing.authPublicKey),
-          JSON.stringify(pairing.ecdhPublicKey),
+          pairing.ecdhPublicKey,
           now,
           now,
         );
@@ -272,9 +275,11 @@ export class Relay {
           authenticated: true,
           deviceId: pairing.deviceId,
         } satisfies SocketAttachment);
+        const pairedDevice = this.device(pairing.deviceId);
+        if (pairedDevice) this.send(socket, { type: "deviceConnected", device: pairedDevice, connectionId: pendingAttachment.connectionId });
         this.send(pendingSocket, { type: "paired", deviceId: pairing.deviceId, hostPublicKey: pairing.hostPublicKey });
         this.send(pendingSocket, { type: "ready", hostOnline: true });
-        this.send(socket, { type: "devices", devices: this.devices() });
+        this.send(socket, { type: "devicesSnapshot", devices: this.devices() });
         this.send(socket, { type: "ack", id: message.id, ok: true });
         return;
       }
@@ -286,9 +291,10 @@ export class Relay {
       case "revokeDevice": {
         if (!onlyKeys(message, ["type", "id", "deviceId"]) || !isRequestID(message.id) || !isDeviceID(message.deviceId)) return this.invalid(socket);
         this.sql.exec("DELETE FROM devices WHERE id = ?", message.deviceId);
+        for (const deviceSocket of this.socketsForDevice(message.deviceId)) this.send(deviceSocket, { type: "revoked" });
         for (const deviceSocket of this.socketsForDevice(message.deviceId)) this.close(deviceSocket, 1008, "Device revoked");
         this.send(socket, { type: "ack", id: message.id, ok: true });
-        this.send(socket, { type: "devices", devices: this.devices() });
+        this.send(socket, { type: "devicesSnapshot", devices: this.devices() });
         return;
       }
       case "toDevice": {
@@ -333,7 +339,7 @@ export class Relay {
     if (message.type === "pair") {
       if (!onlyKeys(message, ["type", "ticket", "deviceId", "name", "authPublicKey", "ecdhPublicKey"]) || !isToken(message.ticket) || !isDeviceID(message.deviceId) || !isName(message.name)) return this.invalid(socket);
       const authPublicKey = publicJwk(message.authPublicKey);
-      const ecdhPublicKey = publicJwk(message.ecdhPublicKey);
+      const ecdhPublicKey = p256PublicKey(message.ecdhPublicKey);
       if (!authPublicKey || !ecdhPublicKey) return this.invalid(socket);
       const ticketHash = await sha256Base64url(message.ticket);
       const host = this.currentHost();
@@ -356,7 +362,7 @@ export class Relay {
         requestedAt: Date.now(),
         authPublicKey,
         ecdhPublicKey,
-        hostPublicKey: JSON.parse(offer.host_public_key) as PublicJwk,
+        hostPublicKey: offer.host_public_key,
       };
       socket.serializeAttachment({ ...attachment, pairing });
       this.send(host, { type: "pairRequest", pairing: {
@@ -402,6 +408,16 @@ export class Relay {
     this.invalid(socket);
   }
 
+  private socketEnded(socket: WebSocket): void {
+    const attachment = this.attachment(socket);
+    if (attachment?.role === "host" && !this.hostOnline()) {
+      broadcastHostPresence(this.authenticatedDeviceSockets(), false, (deviceSocket, message) => this.send(deviceSocket, message));
+    } else if (attachment?.role === "device" && attachment.authenticated && attachment.deviceId) {
+      const host = this.currentHost();
+      if (host) this.send(host, { type: "deviceDisconnected", deviceId: attachment.deviceId, connectionId: attachment.connectionId });
+    }
+  }
+
   private ensureInstallationID(installationID: string): boolean {
     const stored = this.config("installation_id");
     if (stored !== null) return stored === installationID;
@@ -441,7 +457,7 @@ export class Relay {
       id: row.id,
       name: row.name,
       authPublicKey: JSON.parse(row.auth_public_key) as PublicJwk,
-      ecdhPublicKey: JSON.parse(row.ecdh_public_key) as PublicJwk,
+      ecdhPublicKey: row.ecdh_public_key,
       pairedAt: row.paired_at,
       lastSeenAt: row.last_seen_at,
     };

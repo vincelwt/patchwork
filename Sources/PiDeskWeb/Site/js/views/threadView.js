@@ -28,6 +28,7 @@ export function renderThreadView(state, actions, threadId) {
   let refetchQueued = false;
   let renderedCount = 0;
   let loadedOnce = false;
+  let lastRunSignature = "";
 
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
   const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
@@ -321,6 +322,15 @@ export function renderThreadView(state, actions, threadId) {
   return {
     node,
     onStateChange(next) {
+      const run = next.lastRunEvent;
+      const runSignature = run ? `${run.id}:${run.status}:${run.finishedAt || ""}` : "";
+      if (run?.threadId === threadId && runSignature !== lastRunSignature) {
+        lastRunSignature = runSignature;
+        thread = { ...thread, running: run.status === "running" };
+        paintHeader();
+        scheduleRefetch();
+      }
+
       const event = next.lastThreadEvent;
       if (!event || (event.id !== threadId && event.path !== thread?.path)) return;
       const wasUpdatedAt = thread?.updatedAt;

@@ -13,6 +13,7 @@ import {
   isInstallationID,
   isName,
   isToken,
+  p256PublicKey,
   publicJwk,
   relayRoute,
   sha256Base64url,
@@ -57,6 +58,9 @@ test("route, identifiers, and names are strictly bounded", () => {
   assert.equal(isInstallationID("A".repeat(31)), false);
   assert.equal(isConnectionID(encodeBase64url(bytes(16))), true);
   assert.equal(isConnectionID(encodeBase64url(bytes(15))), false);
+  const p256 = encodeBase64url(Uint8Array.from([4, ...bytes(64)]));
+  assert.equal(p256PublicKey(p256), p256);
+  assert.equal(p256PublicKey(encodeBase64url(bytes(65))), null);
   assert.equal(isName("Laptop"), true);
   assert.equal(isName(" Laptop"), false);
   assert.equal(isName("x".repeat(65)), false);

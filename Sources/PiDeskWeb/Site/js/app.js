@@ -8,15 +8,26 @@
 import { h, mount } from "./dom.js";
 import { api, ApiError, getToken, setToken, clearToken, hasToken, describeError } from "./api.js";
 import { connectEvents } from "./sse.js";
+import {
+  forgetRelayDevice,
+  hasRelayDevice,
+  isRelayMode,
+  relayPairingState,
+  startRelay
+} from "./relay.js";
 import { renderTokenScreen } from "./views/token.js";
+import { renderPairingScreen } from "./views/pairing.js";
 import { renderThreadList } from "./views/threadList.js";
 import { renderThreadView } from "./views/threadView.js";
 import { renderNewThread } from "./views/newThread.js";
 import { renderSchedules, renderScheduleDetail } from "./views/schedules.js";
 import { renderScheduleForm } from "./views/scheduleForm.js";
 
+const hosted = isRelayMode();
+const openingPairingLink = hosted && location.pathname.startsWith("/pair/");
 const state = {
-  authed: hasToken(),
+  authed: hosted ? hasRelayDevice() && !openingPairingLink : hasToken(),
+  relayPairing: relayPairingState(),
   connection: "connecting", // "connecting" | "online" | "offline"
   threads: [],
   threadsLoading: false,
@@ -140,6 +151,7 @@ function handleEvent(name, data) {
     setState((s) => ({ schedules: upsertBy(s.schedules, data, "id"), lastScheduleEvent: data }));
   } else if (name === "run") {
     setState({ lastRunEvent: data });
+    loadThreads();
   } else if (name === "activity") {
     setState({ activity: data });
   }
@@ -178,10 +190,17 @@ const actions = {
     );
   },
 
-  signOut() {
+  async signOut() {
     stopEvents();
-    clearToken();
-    Object.assign(state, { authed: false, threads: [], schedules: [], connection: "connecting" });
+    if (hosted) await forgetRelayDevice();
+    else clearToken();
+    Object.assign(state, {
+      authed: false,
+      relayPairing: relayPairingState(),
+      threads: [],
+      schedules: [],
+      connection: "connecting"
+    });
     go("/", { replace: true });
   },
 
@@ -257,7 +276,11 @@ function go(path, { replace = false } = {}) {
 }
 
 function mountRoute() {
-  const view = state.authed ? resolveRoute(location.pathname) : renderTokenScreen(state, actions);
+  const view = state.authed
+    ? resolveRoute(location.pathname)
+    : hosted
+      ? renderPairingScreen(state, actions)
+      : renderTokenScreen(state, actions);
   currentView = view;
   view.node.classList.add("view-enter");
   mount(mainEl, view.node);
@@ -293,9 +316,20 @@ window.addEventListener("pi:unauthorized", () => {
   Object.assign(state, { authed: false, threads: [], schedules: [], connection: "connecting" });
   mountRoute();
 });
+window.addEventListener("pi:relay-pairing", (event) => {
+  setState({ relayPairing: event.detail });
+});
+window.addEventListener("pi:relay-paired", () => {
+  setState({ authed: true, relayPairing: relayPairingState() });
+  loadThreads();
+  loadSchedules();
+  startEvents();
+  go("/", { replace: true });
+});
 
 // ---------- boot ----------
 
+if (hosted) startRelay();
 if (state.authed) {
   loadThreads();
   loadSchedules();

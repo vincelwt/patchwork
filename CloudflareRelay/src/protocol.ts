@@ -69,6 +69,12 @@ export function isSignature(value: unknown): value is string {
   return typeof value === "string" && decodeBase64url(value, 64) !== null;
 }
 
+export function p256PublicKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const bytes = decodeBase64url(value, 65);
+  return bytes?.[0] === 4 ? value : null;
+}
+
 export function publicJwk(value: unknown): PublicJwk | null {
   if (!isRecord(value)) return null;
   const allowed = new Set(["kty", "crv", "x", "y", "ext", "key_ops"]);

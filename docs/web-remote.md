@@ -1,128 +1,112 @@
 # Web remote
 
-A phone-first web app for managing Pi Desktop threads and schedules away from the Mac. It is
-static HTML/CSS/JS, bundled into the app and served by `pi-deskd`, the daemon described in
-[`docs/daemon-api.md`](daemon-api.md). This document covers the parts that document doesn't:
-how to turn the listener on, where the token lives, how to reach it from a phone safely, and
-what the security model actually guarantees.
+Pi Desktop can be used from a phone or another browser without a VPN, inbound port, or tunnel.
+The daemon opens an outbound WebSocket to the Cloudflare relay at
+[`remote.ai.gloom.sh`](https://remote.ai.gloom.sh); the same phone-first static app remains
+available over the older loopback listener for local/tunnel use.
 
-## Enabling it
+Pi and the Mac remain the source of truth. Cloudflare routes encrypted request, response, and
+event envelopes but never receives Pi provider credentials or session files.
 
-The daemon's Unix socket (used by the Mac app and the `pidesk` CLI) is always on. The web remote
-needs the second, opt-in transport: a loopback TCP listener.
+## Hosted remote
+
+The hosted connection starts automatically with `pi-deskd`. Since the app supervises the daemon
+by default, opening Pi Desktop also starts the remote connection. If `pi-deskd` is installed as a
+LaunchAgent, it stays reachable after the window app quits.
+
+Pair a browser once:
+
+1. Click the phone button in the sidebar footer.
+2. Scan the QR code with the phone.
+3. Confirm the same six-digit code on the phone and Mac, then click **Allow**.
+4. Optionally add the site to the phone's Home Screen.
+
+The QR link expires after five minutes and is single-use. It contains a random installation ID,
+one-time ticket, and the Mac's public encryption key. It contains no provider credential,
+session data, or reusable daemon bearer token.
+
+After approval, the browser keeps non-exportable P-256 authentication and key-agreement keys in
+IndexedDB. Each reconnection signs a fresh challenge. API traffic uses a device-specific key
+derived with P-256 ECDH + HKDF-SHA256 and is encrypted with AES-256-GCM before reaching the
+relay. Clearing site data, using private browsing, or revoking the device requires pairing again.
+Each browser has its own identity and can be revoked independently from the same sheet.
+
+The Mac must be online and `pi-deskd` must be running to execute or read conversations. The
+relay deliberately does not queue mutations while the host is offline, avoiding an ambiguous
+"did this prompt run twice?" failure after reconnect.
+
+### Hosted topology
+
+```text
+browser/PWA -- encrypted WSS --> Cloudflare Worker + Durable Object <-- WSS -- pi-deskd
+```
+
+One hibernatable Durable Object coordinates each random installation ID. It retains only the
+host-token hash, public device keys, device labels/timestamps, and one bounded pairing offer.
+There is no D1, KV, R2, plaintext conversation cache, or offline prompt queue. Static files are
+the same `Sources/PiDeskWeb/Site/` assets bundled into the daemon.
+
+Deployment lives in `CloudflareRelay/`:
 
 ```bash
-pidesk remote enable            # starts listening on 127.0.0.1:7717
+cd CloudflareRelay
+npm test
+npx wrangler deploy
+```
+
+`wrangler.jsonc` binds the Durable Object, static assets, and `remote.ai.gloom.sh` custom domain.
+
+## Local loopback remote
+
+The Unix socket used by the Mac app and `pidesk` is always on. The optional local web listener
+remains available for development, SSH forwarding, or a user-managed tunnel:
+
+```bash
+pidesk remote enable            # 127.0.0.1:7717
 pidesk remote enable --port 8080
-pidesk remote url                # prints http://127.0.0.1:<port>
-pidesk remote token              # prints the bearer token
+pidesk remote url
+pidesk remote token
 pidesk remote disable
 ```
 
-`pidesk daemon status` shows whether the daemon and the remote listener are both running. If the
-daemon isn't running yet, `pidesk daemon start` (or just opening Pi Desktop once, since it
-installs the LaunchAgent) starts it.
-
-## Where the token lives
+Restart the daemon after changing this setting. The token lives at:
 
 ```text
 ~/Library/Application Support/Pi Desktop/daemon-token
 ```
 
-32 random bytes, base64url-encoded, file mode `0600` (owner read/write only). The daemon
-generates it the first time `remote enable` runs and reuses it after that; `pidesk remote token`
-just prints the existing file. Every request to the loopback listener — including the page load
-for the web app itself and the `/v1/events` stream — must carry:
+It is 32 random bytes, base64url-encoded, and stored with mode `0600`. Local TCP API requests
+carry `Authorization: Bearer <token>`. The web app stores that token in `localStorage`; it never
+places it in a URL or log. The listener binds only to `127.0.0.1`.
 
-```text
-Authorization: Bearer <token>
-```
-
-There is no session/cookie concept. Losing the token (e.g. suspecting it leaked) means deleting
-the file and re-running `pidesk remote enable`, which mints a new one and immediately
-invalidates the old one.
-
-## Using it on the phone
-
-1. On the Mac: `pidesk remote enable`, then `pidesk remote token` and copy it somewhere you can
-   paste from (or just keep the Terminal window open).
-2. Get traffic from the phone to `127.0.0.1:<port>` on the Mac. The daemon will not do this part
-   for you — see the two options below.
-3. On the phone, open the tunnel's URL, paste the token into the sign-in screen, and add the
-   page to the home screen (Safari: Share → Add to Home Screen) for an app-like icon and no
-   browser chrome.
-
-The daemon deliberately never opens a public listener itself and never ships a tunnel client.
-That is a hard line, not a missing feature: a background daemon that can start Pi runs is a bad
-thing to expose to the internet by accident, so the only way traffic reaches it from outside
-`127.0.0.1` is a tunnel *you* explicitly start, which you can stop the moment you're done.
-
-### Option A — SSH tunnel (no new software, if you already SSH into the Mac)
-
-From the phone (Termius, Blink, iSH, or any SSH client with port forwarding):
+For a manual Cloudflare quick tunnel:
 
 ```bash
-ssh -L 7717:127.0.0.1:7717 you@your-mac.local
-```
-
-Then browse to `http://127.0.0.1:7717` **on the phone** — the SSH client is forwarding that local
-port to the Mac's loopback port through the encrypted SSH connection. Nothing is listening on
-the network beyond the SSH server you already trust. Works over your home network; works over
-the internet too if the Mac is SSH-reachable (a VPN back to home, or a always-on SSH endpoint).
-
-### Option B — Cloudflare Tunnel (works from anywhere, no port forwarding)
-
-On the Mac, `cloudflared` creates an outbound-only connection to Cloudflare's edge and gives you
-a URL:
-
-```bash
-brew install cloudflared
 cloudflared tunnel --url http://127.0.0.1:7717
 ```
 
-That prints a `https://*.trycloudflare.com` URL you can open from the phone on any network — no
-router configuration, no open inbound port on your home network. Cloudflare terminates TLS for
-you, which matters because the daemon itself only ever speaks plain HTTP on loopback. For
-anything longer-lived than a quick check, use a named tunnel with `cloudflared` authenticated to
-your own domain instead of the throwaway quick-tunnel URL, and keep the bearer token as the real
-access control either way — the tunnel gets you a reachable URL, not authorization.
+The hosted relay does not use this listener or token and does not expose a port on the Mac.
 
-Either option is "on when you need it": start it before you leave, stop it (`Ctrl-C`, or
-`pidesk remote disable` on the Mac) when you're back. The token stays useless to anyone without
-the tunnel, and the tunnel stays useless to anyone without the token.
+## Security boundaries
 
-## Security model, in plain language
+- Hosted traffic enters the daemon only after Durable Object device authentication and
+  device-to-daemon decryption.
+- Pairing/device-management endpoints are Unix-socket-only. A paired browser cannot mint or
+  approve another device.
+- Hosted RPC accepts only the documented `/v1/*` methods and rejects `/v1/remote/*`, oversized
+  frames, malformed ciphertext, and unknown mutation methods.
+- Relay and browser payloads are bounded to 2 MiB; retained device records are capped at 32.
+- Unknown API fields and event names continue to degrade through the existing bounded,
+  forward-compatible web and daemon paths.
+- Revoking a browser deletes its relay-side public record and closes its live sockets.
+- Cloudflare can observe connection metadata and encrypted payload sizes/timing. It cannot read
+  the encrypted API body. As with any hosted web app, a compromised future JavaScript deployment
+  could target a browser after page load; a native mobile client would be the upgrade if that
+  threat model becomes necessary.
 
-- **Nothing is exposed by default.** `pidesk remote enable` is opt-in; a fresh install has no
-  network listener beyond the filesystem-permissioned Unix socket.
-- **Two layers, not one.** Reaching the daemon from a phone requires *both* a tunnel you started
-  and the bearer token. A leaked tunnel URL alone gets an attacker a login screen, nothing more —
-  Chrome DevTools, `curl`, or a nosy person on the same Cloudflare edge cannot act without the
-  token. A leaked token alone is useless without also being able to reach `127.0.0.1:<port>` on
-  the Mac, i.e. through your tunnel.
-- **The token is a bearer credential, not a password.** Anyone who has it can do anything the API
-  allows — read threads, send messages, run schedules — until you rotate it. Treat it like an SSH
-  private key: store it in a password manager on the phone, not in a notes app, and never share a
-  screenshot that includes it.
-- **The client never logs it.** The web app keeps the token in `localStorage` only, sends it
-  solely as the `Authorization` header, and never writes it to the console, an error message, or
-  a URL/query string (the SSE stream is fetched with a normal header, not a `?token=` query
-  param, specifically to avoid it ending up in server access logs).
-- **Sign-out is real.** The visible sign-out button clears `localStorage` and returns to the
-  token screen; nothing is cached server-side per browser.
-- **A 401 always means "sign in again."** Every request path — page load, API call, or the event
-  stream — treats an unauthorized response as "the token is gone or wrong" and drops back to the
-  token screen rather than retrying silently.
-- **The daemon is still the source of truth for what's allowed.** The web remote has no
-  privileges the CLI or the app don't also have; it is one more caller of the same API in
-  `docs/daemon-api.md`, bound by the same execution model (concurrency limits, `skipIfRunning`,
-  quiet hours, run history).
+## Web app
 
-## What the web app actually is
-
-`Sources/PiDeskWeb/Site/` — plain HTML/CSS/JS, no build step, no framework, no npm, no CDN.
-`PiDeskWeb.asset(for:)` (Swift, `Sources/PiDeskWeb/PiDeskWeb.swift`) serves it: known files by
-path, everything else falls back to `index.html` so the client-side router (`/`, `/thread/:id`,
-`/new`, `/schedules`, `/schedules/:id`, `/schedules/new`) works on a hard refresh or a deep link,
-and `/v1/*` is always left for the daemon's own router. See that file's doc comment for the exact
-contract the daemon implements against.
+`Sources/PiDeskWeb/Site/` is plain HTML/CSS/JavaScript with no framework, CDN, or build step.
+`PiDeskWeb.asset(for:)` bundles it for loopback use, while Wrangler serves the same directory on
+the hosted origin. Local mode uses HTTP + authenticated SSE; hosted mode swaps only the transport
+for the encrypted relay WebSocket. The views and `/v1` response contract are shared.

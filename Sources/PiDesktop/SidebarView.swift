@@ -117,6 +117,7 @@ private struct SidebarFooter: View {
     let archivedCount: Int
     @Binding var archiveExpanded: Bool
     let archiveForcedOpen: Bool
+    @State private var remoteAccessPresented = false
     private var runningCount: Int { store.runningSessions.count }
     private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
@@ -129,6 +130,17 @@ private struct SidebarFooter: View {
                     .accessibilityValue(label)
             }
             Spacer(minLength: PiTheme.space4)
+            Button { remoteAccessPresented = true } label: {
+                Image(systemName: "iphone")
+                    .font(.system(size: PiIcon.small, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Remote access")
+            .accessibilityLabel("Remote access")
+            .sheet(isPresented: $remoteAccessPresented) { RemoteAccessView() }
             if archivedCount > 0 {
                 Button { archiveExpanded.toggle() } label: {
                     Image(systemName: "archivebox")
