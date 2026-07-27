@@ -318,6 +318,7 @@ struct SessionParser {
             customType: message["customType"]?.stringValue,
             details: message["details"]?.boundedProjection(),
             usage: message["usage"]?.boundedProjection(),
+            modelName: message["model"]?.stringValue,
             raw: role == .unknown ? message.boundedFallback(maxLength: PiTheme.unknownPayloadLimit) : .null
         )
     }

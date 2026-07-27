@@ -157,6 +157,7 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var customType: String?
     var details: JSONValue?
     var usage: JSONValue?
+    var modelName: String?
     /// Known messages set this to `.null`; only bounded unknown fallbacks retain content.
     let raw: JSONValue
 
@@ -274,6 +275,11 @@ struct ActivityItem: Identifiable, Hashable, Sendable {
     var startedAt: Date?
     var endedAt: Date?
     var raw: JSONValue
+    var agentID: String?
+    var agentType: String?
+    var modelName: String?
+    var toolCallCount: Int?
+    var duration: TimeInterval?
 }
 
 enum AppRoute: Hashable { case newChat, session(String) }

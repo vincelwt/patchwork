@@ -2182,11 +2182,14 @@ final class AppStore: ObservableObject {
                     pendingQuestionnaire = QuestionnaireParser.parse(toolCallID: callID, arguments: arguments)
                 }
             }
-            if let item = ActivityPresenter.activityForToolStart(event: event) { upsertActivity(item) }
+            if let item = ActivityPresenter.activityForToolStart(
+                event: event,
+                modelName: runtimeState.modelName ?? runtimeState.modelID
+            ) { upsertActivity(item) }
         case "tool_execution_update":
             guard selected, let id = event["toolCallId"]?.stringValue,
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
-            activities[index].detail = extractResultText(event["partialResult"])?.suffixString(900)
+            ActivityPresenter.applyResult(event["partialResult"], finished: false, to: &activities[index])
         case "tool_execution_end":
             guard let id = event["toolCallId"]?.stringValue else { return }
             // The question belongs to the attached runtime, not to whatever is on screen, so it
@@ -2195,9 +2198,13 @@ final class AppStore: ObservableObject {
             guard selected else { return }
             if activeCapability?.sourceID == id { activeCapability = nil }
             if let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) {
-                activities[index].status = event["isError"]?.boolValue == true ? .failed : .succeeded
-                activities[index].endedAt = Date()
-                activities[index].detail = extractResultText(event["result"])?.suffixString(900)
+                ActivityPresenter.applyResult(
+                    event["result"],
+                    finished: true,
+                    endedAt: Date(),
+                    isError: event["isError"]?.boolValue == true,
+                    to: &activities[index]
+                )
             }
         case "queue_update":
             runtimeState.steeringQueue = queueStrings(event["steering"])
@@ -2438,17 +2445,20 @@ final class AppStore: ObservableObject {
         let history = activityPresenter.activities(from: messages)
         let live = activities.filter { $0.status == .running || $0.status == .waiting }
         var merged = history
-        for item in live where !merged.contains(where: { $0.id == item.id }) { merged.insert(item, at: 0) }
+        for item in live where !merged.contains(where: {
+            $0.id == item.id || (item.agentID != nil && $0.agentID == item.agentID)
+        }) { merged.insert(item, at: 0) }
         activities = merged
     }
 
     private func upsertActivity(_ item: ActivityItem) {
-        if let index = activities.firstIndex(where: { $0.id == item.id }) { activities[index] = item }
-        else { activities.insert(item, at: 0) }
-    }
-
-    private func extractResultText(_ result: JSONValue?) -> String? {
-        result?["content"]?.arrayValue?.compactMap { $0["type"]?.stringValue == "text" ? $0["text"]?.stringValue : nil }.joined(separator: "\n")
+        if let index = activities.firstIndex(where: {
+            $0.id == item.id || (item.agentID != nil && $0.agentID == item.agentID)
+        }) {
+            activities[index] = ActivityPresenter.merged(item, with: activities[index])
+        } else {
+            activities.insert(item, at: 0)
+        }
     }
 
     private func responseError(_ response: JSONValue) -> String? {
