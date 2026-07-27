@@ -443,12 +443,26 @@ touching the files, so there is exactly one writer.
 - **The settlement boundary is guarded on both sides.** Admission closes under the same lock a
   delivery claims its reservation with, so a caller either gets in before the run finishes or finds
   nothing and falls back to a fresh queued run — there is no window in between, and the executor
-  never stops a session while a write or acknowledgement is outstanding. An accepted (or
-  unacknowledged) `steer`/`follow_up` also banks a *turn credit*: the run keeps consuming through
-  the turn that message bought instead of stopping on the `agent_settled` of the turn already in
-  progress, which would have discarded it. Each credit extends the run's deadline by up to five
-  minutes, and a run may be extended at most 8 times before further live messages are refused and
-  queue as new runs instead.
+  never stops a session while a write or acknowledgement is outstanding.
+- **`steer` and `follow_up` settle differently, because Pi runs them differently.** A `steer` is
+  folded into the turn already running, so the next `agent_settled` *is* its settle and the run may
+  end there. A `follow_up` runs as its own later turn, so an accepted (or unacknowledged) one banks
+  a *turn credit* the run must spend before admission can close — otherwise the settle of the turn
+  already in progress would stop the session and discard it. Crediting a steer would be the mirror
+  mistake: the run would wait for a turn that never starts and record a finished conversation as a
+  timeout.
+- **A delivery still in flight when the boundary arrives is the ambiguous case.** It may have
+  landed too late to join the settling turn, so if it could have been delivered at all the run
+  continues exactly once; if Pi rejected it or the write failed, it owes nothing and the run
+  closes. Each credit extends the deadline by up to five minutes, and a run may be extended at most
+  8 times before further live messages are refused and queue as new runs instead. Steering is not
+  rate-limited by that bound, since it owes no turns.
+- **Writing to Pi is bounded.** A full stdin buffer — what a wedged `pi` looks like — would
+  otherwise park the writing task indefinitely, holding an HTTP handler and the session's write
+  lock. Writes use a non-blocking descriptor with a 15-second `poll()` deadline; a timeout fails
+  the command (nothing incomplete can have been executed, so the caller may safely queue it
+  instead) and poisons the session's writer, since a partial record cannot be repaired by writing
+  more.
 - Pi's stdin has exactly one writer lock (request ids and whole JSONL lines are written under it)
   and its stdout exactly one drainer (the run's own event loop). A steer delivered from an HTTP
   handler collects its acknowledgement from the bounded response cache that loop fills; it never

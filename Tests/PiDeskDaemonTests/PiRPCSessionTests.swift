@@ -158,3 +158,103 @@ final class PiRPCSessionTests: XCTestCase {
         XCTAssertNil(response, "callers treat this as outcome-unknown, never as \"not delivered\"")
     }
 }
+
+/// A pipe write blocks once the kernel buffer fills, which is exactly what a wedged `pi` looks
+/// like. Unbounded, that pins whichever task issued the write — a steer arriving over HTTP would
+/// hold an HTTP handler and the session's write lock until the process was killed. These tests use
+/// a child that reads nothing at all; no provider is ever contacted.
+final class BlockingPipeWriteTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUp() {
+        super.setUp()
+        // `pi-deskd`'s own `main.swift` does this at startup: writing to a pipe whose reader has
+        // gone must surface as EPIPE on the write, not kill the process. The test binary has no
+        // such startup, so it opts in here.
+        signal(SIGPIPE, SIG_IGN)
+        directory = TestSupport.tempDirectory()
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: directory)
+        super.tearDown()
+    }
+
+    /// Sleeps without ever reading stdin, so the pipe buffer fills and stays full.
+    private func makeDeafPi() throws -> URL {
+        let executable = directory.appendingPathComponent("deaf-pi")
+        try """
+        #!/bin/sh
+        /bin/sleep 30
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        return executable
+    }
+
+    func testAWriteToAChildThatNeverReadsFailsWithinItsTimeoutInsteadOfHanging() throws {
+        let pipe = Pipe()
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        defer {
+            try? pipe.fileHandleForWriting.close()
+            try? pipe.fileHandleForReading.close()
+        }
+
+        // Far more than any pipe buffer, so the write cannot complete without a reader.
+        let payload = Data(repeating: 0x41, count: 8 * 1_024 * 1_024)
+        let started = Date()
+        XCTAssertThrowsError(try BlockingPipeIO.writeAll(fd: fd, data: payload, timeoutSeconds: 0.4)) { error in
+            guard case let RunnerError.ioFailure(message) = error else { return XCTFail("expected an I/O failure, got \(error)") }
+            XCTAssertTrue(message.contains("did not accept input"), message)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "the whole point is that it returns")
+    }
+
+    func testAWriteToAClosedReaderFailsImmediatelyRatherThanWaitingOutTheTimeout() throws {
+        let pipe = Pipe()
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        try pipe.fileHandleForReading.close()
+        defer { try? pipe.fileHandleForWriting.close() }
+
+        let started = Date()
+        XCTAssertThrowsError(try BlockingPipeIO.writeAll(fd: fd, data: Data(repeating: 0x41, count: 8 * 1_024 * 1_024), timeoutSeconds: 30))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "EPIPE is known immediately; no need to wait it out")
+    }
+
+    func testAnOrdinaryWriteStillSucceeds() throws {
+        let pipe = Pipe()
+        defer {
+            try? pipe.fileHandleForWriting.close()
+            try? pipe.fileHandleForReading.close()
+        }
+        try BlockingPipeIO.writeAll(fd: pipe.fileHandleForWriting.fileDescriptor, data: Data("hello\n".utf8), timeoutSeconds: 5)
+        XCTAssertEqual(pipe.fileHandleForReading.availableData, Data("hello\n".utf8))
+    }
+
+    func testASessionWhoseChildNeverReadsFailsItsSendAndThenRefusesFurtherWrites() async throws {
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: try makeDeafPi(),
+            environment: ProcessInfo.processInfo.environment, writeTimeout: 0.4
+        )
+        defer { session.stop() }
+
+        // Fill the pipe. One of these writes will exhaust the buffer and hit the bound.
+        let huge = String(repeating: "x", count: 256 * 1_024)
+        var failure: Error?
+        for _ in 0..<64 where failure == nil {
+            do {
+                _ = try session.send(type: "prompt", payload: ["message": .string(huge)])
+            } catch {
+                failure = error
+            }
+        }
+        let thrown = try XCTUnwrap(failure, "a child that never reads must eventually fail a write")
+        XCTAssertTrue("\(thrown)".contains("did not accept input"), "\(thrown)")
+
+        // The stream now holds a partial record that no later write can repair.
+        XCTAssertThrowsError(try session.send(type: "get_state"), "later writes must fail fast, not append to a torn command")
+    }
+}

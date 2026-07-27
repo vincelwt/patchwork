@@ -57,8 +57,9 @@ The phone UI covers the daily loop, not just reading:
   keeps its text with Retry, and a per-message submission id means a retry after a lost response
   replays the original answer instead of prompting Pi twice.
 - **Steering and follow-ups are real.** Both are delivered into the live Pi turn with Pi's own
-  `steer` / `follow_up` command. With no daemon-owned turn running there is nothing to interrupt,
-  and the UI says the message was queued instead of claiming it steered.
+  `steer` / `follow_up` command — a steer joins the turn in progress, a follow-up runs as its own
+  next turn, and the daemon settles each accordingly. With no daemon-owned turn running there is
+  nothing to interrupt, and the UI says the message was queued instead of claiming it steered.
 - **Questions can be answered from the phone.** An `ask_user_question` step or permission prompt
   raised by a daemon run appears in the thread with accessible single-select, multi-select, typed,
   and confirm forms. Nothing is ever auto-answered; an unsupported dialog says so and offers
@@ -218,7 +219,7 @@ node --test docs/js-checks/*.test.mjs      # pure web-remote logic, no DOM, no n
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. The remote-parity work adds coverage for optimistic pending-message reconciliation and its eviction rules, submission replay protection, the live-session settlement boundary (in-flight writes, banked turn credits, late callers, credit bounds), folder-tree cycle/depth/legacy handling on both sides, inline-image projection with encoding validation and bounded retrieval, the bounded image cache, the interaction registry's bounds, method-appropriate response validation and expiry-cancels-never-answers rule, `tool_execution_start` questionnaire parsing, live steer/follow-up delivery outcomes, and concurrent stdin writes against a fake `pi`. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
+Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. The remote-parity work adds coverage for optimistic pending-message reconciliation and its eviction rules, submission replay protection, the live-session settlement boundary (steer-joins-this-turn vs follow-up-owns-the-next, in-flight deliveries crossing the boundary, late callers refused during it, credit bounds), bounded pipe writes against a child that never reads, folder-tree cycle/depth/legacy handling on both sides, inline-image projection with encoding validation and bounded retrieval, the bounded image cache, the interaction registry's bounds, method-appropriate response validation and expiry-cancels-never-answers rule, `tool_execution_start` questionnaire parsing, live steer/follow-up delivery outcomes, and concurrent stdin writes against a fake `pi`. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
 
 ## Current limitations
 

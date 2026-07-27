@@ -47,11 +47,18 @@ struct PiSessionRuntimeHandle: LiveRuntimeHandle {
 ///    delivery claims its reservation with, so a caller either gets in before the run finishes or
 ///    finds nothing and falls back to a fresh queued run. There is no window in between, and the
 ///    executor never stops a session while a reservation is outstanding.
-/// 2. **A message accepted and then killed.** Pi acknowledges a `steer`/`follow_up`, then the
+/// 2. **A message accepted and then killed.** Pi acknowledges a `follow_up`, then the
 ///    `agent_settled` for the turn already in progress arrives and the executor would stop the
-///    session — discarding the message it just accepted. Every accepted delivery therefore banks a
-///    *turn credit*, and the executor must spend those credits (keep consuming through the turns
-///    they own) before admission can close.
+///    session — discarding the message it just accepted, because a follow-up runs as its *own*
+///    later turn. Such a delivery therefore banks a *turn credit*, and the executor must spend
+///    those credits before admission can close.
+///
+///    A `steer` is different and must not bank one: Pi folds it into the turn already running, so
+///    the very next `agent_settled` **is** that message's settle. Crediting it would make the
+///    executor wait for a second turn that never starts, stalling the run until its deadline and
+///    recording a successful conversation as a timeout. The single exception is a steer still
+///    in flight when the boundary arrives — it may have landed too late to be folded in, so if it
+///    could have been delivered at all, the run conservatively continues once.
 ///
 /// Entries are keyed by thread but generation-checked by run id: two runs on one thread cannot
 /// overlap (`RunQueue` enforces per-thread mutual exclusion), but their registrations still can,
@@ -80,6 +87,9 @@ final class LiveSessionRegistry: @unchecked Sendable {
         var inFlight = 0
         var turnCredits = 0
         var grantedCredits = 0
+        /// A settle boundary was reached while deliveries were still in flight. Those deliveries
+        /// crossed it, so their outcome decides whether the run continues.
+        var boundaryPending = false
 
         init(runID: String, handle: LiveRuntimeHandle) {
             self.runID = runID
@@ -115,12 +125,22 @@ final class LiveSessionRegistry: @unchecked Sendable {
     }
 
     /// Called by the executor when it sees `agent_settled`. See `CloseOutcome`.
+    ///
+    /// `.busy` closes admission too: a caller arriving during that window must fall back to a
+    /// queued run rather than write into a session that is one instant from being stopped.
+    /// Admission reopens only when the run genuinely continues into a credited turn.
     func closeAdmission(threadID: String, runID: String) -> CloseOutcome {
         lock.lock(); defer { lock.unlock() }
         guard let entry = entries[threadID], entry.runID == runID else { return .closed }
-        if entry.inFlight > 0 { return .busy }
+        if entry.inFlight > 0 {
+            entry.admitting = false
+            entry.boundaryPending = true
+            return .busy
+        }
+        entry.boundaryPending = false
         if entry.turnCredits > 0 {
             entry.turnCredits -= 1
+            entry.admitting = true
             return .continueConsuming
         }
         entry.admitting = false
@@ -135,19 +155,13 @@ final class LiveSessionRegistry: @unchecked Sendable {
         guard let entry = reserve(threadID: threadID) else { return nil }
         do {
             let result = try await entry.handle.deliver(command: command, message: message)
-            // A rejected message never ran, so it owes no turn. The other two may already have
-            // been applied and must keep the run consuming through the turn they bought.
-            let ownsATurn: Bool
-            switch result {
-            case .acknowledged, .unacknowledged: ownsATurn = true
-            case .rejected: ownsATurn = false
-            }
-            release(entry, bankTurn: ownsATurn)
+            release(entry, command: command, result: result)
             return (entry.runID, result)
         } catch {
-            // The write failed (the process exited between reservation and send), so nothing
-            // reached Pi and sending it again cannot duplicate anything.
-            release(entry, bankTurn: false)
+            // The write failed (the process exited between reservation and send, or Pi stopped
+            // accepting input), so nothing reached Pi and sending it again cannot duplicate
+            // anything — and it owes no turn either way.
+            release(entry, command: command, result: nil)
             return nil
         }
     }
@@ -165,15 +179,31 @@ final class LiveSessionRegistry: @unchecked Sendable {
         return entry
     }
 
-    private func release(_ entry: Entry, bankTurn: Bool) {
+    /// Decides, under the lock, whether this delivery owes the run another turn.
+    ///
+    /// - a rejected or unwritten message never ran, so it owes nothing;
+    /// - a `follow_up` runs as its own later turn, so it owes one;
+    /// - a `steer` is folded into the turn already running, so it owes nothing — unless it was
+    ///   still in flight when the settle boundary arrived, in which case it may have missed that
+    ///   turn, and one extra turn is the conservative reading.
+    private func release(_ entry: Entry, command: String, result: LiveDelivery?) {
         lock.lock()
         entry.inFlight -= 1
-        if bankTurn {
+        let mayHaveApplied: Bool
+        switch result {
+        case .acknowledged, .unacknowledged: mayHaveApplied = true
+        case .rejected, nil: mayHaveApplied = false
+        }
+        if mayHaveApplied, command == Self.followUpCommand || entry.boundaryPending {
             entry.turnCredits += 1
             entry.grantedCredits += 1
         }
         lock.unlock()
     }
+
+    /// Pi's own verb for a message that runs after the current turn, as opposed to `steer`, which
+    /// joins it.
+    static let followUpCommand = "follow_up"
 }
 
 /// Every `extension_ui_request` a daemon run is currently blocked on, plus the way to answer it.

@@ -21,6 +21,10 @@ final class PiRPCSession: @unchecked Sendable {
     /// follow-up deliveries and `extension_ui_response` answers arrive from HTTP handlers on
     /// other tasks entirely — two interleaved partial JSONL lines would corrupt the stream.
     private let writeLock = NSLock()
+    /// Set when a write timed out or failed part-way through a record. The stream then holds a
+    /// partial line that no later write can repair, so every subsequent write fails fast rather
+    /// than appending onto a torn command.
+    private var writeBroken: String?
     private let stderrLock = NSLock()
     private var stderrTail = ""
     /// Responses seen by whoever is draining output, kept so a caller that is *not* the drainer
@@ -31,15 +35,23 @@ final class PiRPCSession: @unchecked Sendable {
 
     var isRunning: Bool { process.isRunning }
 
-    private init(process: Process, inputHandle: FileHandle, outputFD: Int32, errorHandle: FileHandle) {
+    /// How long one write may wait for a wedged child to drain its stdin. A parameter only so a
+    /// test can prove the bound in a fraction of a second instead of the production default.
+    private let writeTimeout: TimeInterval
+
+    private init(process: Process, inputHandle: FileHandle, outputFD: Int32, errorHandle: FileHandle, writeTimeout: TimeInterval) {
         self.process = process
         self.inputHandle = inputHandle
         self.outputFD = outputFD
         self.errorHandle = errorHandle
+        self.writeTimeout = writeTimeout
         watchStderr()
     }
 
-    static func start(cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String]) throws -> PiRPCSession {
+    static func start(
+        cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String],
+        writeTimeout: TimeInterval = BlockingPipeIO.defaultWriteTimeout
+    ) throws -> PiRPCSession {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -54,7 +66,17 @@ final class PiRPCSession: @unchecked Sendable {
         process.standardOutput = output
         process.standardError = error
         try process.run()
-        return PiRPCSession(process: process, inputHandle: input.fileHandleForWriting, outputFD: output.fileHandleForReading.fileDescriptor, errorHandle: error.fileHandleForReading)
+        // Pipe descriptors are blocking by default, which would make a full stdin buffer park the
+        // writing task indefinitely — the exact hang `BlockingPipeIO.writeAll`'s timeout exists to
+        // bound. Non-blocking turns that into `EAGAIN`, which it can poll on with a deadline.
+        let inputFD = input.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(inputFD, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(inputFD, F_SETFL, flags | O_NONBLOCK) }
+        return PiRPCSession(
+            process: process, inputHandle: input.fileHandleForWriting,
+            outputFD: output.fileHandleForReading.fileDescriptor, errorHandle: error.fileHandleForReading,
+            writeTimeout: writeTimeout
+        )
     }
 
     /// Writes a correlated request and returns its id; the caller awaits the matching response
@@ -82,12 +104,20 @@ final class PiRPCSession: @unchecked Sendable {
 
     /// Must only be called with `writeLock` held.
     private func writeLocked(_ object: [String: PiJSONValue]) throws {
+        if let writeBroken { throw RunnerError.ioFailure(writeBroken) }
         do {
-            try BlockingPipeIO.writeAll(fd: inputHandle.fileDescriptor, data: try PiJSONValue.object(object).encodedLine())
+            try BlockingPipeIO.writeAll(
+                fd: inputHandle.fileDescriptor,
+                data: try PiJSONValue.object(object).encodedLine(),
+                timeoutSeconds: writeTimeout
+            )
         } catch let error as RunnerError {
+            writeBroken = error.localizedDescription
             throw error
         } catch {
-            throw RunnerError.ioFailure("Could not write to Pi: \(error)")
+            let message = "Could not write to Pi: \(error)"
+            writeBroken = message
+            throw RunnerError.ioFailure(message)
         }
     }
 

@@ -15,6 +15,8 @@ final class GatedLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
     var result: LiveDelivery = .acknowledged
     /// When true, `deliver` blocks until `finishDelivery()` is called.
     var gated = false
+    /// Simulates a write that fails only once the boundary has already been crossed.
+    var throwsAfterGate = false
 
     func deliver(command: String, message: String) async throws -> LiveDelivery {
         lock.lock(); _delivered.append((command, message)); lock.unlock()
@@ -27,6 +29,7 @@ final class GatedLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
                 }
             }
         }
+        if throwsAfterGate { throw RunnerError.ioFailure("Pi did not accept input within 15s.") }
         return result
     }
 
@@ -60,24 +63,51 @@ final class LiveSettlementTests: XCTestCase {
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
     }
 
-    func testAnAcceptedSteerKeepsTheRunConsumingThroughTheTurnItBought() async {
+    // MARK: - What a delivery owes the run
+
+    func testAMidTurnSteerOwesNoExtraTurnSoTheNextSettleEndsTheRun() async {
+        // Pi folds a steer into the turn already running, so the next `agent_settled` *is* that
+        // message's settle. Treating it as owing another turn would leave the executor waiting for
+        // a turn that never starts, stalling to the deadline and recording success as a timeout.
         let registry = LiveSessionRegistry()
         registry.register(threadID: thread, runID: run, handle: FakeLiveRuntime())
 
         let delivered = await registry.deliver(threadID: thread, command: "steer", message: "stop")
         XCTAssertEqual(delivered?.result, .acknowledged)
 
-        // The `agent_settled` for the turn that was already running. Stopping here would discard
-        // the message Pi just accepted.
-        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
-        XCTAssertNotNil(registry.liveRunID(threadID: thread), "still live: a turn is owed")
-
-        // The steered turn's own settle. Nothing is owed now.
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
         XCTAssertNil(registry.liveRunID(threadID: thread))
     }
 
-    func testAnUnacknowledgedDeliveryAlsoBuysATurnBecauseItMayHaveApplied() async {
+    func testAnAcceptedFollowUpOwnsALaterTurnAndKeepsTheRunConsuming() async {
+        let registry = LiveSessionRegistry()
+        registry.register(threadID: thread, runID: run, handle: FakeLiveRuntime())
+
+        _ = await registry.deliver(threadID: thread, command: "follow_up", message: "and also")
+
+        // The settle of the turn that was already running. Stopping here would discard the
+        // follow-up, which has not run yet.
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
+        XCTAssertNotNil(registry.liveRunID(threadID: thread), "admission reopens for the new turn")
+
+        // The follow-up's own settle. Nothing is owed now.
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
+        XCTAssertNil(registry.liveRunID(threadID: thread))
+    }
+
+    func testEachAcceptedFollowUpOwnsExactlyOneTurn() async {
+        let registry = LiveSessionRegistry()
+        registry.register(threadID: thread, runID: run, handle: FakeLiveRuntime())
+
+        _ = await registry.deliver(threadID: thread, command: "follow_up", message: "one")
+        _ = await registry.deliver(threadID: thread, command: "follow_up", message: "two")
+
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
+    }
+
+    func testAnUnacknowledgedFollowUpAlsoOwnsATurnBecauseItMayHaveApplied() async {
         let registry = LiveSessionRegistry()
         let runtime = FakeLiveRuntime()
         runtime.result = .unacknowledged
@@ -87,17 +117,19 @@ final class LiveSettlementTests: XCTestCase {
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
     }
 
-    func testARejectedDeliveryBuysNothing() async {
+    func testARejectedFollowUpOwesNothing() async {
         let registry = LiveSessionRegistry()
         let runtime = FakeLiveRuntime()
         runtime.result = .rejected("nope")
         registry.register(threadID: thread, runID: run, handle: runtime)
 
-        _ = await registry.deliver(threadID: thread, command: "steer", message: "x")
-        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed, "it never ran, so it owes no turn")
+        _ = await registry.deliver(threadID: thread, command: "follow_up", message: "x")
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed, "it never ran")
     }
 
-    func testASettleDuringAnInFlightWriteReportsBusyRatherThanClosing() async {
+    // MARK: - The settlement boundary itself
+
+    func testASettleDuringAnInFlightWriteWaitsAndRefusesLateCallers() async {
         let registry = LiveSessionRegistry()
         let runtime = GatedLiveRuntime()
         runtime.gated = true
@@ -108,14 +140,68 @@ final class LiveSettlementTests: XCTestCase {
 
         // This is the race: the executor must not stop the session here.
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .busy)
-        XCTAssertNotNil(registry.liveRunID(threadID: thread))
+
+        // …and admission is already shut, so anyone arriving in this window queues a fresh run
+        // instead of writing into a session that is about to be stopped.
+        XCTAssertNil(registry.liveRunID(threadID: thread))
+        let late = await registry.deliver(threadID: thread, command: "steer", message: "too late")
+        XCTAssertNil(late)
 
         runtime.finishDelivery()
         let result = await delivery.value
         XCTAssertEqual(result?.result, .acknowledged)
+        XCTAssertEqual(runtime.delivered.count, 1, "the late caller never wrote anything")
+    }
 
-        // Once the write lands it owes a turn, then the run may finish.
+    func testASteerThatCrossedTheBoundaryContinuesOnceBecauseItMayHaveMissedTheTurn() async {
+        let registry = LiveSessionRegistry()
+        let runtime = GatedLiveRuntime()
+        runtime.gated = true
+        registry.register(threadID: thread, runID: run, handle: runtime)
+
+        let delivery = Task { await registry.deliver(threadID: thread, command: "steer", message: "stop") }
+        XCTAssertTrue(runtime.waitForDeliveryToStart())
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .busy)
+
+        runtime.finishDelivery()
+        _ = await delivery.value
+
+        // It may have landed too late to join the settling turn, so the conservative reading is
+        // one more turn — never a stop that would discard it.
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .continueConsuming)
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed, "exactly once, not forever")
+    }
+
+    func testASteerThatCrossedTheBoundaryAndWasRejectedClosesImmediately() async {
+        let registry = LiveSessionRegistry()
+        let runtime = GatedLiveRuntime()
+        runtime.gated = true
+        runtime.result = .rejected("nothing to steer")
+        registry.register(threadID: thread, runID: run, handle: runtime)
+
+        let delivery = Task { await registry.deliver(threadID: thread, command: "steer", message: "stop") }
+        XCTAssertTrue(runtime.waitForDeliveryToStart())
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .busy)
+
+        runtime.finishDelivery()
+        _ = await delivery.value
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed, "it never ran, so nothing is owed")
+    }
+
+    func testASteerThatCrossedTheBoundaryAndFailedToWriteClosesImmediately() async {
+        let registry = LiveSessionRegistry()
+        let runtime = GatedLiveRuntime()
+        runtime.gated = true
+        runtime.throwsAfterGate = true
+        registry.register(threadID: thread, runID: run, handle: runtime)
+
+        let delivery = Task { await registry.deliver(threadID: thread, command: "steer", message: "stop") }
+        XCTAssertTrue(runtime.waitForDeliveryToStart())
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .busy)
+
+        runtime.finishDelivery()
+        let result = await delivery.value
+        XCTAssertNil(result, "nothing reached Pi, so the caller may queue it instead")
         XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
     }
 
@@ -135,11 +221,24 @@ final class LiveSettlementTests: XCTestCase {
         registry.register(threadID: thread, runID: run, handle: FakeLiveRuntime())
 
         for index in 0..<LiveSessionRegistry.maxTurnCredits {
-            let delivered = await registry.deliver(threadID: thread, command: "steer", message: "m\(index)")
+            let delivered = await registry.deliver(threadID: thread, command: "follow_up", message: "m\(index)")
             XCTAssertNotNil(delivered, "delivery \(index) should be admitted")
         }
-        let refused = await registry.deliver(threadID: thread, command: "steer", message: "one too many")
+        let refused = await registry.deliver(threadID: thread, command: "follow_up", message: "one too many")
         XCTAssertNil(refused, "past the bound the caller gets a fresh queued run, not an endless one")
+    }
+
+    func testSteeringIsNotRateLimitedByTheTurnCreditBound() async {
+        // Steers owe no turns, so a long steering conversation must not exhaust the extension
+        // budget that exists to stop a run being kept alive forever.
+        let registry = LiveSessionRegistry()
+        registry.register(threadID: thread, runID: run, handle: FakeLiveRuntime())
+
+        for index in 0..<(LiveSessionRegistry.maxTurnCredits * 3) {
+            let delivered = await registry.deliver(threadID: thread, command: "steer", message: "m\(index)")
+            XCTAssertNotNil(delivered, "steer \(index) should still be admitted")
+        }
+        XCTAssertEqual(registry.closeAdmission(threadID: thread, runID: run), .closed)
     }
 
     func testUnregisterStillRespectsGenerationAfterAClose() {
