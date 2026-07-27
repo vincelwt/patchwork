@@ -8,6 +8,63 @@ extension PiTheme {
     static let conversationTitlePillMaxWidth: CGFloat = 280
 }
 
+@MainActor
+final class ConversationScrollAnchorStore {
+    private var anchors: [String: String] = [:]
+    private var order: [String] = []
+    private let limit: Int
+
+    init(limit: Int = 32) { self.limit = limit }
+
+    func anchor(for path: String) -> String? { anchors[path] }
+
+    func remember(_ anchor: String, for path: String) {
+        guard anchors[path] != anchor else { return }
+        anchors[path] = anchor
+        order.removeAll { $0 == path }
+        order.append(path)
+        while order.count > limit { anchors.removeValue(forKey: order.removeFirst()) }
+    }
+}
+
+@MainActor
+final class TranscriptProjectionCache {
+    private var revision = -1
+    private var isRunning = false
+    private var cached: [TranscriptItem] = []
+    private(set) var buildCount = 0
+
+    func items(
+        revision: Int,
+        messages: [ChatMessage],
+        streaming: ChatMessage?,
+        isRunning: Bool
+    ) -> [TranscriptItem] {
+        guard self.revision != revision || self.isRunning != isRunning else { return cached }
+        self.revision = revision
+        self.isRunning = isRunning
+        let projected = TranscriptPresenter.items(messages: messages, streaming: streaming, isRunning: isRunning)
+        cached = preservingWorkIDs(in: projected)
+        buildCount += 1
+        return cached
+    }
+
+    private func preservingWorkIDs(in projected: [TranscriptItem]) -> [TranscriptItem] {
+        var previousIDByEntry: [String: String] = [:]
+        for case let .work(block) in cached {
+            for entry in block.entries { previousIDByEntry[entry.id] = block.id }
+        }
+        var used: Set<String> = []
+        return projected.map { item in
+            guard case var .work(block) = item,
+                  let priorID = block.entries.lazy.compactMap({ previousIDByEntry[$0.id] }).first,
+                  used.insert(priorID).inserted else { return item }
+            block.id = priorID
+            return .work(block)
+        }
+    }
+}
+
 struct ConversationView: View {
     @EnvironmentObject private var store: AppStore
     @State private var renamePresented = false
@@ -17,8 +74,7 @@ struct ConversationView: View {
     @State private var composerFocusTick = 0
     /// In-memory only: recent routes reopen at the row the user was reading. The transcript page
     /// cache carries the matching rows; both structures stay bounded.
-    @State private var scrollAnchors: [String: String] = [:]
-    @State private var scrollAnchorOrder: [String] = []
+    @State private var scrollAnchors = ConversationScrollAnchorStore()
 
     var body: some View {
         GeometryReader { proxy in
@@ -200,7 +256,8 @@ struct ConversationView: View {
                 messages: store.messages,
                 streaming: store.streamingMessage,
                 isRunning: conversationIsRunning,
-                restoredAnchorID: scrollAnchors[path],
+                transcriptRevision: store.transcriptRevision,
+                restoredAnchorID: scrollAnchors.anchor(for: path),
                 unseenMessageID: store.initialScrollTargetMessageID,
                 onVisibleAnchorChange: { rememberScrollAnchor($0, for: path) },
                 onEditLastMessage: {
@@ -213,13 +270,7 @@ struct ConversationView: View {
     }
 
     private func rememberScrollAnchor(_ anchor: String, for path: String) {
-        guard scrollAnchors[path] != anchor else { return }
-        scrollAnchors[path] = anchor
-        scrollAnchorOrder.removeAll { $0 == path }
-        scrollAnchorOrder.append(path)
-        while scrollAnchorOrder.count > 32 {
-            scrollAnchors.removeValue(forKey: scrollAnchorOrder.removeFirst())
-        }
+        scrollAnchors.remember(anchor, for: path)
     }
 }
 
@@ -229,6 +280,7 @@ struct MessageScrollView: View {
     let streaming: ChatMessage?
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
+    let transcriptRevision: Int
     let restoredAnchorID: String?
     let unseenMessageID: String?
     let onVisibleAnchorChange: (String) -> Void
@@ -240,19 +292,26 @@ struct MessageScrollView: View {
     @State private var scrollBridge = ConversationScrollBridge()
     @State private var prependPending = false
     @State private var didRestoreInitialAnchor = false
+    @State private var autoPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
+    @State private var initialDefaultScrollAnchor: UnitPoint?
+    @State private var projectionCache = TranscriptProjectionCache()
     private let bottomID = "conversation-bottom"
     private let coordinateSpaceName = "conversation-scroll"
 
-    private var defaultScrollAnchor: UnitPoint {
-        unseenMessageID != nil || (restoredAnchorID != nil && restoredAnchorID != bottomID) ? .top : .bottom
+    private func requestedDefaultScrollAnchor(items: [TranscriptItem]) -> UnitPoint {
+        if unseenMessageID != nil { return .top }
+        if let restoredAnchorID, restoredAnchorID != bottomID,
+           items.contains(where: { $0.id == restoredAnchorID }) { return .top }
+        return .bottom
     }
 
     private var transcriptItems: [TranscriptItem] {
-        TranscriptPresenter.items(
+        projectionCache.items(
+            revision: transcriptRevision,
             messages: messages,
             streaming: streaming,
-            isRunning: isRunning || (store.isSelectedRuntime && store.runtimeState.isStreaming)
+            isRunning: isRunning
         )
     }
 
@@ -274,6 +333,7 @@ struct MessageScrollView: View {
     var body: some View {
         let items = transcriptItems
         let imageIDs = prominentImageIDs(in: items)
+        let activeQuestionnaire = store.activeQuestionnaireSession
         ScrollViewReader { reader in
             ScrollView {
                 // A single small gap between entries keeps consecutive tool rows on an even
@@ -304,13 +364,20 @@ struct MessageScrollView: View {
                                     message: message,
                                     isStreaming: isStreaming,
                                     onImage: store.showImage,
+                                    activeQuestionnaire: activeQuestionnaire,
                                     showsActions: true,
                                     onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
                                 )
+                                .equatable()
                                 .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
                             case let .work(block):
-                                TranscriptWorkView(block: block, onImage: store.showImage)
-                                    .padding(.top, PiTheme.space6)
+                                TranscriptWorkView(
+                                    block: block,
+                                    onImage: store.showImage,
+                                    activeQuestionnaire: activeQuestionnaire
+                                )
+                                .equatable()
+                                .padding(.top, PiTheme.space6)
                             case let .compaction(note):
                                 CompactionRowView(note: note)
                                     .padding(.vertical, PiTheme.space6)
@@ -349,12 +416,18 @@ struct MessageScrollView: View {
                 )
             }
             // Native initial anchoring prevents a top-frame flash before any scrollTo callback.
-            .defaultScrollAnchor(defaultScrollAnchor)
+            .defaultScrollAnchor(initialDefaultScrollAnchor ?? requestedDefaultScrollAnchor(items: items))
             .coordinateSpace(name: coordinateSpaceName)
             .scrollDismissesKeyboard(.interactively)
-            .onAppear { restoreInitialAnchorIfPossible(items: items, reader: reader) }
+            .onAppear {
+                if initialDefaultScrollAnchor == nil {
+                    initialDefaultScrollAnchor = requestedDefaultScrollAnchor(items: items)
+                }
+                restoreInitialAnchorIfPossible(items: items, reader: reader)
+            }
             .onChange(of: messages.first?.id) { _, _ in
                 restoreInitialAnchorIfPossible(items: items, reader: reader)
+                if didRestoreInitialAnchor, isPinnedToBottom, !prependPending { scheduleBottomScroll(reader) }
             }
             .onChange(of: messages.last?.id) { _, _ in scheduleBottomScroll(reader) }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in scheduleBottomScroll(reader) }
@@ -362,9 +435,13 @@ struct MessageScrollView: View {
             // Only when already pinned: a question appearing must never yank a user reading history.
             .onChange(of: questionnaireKey) { _, _ in scheduleBottomScroll(reader) }
             .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
-                guard wasLoading, !isLoading, prependPending else { return }
-                scrollBridge.restoreAfterPrepend()
-                prependPending = false
+                guard wasLoading, !isLoading else { return }
+                if prependPending {
+                    scrollBridge.restoreAfterPrepend()
+                    prependPending = false
+                } else {
+                    restoreInitialAnchorIfPossible(items: items, reader: reader)
+                }
             }
             .onPreferenceChange(TranscriptRowFramesKey.self) { frames in
                 guard !isPinnedToBottom,
@@ -415,11 +492,20 @@ struct MessageScrollView: View {
         if let unseenMessageID {
             target = items.first(where: { $0.sourceMessageID == unseenMessageID })?.id
             guard target != nil else { return }
-        } else if let restoredAnchorID,
-                  restoredAnchorID == bottomID || items.contains(where: { $0.id == restoredAnchorID }) {
-            target = restoredAnchorID
+        } else if let restoredAnchorID {
+            if restoredAnchorID == bottomID || items.contains(where: { $0.id == restoredAnchorID }) {
+                target = restoredAnchorID
+            } else if store.isLoadingEarlierMessages {
+                return
+            } else if store.hasEarlierMessages, autoPageAttempts < 2 {
+                autoPageAttempts += 1
+                store.loadEarlierMessages()
+                return
+            } else {
+                target = bottomID
+            }
         } else {
-            target = nil
+            target = bottomID
         }
         didRestoreInitialAnchor = true
         guard let target else { return }

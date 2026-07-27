@@ -97,7 +97,7 @@ enum TranscriptWorkEntry: Identifiable, Hashable, Sendable {
 
 /// A turn's work log: details collapse once Pi answers, while prominent outputs remain visible.
 struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
-    let id: String
+    var id: String
     var entries: [TranscriptWorkEntry]
     var isActive: Bool
     var startedAt: Date?
@@ -425,9 +425,8 @@ private struct TurnBuilder {
     private mutating func closeTurn(active: Bool) {
         closeActivity(active: active)
         if !entries.isEmpty {
-            // Identity comes from the first entry's own durable id (a block, tool call, or
-            // message id), never a turn counter: prepending earlier history must not renumber
-            // every work block below it.
+            // The first durable entry stays invariant as live work appends more steps. A page
+            // prepend can extend the one seam turn once; live identity must not churn every step.
             result.append(.work(TranscriptWorkBlock(
                 id: "work:\(entries.first?.id ?? "")",
                 entries: entries,

@@ -171,11 +171,11 @@ Archiving never moves or edits a Pi JSONL file.
 - Rapid route changes cancel newest-page, older-page, and activity-projection work and reject stale publications.
 - Abandoned branches and raw/base64 trees are not retained. A torn final JSONL line is invisible until complete.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
-- Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; auto-scroll is coalesced and runs only while native viewport geometry says the reader is pinned.
+- Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; transcript projection is memoized by content revision, scroll callbacks are coalesced, and route anchors no longer invalidate the view while the user scrolls.
 - Git refresh pauses while the app is inactive, refreshes the selected folder at a modest interval, and avoids a full session rescan/reload after every settled turn. A folder shown only as the passive pre-selection default (not yet chosen by the user, and not backing any real session) never triggers a refresh at all, so a fresh launch never touches a TCC-protected folder like Desktop just to draw the New Chat screen.
 - Image imports are limited to 8 images, 16 MB each and 64 MB total, with decoded `NSImage` reuse.
 - The transcript cache bounds both entry count and estimated byte cost (text plus already-budgeted image bytes), evicting least-recently-used windows first.
-- Opening uses SwiftUI's native bottom anchor instead of a post-paint jump. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
+- Opening uses SwiftUI's native bottom anchor plus one explicit settled-position restore. TextKit supplies a nonzero first-pass measure even before SwiftUI proposes a width. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
 - Instruments points-of-interest mark newest-page read, first publish, first text paint, activity projection, prepend, viewport restore, RPC ready, and first model output.
 - The current 25.8 MiB largest-session gate reads its newest page in about 32 ms (5.5 MiB scanned) versus about 1.05 s for the legacy full parse, so no sidecar index is justified yet; add one only if measured page latency stops meeting the sub-50 ms target.
 
