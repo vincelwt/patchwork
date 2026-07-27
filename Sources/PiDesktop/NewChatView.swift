@@ -18,7 +18,10 @@ struct NewChatView: View {
                 MessageScrollView(
                     messages: store.messages,
                     streaming: store.streamingMessage,
-                    isRunning: true
+                    isRunning: true,
+                    restoredAnchorID: nil,
+                    unseenMessageID: nil,
+                    onVisibleAnchorChange: { _ in }
                 )
             }
         }

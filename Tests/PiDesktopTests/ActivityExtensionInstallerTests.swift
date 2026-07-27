@@ -99,7 +99,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
         XCTAssertTrue(bundled.contains("/v1/schedules"))
         XCTAssertTrue(bundled.contains("event.toolName.toLowerCase() !== \"agent\""))
         XCTAssertTrue(bundled.contains("completionId"))
-        XCTAssertTrue(bundled.contains("latestCompletedEntryID(ctx.sessionManager.getEntries())"))
+        XCTAssertTrue(bundled.contains("latestCompletedEntryID(ctx.sessionManager.getBranch())"))
     }
 
     // MARK: - Disable setting

@@ -101,9 +101,17 @@ actor ThreadStore {
         let overlayState = await overlay.snapshot()
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
         let heartbeatIDs = Set(heartbeats.map(\.sessionId))
-        let latestHeartbeatCompletionBySessionID = Dictionary(grouping: heartbeats.filter { $0.completionId != nil }, by: \.sessionId)
-            .compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
-        var runningIDs = Set(heartbeats.filter { ActivityReader.isRunning($0) }.map(\.sessionId))
+        let heartbeatPaths = Set(heartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
+        let latestHeartbeatCompletionByPath = Dictionary(
+            grouping: heartbeats.filter { $0.completionId != nil && $0.sessionFile != nil },
+            by: { URL(fileURLWithPath: $0.sessionFile!).standardizedFileURL.path }
+        ).compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
+        let latestHeartbeatCompletionBySessionID = Dictionary(
+            grouping: heartbeats.filter { $0.completionId != nil }, by: \.sessionId
+        ).compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
+        let runningHeartbeats = heartbeats.filter { ActivityReader.isRunning($0) }
+        var runningIDs = Set(runningHeartbeats.filter { $0.sessionFile == nil }.map(\.sessionId))
+        let runningPaths = Set(runningHeartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
 
         var results: [PiThread] = []
         results.reserveCapacity(files.count)
@@ -132,17 +140,18 @@ actor ThreadStore {
             thread.unread = overlayState.unreadOverride(path: thread.path, updatedAt: thread.updatedAt)
                 ?? appState.isUnread(
                     path: thread.path,
-                    latestCompletionID: latestHeartbeatCompletionBySessionID[thread.id],
+                    latestCompletionID: latestHeartbeatCompletionByPath[path]
+                        ?? latestHeartbeatCompletionBySessionID[thread.id],
                     modifiedAt: thread.updatedAt
                 )
             // A session the extension has never seen still has to report honestly, so its file
             // decides. Freshly written files are the only ones worth reading a tail for.
-            if !heartbeatIDs.contains(thread.id),
+            if !heartbeatPaths.contains(path), !heartbeatIDs.contains(thread.id),
                Date().timeIntervalSince(thread.updatedAt) <= FileRunStateFallback.idleAfter,
                FileRunStateFallback.isRunning(sessionFile: standardizedURL) {
                 runningIDs.insert(thread.id)
             }
-            thread.running = runningIDs.contains(thread.id)
+            thread.running = runningPaths.contains(path) || runningIDs.contains(thread.id)
             if thread.running { thread.unread = false }
             results.append(thread)
         }

@@ -74,6 +74,8 @@ private final class RuntimeSlot {
     var deferredEvents: [JSONValue] = []
     var isReady = false
     var isStarting = false
+    var startupBeganAt: Date?
+    var promptBeganAt: Date?
     var readyWaiters: [(Result<RuntimeSlot, Error>) -> Void] = []
 
     init(runtime: PiRuntimeProtocol) { self.runtime = runtime }
@@ -146,6 +148,10 @@ final class AppStore: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var streamingMessage: ChatMessage?
     @Published var isConversationLoading = false
+    @Published private(set) var isLoadingEarlierMessages = false
+    @Published private(set) var hasEarlierMessages = false
+    @Published private(set) var conversationHistoryLimitReached = false
+    @Published private(set) var initialScrollTargetMessageID: String?
     @Published var conversationError: String?
 
     @Published var draft = ""
@@ -229,7 +235,13 @@ final class AppStore: ObservableObject {
     private var gitRefreshTask: Task<Void, Never>?
     private var selectedGitTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
+    private var earlierMessagesTask: Task<Void, Never>?
+    private var activityProjectionTask: Task<Void, Never>?
     private var conversationLoadGeneration = 0
+    private var loadedConversationPage: ConversationPage?
+    private var loadedConversationPath: String?
+    private var loadedConversationFingerprint: SessionFileFingerprint?
+    private var initialPreviousSeenCompletionID: String?
     private var toastTask: Task<Void, Never>?
     private var dialogTimeoutTask: Task<Void, Never>?
     private var probeRuntime: PiRuntimeProtocol?
@@ -251,6 +263,12 @@ final class AppStore: ObservableObject {
     /// Persisted latest IDs provide cross-launch deduplication; this set prevents stale launch
     /// notifications while remaining bounded to discovered sessions.
     private var observedActivityPaths: Set<String> = []
+    /// Terminal RPC answers remain as a bounded overlay until the same answer is visible in the
+    /// authoritative JSONL page. This closes the short message_end → disk durability gap.
+    private var pendingFinalMessagesByPath: [String: ChatMessage] = [:]
+    private var pendingFinalOrder: [String] = []
+    private var finalDurabilityTasks: [UUID: Task<Void, Never>] = [:]
+    private static let pendingFinalLimit = 32
     /// Set for the in-flight "prompt" of the currently attached turn; see `PendingUserTurn`.
     private var activeTurnPrompt: PendingUserTurn? {
         get { activeRuntimeSlot.pendingTurn }
@@ -263,10 +281,9 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
-    /// How many trailing messages the tail-first scan reconstructs before the full parse lands
-    /// (Task 1). Generous enough to fill a typical window without scrolling, small enough that
-    /// even a giant conversation's tail decodes in effectively zero time.
-    private static let tailPreviewMessageLimit = 40
+    /// Explicit ceiling for a user-expanded transcript window. The newest page is 50 messages;
+    /// older pages remain on demand without allowing a long browsing session to retain forever.
+    private static let loadedMessageLimit = 1_000
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -312,7 +329,11 @@ final class AppStore: ObservableObject {
 
         bindRuntime(activeRuntimeSlot)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
-            .sink { [weak self] _ in self?.refreshSelectedGit() }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                refreshSelectedGit()
+                if let selectedSession { markRead(selectedSession) }
+            }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
             .sink { [weak self] _ in self?.flushDraftPersistence() }
@@ -637,7 +658,7 @@ final class AppStore: ObservableObject {
                 failed ? .turnFailed : .turnFinished,
                 session: session,
                 preview: activity.preview,
-                coalesce: false
+                completionID: completionID
             )
         }
     }
@@ -656,13 +677,16 @@ final class AppStore: ObservableObject {
         _ trigger: NotificationTrigger,
         session: SessionSummary?,
         preview: String? = nil,
-        coalesce: Bool = true
+        completionID: String? = nil
     ) {
         guard let session else { return }
         let key = session.fileURL.standardizedFileURL.path
         let focusedKey = isApplicationActive ? selectedSession?.fileURL.standardizedFileURL.path : nil
         guard !NotificationGate.isSuppressed(sessionKey: key, focusedSessionKey: focusedKey) else { return }
-        guard !coalesce || notificationCoalescer.shouldEmit(sessionKey: key) else { return }
+        // Distinct completion IDs bypass the per-session quiet window while still sharing the
+        // global burst cap. Every non-completion trigger keeps the ordinary per-session key.
+        let coalescingKey = completionID.map { "\(key)#\($0)" } ?? key
+        guard notificationCoalescer.shouldEmit(sessionKey: coalescingKey) else { return }
         // A finished turn's body shows the beginning of Pi's actual answer when one is available
         // (a live RPC message, or a cross-terminal heartbeat preview); every other trigger keeps
         // its fixed, specific summary.
@@ -785,6 +809,7 @@ final class AppStore: ObservableObject {
         parkCurrentDraft()
         flushDraftPersistence()
         cancelConversationLoad()
+        resetConversationPageState()
         let newFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
         if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
             detachActiveRuntimePresentation()
@@ -811,7 +836,19 @@ final class AppStore: ObservableObject {
         if let current = selectedSession, current.fileURL.standardizedFileURL.path != path { markRead(current) }
         parkCurrentDraft()
         cancelConversationLoad()
-        let targetKey = RuntimeRouteKey.session(session.fileURL.standardizedFileURL.path)
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        resetConversationPageState()
+
+        let latestCompletion = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+            ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
+        let lastSeenCompletion = persistence.state.lastSeenCompletedEntryIDBySessionPath[path]
+        if let latestCompletion, latestCompletion != lastSeenCompletion {
+            initialPreviousSeenCompletionID = lastSeenCompletion
+            initialScrollTargetMessageID = latestCompletion
+        }
+
+        let targetKey = RuntimeRouteKey.session(path)
         if runtimeKey(for: activeRuntimeSlot) != targetKey { detachActiveRuntimePresentation() }
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
@@ -822,43 +859,42 @@ final class AppStore: ObservableObject {
         streamingMessage = nil
         activeCapability = nil
         pendingQuestionnaire = nil
-        let draftKey = session.fileURL.standardizedFileURL.path
-        draft = draftStore.text(for: draftKey)
-        attachments = attachmentsByKey[draftKey] ?? []
+        draft = draftStore.text(for: path)
+        attachments = attachmentsByKey[path] ?? []
         flushDraftPersistence()
         DecodedImageCache.purge()
         let cwdPath = session.cwd.standardizedFileURL.path
         selectedGit = folderGit[cwdPath] ?? .none
         selectedWorktree = folderWorktrees[cwdPath]
 
-        // A synchronous cache hit (Task 1): `transcriptCache` is a plain lock-protected cache,
-        // not an actor, precisely so this check never suspends. Nothing async runs between
-        // clearing the previous conversation and painting the new one, so there is no frame in
-        // which a spinner — or even a blank transcript — could ever be drawn.
-        if let cached = cachedConversation(for: session.fileURL) {
-            messages = cached.messages
-            activities = activityPresenter.activities(from: cached.messages)
+        // A page-cache hit publishes synchronously in the selection tick. Activity projection is
+        // inspector data and stays off the main actor so it cannot delay the transcript frame.
+        if let (cached, fingerprint) = cachedPage(for: session.fileURL) {
+            publishConversationPage(cached, path: path, fingerprint: fingerprint)
             isConversationLoading = false
-            conversationLoadTask = Task { [weak self] in await self?.refreshGit(for: session.cwd) }
-            schedulePrefetch(around: session)
+            conversationLoadTask = Task { [weak self] in
+                guard let self else { return }
+                let projected = await projectActivities(from: cached.messages)
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                activities = projected
+                await refreshGit(for: session.cwd)
+                guard conversationLoadGeneration == generation else { return }
+                schedulePrefetch(around: session)
+            }
             return
         }
 
-        // Cache miss: parse from the end so the tail paints immediately, already at the bottom,
-        // instead of an empty spinner that reflows once the (possibly multi-megabyte) file
-        // finishes parsing. The scroll never has to move for this: the tail renders at the
-        // bottom from the first frame, and any earlier history is filled in above it once the
-        // full parse lands.
         isConversationLoading = true
-        messages.removeAll(keepingCapacity: false)
+        if let pending = pendingFinalMessagesByPath[path] { messages = [pending] }
+        else { messages.removeAll(keepingCapacity: false) }
         activities.removeAll(keepingCapacity: false)
-
         conversationLoadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await loadConversationProgressively(session, generation: generation)
+                try await loadNewestConversationPage(session, generation: generation)
             } catch is CancellationError {
-                // Never publish stale cancellation over a newer selection.
+                // A newer route owns the UI.
             } catch {
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
@@ -866,58 +902,178 @@ final class AppStore: ObservableObject {
                 isConversationLoading = false
             }
         }
-        // Warms the neighbours (and keeps the launch-recency set warm) so stepping through the
-        // sidebar stays instant too. Additive only — see `schedulePrefetch`.
+    }
+
+    private func loadNewestConversationPage(_ session: SessionSummary, generation: Int) async throws {
+        let path = session.fileURL.standardizedFileURL.path
+        let fingerprint = fileFingerprint(for: session.fileURL)
+        let startedAt = Date()
+        let page = try await repository.loadNewestConversationPage(from: session.fileURL)
+        ConversationPerformance.mark(
+            "JSONL newest page", path: path, count: page.messages.count,
+            milliseconds: Date().timeIntervalSince(startedAt) * 1_000
+        )
+        try Task.checkCancellation()
+        guard conversationLoadGeneration == generation,
+              selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+
+        publishConversationPage(page, path: path, fingerprint: fingerprint)
+        cachePage(page, for: session.fileURL, fingerprint: fingerprint)
+        isConversationLoading = false
+        ConversationPerformance.mark("Conversation first publish", path: path, count: page.messages.count)
+
+        let projectionStartedAt = Date()
+        let projected = await projectActivities(from: page.messages)
+        guard conversationLoadGeneration == generation,
+              selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+        activities = projected
+        ConversationPerformance.mark(
+            "Transcript activity projection", path: path, count: projected.count,
+            milliseconds: Date().timeIntervalSince(projectionStartedAt) * 1_000
+        )
+        await refreshGit(for: session.cwd)
+        guard conversationLoadGeneration == generation else { return }
         schedulePrefetch(around: session)
     }
 
-    /// The tail-first load for a cache miss: an immediate partial paint that is already the true
-    /// tail (so the transcript never has to re-scroll), then the authoritative full parse fills
-    /// in earlier history — or, when the tail scan already reached the conversation's root,
-    /// there is no earlier history and the tail stands as the final result.
-    private func loadConversationProgressively(_ session: SessionSummary, generation: Int) async throws {
-        let tail = try await repository.loadConversationTail(from: session.fileURL, limit: Self.tailPreviewMessageLimit)
-        try Task.checkCancellation()
-        guard conversationLoadGeneration == generation,
-              selectedSession?.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path else { return }
-        replaceLoadedMessages(with: tail.conversation.messages)
-        isConversationLoading = false
-
-        if tail.isComplete {
-            cacheConversation(tail.conversation, for: session.fileURL)
-            await refreshGit(for: session.cwd)
-            return
+    func loadEarlierMessages() {
+        guard !isConversationLoading, !isLoadingEarlierMessages,
+              !conversationHistoryLimitReached,
+              let session = selectedSession,
+              let current = loadedConversationPage,
+              let cursor = current.olderCursor else { return }
+        let path = session.fileURL.standardizedFileURL.path
+        guard loadedConversationPath == path else { return }
+        let generation = conversationLoadGeneration
+        isLoadingEarlierMessages = true
+        earlierMessagesTask = Task { [weak self] in
+            guard let self else { return }
+            let startedAt = Date()
+            do {
+                let older = try await repository.loadOlderConversationPage(from: session.fileURL, cursor: cursor)
+                try Task.checkCancellation()
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                let prepended = mergeEarlierPage(older)
+                isLoadingEarlierMessages = false
+                if let merged = loadedConversationPage {
+                    cachePage(merged, for: session.fileURL, fingerprint: loadedConversationFingerprint)
+                }
+                ConversationPerformance.mark(
+                    "Conversation page prepend", path: path, count: prepended,
+                    milliseconds: Date().timeIntervalSince(startedAt) * 1_000
+                )
+                let projected = await projectActivities(from: messages)
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                activities = projected
+            } catch is CancellationError {
+                // Route changed.
+            } catch {
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                isLoadingEarlierMessages = false
+                showToast("Couldn’t load earlier history: \(error.localizedDescription)", style: .warning)
+            }
         }
-
-        let full = try await cachedOrFreshConversation(for: session.fileURL)
-        try Task.checkCancellation()
-        guard conversationLoadGeneration == generation,
-              selectedSession?.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path else { return }
-        replaceLoadedMessages(with: full.messages)
-        await refreshGit(for: session.cwd)
     }
 
-    /// Reuses a cached parse when the file has not changed since it was cached; otherwise parses
-    /// fresh and warms the cache for next time. Callers still apply the same generation/route
-    /// check to the result regardless of which path was taken.
-    private func cachedOrFreshConversation(for fileURL: URL) async throws -> SessionConversation {
-        if let cached = cachedConversation(for: fileURL) { return cached }
-        let conversation = try await repository.loadConversation(from: fileURL)
-        cacheConversation(conversation, for: fileURL)
-        return conversation
+    func consumeInitialScrollTarget() {
+        initialScrollTargetMessageID = nil
+        initialPreviousSeenCompletionID = nil
     }
 
-    /// Synchronous, zero-suspension cache probe (Task 1) — see `TranscriptCache`.
-    private func cachedConversation(for fileURL: URL) -> SessionConversation? {
-        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return nil }
-        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
-        return transcriptCache.conversation(for: fileURL.standardizedFileURL.path, fingerprint: fingerprint)
+    @discardableResult
+    private func mergeEarlierPage(_ older: ConversationPage) -> Int {
+        guard let current = loadedConversationPage else { return 0 }
+        let existingIDs = Set(current.messages.map(\.id))
+        let unique = older.messages.filter { !existingIDs.contains($0.id) }
+        let remaining = max(0, Self.loadedMessageLimit - current.messages.count)
+        let accepted = Array(unique.suffix(remaining))
+        let mergedMessages = accepted + current.messages
+        loadedConversationPage = ConversationPage(
+            messages: mergedMessages,
+            olderCursor: older.olderCursor,
+            leafID: current.leafID ?? older.leafID,
+            rawEntryCount: current.rawEntryCount + older.rawEntryCount,
+            scannedEntryCount: current.scannedEntryCount + older.scannedEntryCount,
+            scannedByteCount: current.scannedByteCount + older.scannedByteCount,
+            isTruncated: older.isTruncated
+        )
+        replaceLoadedMessages(with: mergedMessages)
+        conversationHistoryLimitReached = (older.olderCursor != nil && mergedMessages.count >= Self.loadedMessageLimit)
+            || (older.isTruncated && older.olderCursor == nil)
+        hasEarlierMessages = older.olderCursor != nil && !conversationHistoryLimitReached
+        return accepted.count
     }
 
-    private func cacheConversation(_ conversation: SessionConversation, for fileURL: URL) {
-        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
-        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
-        transcriptCache.store(conversation, for: fileURL.standardizedFileURL.path, fingerprint: fingerprint)
+    private func publishConversationPage(
+        _ page: ConversationPage,
+        path: String,
+        fingerprint: SessionFileFingerprint?
+    ) {
+        loadedConversationPage = page
+        loadedConversationPath = path
+        loadedConversationFingerprint = fingerprint
+        if initialScrollTargetMessageID != nil {
+            let completions = page.messages.filter {
+                $0.role == .assistant
+                    && SessionParser.terminalAssistantStopReasons.contains($0.stopReason ?? "")
+            }
+            if let seen = initialPreviousSeenCompletionID,
+               let seenIndex = completions.firstIndex(where: { $0.id == seen }),
+               completions.indices.contains(seenIndex + 1) {
+                initialScrollTargetMessageID = completions[seenIndex + 1].id
+            } else if let first = completions.first {
+                initialScrollTargetMessageID = first.id
+            }
+        }
+        replaceLoadedMessages(with: page.messages)
+        conversationHistoryLimitReached = (page.olderCursor != nil && page.messages.count >= Self.loadedMessageLimit)
+            || (page.isTruncated && page.olderCursor == nil)
+        hasEarlierMessages = page.olderCursor != nil && !conversationHistoryLimitReached
+    }
+
+    private func resetConversationPageState() {
+        loadedConversationPage = nil
+        loadedConversationPath = nil
+        loadedConversationFingerprint = nil
+        hasEarlierMessages = false
+        isLoadingEarlierMessages = false
+        conversationHistoryLimitReached = false
+        initialScrollTargetMessageID = nil
+        initialPreviousSeenCompletionID = nil
+    }
+
+    private func fileFingerprint(for fileURL: URL) -> SessionFileFingerprint? {
+        // A URL can retain resource values across an append. Recreate it so cache validation
+        // always stats the file rather than trusting metadata from the selection summary.
+        let fresh = URL(fileURLWithPath: fileURL.path)
+        guard let values = try? fresh.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return nil }
+        return SessionFileFingerprint(url: fresh, values: values)
+    }
+
+    /// Synchronous, zero-suspension cache probe — see `TranscriptCache`.
+    private func cachedPage(for fileURL: URL) -> (ConversationPage, SessionFileFingerprint)? {
+        guard let fingerprint = fileFingerprint(for: fileURL),
+              let page = transcriptCache.page(for: fileURL.standardizedFileURL.path, fingerprint: fingerprint) else { return nil }
+        return (page, fingerprint)
+    }
+
+    private func cachePage(
+        _ page: ConversationPage,
+        for fileURL: URL,
+        fingerprint: SessionFileFingerprint?
+    ) {
+        guard let fingerprint, fileFingerprint(for: fileURL) == fingerprint else { return }
+        transcriptCache.store(page, for: fileURL.standardizedFileURL.path, fingerprint: fingerprint)
+    }
+
+    private func projectActivities(from messages: [ChatMessage]) async -> [ActivityItem] {
+        let presenter = activityPresenter
+        return await Task.detached(priority: .userInitiated) {
+            presenter.activities(from: messages)
+        }.value
     }
 
     // MARK: - Prefetch
@@ -938,13 +1094,22 @@ final class AppStore: ObservableObject {
 
     private func prefetchCandidates(around session: SessionSummary?) -> [URL] {
         var ordered = Array(sessions.filter { !$0.isArchived }.prefix(Self.prefetchLaunchCount).map(\.fileURL))
-        guard let session, let index = sessions.firstIndex(where: { $0.id == session.id }) else { return ordered }
-        for offset in -Self.prefetchNeighborRadius...Self.prefetchNeighborRadius where offset != 0 {
-            let neighborIndex = index + offset
-            guard sessions.indices.contains(neighborIndex) else { continue }
-            ordered.append(sessions[neighborIndex].fileURL)
+        if let session,
+           let index = sessions.firstIndex(where: {
+               $0.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path
+           }) {
+            for offset in -Self.prefetchNeighborRadius...Self.prefetchNeighborRadius where offset != 0 {
+                let neighborIndex = index + offset
+                guard sessions.indices.contains(neighborIndex) else { continue }
+                ordered.append(sessions[neighborIndex].fileURL)
+            }
         }
-        return ordered
+        let selectedPath = session?.fileURL.standardizedFileURL.path
+        var seen: Set<String> = []
+        return ordered.filter {
+            let path = $0.standardizedFileURL.path
+            return path != selectedPath && seen.insert(path).inserted
+        }
     }
 
     private func runPrefetch(_ urls: [URL]) async {
@@ -965,13 +1130,15 @@ final class AppStore: ObservableObject {
 
     private static func prefetchOne(_ url: URL, repository: SessionRepositoryProtocol, cache: TranscriptCache) async {
         guard !Task.isCancelled else { return }
-        let path = url.standardizedFileURL.path
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
-        let fingerprint = SessionFileFingerprint(url: url, values: values)
-        if cache.conversation(for: path, fingerprint: fingerprint) != nil { return } // Already warm.
-        guard let conversation = try? await repository.loadConversation(from: url) else { return }
-        guard !Task.isCancelled else { return }
-        cache.store(conversation, for: path, fingerprint: fingerprint)
+        let fresh = URL(fileURLWithPath: url.path)
+        let path = fresh.standardizedFileURL.path
+        guard let values = try? fresh.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
+        let fingerprint = SessionFileFingerprint(url: fresh, values: values)
+        if cache.page(for: path, fingerprint: fingerprint) != nil { return }
+        guard let page = try? await repository.loadNewestConversationPage(from: url), !Task.isCancelled,
+              let currentValues = try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              SessionFileFingerprint(url: URL(fileURLWithPath: url.path), values: currentValues) == fingerprint else { return }
+        cache.store(page, for: path, fingerprint: fingerprint)
     }
 
     // MARK: - Activity heartbeat extension
@@ -1815,6 +1982,8 @@ final class AppStore: ObservableObject {
         slot.deferredEvents.removeAll()
         slot.isReady = false
         slot.isStarting = true
+        slot.startupBeganAt = Date()
+        slot.promptBeganAt = nil
         slot.readyWaiters = [completion]
         restoreRuntimePresentation(slot)
     }
@@ -1921,7 +2090,16 @@ final class AppStore: ObservableObject {
 
     private func finishRuntimeStart(_ slot: RuntimeSlot, result: Result<RuntimeSlot, Error>) {
         slot.isStarting = false
-        if case .success = result { slot.isReady = true }
+        if case .success = result {
+            slot.isReady = true
+            if let beganAt = slot.startupBeganAt {
+                ConversationPerformance.mark(
+                    "Pi runtime ready", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+                    milliseconds: Date().timeIntervalSince(beganAt) * 1_000
+                )
+            }
+        }
+        slot.startupBeganAt = nil
         let waiters = slot.readyWaiters
         slot.readyWaiters.removeAll()
         for waiter in waiters { waiter(result) }
@@ -1961,6 +2139,7 @@ final class AppStore: ObservableObject {
         let wasStreaming = state(for: slot).isStreaming
         let previousPhase = state(for: slot).phase
         if command == "prompt" {
+            slot.promptBeganAt = Date()
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
                 state.isStreaming = true
@@ -1994,6 +2173,7 @@ final class AppStore: ObservableObject {
                     state.isStreaming = wasStreaming
                     state.phase = previousPhase
                 }
+                slot.promptBeganAt = nil
                 slot.pendingTurn = nil
             }
             if let optimisticID { messages.removeAll { $0.id == optimisticID } }
@@ -2048,6 +2228,9 @@ final class AppStore: ObservableObject {
             provisional.prepareSearchKey()
             sessions.insert(provisional, at: 0)
             syncActivityMonitorPaths()
+            // This path was created during this app run, so its first completion is not stale
+            // launch history and may notify if the user has moved away.
+            observedActivityPaths.insert(path)
         }
 
         removeParkedReference(to: slot)
@@ -2062,10 +2245,11 @@ final class AppStore: ObservableObject {
         return DraftOrigin(route: .session(path), sessionPath: path)
     }
 
-    /// Async history loads must not erase a message already painted at Send time.
+    /// Disk pages never erase optimistic user content or a terminal RPC answer that has not yet
+    /// reached JSONL. Once the durable equivalent appears, the overlay removes itself.
     private func replaceLoadedMessages(with loaded: [ChatMessage]) {
         let optimistic = messages.filter { $0.id.hasPrefix("local-") }
-        messages = loaded + optimistic.filter { local in
+        var merged = loaded + optimistic.filter { local in
             !loaded.contains { candidate in
                 guard candidate.role == .user,
                       candidate.textContent == local.textContent,
@@ -2075,7 +2259,37 @@ final class AppStore: ObservableObject {
                 return candidateTime >= localTime.addingTimeInterval(-0.01)
             }
         }
-        activities = activityPresenter.activities(from: messages)
+
+        if let path = loadedConversationPath, let pending = pendingFinalMessagesByPath[path] {
+            if loaded.contains(where: { durableAnswer($0, matches: pending) }) {
+                removePendingFinal(path: path)
+            } else if !merged.contains(where: { $0.id == pending.id }) {
+                merged.append(pending)
+            }
+        }
+        messages = merged
+    }
+
+    private func durableAnswer(_ candidate: ChatMessage, matches pending: ChatMessage) -> Bool {
+        candidate.role == .assistant && candidate.textContent == pending.textContent
+            && candidate.images.count == pending.images.count && candidate.isError == pending.isError
+    }
+
+    private func retainPendingFinal(_ message: ChatMessage, for slot: RuntimeSlot) {
+        guard message.role == .assistant,
+              let path = slot.sessionPath ?? state(for: slot).sessionFile else { return }
+        let key = URL(fileURLWithPath: path).standardizedFileURL.path
+        pendingFinalMessagesByPath[key] = message
+        pendingFinalOrder.removeAll { $0 == key }
+        pendingFinalOrder.append(key)
+        while pendingFinalOrder.count > Self.pendingFinalLimit {
+            pendingFinalMessagesByPath.removeValue(forKey: pendingFinalOrder.removeFirst())
+        }
+    }
+
+    private func removePendingFinal(path: String) {
+        pendingFinalMessagesByPath.removeValue(forKey: path)
+        pendingFinalOrder.removeAll { $0 == path }
     }
 
     private func requestStats() {
@@ -2135,6 +2349,16 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func recordRuntimeOutput(for slot: RuntimeSlot) {
+        updateState(for: slot) { $0.phase = .working }
+        guard let beganAt = slot.promptBeganAt else { return }
+        slot.promptBeganAt = nil
+        ConversationPerformance.mark(
+            "Pi first output", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+            milliseconds: Date().timeIntervalSince(beganAt) * 1_000
+        )
+    }
+
     private func handleBackgroundRPCEvent(_ event: JSONValue, slot: RuntimeSlot) {
         let type = event["type"]?.stringValue ?? "unknown"
         switch type {
@@ -2155,23 +2379,29 @@ final class AppStore: ObservableObject {
             discardQuestionnaire(from: slot)
             slot.streamingMessage = nil
             slot.pendingTurn = nil
+            slot.promptBeganAt = nil
             let startedFollowUp = flushBackgroundOutbox(.followUp, slot: slot)
             let session = session(for: slot)
             if let session { Task { await self.refreshSummary(for: session) } }
             if !startedFollowUp {
                 if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
-                else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
+                scheduleFinalDurabilityCheck(for: slot, retireWhenDone: slot !== activeRuntimeSlot)
             }
         case "message_update":
-            updateState(for: slot) { $0.phase = .working }
+            recordRuntimeOutput(for: slot)
             if let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
                 slot.streamingMessage = parsed
             }
         case "message_end":
-            updateState(for: slot) { $0.phase = .working }
+            recordRuntimeOutput(for: slot)
             slot.streamingMessage = nil
+            if let raw = event["message"],
+               SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? ""),
+               let parsed = SessionParser.chatMessage(fromAgentMessage: raw) {
+                retainPendingFinal(parsed, for: slot)
+            }
         case "tool_execution_start":
-            updateState(for: slot) { $0.phase = .working }
+            recordRuntimeOutput(for: slot)
             if let callID = event["toolCallId"]?.stringValue,
                let name = event["toolName"]?.stringValue,
                name.lowercased() == "ask_user_question" {
@@ -2224,7 +2454,7 @@ final class AppStore: ObservableObject {
             discardQuestionnaire(from: slot)
             _ = flushBackgroundOutbox(.steer, slot: slot)
         case "message_start", "tool_execution_update", "bash_execution_update":
-            updateState(for: slot) { $0.phase = .working }
+            recordRuntimeOutput(for: slot)
         case "agent_end", "turn_start", "summarization_retry_scheduled", "summarization_retry_attempt_start",
              "summarization_retry_finished":
             break
@@ -2312,6 +2542,32 @@ final class AppStore: ObservableObject {
         slot.runtime.stop()
     }
 
+    private func scheduleFinalDurabilityCheck(for slot: RuntimeSlot, retireWhenDone: Bool) {
+        finalDurabilityTasks[slot.id]?.cancel()
+        guard let path = slot.sessionPath,
+              let pending = pendingFinalMessagesByPath[path] else {
+            if retireWhenDone { retireBackgroundRuntime(slot) }
+            return
+        }
+        let fileURL = URL(fileURLWithPath: path)
+        finalDurabilityTasks[slot.id] = Task { [weak self, weak slot] in
+            guard let self, let slot else { return }
+            // Pi normally appends before message_end. The retries only cover filesystem/write
+            // scheduling jitter and stay bounded to newest-page reads.
+            for delay in [0, 100_000_000, 250_000_000, 500_000_000, 1_000_000_000] as [UInt64] {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                guard !Task.isCancelled else { return }
+                if let page = try? await repository.loadNewestConversationPage(from: fileURL),
+                   page.messages.contains(where: { self.durableAnswer($0, matches: pending) }) {
+                    removePendingFinal(path: path)
+                    break
+                }
+            }
+            finalDurabilityTasks[slot.id] = nil
+            if retireWhenDone { retireBackgroundRuntime(slot) }
+        }
+    }
+
     /// Lets tests drive the exact event path a live runtime uses, rather than reaching into
     /// private state and asserting on a shape the runtime never actually produces.
     func handleRPCEventForTesting(_ event: JSONValue) { handleRPCEvent(event) }
@@ -2335,6 +2591,7 @@ final class AppStore: ObservableObject {
             flushOutbox(.followUp)
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
             // left: nothing about this dispatch is "pending" any more.
+            activeRuntimeSlot.promptBeganAt = nil
             activeTurnPrompt = nil
             requestStats()
             let settledSession = activeSession()
@@ -2346,14 +2603,18 @@ final class AppStore: ObservableObject {
                 }
             }
             resetRuntimeRetirementLease(for: activeRuntimeSlot)
+            scheduleFinalDurabilityCheck(for: activeRuntimeSlot, retireWhenDone: false)
         case "message_update":
-            runtimeState.phase = .working
+            recordRuntimeOutput(for: activeRuntimeSlot)
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
             streamingMessage = parsed
         case "message_end":
-            runtimeState.phase = .working
+            recordRuntimeOutput(for: activeRuntimeSlot)
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
+            if SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? "") {
+                retainPendingFinal(parsed, for: activeRuntimeSlot)
+            }
             streamingMessage = nil
             if parsed.role == .assistant {
                 var latest = TokenMetrics(); latest.addUsage(parsed.usage)
@@ -2361,7 +2622,7 @@ final class AppStore: ObservableObject {
             }
             mergeHistoryActivities()
         case "tool_execution_start":
-            runtimeState.phase = .working
+            recordRuntimeOutput(for: activeRuntimeSlot)
             // A question can be waiting in a conversation the user has since navigated away.
             if selected, event["toolName"]?.stringValue?.lowercased() == "ask_user_question" {
                 notify(.questionWaiting, session: activeSession())
@@ -2387,7 +2648,7 @@ final class AppStore: ObservableObject {
                 modelName: runtimeState.modelName ?? runtimeState.modelID
             ) { upsertActivity(item) }
         case "tool_execution_update":
-            runtimeState.phase = .working
+            recordRuntimeOutput(for: activeRuntimeSlot)
             guard selected, let id = event["toolCallId"]?.stringValue,
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
             ActivityPresenter.applyResult(event["partialResult"], finished: false, to: &activities[index])
@@ -2438,7 +2699,7 @@ final class AppStore: ObservableObject {
             // Pi delivers steering at exactly this boundary, so holding it until now costs
             // nothing and keeps it editable for as long as possible.
             flushOutbox(.steer)
-        case "message_start", "bash_execution_update": runtimeState.phase = .working
+        case "message_start", "bash_execution_update": recordRuntimeOutput(for: activeRuntimeSlot)
         case "agent_end", "turn_start", "summarization_retry_scheduled",
              "summarization_retry_attempt_start", "summarization_retry_finished": break
         default:
@@ -2648,13 +2909,22 @@ final class AppStore: ObservableObject {
     }
 
     private func mergeHistoryActivities() {
-        let history = activityPresenter.activities(from: messages)
-        let live = activities.filter { $0.status == .running || $0.status == .waiting }
-        var merged = history
-        for item in live where !merged.contains(where: {
-            $0.id == item.id || (item.agentID != nil && $0.agentID == item.agentID)
-        }) { merged.insert(item, at: 0) }
-        activities = merged
+        activityProjectionTask?.cancel()
+        let snapshot = messages
+        let generation = conversationLoadGeneration
+        let path = selectedSession?.fileURL.standardizedFileURL.path
+        activityProjectionTask = Task { [weak self] in
+            guard let self else { return }
+            let history = await projectActivities(from: snapshot)
+            guard !Task.isCancelled, conversationLoadGeneration == generation,
+                  selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+            let live = activities.filter { $0.status == .running || $0.status == .waiting }
+            var merged = history
+            for item in live where !merged.contains(where: {
+                $0.id == item.id || (item.agentID != nil && $0.agentID == item.agentID)
+            }) { merged.insert(item, at: 0) }
+            activities = merged
+        }
     }
 
     private func upsertActivity(_ item: ActivityItem) {
@@ -2737,8 +3007,13 @@ final class AppStore: ObservableObject {
 
     private func cancelConversationLoad() {
         conversationLoadTask?.cancel()
+        earlierMessagesTask?.cancel()
+        activityProjectionTask?.cancel()
         conversationLoadTask = nil
+        earlierMessagesTask = nil
+        activityProjectionTask = nil
         isConversationLoading = false
+        isLoadingEarlierMessages = false
     }
 
     private func showToast(_ text: String, style: ToastMessage.Style, sessionPath: String? = nil) {
@@ -2754,9 +3029,11 @@ final class AppStore: ObservableObject {
     }
 
     deinit {
-        gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel()
+        gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel(); earlierMessagesTask?.cancel()
+        activityProjectionTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel(); cancelRuntimeRetirement?()
+        for task in finalDurabilityTasks.values { task.cancel() }
         probeRuntime?.stop()
         for slot in parkedRuntimes.values { slot.runtime.stop() }
         activeRuntimeSlot.runtime.stop()

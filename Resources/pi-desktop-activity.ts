@@ -459,7 +459,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       startedAt = new Date().toISOString();
       preview = undefined;
       stopReason = undefined;
-      completionId = latestCompletedEntryID(ctx.sessionManager.getEntries());
+      completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());
       // Several processes can attach to one session. A reader must see every writer so an idle
       // RPC attachment cannot overwrite a terminal that is still working.
       heartbeatPath = sessionId
@@ -490,7 +490,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         preview = extractPreview(message.content) ?? preview;
         stopReason = typeof message.stopReason === "string" ? message.stopReason : stopReason;
         if (typeof message.stopReason === "string" && TERMINAL_STOP_REASONS.has(message.stopReason)) {
-          completionId = latestCompletedEntryID(ctx.sessionManager.getEntries()) ?? completionId;
+          completionId = latestCompletedEntryID(ctx.sessionManager.getBranch()) ?? completionId;
         }
       }
       syncHeartbeat();

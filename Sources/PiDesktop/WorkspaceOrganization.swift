@@ -326,7 +326,8 @@ extension AppPersistence {
         pruned.pruneCompletionState(retaining: normalized)
         guard pruned.latestCompletedEntryIDBySessionPath != state.latestCompletedEntryIDBySessionPath
                 || pruned.lastSeenCompletedEntryIDBySessionPath != state.lastSeenCompletedEntryIDBySessionPath
-                || pruned.lastReadAt != state.lastReadAt else { return }
+                || pruned.lastReadAt != state.lastReadAt
+                || pruned.manuallyUnreadSessionPaths != state.manuallyUnreadSessionPaths else { return }
         updateState { $0 = pruned }
     }
 }

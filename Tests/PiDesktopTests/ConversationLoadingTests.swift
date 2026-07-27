@@ -53,29 +53,6 @@ private struct DelayedRepository: SessionRepositoryProtocol {
     }
 }
 
-/// Delays only the *full* parse, leaving the tail scan fast: on a tiny fixture file both steps
-/// would otherwise finish inside a single poll tick, making the intermediate partial-paint state
-/// unobservable. This reopens a reliable window to assert on it.
-private struct TailFastFullSlowRepository: SessionRepositoryProtocol {
-    let base: FileSessionRepository
-    let fullParseDelayNanoseconds: UInt64
-    var rootURL: URL { base.rootURL }
-
-    func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] {
-        try await base.discoverSessions(archivedIDs: archivedIDs)
-    }
-    func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary {
-        try await base.refreshSummary(at: fileURL, archivedIDs: archivedIDs)
-    }
-    func loadConversation(from fileURL: URL) async throws -> SessionConversation {
-        try await Task.sleep(nanoseconds: fullParseDelayNanoseconds)
-        return try await base.loadConversation(from: fileURL)
-    }
-    func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
-        try await base.loadConversationTail(from: fileURL, limit: limit)
-    }
-}
-
 // MARK: - Tests
 
 /// End-to-end coverage for Task 1 ("opening a thread must be instant, with no layout shift"),
@@ -95,30 +72,26 @@ final class ConversationLoadingTests: XCTestCase {
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
 
-    func testCacheMissPaintsThePartialTailImmediatelyThenBackfillsWithoutChangingTheVisibleTail() async throws {
+    func testCacheMissPublishesNewestBoundedPageThenLoadsEarlierOnDemand() async throws {
         let file = temporaryDirectory.appendingPathComponent("big.jsonl")
         try writeLinearConversation(prefix: "big", messageCount: 80, to: file)
-        // The full parse is held back so the partial-tail state has a reliably observable window
-        // — otherwise both steps finish inside a single fixture-sized parse and the intermediate
-        // state is never visible to poll against.
-        let repository = TailFastFullSlowRepository(base: FileSessionRepository(rootURL: temporaryDirectory), fullParseDelayNanoseconds: 300_000_000)
-        let store = makeStore(repository: repository)
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
         let session = try makeSummary(id: "big", fileURL: file)
         store.sessions = [session]
 
         store.selectSession(session)
-        try await waitUntil { !store.messages.isEmpty }
-        // The very first non-empty paint must already be the true tail: fewer than the full 80
-        // messages (a partial preview), ending on the conversation's real last message.
-        let firstPaintCount = store.messages.count
+        try await waitUntil { store.messages.count == ConversationPage.defaultMessageTarget }
         let firstPaintTailID = store.messages.last?.id
-        XCTAssertLessThan(firstPaintCount, 80, "The first paint must be a partial tail, not the full parse")
-        XCTAssertEqual(store.messages.last?.textContent, "big-79", "The tail is already the newest message")
-        XCTAssertFalse(store.isConversationLoading, "A partial paint is still a paint — no spinner once there is something to show")
-
-        try await waitUntil { store.messages.count == 80 }
-        XCTAssertEqual(store.messages.last?.id, firstPaintTailID, "Backfilling earlier history must never change what was already shown at the bottom")
+        XCTAssertEqual(store.messages.first?.textContent, "big-30")
+        XCTAssertEqual(store.messages.last?.textContent, "big-79")
+        XCTAssertTrue(store.hasEarlierMessages)
         XCTAssertFalse(store.isConversationLoading)
+
+        store.loadEarlierMessages()
+        try await waitUntil { store.messages.count == 80 }
+        XCTAssertEqual(store.messages.first?.textContent, "big-0")
+        XCTAssertEqual(store.messages.last?.id, firstPaintTailID, "A prepend must keep the visible tail's durable identity")
+        XCTAssertFalse(store.hasEarlierMessages)
     }
 
     func testASmallConversationsTailScanIsAlreadyCompleteSoNoBackfillIsNeeded() async throws {
@@ -134,6 +107,34 @@ final class ConversationLoadingTests: XCTestCase {
         try await waitUntil { store.messages.count == 3 }
         XCTAssertFalse(store.isConversationLoading)
         XCTAssertEqual(store.messages.map(\.textContent), ["small-0", "small-1", "small-2"])
+    }
+
+    func testUnreadConversationTargetsTheFirstLoadedCompletionAfterLastSeen() async throws {
+        let file = temporaryDirectory.appendingPathComponent("unread.jsonl")
+        try Data("""
+        {"type":"session","version":3,"id":"unread"}
+        {"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"one"}}
+        {"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":"one","stopReason":"stop"}}
+        {"type":"message","id":"u2","parentId":"a1","message":{"role":"user","content":"two"}}
+        {"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":"two","stopReason":"stop"}}
+        {"type":"message","id":"u3","parentId":"a2","message":{"role":"user","content":"three"}}
+        {"type":"message","id":"a3","parentId":"u3","message":{"role":"assistant","content":"three","stopReason":"stop"}}
+
+        """.utf8).write(to: file)
+        let persistence = AppPersistence(baseURL: temporaryDirectory.appendingPathComponent("state"))
+        _ = persistence.observeCompletedEntry(path: file.path, completionID: "a1", modifiedAt: Date(), markSeen: true)
+        _ = persistence.observeCompletedEntry(path: file.path, completionID: "a3", modifiedAt: Date(), markSeen: false)
+        let store = makeStore(
+            repository: FileSessionRepository(rootURL: temporaryDirectory),
+            persistence: persistence
+        )
+        let session = try makeSummary(id: "unread", fileURL: file)
+        store.sessions = [session]
+
+        store.selectSession(session)
+        try await waitUntil { store.messages.last?.id == "a3" }
+
+        XCTAssertEqual(store.initialScrollTargetMessageID, "a2")
     }
 
     func testReselectingAnAlreadyLoadedSessionHitsTheCacheWithNoLoadingStateEver() async throws {
@@ -178,6 +179,57 @@ final class ConversationLoadingTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertTrue(store.messages.allSatisfy { !$0.textContent.hasPrefix("a-") }, "A's stale load must never publish over B")
         XCTAssertEqual(store.selectedSession?.id, "b")
+    }
+
+    func testTerminalRPCAnswerStaysVisibleUntilJSONLBecomesDurable() async throws {
+        let fileA = temporaryDirectory.appendingPathComponent("a.jsonl")
+        let fileB = temporaryDirectory.appendingPathComponent("b.jsonl")
+        try writeLinearConversation(prefix: "a", messageCount: 1, to: fileA)
+        try writeLinearConversation(prefix: "b", messageCount: 1, to: fileB)
+        let runtime = FakeRuntime()
+        runtime.sessionFile = fileA.path
+        runtime.sessionID = "a"
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory), runtime: runtime)
+        let a = try makeSummary(id: "a", fileURL: fileA)
+        let b = try makeSummary(id: "b", fileURL: fileB)
+        store.sessions = [a, b]
+        store.selectSession(a)
+        try await waitUntil { store.messages.count == 1 }
+        store.prepareComposerOptions()
+
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("assistant"), "content": .string("Durable answer"),
+                "stopReason": .string("stop"), "timestamp": .number(2_000)
+            ])
+        ]))
+        XCTAssertEqual(store.messages.last?.textContent, "Durable answer")
+
+        store.selectSession(b)
+        store.selectSession(a)
+        XCTAssertEqual(store.messages.last?.textContent, "Durable answer", "A stale disk page must keep the RPC final overlay")
+
+        let durable: [String: Any] = [
+            "type": "message", "id": "durable-answer", "parentId": "a-entry-0",
+            "message": ["role": "assistant", "content": "Durable answer", "stopReason": "stop", "timestamp": 2_000]
+        ]
+        let handle = try FileHandle(forWritingTo: fileA)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: JSONSerialization.data(withJSONObject: durable) + Data([0x0A]))
+        try handle.close()
+        XCTAssertEqual(try SessionParser.conversationPage(at: fileA).messages.last?.id, "durable-answer")
+
+        store.selectSession(b)
+        store.selectSession(a)
+        for _ in 0..<120 where !store.messages.contains(where: { $0.id == "durable-answer" }) {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        XCTAssertTrue(
+            store.messages.contains(where: { $0.id == "durable-answer" }),
+            "ids=\(store.messages.map(\.id)) loading=\(store.isConversationLoading) error=\(store.conversationError ?? "nil")"
+        )
+        XCTAssertEqual(store.messages.filter { $0.textContent == "Durable answer" }.count, 1)
     }
 
     func testDuplicatePiSessionIDsStillSelectByFilePath() async throws {
@@ -229,12 +281,17 @@ final class ConversationLoadingTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeStore(repository: SessionRepositoryProtocol, gitService: GitStatusProviding = FakeGitService()) -> AppStore {
+    private func makeStore(
+        repository: SessionRepositoryProtocol,
+        gitService: GitStatusProviding = FakeGitService(),
+        runtime: PiRuntimeProtocol = FakeRuntime(),
+        persistence: AppPersistence? = nil
+    ) -> AppStore {
         AppStore(
             repository: repository,
             gitService: gitService,
-            runtime: FakeRuntime(),
-            persistence: AppPersistence(baseURL: temporaryDirectory),
+            runtime: runtime,
+            persistence: persistence ?? AppPersistence(baseURL: temporaryDirectory),
             activityPresenter: ActivityPresenter()
         )
     }

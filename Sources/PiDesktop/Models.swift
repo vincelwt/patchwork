@@ -158,6 +158,7 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var details: JSONValue?
     var usage: JSONValue?
     var modelName: String?
+    var stopReason: String?
     /// Known messages set this to `.null`; only bounded unknown fallbacks retain content.
     let raw: JSONValue
 
@@ -392,10 +393,12 @@ struct PersistedAppState: Codable {
             latestCompletedEntryIDBySessionPath = latestCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
             lastSeenCompletedEntryIDBySessionPath = lastSeenCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
             lastReadAt = lastReadAt.filter { paths.contains($0.key) }
+            manuallyUnreadSessionPaths.formIntersection(paths)
         }
         var keys = Set(latestCompletedEntryIDBySessionPath.keys)
             .union(lastSeenCompletedEntryIDBySessionPath.keys)
             .union(lastReadAt.keys)
+            .union(manuallyUnreadSessionPaths)
         guard keys.count > Self.maxRetainedCompletionSessions else { return }
         if let preferredPath { keys.remove(preferredPath) }
         var retained = Set(keys.sorted().prefix(Self.maxRetainedCompletionSessions - (preferredPath == nil ? 0 : 1)))
@@ -403,6 +406,7 @@ struct PersistedAppState: Codable {
         latestCompletedEntryIDBySessionPath = latestCompletedEntryIDBySessionPath.filter { retained.contains($0.key) }
         lastSeenCompletedEntryIDBySessionPath = lastSeenCompletedEntryIDBySessionPath.filter { retained.contains($0.key) }
         lastReadAt = lastReadAt.filter { retained.contains($0.key) }
+        manuallyUnreadSessionPaths.formIntersection(retained)
     }
 }
 
