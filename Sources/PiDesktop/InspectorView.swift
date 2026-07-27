@@ -224,14 +224,23 @@ private struct ActivityRow: View {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PiTheme.space6) {
                     status.frame(width: 12, height: 12)
-                    Text(item.title).font(PiFont.caption).lineLimit(1)
-                    Spacer(minLength: PiTheme.space4)
-                    if let subtitle = item.subtitle {
-                        Text(subtitle).font(PiFont.micro).foregroundStyle(.tertiary).lineLimit(1)
+                    if item.kind == .subagent {
+                        VStack(alignment: .leading, spacing: PiTheme.space2) {
+                            Text(item.title).font(PiFont.caption).lineLimit(1)
+                            AgentMetadataLine(item: item)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text(item.title).font(PiFont.caption).lineLimit(1)
+                        Spacer(minLength: PiTheme.space4)
+                        if let subtitle = item.subtitle {
+                            Text(subtitle).font(PiFont.micro).foregroundStyle(.tertiary).lineLimit(1)
+                        }
                     }
                     PiChevron(expanded: expanded).opacity(hovering || expanded ? 1 : 0.3)
                 }
-                .frame(height: PiTheme.inspectorRowHeight)
+                .frame(minHeight: PiTheme.inspectorRowHeight)
+                .padding(.vertical, item.kind == .subagent ? PiTheme.space2 : 0)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -262,6 +271,27 @@ private struct ActivityRow: View {
 
     private func symbol(_ name: String, _ tint: Color) -> some View {
         Image(systemName: name).font(.system(size: PiIcon.small)).foregroundStyle(tint)
+    }
+}
+
+private struct AgentMetadataLine: View {
+    let item: ActivityItem
+
+    @ViewBuilder var body: some View {
+        if [.running, .waiting, .queued].contains(item.status), item.startedAt != nil {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                label(at: context.date)
+            }
+        } else {
+            label(at: item.endedAt ?? Date())
+        }
+    }
+
+    private func label(at date: Date) -> some View {
+        Text(item.agentSummary(now: date) ?? "Agent")
+            .font(PiFont.micro.monospacedDigit())
+            .foregroundStyle(.tertiary)
+            .lineLimit(1)
     }
 }
 

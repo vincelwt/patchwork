@@ -515,6 +515,14 @@ enum NumberFormatting {
         if seconds < 86_400 { return "\(seconds / 3_600)h" }
         return "\(seconds / 86_400)d"
     }
+
+    static func compactDuration(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded()))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h" }
+        return "\(seconds / 86_400)d"
+    }
 }
 
 extension Date {
