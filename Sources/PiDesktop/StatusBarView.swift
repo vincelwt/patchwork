@@ -165,7 +165,6 @@ private struct CodexAccountControl: View {
             .font(PiFont.micro)
             .foregroundStyle(tint)
             .opacity(isLive && !isStale ? 1 : 0.55)
-            .frame(maxWidth: 260, alignment: .trailing)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
