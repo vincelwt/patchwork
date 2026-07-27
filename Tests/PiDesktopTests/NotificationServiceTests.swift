@@ -118,7 +118,10 @@ final class NotificationTriggerWiringTests: XCTestCase {
             runtime: runtime,
             persistence: AppPersistence(baseURL: directory),
             activityPresenter: ActivityPresenter(),
-            activityMonitor: SessionActivityMonitor(isActiveOverride: true),
+            activityMonitor: SessionActivityMonitor(
+                isActiveOverride: isActive,
+                heartbeatDirectory: directory.appendingPathComponent("heartbeats")
+            ),
             notificationService: spy,
             isActiveOverride: isActive
         )
@@ -141,107 +144,80 @@ final class NotificationTriggerWiringTests: XCTestCase {
         store.prepareComposerOptions()
     }
 
-    func testTurnFinishedNotifiesOnceWhenBackgroundedAndNotAgainWithinTheWindow() {
+    func testAgentSettledWithoutANewCompletionIDDoesNotNotify() {
         let (store, runtime, spy, session) = makeStore(isActive: false)
-        attachRuntime(store, runtime: runtime, to: session)
-        store.openNewChat() // Look elsewhere so the event is not about the visible conversation.
-
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(spy.presented.count, 1)
-        XCTAssertEqual(spy.presented.first?.sessionKey, session.fileURL.standardizedFileURL.path)
-        XCTAssertTrue(spy.presented.first!.body.contains("finished"))
-
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(spy.presented.count, 1, "A repeat within the coalescing window must not notify again")
-    }
-
-    func testFocusedVisibleConversationIsNeverNotifiedWhileFrontmost() {
-        let (store, runtime, spy, session) = makeStore(isActive: true)
-        attachRuntime(store, runtime: runtime, to: session)
-        // `store` is already looking at `session` (attachRuntime selected it) and is frontmost.
-
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertTrue(spy.presented.isEmpty, "The active, visible conversation must stay quiet")
-        XCTAssertNil(store.toast, "No banner either: this is the conversation already on screen")
-    }
-
-    func testFrontmostButDifferentConversationShowsAnInAppBannerNotADesktopNotification() {
-        let (store, runtime, spy, session) = makeStore(isActive: true)
-        attachRuntime(store, runtime: runtime, to: session)
-        store.openNewChat() // Frontmost, but looking at something else now.
-
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertTrue(spy.presented.isEmpty, "Frontmost never uses the OS notification path")
-        XCTAssertEqual(store.toast?.style, .info)
-        XCTAssertTrue(store.toast?.text.contains(session.displayName) == true)
-    }
-
-    func testOpeningAnInAppBannerSelectsItsConversation() throws {
-        let (store, runtime, _, session) = makeStore(isActive: true)
         attachRuntime(store, runtime: runtime, to: session)
         store.openNewChat()
 
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        let toast = try XCTUnwrap(store.toast)
-        XCTAssertEqual(toast.sessionPath, session.fileURL.standardizedFileURL.path)
+        XCTAssertTrue(spy.presented.isEmpty, "Run-state events are not completion signals")
+    }
 
-        store.openToast(toast)
-        XCTAssertEqual(store.selectedSession?.id, session.id)
+    func testFocusedVisibleCompletionIsNeverNotifiedWhileFrontmost() async throws {
+        let (store, runtime, spy, session) = makeStore(isActive: true)
+        try Data("{\"type\":\"message\",\"id\":\"user\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: session.fileURL)
+        attachRuntime(store, runtime: runtime, to: session)
+        store.activityMonitor.setTrackedPaths([session.fileURL.path])
+        try await waitUntil { store.activityMonitor.activity(forPath: session.fileURL.path) != nil }
+
+        try Data("{\"type\":\"message\",\"id\":\"answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: session.fileURL)
+        store.activityMonitor.tickNow()
+        try await waitUntil { store.activityMonitor.activity(forPath: session.fileURL.path)?.latestCompletedEntryID == "answer" }
+
+        XCTAssertTrue(spy.presented.isEmpty)
         XCTAssertNil(store.toast)
     }
 
-    /// Drives the real `SessionActivityMonitor` (no fake snapshot injection needed here, since
-    /// nothing shells out) so the running→idle transition reaches `AppStore` exactly as it does
-    /// in the app: through the monitor's own published `activities`.
-    func testCrossTerminalCompletionNotifiesExactlyOnceOnTheRunningToIdleTransition() async throws {
+    func testFrontmostDifferentConversationGetsCompletionBannerAndCanOpenIt() async throws {
+        let (store, _, spy, session) = makeStore(isActive: true)
+        try Data("{\"type\":\"message\",\"id\":\"user\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: session.fileURL)
+        store.activityMonitor.setTrackedPaths([session.fileURL.path])
+        try await waitUntil { store.activityMonitor.activity(forPath: session.fileURL.path) != nil }
+
+        try Data("{\"type\":\"message\",\"id\":\"answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: session.fileURL)
+        store.activityMonitor.tickNow()
+        try await waitUntil { store.toast != nil }
+
+        XCTAssertTrue(spy.presented.isEmpty, "Frontmost uses an in-app banner")
+        let toast = try XCTUnwrap(store.toast)
+        XCTAssertEqual(toast.sessionPath, session.fileURL.standardizedFileURL.path)
+        store.openToast(toast)
+        XCTAssertEqual(store.selectedSession?.id, session.id)
+    }
+
+    func testBackgroundCompletionsNotifyOncePerDistinctIDWithoutAStateTransition() async throws {
         let (store, _, spy, session) = makeStore(isActive: false)
         let path = session.fileURL.standardizedFileURL.path
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: session.fileURL)
+        let fixedMtime = Date().addingTimeInterval(-600)
+        try Data("{\"type\":\"message\",\"id\":\"baseline\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: session.fileURL)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: path)
 
         store.activityMonitor.setTrackedPaths([path])
-        try await waitUntil { store.activityMonitor.activity(forPath: path)?.state == .running }
-        XCTAssertTrue(spy.presented.isEmpty, "Still running: nothing to say yet")
+        try await waitUntil { store.activityMonitor.activity(forPath: path)?.latestCompletedEntryID == "baseline" }
+        XCTAssertTrue(spy.presented.isEmpty, "Existing history is a quiet baseline")
 
-        // A terminal stop reason settles the session; the monitor picks this up on its own poll.
-        try Data("{\"type\":\"message\",\"id\":\"2\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: session.fileURL)
+        let handle = try FileHandle(forWritingTo: session.fileURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"second\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: path)
         store.activityMonitor.tickNow()
-        try await waitUntil { store.activityMonitor.activity(forPath: path)?.state == .idle }
-        XCTAssertEqual(spy.presented.count, 1)
+        try await waitUntil { spy.presented.count == 1 }
 
         store.activityMonitor.tickNow()
-        try await Task.sleep(nanoseconds: 150_000_000)
-        XCTAssertEqual(spy.presented.count, 1, "A repeat idle snapshot without a new transition must not notify again")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(spy.presented.count, 1, "Duplicate observation of one completion ID stays silent")
+
+        let next = try FileHandle(forWritingTo: session.fileURL)
+        try next.seekToEnd()
+        try next.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"third\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\"}}\n".utf8))
+        try next.close()
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: path)
+        store.activityMonitor.tickNow()
+        try await waitUntil { spy.presented.count == 2 }
     }
 
     // MARK: - Task 5: notification body shows Pi's actual answer
-
-    func testTurnFinishedBodyShowsTheBeginningOfPisActualAnswerNotAGenericPhrase() {
-        let (store, runtime, spy, session) = makeStore(isActive: false)
-        attachRuntime(store, runtime: runtime, to: session)
-        runtime.onEvent?(.object([
-            "type": .string("message_end"),
-            "message": .object(["role": .string("assistant"), "content": .string("The fix is in PaymentService.swift, line 42.")])
-        ]))
-        // Backgrounded (isActive: false) already means `notify` never suppresses on focus, so
-        // the session stays selected here — unlike the other tests in this file, `messages` must
-        // still hold the assistant reply when `agent_settled` reads it for the preview.
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(spy.presented.count, 1)
-        XCTAssertTrue(
-            spy.presented.first!.body.contains("The fix is in PaymentService.swift"),
-            "Body: \(spy.presented.first!.body)"
-        )
-    }
-
-    func testTurnFinishedBodyFallsBackToTheGenericPhraseWithNoAnswerText() {
-        let (store, runtime, spy, session) = makeStore(isActive: false)
-        attachRuntime(store, runtime: runtime, to: session)
-        store.openNewChat()
-
-        runtime.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(spy.presented.count, 1)
-        XCTAssertTrue(spy.presented.first!.body.contains("finished"))
-    }
 
     func testCrossTerminalTurnFinishedUsesTheHeartbeatPreviewWhenOneIsAvailable() async throws {
         let runtime = FakeRuntime()
@@ -275,7 +251,7 @@ final class NotificationTriggerWiringTests: XCTestCase {
         try await waitUntil { store.activityMonitor.activity(forPath: file.path)?.state == .running }
 
         try Data("""
-        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"Done: renamed the export helper."}
+        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"Done: renamed the export helper.","stopReason":"stop","completionId":"answer"}
         """.utf8).write(to: heartbeatDirectory.appendingPathComponent("cross.json"))
         store.activityMonitor.tickNow()
         try await waitUntil { !spy.presented.isEmpty }

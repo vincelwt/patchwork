@@ -9,16 +9,21 @@ import PiDeskKit
 ///
 /// `unread` provides the persisted part of the app's own `WorkspaceOrganization.isUnread(_:)`
 /// (`Sources/PiDesktop/WorkspaceOrganization.swift`, not importable from here): a manually marked
-/// unread session wins, otherwise a session with no recorded read is unread, otherwise it is unread iff
-/// it changed since it was last read. `ThreadStore` separately suppresses unread while running;
-/// the "currently selected in the UI" carve-out has no daemon equivalent.
+/// unread session wins, otherwise latest/last-seen completion IDs decide. `lastReadAt` is only
+/// the backward-compatible fallback for state the app has not migrated yet. `ThreadStore`
+/// separately suppresses unread while running; the selected-UI carve-out has no daemon equivalent.
 enum AppStatePeek {
     struct Snapshot: Decodable, Sendable {
         var archivedSessionIDs: Set<String> = []
         var manuallyUnreadSessionPaths: Set<String> = []
+        var latestCompletedEntryIDBySessionPath: [String: String] = [:]
+        var lastSeenCompletedEntryIDBySessionPath: [String: String] = [:]
         var lastReadAt: [String: Date] = [:]
 
-        private enum CodingKeys: String, CodingKey { case archivedSessionIDs, manuallyUnreadSessionPaths, lastReadAt }
+        private enum CodingKeys: String, CodingKey {
+            case archivedSessionIDs, manuallyUnreadSessionPaths
+            case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
+        }
 
         init() {}
 
@@ -26,14 +31,23 @@ enum AppStatePeek {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
             manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
+            latestCompletedEntryIDBySessionPath = try container.decodeIfPresent(
+                [String: String].self, forKey: .latestCompletedEntryIDBySessionPath
+            ) ?? [:]
+            lastSeenCompletedEntryIDBySessionPath = try container.decodeIfPresent(
+                [String: String].self, forKey: .lastSeenCompletedEntryIDBySessionPath
+            ) ?? [:]
             lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
         }
 
         func isArchived(sessionID: String) -> Bool { archivedSessionIDs.contains(sessionID) }
 
-        func isUnread(path: String, modifiedAt: Date) -> Bool {
+        func isUnread(path: String, latestCompletionID: String?, modifiedAt: Date) -> Bool {
             if manuallyUnreadSessionPaths.contains(path) { return true }
-            guard let viewed = lastReadAt[path] else { return true }
+            if let latest = latestCompletionID ?? latestCompletedEntryIDBySessionPath[path] {
+                return lastSeenCompletedEntryIDBySessionPath[path] != latest
+            }
+            guard let viewed = lastReadAt[path] else { return false }
             return modifiedAt > viewed
         }
     }

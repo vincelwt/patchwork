@@ -214,14 +214,14 @@ final class SessionActivityClassifierTests: XCTestCase {
         XCTAssertEqual(SessionActivityClassifier.lastEntry(inTail: tail)?["id"]?.stringValue, "last")
     }
 
-    func testOldFileIsClassifiedIdleWithoutAnyRead() throws {
+    func testOldFileIsIdleButStillExposesItsLatestCompletionID() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiActivity-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let url = directory.appendingPathComponent("old.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: url)
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: url)
         try FileManager.default.setAttributes(
             [.modificationDate: Date().addingTimeInterval(-3_600)],
             ofItemAtPath: url.path
@@ -229,6 +229,7 @@ final class SessionActivityClassifierTests: XCTestCase {
 
         let activity = try XCTUnwrap(SessionActivityClassifier.classifyFile(at: url))
         XCTAssertEqual(activity.state, .idle)
+        XCTAssertEqual(activity.latestCompletedEntryID, "1")
         XCTAssertNil(activity.runningSince)
     }
 
@@ -352,7 +353,7 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
 
         try write(
             """
-            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z"}
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-1"}
             """, name: "a.json", in: directory
         )
         try write(
@@ -367,6 +368,7 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
         XCTAssertEqual(result.count, 1)
         XCTAssertEqual(result["/tmp/a.jsonl"]?.count, 2)
         XCTAssertEqual(Set(result["/tmp/a.jsonl"]?.map(\.pid) ?? []), [1, 2])
+        XCTAssertEqual(result["/tmp/a.jsonl"]?.first(where: { $0.pid == 1 })?.completionId, "answer-1")
     }
 
     func testScanOfAMissingDirectoryIsEmptyNotAnError() {
@@ -497,19 +499,30 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "No heartbeat: the file heuristic alone decides")
     }
 
-    func testInactiveApplicationNeverPolls() async throws {
+    func testPollingTaskDoesNotRetainTheMonitor() async throws {
+        var monitor: SessionActivityMonitor? = SessionActivityMonitor(
+            isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory()
+        )
+        weak var released = monitor
+        monitor?.start()
+        monitor = nil
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertNil(released)
+    }
+
+    func testBackgroundApplicationStillPollsForCompletedAnswers() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let file = directory.appendingPathComponent("s.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
+        try Data("{\"type\":\"message\",\"id\":\"background-answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
 
         let monitor = SessionActivityMonitor(isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory())
         monitor.setTrackedPaths([file.path])
-        try await Task.sleep(nanoseconds: 250_000_000)
-        XCTAssertTrue(monitor.activities.isEmpty, "A background app must not stat or read session files")
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "background-answer" }
+        XCTAssertEqual(SessionActivityMonitor.backgroundPollInterval, 15)
     }
 
     /// The exact flicker the user reported: an ambiguous tail read (no heartbeat, and the file

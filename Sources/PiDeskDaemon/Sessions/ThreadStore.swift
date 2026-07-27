@@ -101,6 +101,8 @@ actor ThreadStore {
         let overlayState = await overlay.snapshot()
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
         let heartbeatIDs = Set(heartbeats.map(\.sessionId))
+        let latestHeartbeatCompletionBySessionID = Dictionary(grouping: heartbeats.filter { $0.completionId != nil }, by: \.sessionId)
+            .compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
         var runningIDs = Set(heartbeats.filter { ActivityReader.isRunning($0) }.map(\.sessionId))
 
         var results: [PiThread] = []
@@ -128,7 +130,11 @@ actor ThreadStore {
 
             thread.archived = appState.isArchived(sessionID: thread.id) || overlayState.isArchived(thread.id)
             thread.unread = overlayState.unreadOverride(path: thread.path, updatedAt: thread.updatedAt)
-                ?? appState.isUnread(path: thread.path, modifiedAt: thread.updatedAt)
+                ?? appState.isUnread(
+                    path: thread.path,
+                    latestCompletionID: latestHeartbeatCompletionBySessionID[thread.id],
+                    modifiedAt: thread.updatedAt
+                )
             // A session the extension has never seen still has to report honestly, so its file
             // decides. Freshly written files are the only ones worth reading a tail for.
             if !heartbeatIDs.contains(thread.id),

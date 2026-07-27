@@ -69,8 +69,6 @@ private final class RuntimeSlot {
     var dialogs: [ExtensionDialogRequest] = []
     var outbox: [OutboxEntry] = []
     var streamingMessage: ChatMessage?
-    var lastAssistantText: String?
-    var lastAssistantWasError = false
     var pendingTurn: PendingUserTurn?
     var outboxDispatches: Set<UUID> = []
     var deferredEvents: [JSONValue] = []
@@ -249,9 +247,10 @@ final class AppStore: ObservableObject {
     private var attachmentsByKey: [String: [ImageAttachment]] = [:]
     private var draftPersistTask: Task<Void, Never>?
     private var notificationCoalescer = NotificationCoalescer()
-    /// Last seen state per tracked session path, purely to detect a running→idle transition for
-    /// conversations finishing in another terminal.
-    private var previousActivityStates: [String: SessionRunState] = [:]
+    /// Distinguishes the first baseline for a tracked path from a completion observed later.
+    /// Persisted latest IDs provide cross-launch deduplication; this set prevents stale launch
+    /// notifications while remaining bounded to discovered sessions.
+    private var observedActivityPaths: Set<String> = []
     /// Set for the in-flight "prompt" of the currently attached turn; see `PendingUserTurn`.
     private var activeTurnPrompt: PendingUserTurn? {
         get { activeRuntimeSlot.pendingTurn }
@@ -609,18 +608,37 @@ final class AppStore: ObservableObject {
             .sorted { liveModifiedAt($0) > liveModifiedAt($1) }
     }
 
-    /// Detects a session transitioning running → idle in another terminal, the one completion
-    /// signal the RPC event stream can never see on its own.
+    /// Completion IDs, not run-state or mtime transitions, are the sole finished-answer signal.
+    /// The first snapshot establishes a quiet baseline; every later distinct ID is persisted
+    /// before notification gating so duplicate observations and relaunches stay silent.
     private func handleActivitySnapshot(_ activities: [String: SessionActivity]) {
         for (path, activity) in activities {
-            let previous = previousActivityStates.updateValue(activity.state, forKey: path)
-            guard previous == .running, activity.state == .idle else { continue }
-            guard let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
+            let hadBaseline = observedActivityPaths.contains(path)
+            observedActivityPaths.insert(path)
+            guard let completionID = activity.latestCompletedEntryID else { continue }
+
+            let previousID = persistence.state.latestCompletedEntryIDBySessionPath[path]
+            let focused = isApplicationActive
+                && selectedSession?.fileURL.standardizedFileURL.path == path
+            let alreadySeen = persistence.state.lastSeenCompletedEntryIDBySessionPath[path] == completionID
+            if previousID != completionID || (focused && !alreadySeen) || persistence.state.lastReadAt[path] != nil {
+                persistence.observeCompletedEntry(
+                    path: path,
+                    completionID: completionID,
+                    modifiedAt: activity.modifiedAt,
+                    markSeen: focused
+                )
+            }
+
+            guard hadBaseline, previousID != completionID,
+                  let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
             let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
-            notify(failed ? .turnFailed : .turnFinished, session: session, preview: activity.preview)
-        }
-        if previousActivityStates.count > activities.count {
-            previousActivityStates = previousActivityStates.filter { activities[$0.key] != nil }
+            notify(
+                failed ? .turnFailed : .turnFinished,
+                session: session,
+                preview: activity.preview,
+                coalesce: false
+            )
         }
     }
 
@@ -634,12 +652,17 @@ final class AppStore: ObservableObject {
     /// Single entry point for every notification trigger: applies the "don't tell me about what
     /// I'm already looking at" rule, coalesces bursts, then routes to a toast (frontmost) or a
     /// desktop notification (backgrounded).
-    private func notify(_ trigger: NotificationTrigger, session: SessionSummary?, preview: String? = nil) {
+    private func notify(
+        _ trigger: NotificationTrigger,
+        session: SessionSummary?,
+        preview: String? = nil,
+        coalesce: Bool = true
+    ) {
         guard let session else { return }
         let key = session.fileURL.standardizedFileURL.path
         let focusedKey = isApplicationActive ? selectedSession?.fileURL.standardizedFileURL.path : nil
         guard !NotificationGate.isSuppressed(sessionKey: key, focusedSessionKey: focusedKey) else { return }
-        guard notificationCoalescer.shouldEmit(sessionKey: key) else { return }
+        guard !coalesce || notificationCoalescer.shouldEmit(sessionKey: key) else { return }
         // A finished turn's body shows the beginning of Pi's actual answer when one is available
         // (a live RPC message, or a cross-terminal heartbeat preview); every other trigger keeps
         // its fixed, specific summary.
@@ -743,6 +766,7 @@ final class AppStore: ObservableObject {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
             let discovered = try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
             sessions = discovered
+            persistence.pruneCompletionState(retainingSessionPaths: discovered.map { $0.fileURL.path })
             syncActivityMonitorPaths()
             if let selectedPath, sessions.contains(where: { $0.fileURL.standardizedFileURL.path == selectedPath }) {
                 route = .session(selectedPath)
@@ -1010,7 +1034,9 @@ final class AppStore: ObservableObject {
     /// directory — several sessions can share one, which is exactly what made that cross-check
     /// unreliable.
     private func syncActivityMonitorPaths() {
-        activityMonitor.setTrackedPaths(sessions.map { $0.fileURL.standardizedFileURL.path })
+        let paths = sessions.map { $0.fileURL.standardizedFileURL.path }
+        observedActivityPaths.formIntersection(Set(paths))
+        activityMonitor.setTrackedPaths(paths)
     }
 
     // MARK: - Draft persistence
@@ -1784,8 +1810,6 @@ final class AppStore: ObservableObject {
         slot.dialogs.removeAll()
         slot.outbox.removeAll()
         slot.streamingMessage = nil
-        slot.lastAssistantText = nil
-        slot.lastAssistantWasError = false
         slot.pendingTurn = nil
         slot.outboxDispatches.removeAll()
         slot.deferredEvents.removeAll()
@@ -2133,11 +2157,6 @@ final class AppStore: ObservableObject {
             slot.pendingTurn = nil
             let startedFollowUp = flushBackgroundOutbox(.followUp, slot: slot)
             let session = session(for: slot)
-            notify(
-                slot.lastAssistantWasError ? .turnFailed : .turnFinished,
-                session: session,
-                preview: slot.lastAssistantText
-            )
             if let session { Task { await self.refreshSummary(for: session) } }
             if !startedFollowUp {
                 if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
@@ -2151,11 +2170,6 @@ final class AppStore: ObservableObject {
         case "message_end":
             updateState(for: slot) { $0.phase = .working }
             slot.streamingMessage = nil
-            if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw),
-               parsed.role == .assistant {
-                slot.lastAssistantText = String(parsed.textContent.prefix(4_000))
-                slot.lastAssistantWasError = parsed.isError
-            }
         case "tool_execution_start":
             updateState(for: slot) { $0.phase = .working }
             if let callID = event["toolCallId"]?.stringValue,
@@ -2324,11 +2338,6 @@ final class AppStore: ObservableObject {
             activeTurnPrompt = nil
             requestStats()
             let settledSession = activeSession()
-            notify(
-                messages.last?.isError == true ? .turnFailed : .turnFinished,
-                session: settledSession,
-                preview: messages.last?.textContent
-            )
             Task {
                 if let settledSession { await refreshSummary(for: settledSession) }
                 if isApplicationActive,
@@ -2347,8 +2356,6 @@ final class AppStore: ObservableObject {
             upsertMessage(parsed)
             streamingMessage = nil
             if parsed.role == .assistant {
-                activeRuntimeSlot.lastAssistantText = String(parsed.textContent.prefix(4_000))
-                activeRuntimeSlot.lastAssistantWasError = parsed.isError
                 var latest = TokenMetrics(); latest.addUsage(parsed.usage)
                 liveMetrics.latestCacheHitPercent = latest.latestCacheHitPercent
             }

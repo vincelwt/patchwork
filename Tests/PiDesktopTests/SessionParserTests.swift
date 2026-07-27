@@ -162,6 +162,31 @@ final class SessionParserTests: XCTestCase {
         XCTAssertTrue(summary.searchKey.contains("searchable words"), "Search stays useful")
     }
 
+    // MARK: - Completion tail scan
+
+    func testTerminalAssistantStopReasonsProduceStableCompletionEntryIDs() {
+        for reason in ["stop", "length", "error", "aborted"] {
+            let tail = Data("{\"type\":\"message\",\"id\":\"\(reason)\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"\(reason)\"}}\n".utf8)
+            XCTAssertEqual(
+                SessionParser.latestTerminalAssistantCompletion(inTail: tail),
+                SessionParser.AssistantCompletion(id: reason, stopReason: reason)
+            )
+        }
+    }
+
+    func testToolUseIsNotACompletionAndDoesNotHideThePreviousCompletedAnswer() {
+        let tail = Data("""
+        {"type":"message","id":"done","message":{"role":"assistant","stopReason":"stop"}}
+        {"type":"message","id":"tools","message":{"role":"assistant","stopReason":"toolUse"}}
+        """.utf8)
+        XCTAssertEqual(SessionParser.latestTerminalAssistantCompletion(inTail: tail)?.id, "done")
+    }
+
+    func testCompletionTailIgnoresAnUnterminatedTornLastLine() {
+        let tail = Data("{\"type\":\"message\",\"id\":\"done\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n{\"type\":\"message\",\"id\":\"torn\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\"}}".utf8)
+        XCTAssertEqual(SessionParser.latestTerminalAssistantCompletion(inTail: tail)?.id, "done")
+    }
+
     // MARK: - Task 1: tail-first scan
 
     func testConversationTailReturnsLastMessagesInOrderAndReportsIncomplete() throws {

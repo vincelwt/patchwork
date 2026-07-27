@@ -90,8 +90,9 @@ final class HTTPServerIntegrationTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-running", cwd: "/tmp/project")
         let heartbeatURL = directory.appendingPathComponent("activity/sess-running.json")
         let writeHeartbeat: (String) throws -> Void = { state in
+            let completion = state == "idle" ? ",\"completionId\":\"answer-1\"" : ""
             try """
-            {"sessionId":"sess-running","pid":\(getpid()),"state":"\(state)","updatedAt":"\(PiDeskDate.string(from: Date()))"}
+            {"sessionId":"sess-running","pid":\(getpid()),"state":"\(state)","updatedAt":"\(PiDeskDate.string(from: Date()))"\(completion)}
             """.write(to: heartbeatURL, atomically: true, encoding: .utf8)
         }
 

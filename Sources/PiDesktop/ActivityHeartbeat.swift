@@ -14,6 +14,7 @@ struct ActivityHeartbeat: Decodable, Equatable, Sendable {
     var updatedAt: String
     var preview: String?
     var stopReason: String?
+    var completionId: String? = nil
 
     /// The session JSONL path this heartbeat describes, reconstructed from `sessionDir` + id
     /// when the extension could not resolve a concrete file (an in-memory session).

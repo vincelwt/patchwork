@@ -196,6 +196,38 @@ struct SessionParser {
         return SessionConversation(messages: messages, leafID: lastEntryID, rawEntryCount: rawEntryCount)
     }
 
+    struct AssistantCompletion: Equatable, Sendable {
+        let id: String
+        let stopReason: String
+    }
+
+    static let terminalAssistantStopReasons: Set<String> = ["stop", "length", "error", "aborted"]
+
+    static func terminalAssistantCompletion(from entry: JSONValue?) -> AssistantCompletion? {
+        guard entry?["type"]?.stringValue == "message",
+              let id = entry?["id"]?.stringValue,
+              let message = entry?["message"], message["role"]?.stringValue == "assistant",
+              let stopReason = message["stopReason"]?.stringValue,
+              terminalAssistantStopReasons.contains(stopReason) else { return nil }
+        return AssistantCompletion(id: id, stopReason: stopReason)
+    }
+
+    /// Finds the newest completed assistant answer in a bounded JSONL tail. Pi commits records
+    /// with a trailing newline, so an unterminated final fragment is ignored even if it happens
+    /// to be temporarily decodable while another process is still writing it.
+    static func latestTerminalAssistantCompletion(inTail tail: Data) -> AssistantCompletion? {
+        guard let lastNewline = tail.lastIndex(of: 0x0A) else { return nil }
+        let complete = tail[...lastNewline]
+        for line in complete.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
+            var record = Data(line)
+            if record.last == 0x0D { record.removeLast() }
+            guard let entry = try? JSONValue.decode(record),
+                  let completion = terminalAssistantCompletion(from: entry) else { continue }
+            return completion
+        }
+        return nil
+    }
+
     /// Bytes read backward from EOF for the tail-first preview (Task 1). Large enough that a
     /// realistic tail of `AppStore`'s preview limit almost always resolves from one window,
     /// small enough that even a 25 MB session only ever pays for a few MB of it.

@@ -232,6 +232,7 @@ final class AppPersistence {
         } else {
             state = PersistedAppState()
         }
+        state.pruneCompletionState()
     }
 
     func setArchived(_ archived: Bool, sessionID: String) {
