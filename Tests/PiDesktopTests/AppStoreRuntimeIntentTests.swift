@@ -228,6 +228,35 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.stopCount, 1)
     }
 
+    func testBufferedEventsFromBeforeReuseCannotMutateOrStopTheNewRoute() {
+        let runtime = IntentRuntime()
+        let store = makeStore(runtime: runtime)
+        let a = summary("a", cwd: root)
+        let b = summary("b", cwd: root)
+        store.sessions = [a, b]
+        store.selectSession(a)
+        store.composerContentDidChange()
+        let staleHandler = runtime.onEvent
+
+        runtime.delayState = true
+        store.selectSession(b)
+        store.composerContentDidChange()
+        XCTAssertNil(runtime.onEvent, "Events stay gated until the switched route passes get_state validation")
+        staleHandler?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("assistant"), "content": .string("stale A answer"),
+                "stopReason": .string("stop"), "timestamp": .number(1_000)
+            ])
+        ]))
+        staleHandler?(.object(["type": .string("agent_settled")]))
+        runtime.finishState()
+
+        XCTAssertFalse(store.messages.contains { $0.textContent == "stale A answer" })
+        XCTAssertEqual(runtime.stopCount, 0)
+        XCTAssertEqual(store.currentRouteRuntimePhase, .idle)
+    }
+
     func testBusyRuntimeIsPreservedAndReuseCancellationOrErrorFallsBackCold() {
         let busy = IntentRuntime()
         let replacement = IntentRuntime()

@@ -94,6 +94,34 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertFalse(store.hasEarlierMessages)
     }
 
+    func testPrependingDiskHistoryKeepsBoundedLiveMessages() async throws {
+        let file = temporaryDirectory.appendingPathComponent("live.jsonl")
+        try writeLinearConversation(prefix: "disk", messageCount: 60, to: file)
+        let runtime = FakeRuntime()
+        runtime.sessionFile = file.path
+        runtime.sessionID = "live"
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory), runtime: runtime)
+        let session = try makeSummary(id: "live", fileURL: file)
+        store.sessions = [session]
+        store.selectSession(session)
+        try await waitUntil { store.messages.count == 50 }
+        store.prepareComposerOptions()
+
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("assistant"), "content": .string("Live narration"),
+                "stopReason": .string("toolUse"), "timestamp": .number(2_000)
+            ])
+        ]))
+        XCTAssertEqual(store.messages.last?.textContent, "Live narration")
+
+        store.loadEarlierMessages()
+        try await waitUntil { store.messages.count == 61 }
+        XCTAssertEqual(store.messages.last?.textContent, "Live narration")
+        XCTAssertEqual(store.messages.filter { $0.textContent == "Live narration" }.count, 1)
+    }
+
     func testASmallConversationsTailScanIsAlreadyCompleteSoNoBackfillIsNeeded() async throws {
         // Fewer messages than the tail preview limit: the backward scan reaches the root on its
         // own, so the very first publish is already final.
@@ -107,6 +135,41 @@ final class ConversationLoadingTests: XCTestCase {
         try await waitUntil { store.messages.count == 3 }
         XCTAssertFalse(store.isConversationLoading)
         XCTAssertEqual(store.messages.map(\.textContent), ["small-0", "small-1", "small-2"])
+    }
+
+    func testLoadingMultiplePagesKeepsOneAggregateImageBudget() async throws {
+        let file = temporaryDirectory.appendingPathComponent("paged-images.jsonl")
+        let encoded = Data("pixel".utf8).base64EncodedString()
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "images"]]
+        var parent: Any = NSNull()
+        for index in 0..<60 {
+            let id = "image-\(index)"
+            lines.append([
+                "type": "message", "id": id, "parentId": parent,
+                "message": [
+                    "role": "assistant",
+                    "content": [["type": "image", "data": encoded, "mimeType": "image/png"]]
+                ]
+            ])
+            parent = id
+        }
+        let data = try lines.reduce(into: Data()) { output, line in
+            output.append(try JSONSerialization.data(withJSONObject: line))
+            output.append(0x0A)
+        }
+        try data.write(to: file)
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
+        let session = try makeSummary(id: "images", fileURL: file)
+        store.sessions = [session]
+
+        store.selectSession(session)
+        try await waitUntil { store.messages.count == 50 }
+        XCTAssertEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
+
+        store.loadEarlierMessages()
+        try await waitUntil { store.messages.count == 60 }
+        XCTAssertEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
+        XCTAssertEqual(store.messages.last?.images.count, 1, "Newest images have priority")
     }
 
     func testUnreadConversationTargetsTheFirstLoadedCompletionAfterLastSeen() async throws {
@@ -185,6 +248,22 @@ final class ConversationLoadingTests: XCTestCase {
         let fileA = temporaryDirectory.appendingPathComponent("a.jsonl")
         let fileB = temporaryDirectory.appendingPathComponent("b.jsonl")
         try writeLinearConversation(prefix: "a", messageCount: 1, to: fileA)
+        let priorEntries: [[String: Any]] = [
+            [
+                "type": "message", "id": "prior-same-answer", "parentId": "a-entry-0",
+                "message": ["role": "assistant", "content": "Durable answer", "stopReason": "stop", "timestamp": 1_000]
+            ],
+            [
+                "type": "message", "id": "next-user", "parentId": "prior-same-answer",
+                "message": ["role": "user", "content": "Again", "timestamp": 1_500]
+            ]
+        ]
+        let priorHandle = try FileHandle(forWritingTo: fileA)
+        try priorHandle.seekToEnd()
+        for entry in priorEntries {
+            try priorHandle.write(contentsOf: JSONSerialization.data(withJSONObject: entry) + Data([0x0A]))
+        }
+        try priorHandle.close()
         try writeLinearConversation(prefix: "b", messageCount: 1, to: fileB)
         let runtime = FakeRuntime()
         runtime.sessionFile = fileA.path
@@ -194,7 +273,7 @@ final class ConversationLoadingTests: XCTestCase {
         let b = try makeSummary(id: "b", fileURL: fileB)
         store.sessions = [a, b]
         store.selectSession(a)
-        try await waitUntil { store.messages.count == 1 }
+        try await waitUntil { store.messages.count == 3 }
         store.prepareComposerOptions()
 
         runtime.onEvent?(.object([
@@ -211,7 +290,7 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.textContent, "Durable answer", "A stale disk page must keep the RPC final overlay")
 
         let durable: [String: Any] = [
-            "type": "message", "id": "durable-answer", "parentId": "a-entry-0",
+            "type": "message", "id": "durable-answer", "parentId": "next-user",
             "message": ["role": "assistant", "content": "Durable answer", "stopReason": "stop", "timestamp": 2_000]
         ]
         let handle = try FileHandle(forWritingTo: fileA)
@@ -229,7 +308,7 @@ final class ConversationLoadingTests: XCTestCase {
             store.messages.contains(where: { $0.id == "durable-answer" }),
             "ids=\(store.messages.map(\.id)) loading=\(store.isConversationLoading) error=\(store.conversationError ?? "nil")"
         )
-        XCTAssertEqual(store.messages.filter { $0.textContent == "Durable answer" }.count, 1)
+        XCTAssertEqual(store.messages.filter { $0.textContent == "Durable answer" }.count, 2)
     }
 
     func testDuplicatePiSessionIDsStillSelectByFilePath() async throws {

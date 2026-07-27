@@ -119,6 +119,13 @@ final class PiRPCClientProcessTests: XCTestCase {
     done
     """
 
+    private static let responseThenEventScript = """
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+      printf '{"type":"response","id":"%s","success":true,"data":{}}\\n{"type":"owner_event"}\\n' "$id"
+    done
+    """
+
     private func client(script: String) -> PiRPCClient {
         PiRPCClient(
             executableOverride: URL(fileURLWithPath: "/bin/sh"),
@@ -150,6 +157,27 @@ final class PiRPCClientProcessTests: XCTestCase {
             return XCTFail("A stopped runtime must not publish a success response")
         }
         XCTAssertFalse(client.isRunning)
+    }
+
+    func testBufferedEventKeepsTheHandlerThatOwnedItsPipeChunk() throws {
+        let client = self.client(script: Self.responseThenEventScript)
+        defer { client.stop() }
+        try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
+        let oldOwner = expectation(description: "old owner receives buffered event")
+        let wrongOwner = expectation(description: "new owner never receives buffered event")
+        wrongOwner.isInverted = true
+        client.onEvent = { event in
+            if event["type"]?.stringValue == "owner_event" { oldOwner.fulfill() }
+        }
+
+        let response = expectation(description: "response rebinds owner first")
+        client.send(type: "get_state", payload: [:]) { _ in
+            client.onEvent = { event in
+                if event["type"]?.stringValue == "owner_event" { wrongOwner.fulfill() }
+            }
+            response.fulfill()
+        }
+        wait(for: [response, oldOwner, wrongOwner], timeout: 2)
     }
 
     func testReplacementRuntimeAnswersWithItsOwnGenerationScopedIDs() throws {

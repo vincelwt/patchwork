@@ -525,6 +525,21 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertEqual(SessionActivityMonitor.backgroundPollInterval, 15)
     }
 
+    func testFallbackStatsAreBoundedAndRoundRobinWhileHeartbeatsStayImmediate() {
+        let paths = (0..<200).map { "session-\($0)" }
+        let heartbeat = Set(["session-199"])
+        let first = SessionActivityMonitor.pollSelection(paths: paths, heartbeatPaths: heartbeat, fallbackCursor: 0)
+        let second = SessionActivityMonitor.pollSelection(
+            paths: paths, heartbeatPaths: heartbeat, fallbackCursor: first.nextCursor
+        )
+
+        XCTAssertEqual(first.paths.count, SessionActivityMonitor.fallbackStatsPerTick + 1)
+        XCTAssertEqual(second.paths.count, SessionActivityMonitor.fallbackStatsPerTick + 1)
+        XCTAssertTrue(first.paths.contains("session-199"))
+        XCTAssertTrue(second.paths.contains("session-199"))
+        XCTAssertTrue(Set(first.paths).intersection(second.paths).subtracting(heartbeat).isEmpty)
+    }
+
     /// The exact flicker the user reported: an ambiguous tail read (no heartbeat, and the file
     /// heuristic itself returns `.unknown`) must never overwrite an already-known verdict.
     func testAmbiguousFileReadIsStickyAndNeverFlipsAnAlreadyKnownState() async throws {

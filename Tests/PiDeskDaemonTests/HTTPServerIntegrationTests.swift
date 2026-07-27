@@ -109,6 +109,23 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertTrue(idleThread.unread, "The completed turn becomes unread")
     }
 
+    func testPathlessHeartbeatDoesNotAttachToDuplicateSessionIDs() async throws {
+        let source = TestSupport.writeSessionFile(in: directory, id: "duplicate", cwd: "/tmp/project")
+        let copy = source.deletingLastPathComponent().appendingPathComponent("duplicate-copy.jsonl")
+        try FileManager.default.copyItem(at: source, to: copy)
+        try """
+        {"sessionId":"duplicate","pid":\(getpid()),"state":"running","updatedAt":"\(PiDeskDate.string(from: Date()))","completionId":"answer"}
+        """.write(
+            to: directory.appendingPathComponent("activity/duplicate.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let threads = try await client.listThreads().threads
+        XCTAssertEqual(threads.count, 2)
+        XCTAssertTrue(threads.allSatisfy { !$0.running })
+    }
+
     func testSendMessageEnqueuesAFakeRunAndItCompletes() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-3", cwd: "/tmp/project")
         let sent = try await client.sendMessage(threadId: "sess-3", SendMessageRequest(text: "do the thing"))

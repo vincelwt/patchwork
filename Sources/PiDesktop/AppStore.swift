@@ -47,6 +47,11 @@ private struct PendingUserTurn {
     let attachments: [ImageAttachment]
 }
 
+private struct LiveMessageKey: Equatable {
+    let path: String
+    let id: String
+}
+
 /// One independent Pi process plus the route-visible state that must follow it when the user
 /// switches conversations mid-turn. Idle processes are still reused; only live work is parked.
 private final class RuntimeSlot {
@@ -77,6 +82,7 @@ private final class RuntimeSlot {
     var startupBeganAt: Date?
     var promptBeganAt: Date?
     var readyWaiters: [(Result<RuntimeSlot, Error>) -> Void] = []
+    var isSuperseded = false
 
     init(runtime: PiRuntimeProtocol) { self.runtime = runtime }
 }
@@ -267,8 +273,11 @@ final class AppStore: ObservableObject {
     /// authoritative JSONL page. This closes the short message_end → disk durability gap.
     private var pendingFinalMessagesByPath: [String: ChatMessage] = [:]
     private var pendingFinalOrder: [String] = []
+    private var liveMessagesByPath: [String: [ChatMessage]] = [:]
+    private var liveMessageOrder: [LiveMessageKey] = []
     private var finalDurabilityTasks: [UUID: Task<Void, Never>] = [:]
     private static let pendingFinalLimit = 32
+    private static let liveMessageLimit = 256
     /// Set for the in-flight "prompt" of the currently attached turn; see `PendingUserTurn`.
     private var activeTurnPrompt: PendingUserTurn? {
         get { activeRuntimeSlot.pendingTurn }
@@ -886,8 +895,11 @@ final class AppStore: ObservableObject {
         }
 
         isConversationLoading = true
-        if let pending = pendingFinalMessagesByPath[path] { messages = [pending] }
-        else { messages.removeAll(keepingCapacity: false) }
+        var live = liveMessagesByPath[path] ?? []
+        if let pending = pendingFinalMessagesByPath[path], !live.contains(where: { $0.id == pending.id }) {
+            live.append(pending)
+        }
+        messages = enforcingLoadedImageBudget(live)
         activities.removeAll(keepingCapacity: false)
         conversationLoadTask = Task { [weak self] in
             guard let self else { return }
@@ -990,7 +1002,7 @@ final class AppStore: ObservableObject {
         let unique = older.messages.filter { !existingIDs.contains($0.id) }
         let remaining = max(0, Self.loadedMessageLimit - current.messages.count)
         let accepted = Array(unique.suffix(remaining))
-        let mergedMessages = accepted + current.messages
+        let mergedMessages = enforcingLoadedImageBudget(accepted + current.messages)
         loadedConversationPage = ConversationPage(
             messages: mergedMessages,
             olderCursor: older.olderCursor,
@@ -1285,6 +1297,7 @@ final class AppStore: ObservableObject {
             let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
             optimisticID = message.id
             messages.append(message)
+            messages = enforcingLoadedImageBudget(messages)
         } else {
             optimisticID = nil
         }
@@ -1905,8 +1918,13 @@ final class AppStore: ObservableObject {
         if canReuseProcess(previous, in: cwd) {
             let oldSessionPath = state(for: previous).sessionFile ?? previous.sessionPath
             removeParkedReference(to: previous)
+            previous.isSuperseded = true
+            previous.runtime.onEvent = nil
             let slot = RuntimeSlot(runtime: previous.runtime)
-            bindRuntime(slot)
+            slot.runtime.onExit = { [weak self, weak slot] error in
+                guard let self, let slot else { return }
+                self.handleRuntimeExit(error, from: slot)
+            }
             activeRuntimeSlot = slot
             configureRuntimeSlot(slot, cwd: cwd, sessionPath: sessionPath, phase: .openingConversation, completion: completion)
             switchReusedRuntime(slot, cwd: cwd, sessionPath: sessionPath, oldSessionPath: oldSessionPath)
@@ -2001,6 +2019,7 @@ final class AppStore: ObservableObject {
             guard case let .success(response) = result,
                   responseError(response) == nil,
                   response["data"]?["cancelled"]?.boolValue != true else {
+                bindRuntime(slot)
                 coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
                 return
             }
@@ -2008,8 +2027,10 @@ final class AppStore: ObservableObject {
                 slot,
                 sessionPath: sessionPath,
                 reusedFrom: oldSessionPath,
-                validateReusedRoute: true
+                validateReusedRoute: true,
+                bindOnSuccess: true
             ) {
+                self.bindRuntime(slot)
                 self.coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
             }
         }
@@ -2040,6 +2061,7 @@ final class AppStore: ObservableObject {
         sessionPath: URL?,
         reusedFrom oldSessionPath: String?,
         validateReusedRoute: Bool = false,
+        bindOnSuccess: Bool = false,
         onReuseFailure: (() -> Void)? = nil
     ) {
         slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
@@ -2061,6 +2083,7 @@ final class AppStore: ObservableObject {
                 onReuseFailure?()
                 return
             }
+            if bindOnSuccess { bindRuntime(slot) }
             finishRuntimeStart(slot, result: .success(slot))
             if slot === activeRuntimeSlot { requestStats() }
         }
@@ -2260,19 +2283,96 @@ final class AppStore: ObservableObject {
             }
         }
 
-        if let path = loadedConversationPath, let pending = pendingFinalMessagesByPath[path] {
-            if loaded.contains(where: { durableAnswer($0, matches: pending) }) {
-                removePendingFinal(path: path)
-            } else if !merged.contains(where: { $0.id == pending.id }) {
-                merged.append(pending)
+        if let path = loadedConversationPath {
+            removeDurableLiveMessages(in: loaded, path: path)
+            for live in liveMessagesByPath[path] ?? [] where !merged.contains(where: { $0.id == live.id }) {
+                merged.append(live)
+            }
+            if let pending = pendingFinalMessagesByPath[path] {
+                if loaded.contains(where: { durableAnswer($0, matches: pending) }) {
+                    removePendingFinal(path: path)
+                } else if !merged.contains(where: { $0.id == pending.id }) {
+                    merged.append(pending)
+                }
             }
         }
-        messages = merged
+        messages = enforcingLoadedImageBudget(merged)
+    }
+
+    private func enforcingLoadedImageBudget(_ source: [ChatMessage]) -> [ChatMessage] {
+        var result = source.count > Self.loadedMessageLimit
+            ? Array(source.suffix(Self.loadedMessageLimit))
+            : source
+        var count = 0
+        var bytes = 0
+        // Newer messages win. Paging backward can otherwise multiply the parser's per-page image
+        // allowance into an unbounded retained window.
+        for messageIndex in result.indices.reversed() {
+            var message = result[messageIndex]
+            for blockIndex in message.blocks.indices {
+                guard case let .image(image) = message.blocks[blockIndex].kind else { continue }
+                if count < PiTheme.imageCountLimit,
+                   image.data.count <= PiTheme.imageByteLimit,
+                   bytes + image.data.count <= PiTheme.totalImageByteLimit {
+                    count += 1
+                    bytes += image.data.count
+                } else {
+                    let block = message.blocks[blockIndex]
+                    message.blocks[blockIndex] = MessageBlock(
+                        id: block.id,
+                        kind: .unknown(type: "image", raw: .string(ImageBudget.omittedPlaceholder))
+                    )
+                }
+            }
+            result[messageIndex] = message
+        }
+        return result
     }
 
     private func durableAnswer(_ candidate: ChatMessage, matches pending: ChatMessage) -> Bool {
-        candidate.role == .assistant && candidate.textContent == pending.textContent
-            && candidate.images.count == pending.images.count && candidate.isError == pending.isError
+        candidate.role == .assistant && durableMessage(candidate, matches: pending)
+    }
+
+    private func durableMessage(_ candidate: ChatMessage, matches live: ChatMessage) -> Bool {
+        guard candidate.role == live.role, candidate.textContent == live.textContent,
+              candidate.toolCallID == live.toolCallID, candidate.isError == live.isError else { return false }
+        if let candidateTime = candidate.timestamp, let liveTime = live.timestamp {
+            return abs(candidateTime.timeIntervalSince(liveTime)) < 0.01
+        }
+        return candidate.id == live.id
+    }
+
+    private func retainLiveMessage(_ message: ChatMessage, path: String) {
+        let key = LiveMessageKey(path: path, id: message.id)
+        var live = liveMessagesByPath[path] ?? []
+        if let index = live.firstIndex(where: { $0.id == message.id }) { live[index] = message }
+        else { live.append(message) }
+        liveMessagesByPath[path] = live
+        liveMessageOrder.removeAll { $0 == key }
+        liveMessageOrder.append(key)
+        while liveMessageOrder.count > Self.liveMessageLimit {
+            let removed = liveMessageOrder.removeFirst()
+            liveMessagesByPath[removed.path]?.removeAll { $0.id == removed.id }
+            if liveMessagesByPath[removed.path]?.isEmpty == true { liveMessagesByPath.removeValue(forKey: removed.path) }
+        }
+        let bounded = enforcingLoadedImageBudget(liveMessageOrder.compactMap { key in
+            liveMessagesByPath[key.path]?.first { $0.id == key.id }
+        })
+        for (key, message) in zip(liveMessageOrder, bounded) {
+            guard let index = liveMessagesByPath[key.path]?.firstIndex(where: { $0.id == key.id }) else { continue }
+            liveMessagesByPath[key.path]?[index] = message
+        }
+    }
+
+    private func removeDurableLiveMessages(in loaded: [ChatMessage], path: String) {
+        guard let live = liveMessagesByPath[path] else { return }
+        let durableIDs = Set(live.filter { item in
+            loaded.contains { durableMessage($0, matches: item) }
+        }.map(\.id))
+        guard !durableIDs.isEmpty else { return }
+        liveMessagesByPath[path] = live.filter { !durableIDs.contains($0.id) }
+        if liveMessagesByPath[path]?.isEmpty == true { liveMessagesByPath.removeValue(forKey: path) }
+        liveMessageOrder.removeAll { $0.path == path && durableIDs.contains($0.id) }
     }
 
     private func retainPendingFinal(_ message: ChatMessage, for slot: RuntimeSlot) {
@@ -2284,6 +2384,10 @@ final class AppStore: ObservableObject {
         pendingFinalOrder.append(key)
         while pendingFinalOrder.count > Self.pendingFinalLimit {
             pendingFinalMessagesByPath.removeValue(forKey: pendingFinalOrder.removeFirst())
+        }
+        let bounded = enforcingLoadedImageBudget(pendingFinalOrder.compactMap { pendingFinalMessagesByPath[$0] })
+        for (path, message) in zip(pendingFinalOrder, bounded) {
+            pendingFinalMessagesByPath[path] = message
         }
     }
 
@@ -2342,6 +2446,7 @@ final class AppStore: ObservableObject {
     }
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
+        guard !slot.isSuperseded else { return }
         if slot === activeRuntimeSlot, !activePresentationDetached {
             handleRPCEvent(event)
         } else {
@@ -2395,10 +2500,13 @@ final class AppStore: ObservableObject {
         case "message_end":
             recordRuntimeOutput(for: slot)
             slot.streamingMessage = nil
-            if let raw = event["message"],
-               SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? ""),
-               let parsed = SessionParser.chatMessage(fromAgentMessage: raw) {
-                retainPendingFinal(parsed, for: slot)
+            if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) {
+                if let path = slot.sessionPath ?? state(for: slot).sessionFile {
+                    retainLiveMessage(parsed, path: URL(fileURLWithPath: path).standardizedFileURL.path)
+                }
+                if SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? "") {
+                    retainPendingFinal(parsed, for: slot)
+                }
             }
         case "tool_execution_start":
             recordRuntimeOutput(for: slot)
@@ -2559,6 +2667,7 @@ final class AppStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if let page = try? await repository.loadNewestConversationPage(from: fileURL),
                    page.messages.contains(where: { self.durableAnswer($0, matches: pending) }) {
+                    removeDurableLiveMessages(in: page.messages, path: path)
                     removePendingFinal(path: path)
                     break
                 }
@@ -2901,11 +3010,15 @@ final class AppStore: ObservableObject {
     }
 
     private func upsertMessage(_ message: ChatMessage) {
+        if let path = activeRuntimeSlot.sessionPath ?? state(for: activeRuntimeSlot).sessionFile {
+            retainLiveMessage(message, path: URL(fileURLWithPath: path).standardizedFileURL.path)
+        }
         if let index = messages.firstIndex(where: { $0.id == message.id }) { messages[index] = message }
         else if message.role == .user,
                 let localIndex = messages.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
             messages[localIndex] = message
         } else { messages.append(message) }
+        messages = enforcingLoadedImageBudget(messages)
     }
 
     private func mergeHistoryActivities() {

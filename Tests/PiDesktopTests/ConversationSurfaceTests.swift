@@ -233,6 +233,21 @@ final class TranscriptPresenterTests: XCTestCase {
         )
     }
 
+    func testCustomUpdateAfterPlainTerminalAnswerDoesNotHideIt() throws {
+        var answer = assistant(id: "a1", blocks: [text("Done.")])
+        answer.stopReason = "stop"
+        let update = ChatMessage(
+            id: "custom", role: .custom, blocks: [text("Background update")],
+            timestamp: nil, customType: "process:update", raw: .null
+        )
+
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "u", text: "Go", at: nil), answer, update], streaming: nil
+        )
+        guard case let .message(visible, _) = items[1] else { return XCTFail("The plain final answer stays visible") }
+        XCTAssertEqual(visible.textContent, "Done.")
+    }
+
     func testFollowOnToolCallAfterTheAnswerOpensANewTurnInsteadOfBuryingIt() throws {
         let messages = [
             user(id: "u", text: "Go", at: nil),

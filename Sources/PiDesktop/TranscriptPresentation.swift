@@ -331,8 +331,12 @@ private struct TurnBuilder {
         // close the previous turn, whose header must report *that* turn's answer, not this one.
         turnAnswerFailed = message.isError
         if let answer = proseMessage() {
-            // Prose that follows this turn's own work is the answer, not narration.
-            if !entries.isEmpty || pending != nil { trailingIsAnswer = true }
+            // Prose that follows this turn's own work or carries a terminal stop reason is the
+            // answer, not narration. Later custom/system updates must never bury a plain final.
+            if !entries.isEmpty || pending != nil
+                || SessionParser.terminalAssistantStopReasons.contains(message.stopReason ?? "") {
+                trailingIsAnswer = true
+            }
             trailing.append(.message(answer, streaming: streaming))
         }
     }

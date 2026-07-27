@@ -240,6 +240,7 @@ struct MessageScrollView: View {
     @State private var scrollBridge = ConversationScrollBridge()
     @State private var prependPending = false
     @State private var didRestoreInitialAnchor = false
+    @State private var didMarkFirstTextPaint = false
     private let bottomID = "conversation-bottom"
     private let coordinateSpaceName = "conversation-scroll"
 
@@ -324,6 +325,15 @@ struct MessageScrollView: View {
                             }
                         )
                         .id(item.id)
+                        .onAppear {
+                            guard !didMarkFirstTextPaint else { return }
+                            didMarkFirstTextPaint = true
+                            ConversationPerformance.mark(
+                                "Conversation first text paint",
+                                path: store.selectedSession?.fileURL.path ?? "new-chat",
+                                count: items.count
+                            )
+                        }
                     }
                     Color.clear.frame(height: 1).id(bottomID)
                 }

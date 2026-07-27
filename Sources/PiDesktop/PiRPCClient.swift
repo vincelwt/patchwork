@@ -88,8 +88,17 @@ enum PiLocator {
 }
 
 final class PiRPCClient: PiRuntimeProtocol {
-    var onEvent: ((JSONValue) -> Void)?
-    var onExit: ((String?) -> Void)?
+    private let callbackLock = NSLock()
+    private var eventHandler: ((JSONValue) -> Void)?
+    private var exitHandler: ((String?) -> Void)?
+    var onEvent: ((JSONValue) -> Void)? {
+        get { callbackLock.withLock { eventHandler } }
+        set { callbackLock.withLock { eventHandler = newValue } }
+    }
+    var onExit: ((String?) -> Void)? {
+        get { callbackLock.withLock { exitHandler } }
+        set { callbackLock.withLock { exitHandler = newValue } }
+    }
 
     private let ioQueue = DispatchQueue(label: "dev.pi.desktop.rpc", qos: .userInitiated)
     /// Blocking pipe reads live off the command/state queue. Unlike FileHandle readability
@@ -275,8 +284,9 @@ final class PiRPCClient: PiRuntimeProtocol {
             defer { try? handle.close() }
             while currentGeneration.isValid {
                 guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 64 * 1024) else { return }
+                let eventHandler = self?.onEvent
                 self?.ioQueue.async { [weak self] in
-                    self?.consume(data, generation: currentGeneration)
+                    self?.consume(data, generation: currentGeneration, eventHandler: eventHandler)
                 }
             }
         }
@@ -314,7 +324,11 @@ final class PiRPCClient: PiRuntimeProtocol {
         }
     }
 
-    private func consume(_ data: Data, generation currentGeneration: RuntimeGeneration) {
+    private func consume(
+        _ data: Data,
+        generation currentGeneration: RuntimeGeneration,
+        eventHandler: ((JSONValue) -> Void)?
+    ) {
         // A retired generation's buffered output is dropped rather than published.
         guard currentGeneration.isValid, generation === currentGeneration else { return }
         for record in framer.append(data) {
@@ -330,10 +344,8 @@ final class PiRPCClient: PiRuntimeProtocol {
                     callback(.success(value))
                 }
             } else {
-                // Capture the owner now. Same-process session reuse can rebind `onEvent` before
-                // main drains this block; looking it up later would deliver an old session event
-                // into the replacement route.
-                let eventHandler = onEvent
+                // The reader captured the owner with this byte chunk. Rebinding during a
+                // same-process session transition cannot redirect buffered bytes to the new route.
                 DispatchQueue.main.async {
                     guard currentGeneration.isValid else { return }
                     eventHandler?(value)

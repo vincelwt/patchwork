@@ -152,8 +152,10 @@ final class SessionActivityMonitor: ObservableObject {
 
     static let pollInterval: TimeInterval = 2
     static let backgroundPollInterval: TimeInterval = 15
-    /// Upper bound on tail reads per tick, so a burst of concurrent sessions stays cheap.
-    static let tailReadsPerTick = 16
+    /// Upper bounds on fallback work per tick, so large histories do not cause periodic stat
+    /// storms while heartbeat-backed sessions still update immediately.
+    nonisolated static let fallbackStatsPerTick = 64
+    nonisolated static let tailReadsPerTick = 16
 
     private struct Fingerprint: Equatable, Sendable {
         let modifiedAt: TimeInterval
@@ -164,6 +166,7 @@ final class SessionActivityMonitor: ObservableObject {
     private var fingerprints: [String: Fingerprint] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
+    private var fallbackCursor = 0
     private var cancellables: Set<AnyCancellable> = []
     private let isActiveOverride: Bool?
     private let heartbeatDirectory: URL
@@ -192,6 +195,7 @@ final class SessionActivityMonitor: ObservableObject {
         let unique = paths.filter { seen.insert($0).inserted }
         guard unique != trackedPaths else { return }
         trackedPaths = unique
+        fallbackCursor = 0
         let live = Set(unique)
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
@@ -221,6 +225,22 @@ final class SessionActivityMonitor: ObservableObject {
 
     func activity(forPath path: String) -> SessionActivity? { activities[path] }
 
+    nonisolated static func pollSelection(
+        paths: [String],
+        heartbeatPaths: Set<String>,
+        fallbackCursor: Int
+    ) -> (paths: [String], nextCursor: Int) {
+        let fallback = paths.filter { !heartbeatPaths.contains($0) }
+        guard !fallback.isEmpty else { return (paths.filter(heartbeatPaths.contains), 0) }
+        let start = fallbackCursor % fallback.count
+        let count = min(fallbackStatsPerTick, fallback.count)
+        let selectedFallback = Set((0..<count).map { fallback[(start + $0) % fallback.count] })
+        return (
+            paths.filter { heartbeatPaths.contains($0) || selectedFallback.contains($0) },
+            (start + count) % fallback.count
+        )
+    }
+
     private func tick() async {
         guard !trackedPaths.isEmpty, !tickInFlight else { return }
         tickInFlight = true
@@ -232,15 +252,21 @@ final class SessionActivityMonitor: ObservableObject {
         let limit = Self.tailReadsPerTick
         let heartbeatDirectory = heartbeatDirectory
         let isProcessAlive = isProcessAlive
+        let cursor = fallbackCursor
 
-        let result = await Task.detached(priority: .utility) { () -> ([String: SessionActivity], [String: Fingerprint]) in
+        let result = await Task.detached(priority: .utility) { () -> ([String: SessionActivity], [String: Fingerprint], Int) in
             let now = Date()
             let heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
-            var states: [String: SessionActivity] = [:]
-            var stamps: [String: Fingerprint] = [:]
+            let selection = Self.pollSelection(
+                paths: paths,
+                heartbeatPaths: Set(heartbeats.keys),
+                fallbackCursor: cursor
+            )
+            var states = previous
+            var stamps = known
             var tailReads = 0
 
-            for path in paths {
+            for path in selection.paths {
                 let url = URL(fileURLWithPath: path)
                 guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
                       let modifiedAt = values.contentModificationDate else { continue }
@@ -334,10 +360,11 @@ final class SessionActivityMonitor: ObservableObject {
                     preview: old?.preview
                 )
             }
-            return (states, stamps)
+            return (states, stamps, selection.nextCursor)
         }.value
 
         fingerprints = result.1
+        fallbackCursor = result.2
         if activities != result.0 { activities = result.0 }
     }
 
