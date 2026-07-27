@@ -27,7 +27,7 @@ struct PiDesktopApp: App {
         }
         .defaultSize(width: 1_280, height: 840)
         .windowResizability(.contentMinSize)
-        .windowToolbarStyle(.unified(showsTitle: false))
+        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { store.openNewChat() }
