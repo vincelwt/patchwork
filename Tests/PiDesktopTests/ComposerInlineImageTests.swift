@@ -254,16 +254,14 @@ final class ComposerInlineImageTests: XCTestCase {
 
     // MARK: - Key handling
 
-    func testDoubleEscapeCancelsThePendingSingleEscapeAndFullyStops() {
+    func testEscapeStopsImmediately() {
         let textView = ComposerTextView()
-        var fullyStops: [Bool] = []
-        textView.onEscape = { fullyStops.append($0) }
+        var stopCount = 0
+        textView.onEscape = { stopCount += 1 }
 
         textView.keyDown(with: escapeEvent(at: 1))
-        XCTAssertTrue(fullyStops.isEmpty, "The first Escape waits to distinguish a single from a double press")
 
-        textView.keyDown(with: escapeEvent(at: 1.1))
-        XCTAssertEqual(fullyStops, [true])
+        XCTAssertEqual(stopCount, 1)
     }
 
     // MARK: - Finder drop

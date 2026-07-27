@@ -8,12 +8,13 @@ private final class FakeRuntime: PiRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
+    private(set) var stopCount = 0
     private(set) var sent: [(type: String, payload: [String: JSONValue])] = []
     var sessionFile = ""
     var sessionID = ""
 
     func start(cwd: URL, sessionPath: URL?) throws { isRunning = true }
-    func stop() { isRunning = false }
+    func stop() { isRunning = false; stopCount += 1 }
 
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append((type, payload))
@@ -178,35 +179,33 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("follow_up"), 1)
     }
 
-    func testSingleEscapeStopsOnlyWhenAQueuedMessageCanContinueAsFollowUp() {
+    func testStopImmediatelyClearsEveryQueueAndRetiresTheRuntime() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
         store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "do not steer", delivery: .steer)
+        store.enqueueOutbox(text: "do not continue", delivery: .followUp)
+        store.handleRPCEventForTesting(.object([
+            "type": .string("queue_update"),
+            "steering": .array([.string("already accepted")]),
+            "followUp": .array([.string("also accepted")])
+        ]))
 
-        store.stopFromEscape(fully: false)
-        XCTAssertEqual(runtime.commandCount("abort"), 0)
-
-        store.enqueueOutbox(text: "continue with this", delivery: .steer)
-        store.stopFromEscape(fully: false)
-        XCTAssertEqual(runtime.commandCount("abort"), 1)
-        XCTAssertEqual(store.outbox.map(\.delivery), [.followUp])
-
-        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(runtime.commandCount("follow_up"), 1)
-        XCTAssertEqual(runtime.lastPayload("follow_up")?["message"]?.stringValue, "continue with this")
-    }
-
-    func testFullEscapeClearsQueuedContinuationBeforeAborting() {
-        let (store, runtime, session) = makeStore()
-        attach(store, runtime, session)
-        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
-        store.enqueueOutbox(text: "do not continue", delivery: .steer)
-
-        store.stopFromEscape(fully: true)
+        store.abort()
 
         XCTAssertTrue(store.outbox.isEmpty)
+        XCTAssertTrue(store.runtimeState.steeringQueue.isEmpty)
+        XCTAssertTrue(store.runtimeState.followUpQueue.isEmpty)
+        XCTAssertFalse(store.runtimeState.isStreaming)
+        XCTAssertFalse(store.canStopCurrentThread)
         XCTAssertEqual(runtime.commandCount("abort"), 1)
+        XCTAssertEqual(runtime.stopCount, 1)
+
+        store.abort()
+        store.handleRPCEventForTesting(.object(["type": .string("turn_end")]))
         store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(runtime.commandCount("abort"), 1, "Repeated stop is a no-op")
+        XCTAssertEqual(runtime.commandCount("steer"), 0)
         XCTAssertEqual(runtime.commandCount("follow_up"), 0)
     }
 

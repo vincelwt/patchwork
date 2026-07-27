@@ -420,7 +420,8 @@ final class AppStoreRollbackTests: XCTestCase {
         store.setConnectivityForTesting(isOnline: true)
         XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
-        XCTAssertEqual(runtime.commandCount("abort"), 0, "The Pi run was already settled")
+        XCTAssertEqual(runtime.commandCount("abort"), 1, "Full stop also clears Pi-owned continuations")
+        XCTAssertEqual(runtime.stopCount, 1)
     }
 
     func testAbortBeforeRetryEventCannotRearmConnectivityResume() {

@@ -185,6 +185,29 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("get_messages"), 0)
     }
 
+    func testStopDuringStartupPreventsThePendingPromptFromDispatching() {
+        let runtime = IntentRuntime()
+        runtime.delayState = true
+        let store = makeStore(runtime: runtime)
+        let session = summary("a", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.draft = "never send this"
+        store.submitDraft()
+        XCTAssertTrue(store.canStopCurrentThread)
+        XCTAssertEqual(runtime.count("prompt"), 0)
+
+        store.abort()
+        runtime.finishState()
+
+        XCTAssertFalse(store.canStopCurrentThread)
+        XCTAssertEqual(runtime.count("abort"), 1)
+        XCTAssertEqual(runtime.count("prompt"), 0)
+        XCTAssertEqual(runtime.stopCount, 1)
+        XCTAssertEqual(store.draft, "never send this")
+        XCTAssertFalse(store.messages.contains { $0.textContent == "never send this" })
+    }
+
     func testPendingModelOptionsDoNotGatePromptDispatch() {
         let runtime = IntentRuntime()
         runtime.delayModels = true
