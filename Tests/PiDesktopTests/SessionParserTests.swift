@@ -81,6 +81,30 @@ final class SessionParserTests: XCTestCase {
         XCTAssertTrue(conversation.messages.allSatisfy { $0.raw == .null }, "Known messages must not retain duplicate raw/base64 trees")
     }
 
+    func testExplicitlyHiddenCustomMessagesStayOutOfTheTranscript() throws {
+        XCTAssertNil(SessionParser.chatMessage(fromAgentMessage: .object([
+            "role": .string("custom"),
+            "customType": .string("pi-desktop-connectivity-resume"),
+            "content": .string("continue"),
+            "display": .bool(false)
+        ])))
+
+        let file = temporaryDirectory.appendingPathComponent("hidden-custom.jsonl")
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "hidden", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "user", "parentId": NSNull(),
+             "message": ["role": "user", "content": "start"]],
+            ["type": "custom_message", "id": "resume", "parentId": "user",
+             "customType": "pi-desktop-connectivity-resume", "content": "continue", "display": false],
+            ["type": "message", "id": "answer", "parentId": "resume",
+             "message": ["role": "assistant", "content": "done"]]
+        ], to: file)
+
+        let conversation = try SessionParser.conversation(at: file)
+        XCTAssertEqual(conversation.messages.map(\.textContent), ["start", "done"])
+        XCTAssertEqual(conversation.leafID, "answer", "The hidden context entry stays on Pi's active branch")
+    }
+
     func testAggregateImageBudgetReplacesExcessImagesWithPlaceholders() throws {
         let file = temporaryDirectory.appendingPathComponent("many-images.jsonl")
         let imageCount = ImageBudget.defaultCountLimit + 16

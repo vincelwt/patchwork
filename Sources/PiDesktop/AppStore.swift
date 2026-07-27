@@ -77,6 +77,10 @@ private final class RuntimeSlot {
     var pendingTurn: PendingUserTurn?
     var outboxDispatches: Set<UUID> = []
     var deferredEvents: [JSONValue] = []
+    var connectivityRetryAbortRequested = false
+    var connectivityResumeCancelled = false
+    var connectivityResumePreparing = false
+    var connectivityResumeInFlight = false
     var isReady = false
     var isStarting = false
     var startupBeganAt: Date?
@@ -167,6 +171,7 @@ final class AppStore: ObservableObject {
     @Published var attachments: [ImageAttachment] = []
     @Published var selectedFolder: URL?
     @Published var runtimeState = RuntimeState()
+    @Published private(set) var isOffline = false
     @Published var liveMetrics = TokenMetrics()
     @Published private(set) var availableModels: [AvailableModel] = []
     @Published private(set) var availableThinkingLevels: [String] = ["off"]
@@ -221,6 +226,7 @@ final class AppStore: ObservableObject {
     let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
     private let runtimeFactory: () -> PiRuntimeProtocol
+    private let connectivityMonitor: ConnectivityMonitor?
     private let runtimeRetirementDelay: TimeInterval
     private let runtimeRetirementScheduler: RuntimeRetirementScheduler
     private var cancelRuntimeRetirement: (() -> Void)?
@@ -300,6 +306,10 @@ final class AppStore: ObservableObject {
     /// Explicit ceiling for a user-expanded transcript window. Pages target 50 messages and may
     /// finish the current turn; older pages stay on demand without retaining history forever.
     private static let loadedMessageLimit = 1_000
+    private static let connectivityResumeCommand = "/pi-desktop-resume"
+    private static let connectivityResumeDescription = "Resume an interrupted turn after network connectivity returns"
+    private static let connectivityResumeInstruction =
+        "Network connectivity interrupted the previous turn. Continue from where it stopped without repeating completed work."
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -309,6 +319,7 @@ final class AppStore: ObservableObject {
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
+        connectivityMonitor: ConnectivityMonitor? = nil,
         probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil,
         notificationService: NotificationPresenting? = nil,
         isActiveOverride: Bool? = nil,
@@ -327,6 +338,7 @@ final class AppStore: ObservableObject {
         self.runtimeFactory = runtimeFactory
         self.runtimeRetirementDelay = runtimeRetirementDelay
         self.runtimeRetirementScheduler = runtimeRetirementScheduler
+        self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
         self.activityPresenter = activityPresenter
@@ -369,6 +381,9 @@ final class AppStore: ObservableObject {
                 persistDraftText(text, for: currentDraftKey)
             }
             .store(in: &appCancellables)
+        self.connectivityMonitor?.start { [weak self] isOnline in
+            Task { @MainActor in self?.updateConnectivity(isOnline: isOnline) }
+        }
     }
 
     private func bindRuntime(_ slot: RuntimeSlot) {
@@ -407,6 +422,138 @@ final class AppStore: ObservableObject {
             slot.state = runtimeState
         } else {
             update(&slot.state)
+        }
+    }
+
+    private func runtimeSlots() -> [RuntimeSlot] {
+        var seen: Set<UUID> = []
+        return ([activeRuntimeSlot] + Array(parkedRuntimes.values)).filter { seen.insert($0.id).inserted }
+    }
+
+    func setConnectivityForTesting(isOnline: Bool) { updateConnectivity(isOnline: isOnline) }
+
+    private func updateConnectivity(isOnline: Bool) {
+        let offline = !isOnline
+        guard offline != isOffline else { return }
+        isOffline = offline
+        if offline {
+            for slot in runtimeSlots() where state(for: slot).isRetrying { pauseRetryForConnectivity(slot) }
+        } else {
+            for slot in runtimeSlots() { resumeAfterConnectivityIfPossible(slot) }
+        }
+    }
+
+    private func markWaitingForConnectivity(_ slot: RuntimeSlot) {
+        guard slot.runtime.isRunning, !slot.isSuperseded else { return }
+        updateState(for: slot) { $0.isWaitingForNetwork = true }
+        if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+    }
+
+    private func pauseRetryForConnectivity(_ slot: RuntimeSlot) {
+        guard isOffline, state(for: slot).isRetrying, !slot.connectivityResumeCancelled else { return }
+        markWaitingForConnectivity(slot)
+        guard !slot.connectivityRetryAbortRequested else { return }
+        slot.connectivityRetryAbortRequested = true
+        slot.runtime.send(type: "abort_retry", payload: [:]) { _ in }
+    }
+
+    private func clearConnectivityWait(for slot: RuntimeSlot) {
+        slot.connectivityRetryAbortRequested = false
+        slot.connectivityResumePreparing = false
+        updateState(for: slot) { $0.isWaitingForNetwork = false }
+    }
+
+    private func resumeAfterConnectivityIfPossible(_ slot: RuntimeSlot) {
+        let current = state(for: slot)
+        guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying,
+              !slot.connectivityResumeCancelled, !slot.connectivityResumePreparing,
+              slot.runtime.isRunning, slot.isReady, !slot.isStarting else { return }
+
+        // Verify the helper command on this already-running Pi process. The extension may have
+        // been disabled or upgraded after launch; in that case a plain visible continuation is
+        // safer than sending an unknown slash command.
+        slot.connectivityResumePreparing = true
+        slot.runtime.send(type: "get_commands", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            slot.connectivityResumePreparing = false
+            let current = state(for: slot)
+            guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying,
+                  !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
+
+            let response: JSONValue
+            switch result {
+            case let .success(value): response = value
+            case .failure:
+                sendConnectivityResume(to: slot, hidden: false)
+                return
+            }
+            guard responseError(response) == nil else {
+                sendConnectivityResume(to: slot, hidden: false)
+                return
+            }
+            let helperPath = ActivityExtensionInstaller.installedFileURL().standardizedFileURL.path
+            let hasHelper = (response["data"]?["commands"]?.arrayValue ?? []).contains {
+                $0["name"]?.stringValue == "pi-desktop-resume"
+                    && $0["source"]?.stringValue == "extension"
+                    && $0["description"]?.stringValue == Self.connectivityResumeDescription
+                    && $0["sourceInfo"]?["path"]?.stringValue.map {
+                        URL(fileURLWithPath: $0).standardizedFileURL.path == helperPath
+                    } == true
+            }
+            sendConnectivityResume(to: slot, hidden: hasHelper)
+        }
+    }
+
+    private func sendConnectivityResume(to slot: RuntimeSlot, hidden: Bool) {
+        guard state(for: slot).isWaitingForNetwork, !slot.connectivityResumeCancelled else { return }
+        clearConnectivityWait(for: slot)
+        slot.connectivityResumeInFlight = true
+        slot.promptBeganAt = Date()
+        if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+        updateState(for: slot) { state in
+            state.isStreaming = true
+            state.phase = .waitingForModel
+            state.lastError = nil
+        }
+        slot.runtime.send(
+            type: "prompt",
+            payload: ["message": .string(hidden ? Self.connectivityResumeCommand : Self.connectivityResumeInstruction)]
+        ) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            let errorText: String?
+            var outcomeUnknown = false
+            switch result {
+            case let .success(response): errorText = responseError(response)
+            case let .failure(error):
+                errorText = error.localizedDescription
+                outcomeUnknown = RPCFailureHandling.isOutcomeUnknown(error)
+            }
+            guard let errorText else { return }
+            if outcomeUnknown {
+                if slot === activeRuntimeSlot, !activePresentationDetached {
+                    showToast(errorText, style: .warning)
+                }
+                return
+            }
+            failConnectivityResume(slot, error: errorText)
+        }
+    }
+
+    private func failConnectivityResume(_ slot: RuntimeSlot, error: String) {
+        clearConnectivityWait(for: slot)
+        slot.connectivityResumeInFlight = false
+        let message = "Could not resume after reconnecting: \(error)"
+        updateState(for: slot) { state in
+            state.isStreaming = false
+            state.phase = .idle
+            state.lastError = message
+        }
+        slot.promptBeganAt = nil
+        if slot === activeRuntimeSlot, !activePresentationDetached {
+            showToast(message, style: .error)
+            resetRuntimeRetirementLease(for: slot)
+        } else if isIdleAndClean(slot) {
+            retireBackgroundRuntime(slot)
         }
     }
 
@@ -620,6 +767,14 @@ final class AppStore: ObservableObject {
         return paths
     }
 
+    private func isWaitingForConnectivity(at path: String) -> Bool {
+        runtimeSlots().contains { slot in
+            guard (state(for: slot).isWaitingForNetwork || slot.connectivityResumeInFlight),
+                  let candidate = slot.sessionPath ?? state(for: slot).sessionFile else { return false }
+            return URL(fileURLWithPath: candidate).standardizedFileURL.path == path
+        }
+    }
+
     // MARK: - Cross-terminal activity
 
     /// True when this session is working, whether it was started by this app or by any terminal.
@@ -670,6 +825,9 @@ final class AppStore: ObservableObject {
             let hadBaseline = observedActivityPaths.contains(path)
             observedActivityPaths.insert(path)
             guard let completionID = activity.latestCompletedEntryID else { continue }
+            // A transport error is intermediate while Desktop owns a pending continuation.
+            // Deferring it avoids an error notification immediately followed by a success one.
+            if isWaitingForConnectivity(at: path) { continue }
 
             let previousID = persistence.state.latestCompletedEntryIDBySessionPath[path]
             let focused = isApplicationActive
@@ -1654,7 +1812,16 @@ final class AppStore: ObservableObject {
     }
 
     func abort() {
-        guard runtimeMatchesCurrentRoute, runtimeState.isStreaming else { return }
+        guard runtimeMatchesCurrentRoute else { return }
+        activeRuntimeSlot.connectivityResumeCancelled = true
+        if runtimeState.isWaitingForNetwork {
+            clearConnectivityWait(for: activeRuntimeSlot)
+            guard runtimeState.isStreaming else {
+                resetRuntimeRetirementLease(for: activeRuntimeSlot)
+                return
+            }
+        }
+        guard runtimeState.isStreaming else { return }
         runtime.send(type: "abort", payload: [:]) { [weak self] result in
             if case let .failure(error) = result { self?.showToast(error.localizedDescription, style: .error) }
         }
@@ -2218,6 +2385,10 @@ final class AppStore: ObservableObject {
         slot.pendingTurn = nil
         slot.outboxDispatches.removeAll()
         slot.deferredEvents.removeAll()
+        slot.connectivityRetryAbortRequested = false
+        slot.connectivityResumeCancelled = false
+        slot.connectivityResumePreparing = false
+        slot.connectivityResumeInFlight = false
         slot.isReady = false
         slot.isStarting = true
         slot.startupBeganAt = Date()
@@ -2375,6 +2546,9 @@ final class AppStore: ObservableObject {
         let origin = promotedOrigin ?? submissionOrigin
         if command != "prompt", let optimisticID { messages.removeAll { $0.id == optimisticID } }
         if command == "prompt" {
+            slot.connectivityResumeCancelled = false
+            slot.connectivityResumeInFlight = false
+            clearConnectivityWait(for: slot)
             slot.pendingTurn = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
         }
 
@@ -2696,21 +2870,25 @@ final class AppStore: ObservableObject {
                 if state.phase != .waitingForModel { state.phase = .working }
             }
         case "agent_settled":
+            let waitingForNetwork = state(for: slot).isWaitingForNetwork
             updateState(for: slot) { state in
                 state.isStreaming = false
                 state.isRetrying = false
                 state.phase = .idle
             }
+            slot.connectivityResumeCancelled = false
+            slot.connectivityResumeInFlight = false
             slot.capability = nil
             discardQuestionnaire(from: slot)
             slot.streamingMessage = nil
             slot.pendingTurn = nil
             slot.promptBeganAt = nil
-            let startedFollowUp = flushBackgroundOutbox(.followUp, slot: slot)
+            let startedFollowUp = waitingForNetwork ? false : flushBackgroundOutbox(.followUp, slot: slot)
             let session = session(for: slot)
             if let session { Task { await self.refreshSummary(for: session) } }
             if !startedFollowUp {
-                if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                if waitingForNetwork { resumeAfterConnectivityIfPossible(slot) }
+                else if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
                 scheduleFinalDurabilityCheck(for: slot, retireWhenDone: slot !== activeRuntimeSlot)
             }
         case "message_update":
@@ -2764,11 +2942,19 @@ final class AppStore: ObservableObject {
                 state.isRetrying = true
                 state.retryAttempt = event["attempt"]?.intValue
             }
+            pauseRetryForConnectivity(slot)
         case "auto_retry_end":
+            let waitingForNetwork = state(for: slot).isWaitingForNetwork
+            let succeeded = event["success"]?.boolValue == true
             updateState(for: slot) { state in
                 state.isRetrying = false
-                if event["success"]?.boolValue == false { state.lastError = event["finalError"]?.stringValue }
+                if slot.connectivityResumeCancelled {
+                    state.lastError = nil
+                } else if !succeeded, !waitingForNetwork {
+                    state.lastError = event["finalError"]?.stringValue
+                }
             }
+            if succeeded { clearConnectivityWait(for: slot) }
         case "extension_ui_request":
             handleBackgroundExtensionUI(event, slot: slot)
         case "extension_error":
@@ -2781,7 +2967,7 @@ final class AppStore: ObservableObject {
         case "turn_end":
             slot.capability = nil
             discardQuestionnaire(from: slot)
-            _ = flushBackgroundOutbox(.steer, slot: slot)
+            if !state(for: slot).isWaitingForNetwork { _ = flushBackgroundOutbox(.steer, slot: slot) }
         case "message_start", "tool_execution_update", "bash_execution_update":
             recordRuntimeOutput(for: slot)
         case "agent_end", "turn_start", "summarization_retry_scheduled", "summarization_retry_attempt_start",
@@ -2918,13 +3104,16 @@ final class AppStore: ObservableObject {
             runtimeState.isStreaming = true
             if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
         case "agent_settled":
+            let waitingForNetwork = runtimeState.isWaitingForNetwork
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
             runtimeState.phase = .idle
+            activeRuntimeSlot.connectivityResumeCancelled = false
+            activeRuntimeSlot.connectivityResumeInFlight = false
             activeCapability = nil
             discardQuestionnaire()
             streamingMessage = nil
-            flushOutbox(.followUp)
+            if !waitingForNetwork { flushOutbox(.followUp) }
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
             // left: nothing about this dispatch is "pending" any more.
             activeRuntimeSlot.promptBeganAt = nil
@@ -2938,7 +3127,8 @@ final class AppStore: ObservableObject {
                     refreshSelectedGit()
                 }
             }
-            resetRuntimeRetirementLease(for: activeRuntimeSlot)
+            if waitingForNetwork { resumeAfterConnectivityIfPossible(activeRuntimeSlot) }
+            else { resetRuntimeRetirementLease(for: activeRuntimeSlot) }
             scheduleFinalDurabilityCheck(for: activeRuntimeSlot, retireWhenDone: false)
         case "message_update":
             recordRuntimeOutput(for: activeRuntimeSlot)
@@ -3016,12 +3206,20 @@ final class AppStore: ObservableObject {
                 runtimeState.lastError = error
                 showToast(error, style: .error)
             }
-        case "auto_retry_start": runtimeState.isRetrying = true; runtimeState.retryAttempt = event["attempt"]?.intValue
+        case "auto_retry_start":
+            runtimeState.isRetrying = true
+            runtimeState.retryAttempt = event["attempt"]?.intValue
+            pauseRetryForConnectivity(activeRuntimeSlot)
         case "auto_retry_end":
+            let waitingForNetwork = runtimeState.isWaitingForNetwork
+            let succeeded = event["success"]?.boolValue == true
             runtimeState.isRetrying = false
-            // Pi's own automatic retries (provider overload/rate limit/5xx) were exhausted:
-            // surface it the same durable way as any other runtime failure.
-            if event["success"]?.boolValue == false, let error = event["finalError"]?.stringValue {
+            if succeeded {
+                clearConnectivityWait(for: activeRuntimeSlot)
+            } else if activeRuntimeSlot.connectivityResumeCancelled {
+                runtimeState.lastError = nil
+            } else if !waitingForNetwork, let error = event["finalError"]?.stringValue {
+                // Pi's own automatic retries were exhausted while the network path was live.
                 runtimeState.lastError = error
                 showToast(error, style: .error)
             }
@@ -3034,7 +3232,7 @@ final class AppStore: ObservableObject {
             discardQuestionnaire()
             // Pi delivers steering at exactly this boundary, so holding it until now costs
             // nothing and keeps it editable for as long as possible.
-            flushOutbox(.steer)
+            if !runtimeState.isWaitingForNetwork { flushOutbox(.steer) }
         case "message_start", "bash_execution_update": recordRuntimeOutput(for: activeRuntimeSlot)
         case "agent_end", "turn_start", "summarization_retry_scheduled",
              "summarization_retry_attempt_start", "summarization_retry_finished": break
@@ -3192,6 +3390,10 @@ final class AppStore: ObservableObject {
 
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         slot.outboxDispatches.removeAll()
+        slot.connectivityRetryAbortRequested = false
+        slot.connectivityResumeCancelled = false
+        slot.connectivityResumePreparing = false
+        slot.connectivityResumeInFlight = false
         if slot === activeRuntimeSlot {
             cancelRuntimeRetirementLease()
             clearExtensionDialogs()
@@ -3200,6 +3402,7 @@ final class AppStore: ObservableObject {
                 state.isStreaming = false
                 state.isCompacting = false
                 state.isRetrying = false
+                state.isWaitingForNetwork = false
                 state.phase = .idle
             }
             activeCapability = nil
@@ -3211,6 +3414,7 @@ final class AppStore: ObservableObject {
                 state.isStreaming = false
                 state.isCompacting = false
                 state.isRetrying = false
+                state.isWaitingForNetwork = false
                 state.phase = .idle
             }
             slot.capability = nil

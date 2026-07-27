@@ -261,6 +261,7 @@ struct RuntimeState: Hashable, Sendable {
     var isStreaming = false
     var isCompacting = false
     var isRetrying = false
+    var isWaitingForNetwork = false
     var retryAttempt: Int?
     var steeringQueue: [String] = []
     var followUpQueue: [String] = []
@@ -278,7 +279,7 @@ struct RuntimeState: Hashable, Sendable {
     var queuedSteering: Int { steeringQueue.count }
     var queuedFollowUp: Int { followUpQueue.count }
     var queueCount: Int { steeringQueue.count + followUpQueue.count }
-    var isBusy: Bool { isStreaming || isCompacting || isRetrying }
+    var isBusy: Bool { isStreaming || isCompacting || isRetrying || isWaitingForNetwork }
 }
 
 struct GitFileChange: Identifiable, Hashable, Sendable {

@@ -538,6 +538,7 @@ struct SessionParser {
 
     static func chatMessage(fromAgentMessage message: JSONValue, id: String? = nil, budget: inout ImageBudget) -> ChatMessage? {
         guard let roleName = message["role"]?.stringValue else { return nil }
+        if roleName == "custom", message["display"]?.boolValue == false { return nil }
         let timestamp = date(from: message["timestamp"])
         let stableID = id ?? "rpc-\(roleName)-\(message["timestamp"]?.intValue ?? Int(Date().timeIntervalSince1970 * 1_000))"
 
@@ -609,6 +610,7 @@ struct SessionParser {
             guard let message = entry.raw["message"] else { return nil }
             return chatMessage(fromAgentMessage: message, id: entry.id, budget: &budget)
         case "custom_message":
+            guard entry.raw["display"]?.boolValue != false else { return nil }
             return ChatMessage(
                 id: entry.id,
                 role: .custom,
