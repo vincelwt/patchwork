@@ -60,7 +60,7 @@ struct MenuBarContentView: View {
                     }
                     .padding(PiTheme.space4)
                 }
-                .frame(maxHeight: heights.sessions)
+                .frame(height: heights.sessions)
             }
 
             PiHairline()
@@ -68,7 +68,7 @@ struct MenuBarContentView: View {
             // hover — cached instantly, refreshed periodically in the background by
             // `LimitsReportStore`, never fetched directly by this view.
             ScrollView { LimitsPopoverView(fallback: account) }
-                .frame(maxHeight: heights.limits)
+                .frame(height: heights.limits)
             PiHairline()
 
             VStack(spacing: PiTheme.space2) {
