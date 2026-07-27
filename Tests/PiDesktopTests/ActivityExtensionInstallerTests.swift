@@ -92,6 +92,14 @@ final class ActivityExtensionInstallerTests: XCTestCase {
         XCTAssertTrue(bundled.contains("subagents:completed"))
     }
 
+    func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
+        let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 4)
+        XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
+        XCTAssertTrue(bundled.contains("/v1/schedules"))
+        XCTAssertTrue(bundled.contains("event.toolName.toLowerCase() !== \"agent\""))
+    }
+
     // MARK: - Disable setting
 
     func testActivityExtensionSettingsPersistsTheDisabledFlag() {

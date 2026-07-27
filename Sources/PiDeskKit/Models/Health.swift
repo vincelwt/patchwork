@@ -12,6 +12,8 @@ public struct HealthStatus: Codable, Hashable, Sendable {
     public var queuedRuns: Int
     public var piVersion: String?
     public var schedulesEnabled: Bool
+    /// True when `POST /v1/schedules` honors `idempotencyKey`.
+    public var scheduleIdempotency: Bool
     public var issues: [HealthIssue]
 
     public init(
@@ -23,6 +25,7 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         queuedRuns: Int,
         piVersion: String?,
         schedulesEnabled: Bool,
+        scheduleIdempotency: Bool = true,
         issues: [HealthIssue] = []
     ) {
         self.ok = ok
@@ -33,6 +36,7 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         self.queuedRuns = queuedRuns
         self.piVersion = piVersion
         self.schedulesEnabled = schedulesEnabled
+        self.scheduleIdempotency = scheduleIdempotency
         self.issues = issues
     }
 
@@ -46,6 +50,7 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         queuedRuns = try container.decodeIfPresent(Int.self, forKey: .queuedRuns) ?? 0
         piVersion = try container.decodeIfPresent(String.self, forKey: .piVersion)
         schedulesEnabled = try container.decodeIfPresent(Bool.self, forKey: .schedulesEnabled) ?? true
+        scheduleIdempotency = try container.decodeIfPresent(Bool.self, forKey: .scheduleIdempotency) ?? false
         issues = try container.decodeIfPresent([HealthIssue].self, forKey: .issues) ?? []
     }
 }

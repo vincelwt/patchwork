@@ -1,9 +1,10 @@
 import Foundation
 
-/// Installs and repairs the small Pi extension that maintains activity heartbeats
-/// (`Resources/pi-desktop-activity.ts` is the source of truth; see `ActivityHeartbeat.swift`
-/// for the reader side). Extensions in `~/.pi/agent/extensions/` are auto-discovered by every
-/// Pi session, terminal or RPC, so installing here is enough for the whole system.
+/// Installs and repairs Pi Desktop's Pi extension: activity heartbeats plus the bridge that
+/// sends thread-created automations to the durable background service
+/// (`Resources/pi-desktop-activity.ts` is the source of truth). Extensions in
+/// `~/.pi/agent/extensions/` are auto-discovered by every Pi session, terminal or RPC, so one
+/// install covers the whole system.
 enum ActivityExtensionInstaller {
     static let versionMarkerPrefix = "// pi-desktop-activity-version:"
     static let resourceName = "pi-desktop-activity"
@@ -93,8 +94,8 @@ enum ActivityExtensionInstaller {
     }
 }
 
-/// Whether the user has opted out of the heartbeat extension entirely. Kept as its own
-/// UserDefaults flag rather than a new `PersistedAppState` field, so a fresh install/upgrade of
+/// Whether the user has opted out of Pi Desktop's installed Pi extension entirely. Kept as its
+/// own UserDefaults flag rather than a new `PersistedAppState` field, so a fresh install/upgrade of
 /// Pi Desktop never depends on the session-summary/archive state schema, and a power user (or a
 /// future settings UI) can flip it with a single `defaults write`.
 enum ActivityExtensionSettings {

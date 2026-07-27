@@ -18,12 +18,42 @@ enum ScheduleHandlers {
                 try validate(body.trigger)
                 if let quietHours = body.policy?.quietHours { try validate(quietHours) }
 
+                let enabled = body.enabled ?? true
+                let policy = body.policy ?? SchedulePolicy()
+                let id: String
+                if let key = body.idempotencyKey {
+                    guard (16...64).contains(key.count), key.unicodeScalars.allSatisfy({ scalar in
+                        (48...57).contains(scalar.value) || (65...90).contains(scalar.value)
+                            || (97...122).contains(scalar.value) || scalar.value == 45 || scalar.value == 95
+                    }) else {
+                        throw DaemonHTTPError.badRequest(
+                            code: "invalid_idempotency_key",
+                            message: "idempotencyKey must be 16-64 letters, numbers, dashes, or underscores."
+                        )
+                    }
+                    id = "sch_req_\(key)"
+                    if let existing = await core.scheduleStore.get(id: id) {
+                        guard existing.name == name, existing.enabled == enabled,
+                              existing.target == body.target, existing.prompt == prompt,
+                              existing.mode == body.mode, existing.trigger == body.trigger,
+                              existing.policy == policy else {
+                            throw DaemonHTTPError.badRequest(
+                                code: "idempotency_conflict",
+                                message: "idempotencyKey was already used for a different schedule."
+                            )
+                        }
+                        return .json(ScheduleResponse(schedule: existing))
+                    }
+                } else {
+                    id = "sch_\(UUID().uuidString)"
+                }
+
                 let now = Date()
                 let nextRunAt = await core.scheduler.computeInitialNextRunAt(for: body.trigger)
                 let schedule = Schedule(
-                    id: "sch_\(UUID().uuidString)", name: name, enabled: body.enabled ?? true,
+                    id: id, name: name, enabled: enabled,
                     target: body.target, prompt: prompt, mode: body.mode, trigger: body.trigger,
-                    policy: body.policy ?? SchedulePolicy(), createdAt: now, updatedAt: now, nextRunAt: nextRunAt
+                    policy: policy, createdAt: now, updatedAt: now, nextRunAt: nextRunAt
                 )
                 let saved = try await core.scheduleStore.upsert(schedule)
                 core.bus.publish(.schedule(saved))

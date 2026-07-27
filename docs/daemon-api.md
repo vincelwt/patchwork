@@ -114,7 +114,7 @@ carries `X-Pi-Desktop-Api: 1`.
 ```
 GET /v1/health
 → {"ok":true,"version":"1.0.0","api":1,"startedAt":"…","runningRuns":1,"queuedRuns":0,
-   "piVersion":"0.82.1","schedulesEnabled":true}
+   "piVersion":"0.82.1","schedulesEnabled":true,"scheduleIdempotency":true}
 ```
 
 ### Threads
@@ -179,6 +179,10 @@ DELETE /v1/schedules/{id}                  → {"deleted":true}
 POST   /v1/schedules/{id}/run              → {"runId":"…"}      // run now, out of band
 POST   /v1/schedules/{id}/pause            {"paused":true} → {"schedule":Schedule}
 ```
+
+`POST /v1/schedules` accepts an optional `idempotencyKey` (16–64 letters, numbers, dashes, or
+underscores). Repeating the same request with the same key returns the existing schedule; reusing
+the key for different content is rejected.
 
 ```jsonc
 // Schedule
