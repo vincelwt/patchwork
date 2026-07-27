@@ -24,7 +24,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
-- Paste, drop, file attach, preview, remove, open, zoom, and save for images
+- Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images
 - Subagent/background-process lifecycle presentation and Pi extension UI dialogs/status/widgets/title/editor bridge
 - A native `ask_user_question` questionnaire rendered inline in the transcript at its own tool call row instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. The work log and its rows are held open while a question is unanswered so it cannot hide under a collapsed turn, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels

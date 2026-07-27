@@ -223,7 +223,8 @@ struct ModeSlider: View {
             Text(mode?.label ?? "mode")
                 .font(mode == .ultra ? PiFont.captionEmphasis : PiFont.caption)
                 .foregroundStyle(mode.map { $0.piTint } ?? Color.secondary)
-                .frame(width: 34, alignment: .trailing)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
 
             // AppKit's slider cannot be restyled, so effort gets its own calm-to-hot track.
             PiEffortTrack(mode: mode) { store.setMode($0) }
