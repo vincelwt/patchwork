@@ -9,6 +9,8 @@ struct ConversationPageCursor: Hashable, Sendable {
 
 struct ConversationPage: Sendable {
     static let defaultMessageTarget = 50
+    /// A single pathological turn may exceed the soft target, but opening it must stay bounded.
+    static let maximumMessageCount = 1_000
 
     let messages: [ChatMessage]
     let olderCursor: ConversationPageCursor?
@@ -263,7 +265,7 @@ struct SessionParser {
             maxRecordBytes: min(windowBytes, PageLimits.default.maxRecordBytes),
             chunkBytes: min(windowBytes, PageLimits.default.chunkBytes)
         )
-        let page = try conversationPage(at: url, target: limit, limits: limits)
+        let page = try conversationPage(at: url, target: limit, alignToTurnBoundary: false, limits: limits)
         return TailScan(
             conversation: SessionConversation(messages: page.messages, leafID: page.leafID, rawEntryCount: page.rawEntryCount),
             isComplete: page.hasNoMoreHistory
@@ -298,6 +300,7 @@ struct SessionParser {
         at url: URL,
         cursor: ConversationPageCursor? = nil,
         target: Int = ConversationPage.defaultMessageTarget,
+        alignToTurnBoundary: Bool = true,
         limits: PageLimits = .default
     ) throws -> ConversationPage {
         let sourcePath = url.standardizedFileURL.path
@@ -359,15 +362,22 @@ struct SessionParser {
                 }
 
                 rawEntryCount += 1
+                var reachedTurnBoundary = false
                 autoreleasepool {
                     guard let raw = try? JSONValue.decode(record.data) else { return }
                     let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
-                    if let message = chatMessage(from: entry, budget: &budget) { collected.append(message) }
+                    if let message = chatMessage(from: entry, budget: &budget) {
+                        collected.append(message)
+                        reachedTurnBoundary = message.role == .user
+                            || entry.type == "compaction" || entry.type == "branch_summary"
+                    }
                 }
                 expectedID = header.parentId
 
                 if expectedID == nil { return result(olderCursor: nil, truncated: false) }
-                if collected.count >= max(1, target) {
+                if collected.count >= max(1, target),
+                   (!alignToTurnBoundary || reachedTurnBoundary
+                    || collected.count >= ConversationPage.maximumMessageCount) {
                     return result(olderCursor: continuation(before: record.startOffset), truncated: false)
                 }
 

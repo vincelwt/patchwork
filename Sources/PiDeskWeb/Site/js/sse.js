@@ -4,6 +4,7 @@
 // built-in reconnect has no backoff control, while the task calls for exponential backoff.
 
 import { getToken } from "./api.js";
+import { connectRelayEvents, isRelayMode } from "./relay.js";
 
 const INITIAL_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30000;
@@ -16,6 +17,8 @@ const MAX_DELAY_MS = 30000;
  * (capped) until `close()` is called or the server answers 401.
  */
 export function connectEvents({ onEvent, onStatus }) {
+  if (isRelayMode()) return connectRelayEvents({ onEvent, onStatus });
+
   let closed = false;
   let delay = INITIAL_DELAY_MS;
   let controller = null;

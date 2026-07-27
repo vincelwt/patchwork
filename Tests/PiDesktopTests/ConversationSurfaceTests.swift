@@ -14,6 +14,17 @@ final class ConversationScrollMetricsTests: XCTestCase {
             originY: PiTheme.transcriptScrollEdgeThreshold, viewportHeight: 500,
             documentHeight: 1_500, direction: .up
         ).isNearTop)
+        let underfilled = ConversationScrollMetrics(
+            originY: 0, viewportHeight: 500, documentHeight: 500, direction: .stationary
+        )
+        XCTAssertTrue(underfilled.isUnderfilled)
+        XCTAssertTrue(underfilled.shouldRequestEarlierHistory)
+        XCTAssertFalse(ConversationScrollMetrics(
+            originY: 0, viewportHeight: 500, documentHeight: 700, direction: .stationary
+        ).shouldRequestEarlierHistory)
+        XCTAssertFalse(ConversationScrollMetrics(
+            originY: 0, viewportHeight: 0, documentHeight: 0, direction: .stationary
+        ).shouldRequestEarlierHistory)
     }
 
     func testPrependRestorationPreservesTheOriginalViewportOffset() {
@@ -64,6 +75,27 @@ final class ConversationScrollCacheTests: XCTestCase {
 
         _ = cache.items(revision: 2, messages: [message], streaming: nil, isRunning: false)
         XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testUnreadTargetResolutionHandlesAWorkOnlyCompletion() {
+        let completion = ChatMessage(
+            id: "completion", role: .assistant,
+            blocks: [MessageBlock(id: "thought", kind: .thinking("Done"))],
+            timestamp: nil, stopReason: "error", raw: .null
+        )
+        let workOnly = TranscriptPresenter.items(messages: [completion], streaming: nil)
+        XCTAssertNil(MessageScrollView.unseenTargetID("completion", in: workOnly))
+
+        let answer = ChatMessage(
+            id: "answer", role: .assistant,
+            blocks: [MessageBlock(id: "text", kind: .text("Done"))],
+            timestamp: nil, stopReason: "stop", raw: .null
+        )
+        let visibleAnswer = TranscriptPresenter.items(messages: [answer], streaming: nil)
+        XCTAssertEqual(
+            MessageScrollView.unseenTargetID("answer", in: visibleAnswer),
+            "message:answer:text"
+        )
     }
 
     func testProjectionCachePreservesAWorkRowAcrossAPrependSeam() {

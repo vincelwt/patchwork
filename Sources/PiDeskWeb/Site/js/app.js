@@ -8,15 +8,26 @@
 import { h, mount } from "./dom.js";
 import { api, ApiError, getToken, setToken, clearToken, hasToken, describeError } from "./api.js";
 import { connectEvents } from "./sse.js";
+import {
+  forgetRelayDevice,
+  hasRelayDevice,
+  isRelayMode,
+  relayPairingState,
+  startRelay
+} from "./relay.js";
 import { renderTokenScreen } from "./views/token.js";
+import { renderPairingScreen } from "./views/pairing.js";
 import { renderThreadList } from "./views/threadList.js";
 import { renderThreadView } from "./views/threadView.js";
 import { renderNewThread } from "./views/newThread.js";
 import { renderSchedules, renderScheduleDetail } from "./views/schedules.js";
 import { renderScheduleForm } from "./views/scheduleForm.js";
 
+const hosted = isRelayMode();
+const openingPairingLink = hosted && location.pathname.startsWith("/pair/");
 const state = {
-  authed: hasToken(),
+  authed: hosted ? hasRelayDevice() && !openingPairingLink : hasToken(),
+  relayPairing: relayPairingState(),
   connection: "connecting", // "connecting" | "online" | "offline"
   threads: [],
   threadsLoading: false,
@@ -41,10 +52,33 @@ const mainEl = h("main");
 const tabbarEl = h(
   "nav",
   { class: "tabbar", "aria-label": "Primary" },
-  h("button", { onclick: () => actions.navigate("/") }, h("span", { class: "tab-icon", "aria-hidden": "true" }, "\u25a4"), "Threads"),
-  h("button", { onclick: () => actions.navigate("/schedules") }, h("span", { class: "tab-icon", "aria-hidden": "true" }, "\u23f0"), "Schedules")
+  h("button", { type: "button", onclick: () => actions.navigate("/") }, h("span", { class: "tab-icon", "aria-hidden": "true" }, "\u25a4"), "Threads"),
+  h("button", { type: "button", onclick: () => actions.navigate("/schedules") }, h("span", { class: "tab-icon", "aria-hidden": "true" }, "\u23f0"), "Schedules")
 );
 mount(root, [bannerEl, mainEl, tabbarEl]);
+
+// A phone hides the tab bar on detail screens to give the composer the full height; a desktop
+// window is wide enough to keep the rail permanently, and hiding it there would shift the whole
+// layout sideways on every navigation.
+const wideLayout = window.matchMedia("(min-width: 800px)");
+wideLayout.addEventListener("change", () => paintChrome());
+
+// The on-screen keyboard: iOS leaves the layout viewport at full height and slides the keyboard
+// over it, so `100dvh` alone would put the composer underneath. visualViewport reports the real
+// overlap; the shell subtracts it through `--kb` (see css/app.css). Android with
+// `interactive-widget=resizes-content` shrinks the layout viewport itself, which makes the
+// overlap zero and leaves the same code correct.
+const viewport = window.visualViewport;
+if (viewport) {
+  const syncKeyboardInset = () => {
+    const overlap = Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop));
+    document.documentElement.style.setProperty("--kb", `${overlap}px`);
+    root.dataset.keyboard = overlap > 80 ? "open" : "closed";
+  };
+  viewport.addEventListener("resize", syncKeyboardInset);
+  viewport.addEventListener("scroll", syncKeyboardInset);
+  syncKeyboardInset();
+}
 
 // ---------- state plumbing ----------
 
@@ -55,9 +89,19 @@ function setState(patch) {
 }
 
 function paintChrome() {
-  mount(bannerEl, state.connection === "offline" ? h("div", { class: "banner banner-offline", role: "status" }, "Offline \u2014 retrying\u2026") : []);
+  mount(
+    bannerEl,
+    state.connection === "offline"
+      ? h(
+          "div",
+          { class: "banner banner-offline", role: "status" },
+          h("span", { class: "spinner", "aria-hidden": "true" }),
+          "Offline \u2014 reconnecting\u2026"
+        )
+      : []
+  );
   const onList = location.pathname === "/" || location.pathname === "/schedules";
-  tabbarEl.hidden = !state.authed || !onList;
+  tabbarEl.hidden = !state.authed || (!onList && !wideLayout.matches);
   const buttons = tabbarEl.querySelectorAll("button");
   buttons[0]?.setAttribute("aria-current", String(location.pathname === "/"));
   buttons[1]?.setAttribute("aria-current", String(location.pathname === "/schedules"));
@@ -107,6 +151,7 @@ function handleEvent(name, data) {
     setState((s) => ({ schedules: upsertBy(s.schedules, data, "id"), lastScheduleEvent: data }));
   } else if (name === "run") {
     setState({ lastRunEvent: data });
+    loadThreads();
   } else if (name === "activity") {
     setState({ activity: data });
   }
@@ -145,10 +190,17 @@ const actions = {
     );
   },
 
-  signOut() {
+  async signOut() {
     stopEvents();
-    clearToken();
-    Object.assign(state, { authed: false, threads: [], schedules: [], connection: "connecting" });
+    if (hosted) await forgetRelayDevice();
+    else clearToken();
+    Object.assign(state, {
+      authed: false,
+      relayPairing: relayPairingState(),
+      threads: [],
+      schedules: [],
+      connection: "connecting"
+    });
     go("/", { replace: true });
   },
 
@@ -224,14 +276,26 @@ function go(path, { replace = false } = {}) {
 }
 
 function mountRoute() {
-  const view = state.authed ? resolveRoute(location.pathname) : renderTokenScreen(state, actions);
+  const view = state.authed
+    ? resolveRoute(location.pathname)
+    : hosted
+      ? renderPairingScreen(state, actions)
+      : renderTokenScreen(state, actions);
   currentView = view;
+  view.node.classList.add("view-enter");
   mount(mainEl, view.node);
   paintChrome();
-  const heading = view.node.querySelector("h1, h2");
-  if (heading) {
-    heading.setAttribute("tabindex", "-1");
-    heading.focus({ preventScroll: true });
+  // Move focus to the new screen so assistive tech announces it and keyboard scrolling starts
+  // inside it. Every screen exposes exactly one such target: its heading, or (thread view, whose
+  // title lives in an editable button that must stay in the tab order) its labelled scroll area.
+  const target = view.node.querySelector('h1, h2, [tabindex="-1"]');
+  if (target) {
+    target.setAttribute("tabindex", "-1");
+    target.focus({ preventScroll: true });
+    const label = (target.getAttribute("aria-label") || target.textContent || "").trim();
+    document.title = label ? `${label} \u00b7 Pi Desktop` : "Pi Desktop";
+  } else {
+    document.title = "Pi Desktop";
   }
 }
 
@@ -252,9 +316,33 @@ window.addEventListener("pi:unauthorized", () => {
   Object.assign(state, { authed: false, threads: [], schedules: [], connection: "connecting" });
   mountRoute();
 });
+window.addEventListener("pi:relay-pairing", (event) => {
+  if (event.detail?.phase === "unpaired" && state.authed) {
+    stopEvents();
+    Object.assign(state, {
+      authed: false,
+      threads: [],
+      schedules: [],
+      connection: "connecting",
+      relayPairing: event.detail
+    });
+    history.replaceState(null, "", "/");
+    mountRoute();
+  } else {
+    setState({ relayPairing: event.detail });
+  }
+});
+window.addEventListener("pi:relay-paired", () => {
+  setState({ authed: true, relayPairing: relayPairingState() });
+  loadThreads();
+  loadSchedules();
+  startEvents();
+  go("/", { replace: true });
+});
 
 // ---------- boot ----------
 
+if (hosted) startRelay();
 if (state.authed) {
   loadThreads();
   loadSchedules();

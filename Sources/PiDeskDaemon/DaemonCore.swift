@@ -16,6 +16,7 @@ final class DaemonCore: @unchecked Sendable {
     let scheduler: Scheduler
     let activityService: ActivityService
     let limitsCache: LimitsCache
+    let relay: RelayService
     let settings: DaemonSettings
     let startedAt = Date()
     let version = "1.0.0"
@@ -30,6 +31,8 @@ final class DaemonCore: @unchecked Sendable {
         schedulesFileURL: URL = PiDeskPaths.schedules,
         runHistoryFileURL: URL = PiDeskPaths.runHistory,
         overlayFileURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json"),
+        relayIdentityFileURL: URL = PiDeskPaths.relayIdentity,
+        relayWebSocketOrigin: String = RelayService.websocketOrigin,
         schedulerPollInterval: TimeInterval = 1,
         piVersion: String? = nil
     ) {
@@ -39,6 +42,12 @@ final class DaemonCore: @unchecked Sendable {
 
         let bus = EventBus(logger: logger)
         self.bus = bus
+        relay = RelayService(
+            identityFileURL: relayIdentityFileURL,
+            websocketOrigin: relayWebSocketOrigin,
+            logger: logger,
+            bus: bus
+        )
         scheduleStore = ScheduleStore(fileURL: schedulesFileURL, logger: logger)
         runHistoryStore = RunHistoryStore(fileURL: runHistoryFileURL, logger: logger)
         leaseStore = LeaseStore()
@@ -59,11 +68,16 @@ final class DaemonCore: @unchecked Sendable {
         await scheduler.start()
     }
 
+    func startRelay(router: DaemonRouter) async {
+        await relay.start(router: router)
+    }
+
     /// `graceSeconds` bounds how long a run in flight gets to finish naturally before this
     /// forcibly cancels it — see `RunQueue.shutdown(graceSeconds:)` and docs/daemon-api.md's
     /// "Shutdown" section for the full contract. The scheduler stops first so nothing new can
     /// start while the queue is draining.
     func stop(graceSeconds: TimeInterval = 10) async {
+        await relay.stop()
         await scheduler.stop()
         let running = await runQueue.activeCount()
         if running > 0 {

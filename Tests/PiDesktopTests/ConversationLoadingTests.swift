@@ -147,7 +147,7 @@ final class ConversationLoadingTests: XCTestCase {
             lines.append([
                 "type": "message", "id": id, "parentId": parent,
                 "message": [
-                    "role": "assistant",
+                    "role": index.isMultiple(of: 2) ? "user" : "assistant",
                     "content": [["type": "image", "data": encoded, "mimeType": "image/png"]]
                 ]
             ])

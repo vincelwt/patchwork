@@ -26,7 +26,10 @@ do {
     exit(1)
 }
 
-Task { await core.start() }
+Task {
+    await core.start()
+    await core.startRelay(router: router)
+}
 
 // GCD signal sources (not the raw libc handler) so shutdown runs real Swift code \u2014 stopping the
 // scheduler and flushing the log \u2014 instead of being restricted to async-signal-safe calls only.

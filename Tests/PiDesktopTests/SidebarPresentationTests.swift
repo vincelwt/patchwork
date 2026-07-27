@@ -72,6 +72,20 @@ final class SidebarPresentationTests: XCTestCase {
         XCTAssertTrue(snapshot.activeGroups.first?.isGlobal == true)
         XCTAssertEqual(snapshot.activeGroups.first?.sessions.map(\.id), ["global"])
     }
+
+    func testNewFolderActionLivesInTheSidebarContextMenu() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/PiDesktop/SidebarView.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(source.contains("title: \"New folder\""))
+        XCTAssertTrue(source.contains(".contextMenu {\n            Button(\"New Folder…\")"))
+    }
 }
 
 /// The sidebar retains semantic roles for weight and colour, but all roles resolve to the app's

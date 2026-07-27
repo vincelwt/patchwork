@@ -15,10 +15,6 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
             SidebarActionRow(
-                title: "New folder", symbol: "folder.badge.plus", shortcut: "",
-                action: { store.newVirtualFolderRequested = true }
-            )
-            SidebarActionRow(
                 title: "Automations", symbol: "clock.arrow.2.circlepath", shortcut: "⌥⌘S",
                 action: { store.schedulesPresented = true },
                 selected: store.schedulesPresented
@@ -71,6 +67,9 @@ struct SidebarView: View {
                 archiveForcedOpen: snapshot.isFiltering
             )
         }
+        .contextMenu {
+            Button("New Folder…") { store.newVirtualFolderRequested = true }
+        }
         // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
         // filtering it drives below) stays wired for when a query is ever supplied again.
     }
@@ -117,6 +116,7 @@ private struct SidebarFooter: View {
     let archivedCount: Int
     @Binding var archiveExpanded: Bool
     let archiveForcedOpen: Bool
+    @State private var remoteAccessPresented = false
     private var runningCount: Int { store.runningSessions.count }
     private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
@@ -129,6 +129,17 @@ private struct SidebarFooter: View {
                     .accessibilityValue(label)
             }
             Spacer(minLength: PiTheme.space4)
+            Button { remoteAccessPresented = true } label: {
+                Image(systemName: "iphone")
+                    .font(.system(size: PiIcon.small, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Remote access")
+            .accessibilityLabel("Remote access")
+            .sheet(isPresented: $remoteAccessPresented) { RemoteAccessView() }
             if archivedCount > 0 {
                 Button { archiveExpanded.toggle() } label: {
                     Image(systemName: "archivebox")

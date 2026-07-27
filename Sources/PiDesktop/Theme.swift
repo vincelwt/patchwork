@@ -121,6 +121,11 @@ enum PiTheme {
     static let quickSwitchRowHeight: CGFloat = 34
     static let quickSwitchResultLimit = 60
 
+    // Hosted remote pairing sheet.
+    static let remoteAccessWidth: CGFloat = 560
+    static let remoteAccessHeight: CGFloat = 620
+    static let remoteQRCodeSize: CGFloat = 208
+
     // Menu bar panel.
     static let menuBarWidth: CGFloat = 320
     static let menuBarHeaderHeight: CGFloat = 38

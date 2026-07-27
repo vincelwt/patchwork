@@ -96,12 +96,17 @@ stops just like a quit does. With it off, automations say so explicitly instead 
 1. **Unix domain socket** (always on): `~/Library/Application Support/Pi Desktop/daemon.sock`.
    Authorization is filesystem permissions: the socket's directory is `0700`, the socket `0600`.
    This is what the CLI and the app use.
-2. **Loopback TCP** (opt-in, for the web remote): `127.0.0.1:<port>`, default port `7717`,
+2. **Loopback TCP** (opt-in, for local/tunnel use): `127.0.0.1:<port>`, default port `7717`,
    enabled by `pidesk remote enable`. Every request must carry
    `Authorization: Bearer <token>`, where the token lives in
    `~/Library/Application Support/Pi Desktop/daemon-token` (`0600`, 32 random bytes, base64url).
-   Exposing that port beyond the machine is the user's choice (an SSH or Cloudflare tunnel);
-   the daemon never opens a public listener itself and never ships a tunnel client.
+3. **Hosted relay** (outbound, automatic): `pi-deskd` connects by WSS to
+   `remote.ai.gloom.sh`. QR-approved browsers prove possession of the fragment-only ticket, then
+   authenticate with a per-device P-256 key and send direction-bound AES-256-GCM envelopes
+   through a Cloudflare Durable Object. The Mac retains the approved public key and highest
+   mutation counter locally. Hosted protocol version 2 resets incompatible legacy pairing state
+   instead of attempting mixed-version traffic. No listener, tunnel, or daemon bearer token is
+   exposed. Pairing management remains Unix-socket-only.
 
 Protocol is HTTP/1.1 with JSON bodies, `Content-Type: application/json`, UTF-8. Errors use the
 shape `{"error": {"code": "…", "message": "…"}}` with a matching HTTP status. Every response
@@ -236,6 +241,18 @@ GET /v1/runs/{id}                            → {"run":Run}
 GET /v1/limits → {"report":{…parsed /limits…},"generatedAt":"…","stale":false}
 ```
 
+### Hosted remote management (local Unix socket only)
+
+```
+GET    /v1/remote                         → connection, paired devices, pending approvals
+POST   /v1/remote/pairings                → one-time QR URL + five-minute expiry
+POST   /v1/remote/pairings/{id}           {"approved":true|false}
+DELETE /v1/remote/devices/{id}            → {"deleted":true}
+```
+
+These endpoints reject TCP and hosted-relay origins. A paired browser can call the ordinary API
+but cannot approve another browser.
+
 ### Events (SSE)
 
 ```
@@ -256,7 +273,8 @@ forward-compatibility rule the app applies to Pi's own RPC events.
 ~/Library/Application Support/Pi Desktop/
   daemon.sock          control socket
   daemon-token         bearer token for the loopback listener (0600)
-  daemon.json          daemon settings: port, concurrency, remote enabled
+  daemon.json          daemon settings: port, concurrency, loopback remote enabled
+  relay-identity.json  hosted installation/host keys, approved device keys, replay counters (0600)
   daemon-owner.json    pid + start time of the pi-deskd Pi Desktop.app itself started, if any —
                        local coordination between the app and pidesk, not part of this API
   schedules.json       every Schedule, written atomically
