@@ -60,6 +60,11 @@ struct PiSessionRuntimeHandle: LiveRuntimeHandle {
 ///    in flight when the boundary arrives — it may have landed too late to be folded in, so if it
 ///    could have been delivered at all, the run conservatively continues once.
 ///
+/// 3. **A process stopped out from under a delivery.** A timeout or an abort does not arrive at a
+///    settle boundary; it arrives whenever it likes, including mid-write. `drainForShutdown`
+///    closes admission for good and waits, boundedly, for those writes to finish, so the executor
+///    never kills a session whose acknowledgement its HTTP caller is still waiting for.
+///
 /// Entries are keyed by thread but generation-checked by run id: two runs on one thread cannot
 /// overlap (`RunQueue` enforces per-thread mutual exclusion), but their registrations still can,
 /// and a run that settles just after its successor registered must not retire the wrong session.
@@ -86,7 +91,11 @@ final class LiveSessionRegistry: @unchecked Sendable {
         var admitting = true
         var inFlight = 0
         var turnCredits = 0
-        var grantedCredits = 0
+        /// Credits *reserved or granted* over this run's life, never decremented on spend: the
+        /// lifetime extension budget. Taken under the lock at reservation time rather than at
+        /// release, because a hundred simultaneous follow-ups would otherwise each observe an
+        /// untouched budget and every one of them would be admitted.
+        var committedCredits = 0
         /// A settle boundary was reached while deliveries were still in flight. Those deliveries
         /// crossed it, so their outcome decides whether the run continues.
         var boundaryPending = false
@@ -95,6 +104,14 @@ final class LiveSessionRegistry: @unchecked Sendable {
             self.runID = runID
             self.handle = handle
         }
+    }
+
+    /// One reservation's claim on the entry, decided under the lock that admitted it.
+    private struct Reservation {
+        let entry: Entry
+        /// True when this delivery already holds a turn credit, so its release either spends it
+        /// or refunds it — it never has to re-check a budget that may have moved meanwhile.
+        let holdsCredit: Bool
     }
 
     private let lock = NSLock()
@@ -152,53 +169,102 @@ final class LiveSessionRegistry: @unchecked Sendable {
     /// re-send from. Every other case, including `.unacknowledged`, means the message may already
     /// have been applied: re-queueing it would risk prompting Pi twice.
     func deliver(threadID: String, command: String, message: String) async -> (runID: String, result: LiveDelivery)? {
-        guard let entry = reserve(threadID: threadID) else { return nil }
+        guard let reservation = reserve(threadID: threadID, command: command) else { return nil }
         do {
-            let result = try await entry.handle.deliver(command: command, message: message)
-            release(entry, command: command, result: result)
-            return (entry.runID, result)
+            let result = try await reservation.entry.handle.deliver(command: command, message: message)
+            release(reservation, result: result)
+            return (reservation.entry.runID, result)
         } catch {
             // The write failed (the process exited between reservation and send, or Pi stopped
             // accepting input), so nothing reached Pi and sending it again cannot duplicate
             // anything — and it owes no turn either way.
-            release(entry, command: command, result: nil)
+            release(reservation, result: nil)
             return nil
         }
+    }
+
+    /// How long a run ending on a timeout or an abort may wait for deliveries already mid-write.
+    /// A healthy Pi acknowledges in milliseconds and a wedged one will not answer however long
+    /// this is, so the bound is kept small: it must stay well inside the shutdown budget the app
+    /// allows the daemon (docs/daemon-api.md, "Shutdown").
+    static let drainSeconds: TimeInterval = 3
+
+    /// The shutdown counterpart to `closeAdmission`: this is not a settle boundary the run may
+    /// continue past, it is the run ending. Admission closes unconditionally and any outstanding
+    /// credits are dropped, then in-flight deliveries are given until `deadline` to finish.
+    ///
+    /// `pump` runs between polls so the caller can keep reading Pi's output: an in-flight
+    /// delivery is waiting on an acknowledgement that only arrives if somebody is still consuming
+    /// the pipe, and its caller must not be told "outcome unknown" for a reply that was sitting
+    /// unread when the process was killed. It returns false when waiting has become pointless
+    /// (the process is gone), which ends the drain early.
+    ///
+    /// Returns true when nothing is in flight any more.
+    @discardableResult
+    func drainForShutdown(threadID: String, runID: String, deadline: Date, pump: () async -> Bool) async -> Bool {
+        while true {
+            guard closeForShutdown(threadID: threadID, runID: runID) > 0 else { return true }
+            guard Date() < deadline, await pump() else { return false }
+        }
+    }
+
+    /// Closes admission for good and reports how many deliveries are still mid-write.
+    private func closeForShutdown(threadID: String, runID: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[threadID], entry.runID == runID else { return 0 }
+        entry.admitting = false
+        entry.boundaryPending = false
+        entry.turnCredits = 0
+        return entry.inFlight
     }
 
     // Plain synchronous helpers rather than `lock()`/`unlock()` written inside `deliver`'s async
     // body: `NSLock` is unavailable there, since an async function can resume on a different
     // thread than the one that suspended it.
-    private func reserve(threadID: String) -> Entry? {
+    private func reserve(threadID: String, command: String) -> Reservation? {
         lock.lock(); defer { lock.unlock() }
         guard let entry = entries[threadID], entry.admitting else { return nil }
-        // Refuse rather than extend a run indefinitely: past the bound the caller queues a fresh
-        // run, which is bounded by its own timeout like any other.
-        guard entry.grantedCredits < Self.maxTurnCredits else { return nil }
+        // A follow-up runs as its own later turn, so its capacity is taken here, under the lock
+        // that admits it, not when it lands. Refuse rather than extend a run indefinitely: past
+        // the bound the caller queues a fresh run, which is bounded by its own timeout like any
+        // other. A steer joins the turn already running and reserves nothing.
+        let needsCredit = command == Self.followUpCommand
+        if needsCredit {
+            guard entry.committedCredits < Self.maxTurnCredits else { return nil }
+            entry.committedCredits += 1
+        }
         entry.inFlight += 1
-        return entry
+        return Reservation(entry: entry, holdsCredit: needsCredit)
     }
 
     /// Decides, under the lock, whether this delivery owes the run another turn.
     ///
-    /// - a rejected or unwritten message never ran, so it owes nothing;
-    /// - a `follow_up` runs as its own later turn, so it owes one;
+    /// - a rejected or unwritten message never ran, so it owes nothing and refunds the capacity
+    ///   it reserved;
+    /// - a `follow_up` runs as its own later turn, so it spends the credit it reserved;
     /// - a `steer` is folded into the turn already running, so it owes nothing — unless it was
     ///   still in flight when the settle boundary arrived, in which case it may have missed that
-    ///   turn, and one extra turn is the conservative reading.
-    private func release(_ entry: Entry, command: String, result: LiveDelivery?) {
+    ///   turn, and one extra turn is the conservative reading. One turn covers *every* steer that
+    ///   crossed the same boundary: they all raced the same settle, and crediting each of them
+    ///   would extend the run once per concurrent write.
+    private func release(_ reservation: Reservation, result: LiveDelivery?) {
         lock.lock()
+        defer { lock.unlock() }
+        let entry = reservation.entry
         entry.inFlight -= 1
         let mayHaveApplied: Bool
         switch result {
         case .acknowledged, .unacknowledged: mayHaveApplied = true
         case .rejected, nil: mayHaveApplied = false
         }
-        if mayHaveApplied, command == Self.followUpCommand || entry.boundaryPending {
-            entry.turnCredits += 1
-            entry.grantedCredits += 1
+        if reservation.holdsCredit {
+            if mayHaveApplied { entry.turnCredits += 1 } else { entry.committedCredits -= 1 }
+            return
         }
-        lock.unlock()
+        guard mayHaveApplied, entry.boundaryPending, entry.committedCredits < Self.maxTurnCredits else { return }
+        entry.committedCredits += 1
+        entry.turnCredits += 1
+        entry.boundaryPending = false
     }
 
     /// Pi's own verb for a message that runs after the current turn, as opposed to `steer`, which
@@ -389,6 +455,10 @@ actor SubmissionRegistry {
         /// An identical submission is being processed right now. The caller must not start a
         /// second one; it reports a conflict and the client retries.
         case inFlight
+        /// Every slot holds a submission that has not finished yet. Evicting one to make room
+        /// would un-protect a send that is still running, so the *new* one is refused instead:
+        /// a `503` the client can retry, rather than a duplicate prompt it cannot take back.
+        case overloaded
     }
 
     private enum State {
@@ -410,15 +480,20 @@ actor SubmissionRegistry {
         case .inFlight:
             return .inFlight
         case nil:
+            guard states.count < Self.maxEntries || evictOldestCompleted() else { return .overloaded }
             states[key] = .inFlight(since: now)
             order.append(key)
-            evictIfNeeded()
             return .proceed
         }
     }
 
+    /// Only a claim this registry still owns as in-flight becomes replayable. A late `complete`
+    /// — one whose claim was abandoned or aged out from under it — must not resurrect an entry
+    /// nothing is tracking any more.
     func complete(threadID: String, clientID: String, response: SendMessageResponse, now: Date = Date()) {
-        states[key(threadID: threadID, clientID: clientID)] = .done(response, at: now)
+        let key = key(threadID: threadID, clientID: clientID)
+        guard case .inFlight = states[key] else { return }
+        states[key] = .done(response, at: now)
     }
 
     /// Releases a claim whose work failed, so an honest retry is not locked out forever.
@@ -442,10 +517,14 @@ actor SubmissionRegistry {
         order.removeAll { expired.contains($0) }
     }
 
-    private func evictIfNeeded() {
-        while order.count > Self.maxEntries {
-            let oldest = order.removeFirst()
-            states.removeValue(forKey: oldest)
-        }
+    /// Drops the oldest *completed* entry, which costs a retry its replay but can never duplicate
+    /// a prompt. An in-flight claim is never evicted: the submission it guards is still running,
+    /// and forgetting it is exactly how a retry becomes a second turn.
+    private func evictOldestCompleted() -> Bool {
+        guard let index = order.firstIndex(where: { key in
+            if case .done = states[key] { return true } else { return false }
+        }) else { return false }
+        states.removeValue(forKey: order.remove(at: index))
+        return true
     }
 }

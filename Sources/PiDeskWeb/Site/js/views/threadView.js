@@ -10,10 +10,12 @@ import {
   markFailed,
   markInFlight,
   reconcile,
+  rememberRun,
   removePending,
   statusLabel
 } from "../pending.mjs";
-import { imageCache } from "../imagecache.mjs";
+import { applyInteractionLoad } from "../interactions.mjs";
+import { imageCache, ImageCacheBusyError } from "../imagecache.mjs";
 import { renderInteraction } from "./interaction.js";
 
 const INITIAL_MESSAGE_COUNT = 50;
@@ -50,7 +52,13 @@ export function renderThreadView(state, actions, threadId) {
   let interactions = [];
   let fetchingInteractions = false;
   let interactionsQueued = false;
+  let interactionRetryTimer = null;
+  let interactionAttempt = 0;
   let lastInteraction = null;
+  let lastConnection = state.connection;
+  // The latest state of each recent run, so a run event that beat its own POST response is still
+  // applied the moment that response names the run. See `rememberRun` in js/pending.mjs.
+  const recentRuns = new Map();
   let renderedInteractionCards = new Map();
   let renderedInteractionSignature = null;
   let disposed = false;
@@ -248,6 +256,10 @@ export function renderThreadView(state, actions, threadId) {
           // a downgrade the server never reported.
           delivery: response?.delivery ?? delivery ?? null
         });
+        // The bubble only just learned its run id, so any event that arrived for that run while
+        // it was still `null` matched nothing. Replay the latest one now.
+        const known = recentRuns.get(response?.runId);
+        if (known) pending = applyRunEvent(pending, known);
         paintPending();
         loadMessages();
         loadInteractions();
@@ -447,18 +459,30 @@ export function renderThreadView(state, actions, threadId) {
       return Promise.resolve();
     }
     fetchingInteractions = true;
+    if (interactionRetryTimer) {
+      clearTimeout(interactionRetryTimer);
+      interactionRetryTimer = null;
+    }
+    const settle = (result) => {
+      // A failed read is not an empty list. Clearing the cards here would discard an answer
+      // half-typed into a dialog Pi is still blocked on, so the last good set stays on screen
+      // and a bounded retry chain (plus any reconnect) is what refreshes it.
+      const next = applyInteractionLoad(interactions, interactionAttempt, result);
+      interactions = next.interactions;
+      interactionAttempt = next.attempt;
+      paintInteractions();
+      if (next.retryInMs === null || disposed) return;
+      interactionRetryTimer = setTimeout(() => {
+        interactionRetryTimer = null;
+        loadInteractions();
+      }, next.retryInMs);
+    };
     return api
       .interactions(threadId)
-      .then((response) => {
-        interactions = response?.interactions || [];
-        paintInteractions();
-      })
-      // A daemon without the endpoint, or a transient failure, simply means "nothing to answer
-      // here"; the thread itself stays usable.
-      .catch(() => {
-        interactions = [];
-        paintInteractions();
-      })
+      .then((response) => settle({ ok: true, interactions: response?.interactions }))
+      // A daemon without the endpoint, or a transient failure: keep showing what was last known
+      // good. The thread itself stays usable either way.
+      .catch(() => settle({ ok: false }))
       .finally(() => {
         fetchingInteractions = false;
         if (interactionsQueued) {
@@ -538,12 +562,23 @@ export function renderThreadView(state, actions, threadId) {
       closeLightbox?.();
       imageObserver?.disconnect();
       if (refetchTimer) clearTimeout(refetchTimer);
+      if (interactionRetryTimer) clearTimeout(interactionRetryTimer);
     },
     onStateChange(next) {
+      // A dropped tunnel is exactly when a poll fails and a dialog is answered on the Mac
+      // instead. Coming back online re-reads the authoritative list rather than trusting
+      // whatever survived the outage.
+      if (next.connection === "online" && lastConnection !== "online") {
+        interactionAttempt = 0;
+        loadInteractions();
+      }
+      lastConnection = next.connection;
+
       const run = next.lastRunEvent;
       const runSignature = run ? `${run.id}:${run.status}:${run.finishedAt || ""}` : "";
       if (run && runSignature !== lastRunSignature) {
         lastRunSignature = runSignature;
+        rememberRun(recentRuns, run);
         // A run event is matched by id as well as by thread: a steer answers with the *live* run,
         // whose `threadId` is already known here, and a brand-new thread's run reports its id
         // before the thread event lands.
@@ -654,7 +689,9 @@ function renderImage(image, threadId, view) {
         return src;
       })
       .catch((err) => {
-        caption.textContent = describeError(err);
+        // A capacity refusal is this view's own doing and says what to do about it; anything
+        // else came off the wire and goes through the shared phrasing.
+        caption.textContent = err instanceof ImageCacheBusyError ? err.message : describeError(err);
         caption.classList.add("img-failed");
         throw err;
       });

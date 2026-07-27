@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createImageCache, estimateBytes } from "../../Sources/PiDeskWeb/Site/js/imagecache.mjs";
+import { ImageCacheBusyError, createImageCache, estimateBytes } from "../../Sources/PiDeskWeb/Site/js/imagecache.mjs";
 
 const dataURL = (bytes) => `data:image/png;base64,${"A".repeat(Math.ceil(bytes / 3) * 4)}`;
 
@@ -76,6 +76,46 @@ test("an image larger than the whole budget is served but never retained", async
   assert.ok(huge.startsWith("data:image/png;base64,"), "the caller still gets its image");
   assert.equal(cache.peek("huge"), null, "but it does not evict everything else on the way in");
   assert.ok(cache.peek("small"));
+});
+
+test("distinct in-flight loads are bounded, and shared ones still dedupe", async () => {
+  // Entries and bytes were bounded; the map of *pending* fetches was not. A long transcript
+  // scrolled quickly opens one request per thumbnail and holds every promise alive.
+  const cache = createImageCache({ maxInFlight: 2 });
+  const resolvers = [];
+  const never = () => new Promise((resolve) => resolvers.push(resolve));
+
+  const a = cache.fetch("a", never);
+  const b = cache.fetch("b", never);
+  const bAgain = cache.fetch("b", never);
+  assert.equal(cache.inFlightCount, 2, "a second request for one key shares the first");
+  assert.equal(resolvers.length, 2);
+
+  await assert.rejects(() => cache.fetch("c", never), ImageCacheBusyError);
+  assert.equal(cache.inFlightCount, 2, "and the refusal started nothing");
+
+  resolvers[0](dataURL(30));
+  assert.equal(await a, dataURL(30));
+  assert.equal(await cache.fetch("c", () => Promise.resolve(dataURL(30))), dataURL(30), "a freed slot admits it");
+
+  resolvers[1](dataURL(30));
+  assert.equal(await b, await bAgain);
+});
+
+test("a load refused for capacity stays retryable", async () => {
+  const cache = createImageCache({ maxInFlight: 1 });
+  let release;
+  const first = cache.fetch("a", () => new Promise((resolve) => (release = resolve)));
+
+  const refused = await cache.fetch("b", () => Promise.resolve(dataURL(30))).catch((err) => err);
+  assert.ok(refused instanceof ImageCacheBusyError);
+  assert.equal(refused.retryable, true);
+  assert.ok(refused.message.length > 0, "the tile shows why, not a blank caption");
+  assert.equal(cache.peek("b"), null, "nothing was cached, so nothing has to be invalidated");
+
+  release(dataURL(30));
+  await first;
+  assert.equal(await cache.fetch("b", () => Promise.resolve(dataURL(60))), dataURL(60), "the retry just works");
 });
 
 test("a failed fetch is not cached and does not block a retry", async () => {

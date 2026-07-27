@@ -156,6 +156,26 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(executor.executedJobs.count, 1, "Pi was prompted once, however many times the phone asked")
     }
 
+    func testASendIsRefusedRatherThanForgettingASubmissionStillInFlight() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        // Every slot held by a send that has not finished. Making room by evicting one would let
+        // its retry through as a second prompt, so the *new* submission is the one refused.
+        for index in 0..<SubmissionRegistry.maxEntries {
+            _ = await core.submissions.claim(threadID: "sess-1", clientID: "c\(index)")
+        }
+
+        let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello","clientId":"one-too-many"}"#)
+        XCTAssertEqual(response.status, 503)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("submissions_busy"))
+        try await settle()
+        XCTAssertTrue(executor.executedJobs.isEmpty, "a refused send never becomes a run")
+
+        // It is a capacity answer, not a verdict on the message: once a slot frees, it goes.
+        await core.submissions.complete(threadID: "sess-1", clientID: "c0", response: SendMessageResponse(runId: "run_0", queued: false, delivery: .auto))
+        let retry = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello","clientId":"one-too-many"}"#)
+        XCTAssertEqual(retry.status, 200)
+    }
+
     /// Lets an enqueued fake run start and finish. The fake executor returns immediately, so a few
     /// short yields are enough; the assertions above it are what make a regression visible.
     private func settle() async throws {

@@ -75,19 +75,40 @@ final class FolderTreeTests: XCTestCase {
         XCTAssertNil(nodes[0].parentId)
     }
 
-    func testDepthIsCappedAndDeeperFoldersAreDroppedNotMisplaced() {
-        var folders = [folder("f0", "F0", createdAt: 0)]
-        for index in 1...(FolderTree.maxDepth + 5) {
-            folders.append(folder("f\(index)", "F\(index)", parent: "virtual:f\(index - 1)", createdAt: TimeInterval(index)))
+    /// A chain of `count` folders nested one inside the other, the outermost hosted by `parent`.
+    private func chain(_ count: Int, under parent: String? = nil) -> [StoredVirtualFolder] {
+        (0..<count).map { index in
+            folder("f\(index)", "F\(index)", parent: index == 0 ? parent : "virtual:f\(index - 1)", createdAt: TimeInterval(index))
         }
-        let nodes = FolderTree.nodes(from: folders)
-        XCTAssertEqual(nodes.count, FolderTree.maxDepth)
-        XCTAssertEqual(nodes.map(\.depth).max(), FolderTree.maxDepth - 1)
+    }
 
-        // An assignment into a folder past the cap is dropped, so no thread is filed somewhere
-        // the tree cannot show.
-        let response = FolderTree.response(folders: folders, assignments: ["/s/a.jsonl": "f\(FolderTree.maxDepth + 3)"])
-        XCTAssertTrue(response.assignments.isEmpty)
+    func testDepthStopsExactlyWhereTheAppsSidebarStops() {
+        // The Mac renders the folder *at* `sidebarMaxFolderDepth` and drops only its children
+        // (`SidebarView.build`). Cutting one level earlier here would hide, from a phone, a folder
+        // the same machine shows in its own sidebar.
+        let folders = chain(FolderTree.maxDepth + 6)
+        let nodes = FolderTree.nodes(from: folders)
+        XCTAssertEqual(nodes.count, FolderTree.maxDepth + 1)
+        XCTAssertEqual(nodes.map(\.depth).max(), FolderTree.maxDepth)
+        XCTAssertEqual(nodes.last?.id, "f\(FolderTree.maxDepth)")
+
+        // A session in the last visible folder keeps its assignment; one filed past the cap is
+        // dropped, so no thread is filed somewhere the tree cannot show it.
+        let response = FolderTree.response(folders: folders, assignments: [
+            "/s/last.jsonl": "f\(FolderTree.maxDepth)",
+            "/s/beyond.jsonl": "f\(FolderTree.maxDepth + 1)"
+        ])
+        XCTAssertEqual(response.assignments, ["/s/last.jsonl": "f\(FolderTree.maxDepth)"])
+    }
+
+    func testAProjectWrapperDoesNotCostAFolderLevel() {
+        // A project group hosts folders; it is not itself one. The app starts a project's folders
+        // at depth 0 exactly like top-level ones, so the same chain must survive either way.
+        let nodes = FolderTree.nodes(from: chain(FolderTree.maxDepth + 6, under: "/Users/x/code"))
+        XCTAssertEqual(nodes.count, FolderTree.maxDepth + 1)
+        XCTAssertEqual(nodes.first?.parentId, "/Users/x/code")
+        XCTAssertEqual(nodes.first?.depth, 0, "the project wrapper is not a level of nesting")
+        XCTAssertEqual(nodes.map(\.depth).max(), FolderTree.maxDepth)
     }
 
     func testDuplicateFolderIDsRenderOnce() {

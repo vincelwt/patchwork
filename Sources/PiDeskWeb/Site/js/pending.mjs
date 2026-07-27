@@ -50,7 +50,8 @@ export function userTextCounts(messages) {
  *
  * Returns `{ list, entry, rejected }`. When the bound is full of messages that cannot be dropped
  * safely, `rejected` is true and the caller must put the text back in the composer: silently
- * evicting a *failed* bubble would throw away the only copy of something that was never sent.
+ * evicting a bubble whose send has not been accepted would throw away the only copy of something
+ * that may never have been sent at all.
  */
 export function addPending(list, { key, text, delivery = null, clientId = null, messages = [], at = Date.now() }) {
   const entry = {
@@ -64,15 +65,19 @@ export function addPending(list, { key, text, delivery = null, clientId = null, 
     runId: null,
     error: null,
     settled: false,
+    // Set only by `markAccepted`: the daemon answered, so this text is on its way into the
+    // transcript whatever happens to this bubble. Until then the bubble holds the only copy.
+    accepted: false,
     baseline: userTextCounts(messages).get(normalizeText(text)) || 0
   };
 
   if (list.length < PENDING_LIMIT) return { list: [...list, entry], entry, rejected: false };
 
-  // Full: drop the oldest entry that is safe to drop — one the daemon already accepted, whose
-  // text is on its way into the transcript regardless. If every slot holds a failed message,
-  // refuse rather than destroy one.
-  const index = list.findIndex((candidate) => candidate.status !== "failed");
+  // Full: drop the oldest entry that is safe to drop — one the daemon has explicitly accepted,
+  // whose text is on its way into the transcript regardless. A bubble still sending, or already
+  // failed, is the only record of that message; if every slot holds one of those, refuse rather
+  // than destroy it.
+  const index = list.findIndex((candidate) => candidate.accepted && candidate.status !== "failed");
   if (index === -1) return { list, entry: null, rejected: true };
   return { list: [...list.slice(0, index), ...list.slice(index + 1), entry], entry, rejected: false };
 }
@@ -88,12 +93,15 @@ function patch(list, key, changes) {
  */
 export function markAccepted(list, key, { runId = null, queued = false, delivery = null } = {}) {
   // `requestedDelivery` is deliberately untouched: it is what Retry must ask for again.
-  return patch(list, key, { runId, delivery, status: queued ? "queued" : "working", error: null });
+  return patch(list, key, { runId, delivery, status: queued ? "queued" : "working", error: null, accepted: true });
 }
 
 /**
  * The daemon is already processing this exact submission — a retry that overlapped the original.
  * Not a failure: the bubble stays alive rather than offering a Retry that would race it again.
+ *
+ * Deliberately *not* an acceptance. The original attempt can still fail and release its claim,
+ * and this bubble would then hold the only copy of the text, so it must stay un-evictable.
  */
 export function markInFlight(list, key) {
   return patch(list, key, { status: "working", error: null });
@@ -144,6 +152,25 @@ export function reconcile(list, messages) {
     used.set(key, (used.get(key) || 0) + 1);
     return false;
   });
+}
+
+/** How many recent runs the view remembers for entries that have no `runId` yet. */
+export const RUN_MEMO_LIMIT = 16;
+
+/**
+ * Remembers the latest state of a run, newest last, bounded.
+ *
+ * A run event can beat the POST response that names its run: Pi is fast, the tunnel is not, and
+ * a `running` — or even a `failed` — event then arrives while the bubble still has `runId: null`
+ * and matches nothing. Replaying the remembered state the moment `markAccepted` supplies the id
+ * is what keeps that bubble from sitting on "Sending…" forever.
+ */
+export function rememberRun(memo, run, limit = RUN_MEMO_LIMIT) {
+  if (!run || !run.id) return memo;
+  memo.delete(run.id); // re-insert so the map stays in recency order
+  memo.set(run.id, run);
+  while (memo.size > limit) memo.delete(memo.keys().next().value);
+  return memo;
 }
 
 /** Short status line shown under an unconfirmed bubble. */

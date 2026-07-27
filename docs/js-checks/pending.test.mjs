@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   PENDING_LIMIT,
+  RUN_MEMO_LIMIT,
   addPending as addPendingRaw,
   announcement,
   markInFlight,
@@ -10,6 +11,7 @@ import {
   markFailed,
   normalizeText,
   reconcile,
+  rememberRun,
   removePending,
   statusLabel,
   userTextCounts
@@ -119,6 +121,43 @@ test("the pending list is bounded, and evicts only messages that were actually s
   assert.equal(list[0].key, "p5", "the oldest accepted entry is the one dropped");
 });
 
+test("a list full of sends still waiting on a response refuses a new one", () => {
+  // The dangerous eviction: a bubble whose POST has not been answered yet holds the only copy of
+  // that text. If the send later fails, dropping the bubble is how the message disappears for
+  // good — so the ninth is refused and the composer takes its text back instead.
+  let list = [];
+  for (let i = 0; i < PENDING_LIMIT; i += 1) {
+    list = addPendingRaw(list, { key: `p${i}`, text: `m${i}`, messages: [] }).list;
+  }
+  assert.ok(list.every((entry) => entry.status === "sending" && entry.accepted === false));
+
+  const added = addPendingRaw(list, { key: "new", text: "must not be lost", messages: [] });
+  assert.equal(added.rejected, true);
+  assert.equal(added.entry, null);
+  assert.deepEqual(added.list.map((entry) => entry.key), list.map((entry) => entry.key), "nothing was evicted");
+
+  // Once the daemon answers one of them, that text is on its way into the transcript and its
+  // bubble is safe to drop.
+  const accepted = markAccepted(list, "p0", { runId: "run_0" });
+  const room = addPendingRaw(accepted, { key: "new", text: "fits now", messages: [] });
+  assert.equal(room.rejected, false);
+  assert.ok(!room.list.some((entry) => entry.key === "p0"), "the accepted one is what made room");
+});
+
+test("an overlapping submission is not an acceptance, so its bubble is not evictable", () => {
+  // `submission_in_flight` says the daemon is already working on this exact submission — which
+  // can still fail and release its claim. Until something is confirmed, this bubble is the only
+  // copy of the text.
+  let list = [];
+  for (let i = 0; i < PENDING_LIMIT; i += 1) {
+    list = markInFlight(addPendingRaw(list, { key: `p${i}`, text: `m${i}`, messages: [] }).list, `p${i}`);
+  }
+  assert.ok(list.every((entry) => entry.status === "working" && entry.accepted === false));
+
+  const added = addPendingRaw(list, { key: "new", text: "must not be lost", messages: [] });
+  assert.equal(added.rejected, true, "a retry that raced the original must not cost a message");
+});
+
 test("a full list of failed messages refuses a new one rather than destroying unsent text", () => {
   let list = [];
   for (let i = 0; i < PENDING_LIMIT; i += 1) {
@@ -129,6 +168,46 @@ test("a full list of failed messages refuses a new one rather than destroying un
   assert.equal(added.entry, null);
   assert.equal(added.list.length, PENDING_LIMIT);
   assert.ok(added.list.every((entry) => entry.status === "failed"), "nothing was evicted");
+});
+
+test("a run event that beat its own POST response still lands on the bubble", () => {
+  // Pi is fast and the tunnel is not: `run` can arrive while the bubble still has `runId: null`,
+  // matching nothing. The view remembers recent runs and replays the latest state the moment
+  // `markAccepted` supplies the id.
+  const memo = new Map();
+  rememberRun(memo, { id: "run_1", status: "running" });
+  rememberRun(memo, { id: "run_1", status: "ok" });
+  assert.equal(memo.size, 1, "one entry per run, latest state");
+
+  let list = addPendingRaw([], { key: "p1", text: "hello", messages: [] }).list;
+  list = applyRunEvent(list, memo.get("run_1"));
+  assert.equal(list[0].settled, false, "nothing matched: the bubble has no run id yet");
+
+  list = markAccepted(list, "p1", { runId: "run_1" });
+  list = applyRunEvent(list, memo.get("run_1"));
+  assert.equal(list[0].settled, true, "the missed event is applied as soon as the id is known");
+});
+
+test("a failed run that arrived early is not lost either", () => {
+  const memo = new Map();
+  rememberRun(memo, { id: "run_1", status: "failed", error: "Pi crashed." });
+
+  let list = addPendingRaw([], { key: "p1", text: "hello", messages: [] }).list;
+  list = markAccepted(list, "p1", { runId: "run_1" });
+  list = applyRunEvent(list, memo.get("run_1"));
+  assert.equal(list[0].status, "failed");
+  assert.equal(statusLabel(list[0]), "Pi crashed.", "and it offers Retry instead of spinning forever");
+});
+
+test("the remembered runs are bounded and keep the newest", () => {
+  const memo = new Map();
+  for (let i = 0; i < RUN_MEMO_LIMIT + 5; i += 1) rememberRun(memo, { id: `run_${i}`, status: "running" });
+  assert.equal(memo.size, RUN_MEMO_LIMIT);
+  assert.equal(memo.has("run_0"), false, "the oldest went first");
+  assert.equal(memo.has(`run_${RUN_MEMO_LIMIT + 4}`), true);
+
+  assert.equal(rememberRun(memo, null).size, RUN_MEMO_LIMIT, "a junk event changes nothing");
+  assert.equal(rememberRun(memo, { status: "ok" }).size, RUN_MEMO_LIMIT);
 });
 
 test("a mixed full list evicts the oldest sent message, never a failed one", () => {

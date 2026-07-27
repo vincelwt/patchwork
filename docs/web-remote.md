@@ -146,10 +146,15 @@ turn. Retry also re-sends the delivery that was originally *requested*, so retry
 the daemon had to downgrade still asks to steer.
 
 At most eight unconfirmed messages are held, and they are scoped to the open screen rather than
-persisted. When that bound is reached the oldest *accepted* message is dropped — its text is
-already on its way into the transcript. If every slot holds a message that was never sent, a new
-send is refused and its text goes back into the composer: evicting an unsent message would destroy
-the only copy of it.
+persisted. When that bound is reached the oldest message the daemon has *explicitly accepted* is
+dropped — its text is already on its way into the transcript. A bubble still waiting for its
+response (including one told `submission_in_flight`, whose original attempt can still fail) is
+never evicted: it holds the only copy of that text. If all eight are unresolved or failed, the
+ninth send is refused and its text goes back into the composer.
+
+A run event can also outrun the response that names its run. The screen keeps the latest state of
+the last sixteen runs and applies the matching one the moment a bubble learns its `runId`, so a
+fast failure is never left spinning on "Sending…".
 
 Attachments are not supported here. The daemon rejects them outright rather than accepting a
 message and dropping its images.
@@ -179,6 +184,11 @@ option. Cards are reused across refreshes, so answering one dialog never wipes a
 another, and a dialog Pi has stopped waiting for says so plainly rather than reading as a failed
 submission.
 
+A *failed* read of `GET /v1/interactions` is not an empty list. The last successful set stays on
+screen — clearing it would discard a half-typed answer to a dialog Pi is still blocked on — and a
+bounded retry chain (2s, then 4s) plus a refresh on every offline→online transition is what brings
+it back up to date.
+
 Nothing is answered automatically. `Question 2 of 3` is shown when the dialog is matched to a
 questionnaire, and answering advances to the next one. **Going back to a previous question is not
 possible from the web remote**: Pi's bridge is sequential and has already consumed the earlier
@@ -195,7 +205,8 @@ the thread detail, which is what keeps a screenshot-heavy conversation inside th
 per-payload ceiling. Loading is deliberately not eager: a thumbnail fetches when it scrolls near
 the viewport, and decoded results go into a shared cache bounded to 24 images and 12 MB, so the
 transcript's debounced repaint re-renders from memory instead of re-downloading everything several
-times a second.
+times a second. At most eight *distinct* images fetch at once (repeat requests for one image still
+share a single fetch); past that a tile keeps its placeholder and says so, and a tap retries.
 
 An image that is too large (over 1 MB decoded) or unreadable shows a labelled placeholder. One past
 the per-view budget of 40 shows a **Load** tile instead — the budget bounds automatic loading, not

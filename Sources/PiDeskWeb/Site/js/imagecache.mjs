@@ -9,6 +9,21 @@
 
 export const MAX_ENTRIES = 24;
 export const MAX_BYTES = 12 * 1024 * 1024;
+/**
+ * How many *distinct* images may be fetching at once. Requests for one key still share a single
+ * fetch, so this bounds concurrent tunnel work, not repaints: without it a long transcript
+ * scrolled quickly opens one request per thumbnail and holds every pending promise alive.
+ */
+export const MAX_IN_FLIGHT = 8;
+
+/** Refused for capacity, not for content. Retrying later is the correct response. */
+export class ImageCacheBusyError extends Error {
+  constructor() {
+    super("Too many images loading. Tap to retry.");
+    this.name = "ImageCacheBusyError";
+    this.retryable = true;
+  }
+}
 
 /** Cheap size estimate for a `data:` URL without decoding it: base64 is 4 chars per 3 bytes. */
 export function estimateBytes(dataURL) {
@@ -16,7 +31,7 @@ export function estimateBytes(dataURL) {
   return comma === -1 ? 0 : Math.floor(((dataURL.length - comma - 1) / 4) * 3);
 }
 
-export function createImageCache({ maxEntries = MAX_ENTRIES, maxBytes = MAX_BYTES } = {}) {
+export function createImageCache({ maxEntries = MAX_ENTRIES, maxBytes = MAX_BYTES, maxInFlight = MAX_IN_FLIGHT } = {}) {
   // Map preserves insertion order, which is all an LRU needs: re-inserting on read moves an entry
   // to the end, so the first key is always the least recently used.
   const entries = new Map();
@@ -51,6 +66,9 @@ export function createImageCache({ maxEntries = MAX_ENTRIES, maxBytes = MAX_BYTE
       if (cached) return Promise.resolve(cached);
       const existing = inFlight.get(key);
       if (existing) return existing;
+      // Nothing is cached and nothing is retained, so a refusal costs only this attempt: the
+      // tile keeps its placeholder and a tap tries again.
+      if (inFlight.size >= maxInFlight) return Promise.reject(new ImageCacheBusyError());
 
       const promise = load()
         .then((dataURL) => {
@@ -74,6 +92,9 @@ export function createImageCache({ maxEntries = MAX_ENTRIES, maxBytes = MAX_BYTE
     },
     get byteCount() {
       return bytes;
+    },
+    get inFlightCount() {
+      return inFlight.size;
     }
   };
 }

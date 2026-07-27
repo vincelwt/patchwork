@@ -130,19 +130,25 @@ function summarize(group) {
  * Depth-first render rows. `collapsed` is a Set of group ids; a collapsed group contributes its
  * own header row and nothing below it. `maxDepth` is an independent guard on top of the daemon's
  * own cap, so a hand-edited tree can never make this recurse without bound.
+ *
+ * The cap counts *virtual folder* nesting only, exactly like the Mac sidebar: a project group is
+ * a wrapper around folders, not a folder level, so a folder hosted by a project starts at 0 just
+ * as a top-level one does. A folder at the cap still renders with its own sessions; only its
+ * children are dropped. Indentation (`depth`) still counts every row, so the two never disagree
+ * about what a row looks like, only about where the tree stops.
  */
 export function flattenTree(groups, collapsed = new Set(), maxDepth = 24) {
   const rows = [];
-  const walk = (list, depth) => {
-    if (depth >= maxDepth) return;
+  const walk = (list, depth, folderDepth) => {
+    if (folderDepth > maxDepth) return;
     for (const group of list) {
       rows.push({ kind: "group", depth, group, collapsed: collapsed.has(group.id) });
       if (collapsed.has(group.id)) continue;
       for (const thread of group.threads) rows.push({ kind: "thread", depth: depth + 1, thread });
-      walk(group.children, depth + 1);
+      walk(group.children, depth + 1, group.kind === "virtual" ? folderDepth + 1 : folderDepth);
     }
   };
-  walk(groups, 0);
+  walk(groups, 0, 0);
   return rows;
 }
 

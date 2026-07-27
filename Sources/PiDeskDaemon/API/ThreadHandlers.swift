@@ -114,6 +114,14 @@ enum ThreadHandlers {
                             code: "submission_in_flight",
                             message: "This message is already being sent."
                         )
+                    case .overloaded:
+                        // Refusing is the safe end of this trade: making room would mean
+                        // forgetting a send that is still running, and its retry would prompt
+                        // Pi twice.
+                        throw DaemonHTTPError.serviceUnavailable(
+                            code: "submissions_busy",
+                            message: "Too many sends are still in flight. Try again in a moment."
+                        )
                     case .proceed:
                         break
                     }

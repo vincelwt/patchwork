@@ -73,8 +73,10 @@ public struct StoredVirtualFolder: Codable, Hashable, Sendable {
 /// agree: same group-id scheme, same cycle/dangling-parent fallback to top level, same
 /// depth-first ordering, same independent max-depth guard.
 public enum FolderTree {
-    /// Deeper than the app's own sidebar ever renders; a second, independent guard on top of the
-    /// cycle check, so hand-edited state cannot make this recurse without bound.
+    /// The deepest folder the app's own sidebar renders (`PiTheme.sidebarMaxFolderDepth`): a
+    /// folder *at* this depth is shown and its children are not, so the two agree on the boundary
+    /// rather than the phone hiding a folder the Mac displays. A second, independent guard on top
+    /// of the cycle check, so hand-edited state cannot make this recurse without bound.
     public static let maxDepth = 24
 
     public static func groupID(forFolderID id: String) -> String { "virtual:\(id)" }
@@ -135,7 +137,8 @@ public enum FolderTree {
         }
 
         func walk(parentGroupID: String, depth: Int) -> [FolderNode] {
-            guard depth < maxDepth else { return [] }
+            // `<=`, not `<`: the sidebar draws the folder at `maxDepth` and stops at its children.
+            guard depth <= maxDepth else { return [] }
             return (childrenByParent[parentGroupID] ?? []).flatMap { folder -> [FolderNode] in
                 [FolderNode(id: folder.id, name: folder.name, parentId: parentGroupID.isEmpty ? nil : parentGroupID, depth: depth)]
                     + walk(parentGroupID: groupID(forFolderID: folder.id), depth: depth + 1)

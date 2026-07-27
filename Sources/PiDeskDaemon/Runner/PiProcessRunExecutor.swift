@@ -81,16 +81,38 @@ struct PiProcessRunExecutor: RunExecuting {
                 session, job: job, liveThreadID: liveThreadID,
                 resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath
             )
-            finishLive(liveThreadID: liveThreadID, job: job)
+            await finishLive(session, liveThreadID: liveThreadID, job: job)
             return outcome
         } catch {
-            finishLive(liveThreadID: liveThreadID, job: job)
+            await finishLive(session, liveThreadID: liveThreadID, job: job)
             throw error
         }
     }
 
-    private func finishLive(liveThreadID: String?, job: RunJob) {
-        if let liveThreadID { liveSessions?.unregister(threadID: liveThreadID, runID: job.id) }
+    private func finishLive(_ session: PiRPCSession, liveThreadID: String?, job: RunJob) async {
+        if let liveThreadID, let liveSessions {
+            // A settle boundary already closed admission with nothing in flight, so this returns
+            // at once on the ordinary path. A timeout or an abort is the case it exists for:
+            // those arrive whenever they like, including while a steer is being written, and
+            // `session.stop()` (this function's caller's `defer`) would kill the process while
+            // its HTTP caller is still waiting to hear what happened. Admission closes for good
+            // first, then the writes already in flight get a bounded chance to land — pumping the
+            // pipe as they do, because an acknowledgement nobody reads is indistinguishable from
+            // one Pi never sent, and "outcome unknown" is never retried.
+            await liveSessions.drainForShutdown(
+                threadID: liveThreadID, runID: job.id,
+                deadline: Date().addingTimeInterval(LiveSessionRegistry.drainSeconds)
+            ) {
+                // A process that has already exited can neither acknowledge anything nor be
+                // stopped twice, so there is nothing left to wait for.
+                guard session.isRunning else { return false }
+                // `receiveNext` caches every response it decodes, which is exactly what an
+                // in-flight `deliver` is waiting on.
+                _ = try? await session.receiveNext(timeout: 0.1)
+                return true
+            }
+            liveSessions.unregister(threadID: liveThreadID, runID: job.id)
+        }
         interactions?.cancelAll(runID: job.id)
     }
 

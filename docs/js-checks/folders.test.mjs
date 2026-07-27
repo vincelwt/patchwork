@@ -108,7 +108,67 @@ test("flattening respects collapse state and its own depth guard", () => {
   assert.equal(collapsed.filter((r) => r.kind === "thread").length, 0);
   assert.equal(collapsed[0].collapsed, true);
 
-  assert.deepEqual(flattenTree(groups, new Set(), 0), [], "maxDepth 0 renders nothing");
+  // The cap is the deepest folder that still renders, matching the Mac sidebar: at 0 the top
+  // folder is drawn and only its children are dropped.
+  assert.equal(flattenTree(groups, new Set(), 0).filter((r) => r.kind === "group").length, 1);
+});
+
+/** A chain of `count` folders nested one inside the other, optionally hosted by a project. */
+const folderChain = (count, parentId = null) =>
+  Array.from({ length: count }, (_, index) => ({
+    id: `f${index}`,
+    name: `F${index}`,
+    parentId: index === 0 ? parentId : `virtual:f${index - 1}`,
+    depth: index
+  }));
+
+test("the depth cap counts folders, and the folder at the cap keeps its sessions", () => {
+  // The Mac renders the folder *at* `sidebarMaxFolderDepth` with its sessions and drops only its
+  // children. Stopping a level early here would hide a folder — and the thread inside it — that
+  // the same machine shows in its own sidebar.
+  const maxDepth = 3;
+  const groups = buildThreadTree([thread("deep", "/Users/x/code"), thread("deeper", "/Users/x/code")], {
+    folders: folderChain(maxDepth + 3),
+    assignments: { "/s/deep.jsonl": `f${maxDepth}`, "/s/deeper.jsonl": `f${maxDepth + 1}` }
+  });
+
+  const rows = flattenTree(groups, new Set(), maxDepth);
+  assert.deepEqual(
+    rows.filter((r) => r.kind === "group").map((r) => r.group.name),
+    ["F0", "F1", "F2", "F3"],
+    "every folder up to and including the cap"
+  );
+  assert.deepEqual(
+    rows.filter((r) => r.kind === "thread").map((r) => r.thread.id),
+    ["deep"],
+    "the last visible folder still renders its own sessions"
+  );
+});
+
+test("a project wrapper does not cost a folder level", () => {
+  // A project group hosts folders; it is not one. The app starts a project's folders at depth 0
+  // exactly like top-level ones, so the same chain must survive in either position.
+  const maxDepth = 3;
+  const groups = buildThreadTree([thread("deep", "/Users/x/code")], {
+    folders: folderChain(maxDepth + 3, "/Users/x/code"),
+    assignments: { "/s/deep.jsonl": `f${maxDepth}` }
+  });
+
+  const rows = flattenTree(groups, new Set(), maxDepth);
+  assert.deepEqual(
+    rows.filter((r) => r.kind === "group").map((r) => r.group.name),
+    ["code", "F0", "F1", "F2", "F3"]
+  );
+  assert.deepEqual(
+    rows.filter((r) => r.kind === "thread").map((r) => r.thread.id),
+    ["deep"],
+    "a session in the last folder is reachable from a project-hosted chain too"
+  );
+  assert.deepEqual(
+    rows.filter((r) => r.kind === "group").map((r) => r.depth),
+    [0, 1, 2, 3, 4],
+    "indentation still counts every row, including the wrapper"
+  );
 });
 
 test("a folder whose parent no longer exists falls back to top level, keeping its threads", () => {

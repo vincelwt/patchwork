@@ -79,7 +79,10 @@ scheduling new runs immediately, then gives whatever is already running up to 10
 finish naturally, then cancels anything still going — the same cooperative cancellation
 `POST /v1/threads/{id}/abort` uses, so an in-flight `pi` process still gets a graceful
 SIGTERM-then-SIGKILL instead of being abandoned, and the run is recorded as `timeout` rather than
-left `running` forever. Only once that has actually finished does the daemon process itself exit.
+left `running` forever. A run cancelled with a steer/follow-up still being written adds that
+delivery's bounded drain (at most three seconds) before its process is stopped, so no message is
+killed while its caller is still waiting to hear what happened. Only once that has actually
+finished does the daemon process itself exit.
 The app, in turn, waits up to 15 seconds (comfortably above the daemon's own worst case) for the
 process to exit before force-killing its whole process group as a last resort — which only
 abandons a run if the daemon failed to shut down on its own in that window. In short: a scheduled
@@ -164,6 +167,10 @@ which is not always what was asked:
 - If the write reached Pi but no acknowledgement arrived in time, the message is reported as
   delivered and **never resent**. Re-queueing is the one failure mode that could prompt Pi twice,
   which is worse than an unconfirmed delivery.
+- A run that ends on its timeout or on `abort` closes admission first and then waits, up to three
+  seconds, for deliveries already mid-write — still reading Pi's output, so an acknowledgement that
+  arrived is seen — before the process is stopped. A steer that lands in that window reports what
+  actually happened instead of an unknown outcome; one that does not still reports as delivered.
 - A thread the *app* has leased still returns `409 thread_leased`; the app owns that runtime.
 
 **`clientId` makes sending replayable.** A phone loses the *response* to a send far more often than
@@ -176,6 +183,9 @@ stable id per message (1–128 letters, numbers, dashes, underscores), reused ve
   first attempt is still running and the client should keep showing the message as sending.
 - A submission that *failed* releases its claim, so an honest retry is never locked out.
 - Omitting `clientId` is allowed and behaves exactly as before: no replay protection.
+- Only *completed* submissions are evicted to make room. If all 256 slots hold sends that have not
+  finished, a new `clientId` gets `503 submissions_busy` rather than costing one of them its
+  protection — refusing a message is recoverable, prompting Pi twice is not. Retry shortly.
 - Bounded and in-memory: 256 submissions, 30 minutes. A daemon restart forgets them, so a retry
   across a restart can still duplicate. `runs.jsonl` records no client id, so closing that window
   would mean a new persisted store for a gap measured in seconds; it is documented, not built.
@@ -233,8 +243,10 @@ GET /v1/folders
 Read-only projection of the app's own virtual folders from `state.json`. The daemon never writes
 that file. `parentId` uses the app's group-id scheme — `null` for top level, a filesystem project
 path, or `"virtual:<uuid>"` — and is always the *effective* parent: a cycle or a dangling parent is
-already resolved to top level, and folders past a depth of 24 are dropped, so a client renders the
-list without any cycle logic of its own. Assignments naming a folder that did not survive are
+already resolved to top level, and folders *past* depth 24 are dropped — the same boundary the Mac
+sidebar draws, which renders the folder at depth 24 and stops at its children — so a client renders
+the list without any cycle logic of its own. A project path in `parentId` hosts folders without
+being a level of nesting: its folders start at depth 0, exactly like top-level ones. Assignments naming a folder that did not survive are
 dropped for the same reason. Missing, legacy (pre-nesting), or malformed state yields an empty
 tree, never an error.
 
