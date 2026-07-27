@@ -15,10 +15,6 @@ struct SidebarView: View {
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
             SidebarActionRow(
-                title: "New folder", symbol: "folder.badge.plus", shortcut: "",
-                action: { store.newVirtualFolderRequested = true }
-            )
-            SidebarActionRow(
                 title: "Automations", symbol: "clock.arrow.2.circlepath", shortcut: "⌥⌘S",
                 action: { store.schedulesPresented = true },
                 selected: store.schedulesPresented
@@ -70,6 +66,9 @@ struct SidebarView: View {
                 archiveExpanded: $archiveExpanded,
                 archiveForcedOpen: snapshot.isFiltering
             )
+        }
+        .contextMenu {
+            Button("New Folder…") { store.newVirtualFolderRequested = true }
         }
         // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
         // filtering it drives below) stays wired for when a query is ever supplied again.
