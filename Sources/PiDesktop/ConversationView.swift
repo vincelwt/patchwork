@@ -225,8 +225,9 @@ struct ConversationView: View {
 
         ToolbarItem(placement: .primaryAction) {
             Button { withAnimation(.easeOut(duration: 0.16)) { store.inspectorVisible.toggle() } } label: {
-                Image(systemName: "sidebar.right").font(.system(size: PiIcon.medium, weight: .regular))
+                Image(systemName: "sidebar.right").font(.system(size: PiIcon.small, weight: .regular))
             }
+            .buttonStyle(.borderless)
             .help("Toggle Environment inspector (⌥⌘I)")
         }
     }
