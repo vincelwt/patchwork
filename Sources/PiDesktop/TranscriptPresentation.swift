@@ -201,8 +201,12 @@ enum TranscriptItem: Identifiable, Hashable, Sendable {
 
     var id: String {
         switch self {
-        case let .message(message, streaming):
-            "message:\(streaming ? "stream:" : "")\(message.id):\(message.blocks.first?.id ?? "")"
+        // Identity is the durable source message plus the block it starts at (one assistant
+        // message can split into narration and an answer). The streaming flag is deliberately
+        // absent: an answer that settles must keep the row it was streaming into, not be torn
+        // down and re-laid-out under a new identity.
+        case let .message(message, _):
+            "message:\(message.id):\(message.blocks.first?.id ?? "")"
         case let .work(block): block.id
         case let .compaction(note): "compaction:\(note.id)"
         }
@@ -216,7 +220,11 @@ enum TranscriptPresenter {
     static func items(messages: [ChatMessage], streaming: ChatMessage?, isRunning: Bool = false) -> [TranscriptItem] {
         var builder = TurnBuilder(isLive: isRunning || streaming != nil)
         for message in messages { builder.consume(message, streaming: false) }
-        if let streaming { builder.consume(streaming, streaming: true) }
+        // A settled message and its still-held streaming copy now share one identity, so the
+        // live copy is dropped once the settled one has landed rather than rendering twice.
+        if let streaming, !messages.contains(where: { $0.id == streaming.id }) {
+            builder.consume(streaming, streaming: true)
+        }
         return builder.finish()
     }
 }
@@ -231,9 +239,11 @@ private struct TurnBuilder {
     private var pending: TranscriptActivityGroup?
     /// Prose that is the answer unless more work arrives after it.
     private var trailing: [TranscriptItem] = []
+    /// True once the held prose was produced *after* this turn's reasoning/tool calls: that is
+    /// the turn's answer, and anything arriving later opens a new turn instead of burying it.
+    private var trailingIsAnswer = false
     private var turnStart: Date?
     private var lastTimestamp: Date?
-    private var turnIndex = 0
     /// The last assistant message's error state seen so far this turn — overwritten, not OR'd,
     /// so a transient error Pi auto-retried past does not leave the settled turn flagged failed.
     private var turnAnswerFailed = false
@@ -275,7 +285,6 @@ private struct TurnBuilder {
         // Blocks are handled in order, so narration that precedes a tool call stays above it in
         // the work log instead of being reordered after it.
         var prose: [MessageBlock] = []
-        turnAnswerFailed = message.isError
 
         func proseMessage() -> ChatMessage? {
             let hasContent = prose.contains { block in
@@ -310,16 +319,23 @@ private struct TurnBuilder {
                 prose.append(block)
             }
         }
-        if let answer = proseMessage() { trailing.append(.message(answer, streaming: streaming)) }
+        // Recorded after the blocks, not before them: a `demoteTrailing()` inside the loop can
+        // close the previous turn, whose header must report *that* turn's answer, not this one.
+        turnAnswerFailed = message.isError
+        if let answer = proseMessage() {
+            // Prose that follows this turn's own work is the answer, not narration.
+            if !entries.isEmpty || pending != nil { trailingIsAnswer = true }
+            trailing.append(.message(answer, streaming: streaming))
+        }
     }
 
     /// System, custom, and unknown entries join the work log when a turn is in flight and stand
     /// on their own otherwise, so an extension message is never silently swallowed.
     private mutating func log(_ message: ChatMessage, streaming: Bool) {
+        demoteTrailing()
         if entries.isEmpty, pending == nil, trailing.isEmpty {
             result.append(.message(message, streaming: streaming))
         } else {
-            demoteTrailing()
             entries.append(.note(message))
         }
     }
@@ -367,9 +383,16 @@ private struct TurnBuilder {
 
     // MARK: - Turn assembly
 
-    /// Prose followed by more work was narration, not the answer.
+    /// Prose followed by more work was narration, not the answer — but only when it also came
+    /// *before* that work. Prose Pi wrote after its tool calls is the turn's answer: a late tool
+    /// result, a process update, or a follow-on tool call opens a new turn under it rather than
+    /// collapsing the answer the user is reading into the work log.
     private mutating func demoteTrailing() {
         guard !trailing.isEmpty else { return }
+        if trailingIsAnswer {
+            closeTurn(active: false)
+            return
+        }
         closeActivity()
         for item in trailing {
             if case let .message(message, _) = item { entries.append(.note(message)) }
@@ -390,8 +413,11 @@ private struct TurnBuilder {
     private mutating func closeTurn(active: Bool) {
         closeActivity(active: active)
         if !entries.isEmpty {
+            // Identity comes from the first entry's own durable id (a block, tool call, or
+            // message id), never a turn counter: prepending earlier history must not renumber
+            // every work block below it.
             result.append(.work(TranscriptWorkBlock(
-                id: "work:\(turnIndex):\(entries.first?.id ?? "")",
+                id: "work:\(entries.first?.id ?? "")",
                 entries: entries,
                 isActive: active,
                 startedAt: turnStart,
@@ -402,7 +428,10 @@ private struct TurnBuilder {
         result.append(contentsOf: trailing)
         entries.removeAll(keepingCapacity: true)
         trailing.removeAll(keepingCapacity: true)
-        turnIndex += 1
+        trailingIsAnswer = false
         turnAnswerFailed = false
+        // Work that follows a settled answer starts its own clock instead of inheriting the
+        // finished turn's start and reporting a duration that spans both.
+        turnStart = lastTimestamp
     }
 }

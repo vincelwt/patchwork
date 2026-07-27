@@ -200,6 +200,136 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertFalse(block.answerFailed, "The turn's final answer is what matters, not an earlier retried error")
     }
 
+    // MARK: - The answer is never buried in the work log
+
+    func testProcessUpdateAfterTheAnswerDoesNotCollapseTheAnswerIntoTheWorkLog() throws {
+        // Real sessions end a turn with `custom_message` entries (background process updates,
+        // model changes) written *after* Pi's answer. Those must not demote the answer.
+        let update = ChatMessage(
+            id: "custom-1",
+            role: .custom,
+            blocks: [text("Process 'tests' completed successfully (14s)")],
+            timestamp: nil,
+            customType: "ad-process:update",
+            raw: .null
+        )
+        let messages = [
+            user(id: "u", text: "Run the tests", at: nil),
+            assistant(id: "a1", blocks: [call("c1", "bash", ["command": .string("swift test")])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            assistant(id: "a2", blocks: [text("All 44 tests pass.")]),
+            update
+        ]
+
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .message(answer, _) = items[2] else {
+            return XCTFail("The answer must stay a visible transcript message, not work-log detail")
+        }
+        XCTAssertEqual(answer.textContent, "All 44 tests pass.")
+        guard case let .work(block) = items[1] else { return XCTFail("Expected the turn's work block above it") }
+        XCTAssertFalse(
+            block.entries.contains { if case .note = $0 { return true } else { return false } },
+            "Nothing prose-like from the answer may be demoted into the collapsed log"
+        )
+    }
+
+    func testFollowOnToolCallAfterTheAnswerOpensANewTurnInsteadOfBuryingIt() throws {
+        let messages = [
+            user(id: "u", text: "Go", at: nil),
+            assistant(id: "a1", blocks: [thinking("plan"), call("c1", "read", [:]), text("Here is the answer.")]),
+            result(id: "r1", callID: "c1", text: "contents"),
+            assistant(id: "a2", blocks: [call("c2", "write", [:])]),
+            result(id: "r2", callID: "c2", text: "written"),
+            assistant(id: "a3", blocks: [text("And now it is saved.")])
+        ]
+
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        let shape = items.map { item -> String in
+            switch item {
+            case .message: "message"
+            case .work: "work"
+            case .compaction: "compaction"
+            }
+        }
+        XCTAssertEqual(shape, ["message", "work", "message", "work", "message"])
+        guard case let .message(first, _) = items[2] else { return XCTFail("Expected the first answer") }
+        XCTAssertEqual(first.textContent, "Here is the answer.", "Prose written after tool calls is the answer")
+        guard case let .message(second, _) = items[4] else { return XCTFail("Expected the second answer") }
+        XCTAssertEqual(second.textContent, "And now it is saved.")
+    }
+
+    func testOrphanToolResultAfterTheAnswerStillShowsWithoutHidingTheAnswer() throws {
+        let messages = [
+            assistant(id: "a1", blocks: [call("c1", "bash", [:])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            assistant(id: "a2", blocks: [text("Done.")]),
+            result(id: "r2", callID: "missing-call", text: "late output")
+        ]
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        guard case let .message(answer, _) = items[1] else { return XCTFail("The answer stays visible") }
+        XCTAssertEqual(answer.textContent, "Done.")
+        guard case let .work(orphanTurn) = items[2] else { return XCTFail("The orphan result opens its own work block") }
+        XCTAssertEqual(orphanTurn.activities.flatMap(\.steps).map(\.id), ["missing-call"])
+    }
+
+    func testNarrationBeforeToolsIsStillDemotedIntoTheWorkLog() throws {
+        // The other half of the rule: prose that *precedes* the work it introduces is narration,
+        // even when it arrives as its own assistant message.
+        let messages = [
+            user(id: "u", text: "Go", at: nil),
+            assistant(id: "a1", blocks: [text("Let me look.")]),
+            assistant(id: "a2", blocks: [call("c1", "read", [:])]),
+            result(id: "r1", callID: "c1", text: "contents"),
+            assistant(id: "a3", blocks: [text("Found it.")])
+        ]
+        let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        XCTAssertEqual(items.count, 3, "user message, one work block, one answer")
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        guard case let .note(narration) = block.entries.first else { return XCTFail("Expected the narration demoted") }
+        XCTAssertEqual(narration.textContent, "Let me look.")
+    }
+
+    // MARK: - Identity
+
+    func testItemIdentityIsUnchangedByPrependingEarlierHistory() throws {
+        let turn = [
+            user(id: "u2", text: "Second", at: nil),
+            assistant(id: "a2", blocks: [call("c2", "read", [:])]),
+            result(id: "r2", callID: "c2", text: "ok"),
+            assistant(id: "a3", blocks: [text("Answer.")])
+        ]
+        let earlier = [
+            user(id: "u1", text: "First", at: nil),
+            assistant(id: "a0", blocks: [call("c1", "bash", [:])]),
+            result(id: "r1", callID: "c1", text: "ok"),
+            assistant(id: "a1", blocks: [text("Earlier answer.")])
+        ]
+
+        let tailOnly = TranscriptPresenter.items(messages: turn, streaming: nil).map(\.id)
+        let withHistory = TranscriptPresenter.items(messages: earlier + turn, streaming: nil).map(\.id)
+        XCTAssertEqual(Array(withHistory.suffix(tailOnly.count)), tailOnly,
+                       "Backfilling earlier history must not renumber the rows already on screen")
+        XCTAssertEqual(Set(withHistory).count, withHistory.count, "identities stay unique")
+    }
+
+    func testAnAnswerKeepsItsIdentityWhenItSettlesOutOfStreaming() throws {
+        let history = [
+            user(id: "u", text: "Go", at: nil),
+            assistant(id: "a1", blocks: [call("c1", "bash", [:])]),
+            result(id: "r1", callID: "c1", text: "ok")
+        ]
+        let answerBlock = text("Everything passes.")
+        let live = ChatMessage(id: "a2", role: .assistant, blocks: [answerBlock], timestamp: nil, raw: .null)
+
+        let streamingIDs = TranscriptPresenter.items(messages: history, streaming: live).map(\.id)
+        let settledIDs = TranscriptPresenter.items(messages: history + [live], streaming: nil).map(\.id)
+        XCTAssertEqual(streamingIDs, settledIDs, "Settling must reuse the row the answer streamed into")
+
+        // And the transcript never renders the live copy twice while both are held.
+        let both = TranscriptPresenter.items(messages: history + [live], streaming: live).map(\.id)
+        XCTAssertEqual(both, settledIDs)
+    }
+
     func testCompactionIsShownAsItsOwnTranscriptEvent() throws {
         let compaction = ChatMessage(
             id: "compaction-1",
