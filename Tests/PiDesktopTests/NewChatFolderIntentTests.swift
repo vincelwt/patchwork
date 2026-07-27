@@ -144,8 +144,8 @@ final class NewChatFolderIntentIntegrationTests: XCTestCase {
         store.draft = "hello from a folder-scoped new chat"
         store.submitDraft()
 
-        XCTAssertEqual(store.route, .session("fresh-session"), "AppStore's own promotion logic is untouched")
         let path = cwd.appendingPathComponent("fresh.jsonl").standardizedFileURL.path
+        XCTAssertEqual(store.route, .session(path), "AppStore's own promotion logic is untouched")
         XCTAssertEqual(store.virtualFolderAssignments[path], folder.id)
         XCTAssertNil(intent.pending, "Resolved exactly once")
     }

@@ -214,14 +214,14 @@ final class SessionActivityClassifierTests: XCTestCase {
         XCTAssertEqual(SessionActivityClassifier.lastEntry(inTail: tail)?["id"]?.stringValue, "last")
     }
 
-    func testOldFileIsClassifiedIdleWithoutAnyRead() throws {
+    func testOldFileIsIdleButStillExposesItsLatestCompletionID() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiActivity-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let url = directory.appendingPathComponent("old.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: url)
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: url)
         try FileManager.default.setAttributes(
             [.modificationDate: Date().addingTimeInterval(-3_600)],
             ofItemAtPath: url.path
@@ -229,6 +229,7 @@ final class SessionActivityClassifierTests: XCTestCase {
 
         let activity = try XCTUnwrap(SessionActivityClassifier.classifyFile(at: url))
         XCTAssertEqual(activity.state, .idle)
+        XCTAssertEqual(activity.latestCompletedEntryID, "1")
         XCTAssertNil(activity.runningSince)
     }
 
@@ -352,7 +353,7 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
 
         try write(
             """
-            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z"}
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-1"}
             """, name: "a.json", in: directory
         )
         try write(
@@ -367,6 +368,51 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
         XCTAssertEqual(result.count, 1)
         XCTAssertEqual(result["/tmp/a.jsonl"]?.count, 2)
         XCTAssertEqual(Set(result["/tmp/a.jsonl"]?.map(\.pid) ?? []), [1, 2])
+        XCTAssertEqual(result["/tmp/a.jsonl"]?.first(where: { $0.pid == 1 })?.completionId, "answer-1")
+    }
+
+    func testScanInvalidatesCachedHeartbeatWhenItsFingerprintChanges() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("a.json")
+        try write(
+            """
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-1"}
+            """, name: file.lastPathComponent, in: directory
+        )
+        let fixedMtime = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: file.path)
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-1")
+
+        let replacement = directory.appendingPathComponent("replacement.json")
+        try Data("""
+        {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-2"}
+        """.utf8).write(to: replacement)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: replacement.path)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.moveItem(at: replacement, to: file)
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-2")
+    }
+
+    func testSymlinkedHeartbeatInvalidatesWhenItsTargetIsReplaced() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let target = directory.appendingPathComponent("heartbeat.payload")
+        let link = directory.appendingPathComponent("heartbeat.json")
+        try Data("""
+        {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-1"}
+        """.utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-1")
+
+        let replacement = directory.appendingPathComponent("replacement.payload")
+        try Data("""
+        {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-2"}
+        """.utf8).write(to: replacement)
+        try FileManager.default.removeItem(at: target)
+        try FileManager.default.moveItem(at: replacement, to: target)
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-2")
     }
 
     func testScanOfAMissingDirectoryIsEmptyNotAnError() {
@@ -425,15 +471,55 @@ final class SessionActivityMonitorTests: XCTestCase {
 
         let heartbeatDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        let heartbeat = heartbeatDirectory.appendingPathComponent("s.json")
         try Data("""
-        {"sessionId":"s","sessionFile":"\(file.path)","pid":4242,"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))"}
-        """.utf8).write(to: heartbeatDirectory.appendingPathComponent("s.json"))
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":4242,"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","completionId":"old"}
+        """.utf8).write(to: heartbeat)
 
         let monitor = SessionActivityMonitor(
             isActiveOverride: true, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in true }
         )
         monitor.setTrackedPaths([file.path])
         try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+
+        try FileManager.default.removeItem(at: heartbeat)
+        monitor.tickNow()
+        try await waitUntil {
+            monitor.activity(forPath: file.path)?.state == .idle
+                && monitor.activity(forPath: file.path)?.latestCompletedEntryID == "1"
+        }
+    }
+
+    func testDisappearedHeartbeatsBeyondTailLimitKeepPriorityForTheNextTick() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var paths: [String] = []
+        for index in 0...SessionActivityMonitor.tailReadsPerTick {
+            let file = directory.appendingPathComponent("session-\(index).jsonl")
+            try Data("{\"type\":\"message\",\"id\":\"a\(index)\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-600)], ofItemAtPath: file.path)
+            try Data("{\"sessionId\":\"s\(index)\",\"sessionFile\":\"\(file.path)\",\"pid\":\(index + 1),\"state\":\"running\",\"updatedAt\":\"\(ISO8601DateFormatter.piShared.string(from: Date()))\"}".utf8)
+                .write(to: heartbeats.appendingPathComponent("s-\(index).json"))
+            paths.append(file.path)
+        }
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true, heartbeatDirectory: heartbeats, isProcessAlive: { _ in true }
+        )
+        monitor.setTrackedPaths(paths)
+        try await waitUntil { monitor.activities.count == paths.count && monitor.activities.values.allSatisfy { $0.state == .running } }
+
+        for url in try FileManager.default.contentsOfDirectory(at: heartbeats, includingPropertiesForKeys: nil) {
+            try FileManager.default.removeItem(at: url)
+        }
+        monitor.tickNow()
+        try await waitUntil {
+            monitor.activities.values.compactMap(\.latestCompletedEntryID).count == SessionActivityMonitor.tailReadsPerTick
+        }
+        monitor.tickNow()
+        try await waitUntil { monitor.activities.values.compactMap(\.latestCompletedEntryID).count == paths.count }
     }
 
     func testLiveWriterWinsOverAnIdleAttachmentForTheSameSession() async throws {
@@ -457,6 +543,28 @@ final class SessionActivityMonitorTests: XCTestCase {
         )
         monitor.setTrackedPaths([file.path])
         try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+    }
+
+    func testUnchangedAmbiguousIdleHeartbeatStillChecksAChangedJSONLTail() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("session.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"a1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try Data("{\"sessionId\":\"s\",\"sessionFile\":\"\(file.path)\",\"pid\":1,\"state\":\"idle\",\"updatedAt\":\"2024-01-01T00:00:00.000Z\"}".utf8)
+            .write(to: heartbeats.appendingPathComponent("s.json"))
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: heartbeats)
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a1" }
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"a2\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8))
+        try handle.close()
+        monitor.tickNow()
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a2" }
     }
 
     func testHeartbeatWithADeadPidReportsIdleEvenIfFresh() async throws {
@@ -497,19 +605,101 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "No heartbeat: the file heuristic alone decides")
     }
 
-    func testInactiveApplicationNeverPolls() async throws {
+    func testPollingTaskDoesNotRetainTheMonitor() async throws {
+        var monitor: SessionActivityMonitor? = SessionActivityMonitor(
+            isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory()
+        )
+        weak var released = monitor
+        monitor?.start()
+        monitor = nil
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertNil(released)
+    }
+
+    func testBackgroundApplicationStillPollsForCompletedAnswers() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let file = directory.appendingPathComponent("s.jsonl")
-        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
+        try Data("{\"type\":\"message\",\"id\":\"background-answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
 
         let monitor = SessionActivityMonitor(isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory())
         monitor.setTrackedPaths([file.path])
-        try await Task.sleep(nanoseconds: 250_000_000)
-        XCTAssertTrue(monitor.activities.isEmpty, "A background app must not stat or read session files")
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "background-answer" }
+        XCTAssertEqual(SessionActivityMonitor.backgroundPollInterval, 15)
+    }
+
+    func testOnlyUnchangedUnambiguousIdleHeartbeatsSkipPolling() {
+        let path = "/tmp/session.jsonl"
+        let heartbeat = ActivityHeartbeat(
+            sessionId: "s", sessionFile: path, sessionDir: nil, pid: 1, state: "idle",
+            updatedAt: "2024-01-01T00:00:00.000Z", preview: nil, stopReason: "stop", completionId: "a1"
+        )
+        let idle = SessionActivity(state: .idle, modifiedAt: Date(), latestCompletedEntryID: "a1")
+        XCTAssertEqual(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [path: [heartbeat]], previousHeartbeats: [:], previousActivities: [:]
+            ),
+            [path]
+        )
+        XCTAssertTrue(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [path: [heartbeat]], previousHeartbeats: [path: [heartbeat]],
+                previousActivities: [path: idle]
+            ).isEmpty
+        )
+
+        var ambiguous = heartbeat
+        ambiguous.completionId = nil
+        XCTAssertEqual(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [path: [ambiguous]], previousHeartbeats: [path: [ambiguous]],
+                previousActivities: [path: idle]
+            ),
+            [path]
+        )
+        XCTAssertEqual(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [:], previousHeartbeats: [path: [heartbeat]],
+                previousActivities: [path: idle]
+            ),
+            [path]
+        )
+
+        var changed = heartbeat
+        changed.completionId = "a2"
+        let running = SessionActivity(state: .running, modifiedAt: Date())
+        XCTAssertEqual(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [path: [changed]], previousHeartbeats: [path: [heartbeat]],
+                previousActivities: [path: idle]
+            ),
+            [path]
+        )
+        XCTAssertEqual(
+            SessionActivityMonitor.heartbeatPathsRequiringPoll(
+                paths: [path], heartbeats: [path: [heartbeat]], previousHeartbeats: [path: [heartbeat]],
+                previousActivities: [path: running]
+            ),
+            [path]
+        )
+    }
+
+    func testFallbackStatsAreBoundedAndRoundRobinWhileHeartbeatsStayImmediate() {
+        let paths = (0..<200).map { "session-\($0)" }
+        let heartbeat = Set(["session-199"])
+        let first = SessionActivityMonitor.pollSelection(paths: paths, heartbeatPaths: heartbeat, fallbackCursor: 0)
+        let second = SessionActivityMonitor.pollSelection(
+            paths: paths, heartbeatPaths: heartbeat, fallbackCursor: first.nextCursor
+        )
+
+        XCTAssertEqual(first.paths.count, SessionActivityMonitor.fallbackStatsPerTick + 1)
+        XCTAssertEqual(second.paths.count, SessionActivityMonitor.fallbackStatsPerTick + 1)
+        XCTAssertTrue(first.paths.contains("session-199"))
+        XCTAssertTrue(second.paths.contains("session-199"))
+        XCTAssertTrue(Set(first.paths).intersection(second.paths).subtracting(heartbeat).isEmpty)
     }
 
     /// The exact flicker the user reported: an ambiguous tail read (no heartbeat, and the file

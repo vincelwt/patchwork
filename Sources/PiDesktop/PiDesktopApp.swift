@@ -3,7 +3,7 @@ import SwiftUI
 
 @main
 struct PiDesktopApp: App {
-    /// The probe factory is supplied only here: `AppStore` never spawns a Pi process in tests.
+    /// The probe factory is supplied only here for the explicit refresh command.
     @StateObject private var store = AppStore(
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
@@ -50,7 +50,7 @@ struct PiDesktopApp: App {
                     .keyboardShortcut("u", modifiers: [.command, .option])
                     .disabled(store.selectedSession == nil)
                 Divider()
-                Button("Stop Pi", action: store.abort)
+                Button("Abort Turn", action: store.abort)
                     .keyboardShortcut(".", modifiers: .command)
                     .disabled(!store.runtimeState.isStreaming)
                 Button("Compact Context", action: store.compact)

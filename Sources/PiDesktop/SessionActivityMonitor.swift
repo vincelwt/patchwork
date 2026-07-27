@@ -14,8 +14,9 @@ struct SessionActivity: Equatable, Sendable {
     var modifiedAt: Date
     /// When the file last transitioned into `running`, used for the menu bar's elapsed label.
     var runningSince: Date?
-    /// The last entry's assistant stop reason, when known. Lets a notification distinguish a
-    /// clean finish from an error/abort without re-reading the file.
+    /// The newest completed assistant entry and its stop reason, when known. These are stable
+    /// completion semantics; mtime and running/idle transitions never stand in for an answer.
+    var latestCompletedEntryID: String?
     var lastStopReason: String?
     /// A short bounded preview of the last assistant text, when a heartbeat supplied one. Used
     /// only to enrich a cross-terminal "turn finished" notification; never re-derived by reading
@@ -39,7 +40,7 @@ enum SessionActivityClassifier {
     /// Only the tail is read, never the whole file.
     static let tailByteLimit = 256 * 1_024
 
-    static let terminalStopReasons: Set<String> = ["stop", "length", "error", "aborted"]
+    static let terminalStopReasons = SessionParser.terminalAssistantStopReasons
 
     static func classify(lastEntry: JSONValue?, age: TimeInterval) -> SessionRunState {
         if age > idleWindow { return .idle }
@@ -77,8 +78,7 @@ enum SessionActivityClassifier {
     }
 
     private static func isTerminalStop(_ entry: JSONValue?) -> Bool {
-        guard let stopReason = stopReason(ofLastEntry: entry) else { return false }
-        return terminalStopReasons.contains(stopReason)
+        SessionParser.terminalAssistantCompletion(from: entry) != nil
     }
 
     /// Extracts the last decodable JSONL record from a tail buffer, tolerating a partially
@@ -111,15 +111,16 @@ enum SessionActivityClassifier {
         guard let values = try? fresh.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
               let modifiedAt = values.contentModificationDate else { return nil }
         let age = now.timeIntervalSince(modifiedAt)
-        // Old files never get read: their mtime alone settles it.
-        if age > idleWindow { return SessionActivity(state: .idle, modifiedAt: modifiedAt) }
-        let entry = readTail(at: fresh).flatMap(lastEntry(inTail:))
+        let tail = readTail(at: fresh)
+        let entry = tail.flatMap(lastEntry(inTail:))
+        let completion = tail.flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))
         let state = classify(lastEntry: entry, age: age)
         return SessionActivity(
             state: state,
             modifiedAt: modifiedAt,
             runningSince: state == .running ? modifiedAt : nil,
-            lastStopReason: stopReason(ofLastEntry: entry)
+            latestCompletedEntryID: completion?.id,
+            lastStopReason: completion?.stopReason ?? stopReason(ofLastEntry: entry)
         )
     }
 }
@@ -142,17 +143,19 @@ enum SessionActivityClassifier {
 /// produce a confident verdict, the previous resolved state is kept rather than guessing
 /// (`.unknown` is sticky), so a momentary gap in the data can never look like a flip.
 ///
-/// Cost control: one shared 2s timer that only runs while the app is active, `stat` for every
-/// tracked path, one heartbeat-directory scan per tick, and a bounded tail read only for files
-/// whose fingerprint changed and whose mtime is recent. Nothing is ever re-read in full and no
-/// timer is created per row.
+/// Cost control: one shared timer runs every 2s while active and every 15s in the background,
+/// with one heartbeat-directory scan per tick and at most 16 bounded tail reads. Unchanged files
+/// reuse their last completion, and no timer is created per row.
 @MainActor
 final class SessionActivityMonitor: ObservableObject {
     @Published private(set) var activities: [String: SessionActivity] = [:]
 
     static let pollInterval: TimeInterval = 2
-    /// Upper bound on tail reads per tick, so a burst of concurrent sessions stays cheap.
-    static let tailReadsPerTick = 16
+    static let backgroundPollInterval: TimeInterval = 15
+    /// Upper bounds on fallback work per tick, so large histories do not cause periodic stat
+    /// storms while heartbeat-backed sessions still update immediately.
+    nonisolated static let fallbackStatsPerTick = 64
+    nonisolated static let tailReadsPerTick = 16
 
     private struct Fingerprint: Equatable, Sendable {
         let modifiedAt: TimeInterval
@@ -161,8 +164,10 @@ final class SessionActivityMonitor: ObservableObject {
 
     private var trackedPaths: [String] = []
     private var fingerprints: [String: Fingerprint] = [:]
+    private var heartbeatSnapshots: [String: [ActivityHeartbeat]] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
+    private var fallbackCursor = 0
     private var cancellables: Set<AnyCancellable> = []
     private let isActiveOverride: Bool?
     private let heartbeatDirectory: URL
@@ -187,12 +192,15 @@ final class SessionActivityMonitor: ObservableObject {
     private var isApplicationActive: Bool { isActiveOverride ?? NSApplication.shared.isActive }
 
     func setTrackedPaths(_ paths: [String]) {
-        let unique = Array(Set(paths))
+        var seen: Set<String> = []
+        let unique = paths.filter { seen.insert($0).inserted }
         guard unique != trackedPaths else { return }
         trackedPaths = unique
+        fallbackCursor = 0
         let live = Set(unique)
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
+        heartbeatSnapshots = heartbeatSnapshots.filter { live.contains($0.key) }
         tickNow()
     }
 
@@ -201,7 +209,9 @@ final class SessionActivityMonitor: ObservableObject {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
-                try? await Task.sleep(nanoseconds: UInt64(Self.pollInterval * 1_000_000_000))
+                guard let active = self?.isApplicationActive else { return }
+                let interval = active ? Self.pollInterval : Self.backgroundPollInterval
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
     }
@@ -217,9 +227,40 @@ final class SessionActivityMonitor: ObservableObject {
 
     func activity(forPath path: String) -> SessionActivity? { activities[path] }
 
+    nonisolated static func heartbeatPathsRequiringPoll(
+        paths: [String],
+        heartbeats: [String: [ActivityHeartbeat]],
+        previousHeartbeats: [String: [ActivityHeartbeat]],
+        previousActivities: [String: SessionActivity]
+    ) -> Set<String> {
+        Set(paths.filter { path in
+            guard let writers = heartbeats[path] else { return previousHeartbeats[path] != nil }
+            let completionIDs = Set(writers.compactMap(\.completionId))
+            return previousHeartbeats[path] != writers
+                || previousActivities[path] == nil
+                || previousActivities[path]?.state == .running
+                || completionIDs.count != 1
+        })
+    }
+
+    nonisolated static func pollSelection(
+        paths: [String],
+        heartbeatPaths: Set<String>,
+        fallbackCursor: Int
+    ) -> (paths: [String], nextCursor: Int) {
+        let fallback = paths.filter { !heartbeatPaths.contains($0) }
+        guard !fallback.isEmpty else { return (paths.filter(heartbeatPaths.contains), 0) }
+        let start = fallbackCursor % fallback.count
+        let count = min(fallbackStatsPerTick, fallback.count)
+        let selectedFallback = Set((0..<count).map { fallback[(start + $0) % fallback.count] })
+        return (
+            paths.filter { heartbeatPaths.contains($0) || selectedFallback.contains($0) },
+            (start + count) % fallback.count
+        )
+    }
+
     private func tick() async {
-        // Paused entirely while the app is inactive; a background app must not poll the disk.
-        guard isApplicationActive, !trackedPaths.isEmpty, !tickInFlight else { return }
+        guard !trackedPaths.isEmpty, !tickInFlight else { return }
         tickInFlight = true
         defer { tickInFlight = false }
 
@@ -229,15 +270,41 @@ final class SessionActivityMonitor: ObservableObject {
         let limit = Self.tailReadsPerTick
         let heartbeatDirectory = heartbeatDirectory
         let isProcessAlive = isProcessAlive
+        let cursor = fallbackCursor
+        let knownHeartbeats = heartbeatSnapshots
 
-        let result = await Task.detached(priority: .utility) { () -> ([String: SessionActivity], [String: Fingerprint]) in
+        let result = await Task.detached(priority: .utility) {
+            () -> ([String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int) in
             let now = Date()
-            let heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
-            var states: [String: SessionActivity] = [:]
-            var stamps: [String: Fingerprint] = [:]
+            var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
+            for path in Array(heartbeats.keys) {
+                heartbeats[path]?.sort { lhs, rhs in
+                    lhs.pid == rhs.pid ? lhs.updatedAt < rhs.updatedAt : lhs.pid < rhs.pid
+                }
+            }
+            let heartbeatPaths = Set(heartbeats.keys)
+            let heartbeatPathsToPoll = Self.heartbeatPathsRequiringPoll(
+                paths: paths,
+                heartbeats: heartbeats,
+                previousHeartbeats: knownHeartbeats,
+                previousActivities: previous
+            )
+            let selection = Self.pollSelection(
+                paths: paths,
+                heartbeatPaths: heartbeatPaths,
+                fallbackCursor: cursor
+            )
+            let selected = Set(selection.paths)
+            let selectedPaths = paths.filter {
+                heartbeatPathsToPoll.contains($0)
+                    || (!heartbeatPaths.contains($0) && selected.contains($0))
+            }
+            var states = previous
+            var stamps = known
+            var deferredHeartbeatPaths: Set<String> = []
             var tailReads = 0
 
-            for path in paths {
+            for path in selectedPaths {
                 let url = URL(fileURLWithPath: path)
                 guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
                       let modifiedAt = values.contentModificationDate else { continue }
@@ -245,70 +312,115 @@ final class SessionActivityMonitor: ObservableObject {
                     modifiedAt: modifiedAt.timeIntervalSince1970,
                     size: Int64(values.fileSize ?? 0)
                 )
-                stamps[path] = fingerprint
+                let old = previous[path]
+                let unchanged = known[path] == fingerprint
+                let writers = heartbeats[path]
+                let heartbeatDisappeared = writers == nil && knownHeartbeats[path] != nil
+                let heartbeatRunning = writers?.contains {
+                    ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+                } ?? false
+                let heartbeatCompletionIDs = Set(writers?.compactMap(\.completionId) ?? [])
+                // A live writer cannot have produced the next terminal completion yet. Its idle
+                // heartbeat will carry that ID; tail fallback is only needed once the writer is
+                // no longer live or no heartbeat exists.
+                let needsTail = writers == nil || (!heartbeatRunning && heartbeatCompletionIDs.count != 1)
+                var entry: JSONValue?
+                var tailCompletion: SessionParser.AssistantCompletion?
+                var readTail = false
 
-                if let writers = heartbeats[path] {
-                    // An attached RPC process is idle while the terminal that owns the same
-                    // session may still be working. Heartbeats are per writer, so any fresh,
-                    // live "running" writer wins; an idle attachment cannot erase it.
-                    let running = writers.contains {
-                        ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+                if needsTail, (!unchanged || heartbeatDisappeared) {
+                    if tailReads < limit {
+                        tailReads += 1
+                        readTail = true
+                        let tail = SessionActivityClassifier.readTail(at: url)
+                        entry = tail.flatMap(SessionActivityClassifier.lastEntry(inTail:))
+                        tailCompletion = tail.flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))
+                        stamps[path] = fingerprint
+                    } else {
+                        // Keep both retry signals until this changed/disappeared writer gets one
+                        // of the bounded tail-read slots on a later tick.
+                        if let known = known[path] { stamps[path] = known }
+                        else { stamps.removeValue(forKey: path) }
+                        if heartbeatDisappeared { deferredHeartbeatPaths.insert(path) }
                     }
+                } else if heartbeatRunning, heartbeatCompletionIDs.count != 1 {
+                    // Do not mark an ambiguous live tail as consumed. If the writer vanishes or
+                    // settles without publishing a completion ID, the fallback must still read it.
+                    if let known = known[path] { stamps[path] = known }
+                    else { stamps.removeValue(forKey: path) }
+                } else {
+                    stamps[path] = fingerprint
+                }
+
+                var completionID = old?.latestCompletedEntryID
+                var completionStopReason = old?.lastStopReason
+                var completionWriter: ActivityHeartbeat?
+                if heartbeatCompletionIDs.count == 1, let heartbeatCompletionID = heartbeatCompletionIDs.first {
+                    completionID = heartbeatCompletionID
+                    completionWriter = writers?
+                        .filter { $0.completionId == heartbeatCompletionID }
+                        .max {
+                            (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
+                        }
+                    if let reason = completionWriter?.stopReason,
+                       SessionParser.terminalAssistantStopReasons.contains(reason) {
+                        completionStopReason = reason
+                    }
+                } else if let tailCompletion {
+                    completionID = tailCompletion.id
+                    completionStopReason = tailCompletion.stopReason
+                }
+
+                if let writers {
+                    // An attached RPC process is idle while the terminal that owns the same
+                    // session may still be working. Any fresh, live running writer wins.
                     let newest = writers.max {
                         (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
                     }
-                    let resolved: SessionRunState = running ? .running : .idle
+                    let resolved: SessionRunState = heartbeatRunning ? .running : .idle
                     states[path] = SessionActivity(
                         state: resolved,
                         modifiedAt: modifiedAt,
-                        runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
-                        lastStopReason: newest?.stopReason ?? previous[path]?.lastStopReason,
-                        preview: newest?.preview ?? previous[path]?.preview
+                        runningSince: resolved == .running ? (old?.runningSince ?? modifiedAt) : nil,
+                        latestCompletedEntryID: completionID,
+                        lastStopReason: completionStopReason ?? newest?.stopReason,
+                        preview: completionWriter?.preview ?? newest?.preview ?? old?.preview
                     )
                     continue
                 }
 
-                // No heartbeat for this session: fall back to the file heuristic exactly as
-                // before heartbeats existed.
                 let age = now.timeIntervalSince(modifiedAt)
-                if age > SessionActivityClassifier.idleWindow {
-                    states[path] = SessionActivity(state: .idle, modifiedAt: modifiedAt)
-                    continue
-                }
-
-                let unchanged = known[path] == fingerprint
                 let fileState: SessionRunState
-                let entry: JSONValue?
-                if unchanged {
-                    entry = nil
-                    fileState = SessionActivityClassifier.classify(lastEntry: nil, age: age)
-                } else if tailReads < limit {
-                    tailReads += 1
-                    entry = SessionActivityClassifier.readTail(at: url).flatMap(SessionActivityClassifier.lastEntry(inTail:))
+                if readTail {
                     fileState = SessionActivityClassifier.classify(lastEntry: entry, age: age)
+                } else if let old {
+                    fileState = old.state == .running && age > SessionActivityClassifier.staleNonTerminalWindow
+                        ? .idle : old.state
                 } else {
-                    // Over budget for this tick: keep the last known verdict rather than
-                    // guessing, exactly like the sticky-unknown rule below.
-                    states[path] = previous[path] ?? SessionActivity(state: .unknown, modifiedAt: modifiedAt)
-                    continue
+                    fileState = SessionActivityClassifier.classify(lastEntry: nil, age: age)
                 }
-
-                // Sticky unknown: an ambiguous read never overrides a previously known verdict,
-                // so a throttled tail read or a file mid-write can never look like a flip
-                // between running and idle.
-                let resolved = fileState == .unknown ? (previous[path]?.state ?? .unknown) : fileState
+                let resolved = fileState == .unknown ? (old?.state ?? .unknown) : fileState
                 states[path] = SessionActivity(
                     state: resolved,
                     modifiedAt: modifiedAt,
-                    runningSince: resolved == .running ? (previous[path]?.runningSince ?? modifiedAt) : nil,
-                    lastStopReason: unchanged ? previous[path]?.lastStopReason : SessionActivityClassifier.stopReason(ofLastEntry: entry),
-                    preview: previous[path]?.preview
+                    runningSince: resolved == .running ? (old?.runningSince ?? modifiedAt) : nil,
+                    latestCompletedEntryID: completionID,
+                    lastStopReason: completionStopReason
+                        ?? (readTail ? SessionActivityClassifier.stopReason(ofLastEntry: entry) : old?.lastStopReason),
+                    preview: old?.preview
                 )
             }
-            return (states, stamps)
+            let tracked = Set(paths)
+            var nextHeartbeats = heartbeats.filter { tracked.contains($0.key) }
+            for path in deferredHeartbeatPaths {
+                if let previous = knownHeartbeats[path] { nextHeartbeats[path] = previous }
+            }
+            return (states, stamps, nextHeartbeats, selection.nextCursor)
         }.value
 
         fingerprints = result.1
+        heartbeatSnapshots = result.2
+        fallbackCursor = result.3
         if activities != result.0 { activities = result.0 }
     }
 

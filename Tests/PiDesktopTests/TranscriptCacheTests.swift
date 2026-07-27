@@ -55,6 +55,28 @@ final class TranscriptCacheTests: XCTestCase {
         XCTAssertEqual(hit?.leafID, "sync")
     }
 
+    func testPagedWindowKeepsItsOlderCursor() throws {
+        let url = directory.appendingPathComponent("paged.jsonl")
+        try Data("""
+        {"type":"session","id":"paged"}
+        {"type":"message","id":"one","parentId":null,"message":{"role":"user","content":"one"}}
+        {"type":"message","id":"two","parentId":"one","message":{"role":"assistant","content":"two"}}
+
+        """.utf8).write(to: url)
+        let page = try SessionParser.conversationPage(at: url, target: 1)
+        let fp = try SessionFileFingerprint(
+            url: url,
+            values: url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        )
+        let cache = TranscriptCache()
+
+        cache.store(page, for: url.path, fingerprint: fp)
+
+        let hit = try XCTUnwrap(cache.page(for: url.path, fingerprint: fp))
+        XCTAssertEqual(hit.messages.map(\.id), ["two"])
+        XCTAssertEqual(hit.olderCursor, page.olderCursor)
+    }
+
     func testStaleFingerprintIsAMissNotStaleData() throws {
         // The file changed on disk (still running in a terminal) since it was cached: serving
         // the old parse would show the user out-of-date content.

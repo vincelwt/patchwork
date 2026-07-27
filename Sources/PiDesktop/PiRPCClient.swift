@@ -88,14 +88,23 @@ enum PiLocator {
 }
 
 final class PiRPCClient: PiRuntimeProtocol {
-    var onEvent: ((JSONValue) -> Void)?
-    var onExit: ((String?) -> Void)?
+    private let callbackLock = NSLock()
+    private var eventHandler: ((JSONValue) -> Void)?
+    private var exitHandler: ((String?) -> Void)?
+    var onEvent: ((JSONValue) -> Void)? {
+        get { callbackLock.withLock { eventHandler } }
+        set { callbackLock.withLock { eventHandler = newValue } }
+    }
+    var onExit: ((String?) -> Void)? {
+        get { callbackLock.withLock { exitHandler } }
+        set { callbackLock.withLock { exitHandler = newValue } }
+    }
 
     private let ioQueue = DispatchQueue(label: "dev.pi.desktop.rpc", qos: .userInitiated)
     /// Blocking pipe reads live off the command/state queue. Unlike FileHandle readability
     /// handlers, these do not depend on a GUI app run loop and consume no CPU while idle.
-    private let outputQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stdout", qos: .userInitiated)
-    private let errorQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stderr", qos: .utility)
+    private let outputQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stdout", qos: .userInitiated, attributes: .concurrent)
+    private let errorQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stderr", qos: .utility, attributes: .concurrent)
     private var process: Process?
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
@@ -195,12 +204,29 @@ final class PiRPCClient: PiRuntimeProtocol {
             generationSequence += 1
             generation = RuntimeGeneration(sequence: generationSequence)
             rejectPending(processExitMessage: "Pi was stopped.")
-            cleanupHandles()
+            // Keep retired read descriptors alive until their process closes them. Closing and
+            // immediately spawning can reuse the same descriptor, letting the old blocking read
+            // consume the replacement runtime's first response.
+            try? inputHandle?.close()
+            inputHandle = nil
+            let retiredOutput = outputHandle
+            let retiredError = errorHandle
+            outputHandle = nil
+            errorHandle = nil
             let dying = process
             process = nil
             // SIGTERM is delivered here (off main, before any replacement is spawned);
-            // waiting and SIGKILL escalation continue on the reaper queue.
-            if let dying { PiProcessReaper.reap(dying) }
+            // waiting and SIGKILL escalation continue on the reaper queue. Retired descriptors
+            // close after reaping, so inherited child-process pipes cannot strand reader threads.
+            if let dying {
+                PiProcessReaper.reap(dying) {
+                    try? retiredOutput?.close()
+                    try? retiredError?.close()
+                }
+            } else {
+                try? retiredOutput?.close()
+                try? retiredError?.close()
+            }
         }
     }
 
@@ -255,10 +281,12 @@ final class PiRPCClient: PiRuntimeProtocol {
 
     private func startOutputReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
         outputQueue.async { [weak self] in
+            defer { try? handle.close() }
             while currentGeneration.isValid {
                 guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 64 * 1024) else { return }
+                let eventHandler = self?.onEvent
                 self?.ioQueue.async { [weak self] in
-                    self?.consume(data, generation: currentGeneration)
+                    self?.consume(data, generation: currentGeneration, eventHandler: eventHandler)
                 }
             }
         }
@@ -266,6 +294,7 @@ final class PiRPCClient: PiRuntimeProtocol {
 
     private func startErrorReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
         errorQueue.async { [weak self] in
+            defer { try? handle.close() }
             while currentGeneration.isValid {
                 guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 16 * 1024) else { return }
                 self?.ioQueue.async { [weak self] in
@@ -295,7 +324,11 @@ final class PiRPCClient: PiRuntimeProtocol {
         }
     }
 
-    private func consume(_ data: Data, generation currentGeneration: RuntimeGeneration) {
+    private func consume(
+        _ data: Data,
+        generation currentGeneration: RuntimeGeneration,
+        eventHandler: ((JSONValue) -> Void)?
+    ) {
         // A retired generation's buffered output is dropped rather than published.
         guard currentGeneration.isValid, generation === currentGeneration else { return }
         for record in framer.append(data) {
@@ -311,9 +344,11 @@ final class PiRPCClient: PiRuntimeProtocol {
                     callback(.success(value))
                 }
             } else {
-                DispatchQueue.main.async { [weak self] in
+                // The reader captured the owner with this byte chunk. Rebinding during a
+                // same-process session transition cannot redirect buffered bytes to the new route.
+                DispatchQueue.main.async {
                     guard currentGeneration.isValid else { return }
-                    self?.onEvent?(value)
+                    eventHandler?(value)
                 }
             }
         }

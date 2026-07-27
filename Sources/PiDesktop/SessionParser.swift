@@ -1,5 +1,38 @@
 import Foundation
 
+struct ConversationPageCursor: Hashable, Sendable {
+    fileprivate let sourcePath: String
+    fileprivate let beforeOffset: UInt64
+    fileprivate let expectedID: String?
+    fileprivate let leafID: String?
+}
+
+struct ConversationPage: Sendable {
+    static let defaultMessageTarget = 50
+
+    let messages: [ChatMessage]
+    let olderCursor: ConversationPageCursor?
+    let leafID: String?
+    /// Active-branch JSONL entries traversed while producing this page, including entries that
+    /// intentionally do not render (for example model changes).
+    let rawEntryCount: Int
+    /// Complete JSONL records inspected, including abandoned branches and malformed records.
+    let scannedEntryCount: Int
+    /// File bytes read for this page. This never exceeds `SessionParser.PageLimits.maxScanBytes`.
+    let scannedByteCount: Int
+    /// True when a byte, entry, or single-record cap stopped the scan. A non-nil cursor means the
+    /// bounded scan can continue; nil means an oversized/unrecoverable record blocked it.
+    let isTruncated: Bool
+
+    var hasMoreHistory: Bool { olderCursor != nil }
+    var hasNoMoreHistory: Bool { olderCursor == nil && !isTruncated }
+}
+
+enum ConversationPagingError: Error {
+    case invalidCursor
+    case unsupported
+}
+
 struct SessionParser {
     private struct EntryHeader: Decodable {
         let type: String?
@@ -163,6 +196,38 @@ struct SessionParser {
         return SessionConversation(messages: messages, leafID: lastEntryID, rawEntryCount: rawEntryCount)
     }
 
+    struct AssistantCompletion: Equatable, Sendable {
+        let id: String
+        let stopReason: String
+    }
+
+    static let terminalAssistantStopReasons: Set<String> = ["stop", "length", "error", "aborted"]
+
+    static func terminalAssistantCompletion(from entry: JSONValue?) -> AssistantCompletion? {
+        guard entry?["type"]?.stringValue == "message",
+              let id = entry?["id"]?.stringValue,
+              let message = entry?["message"], message["role"]?.stringValue == "assistant",
+              let stopReason = message["stopReason"]?.stringValue,
+              terminalAssistantStopReasons.contains(stopReason) else { return nil }
+        return AssistantCompletion(id: id, stopReason: stopReason)
+    }
+
+    /// Finds the newest completed assistant answer in a bounded JSONL tail. Pi commits records
+    /// with a trailing newline, so an unterminated final fragment is ignored even if it happens
+    /// to be temporarily decodable while another process is still writing it.
+    static func latestTerminalAssistantCompletion(inTail tail: Data) -> AssistantCompletion? {
+        guard let lastNewline = tail.lastIndex(of: 0x0A) else { return nil }
+        let complete = tail[...lastNewline]
+        for line in complete.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
+            var record = Data(line)
+            if record.last == 0x0D { record.removeLast() }
+            guard let entry = try? JSONValue.decode(record),
+                  let completion = terminalAssistantCompletion(from: entry) else { continue }
+            return completion
+        }
+        return nil
+    }
+
     /// Bytes read backward from EOF for the tail-first preview (Task 1). Large enough that a
     /// realistic tail of `AppStore`'s preview limit almost always resolves from one window,
     /// small enough that even a 25 MB session only ever pays for a few MB of it.
@@ -177,8 +242,8 @@ struct SessionParser {
 
     /// Reconstructs just the tail of the active conversation without reading the rest of the
     /// file, so a cache miss can paint something at the bottom before the full two-pass parse
-    /// (which must still touch the whole file) finishes. Reads one fixed-size window from EOF,
-    /// then walks the real parent-pointer chain backward through it exactly like `conversation
+    /// (which must still touch the whole file) finishes. Reads up to one fixed byte budget from
+    /// EOF, then walks the real parent-pointer chain backward exactly like `conversation
     /// (at:)` walks it forward: a line only counts if it is genuinely on the active path, so an
     /// abandoned branch physically adjacent to the tail (left behind by an earlier edit) is
     /// skipped rather than mistaken for recent history.
@@ -192,57 +257,255 @@ struct SessionParser {
     /// `windowBytes` defaults to `tailScanWindowBytes`; tests inject a tiny window instead of
     /// allocating real megabytes to exercise truncation deterministically.
     static func conversationTail(at url: URL, limit: Int, windowBytes: Int = SessionParser.tailScanWindowBytes) throws -> TailScan {
+        let limits = PageLimits(
+            maxScanBytes: windowBytes,
+            maxEntries: PageLimits.default.maxEntries,
+            maxRecordBytes: min(windowBytes, PageLimits.default.maxRecordBytes),
+            chunkBytes: min(windowBytes, PageLimits.default.chunkBytes)
+        )
+        let page = try conversationPage(at: url, target: limit, limits: limits)
+        return TailScan(
+            conversation: SessionConversation(messages: page.messages, leafID: page.leafID, rawEntryCount: page.rawEntryCount),
+            isComplete: page.hasNoMoreHistory
+        )
+    }
+
+    struct PageLimits: Sendable {
+        static let `default` = PageLimits(
+            maxScanBytes: 64 * 1_024 * 1_024,
+            maxEntries: 20_000,
+            maxRecordBytes: 32 * 1_024 * 1_024,
+            chunkBytes: 256 * 1_024
+        )
+
+        let maxScanBytes: Int
+        let maxEntries: Int
+        let maxRecordBytes: Int
+        let chunkBytes: Int
+
+        init(maxScanBytes: Int, maxEntries: Int, maxRecordBytes: Int, chunkBytes: Int) {
+            self.maxScanBytes = max(1, maxScanBytes)
+            self.maxEntries = max(1, maxEntries)
+            self.maxRecordBytes = max(1, min(maxRecordBytes, maxScanBytes))
+            self.chunkBytes = max(1, min(chunkBytes, maxScanBytes))
+        }
+    }
+
+    /// Reads one active-branch page backward from JSONL record boundaries. Raw records are
+    /// projected one at a time and released; the reverse reader retains at most one bounded
+    /// record plus one bounded I/O chunk.
+    static func conversationPage(
+        at url: URL,
+        cursor: ConversationPageCursor? = nil,
+        target: Int = ConversationPage.defaultMessageTarget,
+        limits: PageLimits = .default
+    ) throws -> ConversationPage {
+        let sourcePath = url.standardizedFileURL.path
+        if let cursor, cursor.sourcePath != sourcePath { throw ConversationPagingError.invalidCursor }
+
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let fileSize = try handle.seekToEnd()
-        guard fileSize > 0 else {
-            return TailScan(conversation: SessionConversation(messages: [], leafID: nil, rawEntryCount: 0), isComplete: true)
-        }
+        let scanEnd = cursor?.beforeOffset ?? fileSize
+        guard scanEnd <= fileSize else { throw ConversationPagingError.invalidCursor }
 
-        let windowSize = min(fileSize, UInt64(windowBytes))
-        let readEntireFile = windowSize == fileSize
-        try handle.seek(toOffset: fileSize - windowSize)
-        let window = try handle.read(upToCount: Int(windowSize)) ?? Data()
-
-        // Split into complete lines. When the window does not start at byte 0, its leading
-        // fragment (before the first newline) is a truncated record and must be discarded.
-        var lines = window.split(separator: 0x0A, omittingEmptySubsequences: true)
-        if !readEntireFile, !lines.isEmpty { lines.removeFirst() }
-
+        var reader = BackwardJSONLReader(handle: handle, endOffset: scanEnd, limits: limits)
         let decoder = JSONDecoder()
-        var expectedID: String?
-        var leafID: String?
-        var sawAnyEntry = false
-        var reachedRoot = false
+        var expectedID = cursor?.expectedID
+        var leafID = cursor?.leafID
         var collected: [ChatMessage] = []
         var budget = ImageBudget()
+        var rawEntryCount = 0
+        var scannedEntryCount = 0
+        var oldestScannedOffset: UInt64?
 
-        for line in lines.reversed() {
-            try Task.checkCancellation()
-            let record = Data(line)
-            guard let header = try? decoder.decode(EntryHeader.self, from: record) else { continue }
-            if header.type == "session" { reachedRoot = true; break }
-            guard let id = header.id else { continue }
-            if sawAnyEntry {
-                guard id == expectedID else { continue } // An abandoned branch, not our path.
-            } else {
-                sawAnyEntry = true
-                leafID = id
-            }
-            if let raw = try? JSONValue.decode(record) {
-                let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
-                if let message = chatMessage(from: entry, budget: &budget) { collected.append(message) }
-            }
-            expectedID = header.parentId
-            guard expectedID != nil else { reachedRoot = true; break }
-            if collected.count >= limit { break }
+        func result(olderCursor: ConversationPageCursor?, truncated: Bool) -> ConversationPage {
+            ConversationPage(
+                messages: Array(collected.reversed()),
+                olderCursor: olderCursor,
+                leafID: leafID,
+                rawEntryCount: rawEntryCount,
+                scannedEntryCount: scannedEntryCount,
+                scannedByteCount: reader.bytesRead,
+                isTruncated: truncated
+            )
         }
 
-        collected.reverse()
-        return TailScan(
-            conversation: SessionConversation(messages: collected, leafID: leafID, rawEntryCount: collected.count),
-            isComplete: reachedRoot
-        )
+        func continuation(before offset: UInt64) -> ConversationPageCursor? {
+            guard offset > 0, expectedID != nil || leafID == nil else { return nil }
+            return ConversationPageCursor(
+                sourcePath: sourcePath,
+                beforeOffset: offset,
+                expectedID: expectedID,
+                leafID: leafID
+            )
+        }
+
+        while scannedEntryCount < limits.maxEntries {
+            try Task.checkCancellation()
+            switch try reader.next() {
+            case let .record(record):
+                scannedEntryCount += 1
+                oldestScannedOffset = record.startOffset
+                guard !record.isOversized else { return result(olderCursor: nil, truncated: true) }
+                guard !record.data.isEmpty,
+                      let header = try? decoder.decode(EntryHeader.self, from: record.data),
+                      header.type != "session", let id = header.id else { continue }
+
+                if let expectedID {
+                    guard id == expectedID else { continue }
+                } else {
+                    leafID = id
+                }
+
+                rawEntryCount += 1
+                autoreleasepool {
+                    guard let raw = try? JSONValue.decode(record.data) else { return }
+                    let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
+                    if let message = chatMessage(from: entry, budget: &budget) { collected.append(message) }
+                }
+                expectedID = header.parentId
+
+                if expectedID == nil { return result(olderCursor: nil, truncated: false) }
+                if collected.count >= max(1, target) {
+                    return result(olderCursor: continuation(before: record.startOffset), truncated: false)
+                }
+
+            case .limitReached:
+                guard let offset = oldestScannedOffset, let older = continuation(before: offset) else {
+                    return result(olderCursor: nil, truncated: true)
+                }
+                return result(olderCursor: older, truncated: true)
+
+            case .startReached:
+                return result(olderCursor: nil, truncated: false)
+            }
+        }
+
+        guard let offset = oldestScannedOffset, let older = continuation(before: offset) else {
+            return result(olderCursor: nil, truncated: true)
+        }
+        return result(olderCursor: older, truncated: true)
+    }
+
+    private struct BackwardRecord {
+        let data: Data
+        let startOffset: UInt64
+        let isOversized: Bool
+    }
+
+    private enum BackwardRead {
+        case record(BackwardRecord)
+        case limitReached
+        case startReached
+    }
+
+    /// Chunked reverse reader. `fragments` only holds the one line crossing chunk boundaries;
+    /// complete lines wait in `pending` for immediate projection and are bounded by one chunk.
+    private struct BackwardJSONLReader {
+        let handle: FileHandle
+        let limits: PageLimits
+        var position: UInt64
+        var bytesRead = 0
+        var sawRightDelimiter = false
+        var fragments: [Data] = []
+        var fragmentBytes = 0
+        var fragmentIsOversized = false
+        var pending: [BackwardRecord] = []
+        var pendingIndex = 0
+        var finished = false
+
+        init(handle: FileHandle, endOffset: UInt64, limits: PageLimits) {
+            self.handle = handle
+            self.position = endOffset
+            self.limits = limits
+        }
+
+        mutating func next() throws -> BackwardRead {
+            while true {
+                if pendingIndex < pending.count {
+                    defer { pendingIndex += 1 }
+                    return .record(pending[pendingIndex])
+                }
+                pending.removeAll(keepingCapacity: true)
+                pendingIndex = 0
+                if finished || position == 0 { return .startReached }
+                guard bytesRead < limits.maxScanBytes else { return .limitReached }
+
+                let count = min(limits.chunkBytes, limits.maxScanBytes - bytesRead, Int(position))
+                let start = position - UInt64(count)
+                try handle.seek(toOffset: start)
+                let chunk = try handle.read(upToCount: count) ?? Data()
+                guard chunk.count == count else { return .limitReached }
+                bytesRead += chunk.count
+                position = start
+                process(chunk, at: start)
+
+                if start == 0 {
+                    if sawRightDelimiter {
+                        let record = makeRecord(prefix: Data(), startOffset: 0)
+                        pending.append(record)
+                    } else {
+                        resetFragments() // The whole file is an unterminated record: ignore it.
+                    }
+                    finished = true
+                }
+            }
+        }
+
+        private mutating func process(_ chunk: Data, at chunkOffset: UInt64) {
+            var upper = chunk.endIndex
+            var index = chunk.endIndex
+            while index > chunk.startIndex {
+                index = chunk.index(before: index)
+                guard chunk[index] == 0x0A else { continue }
+                let afterNewline = chunk.index(after: index)
+                let part = chunk[afterNewline..<upper]
+                let startOffset = chunkOffset + UInt64(afterNewline - chunk.startIndex)
+                if sawRightDelimiter {
+                    let record = makeRecord(prefix: part, startOffset: startOffset)
+                    pending.append(record)
+                } else {
+                    // Bytes after the file's last LF are a torn record and remain invisible until
+                    // a later retry sees their terminating LF.
+                    sawRightDelimiter = true
+                    resetFragments()
+                }
+                upper = index
+            }
+            appendFragment(chunk[chunk.startIndex..<upper])
+        }
+
+        private mutating func appendFragment(_ fragment: Data.SubSequence) {
+            guard !fragment.isEmpty, !fragmentIsOversized else { return }
+            guard fragmentBytes + fragment.count <= limits.maxRecordBytes else {
+                fragments.removeAll(keepingCapacity: false)
+                fragmentBytes = 0
+                fragmentIsOversized = true
+                return
+            }
+            fragments.append(Data(fragment))
+            fragmentBytes += fragment.count
+        }
+
+        private mutating func makeRecord(prefix: Data.SubSequence, startOffset: UInt64) -> BackwardRecord {
+            let oversized = fragmentIsOversized || prefix.count + fragmentBytes > limits.maxRecordBytes
+            var data = Data()
+            if !oversized {
+                data.reserveCapacity(prefix.count + fragmentBytes)
+                data.append(contentsOf: prefix)
+                for fragment in fragments.reversed() { data.append(fragment) }
+                if data.last == 0x0D { data.removeLast() }
+            }
+            resetFragments()
+            return BackwardRecord(data: data, startOffset: startOffset, isOversized: oversized)
+        }
+
+        private mutating func resetFragments() {
+            fragments.removeAll(keepingCapacity: false)
+            fragmentBytes = 0
+            fragmentIsOversized = false
+        }
     }
 
     static func chatMessages(fromRPCMessages value: JSONValue?) -> [ChatMessage] {
@@ -319,6 +582,7 @@ struct SessionParser {
             details: message["details"]?.boundedProjection(),
             usage: message["usage"]?.boundedProjection(),
             modelName: message["model"]?.stringValue,
+            stopReason: message["stopReason"]?.stringValue,
             raw: role == .unknown ? message.boundedFallback(maxLength: PiTheme.unknownPayloadLimit) : .null
         )
     }

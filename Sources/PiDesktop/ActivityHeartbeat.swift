@@ -14,6 +14,7 @@ struct ActivityHeartbeat: Decodable, Equatable, Sendable {
     var updatedAt: String
     var preview: String?
     var stopReason: String?
+    var completionId: String? = nil
 
     /// The session JSONL path this heartbeat describes, reconstructed from `sessionDir` + id
     /// when the extension could not resolve a concrete file (an in-memory session).
@@ -56,10 +57,70 @@ enum ActivityHeartbeatClassifier {
     }
 }
 
+/// Reuses decoded heartbeats until their file fingerprint changes. A busy day can leave hundreds
+/// of idle writers in this directory; decoding all of them every two seconds is wasted CPU.
+private final class ActivityHeartbeatFileCache: @unchecked Sendable {
+    private struct Fingerprint: Equatable {
+        let inode: UInt64
+        let modifiedAt: TimeInterval
+        let size: Int64
+    }
+    private struct Entry {
+        let fingerprint: Fingerprint
+        let heartbeat: ActivityHeartbeat?
+    }
+
+    private let lock = NSLock()
+    private var directoryPath: String?
+    private var entries: [String: Entry] = [:]
+
+    func scan(directory: URL, limit: Int) -> [String: [ActivityHeartbeat]] {
+        let path = directory.standardizedFileURL.path
+        lock.lock()
+        defer { lock.unlock() }
+        if directoryPath != path {
+            directoryPath = path
+            entries.removeAll(keepingCapacity: false)
+        }
+        guard let listedFiles = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [:] }
+
+        let files = Array(listedFiles.prefix(limit).filter { $0.pathExtension == "json" })
+        let livePaths = Set(files.map { $0.standardizedFileURL.path })
+        entries = entries.filter { livePaths.contains($0.key) }
+        var result: [String: [ActivityHeartbeat]] = [:]
+        for url in files {
+            let filePath = url.standardizedFileURL.path
+            var info = stat()
+            guard fstatat(AT_FDCWD, filePath, &info, 0) == 0 else { continue }
+            let fingerprint = Fingerprint(
+                inode: UInt64(info.st_ino),
+                modifiedAt: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000,
+                size: Int64(info.st_size)
+            )
+            let heartbeat: ActivityHeartbeat?
+            if let cached = entries[filePath], cached.fingerprint == fingerprint {
+                heartbeat = cached.heartbeat
+            } else {
+                heartbeat = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(ActivityHeartbeat.self, from: $0) }
+                entries[filePath] = Entry(fingerprint: fingerprint, heartbeat: heartbeat)
+            }
+            if let heartbeat, let sessionPath = heartbeat.resolvedSessionPath {
+                result[sessionPath, default: []].append(heartbeat)
+            }
+        }
+        return result
+    }
+}
+
 /// Reads the small heartbeat directory. One file per recently-active session in practice, so a
 /// full directory scan every tick is cheap; still bounded defensively against a runaway count.
 enum ActivityHeartbeatStore {
     static let maxFilesPerScan = 500
+    private static let cache = ActivityHeartbeatFileCache()
 
     static func defaultDirectory() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -70,17 +131,6 @@ enum ActivityHeartbeatStore {
     /// session, so each writer is retained; the monitor reports running when any writer is live.
     /// A missing directory (extension never installed, nothing has run yet) is simply empty.
     static func scan(directory: URL) -> [String: [ActivityHeartbeat]] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
-        ) else { return [:] }
-
-        var result: [String: [ActivityHeartbeat]] = [:]
-        for url in entries.prefix(maxFilesPerScan) where url.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: url),
-                  let heartbeat = try? JSONDecoder().decode(ActivityHeartbeat.self, from: data),
-                  let path = heartbeat.resolvedSessionPath else { continue }
-            result[path, default: []].append(heartbeat)
-        }
-        return result
+        cache.scan(directory: directory, limit: maxFilesPerScan)
     }
 }

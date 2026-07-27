@@ -1,7 +1,6 @@
 import Foundation
 
-/// Aggregate ceiling for images admitted while projecting one conversation (session file
-/// replay or an RPC `get_messages` hydration).
+/// Aggregate ceiling for images admitted while projecting one conversation from its session file.
 ///
 /// The budget is consulted with the *encoded* (base64) length so an oversized payload is
 /// rejected before `Data(base64Encoded:)` ever materialises it, and both a count and a

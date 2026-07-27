@@ -15,6 +15,10 @@ struct ConversationView: View {
     /// Bumped whenever the last message's edit affordance fires, so the composer (which owns the
     /// actual `NSTextView`) knows to reclaim first responder after its content is replaced.
     @State private var composerFocusTick = 0
+    /// In-memory only: recent routes reopen at the row the user was reading. The transcript page
+    /// cache carries the matching rows; both structures stay bounded.
+    @State private var scrollAnchors: [String: String] = [:]
+    @State private var scrollAnchorOrder: [String] = []
 
     var body: some View {
         GeometryReader { proxy in
@@ -172,11 +176,7 @@ struct ConversationView: View {
     @ViewBuilder
     private var messageArea: some View {
         if store.isConversationLoading && store.messages.isEmpty {
-            VStack(spacing: PiTheme.space8) {
-                ProgressView().controlSize(.small)
-                Text("Loading conversation…").font(PiFont.caption).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            DelayedConversationLoadingView()
         } else if let error = store.conversationError {
             PiUnavailableView(
                 "Couldn’t open this session",
@@ -195,15 +195,30 @@ struct ConversationView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
+            let path = store.selectedSession?.fileURL.standardizedFileURL.path ?? "new-chat"
             MessageScrollView(
                 messages: store.messages,
                 streaming: store.streamingMessage,
                 isRunning: conversationIsRunning,
+                restoredAnchorID: scrollAnchors[path],
+                unseenMessageID: store.initialScrollTargetMessageID,
+                onVisibleAnchorChange: { rememberScrollAnchor($0, for: path) },
                 onEditLastMessage: {
                     store.beginEditingLastMessage()
                     composerFocusTick += 1
                 }
             )
+            .id(store.route)
+        }
+    }
+
+    private func rememberScrollAnchor(_ anchor: String, for path: String) {
+        guard scrollAnchors[path] != anchor else { return }
+        scrollAnchors[path] = anchor
+        scrollAnchorOrder.removeAll { $0 == path }
+        scrollAnchorOrder.append(path)
+        while scrollAnchorOrder.count > 32 {
+            scrollAnchors.removeValue(forKey: scrollAnchorOrder.removeFirst())
         }
     }
 }
@@ -214,22 +229,24 @@ struct MessageScrollView: View {
     let streaming: ChatMessage?
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
+    let restoredAnchorID: String?
+    let unseenMessageID: String?
+    let onVisibleAnchorChange: (String) -> Void
     /// Wired only to the conversation's single most recent user message; every earlier turn's
     /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
     var onEditLastMessage: (() -> Void)?
     @State private var scrollTask: Task<Void, Never>?
-    /// Tracked by a bottom sentinel appearing/disappearing, which works on macOS 14 without
-    /// scroll-position APIs. Auto-scroll only happens while the user is pinned at the bottom.
     @State private var isPinnedToBottom = true
-    /// This view instance can outlive a single conversation: switching from one already-loaded
-    /// session straight to another never leaves the `else` branch in `messageArea`, so SwiftUI
-    /// reuses the same `MessageScrollView` rather than remounting it. These two let the scroll
-    /// handler tell "a different conversation just replaced this one" (always snap to bottom)
-    /// apart from "the same conversation grew" (animate a genuine live append, but snap when
-    /// Task 1's tail-first backfill only prepends earlier history above an unchanged tail).
-    @State private var loadedRouteKey: AppRoute?
-    @State private var lastKnownTailID: String?
+    @State private var scrollBridge = ConversationScrollBridge()
+    @State private var prependPending = false
+    @State private var didRestoreInitialAnchor = false
+    @State private var didMarkFirstTextPaint = false
     private let bottomID = "conversation-bottom"
+    private let coordinateSpaceName = "conversation-scroll"
+
+    private var defaultScrollAnchor: UnitPoint {
+        unseenMessageID != nil || (restoredAnchorID != nil && restoredAnchorID != bottomID) ? .top : .bottom
+    }
 
     private var transcriptItems: [TranscriptItem] {
         TranscriptPresenter.items(
@@ -247,99 +264,112 @@ struct MessageScrollView: View {
     }
 
     /// An image can arrive inside an existing work block without changing the transcript count.
-    private var prominentImageIDs: [String] {
-        transcriptItems.flatMap { item -> [String] in
+    private func prominentImageIDs(in items: [TranscriptItem]) -> [String] {
+        items.flatMap { item -> [String] in
             guard case let .work(block) = item else { return [] }
             return block.prominentSteps.flatMap { $0.result?.images.map(\.id) ?? [] }
         }
     }
 
     var body: some View {
+        let items = transcriptItems
+        let imageIDs = prominentImageIDs(in: items)
         ScrollViewReader { reader in
             ScrollView {
                 // A single small gap between entries keeps consecutive tool rows on an even
                 // rhythm; paragraphs get their breathing room from the block renderer.
                 LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                    ForEach(transcriptItems) { item in
-                        switch item {
-                        case let .message(message, isStreaming):
-                            MessageView(
-                                message: message,
-                                isStreaming: isStreaming,
-                                onImage: store.showImage,
-                                showsActions: true,
-                                onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
+                    if store.isLoadingEarlierMessages {
+                        ProgressView().controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel("Loading earlier messages")
+                    } else if store.hasEarlierMessages {
+                        Button("Load earlier messages", action: requestEarlierMessages)
+                            .buttonStyle(.plain)
+                            .font(PiFont.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                    } else if store.conversationHistoryLimitReached {
+                        Text("Earlier history is outside this bounded window.")
+                            .font(PiFont.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                    }
+
+                    ForEach(items) { item in
+                        Group {
+                            switch item {
+                            case let .message(message, isStreaming):
+                                MessageView(
+                                    message: message,
+                                    isStreaming: isStreaming,
+                                    onImage: store.showImage,
+                                    showsActions: true,
+                                    onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
+                                )
+                                .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
+                            case let .work(block):
+                                TranscriptWorkView(block: block, onImage: store.showImage)
+                                    .padding(.top, PiTheme.space6)
+                            case let .compaction(note):
+                                CompactionRowView(note: note)
+                                    .padding(.vertical, PiTheme.space6)
+                            }
+                        }
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: TranscriptRowFramesKey.self,
+                                    value: [item.id: proxy.frame(in: .named(coordinateSpaceName))]
+                                )
+                            }
+                        )
+                        .id(item.id)
+                        .onAppear {
+                            guard !didMarkFirstTextPaint else { return }
+                            didMarkFirstTextPaint = true
+                            ConversationPerformance.mark(
+                                "Conversation first text paint",
+                                path: store.selectedSession?.fileURL.path ?? "new-chat",
+                                count: items.count
                             )
-                            .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
-                                .id(item.id)
-                        case let .work(block):
-                            TranscriptWorkView(block: block, onImage: store.showImage)
-                                .padding(.top, PiTheme.space6)
-                                .id(item.id)
-                        case let .compaction(note):
-                            CompactionRowView(note: note)
-                                .padding(.vertical, PiTheme.space6)
-                                .id(item.id)
                         }
                     }
-                    Color.clear
-                        .frame(height: 1)
-                        .id(bottomID)
-                        .onAppear { isPinnedToBottom = true }
-                        .onDisappear { isPinnedToBottom = false }
+                    Color.clear.frame(height: 1).id(bottomID)
                 }
                 .padding(.top, PiTheme.space24)
                 .padding(.bottom, PiTheme.space8)
-                // Frame the transcript content first, then add the same outer gutter as the
-                // composer. This makes their visible left/right edges identical at every width.
                 .frame(maxWidth: PiTheme.transcriptMaxWidth, alignment: .leading)
                 .padding(.horizontal, PiTheme.space20)
                 .frame(maxWidth: .infinity)
+                .background(
+                    ConversationScrollObserver(bridge: scrollBridge) { metrics in
+                        handleScrollMetrics(metrics)
+                    }
+                )
             }
+            // Native initial anchoring prevents a top-frame flash before any scrollTo callback.
+            .defaultScrollAnchor(defaultScrollAnchor)
+            .coordinateSpace(name: coordinateSpaceName)
             .scrollDismissesKeyboard(.interactively)
-            .onAppear {
-                isPinnedToBottom = true
-                loadedRouteKey = store.route
-                lastKnownTailID = transcriptItems.last?.id
-                reader.scrollTo(bottomID, anchor: .bottom)
+            .onAppear { restoreInitialAnchorIfPossible(items: items, reader: reader) }
+            .onChange(of: messages.first?.id) { _, _ in
+                restoreInitialAnchorIfPossible(items: items, reader: reader)
             }
-            .onChange(of: store.route) { _, newRoute in
-                // A different conversation was just selected: always resume at the bottom,
-                // ignoring whatever scroll position the previous conversation was left at, and
-                // never animate a jump the user did not cause (Task 1).
-                loadedRouteKey = newRoute
-                lastKnownTailID = transcriptItems.last?.id
-                isPinnedToBottom = true
-                reader.scrollTo(bottomID, anchor: .bottom)
+            .onChange(of: messages.last?.id) { _, _ in scheduleBottomScroll(reader) }
+            .onChange(of: streaming?.textContent.count ?? 0) { _, _ in scheduleBottomScroll(reader) }
+            .onChange(of: imageIDs) { _, _ in scheduleBottomScroll(reader) }
+            // Only when already pinned: a question appearing must never yank a user reading history.
+            .onChange(of: questionnaireKey) { _, _ in scheduleBottomScroll(reader) }
+            .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
+                guard wasLoading, !isLoading, prependPending else { return }
+                scrollBridge.restoreAfterPrepend()
+                prependPending = false
             }
-            .onChange(of: transcriptItems.count) { _, _ in
-                // A route change above already snapped to the bottom for this same swap; do not
-                // also animate here just because the message count happened to change too.
-                guard loadedRouteKey == store.route else { return }
-                guard isPinnedToBottom else {
-                    lastKnownTailID = transcriptItems.last?.id
-                    return
-                }
-                let tailChanged = transcriptItems.last?.id != lastKnownTailID
-                lastKnownTailID = transcriptItems.last?.id
-                if tailChanged {
-                    withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
-                } else {
-                    // Same tail, more (earlier) history filled in above it — Task 1's cache-miss
-                    // backfill. Snap instantly: nothing the user is looking at should move.
-                    reader.scrollTo(bottomID, anchor: .bottom)
-                }
-            }
-            .onChange(of: streaming?.textContent.count ?? 0) { _, _ in
-                scheduleBottomScroll(reader)
-            }
-            .onChange(of: prominentImageIDs) { _, _ in
-                scheduleBottomScroll(reader)
-            }
-            // Only when already pinned (`scheduleBottomScroll` checks): a question appearing must
-            // never yank a user who is reading history back to the bottom.
-            .onChange(of: questionnaireKey) { _, _ in
-                scheduleBottomScroll(reader)
+            .onPreferenceChange(TranscriptRowFramesKey.self) { frames in
+                guard !isPinnedToBottom,
+                      let top = frames.filter({ $0.value.maxY > 0 }).min(by: { $0.value.minY < $1.value.minY }) else { return }
+                onVisibleAnchorChange(top.key)
             }
             .onDisappear { scrollTask?.cancel() }
             .overlay(alignment: .bottom) {
@@ -347,6 +377,7 @@ struct MessageScrollView: View {
                     Button {
                         scrollTask?.cancel()
                         isPinnedToBottom = true
+                        onVisibleAnchorChange(bottomID)
                         withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
                     } label: {
                         Label("Jump to latest", systemImage: "arrow.down")
@@ -365,6 +396,40 @@ struct MessageScrollView: View {
         }
     }
 
+    private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
+        if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
+        if metrics.isNearBottom { onVisibleAnchorChange(bottomID) }
+        if metrics.direction == .up, metrics.isNearTop { requestEarlierMessages() }
+    }
+
+    private func requestEarlierMessages() {
+        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !prependPending else { return }
+        prependPending = true
+        scrollBridge.captureBeforePrepend()
+        store.loadEarlierMessages()
+    }
+
+    private func restoreInitialAnchorIfPossible(items: [TranscriptItem], reader: ScrollViewProxy) {
+        guard !didRestoreInitialAnchor else { return }
+        let target: String?
+        if let unseenMessageID {
+            target = items.first(where: { $0.sourceMessageID == unseenMessageID })?.id
+            guard target != nil else { return }
+        } else if let restoredAnchorID,
+                  restoredAnchorID == bottomID || items.contains(where: { $0.id == restoredAnchorID }) {
+            target = restoredAnchorID
+        } else {
+            target = nil
+        }
+        didRestoreInitialAnchor = true
+        guard let target else { return }
+        DispatchQueue.main.async {
+            reader.scrollTo(target, anchor: target == bottomID ? .bottom : .top)
+            if unseenMessageID != nil { store.consumeInitialScrollTarget() }
+            ConversationPerformance.mark("Conversation anchor restore", path: store.selectedSession?.fileURL.path ?? "new-chat")
+        }
+    }
+
     private func scheduleBottomScroll(_ reader: ScrollViewProxy) {
         guard isPinnedToBottom else { return }
         scrollTask?.cancel()
@@ -373,6 +438,35 @@ struct MessageScrollView: View {
             guard !Task.isCancelled, isPinnedToBottom else { return }
             reader.scrollTo(bottomID, anchor: .bottom)
         }
+    }
+}
+
+private struct DelayedConversationLoadingView: View {
+    @State private var isVisible = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            if isVisible {
+                VStack(spacing: PiTheme.space8) {
+                    ProgressView().controlSize(.small)
+                    Text("Opening conversation…").font(PiFont.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task {
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+            isVisible = true
+        }
+    }
+}
+
+private struct TranscriptRowFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

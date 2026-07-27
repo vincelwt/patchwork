@@ -283,17 +283,52 @@ extension AppPersistence {
         }
     }
 
-    func markSessionRead(path: String, at date: Date) {
+    /// Returns true only when this is a different completion from the last one persisted.
+    @discardableResult
+    func observeCompletedEntry(
+        path: String, completionID: String, modifiedAt: Date, markSeen: Bool
+    ) -> Bool {
         let key = URL(fileURLWithPath: path).standardizedFileURL.path
-        updateState {
-            $0.lastReadAt[key] = date
-            $0.manuallyUnreadSessionPaths.remove(key)
+        let previous = state.latestCompletedEntryIDBySessionPath[key]
+        updateState { state in
+            if previous == nil, let legacyReadAt = state.lastReadAt[key], modifiedAt <= legacyReadAt {
+                state.lastSeenCompletedEntryIDBySessionPath[key] = completionID
+            }
+            state.lastReadAt.removeValue(forKey: key)
+            state.latestCompletedEntryIDBySessionPath[key] = completionID
+            if markSeen { state.lastSeenCompletedEntryIDBySessionPath[key] = completionID }
+            state.pruneCompletionState(preferredPath: key)
+        }
+        return previous != completionID
+    }
+
+    func markSessionRead(path: String, completionID: String?) {
+        let key = URL(fileURLWithPath: path).standardizedFileURL.path
+        updateState { state in
+            state.lastReadAt.removeValue(forKey: key)
+            if let completionID {
+                state.latestCompletedEntryIDBySessionPath[key] = completionID
+                state.lastSeenCompletedEntryIDBySessionPath[key] = completionID
+                state.pruneCompletionState(preferredPath: key)
+            }
+            state.manuallyUnreadSessionPaths.remove(key)
         }
     }
 
     func markSessionUnread(path: String) {
         let key = URL(fileURLWithPath: path).standardizedFileURL.path
         updateState { $0.manuallyUnreadSessionPaths.insert(key) }
+    }
+
+    func pruneCompletionState(retainingSessionPaths paths: [String]) {
+        let normalized = Set(paths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        var pruned = state
+        pruned.pruneCompletionState(retaining: normalized)
+        guard pruned.latestCompletedEntryIDBySessionPath != state.latestCompletedEntryIDBySessionPath
+                || pruned.lastSeenCompletedEntryIDBySessionPath != state.lastSeenCompletedEntryIDBySessionPath
+                || pruned.lastReadAt != state.lastReadAt
+                || pruned.manuallyUnreadSessionPaths != state.manuallyUnreadSessionPaths else { return }
+        updateState { $0 = pruned }
     }
 }
 
@@ -364,7 +399,10 @@ extension AppStore {
     }
 
     func markRead(_ session: SessionSummary) {
-        persistence.markSessionRead(path: session.fileURL.path, at: liveModifiedAt(session))
+        let path = session.fileURL.standardizedFileURL.path
+        let completionID = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+            ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
+        persistence.markSessionRead(path: path, completionID: completionID)
         objectWillChange.send()
     }
 
@@ -374,12 +412,12 @@ extension AppStore {
     }
 
     func isUnread(_ session: SessionSummary) -> Bool {
-        if isRunning(session) { return false }
         let path = session.fileURL.standardizedFileURL.path
         if persistence.state.manuallyUnreadSessionPaths.contains(path) { return true }
-        if selectedSession?.id == session.id { return false }
-        guard let viewed = persistence.state.lastReadAt[path] else { return true }
-        return liveModifiedAt(session) > viewed
+        if selectedSession?.fileURL.standardizedFileURL.path == path { return false }
+        guard let latest = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+                ?? persistence.state.latestCompletedEntryIDBySessionPath[path] else { return false }
+        return persistence.state.lastSeenCompletedEntryIDBySessionPath[path] != latest
     }
 
     /// Free global shortcut: Option-Command-U marks the selected conversation unread.

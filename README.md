@@ -10,15 +10,15 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a reserved Environment inspector column
 - App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
 - Codex-style turns: streamed reasoning stays visible, tool calls roll up into fading live activity, and the work log smoothly collapses into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
-- Independent live runtimes per working conversation, so starting or revisiting another task never stops the runs already in progress
+- Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
-- Run state verified against a small Pi extension (`pi-desktop-activity`) that reports each process's running/idle state directly, so an idle RPC attachment cannot hide a terminal still working; finished or killed terminal turns stop showing as running without flicker and their unread dots appear only after idle; sessions without the extension fall back to a file heuristic
+- Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
-- Recent conversations and the sidebar neighbours of the one you have open are prefetched into a bounded in-memory cache, so reopening them is instant instead of re-parsing
+- Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening shows the latest 50 messages and scrolling upward pages through the active JSONL branch without an eager full-history parse
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
-- Messages appear in the transcript immediately on Send, while Pi RPC startup and history hydration continue in the background
+- Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape stops a running turn only when an app-held message is queued, promoting it to the follow-up that continues; double-Escape clears that queue and fully stops the run.
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
@@ -79,8 +79,10 @@ for specialized subagent jobs or when the service is off.
 Run state and thread-to-automation routing come from a small Pi extension the app installs into
 `~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes one heartbeat per process to
 `~/.pi/agent/desktop-activity/<sessionId>-<pid>.json`; a session counts as running when any
-heartbeat says so, is fresher than ten seconds, and its process is still alive. Sessions started
-before the extension existed fall back to a bounded file heuristic. Opt out with
+heartbeat says so, is fresher than ten seconds, and its process is still alive. The same heartbeat
+carries a stable terminal assistant entry ID, which drives unread dots and exactly-once completion
+notifications even when file mtimes collide. Sessions started before the extension existed fall
+back to a bounded file heuristic. Opt out with
 `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
 
 ## Run during development
@@ -124,7 +126,7 @@ passes). Pi and Node are intentionally not bundled.
 | `⌘K` | Quick switch |
 | `⌥⌘S` | Automations page |
 | `⌘R` | Refresh sessions and cached Git state |
-| `⌘.` | Stop the active Pi run |
+| `⌘.` | Abort the active turn |
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |
 
@@ -133,14 +135,14 @@ While Pi is running, the delivery menu explicitly offers **Steer current run** a
 ## Architecture
 
 - **`FileSessionRepository` / `SessionSummaryCache`** — discovers direct project session files, excludes nested subagent sessions, and maintains a versioned atomic cache keyed by standardized path, file size, and modification time. Archive flags are applied after lookup; missing files are pruned.
-- **`SessionParser`** — summary projection plus a two-pass conversation parser. The first pass retains only entry identity/parent/type; the second decodes only the final active chain. Known messages discard duplicate raw JSON/base64 trees after projection; unknown fallbacks are bounded strings. `conversationTail` reconstructs just the trailing messages by reading one bounded window backward from EOF and walking the same parent-pointer chain in reverse, so opening a large session can paint its tail before the full file has even been read.
-- **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of parsed transcripts, warmed on launch and around the selected session, never persisted. Lock-protected rather than actor-isolated so a hit resolves with no `await`, letting `AppStore.selectSession` publish a cached transcript in the same tick as the selection instead of flashing a loading state first.
-- **`PiRuntimeProtocol` / `PiRPCClient`** — one subprocess, strict LF JSONL framing, correlated commands, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
+- **`SessionParser`** — bounded reverse JSONL paging over the final active parent chain. The newest and older-page APIs project 50 messages at a time, ignore an unterminated final line until its LF arrives, traverse compaction/branch entries without retaining raw history, and cap each scan at 64 MiB / 20,000 records with a 32 MiB single-record ceiling. Legacy full parsing remains only for compatibility and diagnostics, not conversation opening.
+- **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of projected page windows and their older cursors, warmed on launch and around the selected session, never persisted. Lock protection keeps a hit synchronous so selection can publish it in the same tick.
+- **`PiRuntimeProtocol` / `PiRPCClient`** — strict LF JSONL framing, correlated commands, same-folder idle-process session switching, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, exact small untracked-text LOC classification, and linked-worktree detection (`git rev-parse --git-dir` vs `--git-common-dir`, detailed via `git worktree list --porcelain`).
-- **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run-state detection. The bundled `pi-desktop-activity` extension (installed into `~/.pi/agent/extensions/`) reports each process's running/idle state via a small heartbeat file; the monitor reports running when any fresh heartbeat's pid is alive, and falls back to a file-mtime-and-tail heuristic otherwise. An ambiguous read never overrides an already-known verdict.
-- **`ActivityPresenting` / `ActivityPresenter`** — stable process/run identity where Pi provides `processId`, `runId`, or `id`.
-- **`AppStore`** — main-actor route/RPC coordinator, cancellable generation-checked conversation loading, draft rollback and crash-mid-turn retry, queue state, bounded extension state, background prefetch, and modest active-app Git refresh.
-- **SwiftUI views** — `LazyVStack` history plus a separate streaming row and bottom sentinel; disclosure details format only when expanded. `NativeComposerTextView` supplies Return/Shift-Return and paste/drop semantics.
+- **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run and completion detection. Heartbeats carry the active branch's latest terminal assistant entry ID; unchanged files reuse decoded records and settled idle paths skip repeat work. A bounded tail fallback safely ignores torn writes. One monitor polls every 2 seconds while active and 15 seconds in the background, round-robins at most 64 heartbeat-free file stats, and performs at most 16 tail reads per tick.
+- **`ActivityPresenting` / `ActivityPresenter`** — stable process/run identity where Pi provides `processId`, `runId`, or `id`; history projection runs off the main actor.
+- **`AppStore`** — main-actor route/RPC coordinator, path-based route identity, generation-checked page loading/prepending, completion cursors, terminal-answer durability overlays, draft rollback, process reuse/leases, queue state, and bounded prefetch.
+- **SwiftUI/AppKit views** — `LazyVStack` history uses durable row IDs, native bottom anchoring, real clip-view geometry for pin detection, and height-delta preservation while prepending. Settled answer TextKit sizing is synchronous on the first layout pass. `NativeComposerTextView` supplies Return/Shift-Return and paste/drop semantics.
 
 App-owned archive and recent-folder metadata lives at:
 
@@ -157,22 +159,25 @@ The summary index lives under:
 Activity heartbeats (app/extension-owned, never Pi session data) live under:
 
 ```text
-~/.pi/agent/desktop-activity/<sessionId>.json
+~/.pi/agent/desktop-activity/<sessionId>-<pid>.json
 ```
 
 Archiving never moves or edits a Pi JSONL file.
 
 ## Performance and memory
 
-- Warm scans do not reparse unchanged JSONL files.
-- Rapid route changes cancel the previous file read, release old message/activity/image state, and reject stale publications.
-- Abandoned branches are not retained as full JSON. Known projected messages do not retain a duplicate raw payload.
+- Warm scans do not reparse unchanged JSONL files; warm page hits publish synchronously.
+- Cold opens read the newest 50 active-branch messages only. Older pages load on upward intent, prepend without moving the viewport, and stop retaining at 1,000 displayed messages.
+- Rapid route changes cancel newest-page, older-page, and activity-projection work and reject stale publications.
+- Abandoned branches and raw/base64 trees are not retained. A torn final JSONL line is invisible until complete.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
-- Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; auto-scroll is coalesced.
+- Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; auto-scroll is coalesced and runs only while native viewport geometry says the reader is pinned.
 - Git refresh pauses while the app is inactive, refreshes the selected folder at a modest interval, and avoids a full session rescan/reload after every settled turn. A folder shown only as the passive pre-selection default (not yet chosen by the user, and not backing any real session) never triggers a refresh at all, so a fresh launch never touches a TCC-protected folder like Desktop just to draw the New Chat screen.
 - Image imports are limited to 8 images, 16 MB each and 64 MB total, with decoded `NSImage` reuse.
-- The transcript cache bounds both entry count and estimated byte cost (text length plus already-budgeted image bytes), evicting least-recently-used entries first.
-- Opening a conversation never shows a spinner before something the cache already knows: a synchronous cache hit publishes the transcript, already scrolled to the bottom, with no intermediate state at all. A cold miss paints the tail (read backward from EOF, independent of total file size) immediately, still pinned to the bottom, while the full parse fills in earlier history in the background without moving the scroll position or animating.
+- The transcript cache bounds both entry count and estimated byte cost (text plus already-budgeted image bytes), evicting least-recently-used windows first.
+- Opening uses SwiftUI's native bottom anchor instead of a post-paint jump. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
+- Instruments points-of-interest mark newest-page read, first publish, first text paint, activity projection, prepend, viewport restore, RPC ready, and first model output.
+- The current 25.8 MiB largest-session gate reads its newest page in about 32 ms (5.5 MiB scanned) versus about 1.05 s for the legacy full parse, so no sidecar index is justified yet; add one only if measured page latency stops meeting the sub-50 ms target.
 
 ## Verification
 
@@ -182,8 +187,8 @@ swift test
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, active-branch reconstruction, large abandoned image/payload exclusion, no duplicate known-message raw tree, versioned summary-cache warm hits/invalidation/pruning, direct-session discovery, exact Git LOC/empty-text classification, turn/work-log projection, folder-tree nesting and cycle rejection, draft persistence and eviction, activity-heartbeat freshness/staleness/dead-pid classification and its file-heuristic fallback, sticky-unknown run state, transcript-cache eviction and synchronous-hit behavior, tail-first scan correctness (abandoned-branch skipping, window truncation), linked-worktree detection against both literal porcelain fixtures and a real repository, crash/outcome-unknown RPC classification and single-shot draft retry, notification triggers/coalescing/preview text, extension-notice toast filtering, safe folder defaults, `/limits` parsing, and an installed-Pi `get_state` smoke test that never prompts a provider. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan, which also prints cache-hit/tail-scan/full-parse timings for the largest installed session.
+Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
 
 ## Current limitations
 
-Pi Desktop intentionally owns one RPC subprocess at a time. An idle runtime can switch sessions for rename/send, but a different actively running conversation must settle or be stopped first. The inspector hides at narrow detail widths, shows a worktree row only when the session's cwd resolves to a linked worktree, and Git row indicators use the most recently cached per-folder snapshot rather than continuously polling every project.
+Pi Desktop keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed transcript window retains at most 1,000 messages; a page scan reports an explicit bounded-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.

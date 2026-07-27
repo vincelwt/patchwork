@@ -63,6 +63,8 @@ struct NotificationCoalescer {
     private var recent: [Date] = []
 
     mutating func shouldEmit(sessionKey: String, now: Date = Date()) -> Bool {
+        let retention = max(perSessionWindow, burstWindow)
+        lastEmitted = lastEmitted.filter { now.timeIntervalSince($0.value) < retention }
         if let last = lastEmitted[sessionKey], now.timeIntervalSince(last) < perSessionWindow { return false }
         recent.removeAll { now.timeIntervalSince($0) >= burstWindow }
         guard recent.count < burstLimit else { return false }

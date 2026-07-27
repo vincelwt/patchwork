@@ -123,10 +123,10 @@ final class AutomationsNavigationTests: XCTestCase {
         store.schedulesPresented = true
         store.selectSession(session)
         XCTAssertFalse(store.schedulesPresented, "Selecting a conversation leaves the Automations page")
-        XCTAssertEqual(store.route, .session("thread"))
+        XCTAssertEqual(store.route, .session(file.standardizedFileURL.path))
 
         store.schedulesPresented = true
-        XCTAssertEqual(store.route, .session("thread"), "Visiting Automations never changes the route")
+        XCTAssertEqual(store.route, .session(file.standardizedFileURL.path), "Visiting Automations never changes the route")
 
         store.openNewChat()
         XCTAssertFalse(store.schedulesPresented, "New chat leaves the Automations page")

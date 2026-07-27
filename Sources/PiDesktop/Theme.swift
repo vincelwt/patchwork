@@ -77,6 +77,7 @@ enum PiTheme {
     static let transcriptRowSpacing: CGFloat = 6
     static let transcriptEntrySpacing: CGFloat = 12
     static let transcriptTurnSpacing: CGFloat = 24
+    static let transcriptScrollEdgeThreshold: CGFloat = 80
 
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5
@@ -387,20 +388,11 @@ extension PiUnavailableView where Actions == EmptyView {
 
 struct StatusDot: View {
     let color: Color
-    var isPulsing = false
-    @State private var pulse = false
 
     var body: some View {
         Circle()
             .fill(color)
             .frame(width: 6, height: 6)
-            .scaleEffect(isPulsing && pulse ? 1.2 : 1)
-            .opacity(isPulsing && pulse ? 0.55 : 1)
-            .animation(
-                isPulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default,
-                value: pulse
-            )
-            .onAppear { pulse = true }
     }
 }
 

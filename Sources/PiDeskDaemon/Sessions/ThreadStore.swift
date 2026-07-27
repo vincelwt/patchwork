@@ -101,7 +101,17 @@ actor ThreadStore {
         let overlayState = await overlay.snapshot()
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
         let heartbeatIDs = Set(heartbeats.map(\.sessionId))
-        var runningIDs = Set(heartbeats.filter { ActivityReader.isRunning($0) }.map(\.sessionId))
+        let heartbeatPaths = Set(heartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
+        let latestHeartbeatCompletionByPath = Dictionary(
+            grouping: heartbeats.filter { $0.completionId != nil && $0.sessionFile != nil },
+            by: { URL(fileURLWithPath: $0.sessionFile!).standardizedFileURL.path }
+        ).compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
+        let latestHeartbeatCompletionBySessionID = Dictionary(
+            grouping: heartbeats.filter { $0.completionId != nil }, by: \.sessionId
+        ).compactMapValues { writers in writers.max { $0.updatedAt < $1.updatedAt }?.completionId }
+        let runningHeartbeats = heartbeats.filter { ActivityReader.isRunning($0) }
+        let runningIDs = Set(runningHeartbeats.filter { $0.sessionFile == nil }.map(\.sessionId))
+        let runningPaths = Set(runningHeartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
 
         var results: [PiThread] = []
         results.reserveCapacity(files.count)
@@ -126,19 +136,36 @@ actor ThreadStore {
                 cache[path] = CacheEntry(fingerprint: fingerprint, thread: thread)
             }
 
-            thread.archived = appState.isArchived(sessionID: thread.id) || overlayState.isArchived(thread.id)
-            thread.unread = overlayState.unreadOverride(path: thread.path, updatedAt: thread.updatedAt)
-                ?? appState.isUnread(path: thread.path, modifiedAt: thread.updatedAt)
+            results.append(thread)
+        }
+
+        let sessionIDCounts = Dictionary(grouping: results, by: \.id).mapValues(\.count)
+        var fallbackRunningPaths: Set<String> = []
+        for index in results.indices {
+            let path = URL(fileURLWithPath: results[index].path).standardizedFileURL.path
+            results[index].archived = appState.isArchived(sessionID: results[index].id)
+                || overlayState.isArchived(results[index].id)
+            let completion = latestHeartbeatCompletionByPath[path]
+                ?? (sessionIDCounts[results[index].id] == 1 ? latestHeartbeatCompletionBySessionID[results[index].id] : nil)
+            results[index].unread = overlayState.unreadOverride(
+                path: results[index].path,
+                updatedAt: results[index].updatedAt
+            ) ?? appState.isUnread(
+                path: results[index].path,
+                latestCompletionID: completion,
+                modifiedAt: results[index].updatedAt
+            )
             // A session the extension has never seen still has to report honestly, so its file
             // decides. Freshly written files are the only ones worth reading a tail for.
-            if !heartbeatIDs.contains(thread.id),
-               Date().timeIntervalSince(thread.updatedAt) <= FileRunStateFallback.idleAfter,
-               FileRunStateFallback.isRunning(sessionFile: standardizedURL) {
-                runningIDs.insert(thread.id)
+            if !heartbeatPaths.contains(path), !heartbeatIDs.contains(results[index].id),
+               Date().timeIntervalSince(results[index].updatedAt) <= FileRunStateFallback.idleAfter,
+               FileRunStateFallback.isRunning(sessionFile: URL(fileURLWithPath: path)) {
+                fallbackRunningPaths.insert(path)
             }
-            thread.running = runningIDs.contains(thread.id)
-            if thread.running { thread.unread = false }
-            results.append(thread)
+            results[index].running = runningPaths.contains(path)
+                || fallbackRunningPaths.contains(path)
+                || (sessionIDCounts[results[index].id] == 1 && runningIDs.contains(results[index].id))
+            if results[index].running { results[index].unread = false }
         }
 
         // Drop cache entries for files that disappeared (archived out from under Pi, deleted).

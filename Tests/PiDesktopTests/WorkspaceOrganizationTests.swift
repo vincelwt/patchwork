@@ -369,7 +369,7 @@ final class WorkspaceOrganizationTests: XCTestCase {
         let base = temporaryDirectory("ExternalUnread")
         defer { try? FileManager.default.removeItem(at: base) }
         let file = base.appendingPathComponent("thread.jsonl")
-        try Data("{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try Data("{\"type\":\"message\",\"id\":\"initial\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-600)], ofItemAtPath: file.path)
         let monitor = SessionActivityMonitor(
             isActiveOverride: true,
@@ -379,40 +379,110 @@ final class WorkspaceOrganizationTests: XCTestCase {
         let session = summary(id: "external", cwd: "/tmp", modifiedAt: .distantPast, fileURL: file)
         store.sessions = [session]
         monitor.setTrackedPaths([file.path])
-        try await waitUntil { monitor.activity(forPath: file.path)?.state == .idle }
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "initial" }
         store.markRead(session)
 
-        try Data("{\"type\":\"message\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
+        try Data("{\"type\":\"message\",\"id\":\"question\",\"message\":{\"role\":\"user\"}}\n".utf8).write(to: file)
         monitor.tickNow()
         try await waitUntil { store.isRunning(session) }
-        XCTAssertFalse(store.isUnread(session), "A running turn is not unread yet")
+        XCTAssertFalse(store.isUnread(session), "A nonterminal turn does not create unread state")
 
-        try Data("{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try Data("{\"type\":\"message\",\"id\":\"answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
         monitor.tickNow()
-        try await waitUntil { !store.isRunning(session) }
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "answer" }
         XCTAssertTrue(store.isUnread(session), "The completed turn becomes unread")
     }
 
     @MainActor
-    func testUnreadStatePersistsAndNewerActivityBecomesUnread() throws {
+    func testNeverViewedSessionWithoutACompletionHasNoPhantomUnreadAndManualUnreadPersists() throws {
         let base = temporaryDirectory("UnreadState")
         defer { try? FileManager.default.removeItem(at: base) }
         let persistence = AppPersistence(baseURL: base)
         let store = AppStore(persistence: persistence, activityMonitor: SessionActivityMonitor(isActiveOverride: false))
-        let old = summary(id: "read", cwd: "/tmp", modifiedAt: Date(timeIntervalSince1970: 100))
-        let newer = summary(id: "read", cwd: "/tmp", modifiedAt: Date(timeIntervalSince1970: 200), fileURL: old.fileURL)
+        let session = summary(id: "read", cwd: "/tmp", modifiedAt: Date(timeIntervalSince1970: 200))
 
-        XCTAssertTrue(store.isUnread(old), "Never-viewed sessions are unread")
-        store.markRead(old)
-        XCTAssertFalse(store.isUnread(old))
-        XCTAssertTrue(store.isUnread(newer), "External writes newer than last viewed become unread")
-        store.markUnread(old)
-        XCTAssertTrue(store.isUnread(old))
+        XCTAssertFalse(store.isUnread(session), "Mtime alone never invents a completed answer")
+        store.markUnread(session)
+        XCTAssertTrue(store.isUnread(session))
+        XCTAssertTrue(
+            AppPersistence(baseURL: base).state.manuallyUnreadSessionPaths.contains(session.fileURL.standardizedFileURL.path),
+            "Explicit unread survives relaunch"
+        )
+        store.markRead(session)
+        XCTAssertFalse(store.isUnread(session))
+    }
 
-        let reloaded = AppPersistence(baseURL: base)
-        XCTAssertTrue(reloaded.state.manuallyUnreadSessionPaths.contains(old.fileURL.standardizedFileURL.path))
-        reloaded.markSessionRead(path: old.fileURL.path, at: newer.modifiedAt)
-        XCTAssertFalse(AppPersistence(baseURL: base).state.manuallyUnreadSessionPaths.contains(old.fileURL.standardizedFileURL.path))
+    @MainActor
+    func testSameMtimeNewCompletionBecomesUnreadByEntryID() async throws {
+        let base = temporaryDirectory("SameMtimeUnread")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let file = base.appendingPathComponent("thread.jsonl")
+        let fixedMtime = Date().addingTimeInterval(-600)
+        try Data("{\"type\":\"message\",\"id\":\"first\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: file.path)
+
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: base.appendingPathComponent("heartbeats"))
+        let persistence = AppPersistence(baseURL: base)
+        let store = AppStore(persistence: persistence, activityMonitor: monitor)
+        let session = summary(id: "same-mtime", cwd: "/tmp", modifiedAt: fixedMtime, fileURL: file)
+        store.sessions = [session]
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "first" }
+        store.markRead(session)
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"second\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"length\"}}\n".utf8))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: file.path)
+        monitor.tickNow()
+
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "second" }
+        XCTAssertTrue(store.isUnread(session), "A changed completion ID wins even when mtime is identical")
+    }
+
+    @MainActor
+    func testLegacyLastReadAtMigratesOnceThenCompletionIDsOwnUnreadState() throws {
+        let base = temporaryDirectory("UnreadMigration")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let readPath = base.appendingPathComponent("read.jsonl").standardizedFileURL.path
+        let unreadPath = base.appendingPathComponent("unread.jsonl").standardizedFileURL.path
+        var legacy = PersistedAppState()
+        legacy.lastReadAt = [
+            readPath: Date(timeIntervalSince1970: 200),
+            unreadPath: Date(timeIntervalSince1970: 200)
+        ]
+        try JSONEncoder().encode(legacy).write(to: base.appendingPathComponent("state.json"), options: .atomic)
+
+        let persistence = AppPersistence(baseURL: base)
+        persistence.observeCompletedEntry(
+            path: readPath, completionID: "already-read", modifiedAt: Date(timeIntervalSince1970: 100), markSeen: false
+        )
+        persistence.observeCompletedEntry(
+            path: unreadPath, completionID: "newer", modifiedAt: Date(timeIntervalSince1970: 300), markSeen: false
+        )
+
+        XCTAssertEqual(persistence.state.lastSeenCompletedEntryIDBySessionPath[readPath], "already-read")
+        XCTAssertNil(persistence.state.lastSeenCompletedEntryIDBySessionPath[unreadPath])
+        XCTAssertTrue(persistence.state.lastReadAt.isEmpty, "Legacy timestamps are discarded after their one migration decision")
+    }
+
+    func testCompletionPersistenceIsBoundedAndPrunedToDiscoveredPaths() {
+        var state = PersistedAppState()
+        for index in 0...PersistedAppState.maxRetainedCompletionSessions {
+            state.latestCompletedEntryIDBySessionPath["/tmp/\(index).jsonl"] = "answer-\(index)"
+        }
+        state.pruneCompletionState(preferredPath: "/tmp/preferred.jsonl")
+        XCTAssertLessThanOrEqual(
+            state.latestCompletedEntryIDBySessionPath.count,
+            PersistedAppState.maxRetainedCompletionSessions
+        )
+
+        state.latestCompletedEntryIDBySessionPath["/tmp/preferred.jsonl"] = "answer"
+        state.lastSeenCompletedEntryIDBySessionPath["/tmp/preferred.jsonl"] = "answer"
+        state.pruneCompletionState(retaining: ["/tmp/preferred.jsonl"])
+        XCTAssertEqual(state.latestCompletedEntryIDBySessionPath, ["/tmp/preferred.jsonl": "answer"])
+        XCTAssertEqual(state.lastSeenCompletedEntryIDBySessionPath, ["/tmp/preferred.jsonl": "answer"])
     }
 
     @MainActor

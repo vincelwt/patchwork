@@ -96,37 +96,20 @@ struct MarkdownAnswerText: View {
 
 // MARK: - AppKit host
 
-/// Owns the intrinsic height and code-block copy-button geometry the AppKit view reports, so the
-/// SwiftUI side can size itself and overlay hover-copy buttons without either view reaching into
-/// the other's internals.
+/// Hosts one run and overlays a hover copy button on each code block it reports. Height is not
+/// state here: the representable answers `sizeThatFits` directly, so SwiftUI has the real height
+/// on the first layout pass instead of growing into it after an async callback.
 private struct SelectableTextRun: View {
     let blocks: [MarkdownBlock]
     var onHoverChange: ((Bool) -> Void)?
-    @State private var height: CGFloat = 20
-    @State private var width: CGFloat = 0
     @State private var codeBlocks: [AnswerCodeBlockFrame] = []
 
     var body: some View {
         SelectableTextBlock(
             blocks: blocks,
-            // Measuring against the width SwiftUI actually hands us, rather than whatever the
-            // AppKit frame happens to be mid-update, is what keeps the reported height honest —
-            // an under-reported height lets TextKit draw straight over the next block.
-            width: width,
-            onHeightChange: { newHeight in if abs(newHeight - height) > 0.5 { height = newHeight } },
             onCodeBlocksChange: { codeBlocks = $0 },
             onHoverChange: onHoverChange
         )
-        .frame(height: height)
-        .clipped()
-        .background(
-            GeometryReader { proxy in
-                Color.clear.preference(key: AnswerWidthKey.self, value: proxy.size.width)
-            }
-        )
-        .onPreferenceChange(AnswerWidthKey.self) { measured in
-            if abs(measured - width) > 0.5 { width = measured }
-        }
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .topLeading) {
             ForEach(codeBlocks) { frame in
@@ -187,15 +170,11 @@ private struct CodeBlockCopyOverlay: View {
     }
 }
 
-/// Bridges one contiguous run of blocks into an `NSTextView`. Sizing follows the same
-/// self-reporting pattern `NativeComposerTextView` already uses: the AppKit view measures its own
-/// laid-out height after each width change and publishes it, since SwiftUI has no other way to
-/// learn a TextKit view's wrapped height ahead of layout.
+/// Bridges one contiguous run of blocks into an `NSTextView`. Sizing is the platform's own
+/// `sizeThatFits(_:nsView:context:)` (macOS 13+, and this app targets 14): SwiftUI proposes the
+/// column width and TextKit answers with the height that text really wraps to, in the same pass.
 private struct SelectableTextBlock: NSViewRepresentable {
     let blocks: [MarkdownBlock]
-    /// 0 until SwiftUI has measured the column; the view simply keeps its last layout until then.
-    var width: CGFloat = 0
-    let onHeightChange: (CGFloat) -> Void
     let onCodeBlocksChange: ([AnswerCodeBlockFrame]) -> Void
     var onHoverChange: ((Bool) -> Void)?
 
@@ -204,14 +183,7 @@ private struct SelectableTextBlock: NSViewRepresentable {
         view.isEditable = false
         view.isSelectable = true
         view.drawsBackground = false
-        view.textContainerInset = .zero
-        view.textContainer?.lineFragmentPadding = 0
-        view.isVerticallyResizable = true
-        view.isHorizontallyResizable = false
-        view.autoresizingMask = [.width]
-        view.textContainer?.widthTracksTextView = true
         view.linkTextAttributes = [.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]
-        view.onHeightChange = onHeightChange
         view.onCodeBlocksChange = onCodeBlocksChange
         view.onHoverChange = onHoverChange
         view.setAccessibilityLabel("Answer")
@@ -220,19 +192,23 @@ private struct SelectableTextBlock: NSViewRepresentable {
     }
 
     func updateNSView(_ view: AnswerTextView, context: Context) {
-        view.onHeightChange = onHeightChange
         view.onCodeBlocksChange = onCodeBlocksChange
         view.onHoverChange = onHoverChange
         applyContent(to: view, context: context)
     }
 
+    /// Width is deliberately not part of the key: the attributed string does not depend on the
+    /// measure, only its layout does, and TextKit rewraps that itself.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AnswerTextView, context: Context) -> CGSize? {
+        let proposed = proposal.width ?? nsView.bounds.width
+        guard proposed > 0, proposed.isFinite else { return nil }
+        return CGSize(width: proposed, height: nsView.height(forWidth: proposed))
+    }
+
     private func applyContent(to view: AnswerTextView, context: Context) {
-        // Width is part of the key: the same text at a different measure wraps differently, and
-        // a stale height there is exactly what causes overlapping draws.
-        let key = blocks.map(\.id).joined(separator: "|") + "@\(PiFont.size)@\(Int(width.rounded()))"
+        let key = blocks.map(\.id).joined(separator: "|") + "@\(PiFont.size)"
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key
-        view.measuringWidth = width
         view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
     }
 
@@ -243,31 +219,56 @@ private struct SelectableTextBlock: NSViewRepresentable {
     }
 }
 
-/// A non-editable `NSTextView` that reports its own laid-out height and its code blocks' frames
-/// after every layout pass, so SwiftUI can size around it and float copy buttons over it.
+/// A non-editable `NSTextView` that can be asked for its wrapped height at any width without a
+/// layout pass first, and that reports its code blocks' frames so SwiftUI can float copy buttons
+/// over them.
 final class AnswerTextView: NSTextView {
-    /// The column width SwiftUI reported. Layout is measured against this rather than the view's
-    /// own frame, which lags a size change by a pass.
-    var measuringWidth: CGFloat = 0
-    var onHeightChange: ((CGFloat) -> Void)?
     var onHoverChange: ((Bool) -> Void)?
     private var hoverTracking: NSTrackingArea?
     var onCodeBlocksChange: (([AnswerCodeBlockFrame]) -> Void)?
-    private var reportedHeight: CGFloat = -1
+    private var reportedFrames: [AnswerCodeBlockFrame] = []
     private var codeRanges: [AnswerAttributedTextBuilder.CodeBlockEntry] = []
 
     /// Routes drawing through `AnswerLayoutManager` so code/quote/rule blocks get their inline
-    /// background without a second nested SwiftUI card (see that type's comment).
+    /// background without a second nested SwiftUI card (see that type's comment), and owns its
+    /// own measure.
     convenience init() {
         self.init(frame: .zero)
         let customLayoutManager = AnswerLayoutManager()
         textContainer?.replaceLayoutManager(customLayoutManager)
+        textContainerInset = .zero
+        isVerticallyResizable = true
+        isHorizontallyResizable = false
+        autoresizingMask = [.width]
+        // The container's width is set explicitly, never tracked from the frame. SwiftUI asks
+        // `sizeThatFits` for a height *before* it ever gives this view a width, and a tracking
+        // container would answer against a zero frame — one line tall, which is exactly the
+        // blank/20pt saved answer this sizing path exists to prevent.
+        textContainer?.lineFragmentPadding = 0
+        textContainer?.widthTracksTextView = false
+        textContainer?.heightTracksTextView = false
+        textContainer?.size = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
     }
 
     func apply(_ built: AnswerAttributedTextBuilder.Built) {
         textStorage?.setAttributedString(built.attributedString)
         codeRanges = built.codeBlocks
-        reportGeometry()
+        reportCodeBlocks()
+    }
+
+    /// The height this text wraps to at one column width. Called from `sizeThatFits`, so SwiftUI
+    /// learns the real height during the same layout pass rather than after an async callback.
+    /// Re-measuring at an unchanged width is a cached `usedRect` read, not a fresh layout.
+    func height(forWidth width: CGFloat) -> CGFloat {
+        guard let container = textContainer, let manager = layoutManager, width > 0 else { return 1 }
+        setContainerWidth(width)
+        manager.ensureLayout(for: container)
+        return max(manager.usedRect(for: container).height.rounded(.up), 1)
+    }
+
+    private func setContainerWidth(_ width: CGFloat) {
+        guard let container = textContainer, abs(container.size.width - width) > 0.5 else { return }
+        container.size = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
     }
 
     override func updateTrackingAreas() {
@@ -292,33 +293,29 @@ final class AnswerTextView: NSTextView {
         onHoverChange?(false)
     }
 
-    /// The only measurement that is ever right: after AppKit has laid the view out, when the
-    /// container's width finally matches the column the text actually wraps into.
     override func layout() {
         super.layout()
-        reportGeometry()
+        reportCodeBlocks()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        // Width changes rewrap the text, which changes both the intrinsic height and every code
-        // block's reported rect.
-        reportGeometry()
+        // Nothing tracks the frame for us, so the measure follows it here; a width change also
+        // rewraps the text, which moves every code block's reported rect.
+        if newSize.width > 0 { setContainerWidth(newSize.width) }
+        reportCodeBlocks()
     }
 
-    private func reportGeometry() {
+    /// Copy-button geometry is the one thing SwiftUI still cannot know without a layout pass, so
+    /// it is published — only on change, and asynchronously, since SwiftUI drops state mutations
+    /// made during its own update.
+    private func reportCodeBlocks() {
         guard let container = textContainer, let manager = layoutManager else { return }
-        manager.ensureLayout(for: container)
-        let height = manager.usedRect(for: container).height.rounded(.up)
-        if abs(height - reportedHeight) > 0.5 {
-            reportedHeight = height
-            // SwiftUI drops state mutations made synchronously during make/updateNSView.
-            DispatchQueue.main.async { [weak self] in self?.onHeightChange?(max(height, 1)) }
-        }
         guard !codeRanges.isEmpty else {
-            onCodeBlocksChange?([])
+            publish([])
             return
         }
+        manager.ensureLayout(for: container)
         let storageLength = textStorage?.length ?? 0
         let frames: [AnswerCodeBlockFrame] = codeRanges.compactMap { entry in
             guard entry.range.location + entry.range.length <= storageLength else { return nil }
@@ -330,7 +327,13 @@ final class AnswerTextView: NSTextView {
             let fullWidth = CGRect(x: 0, y: rect.minY, width: bounds.width, height: rect.height)
             return AnswerCodeBlockFrame(id: entry.id, rect: fullWidth, code: entry.code)
         }
-        onCodeBlocksChange?(frames)
+        publish(frames)
+    }
+
+    private func publish(_ frames: [AnswerCodeBlockFrame]) {
+        guard frames != reportedFrames else { return }
+        reportedFrames = frames
+        DispatchQueue.main.async { [weak self] in self?.onCodeBlocksChange?(frames) }
     }
 }
 
@@ -426,7 +429,10 @@ enum AnswerAttributedTextBuilder {
             case let .quote(text):
                 result.append(quote(text, size: size))
             case let .code(_, code):
-                let id = UUID().uuidString
+                // Deterministic, like `MarkdownBlock.id`: a fresh UUID per build handed SwiftUI a
+                // new identity for the same code block on every render. Position keeps two
+                // identical code blocks in one answer distinct.
+                let id = "code:\(codeBlocks.count):\(block.id)"
                 let start = result.length
                 result.append(codeAttributedString(code, size: size))
                 codeBlocks.append(CodeBlockEntry(id: id, code: code, range: NSRange(location: start, length: result.length - start)))
@@ -578,15 +584,5 @@ enum AnswerAttributedTextBuilder {
         if intent.contains(.emphasized) { traits.insert(.italicFontMask) }
         guard !traits.isEmpty else { return base }
         return NSFontManager.shared.convert(base, toHaveTrait: traits)
-    }
-}
-
-
-/// Carries the column width from SwiftUI's layout down into the text view's measurement.
-private struct AnswerWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        let next = nextValue()
-        if next > 0 { value = next }
     }
 }

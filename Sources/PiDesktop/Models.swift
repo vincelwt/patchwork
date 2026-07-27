@@ -158,6 +158,7 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
     var details: JSONValue?
     var usage: JSONValue?
     var modelName: String?
+    var stopReason: String?
     /// Known messages set this to `.null`; only bounded unknown fallbacks retain content.
     let raw: JSONValue
 
@@ -209,7 +210,26 @@ struct ImageAttachment: Identifiable, Hashable {
     }
 }
 
+enum RuntimePhase: Hashable, Sendable {
+    case idle
+    case startingPi
+    case openingConversation
+    case waitingForModel
+    case working
+
+    var label: String? {
+        switch self {
+        case .idle: nil
+        case .startingPi: "Starting Pi…"
+        case .openingConversation: "Opening conversation…"
+        case .waitingForModel: "Waiting for model…"
+        case .working: "Working"
+        }
+    }
+}
+
 struct RuntimeState: Hashable, Sendable {
+    var phase: RuntimePhase = .idle
     var isConnected = false
     var isStreaming = false
     var isCompacting = false
@@ -282,6 +302,7 @@ struct ActivityItem: Identifiable, Hashable, Sendable {
     var duration: TimeInterval?
 }
 
+/// Saved conversations are routed by standardized JSONL path; Pi IDs are not globally unique.
 enum AppRoute: Hashable { case newChat, session(String) }
 enum DeliveryMode: String { case automatic, steer, followUp }
 
@@ -328,7 +349,10 @@ struct PersistedAppState: Codable {
     /// App-only organization. Keys are standardized session-file paths, never Pi JSONL IDs.
     var virtualFolders: [VirtualFolder] = []
     var virtualFolderAssignments: [String: String] = [:]
-    /// Unread state is also keyed by session-file path so duplicate/migrated IDs cannot collide.
+    /// Completion/read state is keyed by session-file path so duplicate/migrated session IDs
+    /// cannot collide. `lastReadAt` is decode-only migration input from pre-completion-ID builds.
+    var latestCompletedEntryIDBySessionPath: [String: String] = [:]
+    var lastSeenCompletedEntryIDBySessionPath: [String: String] = [:]
     var lastReadAt: [String: Date] = [:]
     var manuallyUnreadSessionPaths: Set<String> = []
     /// Per-conversation composer text, keyed by standardized session-file path plus one sentinel
@@ -349,9 +373,40 @@ struct PersistedAppState: Codable {
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
         virtualFolders = try container.decodeIfPresent([VirtualFolder].self, forKey: .virtualFolders) ?? []
         virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
+        latestCompletedEntryIDBySessionPath = try container.decodeIfPresent(
+            [String: String].self, forKey: .latestCompletedEntryIDBySessionPath
+        ) ?? [:]
+        lastSeenCompletedEntryIDBySessionPath = try container.decodeIfPresent(
+            [String: String].self, forKey: .lastSeenCompletedEntryIDBySessionPath
+        ) ?? [:]
         lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
         manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
         drafts = try container.decodeIfPresent([String: String].self, forKey: .drafts) ?? [:]
+    }
+
+    static let maxRetainedCompletionSessions = 2_000
+
+    /// Keeps completion metadata bounded even for hand-edited state, and optionally drops paths
+    /// no longer discovered. `preferredPath` is the just-observed session and is never evicted.
+    mutating func pruneCompletionState(retaining paths: Set<String>? = nil, preferredPath: String? = nil) {
+        if let paths {
+            latestCompletedEntryIDBySessionPath = latestCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
+            lastSeenCompletedEntryIDBySessionPath = lastSeenCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
+            lastReadAt = lastReadAt.filter { paths.contains($0.key) }
+            manuallyUnreadSessionPaths.formIntersection(paths)
+        }
+        var keys = Set(latestCompletedEntryIDBySessionPath.keys)
+            .union(lastSeenCompletedEntryIDBySessionPath.keys)
+            .union(lastReadAt.keys)
+            .union(manuallyUnreadSessionPaths)
+        guard keys.count > Self.maxRetainedCompletionSessions else { return }
+        if let preferredPath { keys.remove(preferredPath) }
+        var retained = Set(keys.sorted().prefix(Self.maxRetainedCompletionSessions - (preferredPath == nil ? 0 : 1)))
+        if let preferredPath { retained.insert(preferredPath) }
+        latestCompletedEntryIDBySessionPath = latestCompletedEntryIDBySessionPath.filter { retained.contains($0.key) }
+        lastSeenCompletedEntryIDBySessionPath = lastSeenCompletedEntryIDBySessionPath.filter { retained.contains($0.key) }
+        lastReadAt = lastReadAt.filter { retained.contains($0.key) }
+        manuallyUnreadSessionPaths.formIntersection(retained)
     }
 }
 

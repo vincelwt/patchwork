@@ -79,12 +79,12 @@ struct ThinkingPickerControl: View {
                 .buttonStyle(.plain)
                 .help("Thinking level — click to cycle")
             case .disabled:
-                // Its own accessibility element, otherwise a plain label merges into the
-                // neighbouring model label and VoiceOver reads "off Model".
-                PickerLabel(text: label.capitalized, font: font)
-                    .opacity(0.55)
-                    .accessibilityElement(children: .ignore)
-                    .help("Thinking level")
+                Button(action: store.prepareComposerOptions) {
+                    PickerLabel(text: label.capitalized, font: font)
+                }
+                .buttonStyle(.plain)
+                .opacity(0.55)
+                .help("Prepare thinking options")
             }
         }
         .accessibilityLabel("Thinking level")
@@ -148,10 +148,12 @@ struct ModelPickerControl: View {
                 .buttonStyle(.plain)
                 .help("\(help(label)) — click to cycle")
             case .disabled:
-                PickerLabel(text: label, font: font, maxWidth: maxWidth)
-                    .opacity(0.55)
-                    .accessibilityElement(children: .ignore)
-                    .help(help(label))
+                Button(action: store.prepareComposerOptions) {
+                    PickerLabel(text: label, font: font, maxWidth: maxWidth)
+                }
+                .buttonStyle(.plain)
+                .opacity(0.55)
+                .help("Prepare model options")
             }
         }
         .accessibilityLabel("Model")

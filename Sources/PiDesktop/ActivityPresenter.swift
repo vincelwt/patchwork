@@ -1,6 +1,6 @@
 import Foundation
 
-protocol ActivityPresenting {
+protocol ActivityPresenting: Sendable {
     func activities(from messages: [ChatMessage]) -> [ActivityItem]
 }
 

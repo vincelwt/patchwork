@@ -20,7 +20,7 @@ final class TranscriptCache: @unchecked Sendable {
     static let defaultByteCapacity = 96 * 1_024 * 1_024
 
     private struct Entry {
-        let conversation: SessionConversation
+        let page: ConversationPage
         let fingerprint: SessionFileFingerprint
         let cost: Int
     }
@@ -43,25 +43,43 @@ final class TranscriptCache: @unchecked Sendable {
     /// A hit requires the fingerprint (size + mtime) to still match what was cached: a
     /// conversation that changed on disk since it was cached (e.g. it kept running in a
     /// terminal) must never be served stale.
-    func conversation(for path: String, fingerprint: SessionFileFingerprint) -> SessionConversation? {
+    func page(for path: String, fingerprint: SessionFileFingerprint) -> ConversationPage? {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = storage[path], entry.fingerprint == fingerprint else { return nil }
         touch(path)
-        return entry.conversation
+        return entry.page
     }
 
-    func store(_ conversation: SessionConversation, for path: String, fingerprint: SessionFileFingerprint) {
+    func store(_ page: ConversationPage, for path: String, fingerprint: SessionFileFingerprint) {
         // Computed before the lock is taken: on a multi-megabyte conversation this walks every
         // block, and the lock only needs to guard the dictionary mutation itself.
-        let cost = Self.estimatedCost(of: conversation)
+        let cost = Self.estimatedCost(of: page.messages)
         lock.lock()
         defer { lock.unlock() }
         if let previous = storage[path] { totalCost -= previous.cost }
-        storage[path] = Entry(conversation: conversation, fingerprint: fingerprint, cost: cost)
+        storage[path] = Entry(page: page, fingerprint: fingerprint, cost: cost)
         totalCost += cost
         touch(path)
         evictIfNeeded()
+    }
+
+    /// Legacy conveniences retained for parser/cache tests and non-paged callers.
+    func conversation(for path: String, fingerprint: SessionFileFingerprint) -> SessionConversation? {
+        guard let page = page(for: path, fingerprint: fingerprint) else { return nil }
+        return SessionConversation(messages: page.messages, leafID: page.leafID, rawEntryCount: page.rawEntryCount)
+    }
+
+    func store(_ conversation: SessionConversation, for path: String, fingerprint: SessionFileFingerprint) {
+        store(ConversationPage(
+            messages: conversation.messages,
+            olderCursor: nil,
+            leafID: conversation.leafID,
+            rawEntryCount: conversation.rawEntryCount,
+            scannedEntryCount: conversation.rawEntryCount,
+            scannedByteCount: 0,
+            isTruncated: false
+        ), for: path, fingerprint: fingerprint)
     }
 
     func remove(_ path: String) {
@@ -109,7 +127,11 @@ final class TranscriptCache: @unchecked Sendable {
     /// image bytes (already bounded per conversation by `ImageBudget`), with a small flat charge
     /// per structured block so an all-tool-calls conversation is not costed as free.
     static func estimatedCost(of conversation: SessionConversation) -> Int {
-        conversation.messages.reduce(0) { total, message in
+        estimatedCost(of: conversation.messages)
+    }
+
+    static func estimatedCost(of messages: [ChatMessage]) -> Int {
+        messages.reduce(0) { total, message in
             total + message.blocks.reduce(0) { blockTotal, block in
                 switch block.kind {
                 case let .text(text): return blockTotal + text.utf8.count

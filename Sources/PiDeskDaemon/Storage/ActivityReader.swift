@@ -13,6 +13,7 @@ struct Heartbeat: Sendable {
     var state: String
     var startedAt: Date?
     var updatedAt: Date
+    var completionId: String? = nil
 }
 
 /// Reads and classifies heartbeat files. Never throws: a missing directory (no extension has
@@ -43,7 +44,8 @@ enum ActivityReader {
                 pid: object["pid"]?.intValue.map(Int32.init),
                 state: object["state"]?.stringValue ?? "idle",
                 startedAt: object["startedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)),
-                updatedAt: object["updatedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)) ?? .distantPast
+                updatedAt: object["updatedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)) ?? .distantPast,
+                completionId: object["completionId"]?.stringValue
             ))
         }
         return heartbeats

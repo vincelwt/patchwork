@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 4
+// pi-desktop-activity-version: 5
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active and routes thread-created schedules into Pi Desktop's durable Automations service.
@@ -10,7 +10,7 @@
 //
 // Writes one small JSON file per process to ~/.pi/agent/desktop-activity/<sessionId>-<pid>.json:
 //   { sessionId, sessionFile, sessionDir, cwd, pid, state: "running" | "idle",
-//     startedAt, updatedAt, preview, stopReason }
+//     startedAt, updatedAt, preview, stopReason, completionId }
 // Every heartbeat write is atomic (temp file + rename), and every activity handler is wrapped
 // in try/catch: heartbeat failures must never interrupt the user's actual Pi session.
 
@@ -27,6 +27,7 @@ import * as path from "node:path";
 /// claiming to be running.
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const PREVIEW_LIMIT = 160;
+const TERMINAL_STOP_REASONS = new Set(["stop", "length", "error", "aborted"]);
 const DAEMON_TIMEOUT_MS = 3_000;
 const DAEMON_RESPONSE_LIMIT = 1_048_576;
 const DAEMON_SOCKET_PATH = process.env.PI_DESKTOP_DAEMON_SOCKET_PATH ?? path.join(
@@ -277,6 +278,20 @@ function runAutomationSelfTest(): void {
 
 if (process.env.PI_DESKTOP_AUTOMATION_SELF_TEST === "1") runAutomationSelfTest();
 
+function latestCompletedEntryID(entries: readonly unknown[]): string | undefined {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (!entry || typeof entry !== "object") continue;
+    const value = entry as { type?: unknown; id?: unknown; message?: unknown };
+    if (value.type !== "message" || typeof value.id !== "string"
+        || !value.message || typeof value.message !== "object") continue;
+    const message = value.message as { role?: unknown; stopReason?: unknown };
+    if (message.role === "assistant" && typeof message.stopReason === "string"
+        && TERMINAL_STOP_REASONS.has(message.stopReason)) return value.id;
+  }
+  return undefined;
+}
+
 export default function piDesktopActivity(pi: ExtensionAPI) {
   let heartbeatPath: string | null = null;
   let sessionId: string | null = null;
@@ -286,6 +301,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   let startedAt: string | null = null;
   let preview: string | undefined;
   let stopReason: string | undefined;
+  let completionId: string | undefined;
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentRunning = false;
   const backgroundAgents = new Set<string>();
@@ -312,6 +328,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         updatedAt: new Date().toISOString(),
         preview,
         stopReason,
+        completionId,
       };
       // Readers must never observe a half-written file: same-directory temp file, then rename.
       const tmpPath = `${heartbeatPath}.${process.pid}.tmp`;
@@ -442,6 +459,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       startedAt = new Date().toISOString();
       preview = undefined;
       stopReason = undefined;
+      completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());
       // Several processes can attach to one session. A reader must see every writer so an idle
       // RPC attachment cannot overwrite a terminal that is still working.
       heartbeatPath = sessionId
@@ -471,6 +489,9 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       if (message && message.role === "assistant") {
         preview = extractPreview(message.content) ?? preview;
         stopReason = typeof message.stopReason === "string" ? message.stopReason : stopReason;
+        if (typeof message.stopReason === "string" && TERMINAL_STOP_REASONS.has(message.stopReason)) {
+          completionId = latestCompletedEntryID(ctx.sessionManager.getBranch()) ?? completionId;
+        }
       }
       syncHeartbeat();
     } catch {

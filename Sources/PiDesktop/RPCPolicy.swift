@@ -22,7 +22,6 @@ enum RPCTimeoutPolicy {
     /// Read-only commands with no side effects.
     static let stateQueries: Set<String> = [
         "get_state",
-        "get_messages",
         "get_session_stats"
     ]
 
@@ -148,8 +147,15 @@ enum PiProcessReaper {
     /// `terminate()` is sent synchronously by the caller (already off main) so the old
     /// runtime is signalled before a replacement is spawned; waiting/escalation is handed
     /// to the reaper queue.
-    static func reap(_ process: Process, gracefulDeadline: TimeInterval = PiProcessReaper.gracefulDeadline) {
-        guard process.isRunning else { return }
+    static func reap(
+        _ process: Process,
+        gracefulDeadline: TimeInterval = PiProcessReaper.gracefulDeadline,
+        completion: (() -> Void)? = nil
+    ) {
+        guard process.isRunning else {
+            completion?()
+            return
+        }
         process.terminate()
         queue.async {
             let deadline = Date().addingTimeInterval(gracefulDeadline)
@@ -160,6 +166,7 @@ enum PiProcessReaper {
                 kill(process.processIdentifier, SIGKILL)
             }
             process.waitUntilExit()
+            completion?()
         }
     }
 }

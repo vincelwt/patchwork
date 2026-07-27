@@ -72,8 +72,7 @@ enum JSONLFileReader {
         }
 
         if let capturedError { throw capturedError }
-        if let trailing = framer.finish() {
-            try onRecord(trailing)
-        }
+        // A session writer may be between writes. JSONL records are visible only after their LF,
+        // so a torn final object is ignored now and parsed on the next retry once completed.
     }
 }

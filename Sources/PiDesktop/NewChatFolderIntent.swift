@@ -64,12 +64,14 @@ final class NewChatFolderIntent {
     /// updated, so `store.route` (and anything derived from it, like `selectedSession`) would
     /// still read the *previous* route at this exact point in the call stack. `store.sessions`
     /// is not in that lag window — `ensureProvisionalSession` finishes inserting the provisional
-    /// session before it ever assigns `route` — so looking the id up there directly is safe.
+    /// session before it ever assigns `route` — so looking the path up there directly is safe.
     private func resolve(_ route: AppRoute, store: AppStore) {
         subscription = nil
         guard let intent = pending else { return }
         pending = nil
-        guard case let .session(id) = route, let session = store.sessions.first(where: { $0.id == id }) else { return }
+        guard case let .session(path) = route,
+              let session = store.sessions.first(where: { $0.fileURL.standardizedFileURL.path == path })
+        else { return }
         guard NewChatFolderResolution.matches(session, intent: intent, existingAssignment: store.virtualFolderID(for: session)) else { return }
         store.moveSession(session, toVirtualFolder: intent.folderID)
     }

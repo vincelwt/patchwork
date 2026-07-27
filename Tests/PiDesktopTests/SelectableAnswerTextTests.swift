@@ -172,6 +172,47 @@ final class SelectableAnswerTextTests: XCTestCase {
         XCTAssertTrue(built.codeBlocks.isEmpty)
     }
 
+    // MARK: - Sizing (a saved answer must never render blank or one line tall)
+
+    @MainActor
+    func testHostedTextReportsItsWrappedHeightSynchronously() throws {
+        let blocks = MarkdownBlockParser.blocks(from: (1...8)
+            .map { "Paragraph \($0) with enough words in it that the line has to wrap at a narrow measure." }
+            .joined(separator: "\n\n"))
+        let view = AnswerTextView()
+        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
+
+        // No run loop turn, no layout pass: the height has to be right on the first ask, which is
+        // what `sizeThatFits` gives SwiftUI before the row is ever drawn.
+        let wide = view.height(forWidth: 900)
+        let narrow = view.height(forWidth: 300)
+        XCTAssertGreaterThan(wide, PiFont.size * 8, "Every block has to be accounted for, not just the first")
+        XCTAssertGreaterThan(narrow, wide, "A narrower measure wraps to more lines")
+
+        // Repeated asks at one width are stable (SwiftUI probes sizes more than once per pass).
+        XCTAssertEqual(view.height(forWidth: 300), narrow, accuracy: 0.5)
+        XCTAssertEqual(view.height(forWidth: 900), wide, accuracy: 0.5)
+    }
+
+    @MainActor
+    func testEmptyAnswerStillReportsAPositiveHeightRatherThanZero() {
+        let view = AnswerTextView()
+        view.apply(AnswerAttributedTextBuilder.build(blocks: []))
+        XCTAssertGreaterThanOrEqual(view.height(forWidth: 400), 1)
+    }
+
+    @MainActor
+    func testCodeBlockOverlayIdentityIsStableAcrossRebuilds() throws {
+        // Overlay ids used to be a fresh UUID per build, so every re-render replaced the copy
+        // button views for unchanged code.
+        let source = "```\nlet x = 1\n```\n\ntext\n\n```\nlet x = 1\n```"
+        let blocks = MarkdownBlockParser.blocks(from: source)
+        let first = AnswerAttributedTextBuilder.build(blocks: blocks).codeBlocks.map(\.id)
+        let second = AnswerAttributedTextBuilder.build(blocks: blocks).codeBlocks.map(\.id)
+        XCTAssertEqual(first, second, "The same answer must rebuild to the same code-block identities")
+        XCTAssertEqual(Set(first).count, 2, "Two identical code blocks still get distinct identities")
+    }
+
     @MainActor
     func testSettledAnswerHostAllocatesHeightForTheWholeAnswer() throws {
         let source = """
@@ -183,8 +224,8 @@ final class SelectableAnswerTextTests: XCTestCase {
         """
         let host = NSHostingView(rootView: MarkdownAnswerText(text: source))
         host.frame = NSRect(x: 0, y: 0, width: 800, height: 500)
-        host.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        // One synchronous layout pass, deliberately without a run loop turn: a saved answer must
+        // be its full height the moment it is laid out, not after an async measurement lands.
         host.layoutSubtreeIfNeeded()
 
         let textView = try XCTUnwrap(descendant(AnswerTextView.self, in: host))

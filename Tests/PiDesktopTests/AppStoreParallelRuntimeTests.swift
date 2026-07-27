@@ -193,7 +193,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
 
         XCTAssertEqual(runtimeA.stopCount, 0)
         XCTAssertEqual(newRuntime.commandCount("prompt"), 1)
-        XCTAssertEqual(store.route, .session("new-session"))
+        XCTAssertEqual(store.route, .session(newSessionFile.standardizedFileURL.path))
         XCTAssertTrue(store.sessions.contains { $0.id == "new-session" })
     }
 

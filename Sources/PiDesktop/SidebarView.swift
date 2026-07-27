@@ -122,7 +122,7 @@ private struct SidebarFooter: View {
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
-            StatusDot(color: runningCount > 0 ? .piGreen : .secondary, isPulsing: runningCount > 0)
+            StatusDot(color: runningCount > 0 ? .piGreen : .secondary)
             if let label {
                 Text(label).font(SidebarTypography.status).foregroundStyle(.secondary).lineLimit(1)
                     .accessibilityLabel("Session activity")
@@ -383,7 +383,7 @@ private struct SessionFolderSection: View {
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
                         .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
-                    if hasRunning { StatusDot(color: .piGreen, isPulsing: true) }
+                    if hasRunning { StatusDot(color: .piGreen) }
                     Spacer(minLength: PiTheme.space4)
                     newChatButton
                 }
@@ -397,7 +397,7 @@ private struct SessionFolderSection: View {
             .onHover { hovering = $0 }
             .help(group.isVirtual ? "Virtual folder" : group.path)
             .accessibilityLabel("\(group.name) folder, \(group.sessions.count) conversations")
-            .accessibilityValue(isOpen ? "expanded" : "collapsed")
+            .accessibilityValue("\(isOpen ? "expanded" : "collapsed")\(hasRunning ? ", sessions running" : "")")
             .contextMenu {
                 if let id = group.virtualFolderID {
                     Button("New Folder Inside…") { childName = ""; creatingChild = true }
@@ -527,7 +527,9 @@ private struct SessionRow: View {
 
     private var selected: Bool {
         guard !store.schedulesPresented else { return false }
-        if case let .session(id) = store.route { return id == session.id }
+        if case let .session(path) = store.route {
+            return path == session.fileURL.standardizedFileURL.path
+        }
         return false
     }
     private var running: Bool { store.isRunning(session) }
@@ -608,7 +610,7 @@ private struct SessionRow: View {
     @ViewBuilder
     private var trailingAccessory: some View {
         if running {
-            ProgressView().controlSize(.mini).help("Pi is working")
+            StatusDot(color: .piGreen).help("Pi is working")
         } else if hovering {
             Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
         } else if GitIndicatorPolicy.showsBranchIndicator(git) {

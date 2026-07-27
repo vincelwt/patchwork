@@ -90,8 +90,9 @@ final class HTTPServerIntegrationTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-running", cwd: "/tmp/project")
         let heartbeatURL = directory.appendingPathComponent("activity/sess-running.json")
         let writeHeartbeat: (String) throws -> Void = { state in
+            let completion = state == "idle" ? ",\"completionId\":\"answer-1\"" : ""
             try """
-            {"sessionId":"sess-running","pid":\(getpid()),"state":"\(state)","updatedAt":"\(PiDeskDate.string(from: Date()))"}
+            {"sessionId":"sess-running","pid":\(getpid()),"state":"\(state)","updatedAt":"\(PiDeskDate.string(from: Date()))"\(completion)}
             """.write(to: heartbeatURL, atomically: true, encoding: .utf8)
         }
 
@@ -106,6 +107,23 @@ final class HTTPServerIntegrationTests: XCTestCase {
         let idleThread = try XCTUnwrap(idleList.threads.first)
         XCTAssertFalse(idleThread.running)
         XCTAssertTrue(idleThread.unread, "The completed turn becomes unread")
+    }
+
+    func testPathlessHeartbeatDoesNotAttachToDuplicateSessionIDs() async throws {
+        let source = TestSupport.writeSessionFile(in: directory, id: "duplicate", cwd: "/tmp/project")
+        let copy = source.deletingLastPathComponent().appendingPathComponent("duplicate-copy.jsonl")
+        try FileManager.default.copyItem(at: source, to: copy)
+        try """
+        {"sessionId":"duplicate","pid":\(getpid()),"state":"running","updatedAt":"\(PiDeskDate.string(from: Date()))","completionId":"answer"}
+        """.write(
+            to: directory.appendingPathComponent("activity/duplicate.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let threads = try await client.listThreads().threads
+        XCTAssertEqual(threads.count, 2)
+        XCTAssertTrue(threads.allSatisfy { !$0.running })
     }
 
     func testSendMessageEnqueuesAFakeRunAndItCompletes() async throws {
