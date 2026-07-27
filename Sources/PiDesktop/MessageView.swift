@@ -778,7 +778,7 @@ private struct CustomMessageRow: View {
     var body: some View {
         DisclosureRow(
             symbol: "puzzlepiece.extension",
-            title: message.customType?.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord ?? "Extension",
+            title: title,
             symbolTint: Color.piPurple
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
@@ -791,6 +791,11 @@ private struct CustomMessageRow: View {
                 }
             }
         }
+    }
+
+    private var title: String {
+        if message.customType == "ad-process:update" { return "Background process update" }
+        return message.customType?.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord ?? "Extension"
     }
 }
 

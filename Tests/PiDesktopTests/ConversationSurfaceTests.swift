@@ -311,9 +311,8 @@ final class TranscriptPresenterTests: XCTestCase {
 
     // MARK: - The answer is never buried in the work log
 
-    func testProcessUpdateAfterTheAnswerDoesNotCollapseTheAnswerIntoTheWorkLog() throws {
-        // Real sessions end a turn with `custom_message` entries (background process updates,
-        // model changes) written *after* Pi's answer. Those must not demote the answer.
+    func testProcessUpdateAfterTheAnswerFoldsIntoWorkWithoutHidingTheAnswer() throws {
+        // Background-process completions are sideband work updates, not new transcript turns.
         let update = ChatMessage(
             id: "custom-1",
             role: .custom,
@@ -335,10 +334,11 @@ final class TranscriptPresenterTests: XCTestCase {
             return XCTFail("The answer must stay a visible transcript message, not work-log detail")
         }
         XCTAssertEqual(answer.textContent, "All 44 tests pass.")
+        XCTAssertEqual(items.count, 3, "The process update must not leak out as a standalone row")
         guard case let .work(block) = items[1] else { return XCTFail("Expected the turn's work block above it") }
-        XCTAssertFalse(
-            block.entries.contains { if case .note = $0 { return true } else { return false } },
-            "Nothing prose-like from the answer may be demoted into the collapsed log"
+        XCTAssertEqual(
+            block.entries.compactMap { if case let .note(message) = $0 { return message.id }; return nil },
+            ["custom-1"]
         )
     }
 
