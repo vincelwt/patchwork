@@ -165,7 +165,7 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertNil(store.toast, "No banner either: this is the conversation already on screen")
     }
 
-    func testFrontmostButDifferentConversationShowsAnInAppBannerNotADesktopNotification() {
+    func testFrontmostButDifferentConversationShowsAnUnnamedInAppBannerNotADesktopNotification() {
         let (store, runtime, spy, session) = makeStore(isActive: true)
         attachRuntime(store, runtime: runtime, to: session)
         store.openNewChat() // Frontmost, but looking at something else now.
@@ -173,7 +173,7 @@ final class NotificationTriggerWiringTests: XCTestCase {
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
         XCTAssertTrue(spy.presented.isEmpty, "Frontmost never uses the OS notification path")
         XCTAssertEqual(store.toast?.style, .info)
-        XCTAssertTrue(store.toast?.text.contains(session.displayName) == true)
+        XCTAssertEqual(store.toast?.text, NotificationTrigger.turnFinished.summary)
     }
 
     func testOpeningAnInAppBannerSelectsItsConversation() throws {
