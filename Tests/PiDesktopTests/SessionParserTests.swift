@@ -433,13 +433,9 @@ final class SessionParserTests: XCTestCase {
         XCTAssertTrue(sessions.allSatisfy { $0.fileURL.deletingLastPathComponent().deletingLastPathComponent() == repository.rootURL })
     }
 
-    /// Task 1 measurement: actual load latency on the largest real session on this machine,
-    /// never a synthetic fixture — `PI_DESKTOP_REAL_SESSION_SMOKE=1` opts in explicitly since
-    /// this depends on whatever happens to be installed. Reading local JSONL is free; nothing
-    /// here starts Pi or talks to a provider. Reports the three numbers that matter for "instant
-    /// open": a warm `TranscriptCache` hit (what a recent/prefetched selection pays), the
-    /// tail-first scan (what a cold selection paints immediately), and the full two-pass parse
-    /// (what eventually replaces the tail on a cold selection).
+    /// Measures the production open path on the largest real session on this machine. This is
+    /// local JSONL only: it never starts Pi or contacts a provider. The legacy full parse remains
+    /// in the report solely as the measured gate for whether a sidecar index is ever warranted.
     func testMeasuresParseLatencyOnTheLargestInstalledSession() async throws {
         guard ProcessInfo.processInfo.environment["PI_DESKTOP_REAL_SESSION_SMOKE"] == "1" else {
             throw XCTSkip("Set PI_DESKTOP_REAL_SESSION_SMOKE=1 to scan the installed Pi session directory")
@@ -458,23 +454,28 @@ final class SessionParserTests: XCTestCase {
         guard let largest else { throw XCTSkip("No session files found") }
 
         let clock = ContinuousClock()
+        var newestPage: ConversationPage?
+        let newestPageDuration = clock.measure {
+            newestPage = try? SessionParser.conversationPage(at: largest.url)
+        }
         let fullParseDuration = clock.measure { _ = try? SessionParser.conversation(at: largest.url) }
-        let tailScanDuration = clock.measure { _ = try? SessionParser.conversationTail(at: largest.url, limit: 40) }
 
         let cache = TranscriptCache()
         guard let values = try? largest.url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-              let conversation = try? SessionParser.conversation(at: largest.url) else {
-            throw XCTSkip("Could not fingerprint/parse the largest session")
+              let newestPage else {
+            throw XCTSkip("Could not fingerprint/page the largest session")
         }
         let fingerprint = SessionFileFingerprint(url: largest.url, values: values)
-        cache.store(conversation, for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
+        cache.store(newestPage, for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
         let cacheHitDuration = clock.measure {
-            _ = cache.conversation(for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
+            _ = cache.page(for: largest.url.standardizedFileURL.path, fingerprint: fingerprint)
         }
 
         print("""
-        [perf] \(largest.url.lastPathComponent) size=\(largest.size / 1_024)KB messages=\(conversation.messages.count) \
-        cacheHit=\(cacheHitDuration) tailScan(cold)=\(tailScanDuration) fullParse(cold)=\(fullParseDuration)
+        [perf] \(largest.url.lastPathComponent) size=\(largest.size / 1_024)KB \
+        newestPage=\(newestPageDuration) messages=\(newestPage.messages.count) \
+        scanned=\(newestPage.scannedByteCount / 1_024)KB cacheHit=\(cacheHitDuration) \
+        legacyFullParse=\(fullParseDuration)
         """)
     }
 

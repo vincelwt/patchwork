@@ -177,6 +177,7 @@ Archiving never moves or edits a Pi JSONL file.
 - The transcript cache bounds both entry count and estimated byte cost (text plus already-budgeted image bytes), evicting least-recently-used windows first.
 - Opening uses SwiftUI's native bottom anchor instead of a post-paint jump. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
 - Instruments points-of-interest mark newest-page read, first publish, activity projection, prepend, viewport restore, RPC ready, and first model output.
+- The current 25.8 MiB largest-session gate reads its newest page in about 32 ms (5.5 MiB scanned) versus about 1.05 s for the legacy full parse, so no sidecar index is justified yet; add one only if measured page latency stops meeting the sub-50 ms target.
 
 ## Verification
 
