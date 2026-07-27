@@ -32,6 +32,7 @@ struct ConversationView: View {
                 conversationColumn
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.piTranscript)
+                    .contentShape(Rectangle())
                     .dropDestination(for: URL.self) { urls, _ in
                         let images = ImageImportService.attachments(from: urls)
                         guard !images.isEmpty else { return false }

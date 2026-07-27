@@ -181,16 +181,21 @@ struct ChatMessage: Identifiable, Hashable, Sendable {
 }
 
 struct ImageAttachment: Identifiable, Hashable {
+    static let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("Pi Desktop Images", isDirectory: true)
+
     let id: UUID
     let data: Data
     let mimeType: String
     let fileName: String
+    let fileURL: URL
 
-    init(id: UUID = UUID(), data: Data, mimeType: String, fileName: String) {
+    init(id: UUID = UUID(), data: Data, mimeType: String, fileName: String, fileURL: URL) {
         self.id = id
         self.data = data
         self.mimeType = mimeType
         self.fileName = fileName
+        self.fileURL = fileURL.standardizedFileURL
     }
 
     var image: NSImage? {
@@ -201,12 +206,16 @@ struct ImageAttachment: Identifiable, Hashable {
         return image
     }
 
-    var rpcValue: JSONValue {
-        .object([
-            "type": .string("image"),
-            "data": .string(data.base64EncodedString()),
-            "mimeType": .string(mimeType)
-        ])
+    static func prompt(text: String, attachments: [ImageAttachment]) -> String {
+        guard !attachments.isEmpty else { return text }
+        for attachment in attachments
+            where attachment.fileURL.deletingLastPathComponent().path == temporaryDirectory.path
+                && !FileManager.default.fileExists(atPath: attachment.fileURL.path) {
+            try? FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+            try? attachment.data.write(to: attachment.fileURL, options: .atomic)
+        }
+        let paths = attachments.map { "- \($0.fileURL.path)" }.joined(separator: "\n")
+        return [text, "Attached image file paths:\n\(paths)"].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 }
 

@@ -199,6 +199,33 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("prompt"), 1)
     }
 
+    func testImageAttachmentsAreSentAsFilePathsInsteadOfRPCImages() throws {
+        let runtime = IntentRuntime()
+        let store = makeStore(runtime: runtime)
+        let session = summary("a", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.composerContentDidChange()
+
+        let imageURL = root.appendingPathComponent("reference image.png")
+        store.draft = "Build this"
+        store.attachments = [ImageAttachment(
+            data: Data("pixels".utf8),
+            mimeType: "image/png",
+            fileName: imageURL.lastPathComponent,
+            fileURL: imageURL
+        )]
+        store.submitDraft()
+
+        let payload = try XCTUnwrap(runtime.sent.last { $0.0 == "prompt" }?.1)
+        XCTAssertEqual(
+            payload["message"]?.stringValue,
+            "Build this\n\nAttached image file paths:\n- \(imageURL.path)"
+        )
+        XCTAssertNil(payload["images"])
+        XCTAssertTrue(store.messages.last?.images.isEmpty == true)
+    }
+
     func testIdleSameCwdProcessSwitchesSavedAndNewRoutesButCrossCwdColdStarts() throws {
         let runtime = IntentRuntime()
         let store = makeStore(runtime: runtime)
