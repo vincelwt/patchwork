@@ -1,11 +1,11 @@
 import AppKit
 import SwiftUI
 
-/// The toolbar title pill's own bound, distinct from the transcript/composer measure — it shares
+/// The toolbar title's own bound, distinct from the transcript/composer measure — it shares
 /// a toolbar with window traffic lights and the inspector toggle, so it needs a cap well short of
 /// `PiTheme.transcriptMaxWidth`.
 extension PiTheme {
-    static let conversationTitlePillMaxWidth: CGFloat = 280
+    static let conversationTitleMaxWidth: CGFloat = 280
 }
 
 @MainActor
@@ -177,11 +177,10 @@ struct ConversationView: View {
 
     @ToolbarContentBuilder
     private var conversationToolbar: some ToolbarContent {
-        ToolbarItem(placement: .principal) {
-            // Explicit padding, a bounded width with truncation, and a `.contentShape` matching
-            // the pill's own drawn bounds — the bare `HStack` this replaced had none of the
-            // three, so it rendered flush against its own content and could clip inside the
-            // toolbar's centered principal item.
+        // Leading placement, so the title reads as the conversation pane's header rather than a
+        // floating centered pill. Bounded width plus tail truncation keeps a long name from
+        // pushing the trailing toolbar items around.
+        ToolbarItem(placement: .navigation) {
             HStack(spacing: PiTheme.space6) {
                 Image(systemName: "folder")
                     .font(.system(size: PiIcon.small))
@@ -219,11 +218,8 @@ struct ConversationView: View {
                 .menuIndicator(.hidden)
                 .frame(width: 16)
             }
-            .padding(.horizontal, PiTheme.space10)
-            .padding(.vertical, PiTheme.space4)
-            .frame(maxWidth: PiTheme.conversationTitlePillMaxWidth, alignment: .leading)
-            .background(Color.piInset, in: Capsule())
-            .contentShape(Capsule())
+            .frame(maxWidth: PiTheme.conversationTitleMaxWidth, alignment: .leading)
+            .contentShape(Rectangle())
             .help(store.selectedSession?.cwd.path ?? "Conversation actions")
         }
 
