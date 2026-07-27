@@ -15,6 +15,9 @@ protocol ScheduleServing: AnyObject {
     func delete(id: String) async throws
     func setPaused(id: String, paused: Bool) async throws -> ScheduleEntry
     func runNow(id: String) async throws
+    /// The daemon's retained execution records for one automation: status, timing, and a stored
+    /// error or summary. Full output remains in the target conversation.
+    func loadRuns(scheduleID: String) async throws -> [Run]
 }
 
 /// One scheduled automation. Mirrors `Schedule` in the API contract.
@@ -144,9 +147,13 @@ extension ScheduleEntry.Trigger {
 @MainActor
 final class InMemoryScheduleService: ScheduleServing {
     private(set) var entries: [ScheduleEntry]
+    var runs: [Run]
     var failure: Error?
 
-    init(entries: [ScheduleEntry] = []) { self.entries = entries }
+    init(entries: [ScheduleEntry] = [], runs: [Run] = []) {
+        self.entries = entries
+        self.runs = runs
+    }
 
     func loadSchedules() async throws -> [ScheduleEntry] {
         if let failure { throw failure }
@@ -175,6 +182,11 @@ final class InMemoryScheduleService: ScheduleServing {
     func runNow(id: String) async throws {
         if let failure { throw failure }
         guard entries.contains(where: { $0.id == id }) else { throw ScheduleServiceError.notFound }
+    }
+
+    func loadRuns(scheduleID: String) async throws -> [Run] {
+        if let failure { throw failure }
+        return runs.filter { $0.scheduleId == scheduleID }
     }
 }
 

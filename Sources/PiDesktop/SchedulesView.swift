@@ -16,6 +16,11 @@ struct SchedulesView: View {
             header
             PiHairline()
             content
+                // A second sheet, deliberately on the inner view: two `.sheet` modifiers on the
+                // same view fight over one presentation slot.
+                .sheet(item: $model.history) { entry in
+                    RunHistoryView(entry: entry, service: model.service)
+                }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.piTranscript)
@@ -79,6 +84,7 @@ struct SchedulesView: View {
                             entry: entry,
                             threadName: threadName(for: entry),
                             onEdit: { model.editing = ScheduleDraft(entry: entry, isNew: false) },
+                            onHistory: { model.history = entry },
                             onToggle: { enabled in Task { await model.setPaused(entry, paused: !enabled) } },
                             onRun: { Task { await model.runNow(entry) } },
                             onDelete: { Task { await model.delete(entry) } }
@@ -108,6 +114,7 @@ private struct ScheduleRow: View {
     let entry: ScheduleEntry
     let threadName: String
     let onEdit: () -> Void
+    let onHistory: () -> Void
     let onToggle: (Bool) -> Void
     let onRun: () -> Void
     let onDelete: () -> Void
@@ -128,6 +135,15 @@ private struct ScheduleRow: View {
             } else if !entry.enabled {
                 Text("Paused").font(PiFont.micro).foregroundStyle(.tertiary)
             }
+            // Always visible, not hover-revealed and not buried in the menu: knowing whether an
+            // automation actually ran is the first question anyone has about it.
+            Button(action: onHistory) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: PiIcon.small, weight: .medium))
+            }
+            .buttonStyle(.plain)
+            .help("Run history")
+            .accessibilityLabel("\(entry.name) run history")
             Toggle("", isOn: Binding(get: { entry.enabled }, set: onToggle))
                 .toggleStyle(.switch)
                 .controlSize(.mini)
@@ -137,6 +153,7 @@ private struct ScheduleRow: View {
             Menu {
                 Button("Edit…", action: onEdit)
                 Button("Run Now", action: onRun)
+                Button("Run History…", action: onHistory)
                 Divider()
                 Button("Delete", role: .destructive, action: onDelete)
             } label: {
@@ -169,10 +186,13 @@ struct ScheduleDraft: Identifiable {
 final class SchedulesModel: ObservableObject {
     @Published var entries: [ScheduleEntry] = []
     @Published var editing: ScheduleDraft?
+    /// The automation whose run history is on screen. `ScheduleEntry` is already `Identifiable`,
+    /// so it is its own sheet key.
+    @Published var history: ScheduleEntry?
     @Published var error: String?
     @Published var isBusy = false
 
-    private let service: any ScheduleServing
+    let service: any ScheduleServing
 
     init(service: any ScheduleServing) { self.service = service }
 

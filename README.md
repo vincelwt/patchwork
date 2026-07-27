@@ -69,8 +69,10 @@ when the app quits.
 
 Automations also have their own page in the window: pick **Automations** in the sidebar or press
 `⌥⌘S`. It opens in the detail area, so the selected conversation and its draft stay put; pausing
-and resuming is the switch on each row. When the background service is reachable, compatible
-scheduling requests from a thread use this same durable store, so they appear on the page and
+and resuming is the switch on each row, and the clock button opens **Run History** — the most
+recent 50 runs for that automation with their status, start time, duration, and stored error or
+summary; full output remains in the target conversation. When the background service is reachable,
+compatible scheduling requests from a thread use this same durable store, so they appear on the page and
 survive that Pi process exiting. The Agent extension's session-local scheduler remains the fallback
 for specialized subagent jobs or when the service is off.
 
