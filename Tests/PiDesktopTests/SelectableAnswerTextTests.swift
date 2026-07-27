@@ -195,6 +195,17 @@ final class SelectableAnswerTextTests: XCTestCase {
     }
 
     @MainActor
+    func testMissingWidthProposalUsesARealFirstPassMeasure() {
+        let view = AnswerTextView()
+        let blocks = MarkdownBlockParser.blocks(from: String(repeating: "A saved answer must be visible immediately. ", count: 20))
+        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
+
+        let size = view.fittingSize(for: nil)
+        XCTAssertEqual(size.width, PiTheme.transcriptMaxWidth)
+        XCTAssertGreaterThan(size.height, PiFont.size * 2, "A nil first proposal must not collapse the lazy row to one point")
+    }
+
+    @MainActor
     func testEmptyAnswerStillReportsAPositiveHeightRatherThanZero() {
         let view = AnswerTextView()
         view.apply(AnswerAttributedTextBuilder.build(blocks: []))

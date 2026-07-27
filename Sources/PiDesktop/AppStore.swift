@@ -151,8 +151,11 @@ final class AppStore: ObservableObject {
     @Published var isScanning = false
     @Published var scanError: String?
 
-    @Published var messages: [ChatMessage] = []
-    @Published var streamingMessage: ChatMessage?
+    @Published var messages: [ChatMessage] = [] { didSet { transcriptRevision &+= 1 } }
+    @Published var streamingMessage: ChatMessage? { didSet { transcriptRevision &+= 1 } }
+    /// Plain revision counter for memoizing transcript projection. It deliberately is not
+    /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
+    private(set) var transcriptRevision = 0
     @Published var isConversationLoading = false
     @Published private(set) var isLoadingEarlierMessages = false
     @Published private(set) var hasEarlierMessages = false
@@ -1294,8 +1297,7 @@ final class AppStore: ObservableObject {
         if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
             let message = Self.optimisticMessage(text: prompt)
             optimisticID = message.id
-            messages.append(message)
-            messages = enforcingLoadedImageBudget(messages)
+            messages = enforcingLoadedImageBudget(messages + [message])
         } else {
             optimisticID = nil
         }
@@ -3175,12 +3177,13 @@ final class AppStore: ObservableObject {
         if let path = activeRuntimeSlot.sessionPath ?? state(for: activeRuntimeSlot).sessionFile {
             retainLiveMessage(message, path: URL(fileURLWithPath: path).standardizedFileURL.path)
         }
-        if let index = messages.firstIndex(where: { $0.id == message.id }) { messages[index] = message }
+        var updated = messages
+        if let index = updated.firstIndex(where: { $0.id == message.id }) { updated[index] = message }
         else if message.role == .user,
-                let localIndex = messages.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
-            messages[localIndex] = message
-        } else { messages.append(message) }
-        messages = enforcingLoadedImageBudget(messages)
+                let localIndex = updated.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
+            updated[localIndex] = message
+        } else { updated.append(message) }
+        messages = enforcingLoadedImageBudget(updated)
     }
 
     private func mergeHistoryActivities() {

@@ -49,6 +49,17 @@ struct ConversationScrollObserver: NSViewRepresentable {
         coordinator.detach()
     }
 
+    static func restoredOriginY(
+        originalY: CGFloat,
+        oldDocumentHeight: CGFloat,
+        newDocumentHeight: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat? {
+        let addedHeight = newDocumentHeight - oldDocumentHeight
+        guard addedHeight > 0.5 else { return nil }
+        return min(max(0, newDocumentHeight - viewportHeight), max(0, originalY + addedHeight))
+    }
+
     final class AttachmentView: NSView {
         weak var coordinator: Coordinator?
 
@@ -68,6 +79,8 @@ struct ConversationScrollObserver: NSViewRepresentable {
         private var boundsObserver: NSObjectProtocol?
         private var previousOriginY: CGFloat?
         private var prependSnapshot: (origin: NSPoint, documentHeight: CGFloat)?
+        private var pendingMetrics: ConversationScrollMetrics?
+        private var metricsCallbackScheduled = false
         private var isRestoring = false
 
         init(parent: ConversationScrollObserver) { self.parent = parent }
@@ -99,6 +112,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
             scrollView = nil
             previousOriginY = nil
             prependSnapshot = nil
+            pendingMetrics = nil
         }
 
         private func publish() {
@@ -112,13 +126,21 @@ struct ConversationScrollObserver: NSViewRepresentable {
                 direction = originY < previousOriginY! ? .up : .down
             }
             previousOriginY = originY
-            let metrics = ConversationScrollMetrics(
+            pendingMetrics = ConversationScrollMetrics(
                 originY: originY,
                 viewportHeight: visible.height,
                 documentHeight: document.bounds.height,
                 direction: direction
             )
-            DispatchQueue.main.async { [weak self] in self?.parent.onChange(metrics) }
+            guard !metricsCallbackScheduled else { return }
+            metricsCallbackScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                metricsCallbackScheduled = false
+                guard let metrics = pendingMetrics else { return }
+                pendingMetrics = nil
+                parent.onChange(metrics)
+            }
         }
 
         private func captureBeforePrepend() {
@@ -127,31 +149,35 @@ struct ConversationScrollObserver: NSViewRepresentable {
         }
 
         private func scheduleRestoreAfterPrepend() {
-            DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(retry: true) }
+            DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(attempt: 0) }
         }
 
-        private func restoreAfterPrepend(retry: Bool) {
+        private func restoreAfterPrepend(attempt: Int) {
             guard let scrollView, let document = scrollView.documentView, let snapshot = prependSnapshot else { return }
             document.layoutSubtreeIfNeeded()
             scrollView.layoutSubtreeIfNeeded()
-            let addedHeight = document.bounds.height - snapshot.documentHeight
-            guard addedHeight > 0.5 else {
-                if retry {
-                    DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(retry: false) }
+            let documentHeight = document.bounds.height
+            guard let targetY = ConversationScrollObserver.restoredOriginY(
+                originalY: snapshot.origin.y,
+                oldDocumentHeight: snapshot.documentHeight,
+                newDocumentHeight: documentHeight,
+                viewportHeight: scrollView.contentView.bounds.height
+            ) else {
+                if attempt < 3 {
+                    DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(attempt: attempt + 1) }
                 } else {
                     prependSnapshot = nil
                 }
                 return
             }
 
-            prependSnapshot = nil
-            let maximumY = max(0, document.bounds.height - scrollView.contentView.bounds.height)
-            let target = NSPoint(x: snapshot.origin.x, y: min(maximumY, max(0, snapshot.origin.y + addedHeight)))
+            let target = NSPoint(x: snapshot.origin.x, y: targetY)
             isRestoring = true
             scrollView.contentView.scroll(to: target)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             previousOriginY = target.y
             isRestoring = false
+            prependSnapshot = nil
             publish()
         }
     }

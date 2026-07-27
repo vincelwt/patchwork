@@ -200,9 +200,9 @@ private struct SelectableTextBlock: NSViewRepresentable {
     /// Width is deliberately not part of the key: the attributed string does not depend on the
     /// measure, only its layout does, and TextKit rewraps that itself.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: AnswerTextView, context: Context) -> CGSize? {
-        let proposed = proposal.width ?? nsView.bounds.width
-        guard proposed > 0, proposed.isFinite else { return nil }
-        return CGSize(width: proposed, height: nsView.height(forWidth: proposed))
+        // Zero is SwiftUI's minimum-size probe, not a usable wrapping width.
+        guard proposal.width != 0 else { return nil }
+        return nsView.fittingSize(for: proposal.width)
     }
 
     private func applyContent(to view: AnswerTextView, context: Context) {
@@ -228,6 +228,7 @@ final class AnswerTextView: NSTextView {
     var onCodeBlocksChange: (([AnswerCodeBlockFrame]) -> Void)?
     private var reportedFrames: [AnswerCodeBlockFrame] = []
     private var codeRanges: [AnswerAttributedTextBuilder.CodeBlockEntry] = []
+    private var lastMeasuredWidth = PiTheme.transcriptMaxWidth
 
     /// Routes drawing through `AnswerLayoutManager` so code/quote/rule blocks get their inline
     /// background without a second nested SwiftUI card (see that type's comment), and owns its
@@ -259,14 +260,23 @@ final class AnswerTextView: NSTextView {
     /// The height this text wraps to at one column width. Called from `sizeThatFits`, so SwiftUI
     /// learns the real height during the same layout pass rather than after an async callback.
     /// Re-measuring at an unchanged width is a cached `usedRect` read, not a fresh layout.
+    func fittingSize(for proposedWidth: CGFloat?) -> CGSize {
+        let proposed = proposedWidth.flatMap { $0 > 0 && $0.isFinite ? $0 : nil }
+        let current = bounds.width > 1 && bounds.width.isFinite ? bounds.width : nil
+        let width = proposed ?? current ?? lastMeasuredWidth
+        return CGSize(width: width, height: height(forWidth: width))
+    }
+
     func height(forWidth width: CGFloat) -> CGFloat {
-        guard let container = textContainer, let manager = layoutManager, width > 0 else { return 1 }
-        setContainerWidth(width)
+        guard let container = textContainer, let manager = layoutManager else { return 1 }
+        let resolvedWidth = width > 0 && width.isFinite ? width : lastMeasuredWidth
+        setContainerWidth(resolvedWidth)
         manager.ensureLayout(for: container)
         return max(manager.usedRect(for: container).height.rounded(.up), 1)
     }
 
     private func setContainerWidth(_ width: CGFloat) {
+        lastMeasuredWidth = width
         guard let container = textContainer, abs(container.size.width - width) > 0.5 else { return }
         container.size = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
     }
