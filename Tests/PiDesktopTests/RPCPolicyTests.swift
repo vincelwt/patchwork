@@ -6,8 +6,9 @@ final class RPCTimeoutPolicyTests: XCTestCase {
     func testStateQueriesFailAuthoritativelyAndSideEffectsDoNot() {
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_state"), .authoritativeFailure(after: 30))
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_session_stats"), .authoritativeFailure(after: 30))
+        XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_fork_messages"), .authoritativeFailure(after: 30))
 
-        for command in ["prompt", "steer", "follow_up", "abort", "set_session_name", "export_html"] {
+        for command in ["prompt", "steer", "follow_up", "abort", "fork", "set_session_name", "export_html"] {
             guard case .outcomeUnknown = RPCTimeoutPolicy.outcome(for: command) else {
                 return XCTFail("\(command) must never be reported as an authoritative rejection")
             }
