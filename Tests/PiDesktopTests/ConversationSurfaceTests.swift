@@ -162,12 +162,12 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(block.stepCount, 2)
     }
 
-    func testLiveWorkStartsCollapsedWithItsLatestThinkingText() throws {
+    func testLiveWorkStartsCollapsedWithoutBoldMarkersInItsLatestThinkingText() throws {
         let items = TranscriptPresenter.items(
             messages: [
                 user(id: "u", text: "Go", at: nil),
                 assistant(id: "a1", blocks: [thinking("First thought")]),
-                assistant(id: "a2", blocks: [thinking("Latest thought")])
+                assistant(id: "a2", blocks: [thinking("**Latest thought**")])
             ],
             streaming: nil,
             isRunning: true
