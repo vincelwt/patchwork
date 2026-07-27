@@ -77,6 +77,7 @@ enum PiTheme {
     static let transcriptRowSpacing: CGFloat = 6
     static let transcriptEntrySpacing: CGFloat = 12
     static let transcriptTurnSpacing: CGFloat = 24
+    static let transcriptScrollEdgeThreshold: CGFloat = 80
 
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5

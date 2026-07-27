@@ -2,6 +2,21 @@ import Foundation
 import XCTest
 @testable import PiDesktop
 
+final class ConversationScrollMetricsTests: XCTestCase {
+    func testPinningUsesViewportGeometry() {
+        XCTAssertTrue(ConversationScrollMetrics(
+            originY: 920, viewportHeight: 500, documentHeight: 1_500, direction: .down
+        ).isNearBottom)
+        XCTAssertFalse(ConversationScrollMetrics(
+            originY: 700, viewportHeight: 500, documentHeight: 1_500, direction: .up
+        ).isNearBottom)
+        XCTAssertTrue(ConversationScrollMetrics(
+            originY: PiTheme.transcriptScrollEdgeThreshold, viewportHeight: 500,
+            documentHeight: 1_500, direction: .up
+        ).isNearTop)
+    }
+}
+
 final class TranscriptPresenterTests: XCTestCase {
     func testTurnCollapsesNarrationAndToolsIntoOneWorkBlock() throws {
         let start = Date(timeIntervalSince1970: 1_000)
