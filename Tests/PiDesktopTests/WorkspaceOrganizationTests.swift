@@ -485,9 +485,12 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertEqual(state.lastSeenCompletedEntryIDBySessionPath, ["/tmp/preferred.jsonl": "answer"])
     }
 
-    @MainActor
-    func testNowhereIsDesktop() {
-        XCTAssertEqual(AppStore.nowhereFolderURL.path, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop").path)
+    func testGlobalWorkingDirectoryIsDesktop() {
+        XCTAssertEqual(
+            WorkspaceOrganization.globalWorkingDirectory.path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop").path
+        )
+        XCTAssertTrue(WorkspaceOrganization.isGlobalWorkingDirectory(WorkspaceOrganization.globalWorkingDirectory))
     }
 
     private func summary(

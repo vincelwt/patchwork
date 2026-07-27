@@ -334,11 +334,9 @@ final class AppStore: ObservableObject {
         self.probeRuntimeFactory = probeRuntimeFactory
         self.notificationService = notificationService ?? NotificationService()
         self.isActiveOverride = isActiveOverride
-        // Never default to a TCC-protected folder (Desktop/Documents/…): a folder the user has
-        // not chosen yet must not be why a fresh launch prompts for permission. `nowhereFolderURL`
-        // (~/Desktop) is kept only as an explicit, user-requested value elsewhere — never used
-        // automatically. See `defaultWorkingFolder` and `hasOptedIntoGitRefresh`.
-        selectedFolder = Self.defaultWorkingFolder(recentFolders: self.persistence.state.recentFolders)
+        // Pi requires a cwd even for a global conversation; Desktop is the neutral default and
+        // passive Git inspection explicitly skips it until a real prompt starts Pi.
+        selectedFolder = WorkspaceOrganization.globalWorkingDirectory
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
@@ -573,11 +571,15 @@ final class AppStore: ObservableObject {
         return sessions.first { $0.fileURL.standardizedFileURL.path == path }
     }
 
-    var recentFolders: [URL] {
-        let persisted = persistence.state.recentFolders.map { URL(fileURLWithPath: $0, isDirectory: true) }
-        let fromSessions = sessions.map(\.cwd)
+    /// Filesystem projects already known from sidebar conversations. A virtual-folder assignment
+    /// must not make its underlying project disappear from the new-chat chooser.
+    var sidebarFolders: [URL] {
         var seen: Set<String> = []
-        return (persisted + fromSessions).filter { seen.insert($0.standardizedFileURL.path).inserted }.prefix(8).map { $0 }
+        return sessions.compactMap { session in
+            let folder = session.cwd.standardizedFileURL
+            guard !WorkspaceOrganization.isGlobalWorkingDirectory(folder), seen.insert(folder.path).inserted else { return nil }
+            return folder
+        }
     }
 
     /// `NSApplication.shared` rather than the `NSApp` global so headless test hosts stay safe.
@@ -590,7 +592,7 @@ final class AppStore: ObservableObject {
     }
 
     /// True for either an attached saved conversation or the query-only runtime prepared for a
-    /// new Desktop chat. Picker controls use this broader route scope; transcript/session actions
+    /// new global chat. Picker controls use this broader route scope; transcript/session actions
     /// deliberately keep using `isSelectedRuntime`.
     var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
 
@@ -764,15 +766,6 @@ final class AppStore: ObservableObject {
         objectWillChange.send()
     }
 
-    /// A safe folder to preselect before the user has chosen one: the most recently used folder
-    /// (already opted into — the user picked it from the picker) if there is one, else the plain
-    /// home directory, which macOS never gates behind a permission prompt the way Desktop,
-    /// Documents, and Downloads are.
-    private static func defaultWorkingFolder(recentFolders: [String]) -> URL {
-        if let mostRecent = recentFolders.first { return URL(fileURLWithPath: mostRecent, isDirectory: true) }
-        return FileManager.default.homeDirectoryForCurrentUser
-    }
-
     func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
@@ -786,7 +779,7 @@ final class AppStore: ObservableObject {
             }
             await refreshSessions()
             if selectedFolder == nil {
-                selectedFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+                selectedFolder = WorkspaceOrganization.globalWorkingDirectory
             }
             // Warm the transcript cache after the scan settles, so opening a recent conversation
             // is instant even before the user selects anything.
@@ -858,7 +851,7 @@ final class AppStore: ObservableObject {
         flushDraftPersistence()
         cancelConversationLoad()
         resetConversationPageState()
-        let newFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+        let newFolder = WorkspaceOrganization.globalWorkingDirectory
         if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
             detachActiveRuntimePresentation()
         }
@@ -1227,7 +1220,7 @@ final class AppStore: ObservableObject {
             detachActiveRuntimePresentation()
         }
         selectedFolder = folder
-        persistence.rememberFolder(url)
+        if !WorkspaceOrganization.isGlobalWorkingDirectory(folder) { persistence.rememberFolder(folder) }
         refreshSelectedGit()
     }
 
@@ -2075,23 +2068,26 @@ final class AppStore: ObservableObject {
     }
 
     /// One awaited refresh at a time; the caller (menu action or polling loop) never spawns
-    /// overlapping git command chains. A session's own cwd is always fair game (Pi already
-    /// reads/writes there); a bare `selectedFolder` with no conversation open yet only refreshes
-    /// once the user has actually opted into it, so the passive default folder shown before any
-    /// chat exists can never trigger a git subprocess — and the TCC prompt a protected directory
-    /// brings with it — on its own.
+    /// overlapping git command chains. A project session's cwd is fair game because Pi already
+    /// reads/writes there; a bare `selectedFolder` refreshes only after explicit selection.
+    /// `fetchGitState` always skips the neutral Desktop cwd used by global conversations.
     private func refreshSelectedGitAndWait() async {
         if let session = selectedSession {
             await refreshGit(for: session.cwd)
             return
         }
-        guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else { return }
+        guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else {
+            selectedGit = .none
+            selectedWorktree = nil
+            return
+        }
         await refreshGit(for: folder)
     }
 
-    /// A folder counts as opted into once the user has actually done something with it: chosen
-    /// it from the folder picker (which remembers it), or it already backs a real session.
+    /// A project folder counts as opted into once the user chose it or it backs a real session.
+    /// Global Desktop is never a project for Git-refresh purposes.
     private func hasOptedIntoGitRefresh(_ url: URL) -> Bool {
+        guard !WorkspaceOrganization.isGlobalWorkingDirectory(url) else { return false }
         let path = url.standardizedFileURL.path
         if persistence.state.recentFolders.contains(path) { return true }
         return sessions.contains { $0.cwd.standardizedFileURL.path == path }
@@ -3309,6 +3305,7 @@ final class AppStore: ObservableObject {
     /// so the worktree check (Task 2) never adds serial latency to the existing Git refresh.
     private static func fetchGitState(_ path: String, service: GitStatusProviding) async -> (String, GitSnapshot, GitWorktreeInfo?) {
         let directory = URL(fileURLWithPath: path, isDirectory: true)
+        guard !WorkspaceOrganization.isGlobalWorkingDirectory(directory) else { return (path, .none, nil) }
         async let snapshot = service.snapshot(for: directory)
         async let worktree = service.worktreeInfo(for: directory)
         return await (path, snapshot, worktree)
