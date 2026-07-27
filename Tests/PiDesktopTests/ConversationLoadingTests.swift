@@ -180,6 +180,25 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.selectedSession?.id, "b")
     }
 
+    func testDuplicatePiSessionIDsStillSelectByFilePath() async throws {
+        let fileA = temporaryDirectory.appendingPathComponent("duplicate-a.jsonl")
+        let fileB = temporaryDirectory.appendingPathComponent("duplicate-b.jsonl")
+        try writeLinearConversation(prefix: "a", messageCount: 2, to: fileA)
+        try writeLinearConversation(prefix: "b", messageCount: 2, to: fileB)
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
+        let a = try makeSummary(id: "duplicate", fileURL: fileA)
+        let b = try makeSummary(id: "duplicate", fileURL: fileB)
+        store.sessions = [a, b]
+
+        store.selectSession(a)
+        try await waitUntil { store.messages.last?.textContent == "a-1" }
+        store.selectSession(b)
+        try await waitUntil { store.messages.last?.textContent == "b-1" }
+
+        XCTAssertEqual(store.route, .session(fileB.standardizedFileURL.path))
+        XCTAssertEqual(store.selectedSession?.fileURL.standardizedFileURL, fileB.standardizedFileURL)
+    }
+
     func testSelectingASessionInAWorktreePopulatesSelectedWorktree() async throws {
         let file = temporaryDirectory.appendingPathComponent("wt.jsonl")
         try writeLinearConversation(prefix: "wt", messageCount: 2, to: file)

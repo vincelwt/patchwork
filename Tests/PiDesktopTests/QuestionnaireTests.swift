@@ -372,7 +372,7 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         )
         summary.prepareSearchKey()
         store.sessions = [summary]
-        store.route = .session(summary.id)
+        store.route = .session(file.standardizedFileURL.path)
         store.prepareComposerOptions()
         return (store, runtime, directory)
     }

@@ -527,7 +527,9 @@ private struct SessionRow: View {
 
     private var selected: Bool {
         guard !store.schedulesPresented else { return false }
-        if case let .session(id) = store.route { return id == session.id }
+        if case let .session(path) = store.route {
+            return path == session.fileURL.standardizedFileURL.path
+        }
         return false
     }
     private var running: Bool { store.isRunning(session) }

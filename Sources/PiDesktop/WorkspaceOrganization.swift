@@ -377,7 +377,7 @@ extension AppStore {
         if isRunning(session) { return false }
         let path = session.fileURL.standardizedFileURL.path
         if persistence.state.manuallyUnreadSessionPaths.contains(path) { return true }
-        if selectedSession?.id == session.id { return false }
+        if selectedSession?.fileURL.standardizedFileURL.path == path { return false }
         guard let viewed = persistence.state.lastReadAt[path] else { return true }
         return liveModifiedAt(session) > viewed
     }

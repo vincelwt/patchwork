@@ -282,6 +282,7 @@ struct ActivityItem: Identifiable, Hashable, Sendable {
     var duration: TimeInterval?
 }
 
+/// Saved conversations are routed by standardized JSONL path; Pi IDs are not globally unique.
 enum AppRoute: Hashable { case newChat, session(String) }
 enum DeliveryMode: String { case automatic, steer, followUp }
 

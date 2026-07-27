@@ -202,7 +202,7 @@ final class AppStoreRollbackTests: XCTestCase {
             "sessionFile": .string(runtime.sessionFile),
             "sessionId": .string(runtime.sessionID)
         ]))
-        XCTAssertEqual(store.route, .session("fresh-session"))
+        XCTAssertEqual(store.route, .session(URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path))
         XCTAssertEqual(store.messages.last?.textContent, "first prompt")
     }
 
@@ -346,7 +346,7 @@ final class AppStoreRollbackTests: XCTestCase {
         store.submitDraft()
 
         // The new chat is promoted in place, so the failure still belongs to this composer.
-        XCTAssertEqual(store.route, .session("fresh-session"))
+        XCTAssertEqual(store.route, .session(URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path))
         runtime.fail("prompt", with: PiRPCError.processExited("provider unreachable"))
         XCTAssertEqual(store.draft, "first prompt of a new chat")
     }

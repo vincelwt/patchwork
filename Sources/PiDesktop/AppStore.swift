@@ -485,8 +485,8 @@ final class AppStore: ObservableObject {
     private var cachedStatuses: [String: String] = [:]
 
     var selectedSession: SessionSummary? {
-        guard case let .session(id) = route else { return nil }
-        return sessions.first { $0.id == id }
+        guard case let .session(path) = route else { return nil }
+        return sessions.first { $0.fileURL.standardizedFileURL.path == path }
     }
 
     var recentFolders: [URL] {
@@ -686,8 +686,8 @@ final class AppStore: ObservableObject {
             let discovered = try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
             sessions = discovered
             syncActivityMonitorPaths()
-            if let selectedPath, let replacement = sessions.first(where: { $0.fileURL.standardizedFileURL.path == selectedPath }) {
-                route = .session(replacement.id)
+            if let selectedPath, sessions.contains(where: { $0.fileURL.standardizedFileURL.path == selectedPath }) {
+                route = .session(selectedPath)
             }
             if isApplicationActive { await refreshFolderGitSnapshots() }
         } catch is CancellationError {
@@ -725,14 +725,15 @@ final class AppStore: ObservableObject {
     }
 
     func selectSession(_ session: SessionSummary) {
-        if let current = selectedSession, current.id != session.id { markRead(current) }
+        let path = session.fileURL.standardizedFileURL.path
+        if let current = selectedSession, current.fileURL.standardizedFileURL.path != path { markRead(current) }
         parkCurrentDraft()
         cancelConversationLoad()
         let targetKey = RuntimeRouteKey.session(session.fileURL.standardizedFileURL.path)
         if runtimeKey(for: activeRuntimeSlot) != targetKey { detachActiveRuntimePresentation() }
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
-        route = .session(session.id)
+        route = .session(path)
         schedulesPresented = false
         markRead(session)
         conversationError = nil
@@ -777,7 +778,8 @@ final class AppStore: ObservableObject {
             } catch is CancellationError {
                 // Never publish stale cancellation over a newer selection.
             } catch {
-                guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
                 conversationError = error.localizedDescription
                 isConversationLoading = false
             }
@@ -794,7 +796,8 @@ final class AppStore: ObservableObject {
     private func loadConversationProgressively(_ session: SessionSummary, generation: Int) async throws {
         let tail = try await repository.loadConversationTail(from: session.fileURL, limit: Self.tailPreviewMessageLimit)
         try Task.checkCancellation()
-        guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
+        guard conversationLoadGeneration == generation,
+              selectedSession?.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path else { return }
         replaceLoadedMessages(with: tail.conversation.messages)
         isConversationLoading = false
 
@@ -806,7 +809,8 @@ final class AppStore: ObservableObject {
 
         let full = try await cachedOrFreshConversation(for: session.fileURL)
         try Task.checkCancellation()
-        guard conversationLoadGeneration == generation, selectedSession?.id == session.id else { return }
+        guard conversationLoadGeneration == generation,
+              selectedSession?.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path else { return }
         replaceLoadedMessages(with: full.messages)
         await refreshGit(for: session.cwd)
     }
@@ -1848,10 +1852,10 @@ final class AppStore: ObservableObject {
         if slot !== activeRuntimeSlot { parkedRuntimes[.session(path)] = slot }
 
         if slot === activeRuntimeSlot, case .newChat = route {
-            route = .session(sessionID)
+            route = .session(path)
             activities = []
         }
-        return DraftOrigin(route: .session(sessionID), sessionPath: path)
+        return DraftOrigin(route: .session(path), sessionPath: path)
     }
 
     /// Async history loads must not erase a message already painted at Send time.
@@ -2145,7 +2149,10 @@ final class AppStore: ObservableObject {
             )
             Task {
                 if let settledSession { await refreshSummary(for: settledSession) }
-                if isApplicationActive, selectedSession?.id == settledSession?.id { refreshSelectedGit() }
+                if isApplicationActive,
+                   selectedSession?.fileURL.standardizedFileURL.path == settledSession?.fileURL.standardizedFileURL.path {
+                    refreshSelectedGit()
+                }
             }
         case "message_update":
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
