@@ -33,12 +33,13 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.piTranscript)
                     .contentShape(Rectangle())
-                    .dropDestination(for: URL.self) { urls, _ in
-                        let images = ImageImportService.attachments(from: urls)
-                        guard !images.isEmpty else { return false }
-                        store.addAttachments(images)
-                        composerFocusTick += 1
-                        return true
+                    .onDrop(of: ImageImportService.dropTypes, isTargeted: nil) { providers in
+                        let route = store.route
+                        return ImageImportService.loadDroppedAttachments(from: providers) { images in
+                            guard store.route == route, !images.isEmpty else { return }
+                            store.addAttachments(images)
+                            composerFocusTick += 1
+                        }
                     }
 
                 if showsInspector {

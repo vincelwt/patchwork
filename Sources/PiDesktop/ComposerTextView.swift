@@ -402,6 +402,7 @@ final class ComposerTextView: NSTextView {
 
 enum ImageImportService {
     private static let temporaryImageCountLimit = 64
+    static let dropTypes: [UTType] = [.fileURL, .image]
 
     static func canReadImages(from pasteboard: NSPasteboard) -> Bool {
         pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]])
@@ -437,6 +438,69 @@ enum ImageImportService {
                 fileURL: url
             )
         }
+    }
+
+    @discardableResult
+    static func loadDroppedAttachments(
+        from providers: [NSItemProvider],
+        completion: @escaping ([ImageAttachment]) -> Void
+    ) -> Bool {
+        let providers = Array(providers.filter { provider in
+            dropTypes.contains { provider.hasItemConformingToTypeIdentifier($0.identifier) }
+        }.prefix(PiTheme.imageCountLimit))
+        guard !providers.isEmpty else { return false }
+
+        var loaded: [(Int, ImageAttachment)] = []
+        var remaining = providers.count
+        for (index, provider) in providers.enumerated() {
+            loadDroppedAttachment(from: provider) { attachment in
+                DispatchQueue.main.async {
+                    if let attachment { loaded.append((index, attachment)) }
+                    remaining -= 1
+                    if remaining == 0 { completion(loaded.sorted { $0.0 < $1.0 }.map(\.1)) }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func loadDroppedAttachment(
+        from provider: NSItemProvider,
+        completion: @escaping (ImageAttachment?) -> Void
+    ) {
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let url = droppedURL(from: item), let attachment = attachments(from: [url]).first {
+                    completion(attachment)
+                } else {
+                    loadDroppedImage(from: provider, completion: completion)
+                }
+            }
+        } else {
+            loadDroppedImage(from: provider, completion: completion)
+        }
+    }
+
+    private static func loadDroppedImage(
+        from provider: NSItemProvider,
+        completion: @escaping (ImageAttachment?) -> Void
+    ) {
+        guard let identifier = provider.registeredTypeIdentifiers.first(where: {
+            UTType($0)?.conforms(to: .image) == true
+        }) else { completion(nil); return }
+        provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, _ in
+            guard let data, data.count <= PiTheme.imageByteLimit,
+                  let image = NSImage(data: data), let png = pngData(from: image),
+                  png.count <= PiTheme.imageByteLimit else { completion(nil); return }
+            completion(temporaryAttachment(data: png, mimeType: "image/png", fileName: "Dropped image.png"))
+        }
+    }
+
+    private static func droppedURL(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL { return url }
+        if let data = item as? Data { return URL(dataRepresentation: data, relativeTo: nil) }
+        if let value = item as? String { return URL(string: value) }
+        return nil
     }
 
     static func attachment(from image: ImagePayload) -> ImageAttachment? {
