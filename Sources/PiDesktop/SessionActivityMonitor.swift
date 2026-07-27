@@ -164,6 +164,7 @@ final class SessionActivityMonitor: ObservableObject {
 
     private var trackedPaths: [String] = []
     private var fingerprints: [String: Fingerprint] = [:]
+    private var heartbeatSnapshots: [String: [ActivityHeartbeat]] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
     private var fallbackCursor = 0
@@ -199,6 +200,7 @@ final class SessionActivityMonitor: ObservableObject {
         let live = Set(unique)
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
+        heartbeatSnapshots = heartbeatSnapshots.filter { live.contains($0.key) }
         tickNow()
     }
 
@@ -224,6 +226,22 @@ final class SessionActivityMonitor: ObservableObject {
     }
 
     func activity(forPath path: String) -> SessionActivity? { activities[path] }
+
+    nonisolated static func heartbeatPathsRequiringPoll(
+        paths: [String],
+        heartbeats: [String: [ActivityHeartbeat]],
+        previousHeartbeats: [String: [ActivityHeartbeat]],
+        previousActivities: [String: SessionActivity]
+    ) -> Set<String> {
+        Set(paths.filter { path in
+            guard let writers = heartbeats[path] else { return previousHeartbeats[path] != nil }
+            let completionIDs = Set(writers.compactMap(\.completionId))
+            return previousHeartbeats[path] != writers
+                || previousActivities[path] == nil
+                || previousActivities[path]?.state == .running
+                || completionIDs.count != 1
+        })
+    }
 
     nonisolated static func pollSelection(
         paths: [String],
@@ -253,20 +271,40 @@ final class SessionActivityMonitor: ObservableObject {
         let heartbeatDirectory = heartbeatDirectory
         let isProcessAlive = isProcessAlive
         let cursor = fallbackCursor
+        let knownHeartbeats = heartbeatSnapshots
 
-        let result = await Task.detached(priority: .utility) { () -> ([String: SessionActivity], [String: Fingerprint], Int) in
+        let result = await Task.detached(priority: .utility) {
+            () -> ([String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int) in
             let now = Date()
-            let heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
+            var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
+            for path in Array(heartbeats.keys) {
+                heartbeats[path]?.sort { lhs, rhs in
+                    lhs.pid == rhs.pid ? lhs.updatedAt < rhs.updatedAt : lhs.pid < rhs.pid
+                }
+            }
+            let heartbeatPaths = Set(heartbeats.keys)
+            let heartbeatPathsToPoll = Self.heartbeatPathsRequiringPoll(
+                paths: paths,
+                heartbeats: heartbeats,
+                previousHeartbeats: knownHeartbeats,
+                previousActivities: previous
+            )
             let selection = Self.pollSelection(
                 paths: paths,
-                heartbeatPaths: Set(heartbeats.keys),
+                heartbeatPaths: heartbeatPaths,
                 fallbackCursor: cursor
             )
+            let selected = Set(selection.paths)
+            let selectedPaths = paths.filter {
+                heartbeatPathsToPoll.contains($0)
+                    || (!heartbeatPaths.contains($0) && selected.contains($0))
+            }
             var states = previous
             var stamps = known
+            var deferredHeartbeatPaths: Set<String> = []
             var tailReads = 0
 
-            for path in selection.paths {
+            for path in selectedPaths {
                 let url = URL(fileURLWithPath: path)
                 guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
                       let modifiedAt = values.contentModificationDate else { continue }
@@ -277,13 +315,20 @@ final class SessionActivityMonitor: ObservableObject {
                 let old = previous[path]
                 let unchanged = known[path] == fingerprint
                 let writers = heartbeats[path]
+                let heartbeatDisappeared = writers == nil && knownHeartbeats[path] != nil
+                let heartbeatRunning = writers?.contains {
+                    ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+                } ?? false
                 let heartbeatCompletionIDs = Set(writers?.compactMap(\.completionId) ?? [])
-                let needsTail = writers == nil || heartbeatCompletionIDs.count != 1
+                // A live writer cannot have produced the next terminal completion yet. Its idle
+                // heartbeat will carry that ID; tail fallback is only needed once the writer is
+                // no longer live or no heartbeat exists.
+                let needsTail = writers == nil || (!heartbeatRunning && heartbeatCompletionIDs.count != 1)
                 var entry: JSONValue?
                 var tailCompletion: SessionParser.AssistantCompletion?
                 var readTail = false
 
-                if needsTail, !unchanged {
+                if needsTail, (!unchanged || heartbeatDisappeared) {
                     if tailReads < limit {
                         tailReads += 1
                         readTail = true
@@ -291,10 +336,18 @@ final class SessionActivityMonitor: ObservableObject {
                         entry = tail.flatMap(SessionActivityClassifier.lastEntry(inTail:))
                         tailCompletion = tail.flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))
                         stamps[path] = fingerprint
-                    } else if let known = known[path] {
-                        // Keep the old fingerprint so this changed file is retried next tick.
-                        stamps[path] = known
+                    } else {
+                        // Keep both retry signals until this changed/disappeared writer gets one
+                        // of the bounded tail-read slots on a later tick.
+                        if let known = known[path] { stamps[path] = known }
+                        else { stamps.removeValue(forKey: path) }
+                        if heartbeatDisappeared { deferredHeartbeatPaths.insert(path) }
                     }
+                } else if heartbeatRunning, heartbeatCompletionIDs.count != 1 {
+                    // Do not mark an ambiguous live tail as consumed. If the writer vanishes or
+                    // settles without publishing a completion ID, the fallback must still read it.
+                    if let known = known[path] { stamps[path] = known }
+                    else { stamps.removeValue(forKey: path) }
                 } else {
                     stamps[path] = fingerprint
                 }
@@ -321,13 +374,10 @@ final class SessionActivityMonitor: ObservableObject {
                 if let writers {
                     // An attached RPC process is idle while the terminal that owns the same
                     // session may still be working. Any fresh, live running writer wins.
-                    let running = writers.contains {
-                        ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
-                    }
                     let newest = writers.max {
                         (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
                     }
-                    let resolved: SessionRunState = running ? .running : .idle
+                    let resolved: SessionRunState = heartbeatRunning ? .running : .idle
                     states[path] = SessionActivity(
                         state: resolved,
                         modifiedAt: modifiedAt,
@@ -360,11 +410,17 @@ final class SessionActivityMonitor: ObservableObject {
                     preview: old?.preview
                 )
             }
-            return (states, stamps, selection.nextCursor)
+            let tracked = Set(paths)
+            var nextHeartbeats = heartbeats.filter { tracked.contains($0.key) }
+            for path in deferredHeartbeatPaths {
+                if let previous = knownHeartbeats[path] { nextHeartbeats[path] = previous }
+            }
+            return (states, stamps, nextHeartbeats, selection.nextCursor)
         }.value
 
         fingerprints = result.1
-        fallbackCursor = result.2
+        heartbeatSnapshots = result.2
+        fallbackCursor = result.3
         if activities != result.0 { activities = result.0 }
     }
 
