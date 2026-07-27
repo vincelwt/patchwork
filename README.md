@@ -9,7 +9,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 - Minimal three-column workspace: global conversations under **Recents**, folder-grouped project sessions, a centered transcript/composer, and a reserved Environment inspector column
 - New conversations start globally (Pi uses `~/Desktop` as its neutral cwd); **Choose…** lists only projects already known from sidebar conversations
-- App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
+- App-owned folders created from the sidebar context menu, nesting at any depth inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
 - Codex-style turns: running work stays collapsed to a fading latest-reasoning line with a spinner, expands into borderless details on demand, and settles into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
