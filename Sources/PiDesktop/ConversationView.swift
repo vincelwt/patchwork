@@ -387,7 +387,7 @@ struct MessageScrollView: View {
     }
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
-        isPinnedToBottom = metrics.isNearBottom
+        if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
         if metrics.isNearBottom { onVisibleAnchorChange(bottomID) }
         if metrics.direction == .up, metrics.isNearTop { requestEarlierMessages() }
     }

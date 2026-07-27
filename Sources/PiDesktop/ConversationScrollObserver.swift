@@ -79,10 +79,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         func attach(from view: NSView) {
             guard let candidate = view.enclosingScrollView else { return }
-            guard candidate !== scrollView else {
-                publish()
-                return
-            }
+            guard candidate !== scrollView else { return }
             detach()
             scrollView = candidate
             candidate.contentView.postsBoundsChangedNotifications = true
