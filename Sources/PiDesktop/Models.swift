@@ -209,7 +209,26 @@ struct ImageAttachment: Identifiable, Hashable {
     }
 }
 
+enum RuntimePhase: Hashable, Sendable {
+    case idle
+    case startingPi
+    case openingConversation
+    case waitingForModel
+    case working
+
+    var label: String? {
+        switch self {
+        case .idle: nil
+        case .startingPi: "Starting Pi"
+        case .openingConversation: "Opening conversation"
+        case .waitingForModel: "Waiting for model"
+        case .working: "Working"
+        }
+    }
+}
+
 struct RuntimeState: Hashable, Sendable {
+    var phase: RuntimePhase = .idle
     var isConnected = false
     var isStreaming = false
     var isCompacting = false

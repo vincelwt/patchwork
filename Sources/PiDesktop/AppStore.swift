@@ -60,6 +60,7 @@ private final class RuntimeSlot {
     var models: [AvailableModel] = []
     var thinkingLevels = ["off"]
     var optionsLoading = false
+    var optionsPrepared = false
     var capability: ToolCapability?
     var questionnaire: QuestionnaireSession?
     var statuses: [String: String] = [:]
@@ -84,6 +85,11 @@ private enum RuntimeRouteKey: Hashable {
     case session(String)
     case newChat(String)
 }
+
+typealias RuntimeRetirementScheduler = (
+    _ delay: TimeInterval,
+    _ action: @escaping @MainActor () -> Void
+) -> () -> Void
 
 /// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
 /// bound across months of use. Recency is tracked purely in memory (never persisted itself);
@@ -198,6 +204,9 @@ final class AppStore: ObservableObject {
     let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
     private let runtimeFactory: () -> PiRuntimeProtocol
+    private let runtimeRetirementDelay: TimeInterval
+    private let runtimeRetirementScheduler: RuntimeRetirementScheduler
+    private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
     private var parkedRuntimes: [RuntimeRouteKey: RuntimeSlot] = [:]
@@ -270,11 +279,22 @@ final class AppStore: ObservableObject {
         activityMonitor: SessionActivityMonitor? = nil,
         probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil,
         notificationService: NotificationPresenting? = nil,
-        isActiveOverride: Bool? = nil
+        isActiveOverride: Bool? = nil,
+        runtimeRetirementDelay: TimeInterval = 120,
+        runtimeRetirementScheduler: @escaping RuntimeRetirementScheduler = { delay, action in
+            let task = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                action()
+            }
+            return { task.cancel() }
+        }
     ) {
         self.repository = repository
         self.gitService = gitService
         self.runtimeFactory = runtimeFactory
+        self.runtimeRetirementDelay = runtimeRetirementDelay
+        self.runtimeRetirementScheduler = runtimeRetirementScheduler
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
         self.activityPresenter = activityPresenter
@@ -381,10 +401,8 @@ final class AppStore: ObservableObject {
         if delivery == .steer || error != nil { slot.outboxDispatches.remove(dispatch) }
         guard let error else { return }
         updateState(for: slot) { $0.lastError = "Queued message could not be delivered: \(error)" }
-        if slot !== activeRuntimeSlot, !slot.state.isBusy, slot.outbox.isEmpty,
-           slot.outboxDispatches.isEmpty, slot.dialogs.isEmpty, slot.deferredEvents.isEmpty {
-            retireBackgroundRuntime(slot)
-        }
+        if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+        else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
     }
 
     private func runtimeSlot(id: UUID) -> RuntimeSlot? {
@@ -453,11 +471,41 @@ final class AppStore: ObservableObject {
     }
 
     private func shouldPark(_ slot: RuntimeSlot) -> Bool {
+        slot.runtime.isRunning && !isIdleAndClean(slot)
+    }
+
+    private func isIdleAndClean(_ slot: RuntimeSlot) -> Bool {
         let presentation = state(for: slot)
         let dialogs = slot === activeRuntimeSlot && !activePresentationDetached ? dialogQueue : slot.dialogs
         let queued = slot === activeRuntimeSlot && !activePresentationDetached ? outbox : slot.outbox
-        return slot.runtime.isRunning && (slot.isStarting || presentation.isBusy || slot.pendingTurn != nil
-            || !dialogs.isEmpty || !queued.isEmpty || !slot.outboxDispatches.isEmpty)
+        let capability = slot === activeRuntimeSlot && !activePresentationDetached ? activeCapability : slot.capability
+        let questionnaire = slot === activeRuntimeSlot && !activePresentationDetached ? pendingQuestionnaire : slot.questionnaire
+        let stream = slot === activeRuntimeSlot && !activePresentationDetached ? streamingMessage : slot.streamingMessage
+        return !slot.isStarting && presentation.phase == .idle && !presentation.isBusy
+            && slot.pendingTurn == nil && dialogs.isEmpty && queued.isEmpty
+            && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
+            && capability == nil && questionnaire == nil && stream == nil
+    }
+
+    private func cancelRuntimeRetirementLease() {
+        cancelRuntimeRetirement?()
+        cancelRuntimeRetirement = nil
+    }
+
+    private func resetRuntimeRetirementLease(for slot: RuntimeSlot) {
+        cancelRuntimeRetirementLease()
+        guard slot === activeRuntimeSlot, slot.runtime.isRunning, slot.isReady, isIdleAndClean(slot) else { return }
+        cancelRuntimeRetirement = runtimeRetirementScheduler(runtimeRetirementDelay) { [weak self, weak slot] in
+            guard let self, let slot, slot === self.activeRuntimeSlot,
+                  slot.runtime.isRunning, slot.isReady, self.isIdleAndClean(slot) else { return }
+            self.cancelRuntimeRetirement = nil
+            slot.isReady = false
+            slot.runtime.stop()
+            self.updateState(for: slot) { state in
+                state.isConnected = false
+                state.phase = .idle
+            }
+        }
     }
 
     private func activateRuntime(_ slot: RuntimeSlot) {
@@ -509,6 +557,17 @@ final class AppStore: ObservableObject {
     /// new Desktop chat. Picker controls use this broader route scope; transcript/session actions
     /// deliberately keep using `isSelectedRuntime`.
     var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
+
+    var currentRouteRuntimePhase: RuntimePhase? {
+        guard !activePresentationDetached, runtimeKey(for: activeRuntimeSlot) == currentRouteKey else { return nil }
+        return runtimeState.phase
+    }
+
+    private var currentRouteKey: RuntimeRouteKey? {
+        if let selectedSession { return .session(selectedSession.fileURL.standardizedFileURL.path) }
+        guard let selectedFolder else { return nil }
+        return .newChat(selectedFolder.standardizedFileURL.path)
+    }
 
     var selectedMetrics: TokenMetrics {
         isSelectedRuntime && runtimeState.isConnected ? liveMetrics : (selectedSession?.metrics ?? TokenMetrics())
@@ -672,7 +731,6 @@ final class AppStore: ObservableObject {
         }
         startGitRefreshLoop()
         activityMonitor.start()
-        refreshExtensionStatuses()
         installActivityExtensionIfNeeded()
         LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
     }
@@ -1210,8 +1268,11 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Actual editor mutations prewarm Pi; merely rendering or navigating to a composer does not.
+    func composerContentDidChange() { prepareComposerOptions() }
+
     /// Starts or attaches the route's RPC runtime and loads picker choices. These are query-only
-    /// commands: opening a composer never sends a provider prompt.
+    /// commands and never send a provider prompt.
     func prepareComposerOptions() {
         let cwd = selectedSession?.cwd ?? selectedFolder
         guard let cwd else { return }
@@ -1298,6 +1359,8 @@ final class AppStore: ObservableObject {
     private func requestComposerOptions(slot: RuntimeSlot? = nil) {
         let slot = slot ?? activeRuntimeSlot
         guard slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { composerOptionsLoading = false; return }
+        guard !slot.optionsLoading, !slot.optionsPrepared else { return }
+        slot.optionsLoading = true
         composerOptionsLoading = true
         slot.runtime.send(type: "get_available_models", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
@@ -1322,6 +1385,7 @@ final class AppStore: ObservableObject {
             }
             composerOptionsLoading = false
             slot.optionsLoading = false
+            slot.optionsPrepared = true
         }
     }
 
@@ -1544,6 +1608,7 @@ final class AppStore: ObservableObject {
         if !dialogQueue.isEmpty { dialogQueue.removeFirst() }
         activeDialog = dialogQueue.first
         if let next = activeDialog { startDialogTimeout(for: next) }
+        else { resetRuntimeRetirementLease(for: activeRuntimeSlot) }
     }
 
     private func startDialogTimeout(for request: ExtensionDialogRequest) {
@@ -1623,16 +1688,14 @@ final class AppStore: ObservableObject {
         sessionPath: URL?,
         completion: @escaping (Result<RuntimeSlot, Error>) -> Void
     ) {
-        // The launch-time status probe is intentionally ephemeral. Never let it race a real
-        // route runtime: simultaneous Pi extension startup can delay the route's first get_state.
         if probeRuntime != nil { finishProbe() }
+        cancelRuntimeRetirementLease()
 
         let key = runtimeKey(cwd: cwd, sessionPath: sessionPath)
         if let parked = parkedRuntimes[key] {
             if parked.runtime.isRunning {
                 activateRuntime(parked)
-                if parked.isReady { completion(.success(parked)) }
-                else { parked.readyWaiters.append(completion) }
+                completeOrWait(for: parked, completion: completion)
                 return
             }
             parkedRuntimes.removeValue(forKey: key)
@@ -1640,40 +1703,78 @@ final class AppStore: ObservableObject {
 
         if runtime.isRunning, runtimeKey(for: activeRuntimeSlot) == key {
             if activePresentationDetached { restoreRuntimePresentation(activeRuntimeSlot) }
-            if activeRuntimeSlot.isReady { completion(.success(activeRuntimeSlot)) }
-            else { activeRuntimeSlot.readyWaiters.append(completion) }
+            completeOrWait(for: activeRuntimeSlot, completion: completion)
+            return
+        }
+
+        let previous = activeRuntimeSlot
+        if canReuseProcess(previous, in: cwd) {
+            let oldSessionPath = state(for: previous).sessionFile ?? previous.sessionPath
+            removeParkedReference(to: previous)
+            let slot = RuntimeSlot(runtime: previous.runtime)
+            bindRuntime(slot)
+            activeRuntimeSlot = slot
+            configureRuntimeSlot(slot, cwd: cwd, sessionPath: sessionPath, phase: .openingConversation, completion: completion)
+            switchReusedRuntime(slot, cwd: cwd, sessionPath: sessionPath, oldSessionPath: oldSessionPath)
             return
         }
 
         let slot: RuntimeSlot
-        if shouldPark(activeRuntimeSlot) {
-            guard let currentKey = runtimeKey(for: activeRuntimeSlot) else {
+        if shouldPark(previous) {
+            guard let currentKey = runtimeKey(for: previous) else {
                 completion(.failure(PiRPCError.processExited("Could not preserve the current Pi run.")))
                 return
             }
             saveActiveRuntimePresentation()
-            parkedRuntimes[currentKey] = activeRuntimeSlot
+            parkedRuntimes[currentKey] = previous
             slot = RuntimeSlot(runtime: runtimeFactory())
-            bindRuntime(slot)
-            activeRuntimeSlot = slot
         } else {
-            let reusableRuntime = activeRuntimeSlot.runtime
-            if reusableRuntime.isRunning { reusableRuntime.stop() }
-            removeParkedReference(to: activeRuntimeSlot)
-            slot = RuntimeSlot(runtime: reusableRuntime)
-            bindRuntime(slot)
-            activeRuntimeSlot = slot
+            removeParkedReference(to: previous)
+            slot = RuntimeSlot(runtime: previous.runtime)
         }
+        bindRuntime(slot)
+        activeRuntimeSlot = slot
+        configureRuntimeSlot(slot, cwd: cwd, sessionPath: sessionPath, phase: .startingPi, completion: completion)
+        coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
+    }
 
+    private func completeOrWait(
+        for slot: RuntimeSlot,
+        completion: @escaping (Result<RuntimeSlot, Error>) -> Void
+    ) {
+        if slot.isReady {
+            completion(.success(slot))
+            resetRuntimeRetirementLease(for: slot)
+        } else {
+            slot.readyWaiters.append(completion)
+        }
+    }
+
+    private func canReuseProcess(_ slot: RuntimeSlot, in cwd: URL) -> Bool {
+        slot.runtime.isRunning
+            && slot.isReady
+            && slot.cwd == cwd.standardizedFileURL.path
+            && state(for: slot).lastError == nil
+            && isIdleAndClean(slot)
+    }
+
+    private func configureRuntimeSlot(
+        _ slot: RuntimeSlot,
+        cwd: URL,
+        sessionPath: URL?,
+        phase: RuntimePhase,
+        completion: @escaping (Result<RuntimeSlot, Error>) -> Void
+    ) {
         clearExtensionDialogs()
         slot.sessionPath = sessionPath?.standardizedFileURL.path
         slot.cwd = cwd.standardizedFileURL.path
         slot.startedForNewChat = sessionPath == nil
-        slot.state = RuntimeState()
+        slot.state = RuntimeState(phase: phase)
         slot.metrics = TokenMetrics()
         slot.models.removeAll()
         slot.thinkingLevels = ["off"]
         slot.optionsLoading = false
+        slot.optionsPrepared = false
         slot.capability = nil
         slot.questionnaire = nil
         slot.statuses.removeAll()
@@ -1691,44 +1792,106 @@ final class AppStore: ObservableObject {
         slot.isStarting = true
         slot.readyWaiters = [completion]
         restoreRuntimePresentation(slot)
+    }
 
+    private func switchReusedRuntime(
+        _ slot: RuntimeSlot,
+        cwd: URL,
+        sessionPath: URL?,
+        oldSessionPath: String?
+    ) {
+        let command = sessionPath == nil ? "new_session" : "switch_session"
+        let payload = sessionPath.map { ["sessionPath": JSONValue.string($0.standardizedFileURL.path)] } ?? [:]
+        slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            guard case let .success(response) = result,
+                  responseError(response) == nil,
+                  response["data"]?["cancelled"]?.boolValue != true else {
+                coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
+                return
+            }
+            loadRuntimeState(
+                slot,
+                sessionPath: sessionPath,
+                reusedFrom: oldSessionPath,
+                validateReusedRoute: true
+            ) {
+                self.coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
+            }
+        }
+    }
+
+    private func coldStartRuntime(_ slot: RuntimeSlot, cwd: URL, sessionPath: URL?) {
+        slot.sessionPath = sessionPath?.standardizedFileURL.path
+        slot.cwd = cwd.standardizedFileURL.path
+        slot.startedForNewChat = sessionPath == nil
+        updateState(for: slot) { $0 = RuntimeState(phase: .startingPi) }
+        if slot.runtime.isRunning { slot.runtime.stop() }
         do {
             try slot.runtime.start(cwd: cwd, sessionPath: sessionPath)
-            updateState(for: slot) { $0.isConnected = true }
+            updateState(for: slot) { state in
+                state.isConnected = true
+                state.phase = .openingConversation
+            }
         } catch {
             updateState(for: slot) { $0.lastError = error.localizedDescription }
             finishRuntimeStart(slot, result: .failure(error))
             return
         }
+        loadRuntimeState(slot, sessionPath: sessionPath, reusedFrom: nil)
+    }
 
+    private func loadRuntimeState(
+        _ slot: RuntimeSlot,
+        sessionPath: URL?,
+        reusedFrom oldSessionPath: String?,
+        validateReusedRoute: Bool = false,
+        onReuseFailure: (() -> Void)? = nil
+    ) {
         slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot else { return }
-            switch result {
-            case let .success(response):
-                if let error = responseError(response) {
-                    updateState(for: slot) { state in
-                        state.lastError = error
-                        state.isConnected = false
-                    }
-                    slot.runtime.stop()
-                    finishRuntimeStart(slot, result: .failure(PiRPCError.processExited(error)))
-                    return
+            guard case let .success(response) = result, responseError(response) == nil else {
+                if let onReuseFailure { onReuseFailure(); return }
+                let error: Error
+                switch result {
+                case let .failure(value): error = value
+                case let .success(response):
+                    error = PiRPCError.processExited(responseError(response) ?? "Pi rejected get_state.")
                 }
-                applyState(response["data"], to: slot)
-                if slot === activeRuntimeSlot {
-                    hydrateRuntimeConversationIfNeeded()
-                    requestStats()
-                }
-                finishRuntimeStart(slot, result: .success(slot))
-            case let .failure(error):
-                updateState(for: slot) { state in
-                    state.lastError = error.localizedDescription
-                    state.isConnected = false
-                }
-                slot.runtime.stop()
-                finishRuntimeStart(slot, result: .failure(error))
+                failRuntimeStart(slot, error: error)
+                return
             }
+            applyState(response["data"], to: slot)
+            if validateReusedRoute,
+               !runtimeStateMatchesReusedRoute(slot, sessionPath: sessionPath, oldSessionPath: oldSessionPath) {
+                onReuseFailure?()
+                return
+            }
+            finishRuntimeStart(slot, result: .success(slot))
+            if slot === activeRuntimeSlot { requestStats() }
         }
+    }
+
+    private func runtimeStateMatchesReusedRoute(
+        _ slot: RuntimeSlot,
+        sessionPath: URL?,
+        oldSessionPath: String?
+    ) -> Bool {
+        guard let reported = state(for: slot).sessionFile, !reported.isEmpty else { return false }
+        let path = URL(fileURLWithPath: reported).standardizedFileURL.path
+        if let sessionPath { return path == sessionPath.standardizedFileURL.path }
+        guard let oldSessionPath else { return false }
+        return path != URL(fileURLWithPath: oldSessionPath).standardizedFileURL.path
+    }
+
+    private func failRuntimeStart(_ slot: RuntimeSlot, error: Error) {
+        updateState(for: slot) { state in
+            state.lastError = error.localizedDescription
+            state.isConnected = false
+            state.phase = .idle
+        }
+        slot.runtime.stop()
+        finishRuntimeStart(slot, result: .failure(error))
     }
 
     private func finishRuntimeStart(_ slot: RuntimeSlot, result: Result<RuntimeSlot, Error>) {
@@ -1737,6 +1900,11 @@ final class AppStore: ObservableObject {
         let waiters = slot.readyWaiters
         slot.readyWaiters.removeAll()
         for waiter in waiters { waiter(result) }
+        if slot === activeRuntimeSlot {
+            resetRuntimeRetirementLease(for: slot)
+        } else if isIdleAndClean(slot) {
+            retireBackgroundRuntime(slot)
+        }
     }
 
     private func dispatchMessage(
@@ -1766,7 +1934,14 @@ final class AppStore: ObservableObject {
         var payload: [String: JSONValue] = ["message": .string(text)]
         if !sentAttachments.isEmpty { payload["images"] = .array(sentAttachments.map(\.rpcValue)) }
         let wasStreaming = state(for: slot).isStreaming
-        if command == "prompt" { updateState(for: slot) { $0.isStreaming = true } }
+        let previousPhase = state(for: slot).phase
+        if command == "prompt" {
+            if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+            updateState(for: slot) { state in
+                state.isStreaming = true
+                state.phase = .waitingForModel
+            }
+        }
 
         slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
             guard let self, let slot else { return }
@@ -1790,13 +1965,17 @@ final class AppStore: ObservableObject {
                 return
             }
             if command == "prompt" {
-                updateState(for: slot) { $0.isStreaming = wasStreaming }
+                updateState(for: slot) { state in
+                    state.isStreaming = wasStreaming
+                    state.phase = previousPhase
+                }
                 slot.pendingTurn = nil
             }
             if let optimisticID { messages.removeAll { $0.id == optimisticID } }
             let restored = restoreDraft(text: originalDraft, attachments: sentAttachments, origin: origin)
             showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
-            if slot !== activeRuntimeSlot, !state(for: slot).isBusy { retireBackgroundRuntime(slot) }
+            if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+            else if !state(for: slot).isBusy { retireBackgroundRuntime(slot) }
         }
     }
 
@@ -1874,17 +2053,6 @@ final class AppStore: ObservableObject {
         activities = activityPresenter.activities(from: messages)
     }
 
-    private func hydrateRuntimeConversationIfNeeded() {
-        guard isSelectedRuntime else { return }
-        let slot = activeRuntimeSlot
-        slot.runtime.send(type: "get_messages", payload: [:]) { [weak self, weak slot] result in
-            guard let self, let slot, slot === activeRuntimeSlot, isSelectedRuntime,
-                  case let .success(response) = result, responseError(response) == nil else { return }
-            let loaded = SessionParser.chatMessages(fromRPCMessages: response["data"]?["messages"])
-            if !loaded.isEmpty { replaceLoadedMessages(with: loaded) }
-        }
-    }
-
     private func requestStats() {
         let slot = activeRuntimeSlot
         guard slot.runtime.isRunning else { return }
@@ -1915,6 +2083,7 @@ final class AppStore: ObservableObject {
         updateState(for: slot) { state in
             state.isConnected = true
             state.isStreaming = data["isStreaming"]?.boolValue ?? false
+            state.phase = state.isStreaming ? .working : .idle
             state.isCompacting = data["isCompacting"]?.boolValue ?? false
             state.thinkingLevel = data["thinkingLevel"]?.stringValue
             state.sessionFile = data["sessionFile"]?.stringValue
@@ -1946,11 +2115,16 @@ final class AppStore: ObservableObject {
         switch type {
         case "agent_start":
             slot.outboxDispatches.removeAll()
-            updateState(for: slot) { $0.isStreaming = true }
+            if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+            updateState(for: slot) { state in
+                state.isStreaming = true
+                state.phase = .working
+            }
         case "agent_settled":
             updateState(for: slot) { state in
                 state.isStreaming = false
                 state.isRetrying = false
+                state.phase = .idle
             }
             slot.capability = nil
             discardQuestionnaire(from: slot)
@@ -1964,9 +2138,9 @@ final class AppStore: ObservableObject {
                 preview: slot.lastAssistantText
             )
             if let session { Task { await self.refreshSummary(for: session) } }
-            if !startedFollowUp, slot.outbox.isEmpty, slot.outboxDispatches.isEmpty,
-               slot.dialogs.isEmpty, slot.deferredEvents.isEmpty {
-                retireBackgroundRuntime(slot)
+            if !startedFollowUp {
+                if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
             }
         case "message_update":
             if let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
@@ -2045,6 +2219,7 @@ final class AppStore: ObservableObject {
         guard let method = event["method"]?.stringValue else { return }
         switch method {
         case "select", "confirm", "input", "editor", "set_editor_text":
+            if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             deferEvent(event, for: slot)
             if method != "set_editor_text" { notify(.approvalNeeded, session: session(for: slot)) }
         case "setStatus":
@@ -2111,8 +2286,7 @@ final class AppStore: ObservableObject {
     }
 
     private func retireBackgroundRuntime(_ slot: RuntimeSlot) {
-        guard slot !== activeRuntimeSlot, !slot.state.isBusy, slot.outbox.isEmpty,
-              slot.outboxDispatches.isEmpty, slot.dialogs.isEmpty, slot.deferredEvents.isEmpty else { return }
+        guard slot !== activeRuntimeSlot, isIdleAndClean(slot) else { return }
         removeParkedReference(to: slot)
         slot.runtime.onEvent = nil
         slot.runtime.onExit = nil
@@ -2129,10 +2303,13 @@ final class AppStore: ObservableObject {
         switch type {
         case "agent_start":
             activeRuntimeSlot.outboxDispatches.removeAll()
+            cancelRuntimeRetirementLease()
             runtimeState.isStreaming = true
+            runtimeState.phase = .working
         case "agent_settled":
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
+            runtimeState.phase = .idle
             activeCapability = nil
             discardQuestionnaire()
             streamingMessage = nil
@@ -2154,6 +2331,7 @@ final class AppStore: ObservableObject {
                     refreshSelectedGit()
                 }
             }
+            resetRuntimeRetirementLease(for: activeRuntimeSlot)
         case "message_update":
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
             streamingMessage = parsed
@@ -2346,6 +2524,7 @@ final class AppStore: ObservableObject {
                 showToast("Too many extension dialogs are open; one was cancelled.", style: .warning)
                 return
             }
+            cancelRuntimeRetirementLease()
             dialogQueue.append(request)
             if activeDialog == nil {
                 activeDialog = request
@@ -2400,12 +2579,14 @@ final class AppStore: ObservableObject {
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         slot.outboxDispatches.removeAll()
         if slot === activeRuntimeSlot {
+            cancelRuntimeRetirementLease()
             clearExtensionDialogs()
             updateState(for: slot) { state in
                 state.isConnected = false
                 state.isStreaming = false
                 state.isCompacting = false
                 state.isRetrying = false
+                state.phase = .idle
             }
             activeCapability = nil
             pendingQuestionnaire = nil
@@ -2416,6 +2597,7 @@ final class AppStore: ObservableObject {
                 state.isStreaming = false
                 state.isCompacting = false
                 state.isRetrying = false
+                state.phase = .idle
             }
             slot.capability = nil
             slot.questionnaire = nil
@@ -2557,7 +2739,7 @@ final class AppStore: ObservableObject {
     deinit {
         gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
-        prefetchTask?.cancel()
+        prefetchTask?.cancel(); cancelRuntimeRetirement?()
         probeRuntime?.stop()
         for slot in parkedRuntimes.values { slot.runtime.stop() }
         activeRuntimeSlot.runtime.stop()

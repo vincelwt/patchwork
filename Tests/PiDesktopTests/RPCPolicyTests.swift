@@ -5,7 +5,6 @@ import XCTest
 final class RPCTimeoutPolicyTests: XCTestCase {
     func testStateQueriesFailAuthoritativelyAndSideEffectsDoNot() {
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_state"), .authoritativeFailure(after: 30))
-        XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_messages"), .authoritativeFailure(after: 30))
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_session_stats"), .authoritativeFailure(after: 30))
 
         for command in ["prompt", "steer", "follow_up", "abort", "set_session_name", "export_html"] {

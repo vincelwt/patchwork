@@ -43,8 +43,10 @@ struct ComposerView: View {
         Binding(
             get: { ComposerContent(text: text, attachments: attachments) },
             set: { value in
-                if text != value.text { text = value.text }
-                if attachments != value.attachments { attachments = value.attachments }
+                guard text != value.text || attachments != value.attachments else { return }
+                text = value.text
+                attachments = value.attachments
+                store.composerContentDidChange()
             }
         )
     }
@@ -81,14 +83,7 @@ struct ComposerView: View {
             RoundedRectangle(cornerRadius: PiTheme.composerRadius, style: .continuous)
                 .stroke(Color.piHairline, lineWidth: PiTheme.hairline)
         }
-        .task(id: optionsContextID) { store.prepareComposerOptions() }
         .onChange(of: focusSignal) { _, _ in bridge.focus?() }
-    }
-
-    private var optionsContextID: String {
-        store.selectedSession?.fileURL.standardizedFileURL.path
-            ?? store.selectedFolder?.standardizedFileURL.path
-            ?? "no-folder"
     }
 
     private var canSend: Bool {
@@ -173,8 +168,8 @@ private struct ComposerToolbar: View {
             ModeSlider()
 
             if isStreaming, let onAbort {
-                IconButton(symbol: "stop.fill", help: "Stop Pi (⌘.)", action: onAbort)
-                    .accessibilityLabel("Stop Pi")
+                IconButton(symbol: "stop.fill", help: "Abort Turn (⌘.)", action: onAbort)
+                    .accessibilityLabel("Abort Turn")
             }
 
             if isStreaming, let onSteer, let onFollowUp {
@@ -280,10 +275,10 @@ private struct ComposerRuntimeLabel: View {
             } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
                 Label("Retry \(store.runtimeState.retryAttempt ?? 1)", systemImage: "arrow.clockwise")
                     .foregroundStyle(Color.piOrange)
-            } else if store.isSelectedRuntime, store.runtimeState.isStreaming {
+            } else if let label = store.currentRouteRuntimePhase?.label {
                 HStack(spacing: PiTheme.space4) {
                     ProgressView().controlSize(.mini)
-                    Text("Working")
+                    Text(label)
                 }
                 .foregroundStyle(.secondary)
             } else {

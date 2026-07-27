@@ -151,7 +151,7 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.draft, "prompt for A", "The failed draft waits in its own conversation")
     }
 
-    func testMessageAppearsBeforeRuntimeStartupFinishesAndSurvivesHistoryHydration() throws {
+    func testMessageAppearsBeforeRuntimeStartupFinishes() throws {
         let (store, runtime, sessionA, _) = makeStore()
         store.selectSession(sessionA)
         runtime.sessionFile = sessionA.fileURL.path
@@ -171,16 +171,8 @@ final class AppStoreRollbackTests: XCTestCase {
             "sessionId": .string(sessionA.id)
         ]))
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
-
-        runtime.succeed("get_messages", data: .object([
-            "messages": .array([.object([
-                "role": .string("assistant"),
-                "content": .string("Earlier answer"),
-                "timestamp": .number(1_000)
-            ])])
-        ]))
-        XCTAssertEqual(store.messages.map(\.textContent), ["Earlier answer", "show this now"])
-        XCTAssertTrue(store.messages.last?.id.hasPrefix("local-") == true)
+        XCTAssertEqual(runtime.commandCount("get_messages"), 0)
+        XCTAssertEqual(store.messages.map(\.textContent), ["show this now"])
     }
 
     func testNewChatMessageAppearsBeforeSessionPromotion() throws {

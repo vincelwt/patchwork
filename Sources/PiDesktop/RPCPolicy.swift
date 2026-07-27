@@ -22,7 +22,6 @@ enum RPCTimeoutPolicy {
     /// Read-only commands with no side effects.
     static let stateQueries: Set<String> = [
         "get_state",
-        "get_messages",
         "get_session_stats"
     ]
 
