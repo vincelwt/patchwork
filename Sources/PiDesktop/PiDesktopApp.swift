@@ -117,6 +117,8 @@ struct RootView: View {
                     ideal: PiTheme.sidebarIdealWidth,
                     max: PiTheme.sidebarMaxWidth
                 )
+                .toolbar(removing: .sidebarToggle)
+                .piPlainToolbar { sidebarToggleItem }
         } detail: {
             VStack(spacing: 0) {
                 detail
@@ -126,8 +128,6 @@ struct RootView: View {
             .frame(minWidth: 500)
         }
         .navigationSplitViewStyle(.balanced)
-        .toolbar(removing: .sidebarToggle)
-        .piPlainToolbar { sidebarToggleItem }
         // Extension `setTitle` drives the real window title, not just an inspector field.
         .navigationTitle(store.windowTitle)
         .onAppear { updateSidebar(for: geometry.size.width) }
@@ -180,7 +180,7 @@ struct RootView: View {
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
     }
 
-    /// Lives on the split view, not the sidebar column, so it survives the column being hidden.
+    /// Scoped to the sidebar column so it renders at that column's trailing edge.
     /// Setting `columnVisibility` without arming `expectedPolicyVisibility` is deliberate: the
     /// `onChange` above must read this as a user override, exactly as the automatic toggle did.
     @ToolbarContentBuilder
