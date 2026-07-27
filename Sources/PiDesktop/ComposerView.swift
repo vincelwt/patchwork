@@ -59,6 +59,7 @@ struct ComposerView: View {
                 placeholder: placeholder,
                 autofocus: autofocus,
                 onSubmit: handleSend,
+                onEscape: isStreaming ? { store.stopFromEscape(fully: $0) } : nil,
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )

@@ -156,6 +156,38 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("follow_up"), 1)
     }
 
+    func testSingleEscapeStopsOnlyWhenAQueuedMessageCanContinueAsFollowUp() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+
+        store.stopFromEscape(fully: false)
+        XCTAssertEqual(runtime.commandCount("abort"), 0)
+
+        store.enqueueOutbox(text: "continue with this", delivery: .steer)
+        store.stopFromEscape(fully: false)
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
+        XCTAssertEqual(store.outbox.map(\.delivery), [.followUp])
+
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(runtime.commandCount("follow_up"), 1)
+        XCTAssertEqual(runtime.lastPayload("follow_up")?["message"]?.stringValue, "continue with this")
+    }
+
+    func testFullEscapeClearsQueuedContinuationBeforeAborting() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "do not continue", delivery: .steer)
+
+        store.stopFromEscape(fully: true)
+
+        XCTAssertTrue(store.outbox.isEmpty)
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(runtime.commandCount("follow_up"), 0)
+    }
+
     // MARK: - Helpers
 
     private func makeStore() -> (AppStore, FakeRuntime, SessionSummary) {

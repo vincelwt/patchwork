@@ -69,6 +69,21 @@ final class ComposerInlineImageTests: XCTestCase {
         return url
     }
 
+    private func escapeEvent(at timestamp: TimeInterval) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: timestamp,
+            windowNumber: 0,
+            context: nil,
+            characters: "\u{1b}",
+            charactersIgnoringModifiers: "\u{1b}",
+            isARepeat: false,
+            keyCode: 53
+        )!
+    }
+
     /// A text view wired the same way `NativeComposerTextView.makeNSView` wires it.
     private func makeTextView() -> ComposerTextView {
         let textView = ComposerTextView()
@@ -189,6 +204,20 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertEqual(content.text, "restored draft")
         XCTAssertEqual(content.attachments.map(\.id), [attachment.id])
         XCTAssertEqual(textView.string.filter { $0 == "\u{FFFC}" }.count, 1)
+    }
+
+    // MARK: - Key handling
+
+    func testDoubleEscapeCancelsThePendingSingleEscapeAndFullyStops() {
+        let textView = ComposerTextView()
+        var fullyStops: [Bool] = []
+        textView.onEscape = { fullyStops.append($0) }
+
+        textView.keyDown(with: escapeEvent(at: 1))
+        XCTAssertTrue(fullyStops.isEmpty, "The first Escape waits to distinguish a single from a double press")
+
+        textView.keyDown(with: escapeEvent(at: 1.1))
+        XCTAssertEqual(fullyStops, [true])
     }
 
     // MARK: - Finder drop

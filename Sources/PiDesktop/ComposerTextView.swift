@@ -51,6 +51,7 @@ struct NativeComposerTextView: NSViewRepresentable {
     var placeholder = ""
     var autofocus = false
     let onSubmit: () -> Void
+    var onEscape: ((Bool) -> Void)? = nil
     /// Applies the image budgets and returns the accepted subset.
     let admitImages: ([ImageAttachment], [ImageAttachment]) -> [ImageAttachment]
     /// Intrinsic content height, so the composer grows with the text (and inline images)
@@ -88,6 +89,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.placeholder = placeholder
         textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
+        textView.onEscape = onEscape
         textView.onHeightChange = onHeightChange
         textView.setAccessibilityLabel("Message")
         textView.registerForDraggedTypes([.fileURL, .png, .tiff])
@@ -114,6 +116,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.placeholder = placeholder
         textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
+        textView.onEscape = onEscape
         textView.onHeightChange = onHeightChange
         // Only rebuild when the model diverges from what the view last published, so typing is
         // never interrupted by a round trip through SwiftUI state.
@@ -150,12 +153,15 @@ struct NativeComposerTextView: NSViewRepresentable {
 
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var onEscape: ((Bool) -> Void)? { didSet { if onEscape == nil { firstEscapeTime = nil } } }
     var onHeightChange: ((CGFloat) -> Void)?
     var placeholder = "" { didSet { needsDisplay = true } }
     var autofocusOnWindow = false
     weak var coordinator: NativeComposerTextView.Coordinator?
     private var reportedHeight: CGFloat = 0
     private var didAutofocus = false
+    private var firstEscapeTime: TimeInterval?
+    private static let doubleEscapeInterval: TimeInterval = 0.5
     /// Attachments currently represented by an inline placeholder, keyed by identity.
     private var known: [UUID: ImageAttachment] = [:]
 
@@ -308,8 +314,30 @@ final class ComposerTextView: NSTextView {
     // MARK: Key handling
 
     override func keyDown(with event: NSEvent) {
-        let isReturn = event.keyCode == 36 || event.keyCode == 76
         let modifiers = event.modifierFlags.intersection([.shift, .option, .command, .control])
+        if event.keyCode == 53, modifiers.isEmpty, !hasMarkedText(), let onEscape {
+            if event.isARepeat { return }
+            if let firstEscapeTime,
+               event.timestamp >= firstEscapeTime,
+               event.timestamp - firstEscapeTime < Self.doubleEscapeInterval {
+                self.firstEscapeTime = nil
+                onEscape(true)
+            } else {
+                let timestamp = event.timestamp
+                firstEscapeTime = timestamp
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.doubleEscapeInterval) { [weak self] in
+                    guard let self, self.firstEscapeTime == timestamp else { return }
+                    self.firstEscapeTime = nil
+                    self.onEscape?(false)
+                }
+            }
+            return
+        }
+        if firstEscapeTime != nil {
+            firstEscapeTime = nil
+            onEscape?(false)
+        }
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
         if isReturn, !hasMarkedText(), !modifiers.contains(.shift) { onSubmit?(); return }
         super.keyDown(with: event)
     }
