@@ -223,6 +223,11 @@ struct ConversationView: View {
             .help(store.selectedSession?.cwd.path ?? "Conversation actions")
         }
 
+        // Keep the inspector control at the trailing edge on macOS 26 toolbars.
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        }
+
         ToolbarItem(placement: .primaryAction) {
             Button { withAnimation(.easeOut(duration: 0.16)) { store.inspectorVisible.toggle() } } label: {
                 Image(systemName: "sidebar.right").font(.system(size: PiIcon.small, weight: .regular))
