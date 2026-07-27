@@ -225,6 +225,29 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertTrue(textView.currentContent().attachments.isEmpty)
     }
 
+    func testWholeConversationRegistersTheImageFileDropTarget() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop/ConversationView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(source.contains("conversationColumn\n                    .frame(maxWidth: .infinity, maxHeight: .infinity)"))
+        XCTAssertTrue(source.contains(".dropDestination(for: URL.self)"))
+        XCTAssertTrue(source.contains("store.addAttachments(images)"))
+    }
+
+    func testModeLabelKeepsItsIntrinsicWidth() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop/ComposerView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(source.contains(".lineLimit(1)\n                .fixedSize(horizontal: true, vertical: false)"))
+        XCTAssertFalse(source.contains(".frame(width: 34, alignment: .trailing)"))
+    }
+
     // MARK: - Budgets
 
     func testCountBudgetIsAppliedToInlineInsertion() throws {

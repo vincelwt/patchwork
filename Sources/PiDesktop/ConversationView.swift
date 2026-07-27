@@ -28,6 +28,13 @@ struct ConversationView: View {
                 conversationColumn
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.piTranscript)
+                    .dropDestination(for: URL.self) { urls, _ in
+                        let images = ImageImportService.attachments(from: urls)
+                        guard !images.isEmpty else { return false }
+                        store.addAttachments(images)
+                        composerFocusTick += 1
+                        return true
+                    }
 
                 if showsInspector {
                     Rectangle()
