@@ -17,20 +17,41 @@ final class PiRPCSession: @unchecked Sendable {
     private let bufferLock = NSLock()
     private var buffer: [PiJSONValue] = []
     private var requestCounter = 0
+    /// Serializes every write to Pi's stdin. Prompts come from the run's own task, while steer/
+    /// follow-up deliveries and `extension_ui_response` answers arrive from HTTP handlers on
+    /// other tasks entirely — two interleaved partial JSONL lines would corrupt the stream.
+    private let writeLock = NSLock()
+    /// Set when a write timed out or failed part-way through a record. The stream then holds a
+    /// partial line that no later write can repair, so every subsequent write fails fast rather
+    /// than appending onto a torn command.
+    private var writeBroken: String?
     private let stderrLock = NSLock()
     private var stderrTail = ""
+    /// Responses seen by whoever is draining output, kept so a caller that is *not* the drainer
+    /// (a steer delivered from an HTTP handler) can still collect its acknowledgement. Bounded;
+    /// oldest entries are evicted, never accumulated.
+    private var responseCache: [(id: String, value: PiJSONValue)] = []
+    private static let responseCacheLimit = 64
 
     var isRunning: Bool { process.isRunning }
 
-    private init(process: Process, inputHandle: FileHandle, outputFD: Int32, errorHandle: FileHandle) {
+    /// How long one write may wait for a wedged child to drain its stdin. A parameter only so a
+    /// test can prove the bound in a fraction of a second instead of the production default.
+    private let writeTimeout: TimeInterval
+
+    private init(process: Process, inputHandle: FileHandle, outputFD: Int32, errorHandle: FileHandle, writeTimeout: TimeInterval) {
         self.process = process
         self.inputHandle = inputHandle
         self.outputFD = outputFD
         self.errorHandle = errorHandle
+        self.writeTimeout = writeTimeout
         watchStderr()
     }
 
-    static func start(cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String]) throws -> PiRPCSession {
+    static func start(
+        cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String],
+        writeTimeout: TimeInterval = BlockingPipeIO.defaultWriteTimeout
+    ) throws -> PiRPCSession {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -45,26 +66,93 @@ final class PiRPCSession: @unchecked Sendable {
         process.standardOutput = output
         process.standardError = error
         try process.run()
-        return PiRPCSession(process: process, inputHandle: input.fileHandleForWriting, outputFD: output.fileHandleForReading.fileDescriptor, errorHandle: error.fileHandleForReading)
+        // Pipe descriptors are blocking by default, which would make a full stdin buffer park the
+        // writing task indefinitely — the exact hang `BlockingPipeIO.writeAll`'s timeout exists to
+        // bound. Non-blocking turns that into `EAGAIN`, which it can poll on with a deadline.
+        let inputFD = input.fileHandleForWriting.fileDescriptor
+        let flags = fcntl(inputFD, F_GETFL, 0)
+        if flags >= 0 { _ = fcntl(inputFD, F_SETFL, flags | O_NONBLOCK) }
+        return PiRPCSession(
+            process: process, inputHandle: input.fileHandleForWriting,
+            outputFD: output.fileHandleForReading.fileDescriptor, errorHandle: error.fileHandleForReading,
+            writeTimeout: writeTimeout
+        )
     }
 
     /// Writes a correlated request and returns its id; the caller awaits the matching response
     /// separately via `receiveMatching`.
     @discardableResult
     func send(type: String, payload: [String: PiJSONValue] = [:]) throws -> String {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         requestCounter += 1
         let id = "daemon-\(process.processIdentifier)-\(requestCounter)"
         var object = payload
         object["type"] = .string(type)
         object["id"] = .string(id)
+        try writeLocked(object)
+        return id
+    }
+
+    /// Writes an object whose `id` the caller owns — an `extension_ui_response` must echo the id
+    /// Pi chose for its request, so it can never use `send`'s generated one.
+    func sendRaw(_ object: [String: PiJSONValue]) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try writeLocked(object)
+    }
+
+    /// Must only be called with `writeLock` held.
+    private func writeLocked(_ object: [String: PiJSONValue]) throws {
+        if let writeBroken { throw RunnerError.ioFailure(writeBroken) }
         do {
-            try BlockingPipeIO.writeAll(fd: inputHandle.fileDescriptor, data: try PiJSONValue.object(object).encodedLine())
+            try BlockingPipeIO.writeAll(
+                fd: inputHandle.fileDescriptor,
+                data: try PiJSONValue.object(object).encodedLine(),
+                timeoutSeconds: writeTimeout
+            )
         } catch let error as RunnerError {
+            writeBroken = error.localizedDescription
             throw error
         } catch {
-            throw RunnerError.ioFailure("Could not write to Pi: \(error)")
+            let message = "Could not write to Pi: \(error)"
+            writeBroken = message
+            throw RunnerError.ioFailure(message)
         }
-        return id
+    }
+
+    /// Waits for the response to `id` *without* reading the pipe: the run's own consume loop is
+    /// the reader, and this only inspects what that loop already cached. Returns `nil` when the
+    /// wait elapses (or the run settled and stopped reading), which callers must treat as
+    /// "outcome unknown" — never as "not delivered", or a resend would double-prompt Pi.
+    func awaitCachedResponse(id: String, timeout: TimeInterval) async -> PiJSONValue? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let cached = takeCachedResponse(id: id) { return cached }
+            guard process.isRunning else { return takeCachedResponse(id: id) }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
+        return takeCachedResponse(id: id)
+    }
+
+    private func takeCachedResponse(id: String) -> PiJSONValue? {
+        bufferLock.lock(); defer { bufferLock.unlock() }
+        guard let index = responseCache.firstIndex(where: { $0.id == id }) else { return nil }
+        return responseCache.remove(at: index).value
+    }
+
+    private func cacheResponses(_ values: [PiJSONValue]) {
+        let responses = values.compactMap { value -> (id: String, value: PiJSONValue)? in
+            guard value["type"]?.stringValue == "response", let id = value["id"]?.stringValue else { return nil }
+            return (id, value)
+        }
+        guard !responses.isEmpty else { return }
+        bufferLock.lock()
+        responseCache.append(contentsOf: responses)
+        if responseCache.count > Self.responseCacheLimit {
+            responseCache.removeFirst(responseCache.count - Self.responseCacheLimit)
+        }
+        bufferLock.unlock()
     }
 
     /// Waits for the next decoded line \u2014 response or event \u2014 up to `timeout`. `nil` means the
@@ -131,6 +219,7 @@ final class PiRPCSession: @unchecked Sendable {
                 let records = framer.append(chunk)
                 guard !records.isEmpty else { continue }
                 let values = records.compactMap { try? PiJSONValue.decode($0) }
+                cacheResponses(values)
                 guard let first = values.first else { continue }
                 if values.count > 1 {
                     bufferLock.lock(); buffer.append(contentsOf: values.dropFirst()); bufferLock.unlock()

@@ -83,20 +83,102 @@ public struct MessageRole: TolerantRawRepresentable {
     public static func other(_ rawValue: String) -> MessageRole { MessageRole(rawValue: rawValue) }
 }
 
-/// `{ "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false }`
+/// Why an inline image is or is not fetchable. Tolerant so a newer daemon can add a reason
+/// without an older client dropping the whole message.
+public struct MessageImageStatus: TolerantRawRepresentable {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    /// Within every bound: `GET /v1/threads/{id}/images/{imageId}` will return the bytes.
+    public static let ok = MessageImageStatus(rawValue: "ok")
+    /// The projection's per-request image budget was already spent on earlier images.
+    public static let omitted = MessageImageStatus(rawValue: "omitted")
+    /// Present but larger than a single bounded response may carry.
+    public static let tooLarge = MessageImageStatus(rawValue: "tooLarge")
+    /// Missing, empty, or not decodable base64.
+    public static let invalid = MessageImageStatus(rawValue: "invalid")
+
+    public static var knownCases: [MessageImageStatus] { [.ok, .omitted, .tooLarge, .invalid] }
+    public static func other(_ rawValue: String) -> MessageImageStatus { MessageImageStatus(rawValue: rawValue) }
+}
+
+/// One inline image on a projected message — metadata only, never base64. A thread detail with
+/// twenty screenshots must stay a small JSON document (the hosted relay caps one encrypted
+/// payload at 1.5 MB), so bytes are fetched one at a time from
+/// `GET /v1/threads/{id}/images/{imageId}` and anything unfetchable stays visible as a
+/// placeholder instead of silently disappearing.
+public struct MessageImage: Codable, Hashable, Sendable, Identifiable {
+    public var id: String
+    public var mimeType: String
+    /// Decoded size, estimated from the base64 length without ever materialising the bytes.
+    public var byteCount: Int
+    public var fileName: String?
+    public var status: MessageImageStatus
+    /// User-facing reason shown in place of a non-`ok` image.
+    public var note: String?
+
+    public init(
+        id: String,
+        mimeType: String,
+        byteCount: Int,
+        fileName: String? = nil,
+        status: MessageImageStatus = .ok,
+        note: String? = nil
+    ) {
+        self.id = id
+        self.mimeType = mimeType
+        self.byteCount = byteCount
+        self.fileName = fileName
+        self.status = status
+        self.note = note
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        mimeType = try container.decodeIfPresent(String.self, forKey: .mimeType) ?? "image/png"
+        byteCount = try container.decodeIfPresent(Int.self, forKey: .byteCount) ?? 0
+        fileName = try container.decodeIfPresent(String.self, forKey: .fileName)
+        status = try container.decodeIfPresent(MessageImageStatus.self, forKey: .status) ?? .ok
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+    }
+}
+
+/// `GET /v1/threads/{id}/images/{imageId}` — one bounded image, base64 in JSON so the loopback
+/// listener and the hosted relay (whose RPC bodies are UTF-8 text) behave identically.
+public struct MessageImageResponse: Codable, Hashable, Sendable {
+    public var id: String
+    public var mimeType: String
+    public var byteCount: Int
+    public var fileName: String?
+    public var data: String
+
+    public init(id: String, mimeType: String, byteCount: Int, fileName: String? = nil, data: String) {
+        self.id = id
+        self.mimeType = mimeType
+        self.byteCount = byteCount
+        self.fileName = fileName
+        self.data = data
+    }
+}
+
+/// `{ "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false,
+///    "images":[MessageImage] }`
 public struct Message: Codable, Hashable, Sendable, Identifiable {
     public var id: String
     public var role: MessageRole
     public var text: String
     public var at: Date
     public var isError: Bool
+    public var images: [MessageImage]
 
-    public init(id: String, role: MessageRole, text: String, at: Date, isError: Bool = false) {
+    public init(id: String, role: MessageRole, text: String, at: Date, isError: Bool = false, images: [MessageImage] = []) {
         self.id = id
         self.role = role
         self.text = text
         self.at = at
         self.isError = isError
+        self.images = images
     }
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +188,7 @@ public struct Message: Codable, Hashable, Sendable, Identifiable {
         text = try container.decodeIfPresent(String.self, forKey: .text) ?? ""
         at = try container.decodeIfPresent(Date.self, forKey: .at) ?? .distantPast
         isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        images = try container.decodeIfPresent([MessageImage].self, forKey: .images) ?? []
     }
 }
 
@@ -180,19 +263,38 @@ public struct SendMessageRequest: Codable, Sendable {
     public var text: String
     public var delivery: DeliveryMode?
     public var attachments: [MessageAttachment]?
-    public init(text: String, delivery: DeliveryMode? = nil, attachments: [MessageAttachment]? = nil) {
+    /// A caller-chosen submission id, stable across retries of *the same* message. Repeating a
+    /// `(thread, clientId)` pair replays the original response instead of prompting Pi twice — the
+    /// difference between a lost response and a duplicate turn. Optional: an older client that
+    /// omits it simply gets no replay protection.
+    public var clientId: String?
+
+    public init(text: String, delivery: DeliveryMode? = nil, attachments: [MessageAttachment]? = nil, clientId: String? = nil) {
         self.text = text
         self.delivery = delivery
         self.attachments = attachments
+        self.clientId = clientId
     }
 }
 
-public struct SendMessageResponse: Codable, Sendable {
+public struct SendMessageResponse: Codable, Hashable, Sendable {
     public var runId: String?
     public var queued: Bool
-    public init(runId: String?, queued: Bool) {
+    /// How the message was *actually* delivered, which is not always what the caller asked for:
+    /// `steer`/`followUp` need a live daemon session to interrupt, and fall back to `auto`
+    /// (queued behind the current run) when there is none. Absent from older daemons.
+    public var delivery: DeliveryMode?
+    public init(runId: String?, queued: Bool, delivery: DeliveryMode? = nil) {
         self.runId = runId
         self.queued = queued
+        self.delivery = delivery
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        runId = try container.decodeIfPresent(String.self, forKey: .runId)
+        queued = try container.decodeIfPresent(Bool.self, forKey: .queued) ?? false
+        delivery = try? container.decodeIfPresent(DeliveryMode.self, forKey: .delivery)
     }
 }
 

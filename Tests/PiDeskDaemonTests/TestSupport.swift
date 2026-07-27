@@ -67,7 +67,9 @@ enum TestSupport {
         in directory: URL,
         executor: RunExecuting = FakeRunExecutor(),
         concurrency: Int = 2,
-        schedulerPollInterval: TimeInterval = 1
+        schedulerPollInterval: TimeInterval = 1,
+        interactions: InteractionRegistry = InteractionRegistry(),
+        liveSessions: LiveSessionRegistry = LiveSessionRegistry()
     ) -> DaemonCore {
         let settings = DaemonSettings(remoteEnabled: false, port: 0, concurrency: concurrency)
         let sessionRoot = directory.appendingPathComponent("sessions", isDirectory: true)
@@ -85,8 +87,21 @@ enum TestSupport {
             schedulesFileURL: directory.appendingPathComponent("schedules.json"),
             runHistoryFileURL: directory.appendingPathComponent("runs.jsonl"),
             overlayFileURL: directory.appendingPathComponent("overlay.json"),
-            schedulerPollInterval: schedulerPollInterval
+            schedulerPollInterval: schedulerPollInterval,
+            interactions: interactions,
+            liveSessions: liveSessions,
+            // Never the real app's `state.json`: the folder endpoint must read a fixture, and
+            // nothing here may depend on how the machine running the tests organises its own
+            // conversations.
+            appStateURL: directory.appendingPathComponent("state.json")
         )
+    }
+
+    /// Writes the app-owned parts of `state.json` this daemon reads (never writes).
+    static func writeAppState(in directory: URL, folders: String = "[]", assignments: [String: String] = [:]) {
+        let pairs = assignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
+        let json = "{\"virtualFolders\":\(folders),\"virtualFolderAssignments\":{\(pairs)}}"
+        try? json.write(to: directory.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
     }
 
     static func writeSessionFile(in directory: URL, id: String = "sess-\(UUID().uuidString)", cwd: String, lines extra: [String] = [], name: String? = nil) -> URL {

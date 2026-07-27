@@ -36,11 +36,19 @@ const state = {
   schedulesLoading: false,
   schedulesError: null,
   activity: null,
+  // `GET /v1/folders`: the Mac app's own virtual folders, read-only. `null` until loaded (or on
+  // an older daemon that has no such endpoint), which the thread list renders as plain project
+  // grouping rather than an error.
+  folders: null,
+  // Collapsed group ids for the thread tree. Session-scoped on purpose: it is a view preference,
+  // not something worth persisting to a device or syncing back to the Mac.
+  collapsedGroups: new Set(),
   // Most recent SSE payload of each kind, so a view whose data isn't part of global state (e.g.
   // an open thread's message list) can tell whether it needs to refetch. See threadView.js.
   lastThreadEvent: null,
   lastScheduleEvent: null,
-  lastRunEvent: null
+  lastRunEvent: null,
+  lastInteractionEvent: null
 };
 
 let currentView = null;
@@ -130,6 +138,16 @@ function loadThreads() {
     });
 }
 
+// Folders change only when someone edits them in the Mac app, so this is loaded with the thread
+// list rather than polled. A daemon without the endpoint leaves `folders` null: the list falls
+// back to project grouping instead of showing an error for a purely organisational feature.
+function loadFolders() {
+  return api
+    .folders()
+    .then((folders) => setState({ folders }))
+    .catch(() => setState({ folders: null }));
+}
+
 function loadSchedules() {
   setState({ schedulesLoading: true, schedulesError: null });
   return api
@@ -154,6 +172,10 @@ function handleEvent(name, data) {
     loadThreads();
   } else if (name === "activity") {
     setState({ activity: data });
+  } else if (name === "interaction") {
+    // Only a hint. The thread view re-reads GET /v1/interactions rather than accumulating
+    // frames, so a missed or out-of-order event cannot leave a stale dialog on screen.
+    setState({ lastInteractionEvent: data });
   }
   // Any other event name is forward-compatible-ignored per docs/daemon-api.md.
 }
@@ -179,6 +201,7 @@ const actions = {
       () => {
         setState({ authed: true });
         loadThreads();
+        loadFolders();
         loadSchedules();
         startEvents();
         go("/", { replace: true });
@@ -204,8 +227,15 @@ const actions = {
     go("/", { replace: true });
   },
 
-  refreshThreads: () => loadThreads(),
+  refreshThreads: () => Promise.all([loadThreads(), loadFolders()]),
   refreshSchedules: () => loadSchedules(),
+
+  toggleGroup(id) {
+    const collapsed = new Set(state.collapsedGroups);
+    if (collapsed.has(id)) collapsed.delete(id);
+    else collapsed.add(id);
+    setState({ collapsedGroups: collapsed });
+  },
 
   createThread(body) {
     return api.createThread(body).then(({ thread }) => {
@@ -217,6 +247,7 @@ const actions = {
 
   sendMessage: (id, body) => api.sendMessage(id, body),
   abortThread: (id) => api.abortThread(id),
+  respondInteraction: (id, body) => api.respondInteraction(id, body),
 
   archiveThread(id, archived) {
     return api.archiveThread(id, archived).then(({ thread }) => {
@@ -276,6 +307,9 @@ function go(path, { replace = false } = {}) {
 }
 
 function mountRoute() {
+  // A screen may own things outside its own node — a body-level overlay, a document listener, an
+  // observer, a timer — and replacing `mainEl`'s children would leave all of them running.
+  currentView?.dispose?.();
   const view = state.authed
     ? resolveRoute(location.pathname)
     : hosted
@@ -335,6 +369,7 @@ window.addEventListener("pi:relay-pairing", (event) => {
 window.addEventListener("pi:relay-paired", () => {
   setState({ authed: true, relayPairing: relayPairingState() });
   loadThreads();
+  loadFolders();
   loadSchedules();
   startEvents();
   go("/", { replace: true });
@@ -345,6 +380,7 @@ window.addEventListener("pi:relay-paired", () => {
 if (hosted) startRelay();
 if (state.authed) {
   loadThreads();
+  loadFolders();
   loadSchedules();
   startEvents();
 }

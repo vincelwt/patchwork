@@ -128,6 +128,18 @@ export const api = {
   archiveThread: (id, archived) => post(`/v1/threads/${encodeURIComponent(id)}/archive`, { archived }),
   renameThread: (id, name) => post(`/v1/threads/${encodeURIComponent(id)}/name`, { name }),
   markThreadRead: (id, unread) => post(`/v1/threads/${encodeURIComponent(id)}/read`, { unread }),
+  // Metadata only travels in the thread detail; each image is fetched separately so one
+  // screenshot-heavy transcript cannot exceed the relay's per-payload ceiling.
+  threadImage: (id, imageId) =>
+    request(`/v1/threads/${encodeURIComponent(id)}/images/${encodeURIComponent(imageId)}`),
+
+  // Read-only projection of the Mac app's own folder tree; never written from here.
+  folders: () => request("/v1/folders"),
+
+  // The authoritative list of dialogs a daemon run is blocked on. The `interaction` SSE event is
+  // only a hint that something changed — this is what a reconnecting client rehydrates from.
+  interactions: (threadId) => request(`/v1/interactions${toQuery({ threadId })}`),
+  respondInteraction: (id, body) => post(`/v1/interactions/${encodeURIComponent(id)}/respond`, body),
 
   activity: () => request("/v1/activity"),
 

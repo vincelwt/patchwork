@@ -1010,3 +1010,306 @@ details.advanced[open] summary { color: var(--text); }
   .composer textarea { max-height: 28vh; }
   .empty-state { padding-top: var(--space-4); padding-bottom: var(--space-4); }
 }
+
+/* ---------- Folder tree (thread list) ---------- */
+
+/* One indentation token drives both row kinds, so a folder header and the threads inside it stay
+   aligned at every depth. threadList.js clamps the step count, so a deep tree still leaves room
+   for a title on a narrow phone. */
+.row,
+.group-row {
+  padding-left: calc(var(--pad-l) + var(--depth, 0) * var(--space-3));
+}
+
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--tap);
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+  padding-right: var(--pad-r);
+  text-align: left;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid var(--hairline);
+  appearance: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--fs-label);
+  font-weight: 600;
+}
+.group-row:active { background: var(--pressed); }
+.group-row:focus-visible { outline-offset: -2px; }
+.group-caret {
+  width: 14px;
+  flex: none;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+.group-glyph { flex: none; color: var(--text-tertiary); font-size: 11px; }
+.group-virtual .group-glyph { color: var(--accent); }
+.group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.group-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  color: var(--text-tertiary);
+}
+
+/* ---------- Pending (unconfirmed) messages ---------- */
+
+/* Held at reduced opacity rather than a different colour: it is the same message, just not yet
+   confirmed by Pi's own session file. A failed one drops the dimming and gains the error tint. */
+.messages-pending {
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+.messages-pending:empty { display: none; }
+.msg-pending .bubble {
+  opacity: 0.72;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg-pending.msg-error .bubble { opacity: 1; }
+.msg-pending-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-end;
+  margin-top: var(--space-1);
+  font-size: var(--fs-caption);
+  color: var(--text-tertiary);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.msg-error .msg-pending-status { color: var(--red); }
+
+/* ---------- Inline images ---------- */
+
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  max-width: 100%;
+}
+.msg-user .msg-images { justify-content: flex-end; }
+
+.img-tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 96px;
+  min-height: 72px;
+  max-width: 100%;
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m);
+  overflow: hidden;
+  cursor: pointer;
+  appearance: none;
+  color: var(--text-tertiary);
+  font-size: var(--fs-caption);
+}
+.img-tile:active { opacity: 0.8; }
+.thumb {
+  display: block;
+  /* Responsive by construction: a wide screenshot shrinks to the column, a tall one is capped so
+     one image never fills the whole transcript. */
+  max-width: min(100%, 320px);
+  max-height: 240px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+.img-loading { padding: var(--space-2) var(--space-3); text-align: center; }
+.img-failed { color: var(--red); }
+
+.img-placeholder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--radius-m);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  max-width: 100%;
+}
+.img-glyph { color: var(--text-tertiary); }
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: calc(var(--space-3) + var(--safe-t)) var(--space-3) calc(var(--space-3) + var(--safe-b));
+  background: rgba(0, 0, 0, 0.92);
+}
+.lightbox-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: #fff;
+}
+.lightbox-bar .icon-btn, .lightbox-bar .link-btn { color: #fff; }
+.lightbox-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-small);
+}
+.lightbox-img {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+}
+
+/* ---------- Interaction (questionnaire / approval) ---------- */
+
+.interactions { display: flex; flex-direction: column; gap: var(--space-4); }
+.interactions:empty { display: none; }
+
+.interaction {
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-quiet);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-l);
+}
+.interaction-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.interaction-chip {
+  font-size: var(--fs-caption);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.interaction-step { font-size: var(--fs-caption); color: var(--text-tertiary); }
+.interaction-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-title);
+  font-weight: 650;
+  line-height: 1.3;
+}
+.interaction-message,
+.interaction-hint {
+  margin: 0 0 var(--space-3);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.interaction-options,
+.interaction-form { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.interaction-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-height: var(--tap);
+  padding: var(--space-3);
+  background: var(--surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius-m);
+  cursor: pointer;
+}
+.interaction-option:focus-within { border-color: var(--accent); }
+.interaction-option input { margin-top: 3px; flex: none; width: 20px; height: 20px; accent-color: var(--accent); }
+.interaction-option-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.interaction-option-label { font-size: var(--fs-body); font-weight: 550; }
+.interaction-option-desc { font-size: var(--fs-small); color: var(--text-secondary); }
+.interaction-option-preview {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  max-height: 180px;
+  overflow: auto;
+  background: var(--bg);
+  border-radius: var(--radius-s);
+  font-size: var(--fs-caption);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.interaction-text,
+.interaction-custom {
+  width: 100%;
+  /* 16px minimum, like every other field here, so iOS Safari never zooms on focus. */
+  font: inherit;
+  font-size: 16px;
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m);
+  resize: vertical;
+}
+.interaction-text:focus-visible,
+.interaction-custom:focus-visible { border-color: var(--accent); }
+
+.interaction-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.interaction-actions:empty { display: none; }
+
+@media (min-width: 800px) {
+  .group-row:hover { background: var(--surface-strong); }
+  .img-tile:hover { border-color: var(--hairline-strong); }
+  .interaction-option:hover { border-color: var(--hairline-strong); }
+}
+
+/* ---------- Review follow-ups ---------- */
+
+/* Scroll lock while the lightbox is open: without it the transcript scrolls underneath a
+   full-screen overlay on every touch drag. */
+body.modal-open { overflow: hidden; }
+
+/* `inert` is honoured natively where supported; this keeps the background visibly and
+   interactively out of the way everywhere else too. */
+[inert] { pointer-events: none; user-select: none; }
+
+/* Native grouping for option lists — no border/padding of its own, the rows carry the styling. */
+.interaction-fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
+/* An option whose preview sits outside the label, so scrolling the sample cannot toggle it. */
+.interaction-option-group { display: flex; flex-direction: column; gap: var(--space-1); }
+.interaction-option-group .interaction-option-preview { margin-left: calc(20px + var(--space-3)); }
+
+/* An image beyond the automatic budget is a deliberate tap, so its tile reads as an action. */
+.img-tile .img-loading { color: var(--accent); }
+.img-tile .img-failed { color: var(--red); }
