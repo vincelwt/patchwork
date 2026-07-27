@@ -586,7 +586,7 @@ final class AppStore: ObservableObject {
         // its fixed, specific summary.
         let body = (trigger == .turnFinished ? NotificationPreviewFormatter.format(preview) : nil) ?? trigger.summary
         if isApplicationActive {
-            showToast("\(session.displayName): \(body)", style: trigger.toastStyle, sessionPath: key)
+            showToast(body, style: trigger.toastStyle, sessionPath: key)
         } else {
             notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: body)
         }
