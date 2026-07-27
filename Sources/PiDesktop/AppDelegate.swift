@@ -9,6 +9,10 @@ import Foundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let daemonSupervisor = DaemonSupervisor()
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        _ = NSApplication.shared.setActivationPolicy(.regular)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { await daemonSupervisor.appDidLaunch() }
     }
