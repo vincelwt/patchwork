@@ -1,9 +1,70 @@
 import SwiftUI
 
-struct MessageView: View {
+private extension ChatMessage {
+    func isRenderEquivalent(to other: ChatMessage) -> Bool {
+        guard id == other.id, role == other.role, timestamp == other.timestamp,
+              toolCallID == other.toolCallID, toolName == other.toolName,
+              isError == other.isError, customType == other.customType,
+              details == other.details, raw == other.raw,
+              blocks.count == other.blocks.count else { return false }
+        return zip(blocks, other.blocks).allSatisfy { lhs, rhs in
+            guard lhs.id == rhs.id else { return false }
+            switch (lhs.kind, rhs.kind) {
+            case let (.image(a), .image(b)):
+                // Session entries are append-only; a stable image id/size cannot change bytes.
+                return a.id == b.id && a.data.count == b.data.count
+                    && a.mimeType == b.mimeType && a.fileName == b.fileName
+            default:
+                return lhs.kind == rhs.kind
+            }
+        }
+    }
+}
+
+private extension TranscriptActivityStep {
+    func isRenderEquivalent(to other: TranscriptActivityStep) -> Bool {
+        guard id == other.id, name == other.name, kind == other.kind,
+              arguments == other.arguments else { return false }
+        switch (result, other.result) {
+        case (nil, nil): return true
+        case let (lhs?, rhs?): return lhs.isRenderEquivalent(to: rhs)
+        default: return false
+        }
+    }
+}
+
+private extension TranscriptWorkEntry {
+    func isRenderEquivalent(to other: TranscriptWorkEntry) -> Bool {
+        switch (self, other) {
+        case let (.thinking(a), .thinking(b)):
+            return a == b
+        case let (.note(a), .note(b)):
+            return a.isRenderEquivalent(to: b)
+        case let (.activity(a), .activity(b)):
+            return a.id == b.id && a.isActive == b.isActive
+                && a.steps.count == b.steps.count
+                && zip(a.steps, b.steps).allSatisfy { $0.isRenderEquivalent(to: $1) }
+        default:
+            return false
+        }
+    }
+}
+
+private extension TranscriptWorkBlock {
+    func isRenderEquivalent(to other: TranscriptWorkBlock) -> Bool {
+        id == other.id && isActive == other.isActive
+            && startedAt == other.startedAt && endedAt == other.endedAt
+            && answerFailed == other.answerFailed
+            && entries.count == other.entries.count
+            && zip(entries, other.entries).allSatisfy { $0.isRenderEquivalent(to: $1) }
+    }
+}
+
+struct MessageView: View, Equatable {
     let message: ChatMessage
     let isStreaming: Bool
     let onImage: (ImagePayload) -> Void
+    var activeQuestionnaire: QuestionnaireSession? = nil
     /// Answers get a hover action row; the same view reused inside a work log does not.
     var showsActions = false
     /// Set only for the conversation's most recent user message, this reveals the hover "edit
@@ -12,6 +73,16 @@ struct MessageView: View {
     @State private var hovering = false
     /// Reported by the answer's AppKit text view, which owns the pointer while it is over prose.
     @State private var textHovering = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message.isRenderEquivalent(to: rhs.message)
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.activeQuestionnaire == rhs.activeQuestionnaire
+            && lhs.showsActions == rhs.showsActions
+            && (lhs.onEdit != nil) == (rhs.onEdit != nil)
+        // `onImage`/`onEdit` always target the same AppStore for this route; ignoring fresh
+        // function wrappers lets SwiftUI keep an unchanged realized row intact.
+    }
 
     var body: some View {
         Group {
@@ -90,7 +161,10 @@ struct MessageView: View {
                     ThinkingBlockView(text: text, streaming: isStreaming)
                 }
             case let .toolCall(call):
-                ToolCallRow(call: call)
+                ToolCallRow(
+                    call: call,
+                    questionnaire: activeQuestionnaire?.toolCallID == call.id ? activeQuestionnaire : nil
+                )
             case let .unknown(type, raw):
                 DisclosureRow(symbol: "questionmark.square.dashed", title: "Unsupported content · \(type)") {
                     CodeBlockView(language: nil, code: raw.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
@@ -130,21 +204,26 @@ struct ThinkingBlockView: View {
 
 // MARK: - Turn work log
 
-/// One turn's work: live and open while Pi is working; its details settle behind one quiet
-/// “Worked for …” line while visual results and unanswered questions remain in the transcript.
-struct TranscriptWorkView: View {
+/// One turn's work: live reasoning stays collapsed behind its latest thought unless the user
+/// opens it; settled details become one quiet “Worked for …” line while prominent output remains.
+struct TranscriptWorkView: View, Equatable {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @EnvironmentObject private var store: AppStore
 
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload) -> Void
+    let activeQuestionnaire: QuestionnaireSession?
 
     /// `nil` until the user decides; the run's own state owns it until then.
     @State private var userExpanded: Bool?
     @State private var hovering = false
 
-    private var isOpen: Bool { userExpanded ?? block.isActive }
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.block.isRenderEquivalent(to: rhs.block)
+            && lhs.activeQuestionnaire == rhs.activeQuestionnaire
+    }
+
+    private var isOpen: Bool { userExpanded ?? block.shouldStartExpanded }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
@@ -177,27 +256,24 @@ struct TranscriptWorkView: View {
             PiHairline()
 
             if isOpen {
-                HStack(alignment: .top, spacing: PiTheme.space12) {
-                    // A quiet rail separates the log from the answer without indenting the
-                    // answer itself.
-                    Rectangle()
-                        .fill(Color.piHairline)
-                        .frame(width: PiTheme.hairline)
-                    VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                        ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
-                            Group {
-                                switch entry {
-                                case let .thinking(value):
-                                    ThinkingBlockView(text: value.text, streaming: value.streaming)
-                                case let .activity(group):
-                                    TranscriptActivityGroupView(group: group)
-                                case let .note(message):
-                                    WorkNoteView(message: message, onImage: onImage)
-                                }
+                VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+                    ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
+                        Group {
+                            switch entry {
+                            case let .thinking(value):
+                                ThinkingBlockView(text: value.text, streaming: value.streaming)
+                            case let .activity(group):
+                                TranscriptActivityGroupView(group: group, activeQuestionnaire: activeQuestionnaire)
+                            case let .note(message):
+                                WorkNoteView(
+                                    message: message,
+                                    onImage: onImage,
+                                    activeQuestionnaire: activeQuestionnaire
+                                )
                             }
-                            .opacity(entryOpacity(at: index))
-                            .transition(.opacity)
                         }
+                        .opacity(entryOpacity(at: index))
+                        .transition(.opacity)
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -205,7 +281,9 @@ struct TranscriptWorkView: View {
             }
 
             ForEach(block.prominentSteps) { step in
-                if step.kind == .question, let questionnaire = store.activeQuestionnaire(for: step.id) {
+                if step.kind == .question,
+                   let questionnaire = activeQuestionnaire,
+                   questionnaire.toolCallID == step.id {
                     InlineQuestionnaire(session: questionnaire, arguments: step.arguments)
                 }
                 ForEach(step.result?.images ?? []) { image in
@@ -214,9 +292,9 @@ struct TranscriptWorkView: View {
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
+        .animation(reduceMotion || reduceTransparency ? nil : .easeOut(duration: 0.18), value: block.latestThinkingText)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
-        // A turn that starts working again owns its own disclosure once more, so a stale
-        // collapse can never hide live work.
+        // A resumed turn returns to the same collapsed latest-thought default as a new one.
         .onChange(of: block.isActive) { _, active in
             if active { userExpanded = nil }
         }
@@ -230,21 +308,13 @@ struct TranscriptWorkView: View {
         return max(0.45, 1 - 0.15 * Double(block.entries.count - index - 1))
     }
 
-    @ViewBuilder
     private var headline: some View {
-        if block.isActive, let startedAt = block.startedAt {
-            // One timer, and only while a turn is actually in flight.
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text("Working for \(NumberFormatting.duration(context.date.timeIntervalSince(startedAt)))")
-                    .font(PiFont.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-        } else {
-            Text(block.isActive ? "Working" : block.title)
-                .font(PiFont.caption)
-                .foregroundStyle(.secondary)
-        }
+        Text(block.isActive ? (block.latestThinkingText ?? "Working") : block.title)
+            .font(PiFont.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.head)
+            .contentTransition(.opacity)
     }
 }
 
@@ -252,6 +322,7 @@ struct TranscriptWorkView: View {
 private struct WorkNoteView: View {
     let message: ChatMessage
     let onImage: (ImagePayload) -> Void
+    let activeQuestionnaire: QuestionnaireSession?
 
     var body: some View {
         if message.role == .assistant {
@@ -261,7 +332,13 @@ private struct WorkNoteView: View {
             }
             .accessibilityLabel("Pi narration")
         } else {
-            MessageView(message: message, isStreaming: false, onImage: onImage)
+            MessageView(
+                message: message,
+                isStreaming: false,
+                onImage: onImage,
+                activeQuestionnaire: activeQuestionnaire
+            )
+            .equatable()
         }
     }
 }
@@ -497,6 +574,7 @@ private struct ToolDetailText: View {
 
 struct TranscriptActivityGroupView: View {
     let group: TranscriptActivityGroup
+    let activeQuestionnaire: QuestionnaireSession?
 
     var body: some View {
         DisclosureRow(
@@ -512,7 +590,11 @@ struct TranscriptActivityGroupView: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
                 ForEach(group.steps) { step in
-                    ToolActivityStepRow(step: step, isLive: group.isActive)
+                    ToolActivityStepRow(
+                        step: step,
+                        isLive: group.isActive,
+                        questionnaire: activeQuestionnaire?.toolCallID == step.id ? activeQuestionnaire : nil
+                    )
                 }
             }
         }
@@ -527,10 +609,10 @@ struct TranscriptActivityGroupView: View {
 }
 
 private struct ToolActivityStepRow: View {
-    @EnvironmentObject private var store: AppStore
     let step: TranscriptActivityStep
     /// A step left unfinished by a killed run must not spin forever in a historical transcript.
     let isLive: Bool
+    let questionnaire: QuestionnaireSession?
 
     var body: some View {
         DisclosureRow(
@@ -544,7 +626,7 @@ private struct ToolActivityStepRow: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if step.kind == .question {
-                    if store.activeQuestionnaire(for: step.id) == nil {
+                    if questionnaire == nil {
                         QuestionnaireCallSummary(arguments: step.arguments)
                     }
                 } else if step.arguments != .object([:]) {
@@ -585,10 +667,9 @@ private struct ConversationImage: View {
 }
 
 private struct ToolCallRow: View {
-    @EnvironmentObject private var store: AppStore
     let call: ToolCallPayload
+    let questionnaire: QuestionnaireSession?
     var body: some View {
-        let questionnaire = store.activeQuestionnaire(for: call.id)
         DisclosureRow(
             symbol: ToolSymbol.forName(call.name),
             title: displayName,
@@ -697,7 +778,7 @@ private struct CustomMessageRow: View {
     var body: some View {
         DisclosureRow(
             symbol: "puzzlepiece.extension",
-            title: message.customType?.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord ?? "Extension",
+            title: title,
             symbolTint: Color.piPurple
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
@@ -710,6 +791,11 @@ private struct CustomMessageRow: View {
                 }
             }
         }
+    }
+
+    private var title: String {
+        if message.customType == "ad-process:update" { return "Background process update" }
+        return message.customType?.replacingOccurrences(of: "_", with: " ").capitalizedFirstWord ?? "Extension"
     }
 }
 

@@ -151,8 +151,11 @@ final class AppStore: ObservableObject {
     @Published var isScanning = false
     @Published var scanError: String?
 
-    @Published var messages: [ChatMessage] = []
-    @Published var streamingMessage: ChatMessage?
+    @Published var messages: [ChatMessage] = [] { didSet { transcriptRevision &+= 1 } }
+    @Published var streamingMessage: ChatMessage? { didSet { transcriptRevision &+= 1 } }
+    /// Plain revision counter for memoizing transcript projection. It deliberately is not
+    /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
+    private(set) var transcriptRevision = 0
     @Published var isConversationLoading = false
     @Published private(set) var isLoadingEarlierMessages = false
     @Published private(set) var hasEarlierMessages = false
@@ -198,6 +201,10 @@ final class AppStore: ObservableObject {
     @Published var outbox: [OutboxEntry] = []
     /// Lazily created so the panel keeps one service for the app's lifetime.
     var cachedScheduleService: (any ScheduleServing)?
+    /// Thread IDs any automation targets, so the sidebar can mark them. IDs only, capped — the
+    /// automations panel still owns the schedules themselves. See `ScheduleService.swift`.
+    @Published private(set) var scheduledThreadIDs: Set<String> = []
+    private static let scheduledThreadIDLimit = 500
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
     /// True only while the ephemeral status probe runtime is attached.
@@ -327,11 +334,9 @@ final class AppStore: ObservableObject {
         self.probeRuntimeFactory = probeRuntimeFactory
         self.notificationService = notificationService ?? NotificationService()
         self.isActiveOverride = isActiveOverride
-        // Never default to a TCC-protected folder (Desktop/Documents/…): a folder the user has
-        // not chosen yet must not be why a fresh launch prompts for permission. `nowhereFolderURL`
-        // (~/Desktop) is kept only as an explicit, user-requested value elsewhere — never used
-        // automatically. See `defaultWorkingFolder` and `hasOptedIntoGitRefresh`.
-        selectedFolder = Self.defaultWorkingFolder(recentFolders: self.persistence.state.recentFolders)
+        // Pi requires a cwd even for a global conversation; Desktop is the neutral default and
+        // passive Git inspection explicitly skips it until a real prompt starts Pi.
+        selectedFolder = WorkspaceOrganization.globalWorkingDirectory
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
@@ -566,11 +571,15 @@ final class AppStore: ObservableObject {
         return sessions.first { $0.fileURL.standardizedFileURL.path == path }
     }
 
-    var recentFolders: [URL] {
-        let persisted = persistence.state.recentFolders.map { URL(fileURLWithPath: $0, isDirectory: true) }
-        let fromSessions = sessions.map(\.cwd)
+    /// Filesystem projects already known from sidebar conversations. A virtual-folder assignment
+    /// must not make its underlying project disappear from the new-chat chooser.
+    var sidebarFolders: [URL] {
         var seen: Set<String> = []
-        return (persisted + fromSessions).filter { seen.insert($0.standardizedFileURL.path).inserted }.prefix(8).map { $0 }
+        return sessions.compactMap { session in
+            let folder = session.cwd.standardizedFileURL
+            guard !WorkspaceOrganization.isGlobalWorkingDirectory(folder), seen.insert(folder.path).inserted else { return nil }
+            return folder
+        }
     }
 
     /// `NSApplication.shared` rather than the `NSApp` global so headless test hosts stay safe.
@@ -583,7 +592,7 @@ final class AppStore: ObservableObject {
     }
 
     /// True for either an attached saved conversation or the query-only runtime prepared for a
-    /// new Desktop chat. Picker controls use this broader route scope; transcript/session actions
+    /// new global chat. Picker controls use this broader route scope; transcript/session actions
     /// deliberately keep using `isSelectedRuntime`.
     var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
 
@@ -757,15 +766,6 @@ final class AppStore: ObservableObject {
         objectWillChange.send()
     }
 
-    /// A safe folder to preselect before the user has chosen one: the most recently used folder
-    /// (already opted into — the user picked it from the picker) if there is one, else the plain
-    /// home directory, which macOS never gates behind a permission prompt the way Desktop,
-    /// Documents, and Downloads are.
-    private static func defaultWorkingFolder(recentFolders: [String]) -> URL {
-        if let mostRecent = recentFolders.first { return URL(fileURLWithPath: mostRecent, isDirectory: true) }
-        return FileManager.default.homeDirectoryForCurrentUser
-    }
-
     func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
@@ -779,11 +779,19 @@ final class AppStore: ObservableObject {
             }
             await refreshSessions()
             if selectedFolder == nil {
-                selectedFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+                selectedFolder = WorkspaceOrganization.globalWorkingDirectory
             }
             // Warm the transcript cache after the scan settles, so opening a recent conversation
             // is instant even before the user selects anything.
             schedulePrefetch(around: selectedSession)
+        }
+        // The daemon can still be spawning/binding its socket while the window comes up (see
+        // DaemonSupervisor), so the first load can lose that race. One retry covers it; anything
+        // longer is the automations panel's or the refresh button's job, not a polling loop.
+        Task {
+            if await refreshScheduledThreads() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await refreshScheduledThreads()
         }
         startGitRefreshLoop()
         activityMonitor.start()
@@ -813,13 +821,37 @@ final class AppStore: ObservableObject {
         isScanning = false
     }
 
+    /// Loads the automations only to learn which conversations they target. A failure keeps the
+    /// previous set: a daemon that is briefly down must not erase clocks from the sidebar.
+    /// Returns whether the load succeeded, so a caller can decide to try once more.
+    @discardableResult
+    func refreshScheduledThreads() async -> Bool {
+        guard let entries = try? await scheduleService.loadSchedules() else { return false }
+        updateScheduledThreads(from: entries)
+        return true
+    }
+
+    /// Called by the automations panel whenever its list changes, so an edit shows up in the
+    /// sidebar without a second round trip. A paused automation still counts — the conversation
+    /// is still associated with one — and a new-thread target marks no existing row.
+    func updateScheduledThreads(from entries: [ScheduleEntry]) {
+        var ids: Set<String> = []
+        for entry in entries {
+            guard case let .existingThread(threadID) = entry.target, !threadID.isEmpty else { continue }
+            ids.insert(threadID)
+            // A display hint, not a copy of the schedule list.
+            if ids.count >= Self.scheduledThreadIDLimit { break }
+        }
+        scheduledThreadIDs = ids
+    }
+
     func openNewChat() {
         if let selectedSession { markRead(selectedSession) }
         parkCurrentDraft()
         flushDraftPersistence()
         cancelConversationLoad()
         resetConversationPageState()
-        let newFolder = Self.defaultWorkingFolder(recentFolders: persistence.state.recentFolders)
+        let newFolder = WorkspaceOrganization.globalWorkingDirectory
         if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
             detachActiveRuntimePresentation()
         }
@@ -1188,7 +1220,7 @@ final class AppStore: ObservableObject {
             detachActiveRuntimePresentation()
         }
         selectedFolder = folder
-        persistence.rememberFolder(url)
+        if !WorkspaceOrganization.isGlobalWorkingDirectory(folder) { persistence.rememberFolder(folder) }
         refreshSelectedGit()
     }
 
@@ -1294,8 +1326,7 @@ final class AppStore: ObservableObject {
         if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
             let message = Self.optimisticMessage(text: prompt)
             optimisticID = message.id
-            messages.append(message)
-            messages = enforcingLoadedImageBudget(messages)
+            messages = enforcingLoadedImageBudget(messages + [message])
         } else {
             optimisticID = nil
         }
@@ -1793,20 +1824,9 @@ final class AppStore: ObservableObject {
     func renameSession(_ session: SessionSummary, to name: String) {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
-        let requestedPath = session.fileURL.standardizedFileURL.path
-        let targetIsBusy = activeRuntimePath == requestedPath
-            ? runtimeState.isBusy
-            : parkedRuntimes[.session(requestedPath)]?.state.isBusy == true
-        if targetIsBusy {
-            showToast("Pi is working in this conversation. Rename when it becomes idle.", style: .warning)
-            return
-        }
-        ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
+        let path = session.fileURL.standardizedFileURL.path
+        let sendRename: (RuntimeSlot) -> Void = { [weak self] slot in
             guard let self else { return }
-            guard case let .success(slot) = result else {
-                if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
-                return
-            }
             slot.runtime.send(type: "set_session_name", payload: ["name": .string(clean)]) { [weak self] result in
                 guard let self else { return }
                 switch result {
@@ -1826,6 +1846,25 @@ final class AppStore: ObservableObject {
                 case let .failure(error): showToast(error.localizedDescription, style: .error)
                 }
             }
+        }
+
+        if activeRuntimePath == path, activeRuntimeSlot.runtime.isRunning,
+           activeRuntimeSlot.isReady, state(for: activeRuntimeSlot).isBusy {
+            sendRename(activeRuntimeSlot)
+            return
+        }
+        if let slot = parkedRuntimes[.session(path)], slot.runtime.isRunning,
+           slot.isReady, state(for: slot).isBusy {
+            sendRename(slot)
+            return
+        }
+        ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
+            guard let self else { return }
+            guard case let .success(slot) = result else {
+                if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
+                return
+            }
+            sendRename(slot)
         }
     }
 
@@ -2029,23 +2068,26 @@ final class AppStore: ObservableObject {
     }
 
     /// One awaited refresh at a time; the caller (menu action or polling loop) never spawns
-    /// overlapping git command chains. A session's own cwd is always fair game (Pi already
-    /// reads/writes there); a bare `selectedFolder` with no conversation open yet only refreshes
-    /// once the user has actually opted into it, so the passive default folder shown before any
-    /// chat exists can never trigger a git subprocess — and the TCC prompt a protected directory
-    /// brings with it — on its own.
+    /// overlapping git command chains. A project session's cwd is fair game because Pi already
+    /// reads/writes there; a bare `selectedFolder` refreshes only after explicit selection.
+    /// `fetchGitState` always skips the neutral Desktop cwd used by global conversations.
     private func refreshSelectedGitAndWait() async {
         if let session = selectedSession {
             await refreshGit(for: session.cwd)
             return
         }
-        guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else { return }
+        guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else {
+            selectedGit = .none
+            selectedWorktree = nil
+            return
+        }
         await refreshGit(for: folder)
     }
 
-    /// A folder counts as opted into once the user has actually done something with it: chosen
-    /// it from the folder picker (which remembers it), or it already backs a real session.
+    /// A project folder counts as opted into once the user chose it or it backs a real session.
+    /// Global Desktop is never a project for Git-refresh purposes.
     private func hasOptedIntoGitRefresh(_ url: URL) -> Bool {
+        guard !WorkspaceOrganization.isGlobalWorkingDirectory(url) else { return false }
         let path = url.standardizedFileURL.path
         if persistence.state.recentFolders.contains(path) { return true }
         return sessions.contains { $0.cwd.standardizedFileURL.path == path }
@@ -3175,12 +3217,13 @@ final class AppStore: ObservableObject {
         if let path = activeRuntimeSlot.sessionPath ?? state(for: activeRuntimeSlot).sessionFile {
             retainLiveMessage(message, path: URL(fileURLWithPath: path).standardizedFileURL.path)
         }
-        if let index = messages.firstIndex(where: { $0.id == message.id }) { messages[index] = message }
+        var updated = messages
+        if let index = updated.firstIndex(where: { $0.id == message.id }) { updated[index] = message }
         else if message.role == .user,
-                let localIndex = messages.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
-            messages[localIndex] = message
-        } else { messages.append(message) }
-        messages = enforcingLoadedImageBudget(messages)
+                let localIndex = updated.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
+            updated[localIndex] = message
+        } else { updated.append(message) }
+        messages = enforcingLoadedImageBudget(updated)
     }
 
     private func mergeHistoryActivities() {
@@ -3262,6 +3305,7 @@ final class AppStore: ObservableObject {
     /// so the worktree check (Task 2) never adds serial latency to the existing Git refresh.
     private static func fetchGitState(_ path: String, service: GitStatusProviding) async -> (String, GitSnapshot, GitWorktreeInfo?) {
         let directory = URL(fileURLWithPath: path, isDirectory: true)
+        guard !WorkspaceOrganization.isGlobalWorkingDirectory(directory) else { return (path, .none, nil) }
         async let snapshot = service.snapshot(for: directory)
         async let worktree = service.worktreeInfo(for: directory)
         return await (path, snapshot, worktree)

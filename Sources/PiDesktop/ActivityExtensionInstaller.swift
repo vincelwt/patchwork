@@ -1,7 +1,7 @@
 import Foundation
 
-/// Installs and repairs Pi Desktop's Pi extension: activity heartbeats plus the bridge that
-/// sends thread-created automations to the durable background service
+/// Installs and repairs Pi Desktop's Pi extension: activity heartbeats, automatic conversation
+/// naming, plus the bridge that sends thread-created automations to the durable background service
 /// (`Resources/pi-desktop-activity.ts` is the source of truth). Extensions in
 /// `~/.pi/agent/extensions/` are auto-discovered by every Pi session, terminal or RPC, so one
 /// install covers the whole system.

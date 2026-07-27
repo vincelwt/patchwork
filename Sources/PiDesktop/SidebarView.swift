@@ -154,7 +154,7 @@ private struct SidebarFooter: View {
                 .accessibilityLabel("Archived, \(archivedCount) conversations")
                 .accessibilityValue(archiveOpen ? "expanded" : "collapsed")
             }
-            Button { Task { await store.refreshSessions() } } label: {
+            Button { Task { await store.refreshSessions(); await store.refreshScheduledThreads() } } label: {
                 Group {
                     if store.isScanning { ProgressView().controlSize(.mini) }
                     else {
@@ -283,6 +283,7 @@ struct SidebarSnapshot {
     }
 
     private static func groupSort(_ lhs: SessionFolderGroup, _ rhs: SessionFolderGroup) -> Bool {
+        if lhs.isGlobal != rhs.isGlobal { return lhs.isGlobal }
         let left = lhs.sessions.first?.modifiedAt ?? lhs.createdAt ?? .distantPast
         let right = rhs.sessions.first?.modifiedAt ?? rhs.createdAt ?? .distantPast
         if left == right { return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
@@ -322,6 +323,9 @@ struct SessionFolderGroup: Identifiable {
     }
 
     var isVirtual: Bool { virtualFolderID != nil }
+    var isGlobal: Bool {
+        !isVirtual && WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
+    }
 
     /// Retained as a pure recency query for callers/tests; visibility no longer depends on it.
     static let recencyWindow: TimeInterval = 14 * 24 * 60 * 60
@@ -337,7 +341,7 @@ struct SessionFolderGroup: Identifiable {
 
     var name: String {
         if let virtualName { return virtualName }
-        return Self.projectName(forPath: path)
+        return isGlobal ? "Recents" : Self.projectName(forPath: path)
     }
 }
 
@@ -390,7 +394,7 @@ private struct SessionFolderSection: View {
                 HStack(spacing: PiTheme.space6) {
                     // No chevron column: the icon itself carries open/closed state, and the
                     // whole row (not a disclosure glyph) is the click target.
-                    Image(systemName: isOpen ? "folder.fill" : "folder")
+                    Image(systemName: group.isGlobal ? (isOpen ? "clock.fill" : "clock") : (isOpen ? "folder.fill" : "folder"))
                         .font(.system(size: PiIcon.small)).foregroundStyle(.tertiary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
@@ -407,11 +411,15 @@ private struct SessionFolderSection: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
-            .help(group.isVirtual ? "Virtual folder" : group.path)
-            .accessibilityLabel("\(group.name) folder, \(group.sessions.count) conversations")
+            .help(group.isGlobal ? "Global conversations" : (group.isVirtual ? "Virtual folder" : group.path))
+            .accessibilityLabel(group.isGlobal
+                ? "Recents, global conversations, \(group.sessions.count) conversations"
+                : "\(group.name) folder, \(group.sessions.count) conversations")
             .accessibilityValue("\(isOpen ? "expanded" : "collapsed")\(hasRunning ? ", sessions running" : "")")
             .contextMenu {
-                if let id = group.virtualFolderID {
+                if group.isGlobal {
+                    Button("New Chat") { store.openNewChat() }
+                } else if let id = group.virtualFolderID {
                     Button("New Folder Inside…") { childName = ""; creatingChild = true }
                     Button("New Chat Here") { newChatHere() }
                     Button("Rename Folder…") { renameValue = group.name; renaming = true }
@@ -438,6 +446,7 @@ private struct SessionFolderSection: View {
                 }
             }
             .dropDestination(for: String.self) { paths, _ in
+                guard !group.isGlobal else { return false }
                 for path in paths {
                     guard let session = store.sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
                     store.moveSession(session, toVirtualFolder: group.virtualFolderID)
@@ -470,7 +479,7 @@ private struct SessionFolderSection: View {
                 if let id = group.virtualFolderID { store.deleteVirtualFolder(id: id) }
             }
         } message: {
-            Text("Subfolders move up a level and conversations return to their project or Desktop group. Session files are not changed.")
+            Text("Subfolders move up a level and conversations return to their project or Recents group. Session files are not changed.")
         }
     }
 
@@ -488,8 +497,8 @@ private struct SessionFolderSection: View {
                 // Higher priority than the header's own Button, so this click starts a chat
                 // here instead of also toggling the folder open/closed.
                 .highPriorityGesture(TapGesture().onEnded { newChatHere() })
-                .help("New chat in \(group.name)")
-                .accessibilityLabel("New chat in \(group.name)")
+                .help(group.isGlobal ? "New global chat" : "New chat in \(group.name)")
+                .accessibilityLabel(group.isGlobal ? "New global chat" : "New chat in \(group.name)")
                 .accessibilityAddTraits(.isButton)
         } else {
             Color.clear
@@ -515,9 +524,11 @@ private struct SessionFolderSection: View {
 
     /// Known project paths, from live sessions, as candidate "Move Folder to…" destinations.
     private var projectDestinations: [String] {
-        Set(store.sessions.map { $0.cwd.standardizedFileURL.path }).sorted {
-            SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
-        }
+        Set(store.sessions.map { $0.cwd.standardizedFileURL.path })
+            .filter { !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: $0, isDirectory: true)) }
+            .sorted {
+                SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
+            }
     }
 
     /// The whole folder tree minus `id` and its own descendants, so the menu never offers a
@@ -546,6 +557,7 @@ private struct SessionRow: View {
     }
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
+    private var scheduled: Bool { store.scheduledThreadIDs.contains(session.id) }
     private var git: GitSnapshot { store.folderGit[session.cwd.standardizedFileURL.path] ?? .none }
     private var indent: CGFloat { CGFloat(min(depth, PiTheme.sidebarMaxFolderDepth)) * PiTheme.sidebarIndentStep }
 
@@ -571,7 +583,7 @@ private struct SessionRow: View {
         .contextMenu {
             Button("Rename…") { renameValue = session.displayName; renaming = true }
             Menu("Move to…") {
-                Button("Project / Desktop") { store.moveSession(session, toVirtualFolder: nil) }
+                Button("Project / Recents") { store.moveSession(session, toVirtualFolder: nil) }
                 let entries = WorkspaceOrganization.allFolderEntries(store.virtualFolders)
                 if !entries.isEmpty { Divider() }
                 ForEach(entries) { entry in
@@ -591,11 +603,11 @@ private struct SessionRow: View {
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
         .help(session.cwd.path)
-        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")")
+        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
-    /// The unread dot and the hover archive/restore button share this one column, so a thread
-    /// title never shifts sideways when the row is hovered or read.
+    /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
+    /// so this column stays empty until the pointer arrives and the title never shifts sideways.
     @ViewBuilder
     private var leadingIcon: some View {
         if hovering {
@@ -611,24 +623,34 @@ private struct SessionRow: View {
                 .accessibilityLabel(archived ? "Restore conversation" : "Archive conversation")
                 .accessibilityAddTraits(.isButton)
         } else {
-            Circle()
-                .fill(unread ? Color.accentColor : Color.clear)
-                .frame(width: 6, height: 6)
-                .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
+            Color.clear
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight)
                 .accessibilityHidden(true)
         }
     }
 
-    @ViewBuilder
+    /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
+    /// running outranks unread, because "working now" is the more urgent of the two. One explicit
+    /// stack, so the pair is always grouped and ordered on the trailing edge.
     private var trailingAccessory: some View {
-        if running {
-            StatusDot(color: .piGreen).help("Pi is working")
-        } else if hovering {
-            Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
-        } else if GitIndicatorPolicy.showsBranchIndicator(git) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
-                .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
+        HStack(spacing: PiTheme.space6) {
+            if hovering {
+                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
+            } else if GitIndicatorPolicy.showsBranchIndicator(git) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
+                    .help([git.branch, git.statusHint].compactMap { $0 }.joined(separator: " · "))
+            }
+            if scheduled {
+                Image(systemName: "clock")
+                    .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
+                    .help("Runs on a schedule")
+            }
+            if running {
+                StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
+            } else if unread {
+                StatusDot(color: .piBlue).help("Unread")
+            }
         }
     }
 }

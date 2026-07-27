@@ -92,9 +92,18 @@ final class ActivityExtensionInstallerTests: XCTestCase {
         XCTAssertTrue(bundled.contains("subagents:completed"))
     }
 
+    func testBundledExtensionLetsPiNameANewConversation() throws {
+        let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 6)
+        XCTAssertTrue(bundled.contains("name: \"set_conversation_name\""))
+        XCTAssertTrue(bundled.contains("After understanding the first user message"))
+        XCTAssertTrue(bundled.contains("const current = pi.getSessionName()"))
+        XCTAssertTrue(bundled.contains("pi.setSessionName(name)"))
+    }
+
     func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 5)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 6)
         XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
         XCTAssertTrue(bundled.contains("/v1/schedules"))
         XCTAssertTrue(bundled.contains("event.toolName.toLowerCase() !== \"agent\""))

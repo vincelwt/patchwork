@@ -97,7 +97,7 @@ enum TranscriptWorkEntry: Identifiable, Hashable, Sendable {
 
 /// A turn's work log: details collapse once Pi answers, while prominent outputs remain visible.
 struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
-    let id: String
+    var id: String
     var entries: [TranscriptWorkEntry]
     var isActive: Bool
     var startedAt: Date?
@@ -118,6 +118,14 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     }
 
     var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }
+    /// Live details are opt-in; the collapsed row carries the latest thought instead.
+    var shouldStartExpanded: Bool { false }
+
+    var latestThinkingText: String? {
+        for case let .thinking(thinking) in entries.reversed() { return thinking.text }
+        return nil
+    }
+
     /// At least one tool step failed somewhere in the log. Individual steps still show red where
     /// they are, but this alone must never drive the collapsed header's "· failed" label.
     var hasFailure: Bool { activities.contains(where: \.hasFailure) }
@@ -344,6 +352,11 @@ private struct TurnBuilder {
     /// System, custom, and unknown entries join the work log when a turn is in flight and stand
     /// on their own otherwise, so an extension message is never silently swallowed.
     private mutating func log(_ message: ChatMessage, streaming: Bool) {
+        if message.customType == "ad-process:update", trailingIsAnswer {
+            closeActivity()
+            entries.append(.note(message))
+            return
+        }
         demoteTrailing()
         if entries.isEmpty, pending == nil, trailing.isEmpty {
             result.append(.message(message, streaming: streaming))
@@ -425,9 +438,8 @@ private struct TurnBuilder {
     private mutating func closeTurn(active: Bool) {
         closeActivity(active: active)
         if !entries.isEmpty {
-            // Identity comes from the first entry's own durable id (a block, tool call, or
-            // message id), never a turn counter: prepending earlier history must not renumber
-            // every work block below it.
+            // The first durable entry stays invariant as live work appends more steps. A page
+            // prepend can extend the one seam turn once; live identity must not churn every step.
             result.append(.work(TranscriptWorkBlock(
                 id: "work:\(entries.first?.id ?? "")",
                 entries: entries,

@@ -38,13 +38,16 @@ struct PiDesktopApp: App {
             CommandMenu("Conversation") {
                 Button("Quick Switch…") { store.quickSwitchPresented = true }
                     .keyboardShortcut("k", modifiers: .command)
-                Button("Refresh") { Task { await store.refreshSessions() } }
-                    .keyboardShortcut("r", modifiers: .command)
+                Button("Refresh") {
+                    Task { await store.refreshSessions(); await store.refreshScheduledThreads() }
+                }
+                .keyboardShortcut("r", modifiers: .command)
                 Divider()
                 Button(archiveTitle) { store.toggleArchiveSelected() }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
                     .disabled(store.selectedSession == nil)
                 Button("Rename…") { store.renameRequested = true }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(store.selectedSession == nil)
                 Button("Mark as Unread") { store.markSelectedUnread() }
                     .keyboardShortcut("u", modifiers: [.command, .option])

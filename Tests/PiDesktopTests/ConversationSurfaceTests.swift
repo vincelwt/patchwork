@@ -15,6 +15,98 @@ final class ConversationScrollMetricsTests: XCTestCase {
             documentHeight: 1_500, direction: .up
         ).isNearTop)
     }
+
+    func testPrependRestorationPreservesTheOriginalViewportOffset() {
+        XCTAssertEqual(
+            ConversationScrollObserver.restoredOriginY(
+                originalY: 500, oldDocumentHeight: 2_000,
+                newDocumentHeight: 2_600, viewportHeight: 600
+            ),
+            1_100
+        )
+        XCTAssertEqual(
+            ConversationScrollObserver.restoredOriginY(
+                originalY: 1_900, oldDocumentHeight: 2_000,
+                newDocumentHeight: 2_600, viewportHeight: 600
+            ),
+            2_000,
+            "Restoration clamps to the new scrollable maximum"
+        )
+        XCTAssertNil(ConversationScrollObserver.restoredOriginY(
+            originalY: 500, oldDocumentHeight: 2_000,
+            newDocumentHeight: 2_000, viewportHeight: 600
+        ))
+    }
+}
+
+@MainActor
+final class ConversationScrollCacheTests: XCTestCase {
+    func testAnchorStoreIsBoundedWithoutObservableState() {
+        let anchors = ConversationScrollAnchorStore(limit: 2)
+        anchors.remember("row-a", for: "/a")
+        anchors.remember("row-b", for: "/b")
+        anchors.remember("row-c", for: "/c")
+        XCTAssertNil(anchors.anchor(for: "/a"))
+        XCTAssertEqual(anchors.anchor(for: "/b"), "row-b")
+        XCTAssertEqual(anchors.anchor(for: "/c"), "row-c")
+    }
+
+    func testTranscriptProjectionRebuildsOnlyWhenItsRevisionChanges() {
+        let message = ChatMessage(
+            id: "a", role: .assistant,
+            blocks: [MessageBlock(id: "text", kind: .text("Answer"))],
+            timestamp: nil, raw: .null
+        )
+        let cache = TranscriptProjectionCache()
+        _ = cache.items(revision: 1, messages: [message], streaming: nil, isRunning: false)
+        _ = cache.items(revision: 1, messages: [message], streaming: nil, isRunning: false)
+        XCTAssertEqual(cache.buildCount, 1)
+
+        _ = cache.items(revision: 2, messages: [message], streaming: nil, isRunning: false)
+        XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testProjectionCachePreservesAWorkRowAcrossAPrependSeam() {
+        let call = ToolCallPayload(id: "call", name: "read", arguments: .object([:]))
+        let tail = [
+            ChatMessage(
+                id: "a2", role: .assistant,
+                blocks: [
+                    MessageBlock(id: "narration", kind: .text("Looking")),
+                    MessageBlock(id: "call", kind: .toolCall(call))
+                ],
+                timestamp: nil, raw: .null
+            ),
+            ChatMessage(
+                id: "result", role: .tool,
+                blocks: [MessageBlock(id: "result-text", kind: .text("contents"))],
+                timestamp: nil, toolCallID: "call", raw: .null
+            ),
+            ChatMessage(
+                id: "answer", role: .assistant,
+                blocks: [MessageBlock(id: "answer-text", kind: .text("Found it"))],
+                timestamp: nil, raw: .null
+            )
+        ]
+        let earlier = [
+            ChatMessage(
+                id: "user", role: .user,
+                blocks: [MessageBlock(id: "user-text", kind: .text("Look"))],
+                timestamp: nil, raw: .null
+            ),
+            ChatMessage(
+                id: "thinking", role: .assistant,
+                blocks: [MessageBlock(id: "thinking-text", kind: .thinking("plan"))],
+                timestamp: nil, raw: .null
+            )
+        ]
+        let cache = TranscriptProjectionCache()
+        let before = cache.items(revision: 1, messages: tail, streaming: nil, isRunning: false)
+        let after = cache.items(revision: 2, messages: earlier + tail, streaming: nil, isRunning: false)
+        let beforeID = before.first { if case .work = $0 { return true }; return false }?.id
+        let afterID = after.first { if case .work = $0 { return true }; return false }?.id
+        XCTAssertEqual(beforeID, afterID)
+    }
 }
 
 final class TranscriptPresenterTests: XCTestCase {
@@ -70,7 +162,24 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(block.stepCount, 2)
     }
 
-    func testLiveTurnStaysOpenAndReportsProgress() throws {
+    func testLiveWorkStartsCollapsedWithItsLatestThinkingText() throws {
+        let items = TranscriptPresenter.items(
+            messages: [
+                user(id: "u", text: "Go", at: nil),
+                assistant(id: "a1", blocks: [thinking("First thought")]),
+                assistant(id: "a2", blocks: [thinking("Latest thought")])
+            ],
+            streaming: nil,
+            isRunning: true
+        )
+
+        guard case let .work(block) = items[1] else { return XCTFail("Expected live work") }
+        XCTAssertTrue(block.isActive)
+        XCTAssertFalse(block.shouldStartExpanded)
+        XCTAssertEqual(block.latestThinkingText, "Latest thought")
+    }
+
+    func testLiveTurnStaysActiveAndReportsProgress() throws {
         let messages = [
             user(id: "u", text: "Run it", at: Date(timeIntervalSince1970: 10)),
             assistant(id: "a", blocks: [
@@ -82,7 +191,7 @@ final class TranscriptPresenterTests: XCTestCase {
 
         let items = TranscriptPresenter.items(messages: messages, streaming: assistant(id: "stream", blocks: []))
         guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
-        XCTAssertTrue(block.isActive, "A turn in flight stays open")
+        XCTAssertTrue(block.isActive, "A turn in flight stays active")
         guard case let .activity(group) = block.entries.last else { return XCTFail("Expected a rollup") }
         XCTAssertEqual(group.kinds, [.commands, .browser])
         XCTAssertEqual(group.summary, "Ran commands and Used browser")
@@ -202,9 +311,8 @@ final class TranscriptPresenterTests: XCTestCase {
 
     // MARK: - The answer is never buried in the work log
 
-    func testProcessUpdateAfterTheAnswerDoesNotCollapseTheAnswerIntoTheWorkLog() throws {
-        // Real sessions end a turn with `custom_message` entries (background process updates,
-        // model changes) written *after* Pi's answer. Those must not demote the answer.
+    func testProcessUpdateAfterTheAnswerFoldsIntoWorkWithoutHidingTheAnswer() throws {
+        // Background-process completions are sideband work updates, not new transcript turns.
         let update = ChatMessage(
             id: "custom-1",
             role: .custom,
@@ -226,10 +334,11 @@ final class TranscriptPresenterTests: XCTestCase {
             return XCTFail("The answer must stay a visible transcript message, not work-log detail")
         }
         XCTAssertEqual(answer.textContent, "All 44 tests pass.")
+        XCTAssertEqual(items.count, 3, "The process update must not leak out as a standalone row")
         guard case let .work(block) = items[1] else { return XCTFail("Expected the turn's work block above it") }
-        XCTAssertFalse(
-            block.entries.contains { if case .note = $0 { return true } else { return false } },
-            "Nothing prose-like from the answer may be demoted into the collapsed log"
+        XCTAssertEqual(
+            block.entries.compactMap { if case let .note(message) = $0 { return message.id }; return nil },
+            ["custom-1"]
         )
     }
 
@@ -305,6 +414,24 @@ final class TranscriptPresenterTests: XCTestCase {
     }
 
     // MARK: - Identity
+
+    func testActiveWorkIdentitySurvivesAppendingMoreSteps() throws {
+        let initial = [
+            user(id: "u", text: "Look", at: nil),
+            assistant(id: "a1", blocks: [thinking("plan"), call("c1", "read", [:])])
+        ]
+        let extended = initial + [
+            result(id: "r1", callID: "c1", text: "contents"),
+            assistant(id: "a2", blocks: [call("c2", "grep", [:])])
+        ]
+        let initialWork = TranscriptPresenter.items(messages: initial, streaming: nil, isRunning: true).first {
+            if case .work = $0 { return true }; return false
+        }
+        let extendedWork = TranscriptPresenter.items(messages: extended, streaming: nil, isRunning: true).first {
+            if case .work = $0 { return true }; return false
+        }
+        XCTAssertEqual(initialWork?.id, extendedWork?.id)
+    }
 
     func testItemIdentityIsUnchangedByPrependingEarlierHistory() throws {
         let turn = [

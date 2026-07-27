@@ -218,6 +218,66 @@ final class AutomationsNavigationTests: XCTestCase {
     }
 }
 
+/// The sidebar's clock: which conversations count as "has an automation".
+@MainActor
+final class ScheduledThreadStoreTests: XCTestCase {
+    private struct QuietGitService: GitStatusProviding {
+        func snapshot(for directory: URL) async -> GitSnapshot { .none }
+    }
+
+    private var directory: URL!
+    private var store: AppStore!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiScheduledThreads-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        store = AppStore(
+            gitService: QuietGitService(),
+            persistence: AppPersistence(baseURL: directory),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func entry(_ name: String, target: ScheduleEntry.Target, enabled: Bool = true) -> ScheduleEntry {
+        ScheduleEntry(name: name, enabled: enabled, target: target, prompt: "p", trigger: .interval(everySeconds: 3_600))
+    }
+
+    func testOnlyExistingThreadTargetsMarkAConversationAndPausedStillCounts() {
+        store.updateScheduledThreads(from: [
+            entry("live", target: .existingThread(threadID: "t1")),
+            entry("paused", target: .existingThread(threadID: "t2"), enabled: false),
+            entry("fresh", target: .newThread(cwd: "/tmp/project", namePattern: nil)),
+            // The degraded target an unknown daemon kind decodes to must not mark every row.
+            entry("unknown", target: .existingThread(threadID: ""))
+        ])
+        XCTAssertEqual(store.scheduledThreadIDs, ["t1", "t2"])
+    }
+
+    func testTheRetainedSetStaysBounded() {
+        store.updateScheduledThreads(from: (0..<600).map { entry("s\($0)", target: .existingThread(threadID: "t\($0)")) })
+        XCTAssertEqual(store.scheduledThreadIDs.count, 500)
+    }
+
+    func testARefreshMarksTargetedThreadsAndADaemonOutageKeepsTheLastKnownSet() async {
+        let service = InMemoryScheduleService()
+        store.cachedScheduleService = service
+        _ = try? await service.save(entry("Nightly", target: .existingThread(threadID: "t1")))
+
+        let loaded = await store.refreshScheduledThreads()
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(store.scheduledThreadIDs, ["t1"])
+
+        service.failure = ScheduleServiceError.daemonUnavailable
+        let retried = await store.refreshScheduledThreads()
+        XCTAssertFalse(retried, "A failed load reports itself, so launch can try once more")
+        XCTAssertEqual(store.scheduledThreadIDs, ["t1"], "A transient outage must not erase the clocks already on screen")
+    }
+}
+
 final class ScheduleWireBridgeTests: XCTestCase {
     func testEveryTriggerAndTargetSurvivesTheRoundTripToTheDaemon() {
         let cases: [ScheduleEntry.Trigger] = [

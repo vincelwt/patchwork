@@ -8,7 +8,11 @@ private final class FakeRuntime: PiRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
-    func start(cwd: URL, sessionPath: URL?) throws { isRunning = true }
+    private(set) var startedCwd: URL?
+    func start(cwd: URL, sessionPath: URL?) throws {
+        startedCwd = cwd
+        isRunning = true
+    }
     func stop() { isRunning = false }
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {}
     func sendUncorrelated(_ value: JSONValue) {}
@@ -55,28 +59,23 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop").path
     }
 
-    private func makeStore(counter: CallCounter = CallCounter()) -> AppStore {
+    private func makeStore(counter: CallCounter = CallCounter(), runtime: FakeRuntime = FakeRuntime()) -> AppStore {
         AppStore(
             repository: FakeRepository(),
             gitService: FakeGitService(counter: counter),
-            runtime: FakeRuntime(),
+            runtime: runtime,
             persistence: AppPersistence(baseURL: directory)
         )
     }
 
-    // MARK: - Default folder never touches a protected location
+    // MARK: - Global default
 
-    func testFreshLaunchWithNoRecentFoldersDefaultsToHomeDirectoryNeverDesktop() {
+    func testFreshLaunchDefaultsToTheGlobalDesktopWorkingDirectory() {
         let store = makeStore()
-        XCTAssertNotEqual(store.selectedFolder?.standardizedFileURL.path, desktopPath, "Never defaults to a TCC-protected folder")
-        XCTAssertEqual(
-            store.selectedFolder?.standardizedFileURL.path,
-            FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path,
-            "Falls back to the plain home directory, which carries no permission prompt"
-        )
+        XCTAssertEqual(store.selectedFolder?.standardizedFileURL.path, desktopPath)
     }
 
-    func testALastUsedFolderIsPreferredOverTheHomeDirectoryDefault() throws {
+    func testALastUsedProjectDoesNotReplaceTheGlobalDefault() throws {
         let persistence = AppPersistence(baseURL: directory)
         let previouslyUsed = directory.appendingPathComponent("previous-project", isDirectory: true)
         try FileManager.default.createDirectory(at: previouslyUsed, withIntermediateDirectories: true)
@@ -86,10 +85,10 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
             repository: FakeRepository(), gitService: FakeGitService(counter: CallCounter()),
             runtime: FakeRuntime(), persistence: persistence
         )
-        XCTAssertEqual(store.selectedFolder?.standardizedFileURL.path, previouslyUsed.standardizedFileURL.path)
+        XCTAssertEqual(store.selectedFolder?.standardizedFileURL.path, desktopPath)
     }
 
-    func testOpeningNewChatAfterASessionKeepsTheSameSafeDefaultNeverDesktop() {
+    func testOpeningNewChatAfterASessionResetsToGlobal() {
         let store = makeStore()
         var session = SessionSummary(
             id: "s", fileURL: directory.appendingPathComponent("s.jsonl"), cwd: directory,
@@ -100,12 +99,46 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         store.selectSession(session)
 
         store.openNewChat()
-        XCTAssertNotEqual(store.selectedFolder?.standardizedFileURL.path, desktopPath)
+        XCTAssertEqual(store.selectedFolder?.standardizedFileURL.path, desktopPath)
+    }
+
+    func testGlobalSubmissionStartsPiFromDesktop() {
+        let runtime = FakeRuntime()
+        let store = makeStore(runtime: runtime)
+        store.draft = "hello"
+
+        store.submitDraft()
+
+        XCTAssertEqual(runtime.startedCwd?.standardizedFileURL.path, desktopPath)
+    }
+
+    func testFolderChoicesContainKnownProjectsOnceButNeverGlobalDesktop() throws {
+        let store = makeStore()
+        func session(_ id: String, cwd: URL) -> SessionSummary {
+            var value = SessionSummary(
+                id: id, fileURL: directory.appendingPathComponent("\(id).jsonl"), cwd: cwd,
+                createdAt: Date(), modifiedAt: Date(), name: id, preview: "",
+                messageCount: 0, metrics: TokenMetrics()
+            )
+            value.prepareSearchKey()
+            return value
+        }
+        let project = directory.appendingPathComponent("project", isDirectory: true)
+        let filedProjectSession = session("project-a", cwd: project)
+        store.sessions = [
+            session("global", cwd: WorkspaceOrganization.globalWorkingDirectory),
+            filedProjectSession,
+            session("project-b", cwd: project)
+        ]
+        let virtualFolder = try XCTUnwrap(store.createVirtualFolder(named: "Filed"))
+        store.moveSession(filedProjectSession, toVirtualFolder: virtualFolder.id)
+
+        XCTAssertEqual(store.sidebarFolders.map(\.standardizedFileURL.path), [project.standardizedFileURL.path])
     }
 
     // MARK: - Git refresh stays lazy until the folder is opted into
 
-    func testTheDefaultFolderNeverTriggersAGitSubprocessOnItsOwn() async throws {
+    func testTheGlobalDesktopFolderNeverTriggersAGitSubprocessOnItsOwn() async throws {
         let counter = CallCounter()
         let store = makeStore(counter: counter)
 
@@ -114,7 +147,7 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         // would have shown up, short enough to keep the suite fast.
         try await Task.sleep(nanoseconds: 300_000_000)
         let count = await counter.count
-        XCTAssertEqual(count, 0, "The unopted default folder must never spawn a git subprocess (and risk a TCC prompt)")
+        XCTAssertEqual(count, 0, "Global mode must not inspect Desktop just to draw New Chat")
     }
 
     func testChoosingAFolderFromThePickerOptsItIntoGitRefresh() async throws {
@@ -126,6 +159,26 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         store.chooseFolder(chosen)
         try await waitUntil { await counter.count > 0 }
         XCTAssertEqual(store.selectedGit.branch, "should-only-appear-once-opted-in")
+    }
+
+    func testAnExistingGlobalConversationStillSkipsDesktopGitInspection() async throws {
+        let counter = CallCounter()
+        let store = makeStore(counter: counter)
+        var session = SessionSummary(
+            id: "global", fileURL: directory.appendingPathComponent("global.jsonl"),
+            cwd: WorkspaceOrganization.globalWorkingDirectory,
+            createdAt: Date(), modifiedAt: Date(), name: "global", preview: "",
+            messageCount: 0, metrics: TokenMetrics()
+        )
+        session.prepareSearchKey()
+        store.sessions = [session]
+
+        store.selectSession(session)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let count = await counter.count
+
+        XCTAssertEqual(count, 0)
+        XCTAssertFalse(store.selectedGit.isRepository)
     }
 
     func testASessionsOwnCwdAlwaysRefreshesEvenWithoutBeingInRecentFolders() async throws {
