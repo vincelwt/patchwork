@@ -20,13 +20,15 @@ import {
   randomBase64url,
   relayRoute,
   sha256Base64url,
-  verificationCode,
   type PublicJwk,
 } from "./protocol";
 
 interface Env {
   RELAY: DurableObjectNamespace;
   ASSETS: Fetcher;
+  CONNECTION_RATE_LIMITER: RateLimit;
+  ENROLLMENT_RATE_LIMITER: RateLimit;
+  FRAME_RATE_LIMITER: RateLimit;
 }
 
 type Device = {
@@ -42,19 +44,22 @@ type PendingPairing = {
   pairingId: string;
   deviceId: string;
   name: string;
-  verificationCode: string;
   requestedAt: number;
+  expiresAt: number;
   authPublicKey: PublicJwk;
   ecdhPublicKey: string;
+  proof: string;
   hostPublicKey: string;
 };
 
 type SocketAttachment =
-  | { role: "host"; connectionId: string }
+  | { role: "host"; connectionId: string; clientIP: string }
   | {
       role: "device";
       connectionId: string;
+      clientIP: string;
       nonce: string;
+      issuedAt: number;
       authenticated: boolean;
       deviceId?: string;
       pairing?: PendingPairing;
@@ -70,7 +75,10 @@ type DeviceRow = {
 };
 
 type OfferRow = { ticket_hash: string; expires_at: number; host_public_key: string };
+type PairingDecisionRow = { approved: number };
+type ExpiryRow = { expires_at: number | null };
 
+const PROTOCOL_VERSION = "2";
 const response = (status: number, body: string) => new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
 const onlyKeys = (value: Record<string, unknown>, keys: string[]) => Object.keys(value).every((key) => keys.includes(key)) && keys.every((key) => key in value);
 
@@ -85,6 +93,9 @@ export default {
     }
     if (request.method !== "GET") return response(400, "WebSocket relay requires GET");
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return response(426, "WebSocket upgrade required");
+    if (url.searchParams.get("v") !== PROTOCOL_VERSION) return response(426, "Relay protocol upgrade required");
+    const clientIP = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (!(await env.CONNECTION_RATE_LIMITER.limit({ key: clientIP })).success) return response(429, "Relay connection rate exceeded");
     if (route.role === "host") {
       const match = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(request.headers.get("Authorization") ?? "");
       if (!match || !isToken(match[1])) return response(401, "Invalid bearer token");
@@ -98,7 +109,7 @@ export default {
 export class Relay {
   private readonly sql: SqlStorage;
 
-  constructor(private readonly state: DurableObjectState, _env: Env) {
+  constructor(private readonly state: DurableObjectState, private readonly env: Env) {
     this.sql = state.storage.sql;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -116,24 +127,44 @@ export class Relay {
         paired_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pairing_decisions (
+        id TEXT PRIMARY KEY,
+        approved INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
   }
 
   async fetch(request: Request): Promise<Response> {
-    const route = relayRoute(new URL(request.url).pathname);
+    const url = new URL(request.url);
+    const route = relayRoute(url.pathname);
     if (!route) return response(404, "Not found");
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return response(426, "WebSocket upgrade required");
+    if (url.searchParams.get("v") !== PROTOCOL_VERSION) return response(426, "Relay protocol upgrade required");
     if (!this.ensureInstallationID(route.installationID)) return response(400, "Installation mismatch");
+    if (route.role === "device" && this.config("protocol_version") !== PROTOCOL_VERSION) return response(409, "Host protocol upgrade required");
 
+    const clientIP = request.headers.get("CF-Connecting-IP") ?? "unknown";
     const sockets = this.state.getWebSockets();
     const oldHosts = route.role === "host" ? this.hostSockets() : [];
-    if (route.role === "device" && sockets.length >= MAX_SOCKETS) return response(429, "Too many relay connections");
-    if (route.role === "host" && sockets.length - oldHosts.length >= MAX_SOCKETS) {
-      const unauthenticated = this.deviceSockets().find((socket) => {
+    const unauthenticated = this.deviceSockets()
+      .filter((socket) => {
         const attachment = this.attachment(socket);
         return attachment?.role === "device" && !attachment.authenticated;
+      })
+      .sort((left, right) => {
+        const a = this.attachment(left);
+        const b = this.attachment(right);
+        return (a?.role === "device" ? a.issuedAt : 0) - (b?.role === "device" ? b.issuedAt : 0);
       });
-      if (unauthenticated) this.close(unauthenticated, 1013, "Host connection has priority");
+    if (route.role === "device" && (sockets.length >= MAX_SOCKETS || unauthenticated.length >= 4)) {
+      const oldest = unauthenticated[0];
+      if (oldest) this.close(oldest, 1013, "Replaced by a newer pairing connection");
+      else return response(429, "Too many relay connections");
+    }
+    if (route.role === "host" && sockets.length - oldHosts.length >= MAX_SOCKETS) {
+      const candidate = unauthenticated[0] ?? this.deviceSockets()[0];
+      if (candidate) this.close(candidate, 1013, "Host connection has priority");
       else return response(429, "Too many relay connections");
     }
 
@@ -143,7 +174,18 @@ export class Relay {
       const tokenHash = await sha256Base64url(match[1]);
       const storedHash = this.config("host_token_hash");
       if (storedHash !== null && !equalFixed(storedHash, tokenHash)) return response(401, "Invalid bearer token");
-      if (storedHash === null) this.setConfig("host_token_hash", tokenHash);
+      if (storedHash === null) {
+        if (!(await this.env.ENROLLMENT_RATE_LIMITER.limit({ key: clientIP })).success) return response(429, "Installation enrollment rate exceeded");
+        this.setConfig("host_token_hash", tokenHash);
+      }
+      if (this.config("protocol_version") !== PROTOCOL_VERSION) {
+        this.sql.exec("DELETE FROM pair_offer; DELETE FROM devices; DELETE FROM pairing_decisions;");
+        this.setConfig("protocol_version", PROTOCOL_VERSION);
+        for (const deviceSocket of this.deviceSockets()) {
+          this.send(deviceSocket, { type: "revoked" });
+          this.close(deviceSocket, 1008, "Relay protocol upgraded");
+        }
+      }
       for (const socket of oldHosts) socket.close(1000, "Replaced by a newer host connection");
     }
 
@@ -153,7 +195,7 @@ export class Relay {
     const connectionId = randomBase64url(16);
 
     if (route.role === "host") {
-      const attachment: SocketAttachment = { role: "host", connectionId };
+      const attachment: SocketAttachment = { role: "host", connectionId, clientIP };
       server.serializeAttachment(attachment);
       this.state.acceptWebSocket(server, ["host", `connection:${connectionId}`]);
       this.send(server, { type: "hostReady", devices: this.devices() });
@@ -167,7 +209,7 @@ export class Relay {
       }
     } else {
       const nonce = randomBase64url(32);
-      const attachment: SocketAttachment = { role: "device", connectionId, nonce, authenticated: false };
+      const attachment: SocketAttachment = { role: "device", connectionId, clientIP, nonce, issuedAt: Date.now(), authenticated: false };
       server.serializeAttachment(attachment);
       this.state.acceptWebSocket(server, ["device", `connection:${connectionId}`]);
       this.send(server, { type: "challenge", nonce, hostOnline: this.hostOnline() });
@@ -177,6 +219,15 @@ export class Relay {
   }
 
   async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
+    const attachment = this.attachment(socket);
+    if (!attachment) {
+      this.close(socket, 1011, "Missing socket state");
+      return;
+    }
+    if (!(await this.env.FRAME_RATE_LIMITER.limit({ key: attachment.clientIP })).success) {
+      this.close(socket, 1013, "Relay frame rate exceeded");
+      return;
+    }
     if (typeof frame !== "string") {
       this.close(socket, frame.byteLength > MAX_FRAME_BYTES ? 1009 : 1003, "Text frames only");
       return;
@@ -198,11 +249,6 @@ export class Relay {
       return;
     }
 
-    const attachment = this.attachment(socket);
-    if (!attachment) {
-      this.close(socket, 1011, "Missing socket state");
-      return;
-    }
     if (attachment.role === "host") {
       if (this.currentHost() !== socket) return this.invalid(socket);
       await this.handleHost(socket, message);
@@ -217,6 +263,25 @@ export class Relay {
 
   webSocketError(socket: WebSocket): void {
     this.socketEnded(socket);
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    this.sql.exec("DELETE FROM pairing_decisions WHERE expires_at <= ?", now);
+    let nextExpiry = this.sql.exec<ExpiryRow>("SELECT MIN(expires_at) AS expires_at FROM pairing_decisions").toArray()[0]?.expires_at ?? null;
+    const host = this.currentHost();
+    for (const socket of this.deviceSockets()) {
+      const attachment = this.attachment(socket);
+      if (attachment?.role !== "device" || !attachment.pairing) continue;
+      if (attachment.pairing.expiresAt <= now) {
+        this.send(socket, { type: "pairRejected", reason: "expiredTicket" });
+        this.close(socket, 1008, "Pairing expired");
+        if (host) this.send(host, { type: "pairExpired", pairingId: attachment.pairing.pairingId });
+      } else {
+        nextExpiry = nextExpiry === null ? attachment.pairing.expiresAt : Math.min(nextExpiry, attachment.pairing.expiresAt);
+      }
+    }
+    if (nextExpiry !== null) await this.state.storage.setAlarm(nextExpiry);
   }
 
   private async handleHost(socket: WebSocket, message: Record<string, unknown>): Promise<void> {
@@ -236,6 +301,7 @@ export class Relay {
       }
       case "pairDecision": {
         if (!onlyKeys(message, ["type", "id", "pairingId", "approved"]) || !isRequestID(message.id) || !isConnectionID(message.pairingId) || typeof message.approved !== "boolean") return this.invalid(socket);
+        this.sql.exec("DELETE FROM pairing_decisions WHERE expires_at <= ?", Date.now());
         const pendingSocket = this.deviceSockets().find((candidate) => {
           const candidateAttachment = this.attachment(candidate);
           return candidateAttachment?.role === "device" && candidateAttachment.pairing?.pairingId === message.pairingId;
@@ -243,10 +309,21 @@ export class Relay {
         const pendingAttachment = pendingSocket && this.attachment(pendingSocket);
         const pairing = pendingAttachment?.role === "device" ? pendingAttachment.pairing : undefined;
         if (!pendingSocket || !pendingAttachment || pendingAttachment.role !== "device" || !pairing) {
-          this.send(socket, { type: "ack", id: message.id, ok: false, error: "pairingNotFound" });
+          const prior = this.sql.exec<PairingDecisionRow>("SELECT approved FROM pairing_decisions WHERE id = ?", message.pairingId).toArray()[0];
+          if (prior && Boolean(prior.approved) === message.approved) this.send(socket, { type: "ack", id: message.id, ok: true });
+          else this.send(socket, { type: "ack", id: message.id, ok: false, error: "pairingNotFound" });
+          return;
+        }
+        if (pairing.expiresAt <= Date.now()) {
+          this.send(pendingSocket, { type: "pairRejected", reason: "expiredTicket" });
+          this.close(pendingSocket, 1008, "Pairing expired");
+          this.send(socket, { type: "ack", id: message.id, ok: false, error: "pairingExpired" });
           return;
         }
         if (!message.approved) {
+          const decisionExpiry = Date.now() + 600_000;
+          this.sql.exec("INSERT OR REPLACE INTO pairing_decisions (id, approved, expires_at) VALUES (?, 0, ?)", message.pairingId, decisionExpiry);
+          await this.schedulePairingAlarm(decisionExpiry);
           this.send(pendingSocket, { type: "pairRejected", reason: "denied" });
           this.close(pendingSocket, 1008, "Pairing denied");
           this.send(socket, { type: "ack", id: message.id, ok: true });
@@ -268,19 +345,25 @@ export class Relay {
           now,
           now,
         );
+        for (const existing of this.socketsForDevice(pairing.deviceId)) this.close(existing, 1000, "Replaced by a newer device connection");
         pendingSocket.serializeAttachment({
           role: "device",
           connectionId: pendingAttachment.connectionId,
+          clientIP: pendingAttachment.clientIP,
           nonce: pendingAttachment.nonce,
+          issuedAt: pendingAttachment.issuedAt,
           authenticated: true,
           deviceId: pairing.deviceId,
         } satisfies SocketAttachment);
+        const decisionExpiry = now + 600_000;
+        this.sql.exec("INSERT OR REPLACE INTO pairing_decisions (id, approved, expires_at) VALUES (?, 1, ?)", message.pairingId, decisionExpiry);
+        await this.schedulePairingAlarm(decisionExpiry);
         const pairedDevice = this.device(pairing.deviceId);
+        this.send(socket, { type: "ack", id: message.id, ok: true });
         if (pairedDevice) this.send(socket, { type: "deviceConnected", device: pairedDevice, connectionId: pendingAttachment.connectionId });
         this.send(pendingSocket, { type: "paired", deviceId: pairing.deviceId, hostPublicKey: pairing.hostPublicKey });
         this.send(pendingSocket, { type: "ready", hostOnline: true });
         this.send(socket, { type: "devicesSnapshot", devices: this.devices() });
-        this.send(socket, { type: "ack", id: message.id, ok: true });
         return;
       }
       case "devicesList": {
@@ -312,6 +395,9 @@ export class Relay {
   }
 
   private async handleDevice(socket: WebSocket, attachment: Extract<SocketAttachment, { role: "device" }>, message: Record<string, unknown>): Promise<void> {
+    if (!attachment.authenticated && !attachment.pairing && Date.now() - attachment.issuedAt > 60_000) {
+      return this.close(socket, 1008, "Authentication challenge expired");
+    }
     if (attachment.authenticated) {
       if (!onlyKeys(message, ["type", "payload"]) || message.type !== "cipher") return this.invalid(socket);
       const payload = cipherPayload(message.payload);
@@ -337,11 +423,10 @@ export class Relay {
 
     if (attachment.pairing) return this.invalid(socket);
     if (message.type === "pair") {
-      if (!onlyKeys(message, ["type", "ticket", "deviceId", "name", "authPublicKey", "ecdhPublicKey"]) || !isToken(message.ticket) || !isDeviceID(message.deviceId) || !isName(message.name)) return this.invalid(socket);
+      if (!onlyKeys(message, ["type", "ticketHash", "proof", "deviceId", "name", "authPublicKey", "ecdhPublicKey"]) || !isToken(message.ticketHash) || !isToken(message.proof) || !isDeviceID(message.deviceId) || !isName(message.name)) return this.invalid(socket);
       const authPublicKey = publicJwk(message.authPublicKey);
       const ecdhPublicKey = p256PublicKey(message.ecdhPublicKey);
       if (!authPublicKey || !ecdhPublicKey) return this.invalid(socket);
-      const ticketHash = await sha256Base64url(message.ticket);
       const host = this.currentHost();
       if (!host) return this.rejectAndClose(socket, "hostOffline", "Host is offline");
       if (this.device(message.deviceId) || this.deviceCount() >= MAX_DEVICES) return this.rejectAndClose(socket, "deviceLimit", "Device cannot be paired");
@@ -351,17 +436,18 @@ export class Relay {
         this.sql.exec("DELETE FROM pair_offer WHERE singleton = 1");
         return this.rejectAndClose(socket, "expiredTicket", "Pairing offer expired");
       }
-      if (!equalFixed(ticketHash, offer.ticket_hash)) return this.rejectAndClose(socket, "invalidTicket", "Invalid pairing ticket");
+      if (!equalFixed(message.ticketHash, offer.ticket_hash)) return this.rejectAndClose(socket, "invalidTicket", "Invalid pairing ticket");
       this.sql.exec("DELETE FROM pair_offer WHERE singleton = 1");
 
       const pairing: PendingPairing = {
         pairingId: randomBase64url(16),
         deviceId: message.deviceId,
         name: message.name,
-        verificationCode: verificationCode(),
         requestedAt: Date.now(),
+        expiresAt: offer.expires_at,
         authPublicKey,
         ecdhPublicKey,
+        proof: message.proof,
         hostPublicKey: offer.host_public_key,
       };
       socket.serializeAttachment({ ...attachment, pairing });
@@ -369,19 +455,24 @@ export class Relay {
         id: pairing.pairingId,
         deviceId: pairing.deviceId,
         name: pairing.name,
-        verificationCode: pairing.verificationCode,
         requestedAt: pairing.requestedAt,
+        expiresAt: pairing.expiresAt,
         authPublicKey: pairing.authPublicKey,
         ecdhPublicKey: pairing.ecdhPublicKey,
+        proof: pairing.proof,
       } });
-      this.send(socket, { type: "pairPending", pairingId: pairing.pairingId, verificationCode: pairing.verificationCode });
+      this.send(socket, { type: "pairPending", pairingId: pairing.pairingId, expiresAt: pairing.expiresAt });
+      await this.schedulePairingAlarm(pairing.expiresAt);
       return;
     }
 
     if (message.type === "authenticate") {
       if (!onlyKeys(message, ["type", "deviceId", "signature"]) || !isDeviceID(message.deviceId) || !isSignature(message.signature)) return this.invalid(socket);
       const device = this.device(message.deviceId);
-      if (!device) return this.close(socket, 1008, "Authentication failed");
+      if (!device) {
+        this.send(socket, { type: "revoked" });
+        return this.close(socket, 1008, "Device revoked");
+      }
       let verified = false;
       try {
         const key = await crypto.subtle.importKey("jwk", device.authPublicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
@@ -395,9 +486,13 @@ export class Relay {
         verified = false;
       }
       const currentDevice = this.device(message.deviceId);
-      if (!verified || !currentDevice || JSON.stringify(currentDevice.authPublicKey) !== JSON.stringify(device.authPublicKey)) return this.close(socket, 1008, "Authentication failed");
+      if (!verified || !currentDevice || JSON.stringify(currentDevice.authPublicKey) !== JSON.stringify(device.authPublicKey)) {
+        this.send(socket, { type: "authRejected" });
+        return this.close(socket, 1008, "Authentication failed");
+      }
       const now = Date.now();
       this.sql.exec("UPDATE devices SET last_seen_at = ? WHERE id = ?", now, message.deviceId);
+      for (const existing of this.socketsForDevice(message.deviceId)) this.close(existing, 1000, "Replaced by a newer device connection");
       socket.serializeAttachment({ ...attachment, authenticated: true, deviceId: message.deviceId } satisfies SocketAttachment);
       const host = this.currentHost();
       this.send(socket, { type: "ready", hostOnline: host !== null });
@@ -413,9 +508,18 @@ export class Relay {
     if (attachment?.role === "host" && !this.hostOnline()) {
       broadcastHostPresence(this.authenticatedDeviceSockets(), false, (deviceSocket, message) => this.send(deviceSocket, message));
     } else if (attachment?.role === "device" && attachment.authenticated && attachment.deviceId) {
+      const stillConnected = this.socketsForDevice(attachment.deviceId).some((candidate) => candidate !== socket);
       const host = this.currentHost();
-      if (host) this.send(host, { type: "deviceDisconnected", deviceId: attachment.deviceId, connectionId: attachment.connectionId });
+      if (!stillConnected && host) this.send(host, { type: "deviceDisconnected", deviceId: attachment.deviceId, connectionId: attachment.connectionId });
+    } else if (attachment?.role === "device" && attachment.pairing) {
+      const host = this.currentHost();
+      if (host) this.send(host, { type: "pairExpired", pairingId: attachment.pairing.pairingId });
     }
+  }
+
+  private async schedulePairingAlarm(expiresAt: number): Promise<void> {
+    const current = await this.state.storage.getAlarm();
+    if (current === null || expiresAt < current) await this.state.storage.setAlarm(expiresAt);
   }
 
   private ensureInstallationID(installationID: string): boolean {

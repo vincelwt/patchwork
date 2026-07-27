@@ -11,6 +11,11 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Relay"] }
   ],
+  "ratelimits": [
+    { "name": "CONNECTION_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 120, "period": 60 } },
+    { "name": "ENROLLMENT_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 3, "period": 60 } },
+    { "name": "FRAME_RATE_LIMITER", "namespace_id": "1003", "simple": { "limit": 1200, "period": 60 } }
+  ],
   "assets": {
     "directory": "../Sources/PiDeskWeb/Site",
     "binding": "ASSETS",

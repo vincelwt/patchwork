@@ -101,9 +101,12 @@ stops just like a quit does. With it off, automations say so explicitly instead 
    `Authorization: Bearer <token>`, where the token lives in
    `~/Library/Application Support/Pi Desktop/daemon-token` (`0600`, 32 random bytes, base64url).
 3. **Hosted relay** (outbound, automatic): `pi-deskd` connects by WSS to
-   `remote.ai.gloom.sh`. QR-approved browsers authenticate with a per-device P-256 key and send
-   AES-256-GCM envelopes through a Cloudflare Durable Object. No listener, tunnel, or daemon
-   bearer token is exposed. Pairing management remains Unix-socket-only.
+   `remote.ai.gloom.sh`. QR-approved browsers prove possession of the fragment-only ticket, then
+   authenticate with a per-device P-256 key and send direction-bound AES-256-GCM envelopes
+   through a Cloudflare Durable Object. The Mac retains the approved public key and highest
+   mutation counter locally. Hosted protocol version 2 resets incompatible legacy pairing state
+   instead of attempting mixed-version traffic. No listener, tunnel, or daemon bearer token is
+   exposed. Pairing management remains Unix-socket-only.
 
 Protocol is HTTP/1.1 with JSON bodies, `Content-Type: application/json`, UTF-8. Errors use the
 shape `{"error": {"code": "…", "message": "…"}}` with a matching HTTP status. Every response
@@ -271,7 +274,7 @@ forward-compatibility rule the app applies to Pi's own RPC events.
   daemon.sock          control socket
   daemon-token         bearer token for the loopback listener (0600)
   daemon.json          daemon settings: port, concurrency, loopback remote enabled
-  relay-identity.json  hosted installation id, host credential, and P-256 private key (0600)
+  relay-identity.json  hosted installation/host keys, approved device keys, replay counters (0600)
   daemon-owner.json    pid + start time of the pi-deskd Pi Desktop.app itself started, if any —
                        local coordination between the app and pidesk, not part of this API
   schedules.json       every Schedule, written atomically

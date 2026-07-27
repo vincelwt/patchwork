@@ -78,8 +78,27 @@ public enum PiDeskWeb {
     // MARK: - Site root
 
     private static let siteRoot: URL = {
-        let bundleURL = Bundle.module.resourceURL ?? Bundle.module.bundleURL
-        return bundleURL.appendingPathComponent("Site", isDirectory: true)
+        let bundleName = "PiDesktop_PiDeskWeb.bundle"
+        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath()
+            .deletingLastPathComponent()
+        var candidates = [
+            executableDirectory.appendingPathComponent(bundleName, isDirectory: true),
+            executableDirectory.deletingLastPathComponent()
+                .appendingPathComponent("Resources", isDirectory: true)
+                .appendingPathComponent(bundleName, isDirectory: true),
+        ]
+        for bundle in Bundle.allBundles {
+            if let resourceURL = bundle.resourceURL {
+                candidates.append(resourceURL.appendingPathComponent(bundleName, isDirectory: true))
+            }
+            candidates.append(bundle.bundleURL.appendingPathComponent(bundleName, isDirectory: true))
+            candidates.append(bundle.bundleURL.deletingLastPathComponent().appendingPathComponent(bundleName, isDirectory: true))
+        }
+        for bundleURL in candidates where FileManager.default.fileExists(atPath: bundleURL.path) {
+            return bundleURL.appendingPathComponent("Site", isDirectory: true)
+        }
+        fatalError("PiDeskWeb resource bundle is missing")
     }()
 
     // MARK: - Resolution

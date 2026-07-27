@@ -26,10 +26,16 @@ one-time ticket, and the Mac's public encryption key. It contains no provider cr
 session data, or reusable daemon bearer token.
 
 After approval, the browser keeps non-exportable P-256 authentication and key-agreement keys in
-IndexedDB. Each reconnection signs a fresh challenge. API traffic uses a device-specific key
-derived with P-256 ECDH + HKDF-SHA256 and is encrypted with AES-256-GCM before reaching the
-relay. Clearing site data, using private browsing, or revoking the device requires pairing again.
-Each browser has its own identity and can be revoked independently from the same sheet.
+IndexedDB. The URL-fragment ticket never goes to the relay: the browser sends its SHA-256 hash
+and an HMAC proof binding the ticket, installation, label, and both device public keys. The Mac
+verifies that proof and derives the same six-digit code before it records the approved key
+locally. Each reconnection signs a fresh challenge.
+
+API traffic uses a device-specific key derived with P-256 ECDH + HKDF-SHA256 and AES-256-GCM.
+Authenticated additional data binds ciphertext direction, and a persistent per-device mutation
+counter makes captured mutations fail closed if replayed. Clearing site data, using private
+browsing, or revoking the device requires pairing again. Each browser has its own identity and
+can be revoked independently from the same sheet.
 
 The Mac must be online and `pi-deskd` must be running to execute or read conversations. The
 relay deliberately does not queue mutations while the host is offline, avoiding an ambiguous
@@ -42,9 +48,10 @@ browser/PWA -- encrypted WSS --> Cloudflare Worker + Durable Object <-- WSS -- p
 ```
 
 One hibernatable Durable Object coordinates each random installation ID. It retains only the
-host-token hash, public device keys, device labels/timestamps, and one bounded pairing offer.
-There is no D1, KV, R2, plaintext conversation cache, or offline prompt queue. Static files are
-the same `Sources/PiDeskWeb/Site/` assets bundled into the daemon.
+host-token hash, public device keys, device labels/timestamps, and one bounded pairing offer
+(ticket hash, expiry, and host public key). Pending approvals expire at the same five-minute
+deadline. There is no D1, KV, R2, plaintext conversation cache, or offline prompt queue. Static
+files are the same `Sources/PiDeskWeb/Site/` assets bundled into the daemon.
 
 Deployment lives in `CloudflareRelay/`:
 
@@ -89,16 +96,22 @@ The hosted relay does not use this listener or token and does not expose a port 
 
 ## Security boundaries
 
-- Hosted traffic enters the daemon only after Durable Object device authentication and
-  device-to-daemon decryption.
+- Hosted traffic enters the daemon only after Durable Object device authentication,
+  device-to-daemon decryption, and a match against the Mac's locally approved device key.
 - Pairing/device-management endpoints are Unix-socket-only. A paired browser cannot mint or
   approve another device.
 - Hosted RPC accepts only the documented `/v1/*` methods and rejects `/v1/remote/*`, oversized
   frames, malformed ciphertext, and unknown mutation methods.
-- Relay and browser payloads are bounded to 2 MiB; retained device records are capped at 32.
-- Unknown API fields and event names continue to degrade through the existing bounded,
-  forward-compatible web and daemon paths.
-- Revoking a browser deletes its relay-side public record and closes its live sockets.
+- Relay and browser frames are bounded to 2 MiB (encrypted plaintext is capped lower to account
+  for AES-GCM and base64 expansion); retained devices are capped at 32 and pending sockets at 4.
+  Cloudflare rate-limit bindings also cap connection attempts, new installations, and frames per
+  source IP. Keep account spend alerts/limits enabled because enrollment is intentionally
+  accountless.
+- The hosted wire protocol is versioned. A protocol upgrade clears incompatible relay records,
+  locally approved legacy keys, and stale browser metadata rather than leaving a half-paired
+  device retrying forever. Unknown API fields and event names remain forward-compatible.
+- Pairing and revocation wait for a relay acknowledgement. Revocation then deletes both the
+  relay-side record and the Mac's local authorization before closing live browser sockets.
 - Cloudflare can observe connection metadata and encrypted payload sizes/timing. It cannot read
   the encrypted API body. As with any hosted web app, a compromised future JavaScript deployment
   could target a browser after page load; a native mobile client would be the upgrade if that

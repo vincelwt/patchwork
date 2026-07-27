@@ -20,6 +20,23 @@ export function challengeText(installationId, deviceId, nonce) {
   return `pi-remote-v1:${installationId}:${deviceId}:${nonce}`;
 }
 
+export function pairingTranscript(installationId, deviceId, name, ecdhPublicKey, authPublicKey) {
+  return ["pi-remote-pair-v1", installationId, deviceId, name, ecdhPublicKey, authPublicKey.x, authPublicKey.y].join("\0");
+}
+
+export async function pairingCredentials(ticket, installationId, deviceId, name, ecdhPublicKey, authPublicKey) {
+  const ticketBytes = fromBase64URL(ticket);
+  const hmacKey = await crypto.subtle.importKey("raw", ticketBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const proofBytes = new Uint8Array(await crypto.subtle.sign(
+    "HMAC",
+    hmacKey,
+    encoder.encode(pairingTranscript(installationId, deviceId, name, ecdhPublicKey, authPublicKey))
+  ));
+  const ticketHash = base64URL(await crypto.subtle.digest("SHA-256", encoder.encode(ticket)));
+  const value = ((proofBytes[0] * 0x1000000) + (proofBytes[1] << 16) + (proofBytes[2] << 8) + proofBytes[3]) % 1000000;
+  return { ticketHash, proof: base64URL(proofBytes), verificationCode: String(value).padStart(6, "0") };
+}
+
 export async function deriveSessionKey(privateKey, hostPublicKey, installationId, deviceId) {
   const publicKey = await crypto.subtle.importKey(
     "raw",
@@ -44,16 +61,24 @@ export async function deriveSessionKey(privateKey, hostPublicKey, installationId
   );
 }
 
-export async function encryptJSON(value, key) {
+export async function encryptJSON(value, key, direction) {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const plaintext = encoder.encode(JSON.stringify(value));
-  const data = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
+  const data = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: nonce, additionalData: encoder.encode(`pi-remote-v1:${direction}`) },
+    key,
+    plaintext
+  );
   return { nonce: base64URL(nonce), data: base64URL(data) };
 }
 
-export async function decryptJSON(payload, key) {
+export async function decryptJSON(payload, key, direction) {
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: fromBase64URL(payload.nonce) },
+    {
+      name: "AES-GCM",
+      iv: fromBase64URL(payload.nonce),
+      additionalData: encoder.encode(`pi-remote-v1:${direction}`)
+    },
     key,
     fromBase64URL(payload.data)
   );

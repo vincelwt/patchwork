@@ -22,6 +22,7 @@ LABEL="dev.pi.desktop.daemon"
 SUPPORT_DIR="$HOME/Library/Application Support/Pi Desktop"
 BIN_DIR="$SUPPORT_DIR/bin"
 INSTALLED_BINARY="$BIN_DIR/pi-deskd"
+INSTALLED_WEB_BUNDLE="$BIN_DIR/PiDesktop_PiDeskWeb.bundle"
 LOG_DIR="$HOME/Library/Logs/Pi Desktop"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
@@ -68,7 +69,8 @@ case "${1:-}" in
         unload_if_loaded
         rm -f "$PLIST_PATH"
         rm -f "$INSTALLED_BINARY"
-        echo "Removed $PLIST_PATH and $INSTALLED_BINARY."
+        rm -rf "$INSTALLED_WEB_BUNDLE"
+        echo "Removed $PLIST_PATH, $INSTALLED_BINARY, and $INSTALLED_WEB_BUNDLE."
         echo "Schedules, run history, and logs were left in place."
         exit 0
         ;;
@@ -90,9 +92,11 @@ esac
 
 echo "Building pi-deskd (release)…"
 (cd "$ROOT" && swift build -c release --product pi-deskd)
-BUILT_BINARY="$(cd "$ROOT" && swift build -c release --show-bin-path)/pi-deskd"
-if [ ! -x "$BUILT_BINARY" ]; then
-    echo "error: build did not produce an executable at $BUILT_BINARY" >&2
+BUILD_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)"
+BUILT_BINARY="$BUILD_DIR/pi-deskd"
+BUILT_WEB_BUNDLE="$BUILD_DIR/PiDesktop_PiDeskWeb.bundle"
+if [ ! -x "$BUILT_BINARY" ] || [ ! -d "$BUILT_WEB_BUNDLE" ]; then
+    echo "error: build did not produce pi-deskd and its PiDeskWeb resource bundle" >&2
     exit 1
 fi
 
@@ -103,6 +107,8 @@ chmod 700 "$SUPPORT_DIR"
 unload_if_loaded
 
 cp "$BUILT_BINARY" "$INSTALLED_BINARY"
+rm -rf "$INSTALLED_WEB_BUNDLE"
+ditto "$BUILT_WEB_BUNDLE" "$INSTALLED_WEB_BUNDLE"
 chmod 700 "$INSTALLED_BINARY"
 
 cat > "$PLIST_PATH" <<PLIST

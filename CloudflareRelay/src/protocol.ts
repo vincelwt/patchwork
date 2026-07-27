@@ -124,13 +124,6 @@ export function randomBase64url(bytes: number): string {
   return encodeBase64url(crypto.getRandomValues(new Uint8Array(bytes)));
 }
 
-export function verificationCode(): string {
-  const limit = 0x1_0000_0000 - (0x1_0000_0000 % 1_000_000);
-  const value = new Uint32Array(1);
-  do crypto.getRandomValues(value); while (value[0] >= limit);
-  return value[0].toString().padStart(6, "0");
-}
-
 export function relayRoute(pathname: string): { role: "host" | "device"; installationID: string } | null {
   const match = /^\/relay\/(host|device)\/([A-Za-z0-9_-]{32})$/.exec(pathname);
   return match ? { role: match[1] as "host" | "device", installationID: match[2] } : null;

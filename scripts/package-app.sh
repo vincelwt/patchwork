@@ -27,6 +27,7 @@ chmod +x "$APP/Contents/MacOS/PiDesktop"
 # both know to look here first.
 cp "$BIN_DIR/pi-deskd" "$APP/Contents/Helpers/pi-deskd"
 cp "$BIN_DIR/pidesk" "$APP/Contents/Helpers/pidesk"
+ditto "$BIN_DIR/PiDesktop_PiDeskWeb.bundle" "$APP/Contents/Resources/PiDesktop_PiDeskWeb.bundle"
 chmod +x "$APP/Contents/Helpers/pi-deskd" "$APP/Contents/Helpers/pidesk"
 
 # Compile the layered Icon Composer source. actool emits both the dynamic catalog used by

@@ -317,7 +317,20 @@ window.addEventListener("pi:unauthorized", () => {
   mountRoute();
 });
 window.addEventListener("pi:relay-pairing", (event) => {
-  setState({ relayPairing: event.detail });
+  if (event.detail?.phase === "unpaired" && state.authed) {
+    stopEvents();
+    Object.assign(state, {
+      authed: false,
+      threads: [],
+      schedules: [],
+      connection: "connecting",
+      relayPairing: event.detail
+    });
+    history.replaceState(null, "", "/");
+    mountRoute();
+  } else {
+    setState({ relayPairing: event.detail });
+  }
 });
 window.addEventListener("pi:relay-paired", () => {
   setState({ authed: true, relayPairing: relayPairingState() });

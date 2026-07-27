@@ -4,6 +4,7 @@ import {
   decryptJSON,
   deriveSessionKey,
   encryptJSON,
+  pairingCredentials,
   utf8
 } from "./relayCrypto.mjs";
 
@@ -12,6 +13,7 @@ const DB_NAME = "pi-desktop-relay";
 const DB_STORE = "keys";
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30000;
+const PROTOCOL_VERSION = 2;
 
 let socket = null;
 let sessionKey = null;
@@ -23,7 +25,9 @@ let stopped = false;
 let hostOnline = false;
 let reconnectDelay = 1000;
 let reconnectTimer = null;
+let pairingExpiryTimer = null;
 let messageChain = Promise.resolve();
+let requestChain = Promise.resolve();
 const pending = new Map();
 const eventListeners = new Set();
 const statusListeners = new Set();
@@ -69,7 +73,6 @@ export async function relayRequest(method, path, body) {
   await waitUntilReady();
   if (!hostOnline) throw new Error("HOST_OFFLINE");
   const id = crypto.randomUUID();
-  const payload = await encryptJSON({ id, method, path, body: body ?? null }, sessionKey);
   const result = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pending.delete(id);
@@ -77,13 +80,31 @@ export async function relayRequest(method, path, body) {
     }, REQUEST_TIMEOUT_MS);
     pending.set(id, { resolve, reject, timeout });
   });
-  send({ type: "cipher", payload });
+  const operation = requestChain.then(async () => {
+    if (!hostOnline || !sessionKey) throw new Error("RELAY_DISCONNECTED");
+    const counter = await nextCounter(metadata.installationId);
+    const payload = await encryptJSON({ id, counter, method, path, body: body ?? null }, sessionKey, "device-to-host");
+    if (!pending.has(id)) throw new Error("RELAY_TIMEOUT");
+    send({ type: "cipher", payload });
+  });
+  requestChain = operation.catch(() => {});
+  try {
+    await operation;
+  } catch (error) {
+    const waiter = pending.get(id);
+    if (waiter) {
+      pending.delete(id);
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+    }
+  }
   return result;
 }
 
 export async function forgetRelayDevice() {
   stopped = true;
   clearTimeout(reconnectTimer);
+  clearTimeout(pairingExpiryTimer);
   socket?.close(1000, "unpaired");
   socket = null;
   rejectPending("UNPAIRED");
@@ -115,20 +136,29 @@ async function beginPairing(offer) {
       ["deriveBits"]
     );
     const deviceId = base64URL(crypto.getRandomValues(new Uint8Array(24)));
-    keyBundle = { authPrivate: auth.privateKey, ecdhPrivate: ecdh.privateKey };
+    keyBundle = { authPrivate: auth.privateKey, ecdhPrivate: ecdh.privateKey, counter: 0 };
     const authPublicKey = await crypto.subtle.exportKey("jwk", auth.publicKey);
     const ecdhPublicKey = base64URL(await crypto.subtle.exportKey("raw", ecdh.publicKey));
     metadata = {
       installationId: offer.installationId,
       deviceId,
       name: deviceName(),
-      hostPublicKey: offer.hostPublicKey
+      hostPublicKey: offer.hostPublicKey,
+      protocolVersion: PROTOCOL_VERSION
     };
+    const credentials = await pairingCredentials(
+      offer.ticket,
+      metadata.installationId,
+      deviceId,
+      metadata.name,
+      ecdhPublicKey,
+      authPublicKey
+    );
     connect({
       mode: "pair",
-      ticket: offer.ticket,
       authPublicKey,
-      ecdhPublicKey
+      ecdhPublicKey,
+      ...credentials
     });
   } catch {
     setPairing({ phase: "error", message: "This browser could not create a secure device key." });
@@ -158,7 +188,7 @@ function connect(context) {
   emitStatus("connecting");
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const origin = `${protocol}//${location.host}`;
-  const ws = new WebSocket(`${origin}/relay/device/${encodeURIComponent(metadata.installationId)}`);
+  const ws = new WebSocket(`${origin}/relay/device/${encodeURIComponent(metadata.installationId)}?v=${PROTOCOL_VERSION}`);
   socket = ws;
 
   ws.onmessage = (event) => {
@@ -168,13 +198,14 @@ function connect(context) {
       ws.close(1008, "invalid message");
     });
   };
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     if (socket !== ws) return;
     socket = null;
     hostOnline = false;
     sessionKey = null;
     rejectPending("RELAY_DISCONNECTED");
     emitStatus("offline");
+    if (event.code === 1000 && event.reason.includes("newer device connection")) stopped = true;
     if (!stopped && context.mode === "authenticate" && hasRelayDevice()) scheduleReconnect();
     else if (!stopped && context.mode === "pair" && !["paired", "error"].includes(pairing.phase)) {
       setPairing({ phase: "error", message: "Pairing expired or was rejected. Scan a new code." });
@@ -191,7 +222,8 @@ async function handleMessage(raw, context) {
       if (context.mode === "pair") {
         send({
           type: "pair",
-          ticket: context.ticket,
+          ticketHash: context.ticketHash,
+          proof: context.proof,
           deviceId: metadata.deviceId,
           name: metadata.name,
           authPublicKey: context.authPublicKey,
@@ -206,15 +238,27 @@ async function handleMessage(raw, context) {
         send({ type: "authenticate", deviceId: metadata.deviceId, signature: base64URL(signature) });
       }
       break;
-    case "pairPending":
-      setPairing({ phase: "pending", verificationCode: message.verificationCode });
+    case "pairPending": {
+      setPairing({ phase: "pending", verificationCode: context.verificationCode });
+      clearTimeout(pairingExpiryTimer);
+      const remaining = Math.max(0, Number(message.expiresAt) - Date.now());
+      pairingExpiryTimer = setTimeout(() => {
+        setPairing({ phase: "error", message: "Pairing expired. Scan a new code." });
+        socket?.close(1000, "expired");
+      }, remaining);
       break;
+    }
     case "pairRejected":
-      setPairing({ phase: "error", message: "Pairing was denied on the Mac." });
+      clearTimeout(pairingExpiryTimer);
+      setPairing({
+        phase: "error",
+        message: message.reason === "expiredTicket" ? "Pairing expired. Scan a new code." : "Pairing was denied on the Mac."
+      });
       socket?.close(1008, "denied");
       break;
     case "paired":
       if (message.hostPublicKey !== metadata.hostPublicKey) throw new Error("host key mismatch");
+      clearTimeout(pairingExpiryTimer);
       await saveKeys(metadata.installationId, keyBundle);
       writeMetadata(metadata);
       sessionKey = await deriveSessionKey(
@@ -258,6 +302,7 @@ async function handleMessage(raw, context) {
       await handleCipher(message.payload);
       break;
     case "revoked":
+    case "authRejected":
       await forgetRelayDevice();
       break;
     default:
@@ -267,7 +312,7 @@ async function handleMessage(raw, context) {
 
 async function handleCipher(payload) {
   if (!sessionKey || !payload) return;
-  const message = await decryptJSON(payload, sessionKey);
+  const message = await decryptJSON(payload, sessionKey, "host-to-device");
   if (message.type === "response") {
     const waiter = pending.get(message.id);
     if (!waiter) return;
@@ -348,7 +393,12 @@ function pairingOfferFromLocation() {
 function readMetadata() {
   try {
     const value = JSON.parse(localStorage.getItem(DEVICE_KEY) || "null");
-    return value && typeof value.installationId === "string" && typeof value.deviceId === "string" ? value : null;
+    if (value && typeof value.installationId === "string" && typeof value.deviceId === "string") {
+      if (value.protocolVersion === PROTOCOL_VERSION) return value;
+      localStorage.removeItem(DEVICE_KEY);
+      deleteKeys(value.installationId).catch(() => {});
+    }
+    return null;
   } catch {
     return null;
   }
@@ -395,6 +445,34 @@ async function loadKeys(id) {
     const request = db.transaction(DB_STORE).objectStore(DB_STORE).get(id);
     request.onsuccess = () => { db.close(); resolve(request.result || null); };
     request.onerror = () => { db.close(); reject(request.error); };
+  });
+}
+
+async function nextCounter(id) {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(DB_STORE, "readwrite");
+    const store = transaction.objectStore(DB_STORE);
+    const request = store.get(id);
+    let counter;
+    request.onsuccess = () => {
+      const keys = request.result;
+      if (!keys?.authPrivate || !keys?.ecdhPrivate) {
+        transaction.abort();
+        return;
+      }
+      counter = Number.isSafeInteger(keys.counter) ? keys.counter + 1 : 1;
+      if (!Number.isSafeInteger(counter)) {
+        transaction.abort();
+        return;
+      }
+      keys.counter = counter;
+      store.put(keys, id);
+      keyBundle = keys;
+    };
+    transaction.oncomplete = () => { db.close(); resolve(counter); };
+    transaction.onabort = () => { db.close(); reject(new Error("This device needs to be paired again.")); };
+    transaction.onerror = () => { db.close(); reject(transaction.error); };
   });
 }
 
