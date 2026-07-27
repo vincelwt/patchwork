@@ -16,7 +16,8 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening shows the latest 50 messages and scrolling upward pages through the active JSONL branch without an eager full-history parse
-- Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename from any idle session, HTML export, reveal, and compaction
+- Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename even while Pi is working, HTML export, reveal, and compaction
+- Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
@@ -106,7 +107,7 @@ Pi Desktop searches for Pi in this order:
 
 The child process receives an augmented `PATH`, so Pi's `#!/usr/bin/env node` launcher also works from Finder. Set `PI_CODING_AGENT_SESSION_DIR` to use a non-default session directory.
 
-On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-activity.ts` (source of truth: `Resources/pi-desktop-activity.ts`) so every Pi session — terminal or RPC — reports its own run state. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
+On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-activity.ts` (source of truth: `Resources/pi-desktop-activity.ts`) so every Pi session — terminal or RPC — reports its own run state and can name a new conversation during its first turn. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
 
 ## Package a local app
 
@@ -128,6 +129,7 @@ passes). Pi and Node are intentionally not bundled.
 | `⌘K` | Quick switch |
 | `⌥⌘S` | Automations page |
 | `⌘R` | Refresh sessions and cached Git state |
+| `⇧⌘R` | Rename the selected conversation |
 | `⌘.` | Abort the active turn |
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |

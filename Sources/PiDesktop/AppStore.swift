@@ -1795,20 +1795,9 @@ final class AppStore: ObservableObject {
     func renameSession(_ session: SessionSummary, to name: String) {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
-        let requestedPath = session.fileURL.standardizedFileURL.path
-        let targetIsBusy = activeRuntimePath == requestedPath
-            ? runtimeState.isBusy
-            : parkedRuntimes[.session(requestedPath)]?.state.isBusy == true
-        if targetIsBusy {
-            showToast("Pi is working in this conversation. Rename when it becomes idle.", style: .warning)
-            return
-        }
-        ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
+        let path = session.fileURL.standardizedFileURL.path
+        let sendRename: (RuntimeSlot) -> Void = { [weak self] slot in
             guard let self else { return }
-            guard case let .success(slot) = result else {
-                if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
-                return
-            }
             slot.runtime.send(type: "set_session_name", payload: ["name": .string(clean)]) { [weak self] result in
                 guard let self else { return }
                 switch result {
@@ -1828,6 +1817,25 @@ final class AppStore: ObservableObject {
                 case let .failure(error): showToast(error.localizedDescription, style: .error)
                 }
             }
+        }
+
+        if activeRuntimePath == path, activeRuntimeSlot.runtime.isRunning,
+           activeRuntimeSlot.isReady, state(for: activeRuntimeSlot).isBusy {
+            sendRename(activeRuntimeSlot)
+            return
+        }
+        if let slot = parkedRuntimes[.session(path)], slot.runtime.isRunning,
+           slot.isReady, state(for: slot).isBusy {
+            sendRename(slot)
+            return
+        }
+        ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
+            guard let self else { return }
+            guard case let .success(slot) = result else {
+                if case let .failure(error) = result { showToast(error.localizedDescription, style: .error) }
+                return
+            }
+            sendRename(slot)
         }
     }
 

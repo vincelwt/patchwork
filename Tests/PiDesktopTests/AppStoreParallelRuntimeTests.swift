@@ -131,6 +131,25 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testRunningConversationsCanBeRenamedWithoutChangingTheSelectedRuntime() {
+        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        store.renameSession(sessionA, to: "Renamed while running")
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        store.renameSession(sessionA, to: "Renamed from the sidebar")
+        store.abort()
+
+        XCTAssertEqual(runtimeA.commandCount("set_session_name"), 2)
+        XCTAssertEqual(runtimeA.stopCount, 0)
+        XCTAssertEqual(runtimeB.commandCount("abort"), 1, "Renaming A must leave selected runtime B attached")
+        XCTAssertEqual(store.sessions.first { $0.id == sessionA.id }?.displayName, "Renamed from the sidebar")
+    }
+
     func testSettledBackgroundRuntimeIsRetiredWithoutStoppingTheSelectedRun() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
 
