@@ -107,7 +107,7 @@ struct ConversationView: View {
                 }
             }
         }
-        .toolbar { conversationToolbar }
+        .piPlainToolbar { conversationToolbar }
         // Without this the transcript scrolls visibly under a transparent toolbar.
         .toolbarBackground(.visible, for: .windowToolbar)
         // Switching conversations keeps the already-mounted composer first responder: the row's
@@ -204,7 +204,7 @@ struct ConversationView: View {
                     }
                     Divider()
                     Button("Compact Context", action: store.compact)
-                        .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
+                        .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
                     Button("Export as HTML…", action: store.exportHTML)
                         .disabled(!store.isSelectedRuntime)
                     Divider()
@@ -221,6 +221,11 @@ struct ConversationView: View {
             .frame(maxWidth: PiTheme.conversationTitleMaxWidth, alignment: .leading)
             .contentShape(Rectangle())
             .help(store.selectedSession?.cwd.path ?? "Conversation actions")
+        }
+
+        // Keep the inspector control at the trailing edge on macOS 26 toolbars.
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
         }
 
         ToolbarItem(placement: .primaryAction) {

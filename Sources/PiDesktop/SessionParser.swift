@@ -538,6 +538,7 @@ struct SessionParser {
 
     static func chatMessage(fromAgentMessage message: JSONValue, id: String? = nil, budget: inout ImageBudget) -> ChatMessage? {
         guard let roleName = message["role"]?.stringValue else { return nil }
+        if roleName == "custom", message["display"]?.boolValue == false { return nil }
         let timestamp = date(from: message["timestamp"])
         let stableID = id ?? "rpc-\(roleName)-\(message["timestamp"]?.intValue ?? Int(Date().timeIntervalSince1970 * 1_000))"
 
@@ -576,6 +577,12 @@ struct SessionParser {
         if let attachments = message["attachments"]?.arrayValue {
             blocks.append(contentsOf: attachmentBlocks(attachments, baseID: stableID, budget: &budget))
         }
+        if role == .user, blocks.contains(where: { if case .image = $0.kind { return true }; return false }) {
+            blocks = blocks.map { block in
+                guard case let .text(text) = block.kind else { return block }
+                return MessageBlock(id: block.id, kind: .text(ImageAttachment.visibleText(from: text)))
+            }
+        }
         if let error = message["errorMessage"]?.stringValue,
            !blocks.contains(where: { if case .text = $0.kind { return true }; return false }) {
             blocks.append(MessageBlock(id: "\(stableID)-error", kind: .text(bounded(error, max: 8_000))))
@@ -603,6 +610,7 @@ struct SessionParser {
             guard let message = entry.raw["message"] else { return nil }
             return chatMessage(fromAgentMessage: message, id: entry.id, budget: &budget)
         case "custom_message":
+            guard entry.raw["display"]?.boolValue != false else { return nil }
             return ChatMessage(
                 id: entry.id,
                 role: .custom,
@@ -734,10 +742,13 @@ struct SessionParser {
     private static func extractText(from content: JSONValue?) -> String? {
         guard let content else { return nil }
         if let string = content.stringValue { return string }
-        return (content.arrayValue?.compactMap { block -> String? in
+        let blocks = content.arrayValue ?? []
+        let text = blocks.compactMap { block -> String? in
             guard block["type"]?.stringValue == "text" else { return nil }
             return block["text"]?.stringValue
-        } ?? []).joined(separator: "\n").nonEmpty
+        }.joined(separator: "\n")
+        let hasImage = blocks.contains { $0["type"]?.stringValue == "image" }
+        return (hasImage ? ImageAttachment.visibleText(from: text) : text).nonEmpty
     }
 
     private static func date(from value: JSONValue?) -> Date? {

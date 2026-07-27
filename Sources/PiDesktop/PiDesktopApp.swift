@@ -5,6 +5,7 @@ import SwiftUI
 struct PiDesktopApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
     @StateObject private var store = AppStore(
+        connectivityMonitor: ConnectivityMonitor(),
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
     // Owns pi-deskd's lifecycle; see AppDelegate and DaemonSupervisor. Kept on the app delegate
@@ -53,11 +54,11 @@ struct PiDesktopApp: App {
                     .keyboardShortcut("u", modifiers: [.command, .option])
                     .disabled(store.selectedSession == nil)
                 Divider()
-                Button("Abort Turn", action: store.abort)
+                Button("Stop Thread", action: store.abort)
                     .keyboardShortcut(".", modifiers: .command)
-                    .disabled(!store.runtimeState.isStreaming)
+                    .disabled(!store.canStopCurrentThread)
                 Button("Compact Context", action: store.compact)
-                    .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
+                    .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
                 Divider()
                 Button("Automations") { store.schedulesPresented = true }
                     .keyboardShortcut("s", modifiers: [.command, .option])
@@ -116,6 +117,8 @@ struct RootView: View {
                     ideal: PiTheme.sidebarIdealWidth,
                     max: PiTheme.sidebarMaxWidth
                 )
+                .toolbar(removing: .sidebarToggle)
+                .piPlainToolbar { sidebarToggleItem }
         } detail: {
             VStack(spacing: 0) {
                 detail
@@ -175,6 +178,23 @@ struct RootView: View {
         }
         }
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+    }
+
+    /// Scoped to the sidebar column so it renders at that column's trailing edge.
+    /// Setting `columnVisibility` without arming `expectedPolicyVisibility` is deliberate: the
+    /// `onChange` above must read this as a user override, exactly as the automatic toggle did.
+    @ToolbarContentBuilder
+    private var sidebarToggleItem: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button {
+                columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+            } label: {
+                Image(systemName: "sidebar.left").font(.system(size: PiIcon.small, weight: .regular))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Toggle Sidebar")
+            .help("Show or hide the sidebar")
+        }
     }
 
     /// An `ask_user_question` request keeps its place in the store — it still owns the response

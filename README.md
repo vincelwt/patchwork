@@ -15,7 +15,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
 - Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
-- A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
+- Network path loss is detected natively: once Pi reports a transient provider failure, Desktop pauses its retry budget and automatically continues the interrupted turn when connectivity returns. The installed helper makes that continuation hidden and context-only (with a visible plain continuation fallback if the helper is unavailable), never a replay of the original prompt. Crashes and non-network failures still remain visible with the exact draft ready to resend.
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening reads at least 50 messages through the current turn boundary, fills a short viewport automatically, and pages upward through the active JSONL branch without an eager full-history parse
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename even while Pi is working, HTML export, reveal, and compaction
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
@@ -23,11 +23,11 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
-- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape stops a running turn only when an app-held message is queued, promoting it to the follow-up that continues; double-Escape clears that queue and fully stops the run.
+- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape, double-Escape, ⌘., and the stop button all immediately clear queued continuations and terminate the active thread runtime.
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
-- Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. The composer grows around inline image previews so its text stays visible. Composer images are sent to Pi as local file paths instead of embedded base64, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
+- Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
 - Subagent/background-process lifecycle presentation, with compact agent type, model, tool-call count, and runtime metadata, plus Pi extension UI dialogs/status/widgets/title/editor bridge
 - A native `ask_user_question` questionnaire rendered inline in the transcript outside nested tool disclosures instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. While unanswered it stays visible even when the work log is collapsed, its thread uses a purple sidebar status dot, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels
@@ -156,11 +156,12 @@ passes). Pi and Node are intentionally not bundled.
 | `⌥⌘S` | Automations page |
 | `⌘R` | Refresh sessions, schedules, and cached Git state |
 | `⇧⌘R` | Rename the selected conversation |
-| `⌘.` | Abort the active turn |
+| `⌘.` | Fully stop the active thread |
+| `Esc` | Fully stop the active thread while the composer is focused |
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |
 
-While Pi is running, the delivery menu explicitly offers **Steer current run** and **Queue as follow-up**. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
+While Pi is running, the delivery menu explicitly offers **Steer current run** and **Queue as follow-up**. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). Stopping clears app-held and Pi-owned queues, sends Pi an abort for tool cleanup, and terminates that thread's runtime so accepted follow-ups cannot restart it. Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
 
 ## Architecture
 
@@ -171,7 +172,7 @@ While Pi is running, the delivery menu explicitly offers **Steer current run** a
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, exact small untracked-text LOC classification, and linked-worktree detection (`git rev-parse --git-dir` vs `--git-common-dir`, detailed via `git worktree list --porcelain`).
 - **`SessionActivityMonitor` / `ActivityHeartbeatStore` / `ActivityExtensionInstaller`** — run and completion detection. Heartbeats carry the active branch's latest terminal assistant entry ID; unchanged files reuse decoded records and settled idle paths skip repeat work. A bounded tail fallback safely ignores torn writes. One monitor polls every 2 seconds while active and 15 seconds in the background, round-robins at most 64 heartbeat-free file stats, and performs at most 16 tail reads per tick.
 - **`ActivityPresenting` / `ActivityPresenter`** — stable process/run identity where Pi provides `processId`, `runId`, or `id`; history projection runs off the main actor.
-- **`AppStore`** — main-actor route/RPC coordinator, path-based route identity, generation-checked page loading/prepending, completion cursors, terminal-answer durability overlays, draft rollback, process reuse/leases, queue state, and bounded prefetch.
+- **`AppStore` / `ConnectivityMonitor`** — main-actor route/RPC coordinator plus native `NWPathMonitor` path changes. A disconnected provider retry is paused locally, then continued through a hidden extension context message after reconnection; route identity, generation-checked paging, draft rollback, process reuse/leases, queue state, and prefetch remain bounded.
 - **SwiftUI/AppKit views** — `LazyVStack` history uses durable row IDs, native bottom anchoring, real clip-view geometry for pin detection, and height-delta preservation while prepending. Settled answer TextKit sizing is synchronous on the first layout pass. `NativeComposerTextView` supplies Return/Shift-Return and paste/drop semantics.
 
 App-owned archive and recent-folder metadata lives at:

@@ -168,6 +168,25 @@ final class RunQueueTests: XCTestCase {
         XCTAssertTrue(finished)
     }
 
+    func testAbortDropsQueuedJobsForTheSameThread() async {
+        let (queue, history, _, executor) = makeQueue(behavior: FakeRunExecutor.hanging())
+        await queue.enqueue(job(id: "running", thread: "t5"))
+        await queue.enqueue(job(id: "queued", thread: "t5"))
+        let started = await poll { await history.get(id: "running")?.status == .running }
+        XCTAssertTrue(started)
+
+        let aborted = await queue.abort(threadId: "t5")
+        XCTAssertTrue(aborted)
+        let finished = await poll(timeout: 3) { await history.get(id: "running")?.status == .timeout }
+        XCTAssertTrue(finished)
+        let queued = await queue.queuedCount()
+        XCTAssertEqual(queued, 0)
+        XCTAssertEqual(executor.executedJobs.map(\.id), ["running"])
+        let cancelled = await history.get(id: "queued")
+        XCTAssertEqual(cancelled?.status, .skipped)
+        XCTAssertEqual(cancelled?.error, "Thread was stopped before this run started.")
+    }
+
     func testAbortOfAnUnknownThreadReturnsFalse() async {
         let (queue, _, _, _) = makeQueue()
         let aborted = await queue.abort(threadId: "no-such-thread")

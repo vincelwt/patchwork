@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import PiDesktop
@@ -11,6 +12,7 @@ private final class ParallelFakeRuntime: PiRuntimeProtocol {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var sent: [(command: String, payload: [String: JSONValue])] = []
+    var followUpError: Error?
 
     init(sessionFile: String, sessionID: String) {
         self.sessionFile = sessionFile
@@ -30,6 +32,10 @@ private final class ParallelFakeRuntime: PiRuntimeProtocol {
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append((type, payload))
         if type == "prompt" { return } // Keep the turn live until the test emits agent_settled.
+        if type == "follow_up", let followUpError {
+            completion?(.failure(followUpError))
+            return
+        }
         let data: JSONValue
         switch type {
         case "get_state":
@@ -131,6 +137,30 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testSelectedParkedConversationCanStopWithoutComposerPrewarm() {
+        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+
+        var stopPublished = false
+        let cancellable = store.objectWillChange.sink { stopPublished = true }
+        store.selectSession(sessionA)
+        stopPublished = false
+        XCTAssertTrue(store.canStopCurrentThread)
+        store.abort()
+
+        XCTAssertTrue(stopPublished)
+        withExtendedLifetime(cancellable) {}
+        XCTAssertEqual(runtimeA.commandCount("abort"), 1)
+        XCTAssertEqual(runtimeA.stopCount, 1)
+        XCTAssertEqual(runtimeB.stopCount, 0)
+        XCTAssertFalse(store.canStopCurrentThread)
+    }
+
     func testRunningConversationsCanBeRenamedWithoutChangingTheSelectedRuntime() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
         store.selectSession(sessionA)
@@ -167,8 +197,8 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertTrue(store.isRunning(sessionB))
     }
 
-    func testAcceptedFollowUpIsNotKilledBeforeItsNextAgentStart() {
-        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
+    func testAcceptedFollowUpCanBeStoppedBeforeItsNextAgentStart() {
+        let (store, runtimeA, _, sessionA, _) = makeStore()
         store.selectSession(sessionA)
         store.draft = "task A"
         store.submitDraft()
@@ -177,13 +207,28 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
         XCTAssertEqual(runtimeA.commandCount("follow_up"), 1)
         XCTAssertFalse(store.runtimeState.isStreaming)
+        XCTAssertTrue(store.canStopCurrentThread, "Accepted follow-up remains stoppable before agent_start")
 
-        store.selectSession(sessionB)
-        store.draft = "task B"
+        store.abort()
+
+        XCTAssertEqual(runtimeA.commandCount("abort"), 1)
+        XCTAssertEqual(runtimeA.stopCount, 1)
+        XCTAssertFalse(store.canStopCurrentThread)
+    }
+
+    func testUnconfirmedFollowUpRemainsStoppable() {
+        let (store, runtimeA, _, sessionA, _) = makeStore()
+        runtimeA.followUpError = PiRPCError.outcomeUnknown("follow_up")
+        store.selectSession(sessionA)
+        store.draft = "task A"
         store.submitDraft()
+        store.enqueueOutbox(text: "maybe accepted", delivery: .followUp)
 
-        XCTAssertEqual(runtimeA.stopCount, 0, "An accepted follow-up still owns A's runtime")
-        XCTAssertEqual(runtimeB.commandCount("prompt"), 1)
+        runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
+
+        XCTAssertTrue(store.canStopCurrentThread)
+        store.abort()
+        XCTAssertEqual(runtimeA.stopCount, 1)
     }
 
     func testNewChatCanStartWhileAnotherConversationIsWorking() {

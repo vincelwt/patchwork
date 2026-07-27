@@ -17,6 +17,9 @@ private final class FakeRuntime: PiRuntimeProtocol {
     var sessionFile: String = ""
     var sessionID: String = ""
     var delaysStateResponse = false
+    var hasConnectivityResumeCommand = true
+    var connectivityResumeCommandPath = ActivityExtensionInstaller.installedFileURL().path
+    var getCommandsFailure: Error?
 
     func start(cwd: URL, sessionPath: URL?) throws {
         isRunning = true
@@ -43,6 +46,22 @@ private final class FakeRuntime: PiRuntimeProtocol {
                     "sessionId": .string(sessionID),
                     "model": .object(["id": .string("m"), "name": .string("M"), "provider": .string("p")])
                 ])
+            ])))
+        case "get_commands":
+            if let getCommandsFailure {
+                completion?(.failure(getCommandsFailure))
+                return
+            }
+            let commands: [JSONValue] = hasConnectivityResumeCommand ? [.object([
+                "name": .string("pi-desktop-resume"),
+                "source": .string("extension"),
+                "description": .string("Resume an interrupted turn after network connectivity returns"),
+                "sourceInfo": .object(["path": .string(connectivityResumeCommandPath)])
+            ])] : []
+            completion?(.success(.object([
+                "type": .string("response"),
+                "success": .bool(true),
+                "data": .object(["commands": .array(commands)])
             ])))
         default:
             if let completion { pending[type] = completion }
@@ -79,6 +98,7 @@ private final class FakeRuntime: PiRuntimeProtocol {
     }
 
     func commandCount(_ command: String) -> Int { sent.filter { $0.command == command }.count }
+    func lastPayload(_ command: String) -> [String: JSONValue]? { sent.last { $0.command == command }?.payload }
 }
 
 private struct FakeRepository: SessionRepositoryProtocol {
@@ -296,6 +316,204 @@ final class AppStoreRollbackTests: XCTestCase {
         // A later, unrelated crash (nothing pending any more) must not resurrect the first turn.
         runtime.crash("Pi exited with status 1.")
         XCTAssertEqual(store.draft, "", "The settled turn left nothing pending to restore")
+    }
+
+    func testOfflineProviderRetryPausesAndResumesOnceAfterReconnect() throws {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "finish this work"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_start"),
+            "attempt": .number(1)
+        ]))
+        XCTAssertTrue(store.runtimeState.isWaitingForNetwork)
+        XCTAssertEqual(runtime.commandCount("abort_retry"), 1, "Offline time must not consume Pi's retry budget")
+
+        store.setConnectivityForTesting(isOnline: true)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1, "The original run must settle before continuation")
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_end"),
+            "success": .bool(false),
+            "finalError": .string("Retry cancelled")
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        XCTAssertEqual(runtime.commandCount("get_commands"), 1)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+        XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "/pi-desktop-resume")
+        XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
+        XCTAssertTrue(store.runtimeState.isStreaming)
+        XCTAssertNil(store.runtimeState.lastError, "An intentional connectivity pause is not a failed turn")
+
+        store.setConnectivityForTesting(isOnline: true)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2, "Repeated path updates must never duplicate the continuation")
+    }
+
+    func testOfflineErrorWithoutPiRetryDoesNotArmContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "fail without retry"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("assistant"),
+                "stopReason": .string("error"),
+                "errorMessage": .string("not retryable")
+            ])
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.setConnectivityForTesting(isOnline: true)
+
+        XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
+        XCTAssertEqual(runtime.commandCount("abort_retry"), 0)
+        XCTAssertEqual(runtime.commandCount("get_commands"), 0)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testPiRecoveryBeforeSettlementCancelsDesktopContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "keep going"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        store.setConnectivityForTesting(isOnline: true)
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(true)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1, "Pi already recovered, so Desktop must not continue twice")
+    }
+
+    func testAbortCancelsASettledOfflineContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "do not resume after I cancel"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertTrue(store.runtimeState.isWaitingForNetwork)
+
+        store.abort()
+        store.setConnectivityForTesting(isOnline: true)
+        XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertEqual(runtime.commandCount("abort"), 1, "Full stop also clears Pi-owned continuations")
+        XCTAssertEqual(runtime.stopCount, 1)
+    }
+
+    func testAbortBeforeRetryEventCannotRearmConnectivityResume() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "stop here"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        store.setConnectivityForTesting(isOnline: false)
+
+        store.abort()
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_end"),
+            "success": .bool(false),
+            "finalError": .string("Retry cancelled")
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.setConnectivityForTesting(isOnline: true)
+
+        XCTAssertFalse(store.runtimeState.isWaitingForNetwork)
+        XCTAssertNil(store.runtimeState.lastError)
+        XCTAssertEqual(runtime.commandCount("abort_retry"), 0)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testMissingResumeHelperFallsBackToAPlainContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        runtime.hasConnectivityResumeCommand = false
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "survive an extension upgrade race"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.setConnectivityForTesting(isOnline: true)
+
+        let continuation = runtime.lastPayload("prompt")?["message"]?.stringValue
+        XCTAssertFalse(continuation?.hasPrefix("/") == true)
+        XCTAssertTrue(continuation?.contains("Continue from where it stopped") == true)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+    }
+
+    func testResumeHelperQueryFailureFallsBackToAPlainContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        runtime.getCommandsFailure = PiRPCError.processExited("query unavailable")
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "survive a query failure"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.setConnectivityForTesting(isOnline: true)
+
+        XCTAssertFalse(runtime.lastPayload("prompt")?["message"]?.stringValue?.hasPrefix("/") == true)
+        XCTAssertTrue(store.runtimeState.isStreaming)
+        XCTAssertNil(store.runtimeState.lastError)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+    }
+
+    func testLookalikeResumeHelperFallsBackToAPlainContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        runtime.connectivityResumeCommandPath = "/tmp/not-pi-desktop.ts"
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "use only the installed helper"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.setConnectivityForTesting(isOnline: true)
+
+        let continuation = runtime.lastPayload("prompt")?["message"]?.stringValue
+        XCTAssertFalse(continuation?.hasPrefix("/") == true)
+        XCTAssertTrue(continuation?.contains("Continue from where it stopped") == true)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
     }
 
     func testNewChatRuntimeOffersExactModelAndThinkingMenus() throws {

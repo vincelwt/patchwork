@@ -206,6 +206,16 @@ struct ImageAttachment: Identifiable, Hashable {
         return image
     }
 
+    static let promptFooterHeader = "Attached image file paths:"
+
+    var rpcValue: JSONValue {
+        .object([
+            "type": .string("image"),
+            "data": .string(data.base64EncodedString()),
+            "mimeType": .string(mimeType)
+        ])
+    }
+
     static func prompt(text: String, attachments: [ImageAttachment]) -> String {
         guard !attachments.isEmpty else { return text }
         for attachment in attachments
@@ -215,7 +225,15 @@ struct ImageAttachment: Identifiable, Hashable {
             try? attachment.data.write(to: attachment.fileURL, options: .atomic)
         }
         let paths = attachments.map { "- \($0.fileURL.path)" }.joined(separator: "\n")
-        return [text, "Attached image file paths:\n\(paths)"].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return [text, "\(promptFooterHeader)\n\(paths)"].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    static func visibleText(from prompt: String) -> String {
+        let footer = "\n\n\(promptFooterHeader)\n"
+        if let range = prompt.range(of: footer, options: .backwards) {
+            return String(prompt[..<range.lowerBound])
+        }
+        return prompt.hasPrefix("\(promptFooterHeader)\n") ? "" : prompt
     }
 }
 
@@ -243,6 +261,7 @@ struct RuntimeState: Hashable, Sendable {
     var isStreaming = false
     var isCompacting = false
     var isRetrying = false
+    var isWaitingForNetwork = false
     var retryAttempt: Int?
     var steeringQueue: [String] = []
     var followUpQueue: [String] = []
@@ -260,7 +279,7 @@ struct RuntimeState: Hashable, Sendable {
     var queuedSteering: Int { steeringQueue.count }
     var queuedFollowUp: Int { followUpQueue.count }
     var queueCount: Int { steeringQueue.count + followUpQueue.count }
-    var isBusy: Bool { isStreaming || isCompacting || isRetrying }
+    var isBusy: Bool { isStreaming || isCompacting || isRetrying || isWaitingForNetwork }
 }
 
 struct GitFileChange: Identifiable, Hashable, Sendable {

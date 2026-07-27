@@ -298,6 +298,16 @@ extension View {
             in: RoundedRectangle(cornerRadius: radius, style: .continuous)
         )
     }
+
+    /// A toolbar without macOS 26's shared glass capsule.
+    @ViewBuilder
+    func piPlainToolbar<C: ToolbarContent>(@ToolbarContentBuilder content: () -> C) -> some View {
+        if #available(macOS 26.0, *) {
+            toolbar { content().sharedBackgroundVisibility(.hidden) }
+        } else {
+            toolbar(content: content)
+        }
+    }
 }
 
 /// One shared transcript grid row: symbol centered in the icon column, content starting at the

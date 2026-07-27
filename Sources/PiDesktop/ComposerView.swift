@@ -61,7 +61,7 @@ struct ComposerView: View {
                 placeholder: placeholder,
                 autofocus: autofocus,
                 onSubmit: handleSend,
-                onEscape: isStreaming ? { store.stopFromEscape(fully: $0) } : nil,
+                onEscape: store.canStopCurrentThread ? { store.abort() } : nil,
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )
@@ -168,9 +168,9 @@ private struct ComposerToolbar: View {
             // level are reported in the status bar.
             ModeSlider()
 
-            if isStreaming, let onAbort {
-                IconButton(symbol: "stop.fill", help: "Abort Turn (⌘.)", action: onAbort)
-                    .accessibilityLabel("Abort Turn")
+            if store.canStopCurrentThread, let onAbort {
+                IconButton(symbol: "stop.fill", help: "Stop Thread (Esc or ⌘.)", action: onAbort)
+                    .accessibilityLabel("Stop Thread")
             }
 
             if isStreaming, let onSteer, let onFollowUp {
@@ -271,7 +271,13 @@ private struct ComposerRuntimeLabel: View {
     @EnvironmentObject private var store: AppStore
     var body: some View {
         Group {
-            if store.isSelectedRuntime, store.runtimeState.isCompacting {
+            if store.isOffline {
+                Label(store.runtimeState.isWaitingForNetwork ? "Offline · paused" : "Offline", systemImage: "wifi.slash")
+                    .foregroundStyle(Color.piOrange)
+            } else if store.isSelectedRuntime, store.runtimeState.isWaitingForNetwork {
+                Label("Resuming", systemImage: "arrow.clockwise")
+                    .foregroundStyle(Color.piOrange)
+            } else if store.isSelectedRuntime, store.runtimeState.isCompacting {
                 Label("Compacting", systemImage: "arrow.triangle.2.circlepath").foregroundStyle(Color.piPurple)
             } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
                 Label("Retry \(store.runtimeState.retryAttempt ?? 1)", systemImage: "arrow.clockwise")
