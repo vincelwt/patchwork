@@ -311,7 +311,8 @@ final class SessionParserTests: XCTestCase {
             pages.append(try await repository.loadOlderConversationPage(from: file, cursor: cursor))
         }
 
-        XCTAssertEqual(pages.map(\.messages.count), [50, 50, 25])
+        XCTAssertEqual(pages.map(\.messages.count), [51, 50, 24],
+                       "Pages meet the soft target, then stop on a user-turn boundary")
         XCTAssertTrue(pages.last?.hasNoMoreHistory == true)
         XCTAssertTrue(pages.allSatisfy { $0.leafID == "entry-124" })
         let pagedIDs = pages.reversed().flatMap { $0.messages.map(\.id) }
@@ -320,6 +321,51 @@ final class SessionParserTests: XCTestCase {
         XCTAssertFalse(pagedIDs.contains("abandoned-1"))
         XCTAssertGreaterThan(pages[1].scannedEntryCount, pages[1].rawEntryCount,
                              "The bounded scan may inspect abandoned records without projecting them")
+    }
+
+    func testNewestPageIncludesTheStartOfALongActiveTurn() throws {
+        let file = temporaryDirectory.appendingPathComponent("paged-active-turn.jsonl")
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "active", "cwd": temporaryDirectory.path]]
+        var parent: Any = NSNull()
+
+        for (id, role) in [("older-user", "user"), ("older-answer", "assistant"), ("current-user", "user")] {
+            lines.append(["type": "message", "id": id, "parentId": parent,
+                          "message": ["role": role, "content": id]])
+            parent = id
+        }
+        for index in 0..<80 {
+            let callID = "call-\(index)"
+            let assistantID = "assistant-\(index)"
+            lines.append([
+                "type": "message", "id": assistantID, "parentId": parent,
+                "message": [
+                    "role": "assistant", "stopReason": "toolUse",
+                    "content": [["type": "toolCall", "id": callID, "name": "read",
+                                 "arguments": [String: Any]()]]
+                ]
+            ])
+            lines.append([
+                "type": "message", "id": "result-\(index)", "parentId": assistantID,
+                "message": [
+                    "role": "toolResult", "toolCallId": callID, "toolName": "read",
+                    "content": [["type": "text", "text": "ok"]]
+                ]
+            ])
+            parent = "result-\(index)"
+        }
+        try write(lines: lines, to: file)
+
+        let page = try SessionParser.conversationPage(at: file)
+
+        XCTAssertEqual(page.messages.first?.id, "current-user")
+        XCTAssertEqual(page.messages.count, 161)
+        XCTAssertNotNil(page.olderCursor)
+        let items = TranscriptPresenter.items(messages: page.messages, streaming: nil, isRunning: true)
+        XCTAssertEqual(items.count, 2, "The opening page shows the prompt and one collapsed work row")
+        guard let last = items.last, case let .work(block) = last else {
+            return XCTFail("Expected active work")
+        }
+        XCTAssertEqual(block.stepCount, 80)
     }
 
     func testOlderPageCrossesCompactionAndKeepsPreCompactionHistory() async throws {
@@ -344,13 +390,14 @@ final class SessionParserTests: XCTestCase {
 
         let repository = FileSessionRepository(rootURL: temporaryDirectory)
         let newest = try await repository.loadNewestConversationPage(from: file)
-        XCTAssertEqual(newest.messages.map(\.id), (0..<50).map { "after-\($0)" })
+        XCTAssertEqual(newest.messages.first?.id, "compact-1")
+        XCTAssertEqual(newest.messages.dropFirst().map(\.id), (0..<50).map { "after-\($0)" })
+        XCTAssertTrue(newest.messages.first?.textContent.contains("bounded summary") == true)
         let cursor = try XCTUnwrap(newest.olderCursor)
         let older = try await repository.loadOlderConversationPage(from: file, cursor: cursor)
 
         XCTAssertEqual(older.messages.first?.id, "before-0")
-        XCTAssertEqual(older.messages.last?.id, "compact-1")
-        XCTAssertTrue(older.messages.last?.textContent.contains("bounded summary") == true)
+        XCTAssertEqual(older.messages.last?.id, "before-19")
         XCTAssertTrue(older.hasNoMoreHistory)
         XCTAssertEqual(older.leafID, "after-49")
     }
