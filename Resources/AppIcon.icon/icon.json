@@ -1,0 +1,55 @@
+{
+  "groups": [
+    {
+      "layers": [
+        {
+          "blend-mode": "normal",
+          "glass": true,
+          "hidden": false,
+          "image-name": "AppIconForeground.png",
+          "name": "Continuous Pi",
+          "opacity": 1,
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "extended-srgb:0.09020,0.09412,0.10196,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "extended-srgb:0.94118,0.93333,0.91373,1.00000"
+              }
+            }
+          ]
+        }
+      ],
+      "lighting": "combined",
+      "name": "Pi Mark",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.3
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.15
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "automatic-gradient": "extended-srgb:0.97255,0.96471,0.94510,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "automatic-gradient": "extended-srgb:0.07059,0.07451,0.08235,1.00000"
+      }
+    }
+  ]
+}
