@@ -272,7 +272,12 @@ final class ComposerTextView: NSTextView {
         let height = (manager.usedRect(for: container).height + textContainerInset.height * 2).rounded(.up)
         guard abs(height - reportedHeight) > 0.5 else { return }
         reportedHeight = height
-        onHeightChange?(height)
+        // Model rebuilds and width changes happen inside SwiftUI updates, where a synchronous
+        // state write is dropped. Publish next turn unless a newer measurement supersedes it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, abs(self.reportedHeight - height) < 0.5 else { return }
+            self.onHeightChange?(height)
+        }
     }
 
     override func didChangeText() {

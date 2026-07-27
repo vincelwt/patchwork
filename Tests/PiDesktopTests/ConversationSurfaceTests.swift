@@ -162,7 +162,24 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(block.stepCount, 2)
     }
 
-    func testLiveTurnStaysOpenAndReportsProgress() throws {
+    func testLiveWorkStartsCollapsedWithItsLatestThinkingText() throws {
+        let items = TranscriptPresenter.items(
+            messages: [
+                user(id: "u", text: "Go", at: nil),
+                assistant(id: "a1", blocks: [thinking("First thought")]),
+                assistant(id: "a2", blocks: [thinking("Latest thought")])
+            ],
+            streaming: nil,
+            isRunning: true
+        )
+
+        guard case let .work(block) = items[1] else { return XCTFail("Expected live work") }
+        XCTAssertTrue(block.isActive)
+        XCTAssertFalse(block.shouldStartExpanded)
+        XCTAssertEqual(block.latestThinkingText, "Latest thought")
+    }
+
+    func testLiveTurnStaysActiveAndReportsProgress() throws {
         let messages = [
             user(id: "u", text: "Run it", at: Date(timeIntervalSince1970: 10)),
             assistant(id: "a", blocks: [
@@ -174,7 +191,7 @@ final class TranscriptPresenterTests: XCTestCase {
 
         let items = TranscriptPresenter.items(messages: messages, streaming: assistant(id: "stream", blocks: []))
         guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
-        XCTAssertTrue(block.isActive, "A turn in flight stays open")
+        XCTAssertTrue(block.isActive, "A turn in flight stays active")
         guard case let .activity(group) = block.entries.last else { return XCTFail("Expected a rollup") }
         XCTAssertEqual(group.kinds, [.commands, .browser])
         XCTAssertEqual(group.summary, "Ran commands and Used browser")

@@ -233,6 +233,25 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertEqual(textView.string.filter { $0 == "\u{FFFC}" }.count, 1)
     }
 
+    func testInlineImagesPublishAComposerHeightAfterTheUpdatePass() async throws {
+        let textView = makeTextView()
+        var heights: [CGFloat] = []
+        textView.onHeightChange = { heights.append($0) }
+        let attachment = try XCTUnwrap(
+            ImageImportService.attachments(from: [try writePNG(named: "tall.png", width: 40, height: 40)]).first
+        )
+
+        textView.apply(content: ComposerContent(text: "look", attachments: [attachment]))
+        XCTAssertTrue(heights.isEmpty, "SwiftUI must receive the height after its update pass")
+
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        let published = try XCTUnwrap(heights.last)
+        XCTAssertGreaterThanOrEqual(published, PiTheme.inlineAttachmentHeight)
+        XCTAssertGreaterThan(published, PiTheme.composerMinEditorHeight)
+    }
+
     // MARK: - Key handling
 
     func testDoubleEscapeCancelsThePendingSingleEscapeAndFullyStops() {
