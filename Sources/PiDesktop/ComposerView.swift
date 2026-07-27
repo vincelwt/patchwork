@@ -61,7 +61,7 @@ struct ComposerView: View {
                 placeholder: placeholder,
                 autofocus: autofocus,
                 onSubmit: handleSend,
-                onEscape: isStreaming ? { store.stopFromEscape(fully: $0) } : nil,
+                onEscape: store.canStopCurrentThread ? { store.abort() } : nil,
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )
@@ -168,9 +168,9 @@ private struct ComposerToolbar: View {
             // level are reported in the status bar.
             ModeSlider()
 
-            if isStreaming, let onAbort {
-                IconButton(symbol: "stop.fill", help: "Abort Turn (⌘.)", action: onAbort)
-                    .accessibilityLabel("Abort Turn")
+            if store.canStopCurrentThread, let onAbort {
+                IconButton(symbol: "stop.fill", help: "Stop Thread (Esc or ⌘.)", action: onAbort)
+                    .accessibilityLabel("Stop Thread")
             }
 
             if isStreaming, let onSteer, let onFollowUp {

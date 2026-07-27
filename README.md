@@ -23,7 +23,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
-- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape stops a running turn only when an app-held message is queued, promoting it to the follow-up that continues; double-Escape clears that queue and fully stops the run.
+- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape, double-Escape, ⌘., and the stop button all immediately clear queued continuations and terminate the active thread runtime.
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
@@ -136,11 +136,12 @@ passes). Pi and Node are intentionally not bundled.
 | `⌥⌘S` | Automations page |
 | `⌘R` | Refresh sessions, schedules, and cached Git state |
 | `⇧⌘R` | Rename the selected conversation |
-| `⌘.` | Abort the active turn |
+| `⌘.` | Fully stop the active thread |
+| `Esc` | Fully stop the active thread while the composer is focused |
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |
 
-While Pi is running, the delivery menu explicitly offers **Steer current run** and **Queue as follow-up**. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
+While Pi is running, the delivery menu explicitly offers **Steer current run** and **Queue as follow-up**. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). Stopping clears app-held and Pi-owned queues, sends Pi an abort for tool cleanup, and terminates that thread's runtime so accepted follow-ups cannot restart it. Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
 
 ## Architecture
 

@@ -51,25 +51,18 @@ actor RunQueue {
         runningThreadIDs.contains(threadID) || pending.contains { $0.target.existingThreadID == threadID }
     }
 
-    /// `POST /v1/threads/{id}/abort`. Cancels the running job's task; a cooperative executor
-    /// (every real one, and every well-behaved fake) notices within a few seconds and unwinds
-    /// — the doc's `Run.status` enum has no distinct "aborted" value, so this still resolves as
-    /// `timeout`, the closest of the documented statuses to "cut short before it finished".
+    /// `POST /v1/threads/{id}/abort`. Drops queued jobs and cancels the running task; the real
+    /// executor then terminates its Pi process, so nothing for this thread can restart afterward.
     @discardableResult
-    func abort(threadId: String) -> Bool {
-        guard let entry = runningTasks.first(where: { $0.value.threadID == threadId }) else { return false }
-        entry.value.task.cancel()
-        return true
-    }
-
-    /// Drops every not-yet-started job for this thread from the FIFO queue (used when a caller
-    /// wants a clean slate rather than waiting out an already-queued backlog). Does not touch a
-    /// job that has already started.
-    @discardableResult
-    func cancelQueued(threadId: String) -> Int {
-        let before = pending.count
+    func abort(threadId: String) async -> Bool {
+        let cancelled = pending.filter { $0.target.existingThreadID == threadId }
         pending.removeAll { $0.target.existingThreadID == threadId }
-        return before - pending.count
+        let running = runningTasks.first { $0.value.threadID == threadId }?.value.task
+        running?.cancel()
+        for job in cancelled {
+            await recordSkipped(job, reason: "Thread was stopped before this run started.")
+        }
+        return running != nil || !cancelled.isEmpty
     }
 
     /// Graceful daemon shutdown (docs/daemon-api.md, "Shutdown"): give whatever is currently

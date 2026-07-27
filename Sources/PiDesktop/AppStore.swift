@@ -519,7 +519,7 @@ final class AppStore: ObservableObject {
             type: "prompt",
             payload: ["message": .string(hidden ? Self.connectivityResumeCommand : Self.connectivityResumeInstruction)]
         ) { [weak self, weak slot] result in
-            guard let self, let slot else { return }
+            guard let self, let slot, !slot.isSuperseded else { return }
             let errorText: String?
             var outcomeUnknown = false
             switch result {
@@ -573,13 +573,18 @@ final class AppStore: ObservableObject {
         delivery: OutboxEntry.Delivery,
         result: Result<JSONValue, Error>
     ) {
-        guard let slot = runtimeSlot(id: owner) else { return }
+        guard let slot = runtimeSlot(id: owner), !slot.isSuperseded else { return }
         let error: String?
+        let outcomeUnknown: Bool
         switch result {
-        case let .success(response): error = responseError(response)
-        case let .failure(value): error = value.localizedDescription
+        case let .success(response):
+            error = responseError(response)
+            outcomeUnknown = false
+        case let .failure(value):
+            error = value.localizedDescription
+            outcomeUnknown = RPCFailureHandling.isOutcomeUnknown(value)
         }
-        if delivery == .steer || error != nil { slot.outboxDispatches.remove(dispatch) }
+        if delivery == .steer || (error != nil && !outcomeUnknown) { slot.outboxDispatches.remove(dispatch) }
         guard let error else { return }
         updateState(for: slot) { $0.lastError = "Queued message could not be delivered: \(error)" }
         if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
@@ -742,6 +747,20 @@ final class AppStore: ObservableObject {
     /// new global chat. Picker controls use this broader route scope; transcript/session actions
     /// deliberately keep using `isSelectedRuntime`.
     var isCurrentRouteRuntime: Bool { runtimeMatchesCurrentRoute }
+
+    private var currentRouteRuntimeSlot: RuntimeSlot? {
+        guard let key = currentRouteKey else { return nil }
+        if runtimeKey(for: activeRuntimeSlot) == key { return activeRuntimeSlot }
+        return parkedRuntimes[key]
+    }
+
+    var canStopCurrentThread: Bool {
+        guard let slot = currentRouteRuntimeSlot else { return false }
+        let current = state(for: slot)
+        let queued = slot === activeRuntimeSlot && !activePresentationDetached ? outbox : slot.outbox
+        return slot.isStarting || current.isBusy || !queued.isEmpty || current.queueCount > 0
+            || !slot.outboxDispatches.isEmpty
+    }
 
     var currentRouteRuntimePhase: RuntimePhase? {
         guard !activePresentationDetached, runtimeKey(for: activeRuntimeSlot) == currentRouteKey else { return nil }
@@ -1812,19 +1831,65 @@ final class AppStore: ObservableObject {
     }
 
     func abort() {
-        guard runtimeMatchesCurrentRoute else { return }
-        activeRuntimeSlot.connectivityResumeCancelled = true
-        if runtimeState.isWaitingForNetwork {
-            clearConnectivityWait(for: activeRuntimeSlot)
-            guard runtimeState.isStreaming else {
-                resetRuntimeRetirementLease(for: activeRuntimeSlot)
-                return
-            }
+        guard canStopCurrentThread, let slot = currentRouteRuntimeSlot else { return }
+        let ownsLivePresentation = slot === activeRuntimeSlot && !activePresentationDetached
+        let readyWaiters = slot.readyWaiters
+        if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+        else { objectWillChange.send() }
+        finalDurabilityTasks.removeValue(forKey: slot.id)?.cancel()
+
+        // A stop is final: discard every app-held and Pi-owned continuation, retire the process,
+        // and ignore any event already en route from its superseded generation.
+        slot.isSuperseded = true
+        slot.isReady = false
+        slot.isStarting = false
+        slot.readyWaiters.removeAll()
+        slot.optionsLoading = false
+        slot.outbox.removeAll()
+        slot.outboxDispatches.removeAll()
+        slot.deferredEvents.removeAll()
+        slot.pendingTurn = nil
+        slot.streamingMessage = nil
+        slot.capability = nil
+        slot.questionnaire = nil
+        slot.dialogs.removeAll()
+        slot.promptBeganAt = nil
+        slot.startupBeganAt = nil
+        slot.connectivityRetryAbortRequested = false
+        slot.connectivityResumeCancelled = true
+        slot.connectivityResumePreparing = false
+        slot.connectivityResumeInFlight = false
+        if ownsLivePresentation {
+            outbox.removeAll()
+            streamingMessage = nil
+            activeCapability = nil
+            composerOptionsLoading = false
+            clearExtensionDialogs()
         }
-        guard runtimeState.isStreaming else { return }
-        runtime.send(type: "abort", payload: [:]) { [weak self] result in
-            if case let .failure(error) = result { self?.showToast(error.localizedDescription, style: .error) }
+        updateState(for: slot) { state in
+            state.isConnected = false
+            state.isStreaming = false
+            state.isCompacting = false
+            state.isRetrying = false
+            state.isWaitingForNetwork = false
+            state.phase = .idle
+            state.steeringQueue.removeAll()
+            state.followUpQueue.removeAll()
         }
+        if slot !== activeRuntimeSlot { removeParkedReference(to: slot) }
+
+        if slot.runtime.isRunning {
+            // Write abort before stop reaches the serial RPC queue, giving Pi a chance to clean
+            // up active tools; process termination is the guarantee that no accepted queue restarts.
+            slot.runtime.send(type: "abort", payload: [:], completion: nil)
+            slot.runtime.onEvent = nil
+            slot.runtime.onExit = nil
+            slot.runtime.stop()
+        }
+        for waiter in readyWaiters {
+            waiter(.failure(PiRPCError.processExited("Pi was stopped.")))
+        }
+        activityMonitor.tickNow()
     }
 
     func compact() {
@@ -2391,6 +2456,7 @@ final class AppStore: ObservableObject {
         slot.connectivityResumeInFlight = false
         slot.isReady = false
         slot.isStarting = true
+        slot.isSuperseded = false
         slot.startupBeganAt = Date()
         slot.promptBeganAt = nil
         slot.readyWaiters = [completion]
@@ -2406,7 +2472,7 @@ final class AppStore: ObservableObject {
         let command = sessionPath == nil ? "new_session" : "switch_session"
         let payload = sessionPath.map { ["sessionPath": JSONValue.string($0.standardizedFileURL.path)] } ?? [:]
         slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
-            guard let self, let slot else { return }
+            guard let self, let slot, !slot.isSuperseded else { return }
             guard case let .success(response) = result,
                   responseError(response) == nil,
                   response["data"]?["cancelled"]?.boolValue != true else {
@@ -2456,7 +2522,7 @@ final class AppStore: ObservableObject {
         onReuseFailure: (() -> Void)? = nil
     ) {
         slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
-            guard let self, let slot else { return }
+            guard let self, let slot, !slot.isSuperseded else { return }
             guard case let .success(response) = result, responseError(response) == nil else {
                 if let onReuseFailure { onReuseFailure(); return }
                 let error: Error
@@ -2566,7 +2632,7 @@ final class AppStore: ObservableObject {
         }
 
         slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
-            guard let self, let slot else { return }
+            guard let self, let slot, !slot.isSuperseded else { return }
             let errorText: String?
             var isOutcomeUnknown = false
             switch result {
@@ -3056,7 +3122,7 @@ final class AppStore: ObservableObject {
     }
 
     private func retireBackgroundRuntime(_ slot: RuntimeSlot) {
-        guard slot !== activeRuntimeSlot, isIdleAndClean(slot) else { return }
+        guard !slot.isSuperseded, slot !== activeRuntimeSlot, isIdleAndClean(slot) else { return }
         removeParkedReference(to: slot)
         slot.runtime.onEvent = nil
         slot.runtime.onExit = nil
@@ -3092,7 +3158,7 @@ final class AppStore: ObservableObject {
 
     /// Lets tests drive the exact event path a live runtime uses, rather than reaching into
     /// private state and asserting on a shape the runtime never actually produces.
-    func handleRPCEventForTesting(_ event: JSONValue) { handleRPCEvent(event) }
+    func handleRPCEventForTesting(_ event: JSONValue) { handleRPCEvent(event, from: activeRuntimeSlot) }
 
     private func handleRPCEvent(_ event: JSONValue) {
         let type = event["type"]?.stringValue ?? "unknown"
@@ -3389,6 +3455,7 @@ final class AppStore: ObservableObject {
     }
 
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
+        guard !slot.isSuperseded else { return }
         slot.outboxDispatches.removeAll()
         slot.connectivityRetryAbortRequested = false
         slot.connectivityResumeCancelled = false
