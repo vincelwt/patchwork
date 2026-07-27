@@ -543,6 +543,7 @@ private struct SessionRow: View {
         }
         return false
     }
+    private var waitingForQuestion: Bool { store.isWaitingForQuestion(session) }
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
     private var scheduled: Bool { store.scheduledThreadIDs.contains(session.id) }
@@ -591,7 +592,7 @@ private struct SessionRow: View {
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
         .help(session.cwd.path)
-        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(running ? ", running" : "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
+        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
     /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
@@ -618,8 +619,8 @@ private struct SessionRow: View {
     }
 
     /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
-    /// running outranks unread, because "working now" is the more urgent of the two. One explicit
-    /// stack, so the pair is always grouped and ordered on the trailing edge.
+    /// waiting for an answer outranks running, which outranks unread. One explicit stack keeps
+    /// the pair grouped and ordered on the trailing edge.
     private var trailingAccessory: some View {
         HStack(spacing: PiTheme.space6) {
             if hovering {
@@ -634,7 +635,9 @@ private struct SessionRow: View {
                     .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
                     .help("Runs on a schedule")
             }
-            if running {
+            if waitingForQuestion {
+                StatusDot(color: .piPurple).help("Waiting for your answer")
+            } else if running {
                 StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
             } else if unread {
                 StatusDot(color: .piBlue).help("Unread")
