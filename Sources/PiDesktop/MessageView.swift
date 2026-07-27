@@ -64,7 +64,6 @@ struct MessageView: View, Equatable {
     let message: ChatMessage
     let isStreaming: Bool
     let onImage: (ImagePayload) -> Void
-    var activeQuestionnaire: QuestionnaireSession? = nil
     /// Answers get a hover action row; the same view reused inside a work log does not.
     var showsActions = false
     /// Set only for the conversation's most recent user message, this reveals the hover "edit
@@ -77,7 +76,6 @@ struct MessageView: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message.isRenderEquivalent(to: rhs.message)
             && lhs.isStreaming == rhs.isStreaming
-            && lhs.activeQuestionnaire == rhs.activeQuestionnaire
             && lhs.showsActions == rhs.showsActions
             && (lhs.onEdit != nil) == (rhs.onEdit != nil)
         // `onImage`/`onEdit` always target the same AppStore for this route; ignoring fresh
@@ -161,10 +159,7 @@ struct MessageView: View, Equatable {
                     ThinkingBlockView(text: text, streaming: isStreaming)
                 }
             case let .toolCall(call):
-                ToolCallRow(
-                    call: call,
-                    questionnaire: activeQuestionnaire?.toolCallID == call.id ? activeQuestionnaire : nil
-                )
+                ToolCallRow(call: call)
             case let .unknown(type, raw):
                 DisclosureRow(symbol: "questionmark.square.dashed", title: "Unsupported content · \(type)") {
                     CodeBlockView(language: nil, code: raw.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
@@ -212,7 +207,6 @@ struct TranscriptWorkView: View, Equatable {
 
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload) -> Void
-    let activeQuestionnaire: QuestionnaireSession?
 
     /// `nil` until the user decides; the run's own state owns it until then.
     @State private var userExpanded: Bool?
@@ -220,7 +214,6 @@ struct TranscriptWorkView: View, Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.block.isRenderEquivalent(to: rhs.block)
-            && lhs.activeQuestionnaire == rhs.activeQuestionnaire
     }
 
     private var isOpen: Bool { userExpanded ?? block.shouldStartExpanded }
@@ -263,13 +256,9 @@ struct TranscriptWorkView: View, Equatable {
                             case let .thinking(value):
                                 ThinkingBlockView(text: value.text, streaming: value.streaming)
                             case let .activity(group):
-                                TranscriptActivityGroupView(group: group, activeQuestionnaire: activeQuestionnaire)
+                                TranscriptActivityGroupView(group: group)
                             case let .note(message):
-                                WorkNoteView(
-                                    message: message,
-                                    onImage: onImage,
-                                    activeQuestionnaire: activeQuestionnaire
-                                )
+                                WorkNoteView(message: message, onImage: onImage)
                             }
                         }
                         .opacity(entryOpacity(at: index))
@@ -281,10 +270,12 @@ struct TranscriptWorkView: View, Equatable {
             }
 
             ForEach(block.prominentSteps) { step in
-                if step.kind == .question,
-                   let questionnaire = activeQuestionnaire,
-                   questionnaire.toolCallID == step.id {
-                    InlineQuestionnaire(session: questionnaire, arguments: step.arguments)
+                if step.kind == .question {
+                    InlineQuestionnaire(
+                        toolCallID: step.id,
+                        arguments: step.arguments,
+                        showsSummaryWhenInactive: false
+                    )
                 }
                 ForEach(step.result?.images ?? []) { image in
                     ConversationImage(image: image, onOpen: { onImage(image) })
@@ -322,7 +313,6 @@ struct TranscriptWorkView: View, Equatable {
 private struct WorkNoteView: View {
     let message: ChatMessage
     let onImage: (ImagePayload) -> Void
-    let activeQuestionnaire: QuestionnaireSession?
 
     var body: some View {
         if message.role == .assistant {
@@ -335,8 +325,7 @@ private struct WorkNoteView: View {
             MessageView(
                 message: message,
                 isStreaming: false,
-                onImage: onImage,
-                activeQuestionnaire: activeQuestionnaire
+                onImage: onImage
             )
             .equatable()
         }
@@ -574,7 +563,6 @@ private struct ToolDetailText: View {
 
 struct TranscriptActivityGroupView: View {
     let group: TranscriptActivityGroup
-    let activeQuestionnaire: QuestionnaireSession?
 
     var body: some View {
         DisclosureRow(
@@ -592,8 +580,7 @@ struct TranscriptActivityGroupView: View {
                 ForEach(group.steps) { step in
                     ToolActivityStepRow(
                         step: step,
-                        isLive: group.isActive,
-                        questionnaire: activeQuestionnaire?.toolCallID == step.id ? activeQuestionnaire : nil
+                        isLive: group.isActive
                     )
                 }
             }
@@ -609,10 +596,10 @@ struct TranscriptActivityGroupView: View {
 }
 
 private struct ToolActivityStepRow: View {
+    @EnvironmentObject private var store: AppStore
     let step: TranscriptActivityStep
     /// A step left unfinished by a killed run must not spin forever in a historical transcript.
     let isLive: Bool
-    let questionnaire: QuestionnaireSession?
 
     var body: some View {
         DisclosureRow(
@@ -626,7 +613,7 @@ private struct ToolActivityStepRow: View {
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if step.kind == .question {
-                    if questionnaire == nil {
+                    if store.activeQuestionnaire(for: step.id) == nil {
                         QuestionnaireCallSummary(arguments: step.arguments)
                     }
                 } else if step.arguments != .object([:]) {
@@ -667,17 +654,18 @@ private struct ConversationImage: View {
 }
 
 private struct ToolCallRow: View {
+    @EnvironmentObject private var store: AppStore
     let call: ToolCallPayload
-    let questionnaire: QuestionnaireSession?
+
     var body: some View {
         DisclosureRow(
             symbol: ToolSymbol.forName(call.name),
             title: displayName,
             trailing: nil,
-            forceExpanded: questionnaire != nil
+            forceExpanded: store.activeQuestionnaire(for: call.id) != nil
         ) {
             if call.name.lowercased() == "ask_user_question" {
-                InlineQuestionnaire(session: questionnaire, arguments: call.arguments)
+                InlineQuestionnaire(toolCallID: call.id, arguments: call.arguments)
             } else {
                 ToolDetailText(code: call.arguments.prettyPrinted(maxLength: 8_000))
             }
@@ -689,17 +677,20 @@ private struct ToolCallRow: View {
     }
 }
 
-/// The `ask_user_question` row itself: the live control while Pi is waiting on this exact tool
-/// call, and a bounded read-only list of the questions once it is not.
+/// The `ask_user_question` row itself observes the live store instead of a memoized transcript
+/// snapshot, so the control cannot disappear until another transcript or focus update arrives.
 private struct InlineQuestionnaire: View {
-    let session: QuestionnaireSession?
+    @EnvironmentObject private var store: AppStore
+    let toolCallID: String
     let arguments: JSONValue
+    var showsSummaryWhenInactive = true
 
     var body: some View {
-        if let session, let question = session.currentQuestion {
+        if let session = store.activeQuestionnaire(for: toolCallID),
+           let question = session.currentQuestion {
             QuestionnaireCardView(session: session, question: question)
                 .id("\(session.toolCallID):\(question.id)")
-        } else {
+        } else if showsSummaryWhenInactive {
             QuestionnaireCallSummary(arguments: arguments)
         }
     }

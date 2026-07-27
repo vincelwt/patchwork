@@ -264,13 +264,16 @@ final class QuestionnaireStateMachineTests: XCTestCase {
 
     func testInlineQuestionIsInteractiveOnlyAfterItsOwnRequestArrives() throws {
         let (store, runtime, _) = makeStore()
+        let session = try XCTUnwrap(store.sessions.first)
         runtime.emit(toolStart(arguments: oneQuestion))
         XCTAssertNotNil(store.pendingQuestionnaire)
         XCTAssertNil(store.activeQuestionnaire(for: "ask-1"), "Nothing is answerable before Pi asks")
+        XCTAssertFalse(store.isWaitingForQuestion(session))
 
         runtime.emit(selectRequest(id: "q1"))
         XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
         XCTAssertNil(store.activeQuestionnaire(for: "another-call"), "Only the exact tool call row is live")
+        XCTAssertTrue(store.isWaitingForQuestion(session))
     }
 
     func testQuestionStartingWhileBrowsedAwayOnlyRendersForItsOwnConversation() throws {
@@ -281,10 +284,12 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         runtime.emit(toolStart(arguments: oneQuestion))
         runtime.emit(selectRequest(id: "q1"))
         XCTAssertNil(store.activeQuestionnaireSession, "A parked runtime's question stays out of this route")
+        XCTAssertTrue(store.isWaitingForQuestion(session), "The sidebar still marks the parked thread")
 
         store.selectSession(session)
         store.prepareComposerOptions()
         XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
+        XCTAssertTrue(store.isWaitingForQuestion(session))
     }
 
     func testToolEndWhileBrowsedAwayClearsADeferredLaterQuestionRequest() throws {
@@ -299,6 +304,7 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         store.openNewChat()
         runtime.emit(multiRequest(id: "q2"))
         runtime.emit(.object(["type": .string("tool_execution_end"), "toolCallId": .string("ask-1")]))
+        XCTAssertFalse(store.isWaitingForQuestion(session))
 
         store.selectSession(session)
         store.prepareComposerOptions()
@@ -345,12 +351,16 @@ final class QuestionnaireStateMachineTests: XCTestCase {
 
     func testCancellationSendsCancelledAndClearsInlineState() throws {
         let (store, runtime, _) = makeStore()
+        let session = try XCTUnwrap(store.sessions.first)
         runtime.emit(toolStart(arguments: oneQuestion))
         runtime.emit(selectRequest(id: "q1"))
+        XCTAssertTrue(store.isWaitingForQuestion(session))
+
         store.cancelQuestionnaire()
         XCTAssertEqual(runtime.responses.last?["cancelled"]?.boolValue, true)
         XCTAssertNil(store.pendingQuestionnaire)
         XCTAssertNil(store.activeDialog)
+        XCTAssertFalse(store.isWaitingForQuestion(session))
     }
 
     private func makeStore() -> (AppStore, QuestionnaireRuntime, URL) {
