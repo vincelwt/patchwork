@@ -58,18 +58,25 @@ private struct RuntimeStateLabel: View {
     @EnvironmentObject private var store: AppStore
 
     /// Idle is the normal state and needs no words: the bar only speaks while Pi is busy.
-    private var activity: (text: String, help: String)? {
+    private var activity: (text: String, help: String, symbol: String?)? {
+        if store.isOffline {
+            let paused = store.runtimeState.isWaitingForNetwork
+            return (paused ? "Offline · paused" : "Offline", paused ? "This turn will resume when the network returns" : "No network connection", "wifi.slash")
+        }
+        if store.isSelectedRuntime, store.runtimeState.isWaitingForNetwork {
+            return ("Resuming", "Network restored; resuming the interrupted turn", nil)
+        }
         if store.isSelectedRuntime, store.runtimeState.isCompacting {
-            return ("Compacting", "Compacting the context window")
+            return ("Compacting", "Compacting the context window", nil)
         }
         if store.isSelectedRuntime, store.runtimeState.isRetrying {
-            return ("Retry \(store.runtimeState.retryAttempt ?? 1)", "Retrying the last provider request")
+            return ("Retry \(store.runtimeState.retryAttempt ?? 1)", "Retrying the last provider request", nil)
         }
         if store.isSelectedRuntime, store.runtimeState.isStreaming {
-            return ("Working", "Pi is working on this turn")
+            return ("Working", "Pi is working on this turn", nil)
         }
         if let session = store.selectedSession, store.isRunning(session) {
-            return ("Working", "This conversation is working")
+            return ("Working", "This conversation is working", nil)
         }
         return nil
     }
@@ -77,7 +84,11 @@ private struct RuntimeStateLabel: View {
     var body: some View {
         if let activity {
             HStack(spacing: PiTheme.space4) {
-                ProgressView().controlSize(.mini)
+                if let symbol = activity.symbol {
+                    Image(systemName: symbol).font(PiFont.micro)
+                } else {
+                    ProgressView().controlSize(.mini)
+                }
                 Text(activity.text)
                     .font(PiFont.micro)
                     .foregroundStyle(.secondary)

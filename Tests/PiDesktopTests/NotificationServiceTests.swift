@@ -187,6 +187,30 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertEqual(store.selectedSession?.id, session.id)
     }
 
+    func testOfflineInterruptionDoesNotNotifyBeforeItsContinuation() async throws {
+        let (store, runtime, spy, session) = makeStore(isActive: false)
+        let path = session.fileURL.standardizedFileURL.path
+        try Data("{\"type\":\"message\",\"id\":\"baseline\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8).write(to: session.fileURL)
+        store.activityMonitor.setTrackedPaths([path])
+        try await waitUntil { store.activityMonitor.activity(forPath: path)?.latestCompletedEntryID == "baseline" }
+
+        attachRuntime(store, runtime: runtime, to: session)
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
+        store.setConnectivityForTesting(isOnline: false)
+        runtime.onEvent?(.object(["type": .string("auto_retry_start"), "attempt": .number(1)]))
+        store.openNewChat()
+
+        let handle = try FileHandle(forWritingTo: session.fileURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"offline-error\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\"}}\n".utf8))
+        try handle.close()
+        store.activityMonitor.tickNow()
+        try await waitUntil { store.activityMonitor.activity(forPath: path)?.latestCompletedEntryID == "offline-error" }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(spy.presented.isEmpty, "The interrupted attempt is not terminal while Desktop will continue it")
+    }
+
     func testBackgroundCompletionsNotifyOncePerDistinctIDWithoutAStateTransition() async throws {
         let (store, _, spy, session) = makeStore(isActive: false)
         let path = session.fileURL.standardizedFileURL.path

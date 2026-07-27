@@ -204,7 +204,7 @@ struct ConversationView: View {
                     }
                     Divider()
                     Button("Compact Context", action: store.compact)
-                        .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
+                        .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
                     Button("Export as HTML…", action: store.exportHTML)
                         .disabled(!store.isSelectedRuntime)
                     Divider()

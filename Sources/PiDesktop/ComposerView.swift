@@ -271,7 +271,13 @@ private struct ComposerRuntimeLabel: View {
     @EnvironmentObject private var store: AppStore
     var body: some View {
         Group {
-            if store.isSelectedRuntime, store.runtimeState.isCompacting {
+            if store.isOffline {
+                Label(store.runtimeState.isWaitingForNetwork ? "Offline · paused" : "Offline", systemImage: "wifi.slash")
+                    .foregroundStyle(Color.piOrange)
+            } else if store.isSelectedRuntime, store.runtimeState.isWaitingForNetwork {
+                Label("Resuming", systemImage: "arrow.clockwise")
+                    .foregroundStyle(Color.piOrange)
+            } else if store.isSelectedRuntime, store.runtimeState.isCompacting {
                 Label("Compacting", systemImage: "arrow.triangle.2.circlepath").foregroundStyle(Color.piPurple)
             } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
                 Label("Retry \(store.runtimeState.retryAttempt ?? 1)", systemImage: "arrow.clockwise")

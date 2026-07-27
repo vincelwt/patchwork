@@ -5,6 +5,7 @@ import SwiftUI
 struct PiDesktopApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
     @StateObject private var store = AppStore(
+        connectivityMonitor: ConnectivityMonitor(),
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
     // Owns pi-deskd's lifecycle; see AppDelegate and DaemonSupervisor. Kept on the app delegate
@@ -55,9 +56,9 @@ struct PiDesktopApp: App {
                 Divider()
                 Button("Abort Turn", action: store.abort)
                     .keyboardShortcut(".", modifiers: .command)
-                    .disabled(!store.runtimeState.isStreaming)
+                    .disabled(!store.runtimeState.isStreaming && !store.runtimeState.isWaitingForNetwork)
                 Button("Compact Context", action: store.compact)
-                    .disabled(!store.isSelectedRuntime || store.runtimeState.isStreaming)
+                    .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
                 Divider()
                 Button("Automations") { store.schedulesPresented = true }
                     .keyboardShortcut("s", modifiers: [.command, .option])

@@ -7,6 +7,7 @@ final class RPCTimeoutPolicyTests: XCTestCase {
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_state"), .authoritativeFailure(after: 30))
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_session_stats"), .authoritativeFailure(after: 30))
         XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_fork_messages"), .authoritativeFailure(after: 30))
+        XCTAssertEqual(RPCTimeoutPolicy.outcome(for: "get_commands"), .authoritativeFailure(after: 30))
 
         for command in ["prompt", "steer", "follow_up", "abort", "fork", "set_session_name", "export_html"] {
             guard case .outcomeUnknown = RPCTimeoutPolicy.outcome(for: command) else {
