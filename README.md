@@ -18,6 +18,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening shows the latest 50 messages and scrolling upward pages through the active JSONL branch without an eager full-history parse
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename even while Pi is working, HTML export, reveal, and compaction
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
+- Sidebar rows carry their status on the trailing edge: a pulsing green dot while Pi is working, a blue dot when unread, and a clock when any automation (running or paused) targets that conversation. The composer takes focus as soon as a conversation opens.
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
@@ -128,7 +129,7 @@ passes). Pi and Node are intentionally not bundled.
 | `⌘N` | New chat |
 | `⌘K` | Quick switch |
 | `⌥⌘S` | Automations page |
-| `⌘R` | Refresh sessions and cached Git state |
+| `⌘R` | Refresh sessions, schedules, and cached Git state |
 | `⇧⌘R` | Rename the selected conversation |
 | `⌘.` | Abort the active turn |
 | `Return` | Send when idle; steer while running |
