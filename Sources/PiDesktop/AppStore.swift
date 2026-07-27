@@ -481,7 +481,7 @@ final class AppStore: ObservableObject {
         let capability = slot === activeRuntimeSlot && !activePresentationDetached ? activeCapability : slot.capability
         let questionnaire = slot === activeRuntimeSlot && !activePresentationDetached ? pendingQuestionnaire : slot.questionnaire
         let stream = slot === activeRuntimeSlot && !activePresentationDetached ? streamingMessage : slot.streamingMessage
-        return !slot.isStarting && presentation.phase == .idle && !presentation.isBusy
+        return !slot.isStarting && !slot.optionsLoading && presentation.phase == .idle && !presentation.isBusy
             && slot.pendingTurn == nil && dialogs.isEmpty && queued.isEmpty
             && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
             && capability == nil && questionnaire == nil && stream == nil
@@ -1386,6 +1386,7 @@ final class AppStore: ObservableObject {
             composerOptionsLoading = false
             slot.optionsLoading = false
             slot.optionsPrepared = true
+            resetRuntimeRetirementLease(for: slot)
         }
     }
 
@@ -2118,7 +2119,7 @@ final class AppStore: ObservableObject {
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
                 state.isStreaming = true
-                state.phase = .working
+                if state.phase != .waitingForModel { state.phase = .working }
             }
         case "agent_settled":
             updateState(for: slot) { state in
@@ -2143,10 +2144,12 @@ final class AppStore: ObservableObject {
                 else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
             }
         case "message_update":
+            updateState(for: slot) { $0.phase = .working }
             if let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
                 slot.streamingMessage = parsed
             }
         case "message_end":
+            updateState(for: slot) { $0.phase = .working }
             slot.streamingMessage = nil
             if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw),
                parsed.role == .assistant {
@@ -2154,6 +2157,7 @@ final class AppStore: ObservableObject {
                 slot.lastAssistantWasError = parsed.isError
             }
         case "tool_execution_start":
+            updateState(for: slot) { $0.phase = .working }
             if let callID = event["toolCallId"]?.stringValue,
                let name = event["toolName"]?.stringValue,
                name.lowercased() == "ask_user_question" {
@@ -2205,8 +2209,9 @@ final class AppStore: ObservableObject {
             slot.capability = nil
             discardQuestionnaire(from: slot)
             _ = flushBackgroundOutbox(.steer, slot: slot)
-        case "agent_end", "turn_start", "message_start", "tool_execution_update",
-             "bash_execution_update", "summarization_retry_scheduled", "summarization_retry_attempt_start",
+        case "message_start", "tool_execution_update", "bash_execution_update":
+            updateState(for: slot) { $0.phase = .working }
+        case "agent_end", "turn_start", "summarization_retry_scheduled", "summarization_retry_attempt_start",
              "summarization_retry_finished":
             break
         default:
@@ -2305,7 +2310,7 @@ final class AppStore: ObservableObject {
             activeRuntimeSlot.outboxDispatches.removeAll()
             cancelRuntimeRetirementLease()
             runtimeState.isStreaming = true
-            runtimeState.phase = .working
+            if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
         case "agent_settled":
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
@@ -2333,9 +2338,11 @@ final class AppStore: ObservableObject {
             }
             resetRuntimeRetirementLease(for: activeRuntimeSlot)
         case "message_update":
+            runtimeState.phase = .working
             guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
             streamingMessage = parsed
         case "message_end":
+            runtimeState.phase = .working
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
             streamingMessage = nil
@@ -2347,6 +2354,7 @@ final class AppStore: ObservableObject {
             }
             mergeHistoryActivities()
         case "tool_execution_start":
+            runtimeState.phase = .working
             // A question can be waiting in a conversation the user has since navigated away.
             if selected, event["toolName"]?.stringValue?.lowercased() == "ask_user_question" {
                 notify(.questionWaiting, session: activeSession())
@@ -2372,6 +2380,7 @@ final class AppStore: ObservableObject {
                 modelName: runtimeState.modelName ?? runtimeState.modelID
             ) { upsertActivity(item) }
         case "tool_execution_update":
+            runtimeState.phase = .working
             guard selected, let id = event["toolCallId"]?.stringValue,
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
             ActivityPresenter.applyResult(event["partialResult"], finished: false, to: &activities[index])
@@ -2422,8 +2431,9 @@ final class AppStore: ObservableObject {
             // Pi delivers steering at exactly this boundary, so holding it until now costs
             // nothing and keeps it editable for as long as possible.
             flushOutbox(.steer)
-        case "agent_end", "turn_start", "message_start", "bash_execution_update",
-             "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished": break
+        case "message_start", "bash_execution_update": runtimeState.phase = .working
+        case "agent_end", "turn_start", "summarization_retry_scheduled",
+             "summarization_retry_attempt_start", "summarization_retry_finished": break
         default:
             unknownRPCEvents.append(event.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
             if unknownRPCEvents.count > 30 { unknownRPCEvents.removeFirst(unknownRPCEvents.count - 30) }

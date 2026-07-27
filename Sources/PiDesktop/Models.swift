@@ -219,9 +219,9 @@ enum RuntimePhase: Hashable, Sendable {
     var label: String? {
         switch self {
         case .idle: nil
-        case .startingPi: "Starting Pi"
-        case .openingConversation: "Opening conversation"
-        case .waitingForModel: "Waiting for model"
+        case .startingPi: "Starting Pi…"
+        case .openingConversation: "Opening conversation…"
+        case .waitingForModel: "Waiting for model…"
         case .working: "Working"
         }
     }

@@ -330,9 +330,13 @@ final class PiRPCClient: PiRuntimeProtocol {
                     callback(.success(value))
                 }
             } else {
-                DispatchQueue.main.async { [weak self] in
+                // Capture the owner now. Same-process session reuse can rebind `onEvent` before
+                // main drains this block; looking it up later would deliver an old session event
+                // into the replacement route.
+                let eventHandler = onEvent
+                DispatchQueue.main.async {
                     guard currentGeneration.isValid else { return }
-                    self?.onEvent?(value)
+                    eventHandler?(value)
                 }
             }
         }

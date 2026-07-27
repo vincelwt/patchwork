@@ -176,6 +176,11 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("prompt"), 1, "thinking/stats requests must not gate dispatch")
         XCTAssertEqual(store.currentRouteRuntimePhase, .waitingForModel)
         runtime.onEvent?(.object(["type": .string("agent_start")]))
+        XCTAssertEqual(store.currentRouteRuntimePhase, .waitingForModel)
+        runtime.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": .object(["role": .string("assistant"), "content": .string("Hi")])
+        ]))
         XCTAssertEqual(store.currentRouteRuntimePhase, .working)
         XCTAssertEqual(runtime.count("get_messages"), 0)
     }
@@ -254,6 +259,25 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
             XCTAssertEqual(runtime.starts.count, 2)
             XCTAssertEqual(runtime.starts.last?.session?.path, b.fileURL.path)
         }
+    }
+
+    func testOptionsRequestMustFinishBeforeIdleLeaseStarts() {
+        let runtime = IntentRuntime()
+        runtime.delayModels = true
+        let lease = ManualRuntimeLease()
+        let store = makeStore(runtime: runtime, lease: lease)
+        let session = summary("a", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+
+        store.composerContentDidChange()
+        XCTAssertTrue(lease.entries.isEmpty)
+        XCTAssertEqual(runtime.stopCount, 0)
+
+        runtime.finishModels()
+        XCTAssertEqual(lease.entries.last?.delay, 120)
+        lease.fire(lease.entries.count - 1)
+        XCTAssertEqual(runtime.stopCount, 1)
     }
 
     func testIdleLeaseIs120SecondsResettableAndNeverRetiresWaitingOrDialogRuntime() {
