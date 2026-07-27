@@ -86,36 +86,51 @@ enum ThreadHandlers {
                 let text = body.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { throw DaemonHTTPError.badRequest(code: "empty_text", message: "text must not be empty.") }
 
+                // Accepting attachments and then dropping them would report a success the caller
+                // never got. The web remote has no attachment picker, so rather than build an
+                // untested image path into Pi's prompt, this says plainly that it is not supported.
+                if let attachments = body.attachments, !attachments.isEmpty {
+                    throw DaemonHTTPError.badRequest(
+                        code: "attachments_unsupported",
+                        message: "This daemon cannot forward message attachments; send the text alone or attach the image in the Mac app."
+                    )
+                }
+
                 if await core.leaseStore.isLeased(threadId: thread.id) {
                     throw DaemonHTTPError.conflict(code: "thread_leased", message: "The app is currently attached to this thread's runtime.")
                 }
 
-                // An explicit steer/follow-up is delivered into the live Pi turn or not at all: it
-                // is never quietly turned into a queued prompt, because "steer" that actually
-                // waits for the current run to finish is exactly the lie this endpoint used to
-                // tell. When nothing is live the response says so (`delivery: auto`) and the text
-                // becomes an ordinary prompt.
-                if let command = liveCommand(for: body.delivery),
-                   let delivered = await core.liveSessions.deliver(threadID: thread.id, command: command, message: text) {
-                    switch delivered.result {
-                    case let .rejected(reason):
-                        throw DaemonHTTPError.conflict(code: "delivery_rejected", message: reason)
-                    case .acknowledged, .unacknowledged:
-                        // `.unacknowledged` means the write reached Pi's stdin but no ack arrived
-                        // in time. Re-queueing here is the one thing that could prompt Pi twice,
-                        // so it is reported as delivered and never resent.
-                        return .json(SendMessageResponse(runId: delivered.runID, queued: false, delivery: body.delivery))
+                // A lost response is the common failure on a phone, and the natural reaction is to
+                // retry. Without this, that retry prompts Pi a second time. `clientId` makes the
+                // whole endpoint replayable: the same pair returns the same answer and does not
+                // deliver or enqueue anything again.
+                let clientID = try validatedClientID(body.clientId)
+                if let clientID {
+                    switch await core.submissions.claim(threadID: thread.id, clientID: clientID) {
+                    case let .replay(response):
+                        return .json(response)
+                    case .inFlight:
+                        throw DaemonHTTPError.conflict(
+                            code: "submission_in_flight",
+                            message: "This message is already being sent."
+                        )
+                    case .proceed:
+                        break
                     }
                 }
 
-                let alreadyBusy = await core.runQueue.isThreadBusy(thread.id)
-                let job = RunJob(
-                    id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
-                    target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd),
-                    prompt: text, mode: nil, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
-                )
-                await core.runQueue.enqueue(job)
-                return .json(SendMessageResponse(runId: job.id, queued: alreadyBusy, delivery: .auto))
+                do {
+                    let response = try await deliverOrEnqueue(core, thread: thread, text: text, delivery: body.delivery)
+                    if let clientID {
+                        await core.submissions.complete(threadID: thread.id, clientID: clientID, response: response)
+                    }
+                    return .json(response)
+                } catch {
+                    // Nothing was delivered or queued, so the claim must not lock out an honest
+                    // retry of the same submission.
+                    if let clientID { await core.submissions.abandon(threadID: thread.id, clientID: clientID) }
+                    throw error
+                }
             },
 
             Route("POST", "/v1/threads/:id/abort") { _, params in
@@ -182,6 +197,51 @@ enum ThreadHandlers {
             throw DaemonHTTPError.notFound("Thread \(id)")
         }
         return thread
+    }
+
+    /// An explicit steer/follow-up is delivered into the live Pi turn or not at all: it is never
+    /// quietly turned into a queued prompt, because "steer" that actually waits for the current
+    /// run to finish is exactly the lie this endpoint used to tell. When nothing is live the
+    /// response says so (`delivery: auto`) and the text becomes an ordinary prompt.
+    private static func deliverOrEnqueue(
+        _ core: DaemonCore, thread: PiThread, text: String, delivery: DeliveryMode?
+    ) async throws -> SendMessageResponse {
+        if let command = liveCommand(for: delivery),
+           let delivered = await core.liveSessions.deliver(threadID: thread.id, command: command, message: text) {
+            switch delivered.result {
+            case let .rejected(reason):
+                throw DaemonHTTPError.conflict(code: "delivery_rejected", message: reason)
+            case .acknowledged, .unacknowledged:
+                // `.unacknowledged` means the write reached Pi's stdin but no ack arrived in time.
+                // Re-queueing here is the one thing that could prompt Pi twice, so it is reported
+                // as delivered and never resent.
+                return SendMessageResponse(runId: delivered.runID, queued: false, delivery: delivery)
+            }
+        }
+
+        let alreadyBusy = await core.runQueue.isThreadBusy(thread.id)
+        let job = RunJob(
+            id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
+            target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd),
+            prompt: text, mode: nil, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
+        )
+        await core.runQueue.enqueue(job)
+        return SendMessageResponse(runId: job.id, queued: alreadyBusy, delivery: .auto)
+    }
+
+    /// A client-chosen id, so it is untrusted input: bounded in length and restricted to characters
+    /// that cannot collide with the registry's own key separator. Absent means "not replayable",
+    /// which is what an older client sends.
+    private static func validatedClientID(_ raw: String?) throws -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+        guard raw.count <= 128, raw.unicodeScalars.allSatisfy(allowed.contains) else {
+            throw DaemonHTTPError.badRequest(
+                code: "invalid_client_id",
+                message: "clientId must be 1-128 letters, numbers, dashes, or underscores."
+            )
+        }
+        return raw
     }
 
     /// Pi's own RPC verb for a delivery mode, or `nil` when the caller did not ask for one (so

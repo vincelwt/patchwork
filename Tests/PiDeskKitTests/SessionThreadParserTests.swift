@@ -319,6 +319,47 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(try SessionThreadParser.messages(at: url, limit: 10)[0].images, [])
     }
 
+    func testBase64ValidationAcceptsRealPayloadsAndRejectsMalformedOnes() {
+        XCTAssertTrue(SessionThreadParser.isWellFormedBase64(Self.tinyPNG))
+        XCTAssertTrue(SessionThreadParser.isWellFormedBase64("AAAA"))
+        XCTAssertTrue(SessionThreadParser.isWellFormedBase64("AA=="))
+        XCTAssertTrue(SessionThreadParser.isWellFormedBase64("AAA="))
+
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64(""), "empty is not an image")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("AAA"), "length must be a multiple of four")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("A!AA"), "outside the alphabet")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("A A A"), "whitespace is not padding")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("A==="), "at most two pad characters")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("AA=A"), "padding only at the end")
+        XCTAssertFalse(SessionThreadParser.isWellFormedBase64("AA-_"), "base64url is not what Pi writes")
+    }
+
+    func testAnImageIsOnlyMarkedOkWhenItsEncodingActuallyDecodes() throws {
+        // Right length, right size, wrong alphabet: advertising this as `ok` would promise a
+        // client a thumbnail that can only ever fail to load.
+        let url = write([imageContentLine(id: "m1", data: "!!!!!!!!")])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].images.first?.status, .invalid)
+        XCTAssertNil(try SessionThreadParser.image(at: url, imageId: "0-c1"))
+    }
+
+    func testAnOkImageIsAlwaysActuallyFetchable() throws {
+        let url = write([
+            imageContentLine(id: "m1", data: Self.tinyPNG),
+            imageContentLine(id: "m2", data: "AAA"),
+            imageContentLine(id: "m3", data: "not base64 at all!!")
+        ])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        for message in messages {
+            for image in message.images where image.status == .ok {
+                XCTAssertNotNil(
+                    try SessionThreadParser.image(at: url, imageId: image.id),
+                    "\(image.id) was advertised as ok but does not resolve"
+                )
+            }
+        }
+    }
+
     func testDecodingAMessageFromAnOlderDaemonWithNoImagesFieldSucceeds() throws {
         let json = Data(#"{"id":"m1","role":"assistant","text":"hi","at":"2026-01-01T00:00:00.000Z"}"#.utf8)
         let message = try PiDeskJSON.decoder.decode(Message.self, from: json)

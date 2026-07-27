@@ -99,3 +99,53 @@ final class QuestionnaireSpecTests: XCTestCase {
         XCTAssertNil(choices[0].description)
     }
 }
+
+/// `tool_execution_start` is how the app itself learns about a questionnaire, and it is the event
+/// that fires when the tool actually runs — i.e. right before the dialogs start. Reading only the
+/// content-block form would mean the first question arrives unlabelled on any Pi version that does
+/// not repeat the tool call there.
+final class QuestionnaireEventSourceTests: XCTestCase {
+    private func event(_ json: String) -> PiJSONValue {
+        (try? PiJSONValue.decode(Data(json.utf8))) ?? .null
+    }
+
+    private static let args = """
+    {"questions":[{"header":"Auth","question":"Which auth method?","options":[
+      {"label":"OAuth","description":"Delegate"},{"label":"Password","description":"Hash it"}]}]}
+    """
+
+    func testSpecsComeFromToolExecutionStart() {
+        let specs = QuestionnaireSpecParser.specs(inEvent: event("""
+        {"type":"tool_execution_start","toolCallId":"call-1","toolName":"ask_user_question","args":\(Self.args)}
+        """))
+        XCTAssertEqual(specs.map(\.header), ["Auth"])
+        XCTAssertEqual(specs.first?.options.map(\.label), ["OAuth", "Password"])
+    }
+
+    func testToolNameMatchingIsCaseInsensitiveLikeTheApps() {
+        let specs = QuestionnaireSpecParser.specs(inEvent: event("""
+        {"type":"tool_execution_start","toolCallId":"c","toolName":"Ask_User_Question","args":\(Self.args)}
+        """))
+        XCTAssertEqual(specs.count, 1)
+    }
+
+    func testAnotherToolsExecutionIsIgnored() {
+        let specs = QuestionnaireSpecParser.specs(inEvent: event("""
+        {"type":"tool_execution_start","toolCallId":"c","toolName":"Bash","args":\(Self.args)}
+        """))
+        XCTAssertTrue(specs.isEmpty)
+    }
+
+    func testTheContentBlockFormStillWorksAsAFallback() {
+        let specs = QuestionnaireSpecParser.specs(inEvent: event("""
+        {"type":"message_end","message":{"role":"assistant","content":[
+          {"type":"toolCall","name":"ask_user_question","arguments":\(Self.args)}]}}
+        """))
+        XCTAssertEqual(specs.map(\.header), ["Auth"])
+    }
+
+    func testAnEventCarryingNeitherShapeYieldsNothing() {
+        XCTAssertTrue(QuestionnaireSpecParser.specs(inEvent: event(#"{"type":"agent_settled"}"#)).isEmpty)
+        XCTAssertTrue(QuestionnaireSpecParser.specs(inEvent: event(#"{"type":"extension_ui_request","message":"plain string"}"#)).isEmpty)
+    }
+}

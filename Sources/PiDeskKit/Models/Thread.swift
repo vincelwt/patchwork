@@ -263,14 +263,21 @@ public struct SendMessageRequest: Codable, Sendable {
     public var text: String
     public var delivery: DeliveryMode?
     public var attachments: [MessageAttachment]?
-    public init(text: String, delivery: DeliveryMode? = nil, attachments: [MessageAttachment]? = nil) {
+    /// A caller-chosen submission id, stable across retries of *the same* message. Repeating a
+    /// `(thread, clientId)` pair replays the original response instead of prompting Pi twice — the
+    /// difference between a lost response and a duplicate turn. Optional: an older client that
+    /// omits it simply gets no replay protection.
+    public var clientId: String?
+
+    public init(text: String, delivery: DeliveryMode? = nil, attachments: [MessageAttachment]? = nil, clientId: String? = nil) {
         self.text = text
         self.delivery = delivery
         self.attachments = attachments
+        self.clientId = clientId
     }
 }
 
-public struct SendMessageResponse: Codable, Sendable {
+public struct SendMessageResponse: Codable, Hashable, Sendable {
     public var runId: String?
     public var queued: Bool
     /// How the message was *actually* delivered, which is not always what the caller asked for:

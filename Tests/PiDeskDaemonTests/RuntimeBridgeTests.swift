@@ -115,7 +115,7 @@ final class InteractionRegistryTests: XCTestCase {
         XCTAssertEqual(registry.pending(threadID: "t1").count, 1)
         XCTAssertEqual(registry.pending(threadID: "other").count, 0)
 
-        XCTAssertTrue(registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false))
+        XCTAssertEqual(registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false), .answered)
         XCTAssertEqual(sent().count, 1)
         XCTAssertEqual(sent()[0]["type"]?.stringValue, "extension_ui_response")
         XCTAssertEqual(sent()[0]["id"]?.stringValue, "d1")
@@ -146,9 +146,9 @@ final class InteractionRegistryTests: XCTestCase {
         let (record, sent) = collect()
         _ = registry.register(interaction(), responder: record)
 
-        XCTAssertTrue(registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false))
-        XCTAssertFalse(registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false))
-        XCTAssertFalse(registry.respond(id: "nope", value: "x", confirmed: nil, cancelled: false))
+        XCTAssertEqual(registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false), .answered)
+        XCTAssertEqual(registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false), .notFound)
+        XCTAssertEqual(registry.respond(id: "nope", value: "x", confirmed: nil, cancelled: false), .notFound)
         XCTAssertEqual(sent().count, 1, "Pi is answered exactly once")
     }
 

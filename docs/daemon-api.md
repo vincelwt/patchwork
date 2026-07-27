@@ -139,7 +139,7 @@ POST /v1/threads
 → {"thread":Thread,"runId":"…"}          // message is optional; without it the session is created idle
 
 POST /v1/threads/{id}/messages
-     {"text":"…","delivery":"auto|steer|followUp","attachments":[]}
+     {"text":"…","delivery":"auto|steer|followUp","clientId":"web-…"}
 → {"runId":"…","queued":false,"delivery":"auto|steer|followUp"}
 
 POST /v1/threads/{id}/abort           → {"aborted":true}
@@ -166,14 +166,45 @@ which is not always what was asked:
   which is worse than an unconfirmed delivery.
 - A thread the *app* has leased still returns `409 thread_leased`; the app owns that runtime.
 
+**`clientId` makes sending replayable.** A phone loses the *response* to a send far more often than
+the request, and the natural reaction is to retry — which without this prompts Pi twice. Send a
+stable id per message (1–128 letters, numbers, dashes, underscores), reused verbatim on retry:
+
+- The same `(thread, clientId)` returns the original `SendMessageResponse` byte for byte and
+  neither enqueues nor delivers anything again.
+- A retry that overlaps the original gets `409 submission_in_flight`. That is not a failure; the
+  first attempt is still running and the client should keep showing the message as sending.
+- A submission that *failed* releases its claim, so an honest retry is never locked out.
+- Omitting `clientId` is allowed and behaves exactly as before: no replay protection.
+- Bounded and in-memory: 256 submissions, 30 minutes. A daemon restart forgets them, so a retry
+  across a restart can still duplicate. `runs.jsonl` records no client id, so closing that window
+  would mean a new persisted store for a gap measured in seconds; it is documented, not built.
+- Independent of the hosted relay's mutation counter, which rejects a replayed *ciphertext frame*
+  outright. This replays a response to a legitimately re-sent request; neither weakens the other.
+
+**`attachments` are rejected, not dropped.** A non-empty `attachments` array returns
+`400 attachments_unsupported`. This daemon has no path from an attachment to Pi's prompt, and
+accepting the message while silently discarding its images would report a success the caller never
+got. Attach images in the Mac app.
+
 **Inline images** are metadata in the transcript and bytes on demand. `Message.images` carries
 `{id, mimeType, byteCount, fileName, status, note}` and never base64, because one screenshot-heavy
-thread detail would otherwise exceed the hosted relay's per-payload ceiling. `status` is `ok`,
-`omitted` (past this view's image budget), `tooLarge`, or `invalid`; anything other than `ok`
-carries a `note` a client shows in place of the picture rather than dropping it silently. Bounds:
-at most 8 images per message, 40 fetchable per `GET /v1/threads/{id}` (newest first), 1 MB decoded
-per image. `imageId` is `"<jsonlRecordOrdinal>-c<blockIndex>"` for a `content` block or `…-a<n>`
-for an `attachments` entry; Pi only appends, so an id stays valid for the life of the file.
+thread detail would otherwise exceed the hosted relay's per-payload ceiling.
+
+`status` is a promise about what fetching will do:
+
+- `ok` — the payload is present, within the size limit, and validly encoded, so
+  `GET /v1/threads/{id}/images/{imageId}` **will** return bytes. Encoding is checked when the
+  transcript is projected, so `ok` never advertises an image that can only fail to load.
+- `omitted` — past this view's automatic budget. Still fetchable by id; the cap bounds what a
+  client loads *without being asked*, so a client may offer an explicit "load".
+- `tooLarge` / `invalid` — will never return bytes.
+
+Anything other than `ok` carries a `note` to show in place of the picture rather than dropping it
+silently. Bounds: at most 8 images per message, 40 marked `ok` per `GET /v1/threads/{id}` (newest
+first), 1 MB decoded per image. `imageId` is `"<jsonlRecordOrdinal>-c<blockIndex>"` for a `content`
+block or `…-a<n>` for an `attachments` entry; Pi only appends, so an id stays valid for the life of
+the file.
 
 ```jsonc
 // Thread
@@ -299,6 +330,19 @@ POST /v1/interactions/{id}/respond
 → {"accepted":true}
 ```
 
+Exactly one answer field, and one that suits the dialog's `method`:
+
+| Response | Accepted for | Rejected |
+|---|---|---|
+| `{"value":"…"}` | `select`, `input`, `editor` | `confirm`, and any `select` value Pi did not offer |
+| `{"confirmed":true\|false}` | `confirm` | everything else |
+| `{"cancelled":true}` | every method, including unknown ones | combining it with `value`/`confirmed` |
+
+Combining fields, omitting all of them, or answering an unrecognised method with anything but a
+cancellation is `400`. `503 response_not_delivered` means the write to Pi failed: the answer did
+*not* land, the dialog is still pending, and it can be retried — the one thing this endpoint will
+not do is report success for an answer Pi never received.
+
 ```jsonc
 // PendingInteraction
 { "id":"…", "runId":"run_…", "threadId":"…",
@@ -323,15 +367,17 @@ Rules this endpoint holds to:
   multi-select (which the questionnaire plugin models as a typed `input`) uses the 1-based index
   encoding, so a client never reconstructs an option format.
 - **Bounded.** At most 16 pending dialogs; past that the daemon cancels the new request outright
-  rather than leaving Pi blocked on something nobody will see. Each dialog expires (Pi's own
-  `timeout`, else 10 minutes, capped at 30) and expiry sends Pi an explicit *cancellation* — never
-  an invented answer — so the run unwinds instead of burning its whole timeout.
+  rather than leaving Pi blocked on something nobody will see. Options are capped at 100 entries,
+  500 characters each, 20 000 in total, and an answer at 20 000 characters. Each dialog expires
+  (Pi's own `timeout`, else 10 minutes, capped at 30) and expiry sends Pi an explicit
+  *cancellation* — never an invented answer — so the run unwinds instead of burning its timeout.
 - **Cleared on every exit.** Answering, expiry, and the run ending all retire the dialog; a
   finished run never leaves an unanswerable prompt on a phone.
-- Only the four blocking methods above are surfaced. `notify`, `setStatus`, `setWidget`,
-  `setTitle` and anything unrecognised expect no reply, exactly as the app treats them, and are
-  not turned into dialogs. A client that cannot render a surfaced method must still show it and
-  offer Cancel.
+- **Unknown methods are surfaced, not swallowed.** Only the methods the app itself handles without
+  replying — `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` — are filtered out.
+  Anything else, including a `method` this build has never seen, may be holding the run hostage, so
+  it appears in the list; a client shows it with a Cancel button, and cancellation is the only
+  answer the daemon will forward for it.
 
 ### Hosted remote management (local Unix socket only)
 
@@ -394,6 +440,15 @@ touching the files, so there is exactly one writer.
   generation-checked by run id, which is what makes `delivery: steer|followUp` possible. It is
   registered only after Pi accepts the prompt and removed on every exit path, so a settling run
   can never retire its successor's registration.
+- **The settlement boundary is guarded on both sides.** Admission closes under the same lock a
+  delivery claims its reservation with, so a caller either gets in before the run finishes or finds
+  nothing and falls back to a fresh queued run — there is no window in between, and the executor
+  never stops a session while a write or acknowledgement is outstanding. An accepted (or
+  unacknowledged) `steer`/`follow_up` also banks a *turn credit*: the run keeps consuming through
+  the turn that message bought instead of stopping on the `agent_settled` of the turn already in
+  progress, which would have discarded it. Each credit extends the run's deadline by up to five
+  minutes, and a run may be extended at most 8 times before further live messages are refused and
+  queue as new runs instead.
 - Pi's stdin has exactly one writer lock (request ids and whole JSONL lines are written under it)
   and its stdout exactly one drainer (the run's own event loop). A steer delivered from an HTTP
   handler collects its acknowledgement from the bounded response cache that loop fills; it never

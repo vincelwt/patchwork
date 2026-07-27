@@ -72,8 +72,15 @@ enum AppStatePeek {
         }
     }
 
+    /// The app's own `state.json` is a few hundred KB at worst. Reading it is unavoidable, but
+    /// reading an arbitrarily large one is not: past this the daemon reports "no state" rather
+    /// than pulling a corrupted or hostile file into memory on every folder request.
+    static let maxStateBytes = 8 * 1_024 * 1_024
+
     static func load(from url: URL = AppStatePeek.defaultURL()) -> Snapshot {
-        guard let data = FileManager.default.contents(atPath: url.path) else { return Snapshot() }
+        guard let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,
+              size <= maxStateBytes,
+              let data = FileManager.default.contents(atPath: url.path) else { return Snapshot() }
         // The app writes this file with a plain, default-configured `JSONEncoder` (no ISO 8601
         // strategy), so `Date` fields are `.deferredToDate` (seconds since the 2001 reference
         // date) \u2014 a plain decoder matches that; `PiDeskJSON.decoder` would reject every date.

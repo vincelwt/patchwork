@@ -7,9 +7,9 @@ enum LiveDelivery: Sendable, Equatable {
     case acknowledged
     /// Pi answered `success: false`; the message did not take effect.
     case rejected(String)
-    /// Written to Pi's stdin, but no acknowledgement arrived before the wait elapsed (or the run
-    /// settled first). Treated as delivered everywhere: re-queueing it could prompt Pi twice, and
-    /// a duplicate prompt is a far worse failure than an unconfirmed one.
+    /// Written to Pi's stdin, but no acknowledgement arrived before the wait elapsed. Treated as
+    /// delivered everywhere: re-queueing it could prompt Pi twice, and a duplicate prompt is a far
+    /// worse failure than an unconfirmed one.
     case unacknowledged
 }
 
@@ -41,19 +41,50 @@ struct PiSessionRuntimeHandle: LiveRuntimeHandle {
 /// Which threads currently have a daemon-owned `pi --mode rpc` process mid-run, so a message can
 /// be steered into the turn in progress instead of queued behind it.
 ///
-/// Registration lives exactly as long as the run's event loop: registered once the prompt has
-/// been accepted, removed on every exit path. A steer that arrives outside that window finds
-/// nothing and is sent as an ordinary prompt instead, which is the honest answer — there is no
-/// live turn to interrupt.
+/// Two hazards shape this type, and both are about the *settlement boundary*:
 ///
-/// Entries are keyed by thread but *generation-checked* by run id. Two runs on one thread cannot
-/// overlap (`RunQueue` enforces per-thread mutual exclusion), but their registrations still can:
-/// a run that settles a moment after its successor registered would otherwise unregister the
-/// wrong session, silently disabling steering for a turn that is genuinely live.
+/// 1. **A late write into a process being stopped.** Admission is closed under the same lock a
+///    delivery claims its reservation with, so a caller either gets in before the run finishes or
+///    finds nothing and falls back to a fresh queued run. There is no window in between, and the
+///    executor never stops a session while a reservation is outstanding.
+/// 2. **A message accepted and then killed.** Pi acknowledges a `steer`/`follow_up`, then the
+///    `agent_settled` for the turn already in progress arrives and the executor would stop the
+///    session — discarding the message it just accepted. Every accepted delivery therefore banks a
+///    *turn credit*, and the executor must spend those credits (keep consuming through the turns
+///    they own) before admission can close.
+///
+/// Entries are keyed by thread but generation-checked by run id: two runs on one thread cannot
+/// overlap (`RunQueue` enforces per-thread mutual exclusion), but their registrations still can,
+/// and a run that settles just after its successor registered must not retire the wrong session.
 final class LiveSessionRegistry: @unchecked Sendable {
-    private struct Entry {
+    /// How many extra turns one run may be extended through before it stops accepting more. A
+    /// steering conversation is legitimate; an unbounded one is a way to keep a run alive forever.
+    static let maxTurnCredits = 8
+
+    /// The result of asking to close a run's admission at a settle boundary.
+    enum CloseOutcome: Equatable {
+        /// Admission is closed. Nothing else can reach this session; the run may finish.
+        case closed
+        /// A delivery was accepted since the last boundary and owns the turn that is starting.
+        /// The executor must keep consuming rather than treating this settle as the end.
+        case continueConsuming
+        /// A write/ack is in flight right now. The executor must keep consuming and retry
+        /// shortly; stopping the session here is exactly the race this type exists to prevent.
+        case busy
+    }
+
+    private final class Entry {
         let runID: String
         let handle: LiveRuntimeHandle
+        var admitting = true
+        var inFlight = 0
+        var turnCredits = 0
+        var grantedCredits = 0
+
+        init(runID: String, handle: LiveRuntimeHandle) {
+            self.runID = runID
+            self.handle = handle
+        }
     }
 
     private let lock = NSLock()
@@ -72,34 +103,76 @@ final class LiveSessionRegistry: @unchecked Sendable {
         lock.unlock()
     }
 
-    func liveRunID(threadID: String) -> String? { entry(threadID: threadID)?.runID }
-
-    // A plain synchronous helper rather than `lock()`/`unlock()` written inside `deliver`'s async
-    // body: `NSLock` is unavailable there, since an async function can resume on a different
-    // thread than the one that suspended it.
-    private func entry(threadID: String) -> Entry? {
+    func liveRunID(threadID: String) -> String? {
         lock.lock(); defer { lock.unlock() }
-        return entries[threadID]
+        let entry = entries[threadID]
+        return entry?.admitting == true ? entry?.runID : nil
     }
 
     var liveThreadIDs: Set<String> {
         lock.lock(); defer { lock.unlock() }
-        return Set(entries.keys)
+        return Set(entries.filter { $0.value.admitting }.keys)
     }
 
-    /// `nil` means "nothing reached Pi" — either no live turn, or the write itself failed — and
-    /// is the *only* outcome a caller may safely re-send from. Every other case, including
-    /// `.unacknowledged`, means the message may already have been applied: re-queueing it would
-    /// risk prompting Pi twice, which is worse than an unconfirmed delivery.
+    /// Called by the executor when it sees `agent_settled`. See `CloseOutcome`.
+    func closeAdmission(threadID: String, runID: String) -> CloseOutcome {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[threadID], entry.runID == runID else { return .closed }
+        if entry.inFlight > 0 { return .busy }
+        if entry.turnCredits > 0 {
+            entry.turnCredits -= 1
+            return .continueConsuming
+        }
+        entry.admitting = false
+        return .closed
+    }
+
+    /// `nil` means "nothing reached Pi" — no live turn, admission already closed, the credit bound
+    /// was reached, or the write itself failed — and is the *only* outcome a caller may safely
+    /// re-send from. Every other case, including `.unacknowledged`, means the message may already
+    /// have been applied: re-queueing it would risk prompting Pi twice.
     func deliver(threadID: String, command: String, message: String) async -> (runID: String, result: LiveDelivery)? {
-        guard let entry = entry(threadID: threadID) else { return nil }
+        guard let entry = reserve(threadID: threadID) else { return nil }
         do {
-            return (entry.runID, try await entry.handle.deliver(command: command, message: message))
+            let result = try await entry.handle.deliver(command: command, message: message)
+            // A rejected message never ran, so it owes no turn. The other two may already have
+            // been applied and must keep the run consuming through the turn they bought.
+            let ownsATurn: Bool
+            switch result {
+            case .acknowledged, .unacknowledged: ownsATurn = true
+            case .rejected: ownsATurn = false
+            }
+            release(entry, bankTurn: ownsATurn)
+            return (entry.runID, result)
         } catch {
-            // The write failed (the process exited between lookup and send), so nothing reached
-            // Pi and sending it again cannot duplicate anything.
+            // The write failed (the process exited between reservation and send), so nothing
+            // reached Pi and sending it again cannot duplicate anything.
+            release(entry, bankTurn: false)
             return nil
         }
+    }
+
+    // Plain synchronous helpers rather than `lock()`/`unlock()` written inside `deliver`'s async
+    // body: `NSLock` is unavailable there, since an async function can resume on a different
+    // thread than the one that suspended it.
+    private func reserve(threadID: String) -> Entry? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[threadID], entry.admitting else { return nil }
+        // Refuse rather than extend a run indefinitely: past the bound the caller queues a fresh
+        // run, which is bounded by its own timeout like any other.
+        guard entry.grantedCredits < Self.maxTurnCredits else { return nil }
+        entry.inFlight += 1
+        return entry
+    }
+
+    private func release(_ entry: Entry, bankTurn: Bool) {
+        lock.lock()
+        entry.inFlight -= 1
+        if bankTurn {
+            entry.turnCredits += 1
+            entry.grantedCredits += 1
+        }
+        lock.unlock()
     }
 }
 
@@ -109,7 +182,9 @@ final class LiveSessionRegistry: @unchecked Sendable {
 /// sends Pi an explicit cancellation so a run whose dialog nobody ever saw unwinds in bounded
 /// time instead of holding a session open until the run's own timeout.
 final class InteractionRegistry: @unchecked Sendable {
-    typealias Responder = @Sendable ([String: PiJSONValue]) -> Void
+    /// Throwing, so a write that never reached Pi is visible to the caller instead of being
+    /// reported as an answered dialog.
+    typealias Responder = @Sendable ([String: PiJSONValue]) throws -> Void
 
     /// Matches the app's own `dialogQueueLimit` intent: past this, a further request is answered
     /// with an immediate cancellation rather than silently swallowed.
@@ -176,11 +251,19 @@ final class InteractionRegistry: @unchecked Sendable {
         return entries[id]?.interaction
     }
 
-    /// Answers a pending dialog. An empty request (no value, no confirmation) is a cancellation,
-    /// never a blank answer — Pi must be able to tell "the user declined" from "the user typed
-    /// nothing", and only the former is safe to invent.
+    enum RespondResult: Equatable {
+        case answered
+        /// No such dialog: already answered, expired, or its run ended.
+        case notFound
+        /// The write to Pi failed. The dialog is left pending so it can be retried, because Pi is
+        /// still blocked on it and reporting success here would strand the run.
+        case writeFailed(String)
+    }
+
+    /// Answers a pending dialog. Exactly one of `value`/`confirmed` may be set, or `cancelled`;
+    /// the caller validates that against the dialog's method before getting here.
     @discardableResult
-    func respond(id: String, value: String?, confirmed: Bool?, cancelled: Bool) -> Bool {
+    func respond(id: String, value: String?, confirmed: Bool?, cancelled: Bool) -> RespondResult {
         var response: [String: PiJSONValue] = ["type": .string("extension_ui_response"), "id": .string(id)]
         if cancelled { response["cancelled"] = .bool(true) }
         else if let confirmed { response["confirmed"] = .bool(confirmed) }
@@ -190,31 +273,149 @@ final class InteractionRegistry: @unchecked Sendable {
     }
 
     /// Cancels everything still pending for a run that is ending, so a finished run never leaves
-    /// a dialog on a phone that can no longer be answered.
+    /// a dialog on a phone that can no longer be answered. A write failure here is expected (the
+    /// session may already be gone), so the entry is dropped regardless.
     func cancelAll(runID: String) {
         lock.lock()
         let ids = entries.values.filter { $0.interaction.runId == runID }.map(\.interaction.id)
         lock.unlock()
-        for id in ids { respond(id: id, value: nil, confirmed: nil, cancelled: true) }
+        for id in ids {
+            if case let .writeFailed(reason) = respond(id: id, value: nil, confirmed: nil, cancelled: true) {
+                logger?.warn("Could not cancel interaction \(id) on its run ending: \(reason)")
+                forget(id: id)
+            }
+        }
     }
 
     private func expire(id: String) {
         guard interaction(id: id) != nil else { return }
         logger?.info("Interaction \(id) expired without an answer; cancelling so the run can continue.")
-        respond(id: id, value: nil, confirmed: nil, cancelled: true)
+        if case let .writeFailed(reason) = respond(id: id, value: nil, confirmed: nil, cancelled: true) {
+            logger?.warn("Could not cancel expired interaction \(id): \(reason)")
+            forget(id: id)
+        }
     }
 
-    private func resolve(id: String, response: [String: PiJSONValue]) -> Bool {
+    /// Drops a dialog without answering Pi, for the cases where answering is impossible anyway
+    /// (the session is gone). Publishes the retirement so clients stop showing it.
+    private func forget(id: String) {
+        lock.lock()
+        var entry = entries.removeValue(forKey: id)
+        lock.unlock()
+        guard entry != nil else { return }
+        entry!.interaction.resolvedAt = Date()
+        currentBus?.publish(.interaction(entry!.interaction))
+    }
+
+    /// The entry is removed *before* the write and restored if the write throws, so two concurrent
+    /// answers can never both reach Pi, and a failed one still leaves the dialog answerable.
+    private func resolve(id: String, response: [String: PiJSONValue]) -> RespondResult {
         lock.lock()
         guard var entry = entries.removeValue(forKey: id) else {
             lock.unlock()
-            return false
+            return .notFound
         }
         lock.unlock()
 
-        entry.responder(response)
+        do {
+            try entry.responder(response)
+        } catch {
+            lock.lock()
+            // Only restore if nothing else claimed the id meanwhile.
+            if entries[id] == nil { entries[id] = entry }
+            lock.unlock()
+            return .writeFailed("\(error)")
+        }
+
         entry.interaction.resolvedAt = Date()
         currentBus?.publish(.interaction(entry.interaction))
-        return true
+        return .answered
+    }
+}
+
+/// De-duplicates `POST /v1/threads/{id}/messages` by the caller's own submission id.
+///
+/// A phone loses the response to a send far more often than it loses the request: the tunnel drops
+/// while the daemon is already enqueueing. Without this, the reader sees a failed message, taps
+/// Retry, and Pi is prompted twice. Repeating a `(thread, clientId)` pair therefore replays the
+/// original `SendMessageResponse` rather than delivering or enqueueing anything a second time.
+///
+/// Bounded and in-memory. A daemon restart forgets these, so a retry across a restart can still
+/// duplicate; `runs.jsonl` records no client id, so covering that would mean a new persisted store
+/// for a window measured in seconds. Documented in docs/daemon-api.md rather than built.
+///
+/// This is independent of, and does not weaken, the hosted relay's own mutation counter: that
+/// rejects a *replayed ciphertext frame* outright, while this replays a response to a legitimately
+/// re-sent request.
+actor SubmissionRegistry {
+    static let maxEntries = 256
+    static let entryTTL: TimeInterval = 1_800
+
+    enum Claim: Equatable {
+        /// First time this submission has been seen; the caller owns it.
+        case proceed
+        /// Already completed: return this exact response again.
+        case replay(SendMessageResponse)
+        /// An identical submission is being processed right now. The caller must not start a
+        /// second one; it reports a conflict and the client retries.
+        case inFlight
+    }
+
+    private enum State {
+        case inFlight(since: Date)
+        case done(SendMessageResponse, at: Date)
+    }
+
+    private var states: [String: State] = [:]
+    private var order: [String] = []
+
+    private func key(threadID: String, clientID: String) -> String { "\(threadID)\u{0}\(clientID)" }
+
+    func claim(threadID: String, clientID: String, now: Date = Date()) -> Claim {
+        prune(now: now)
+        let key = key(threadID: threadID, clientID: clientID)
+        switch states[key] {
+        case let .done(response, _):
+            return .replay(response)
+        case .inFlight:
+            return .inFlight
+        case nil:
+            states[key] = .inFlight(since: now)
+            order.append(key)
+            evictIfNeeded()
+            return .proceed
+        }
+    }
+
+    func complete(threadID: String, clientID: String, response: SendMessageResponse, now: Date = Date()) {
+        states[key(threadID: threadID, clientID: clientID)] = .done(response, at: now)
+    }
+
+    /// Releases a claim whose work failed, so an honest retry is not locked out forever.
+    func abandon(threadID: String, clientID: String) {
+        let key = key(threadID: threadID, clientID: clientID)
+        states.removeValue(forKey: key)
+        order.removeAll { $0 == key }
+    }
+
+    private func prune(now: Date) {
+        // An in-flight claim that outlived the TTL belonged to a request that never finished
+        // (a crashed handler); releasing it is better than blocking that submission forever.
+        let expired = states.filter { _, state in
+            switch state {
+            case let .inFlight(since): now.timeIntervalSince(since) > Self.entryTTL
+            case let .done(_, at): now.timeIntervalSince(at) > Self.entryTTL
+            }
+        }.map(\.key)
+        guard !expired.isEmpty else { return }
+        for key in expired { states.removeValue(forKey: key) }
+        order.removeAll { expired.contains($0) }
+    }
+
+    private func evictIfNeeded() {
+        while order.count > Self.maxEntries {
+            let oldest = order.removeFirst()
+            states.removeValue(forKey: oldest)
+        }
     }
 }

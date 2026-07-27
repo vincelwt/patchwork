@@ -55,7 +55,13 @@ export function renderInteraction(interaction, { respond, describeError }) {
       node.removeAttribute("aria-busy");
       for (const control of node.querySelectorAll("button, input, textarea")) control.disabled = false;
       errorEl.hidden = false;
-      errorEl.textContent = describeError(err);
+      // A 404 means Pi stopped waiting — expired, answered elsewhere, or the run ended. That is
+      // not the reader's mistake and must not read like a failed submission; the list refresh
+      // that follows removes the card.
+      errorEl.textContent =
+        err?.status === 404
+          ? "Pi is no longer waiting for this answer."
+          : describeError(err);
     });
   }
 
@@ -73,16 +79,16 @@ export function renderInteraction(interaction, { respond, describeError }) {
       cancelBtn
     ]);
   } else if (method === "select" && choices.length) {
-    // A radio group, not a list of buttons: one tap must select, a second must submit, so a
-    // mis-tap on a phone is recoverable instead of instantly answering for the reader.
+    // Radios, not a list of buttons: one tap selects, a second submits, so a mis-tap on a phone is
+    // recoverable instead of instantly answering for the reader. A native `fieldset`/`legend`
+    // carries the grouping — `role="radiogroup"` on the form would have swept the submit and
+    // cancel buttons into the group as well, which is not what a radiogroup may contain.
     const name = `opt-${interaction.id}`;
     const submitBtn = h("button", { class: "btn btn-primary", type: "submit", disabled: true }, "Submit");
     const form = h(
       "form",
       {
         class: "interaction-options",
-        role: "radiogroup",
-        "aria-label": interaction.title || "Options",
         onsubmit: (event) => {
           event.preventDefault();
           const checked = form.querySelector("input:checked");
@@ -92,7 +98,12 @@ export function renderInteraction(interaction, { respond, describeError }) {
           submitBtn.disabled = !form.querySelector("input:checked");
         }
       },
-      choices.map((choice) => optionRow({ type: "radio", name, choice })),
+      h(
+        "fieldset",
+        { class: "interaction-fieldset" },
+        h("legend", { class: "visually-hidden" }, interaction.title || "Options"),
+        choices.map((choice) => optionRow({ type: "radio", name, choice, interactionId: interaction.id }))
+      ),
       h("div", { class: "interaction-actions" }, submitBtn, cancelBtn)
     );
     mount(body, form);
@@ -123,7 +134,12 @@ export function renderInteraction(interaction, { respond, describeError }) {
           send({ value: selected.join(",") });
         }
       },
-      choices.map((choice) => optionRow({ type: "checkbox", name, choice })),
+      h(
+        "fieldset",
+        { class: "interaction-fieldset" },
+        h("legend", { class: "visually-hidden" }, interaction.title || "Options"),
+        choices.map((choice) => optionRow({ type: "checkbox", name, choice, interactionId: interaction.id }))
+      ),
       custom,
       h(
         "div",
@@ -177,9 +193,15 @@ export function renderInteraction(interaction, { respond, describeError }) {
   return node;
 }
 
-function optionRow({ type, name, choice }) {
-  const input = h("input", { type, name, value: choice.value });
-  return h(
+/**
+ * The preview deliberately sits *outside* the `<label>`: inside it, a tall scrollable code block
+ * becomes part of the radio's hit area, so trying to scroll or select the sample toggles the
+ * option instead. `aria-describedby` keeps it associated for assistive tech.
+ */
+function optionRow({ type, name, choice, interactionId }) {
+  const previewId = choice.preview ? `pv-${interactionId}-${choice.id}` : null;
+  const input = h("input", { type, name, value: choice.value, "aria-describedby": previewId });
+  const label = h(
     "label",
     { class: "interaction-option" },
     input,
@@ -187,8 +209,14 @@ function optionRow({ type, name, choice }) {
       "span",
       { class: "interaction-option-text" },
       h("span", { class: "interaction-option-label" }, choice.label),
-      choice.description ? h("span", { class: "interaction-option-desc" }, choice.description) : null,
-      choice.preview ? h("pre", { class: "interaction-option-preview" }, choice.preview) : null
+      choice.description ? h("span", { class: "interaction-option-desc" }, choice.description) : null
     )
+  );
+  if (!previewId) return label;
+  return h(
+    "div",
+    { class: "interaction-option-group" },
+    label,
+    h("pre", { class: "interaction-option-preview", id: previewId }, choice.preview)
   );
 }

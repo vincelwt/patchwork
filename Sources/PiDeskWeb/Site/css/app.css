@@ -1284,3 +1284,32 @@ details.advanced[open] summary { color: var(--text); }
   .img-tile:hover { border-color: var(--hairline-strong); }
   .interaction-option:hover { border-color: var(--hairline-strong); }
 }
+
+/* ---------- Review follow-ups ---------- */
+
+/* Scroll lock while the lightbox is open: without it the transcript scrolls underneath a
+   full-screen overlay on every touch drag. */
+body.modal-open { overflow: hidden; }
+
+/* `inert` is honoured natively where supported; this keeps the background visibly and
+   interactively out of the way everywhere else too. */
+[inert] { pointer-events: none; user-select: none; }
+
+/* Native grouping for option lists — no border/padding of its own, the rows carry the styling. */
+.interaction-fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
+/* An option whose preview sits outside the label, so scrolling the sample cannot toggle it. */
+.interaction-option-group { display: flex; flex-direction: column; gap: var(--space-1); }
+.interaction-option-group .interaction-option-preview { margin-left: calc(20px + var(--space-3)); }
+
+/* An image beyond the automatic budget is a deliberate tap, so its tile reads as an action. */
+.img-tile .img-loading { color: var(--accent); }
+.img-tile .img-failed { color: var(--red); }

@@ -136,8 +136,23 @@ text moves into a pending bubble carrying an honest status — sending, queued, 
 or failed — which is removed only when the real parsed message appears in a refetch, or when the
 message's run finishes successfully. A failed send keeps its text with **Retry** and **Dismiss**;
 nothing is silently lost, and a duplicate bubble is impossible because each pending entry is
-reconciled against a count of identical user messages recorded when it was submitted. At most
-eight unconfirmed messages are held, and they are scoped to the open screen rather than persisted.
+reconciled against a count of identical user messages recorded when it was submitted. Status
+changes are announced through one persistent live region rather than from the bubbles themselves,
+which are replaced on every repaint and would announce unreliably.
+
+**Retry never prompts Pi twice.** Each bubble generates a `clientId` once and reuses it verbatim on
+retry, so a send whose response was lost replays the original answer instead of starting a second
+turn. Retry also re-sends the delivery that was originally *requested*, so retrying a steer that
+the daemon had to downgrade still asks to steer.
+
+At most eight unconfirmed messages are held, and they are scoped to the open screen rather than
+persisted. When that bound is reached the oldest *accepted* message is dropped — its text is
+already on its way into the transcript. If every slot holds a message that was never sent, a new
+send is refused and its text goes back into the composer: evicting an unsent message would destroy
+the only copy of it.
+
+Attachments are not supported here. The daemon rejects them outright rather than accepting a
+message and dropping its images.
 
 The composer's overflow menu offers **Send as follow-up** and **Send as steer**. Both are real:
 the daemon delivers them into the live Pi turn. When no daemon-owned turn is running there is
@@ -158,6 +173,12 @@ appears at the bottom of the thread and can be answered from the phone:
 - A dialog kind this build cannot render still appears, says it needs the Mac app, and offers
   Cancel — Pi is blocked until it gets an answer, so it is never silently skipped.
 
+Option lists use a native `fieldset`/`legend` group so screen readers announce them correctly, and
+an option's code preview sits outside its label: inside it, scrolling the sample would toggle the
+option. Cards are reused across refreshes, so answering one dialog never wipes an answer typed into
+another, and a dialog Pi has stopped waiting for says so plainly rather than reading as a failed
+submission.
+
 Nothing is answered automatically. `Question 2 of 3` is shown when the dialog is matched to a
 questionnaire, and answering advances to the next one. **Going back to a previous question is not
 possible from the web remote**: Pi's bridge is sequential and has already consumed the earlier
@@ -166,11 +187,19 @@ answer. Use the Mac app when a questionnaire needs revisiting.
 ## Images
 
 Assistant and tool-result inline images render as responsive thumbnails; tapping one opens a
-focus-trapped lightbox with a download link. Bytes are fetched per image from
-`GET /v1/threads/{id}/images/{imageId}` rather than embedded in the thread detail, which is what
-keeps a screenshot-heavy conversation inside the relay's 1.5 MB per-payload ceiling. An image that
-is too large (over 1 MB decoded), unreadable, or past the per-view budget of 40 shows a labelled
-placeholder instead of disappearing.
+focus-trapped lightbox with a download link, which locks background scrolling and marks the screen
+behind it inert while open, and is torn down if the screen is navigated away from.
+
+Bytes are fetched per image from `GET /v1/threads/{id}/images/{imageId}` rather than embedded in
+the thread detail, which is what keeps a screenshot-heavy conversation inside the relay's 1.5 MB
+per-payload ceiling. Loading is deliberately not eager: a thumbnail fetches when it scrolls near
+the viewport, and decoded results go into a shared cache bounded to 24 images and 12 MB, so the
+transcript's debounced repaint re-renders from memory instead of re-downloading everything several
+times a second.
+
+An image that is too large (over 1 MB decoded) or unreadable shows a labelled placeholder. One past
+the per-view budget of 40 shows a **Load** tile instead — the budget bounds automatic loading, not
+availability.
 
 ## Folders
 

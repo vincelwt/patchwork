@@ -136,7 +136,8 @@ public enum SessionThreadParser {
     }
 
     /// The per-request image ceiling is applied *after* trimming, walking newest first, so the
-    /// images a reader is about to look at are the ones that stay fetchable.
+    /// newest images are the ones a client loads without being asked. `omitted` bounds automatic
+    /// loading, not availability: the id stays valid, and a client may still fetch it on demand.
     static func applyImageBudget(to messages: [Message]) -> [Message] {
         var remaining = imagesPerRequestLimit
         var result = messages
@@ -147,7 +148,7 @@ public enum SessionThreadParser {
                     remaining -= 1
                 } else {
                     result[index].images[imageIndex].status = .omitted
-                    result[index].images[imageIndex].note = "Image not loaded: this view already reached its image limit."
+                    result[index].images[imageIndex].note = "Not loaded automatically — this view reached its image limit."
                 }
             }
         }
@@ -253,7 +254,38 @@ public enum SessionThreadParser {
                 status: .tooLarge, note: "Image is too large to open remotely; view it on the Mac."
             )
         }
+        // `ok` is a promise that fetching this id will return bytes. Validating the encoding here
+        // — without allocating the decoded image — keeps that promise honest instead of handing a
+        // client a thumbnail that can only ever fail to load.
+        guard isWellFormedBase64(encoded) else {
+            return MessageImage(
+                id: id, mimeType: mimeType, byteCount: byteCount, fileName: fileName,
+                status: .invalid, note: "Image omitted because it was empty or unreadable."
+            )
+        }
         return MessageImage(id: id, mimeType: mimeType, byteCount: byteCount, fileName: fileName)
+    }
+
+    /// Standard base64: a multiple of four characters from the base64 alphabet, with at most two
+    /// `=` and only at the very end. One allocation-free pass, so validating every image in a
+    /// transcript scan costs no memory beyond the string already decoded from the JSONL record.
+    static func isWellFormedBase64(_ value: String) -> Bool {
+        let scalars = value.unicodeScalars
+        guard !scalars.isEmpty, scalars.count % 4 == 0 else { return false }
+        var padding = 0
+        for scalar in scalars {
+            switch scalar {
+            case "A"..<"[", "a"..<"{", "0"..<":", "+", "/":
+                // A payload character after padding has started is malformed.
+                if padding > 0 { return false }
+            case "=":
+                padding += 1
+                if padding > 2 { return false }
+            default:
+                return false
+            }
+        }
+        return true
     }
 
     /// Decoded size of a base64 payload, ignoring padding subtleties (over-estimates by <=2 bytes).

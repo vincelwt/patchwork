@@ -40,22 +40,41 @@ export function userTextCounts(messages) {
 }
 
 /**
- * Records a newly submitted message. `baseline` is how many identical user messages the
- * transcript *already* showed: reconciliation waits for one more than that, so re-sending the
- * same text twice resolves the two bubbles one at a time instead of both at once.
+ * Records a newly submitted message.
+ *
+ * `baseline` is how many identical user messages the transcript *already* showed: reconciliation
+ * waits for one more than that, so re-sending the same text twice resolves the two bubbles one at
+ * a time instead of both at once. `requestedDelivery` is fixed at creation and never overwritten
+ * by what the daemon actually did, so retrying a steer that was downgraded to `auto` still asks
+ * to steer.
+ *
+ * Returns `{ list, entry, rejected }`. When the bound is full of messages that cannot be dropped
+ * safely, `rejected` is true and the caller must put the text back in the composer: silently
+ * evicting a *failed* bubble would throw away the only copy of something that was never sent.
  */
-export function addPending(list, { key, text, messages = [], at = Date.now() }) {
+export function addPending(list, { key, text, delivery = null, clientId = null, messages = [], at = Date.now() }) {
   const entry = {
     key,
     text,
     at,
+    clientId,
     status: "sending",
+    requestedDelivery: delivery,
+    delivery,
     runId: null,
     error: null,
     settled: false,
     baseline: userTextCounts(messages).get(normalizeText(text)) || 0
   };
-  return [...list, entry].slice(-PENDING_LIMIT);
+
+  if (list.length < PENDING_LIMIT) return { list: [...list, entry], entry, rejected: false };
+
+  // Full: drop the oldest entry that is safe to drop — one the daemon already accepted, whose
+  // text is on its way into the transcript regardless. If every slot holds a failed message,
+  // refuse rather than destroy one.
+  const index = list.findIndex((candidate) => candidate.status !== "failed");
+  if (index === -1) return { list, entry: null, rejected: true };
+  return { list: [...list.slice(0, index), ...list.slice(index + 1), entry], entry, rejected: false };
 }
 
 function patch(list, key, changes) {
@@ -68,7 +87,16 @@ function patch(list, key, changes) {
  * not deliver live comes back as `auto`, and saying so is the whole point.
  */
 export function markAccepted(list, key, { runId = null, queued = false, delivery = null } = {}) {
+  // `requestedDelivery` is deliberately untouched: it is what Retry must ask for again.
   return patch(list, key, { runId, delivery, status: queued ? "queued" : "working", error: null });
+}
+
+/**
+ * The daemon is already processing this exact submission — a retry that overlapped the original.
+ * Not a failure: the bubble stays alive rather than offering a Retry that would race it again.
+ */
+export function markInFlight(list, key) {
+  return patch(list, key, { status: "working", error: null });
 }
 
 /** The request itself failed. The text stays put so it can be retried or copied back out. */
@@ -132,4 +160,14 @@ export function statusLabel(entry) {
     default:
       return "Pending";
   }
+}
+
+/**
+ * One sentence for the screen-reader live region, naming the message so a status is unambiguous
+ * when several are in flight. Returns "" when there is nothing to announce.
+ */
+export function announcement(entry) {
+  if (!entry) return "";
+  const excerpt = entry.text.length > 40 ? `${entry.text.slice(0, 39)}\u2026` : entry.text;
+  return `${excerpt}: ${statusLabel(entry)}`;
 }

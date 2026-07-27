@@ -23,6 +23,8 @@ final class DaemonCore: @unchecked Sendable {
     let interactions: InteractionRegistry
     /// Threads with a daemon-owned Pi turn in flight, for `delivery: steer|followUp`.
     let liveSessions: LiveSessionRegistry
+    /// Replay protection for `POST /v1/threads/{id}/messages`, keyed by the caller's own id.
+    let submissions = SubmissionRegistry()
     let startedAt = Date()
     let version = "1.0.0"
     let piVersion: String?

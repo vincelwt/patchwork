@@ -4,13 +4,16 @@ import { renderMarkdown } from "../markdown.mjs";
 import { clockTime } from "../time.mjs";
 import {
   addPending,
+  announcement,
   applyRunEvent,
   markAccepted,
   markFailed,
+  markInFlight,
   reconcile,
   removePending,
   statusLabel
 } from "../pending.mjs";
+import { imageCache } from "../imagecache.mjs";
 import { renderInteraction } from "./interaction.js";
 
 const INITIAL_MESSAGE_COUNT = 50;
@@ -48,12 +51,36 @@ export function renderThreadView(state, actions, threadId) {
   let fetchingInteractions = false;
   let interactionsQueued = false;
   let lastInteraction = null;
+  let renderedInteractionCards = new Map();
   let renderedInteractionSignature = null;
+  let disposed = false;
+  let closeLightbox = null;
+  // One observer for every thumbnail on screen: images load when they scroll into view, not all
+  // forty at once the moment the transcript paints.
+  const imageObserver =
+    typeof IntersectionObserver === "function"
+      ? new IntersectionObserver(
+          (entries, observer) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              observer.unobserve(entry.target);
+              entry.target.__piLoad?.();
+            }
+          },
+          { rootMargin: "200px" }
+        )
+      : null;
 
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
   const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
   const cwdEl = h("div", { class: "cwd" });
   const archiveBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Archive thread", onclick: onToggleArchive }, "\u2298");
+
+  // A single persistent live region. Announcing from inside the bubbles themselves does not work:
+  // they are replaced wholesale on every repaint, and assistive tech only announces changes to a
+  // region that was already in the tree.
+  const pendingLive = h("div", { class: "visually-hidden", role: "status", "aria-live": "polite" });
+  let lastAnnouncement = "";
 
   const messagesEl = h("div", { class: "messages" });
   // Unconfirmed messages live in their own container after the transcript, so `paintMessages`'s
@@ -108,6 +135,7 @@ export function renderThreadView(state, actions, threadId) {
   const node = h(
     "div",
     { class: "screen" },
+    pendingLive,
     h(
       "header",
       { class: "topbar" },
@@ -118,6 +146,23 @@ export function renderThreadView(state, actions, threadId) {
     scroll,
     h("div", { class: "composer-dock" }, runStatus, composerError, composerMenu, composerForm)
   );
+
+  // The bridge images use to reach this screen's lifetime: an observer that stops with the view,
+  // and a lightbox this view can close on disposal.
+  const imageHost = {
+    observeImage(tile) {
+      if (!imageObserver || disposed) return false;
+      imageObserver.observe(tile);
+      return true;
+    },
+    openLightbox(src, label) {
+      if (disposed) return;
+      closeLightbox?.();
+      closeLightbox = presentLightbox(src, label, node, () => {
+        closeLightbox = null;
+      });
+    }
+  };
 
   paintHeader();
   paintSkeleton();
@@ -171,14 +216,30 @@ export function renderThreadView(state, actions, threadId) {
     submit(text, delivery);
   }
 
-  function submit(text, delivery) {
+  /**
+   * `clientId` is generated once per bubble and reused verbatim on Retry, so the daemon can tell
+   * "the response was lost, send me the answer again" from "prompt Pi a second time". Without it,
+   * a retry after a dropped response is a duplicate turn.
+   */
+  function submit(text, delivery, clientId = newClientId()) {
     const key = `p${++pendingSeq}`;
-    pending = addPending(pending, { key, text, messages: lastMessages });
+    const added = addPending(pending, { key, text, delivery, clientId, messages: lastMessages });
+    if (added.rejected) {
+      // Every slot holds a message that was never sent. Give this one back rather than destroy
+      // one of them.
+      textarea.value = textarea.value ? `${text}\n${textarea.value}` : text;
+      onInput();
+      composerError.hidden = false;
+      composerError.textContent = "Too many unsent messages. Retry or dismiss one first.";
+      return;
+    }
+    pending = added.list;
     paintPending();
     scrollToBottom();
+
     // Only the send itself may mark the bubble failed. A refetch that fails afterwards is a
     // display problem, not a delivery one, and must never claim a message was not sent.
-    actions.sendMessage(threadId, { text, delivery }).then(
+    actions.sendMessage(threadId, { text, delivery, clientId }).then(
       (response) => {
         pending = markAccepted(pending, key, {
           runId: response?.runId ?? null,
@@ -192,7 +253,9 @@ export function renderThreadView(state, actions, threadId) {
         loadInteractions();
       },
       (err) => {
-        pending = markFailed(pending, key, describeError(err));
+        // The daemon is already handling this exact submission: a retry raced the original. That
+        // is the idempotency guard working, not a failure to report.
+        pending = err?.code === "submission_in_flight" ? markInFlight(pending, key) : markFailed(pending, key, describeError(err));
         paintPending();
       }
     );
@@ -352,7 +415,9 @@ export function renderThreadView(state, actions, threadId) {
         renderPendingMessage(entry, {
           onRetry: () => {
             pending = removePending(pending, entry.key);
-            submit(entry.text, entry.delivery);
+            // The delivery the reader *asked* for, and the same submission id, so a retry can
+            // neither silently downgrade a steer nor duplicate the original.
+            submit(entry.text, entry.requestedDelivery, entry.clientId || newClientId());
           },
           onDismiss: () => {
             pending = removePending(pending, entry.key);
@@ -361,6 +426,16 @@ export function renderThreadView(state, actions, threadId) {
         })
       )
     );
+    announcePending();
+  }
+
+  /// The newest still-unconfirmed message is the one worth speaking; everything else is noise.
+  function announcePending() {
+    const newest = pending[pending.length - 1];
+    const text = announcement(newest);
+    if (text === lastAnnouncement) return;
+    lastAnnouncement = text;
+    pendingLive.textContent = text;
   }
 
   // Always re-read the list rather than accumulating SSE frames: `interaction` events are a hint
@@ -393,23 +468,39 @@ export function renderThreadView(state, actions, threadId) {
       });
   }
 
+  // Two guards, because a repaint is destructive in two different ways. An unchanged set does not
+  // repaint at all, so a poll cannot steal focus mid-answer; and when the set *does* change, the
+  // surviving cards are reused rather than rebuilt, so answering one dialog never wipes the answer
+  // half-typed into another.
   function paintInteractions() {
-    // Repaint only when the *set* of pending dialogs changed. A poll triggered by some other
-    // thread's interaction event must not wipe a half-typed answer or a selected option.
     const signature = interactions.map((interaction) => interaction.id).join("|");
     if (signature === renderedInteractionSignature) return;
     renderedInteractionSignature = signature;
 
     const wasEmpty = !interactionsEl.childElementCount;
-    mount(
-      interactionsEl,
-      interactions.map((interaction) =>
+    const next = new Map();
+    const nodes = interactions.map((interaction) => {
+      const existing = renderedInteractionCards.get(interaction.id);
+      const card =
+        existing ||
         renderInteraction(interaction, {
-          respond: (body) => actions.respondInteraction(interaction.id, body).then(() => loadInteractions()),
+          respond: (body) =>
+            actions.respondInteraction(interaction.id, body).then(
+              () => loadInteractions(),
+              (err) => {
+                // Expired, already answered, or its run ended: re-read the list so the card
+                // disappears instead of sitting there accepting answers nobody is waiting for.
+                if (err?.status === 404) loadInteractions();
+                throw err;
+              }
+            ),
           describeError
-        })
-      )
-    );
+        });
+      next.set(interaction.id, card);
+      return card;
+    });
+    renderedInteractionCards = next;
+    mount(interactionsEl, nodes);
     if (wasEmpty && interactions.length) scrollToBottom();
   }
 
@@ -424,7 +515,7 @@ export function renderThreadView(state, actions, threadId) {
     const firstNew = renderedCount && messages.length > renderedCount ? renderedCount : messages.length;
     mount(
       messagesEl,
-      messages.map((message, index) => renderMessage(message, index >= firstNew, threadId))
+      messages.map((message, index) => renderMessage(message, index >= firstNew, threadId, imageHost))
     );
     renderedCount = messages.length;
   }
@@ -439,6 +530,15 @@ export function renderThreadView(state, actions, threadId) {
 
   return {
     node,
+    /// Called by the router before this screen is replaced. Everything owned outside `node` — the
+    /// body-level lightbox, its key listener and scroll lock, and the observer watching thumbnails
+    /// — has to be undone here, or it outlives the screen that created it.
+    dispose() {
+      disposed = true;
+      closeLightbox?.();
+      imageObserver?.disconnect();
+      if (refetchTimer) clearTimeout(refetchTimer);
+    },
     onStateChange(next) {
       const run = next.lastRunEvent;
       const runSignature = run ? `${run.id}:${run.status}:${run.finishedAt || ""}` : "";
@@ -450,9 +550,13 @@ export function renderThreadView(state, actions, threadId) {
         const before = pending;
         pending = applyRunEvent(pending, run);
         if (pending !== before) paintPending();
-        if (run.threadId === threadId) {
+        // Only patch a thread that has actually loaded. Spreading over `null` used to invent a
+        // nameless thread object, which repainted the header as "Untitled" until the next fetch.
+        if (run.threadId === threadId && thread) {
           thread = { ...thread, running: run.status === "running" };
           paintHeader();
+          scheduleRefetch();
+        } else if (run.threadId === threadId) {
           scheduleRefetch();
         }
       }
@@ -472,7 +576,14 @@ export function renderThreadView(state, actions, threadId) {
   };
 }
 
-function renderMessage(message, isNew, threadId) {
+/** Distinct per bubble, stable across retries of that bubble. */
+function newClientId() {
+  const random = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // The daemon accepts letters, numbers, dashes and underscores only.
+  return `web-${random}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 128);
+}
+
+function renderMessage(message, isNew, threadId, view) {
   const role = ["user", "assistant", "toolResult", "system"].includes(message.role) ? message.role : "system";
   const roleClass = { user: "msg-user", assistant: "msg-assistant", toolResult: "msg-tool", system: "msg-system" }[role];
   const classes = ["msg", roleClass];
@@ -485,18 +596,24 @@ function renderMessage(message, isNew, threadId) {
     { class: classes.join(" ") },
     h("div", { class: "msg-meta" }, `${roleLabel(role)} \u00b7 ${clockTime(message.at)}`),
     message.text ? h("div", { class: bodyClass, html: renderMarkdown(message.text) }) : null,
-    images.length ? h("div", { class: "msg-images" }, images.map((image) => renderImage(image, threadId))) : null
+    images.length ? h("div", { class: "msg-images" }, images.map((image) => renderImage(image, threadId, view))) : null
   );
 }
 
 /**
- * A responsive thumbnail that loads its bytes only when tapped/opened, since the transcript
- * carries metadata only. Anything the daemon refused to serve (too large, unreadable, past the
- * per-view image budget) stays visible as a labelled placeholder instead of disappearing.
+ * A responsive thumbnail whose bytes load when it scrolls into view (or on tap, if this browser
+ * has no IntersectionObserver), never all at once: forty images at the 1 MB server cap would be a
+ * 40 MB burst on a phone tunnel. Decoded results go through a bounded shared LRU, so the
+ * transcript's 700ms debounced repaint re-renders from memory instead of refetching.
+ *
+ * Anything the daemon refused to serve stays visible as a labelled placeholder. `omitted` means
+ * "past this view's automatic budget", not "gone", so it offers an explicit Load.
  */
-function renderImage(image, threadId) {
+function renderImage(image, threadId, view) {
   const label = image.fileName || "Image";
-  if (image.status && image.status !== "ok") {
+  const status = image.status || "ok";
+
+  if (status !== "ok" && status !== "omitted") {
     return h(
       "div",
       { class: "img-placeholder", role: "note" },
@@ -505,50 +622,82 @@ function renderImage(image, threadId) {
     );
   }
 
-  const img = h("img", { class: "thumb", alt: label, loading: "lazy", decoding: "async", hidden: true });
-  const status = h("span", { class: "img-loading" }, `${label} \u00b7 ${formatBytes(image.byteCount)}`);
-  const figure = h("button", { class: "img-tile", type: "button", "aria-label": `Open ${label}`, onclick: open }, img, status);
+  const img = h("img", { class: "thumb", alt: label, decoding: "async", hidden: true });
+  const caption = h(
+    "span",
+    { class: "img-loading" },
+    status === "omitted" ? `Load ${label}` : `${label} \u00b7 ${formatBytes(image.byteCount)}`
+  );
+  const tile = h(
+    "button",
+    { class: "img-tile", type: "button", "aria-label": `Open ${label}`, onclick: onActivate },
+    img,
+    caption
+  );
 
-  let source = null;
-  let loading = null;
+  const cacheKey = `${threadId}\u0000${image.id}`;
+  let loaded = false;
 
   function load() {
-    if (source) return Promise.resolve(source);
-    if (loading) return loading;
-    loading = api
-      .threadImage(threadId, image.id)
-      .then((payload) => {
-        source = `data:${payload.mimeType || "image/png"};base64,${payload.data}`;
-        img.src = source;
-        img.hidden = false;
-        status.remove();
-        return source;
+    const cached = imageCache.peek(cacheKey);
+    if (cached) {
+      show(cached);
+      return Promise.resolve(cached);
+    }
+    caption.textContent = `Loading ${label}\u2026`;
+    return imageCache
+      .fetch(cacheKey, () =>
+        api.threadImage(threadId, image.id).then((payload) => `data:${payload.mimeType || "image/png"};base64,${payload.data}`)
+      )
+      .then((src) => {
+        show(src);
+        return src;
       })
       .catch((err) => {
-        status.textContent = describeError(err);
-        status.classList.add("img-failed");
-        loading = null;
+        caption.textContent = describeError(err);
+        caption.classList.add("img-failed");
         throw err;
       });
-    return loading;
   }
 
-  function open() {
-    load().then((src) => openLightbox(src, label)).catch(() => {});
+  function show(src) {
+    loaded = true;
+    img.src = src;
+    img.hidden = false;
+    caption.remove();
   }
 
-  // Thumbnails fetch as soon as they exist; the bytes are already bounded server-side and a
-  // transcript is capped at a small number of images per view.
-  load().catch(() => {});
-  return figure;
+  function onActivate() {
+    load()
+      .then((src) => view.openLightbox(src, label))
+      .catch(() => {});
+  }
+
+  // An image beyond the automatic budget waits for a deliberate tap; everything else loads when
+  // it comes near the viewport.
+  if (status === "ok") {
+    tile.__piLoad = () => {
+      if (!loaded) load().catch(() => {});
+    };
+    if (view.observeImage(tile)) {
+      // Observed: it will load on approach.
+    } else {
+      load().catch(() => {});
+    }
+  }
+  return tile;
 }
 
 /**
  * A focus-trapped overlay with the full image plus a download link. Dismissed by Escape, by the
  * backdrop, or by the close button — all three, because a phone has no keyboard and a desktop
  * browser has no back gesture.
+ *
+ * Returns its own close function. The overlay lives on `document.body`, outside the screen that
+ * opened it, so the caller owns tearing it down when that screen goes away — otherwise navigating
+ * away leaves a full-screen image with a live key listener over the next route.
  */
-function openLightbox(src, label) {
+function presentLightbox(src, label, background, onClosed) {
   const previouslyFocused = document.activeElement;
   const closeBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Close image", onclick: close }, "\u2715");
   const overlay = h(
@@ -591,15 +740,28 @@ function openLightbox(src, label) {
     }
   }
 
+  let closed = false;
   function close() {
+    if (closed) return;
+    closed = true;
     document.removeEventListener("keydown", onKeydown, true);
     overlay.remove();
-    if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
+    // `aria-modal` alone is not enough on every screen reader, and the scroll lock has to come off
+    // whether the overlay was dismissed or torn down with its screen.
+    background.removeAttribute("aria-hidden");
+    background.removeAttribute("inert");
+    document.body.classList.remove("modal-open");
+    if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) previouslyFocused.focus();
+    onClosed?.();
   }
 
   document.addEventListener("keydown", onKeydown, true);
+  background.setAttribute("aria-hidden", "true");
+  background.setAttribute("inert", "");
+  document.body.classList.add("modal-open");
   document.body.appendChild(overlay);
   closeBtn.focus();
+  return close;
 }
 
 function formatBytes(bytes) {
@@ -619,7 +781,9 @@ function renderPendingMessage(entry, { onRetry, onDismiss }) {
     h("div", { class: "bubble" }, entry.text),
     h(
       "div",
-      { class: "msg-pending-status", role: "status" },
+      // No `role="status"` here: this node is replaced on every repaint, so it would announce
+      // unreliably and duplicate the screen's persistent live region when it did fire.
+      { class: "msg-pending-status" },
       failed ? null : h("span", { class: "spinner", "aria-hidden": "true" }),
       h("span", null, statusLabel(entry)),
       failed ? h("button", { class: "link-btn", type: "button", onclick: onRetry }, "Retry") : null,

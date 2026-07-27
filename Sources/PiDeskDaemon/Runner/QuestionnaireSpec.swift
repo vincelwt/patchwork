@@ -57,11 +57,26 @@ enum QuestionnaireSpecParser {
         return specs
     }
 
+    /// The questions carried by one Pi event, from either shape they can arrive in.
+    ///
+    /// `tool_execution_start` (`toolName` + `args`) is the authoritative one and the only one the
+    /// app itself reads — it fires when the tool actually runs, which is exactly when the dialogs
+    /// start. The content-block form is accepted as well because a streaming update or
+    /// `message_end` can carry the same call, and on some Pi versions that is what lands first.
+    static func specs(inEvent event: PiJSONValue) -> [QuestionSpec] {
+        if event["type"]?.stringValue == "tool_execution_start",
+           event["toolName"]?.stringValue?.lowercased() == toolName {
+            return parse(arguments: event["args"])
+        }
+        return specs(inAssistantContent: event["message"]?["content"])
+    }
+
     /// Every `ask_user_question` call in one assistant message. A message can legitimately carry
     /// several tool calls; only this one is interesting.
     static func specs(inAssistantContent content: PiJSONValue?) -> [QuestionSpec] {
         (content?.arrayValue ?? []).flatMap { block -> [QuestionSpec] in
-            guard block["type"]?.stringValue == "toolCall", block["name"]?.stringValue == toolName else { return [] }
+            guard block["type"]?.stringValue == "toolCall",
+                  block["name"]?.stringValue?.lowercased() == toolName else { return [] }
             return parse(arguments: block["arguments"])
         }
     }

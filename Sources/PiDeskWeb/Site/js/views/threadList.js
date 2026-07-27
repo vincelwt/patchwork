@@ -49,6 +49,11 @@ export function renderThreadList(state, actions) {
   };
 }
 
+// Toggling a folder repaints the whole list, which destroys the button that was just pressed and
+// drops focus to the document — so the next Tab or arrow key starts from the top of the page.
+// Remembering which group was toggled lets the repaint hand focus straight back.
+let pendingFocusGroupId = null;
+
 function paintList(container, state, actions) {
   // A refresh that fails leaves the last good list on screen rather than replacing it with an
   // error page; the error only takes over when there is nothing else to show.
@@ -82,6 +87,14 @@ function paintList(container, state, actions) {
     state.threadsError ? h("div", { class: "banner banner-error", role: "status" }, state.threadsError) : null,
     ...rows
   ]);
+  restoreGroupFocus(container);
+}
+
+function restoreGroupFocus(container) {
+  if (!pendingFocusGroupId) return;
+  const target = container.querySelector(`[data-group-id="${CSS.escape(pendingFocusGroupId)}"]`);
+  pendingFocusGroupId = null;
+  target?.focus({ preventScroll: true });
 }
 
 function indentStyle(depth) {
@@ -108,7 +121,11 @@ function renderGroup(row, actions) {
       style: indentStyle(depth),
       "aria-expanded": String(!collapsed),
       "aria-label": `${group.name}, ${counts.join(", ")}`,
-      onclick: () => actions.toggleGroup(group.id)
+      "data-group-id": group.id,
+      onclick: () => {
+        pendingFocusGroupId = group.id;
+        actions.toggleGroup(group.id);
+      }
     },
     h("span", { class: "group-caret", "aria-hidden": "true" }, collapsed ? "\u203a" : "\u2304"),
     h("span", { class: "group-glyph", "aria-hidden": "true" }, group.kind === "virtual" ? "\u25c8" : "\u25b8"),

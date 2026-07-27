@@ -128,6 +128,118 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertTrue(runtime.delivered.isEmpty, "an ordinary prompt still queues, exactly as before")
     }
 
+    // MARK: - Replay protection
+
+    func testRepeatingASubmissionReplaysTheAnswerInsteadOfPromptingPiTwice() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let body = #"{"text":"hello","clientId":"web-abc123"}"#
+
+        let first = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: body))
+        let second = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: body))
+
+        XCTAssertEqual(first.runId, second.runId, "the retry gets the original answer")
+        XCTAssertEqual(first, second)
+    }
+
+    /// The property that actually matters: a repeat never reaches the runner. Asserted against the
+    /// executor rather than the queue's counters, which drain as soon as a fake run finishes.
+    func testARepeatedSubmissionNeverReachesTheRunner() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let body = #"{"text":"hello","clientId":"web-once"}"#
+
+        _ = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 1)
+
+        _ = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 1, "Pi was prompted once, however many times the phone asked")
+    }
+
+    /// Lets an enqueued fake run start and finish. The fake executor returns immediately, so a few
+    /// short yields are enough; the assertions above it are what make a regression visible.
+    private func settle() async throws {
+        for _ in 0..<40 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+            if await core.runQueue.activeCount() == 0, await core.runQueue.queuedCount() == 0 { return }
+        }
+    }
+
+    func testARepeatedSteerIsNotDeliveredIntoTheLiveTurnASecondTime() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let runtime = FakeLiveRuntime()
+        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        let body = #"{"text":"stop","delivery":"steer","clientId":"web-steer1"}"#
+
+        let first = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: body))
+        let second = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: body))
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(runtime.delivered.count, 1, "Pi was steered once, however many times the phone asked")
+    }
+
+    func testADifferentClientIDIsADifferentMessage() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let one = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"one","clientId":"web-a"}"#))
+        let two = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"two","clientId":"web-b"}"#))
+        XCTAssertNotEqual(one.runId, two.runId)
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 2)
+    }
+
+    func testAMessageWithNoClientIDStillWorksButGetsNoReplayProtection() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let one = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello"}"#))
+        let two = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello"}"#))
+        XCTAssertNotEqual(one.runId, two.runId, "an older client behaves exactly as before")
+    }
+
+    func testAFailedSubmissionDoesNotLockOutAnHonestRetry() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let runtime = FakeLiveRuntime()
+        runtime.result = .rejected("Nothing to steer.")
+        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        let body = #"{"text":"x","delivery":"steer","clientId":"web-retry"}"#
+
+        let rejected = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(rejected.status, 409)
+
+        // Pi refused, so nothing happened and the same submission must be allowed to try again.
+        liveSessions.unregister(threadID: "sess-1", runID: "run_live")
+        let retry = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(retry.status, 200)
+    }
+
+    func testAMalformedClientIDIsRejected() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let bad = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","clientId":"has spaces"}"#)
+        XCTAssertEqual(bad.status, 400)
+
+        let long = String(repeating: "a", count: 129)
+        let tooLong = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","clientId":"\#(long)"}"#)
+        XCTAssertEqual(tooLong.status, 400)
+    }
+
+    // MARK: - Attachments
+
+    func testAttachmentsAreRejectedRatherThanAcceptedAndDropped() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let body = #"{"text":"look","attachments":[{"type":"image","data":"\#(Self.tinyPNG)","mimeType":"image/png"}]}"#
+
+        let response = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(response.status, 400)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("attachments_unsupported"))
+
+        try await settle()
+        XCTAssertTrue(executor.executedJobs.isEmpty, "never reported as sent, and never silently sent without them")
+    }
+
+    func testAnEmptyAttachmentsArrayIsNotAnAttachment() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"plain","attachments":[]}"#)
+        XCTAssertEqual(response.status, 200)
+    }
+
     // MARK: - Images
 
     func testImageEndpointReturnsBoundedBase64ForAProjectedReference() async throws {
@@ -184,6 +296,19 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertTrue(tree.folders.allSatisfy { $0.depth == 0 })
     }
 
+    func testAnOversizedStateFileIsRefusedRatherThanRead() async throws {
+        // A corrupted or hostile state.json must not be pulled into memory on every folder
+        // request. The guard is on the file size, so the check never allocates the contents.
+        let url = directory.appendingPathComponent("state.json")
+        let padding = String(repeating: " ", count: AppStatePeek.maxStateBytes + 1_024)
+        try (#"{"virtualFolders":[{"id":"f1","name":"Review","createdAt":0}]}"# + padding)
+            .write(to: url, atomically: true, encoding: .utf8)
+
+        let response = await send("GET", "/v1/folders")
+        XCTAssertEqual(response.status, 200)
+        XCTAssertTrue(try decode(FolderTreeResponse.self, response).folders.isEmpty)
+    }
+
     func testFoldersEndpointSurvivesAMalformedStateFile() async throws {
         try "{ not json".write(to: directory.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
         let response = await send("GET", "/v1/folders")
@@ -236,6 +361,55 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertTrue(recorder.all.isEmpty, "Pi is left waiting rather than answered with a guess")
         let still = try decode(InteractionListResponse.self, await send("GET", "/v1/interactions"))
         XCTAssertEqual(still.interactions.count, 1, "the dialog stays answerable")
+    }
+
+    func testAResponseFieldMustSuitTheDialogsMethod() async throws {
+        let recorder = registerDialog(id: "s1")
+        let confirmedOnSelect = await send("POST", "/v1/interactions/s1/respond", body: #"{"confirmed":true}"#)
+        XCTAssertEqual(confirmedOnSelect.status, 400, "a yes is not an option choice")
+
+        let both = await send("POST", "/v1/interactions/s1/respond", body: #"{"value":"Alpha","confirmed":true}"#)
+        XCTAssertEqual(both.status, 400, "two answers is no answer")
+
+        let mixedCancel = await send("POST", "/v1/interactions/s1/respond", body: #"{"value":"Alpha","cancelled":true}"#)
+        XCTAssertEqual(mixedCancel.status, 400)
+        XCTAssertTrue(recorder.all.isEmpty, "Pi is left waiting rather than answered ambiguously")
+
+        _ = registerDialog(id: "c1", method: .confirm, options: [])
+        let valueOnConfirm = await send("POST", "/v1/interactions/c1/respond", body: #"{"value":"yes"}"#)
+        XCTAssertEqual(valueOnConfirm.status, 400)
+    }
+
+    func testADialogMethodThisBuildCannotAnswerIsVisibleAndOnlyCancellable() async throws {
+        let recorder = registerDialog(id: "x1", method: .other("holographicPicker"), options: [])
+
+        let listed = try decode(InteractionListResponse.self, await send("GET", "/v1/interactions"))
+        XCTAssertEqual(listed.interactions.map(\.id), ["x1"], "an unknown blocking dialog must still be seen")
+
+        let answered = await send("POST", "/v1/interactions/x1/respond", body: #"{"value":"guess"}"#)
+        XCTAssertEqual(answered.status, 400)
+        XCTAssertTrue(recorder.all.isEmpty)
+
+        let cancelled = await send("POST", "/v1/interactions/x1/respond", body: #"{"cancelled":true}"#)
+        XCTAssertEqual(cancelled.status, 200, "cancelling is always safe, and unblocks the run")
+    }
+
+    func testAResponseThatNeverReachedPiIsNotReportedAsAnswered() async throws {
+        let recorder = ResponseRecorder()
+        _ = interactions.register(
+            PendingInteraction(
+                id: "w1", runId: "run_1", threadId: "sess-1", method: .input, title: "Type",
+                expiresAt: Date().addingTimeInterval(600)
+            ),
+            responder: { _ in throw RunnerError.ioFailure("stdin closed") }
+        )
+
+        let response = await send("POST", "/v1/interactions/w1/respond", body: #"{"value":"hello"}"#)
+        XCTAssertEqual(response.status, 503, "the reader must not believe they answered it")
+        XCTAssertTrue(recorder.all.isEmpty)
+
+        let still = try decode(InteractionListResponse.self, await send("GET", "/v1/interactions"))
+        XCTAssertEqual(still.interactions.count, 1, "and it stays answerable, because Pi is still blocked")
     }
 
     func testAFreeTextAnswerIsNotOptionCheckedAndIsLengthBounded() async throws {

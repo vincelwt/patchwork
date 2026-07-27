@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   PENDING_LIMIT,
-  addPending,
+  addPending as addPendingRaw,
+  announcement,
+  markInFlight,
   applyRunEvent,
   markAccepted,
   markFailed,
@@ -14,6 +16,9 @@ import {
 } from "../../Sources/PiDeskWeb/Site/js/pending.mjs";
 
 const user = (text) => ({ role: "user", text });
+
+/** Most tests only care about the resulting list; the bound test uses the raw form. */
+const addPending = (list, options) => addPendingRaw(list, options).list;
 
 test("a pending message survives a refetch that does not yet contain it", () => {
   // The exact bug this module exists for: the daemon accepts the text, the view refetches
@@ -103,13 +108,66 @@ test("steer delivery is labelled as steering, and a downgrade is reported honest
   assert.equal(statusLabel(downgraded[0]), "Queued \u2014 waiting for the current run");
 });
 
-test("the pending list is bounded", () => {
+test("the pending list is bounded, and evicts only messages that were actually sent", () => {
   let list = [];
   for (let i = 0; i < PENDING_LIMIT + 5; i += 1) {
-    list = addPending(list, { key: `p${i}`, text: `m${i}`, messages: [] });
+    const added = addPendingRaw(list, { key: `p${i}`, text: `m${i}`, messages: [] });
+    assert.equal(added.rejected, false);
+    list = markAccepted(added.list, `p${i}`, { runId: `run_${i}` });
   }
   assert.equal(list.length, PENDING_LIMIT);
-  assert.equal(list[0].key, `p${5}`, "oldest entries are dropped first");
+  assert.equal(list[0].key, "p5", "the oldest accepted entry is the one dropped");
+});
+
+test("a full list of failed messages refuses a new one rather than destroying unsent text", () => {
+  let list = [];
+  for (let i = 0; i < PENDING_LIMIT; i += 1) {
+    list = markFailed(addPendingRaw(list, { key: `p${i}`, text: `m${i}`, messages: [] }).list, `p${i}`, "offline");
+  }
+  const added = addPendingRaw(list, { key: "new", text: "must not be lost", messages: [] });
+  assert.equal(added.rejected, true);
+  assert.equal(added.entry, null);
+  assert.equal(added.list.length, PENDING_LIMIT);
+  assert.ok(added.list.every((entry) => entry.status === "failed"), "nothing was evicted");
+});
+
+test("a mixed full list evicts the oldest sent message, never a failed one", () => {
+  let list = addPendingRaw([], { key: "failed", text: "unsent", messages: [] }).list;
+  list = markFailed(list, "failed", "offline");
+  for (let i = 1; i < PENDING_LIMIT; i += 1) {
+    list = markAccepted(addPendingRaw(list, { key: `p${i}`, text: `m${i}`, messages: [] }).list, `p${i}`, {});
+  }
+  const added = addPendingRaw(list, { key: "fresh", text: "fresh", messages: [] });
+  assert.equal(added.rejected, false);
+  assert.ok(
+    added.list.some((entry) => entry.key === "failed"),
+    "the unsent message survives"
+  );
+  assert.ok(!added.list.some((entry) => entry.key === "p1"), "the oldest sent one went instead");
+});
+
+test("retry keeps the requested delivery even after the daemon downgraded it", () => {
+  const added = addPendingRaw([], { key: "p1", text: "stop", delivery: "steer", clientId: "c1", messages: [] });
+  const downgraded = markAccepted(added.list, "p1", { runId: "run_1", queued: true, delivery: "auto" });
+  assert.equal(downgraded[0].delivery, "auto", "the status line tells the truth");
+  assert.equal(downgraded[0].requestedDelivery, "steer", "retry still asks to steer");
+  assert.equal(downgraded[0].clientId, "c1", "and reuses the same submission id");
+});
+
+test("an overlapping retry is shown as still working, not as a failure", () => {
+  let list = addPendingRaw([], { key: "p1", text: "x", messages: [] }).list;
+  list = markFailed(list, "p1", "boom");
+  list = markInFlight(list, "p1");
+  assert.equal(list[0].status, "working");
+  assert.equal(list[0].error, null);
+});
+
+test("announcements name the message and stay quiet for nothing", () => {
+  const list = addPendingRaw([], { key: "p1", text: "run the tests", messages: [] }).list;
+  assert.equal(announcement(list[0]), "run the tests: Sending\u2026");
+  assert.equal(announcement(undefined), "");
+  const long = addPendingRaw([], { key: "p2", text: "x".repeat(80), messages: [] }).list[0];
+  assert.ok(announcement(long).length < 80, "long text is excerpted");
 });
 
 test("only user messages count toward reconciliation", () => {

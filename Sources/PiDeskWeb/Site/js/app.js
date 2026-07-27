@@ -307,6 +307,9 @@ function go(path, { replace = false } = {}) {
 }
 
 function mountRoute() {
+  // A screen may own things outside its own node — a body-level overlay, a document listener, an
+  // observer, a timer — and replacing `mainEl`'s children would leave all of them running.
+  currentView?.dispose?.();
   const view = state.authed
     ? resolveRoute(location.pathname)
     : hosted
