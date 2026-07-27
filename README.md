@@ -108,12 +108,13 @@ On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-act
 
 ```bash
 ./scripts/package-app.sh
-open "dist/Pi Desktop.app"
+open "/Applications/Pi Desktop.app"
 ```
 
-The script builds, bundles, and ad-hoc signs `PiDesktop` plus the `pi-deskd`/`pidesk` helpers it
-starts and stops (`Contents/Helpers/`, each signed individually before the whole-bundle pass so
-`codesign --verify --deep --strict` still passes). Pi and Node are intentionally not bundled.
+The script builds, bundles, ad-hoc signs, and installs `/Applications/Pi Desktop.app`. It includes
+`PiDesktop` plus the `pi-deskd`/`pidesk` helpers it starts and stops (`Contents/Helpers/`, each
+signed individually before the whole-bundle pass so `codesign --verify --deep --strict` still
+passes). Pi and Node are intentionally not bundled.
 
 ## Keyboard and queue behavior
 
