@@ -48,6 +48,15 @@ struct NewChatView: View {
             .frame(maxWidth: .infinity)
             .background(Color.piTranscript)
         }
+        .contentShape(Rectangle())
+        .onDrop(of: ImageImportService.dropTypes, isTargeted: nil) { providers in
+            let route = store.route
+            let folder = store.selectedFolder?.standardizedFileURL
+            return ImageImportService.loadDroppedAttachments(from: providers) { images in
+                guard store.route == route, store.selectedFolder?.standardizedFileURL == folder else { return }
+                store.addAttachments(images)
+            }
+        }
     }
 
     private var folderContext: some View {

@@ -9,6 +9,7 @@ private final class FakeRuntime: PiRuntimeProtocol {
     var onExit: ((String?) -> Void)?
     var isRunning = false
     private(set) var sent: [String] = []
+    private(set) var sentPayloads: [(type: String, payload: [String: JSONValue])] = []
     private var pending: [String: (Result<JSONValue, Error>) -> Void] = [:]
     var sessionFile = ""
     var sessionID = ""
@@ -18,6 +19,7 @@ private final class FakeRuntime: PiRuntimeProtocol {
 
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append(type)
+        sentPayloads.append((type, payload))
         switch type {
         case "get_state":
             completion?(.success(.object([
@@ -35,11 +37,14 @@ private final class FakeRuntime: PiRuntimeProtocol {
 
     func sendUncorrelated(_ value: JSONValue) {}
 
-    func succeed(_ command: String) {
-        pending.removeValue(forKey: command)?(.success(.object(["success": .bool(true), "data": .object([:])])))
+    func succeed(_ command: String, data: JSONValue = .object([:])) {
+        pending.removeValue(forKey: command)?(.success(.object(["success": .bool(true), "data": data])))
     }
 
     func commandCount(_ command: String) -> Int { sent.filter { $0 == command }.count }
+    func lastPayload(_ command: String) -> [String: JSONValue]? {
+        sentPayloads.last(where: { $0.type == command })?.payload
+    }
 }
 
 private struct FakeRepository: SessionRepositoryProtocol {
@@ -125,23 +130,35 @@ final class AppStoreMessageEditingTests: XCTestCase {
 
     // MARK: - Resubmitting while idle
 
-    func testResubmitWhileIdleSendsTheEditedTextAsAFreshPrompt() async throws {
-        // Seeded directly (not via submitDraft) so the conversation has a settled turn in its
-        // history without also leaving `runtimeState.isStreaming` optimistically true — exactly
-        // what "idle" means for this test.
+    func testResubmitWhileIdleForksBeforeTheMessageAndRewritesVisibleHistory() async throws {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
-        seedUserMessage(store, text: "original question")
+        seedUserMessage(store, text: "earlier question", id: "earlier")
+        store.messages.append(message(id: "earlier-answer", role: .assistant, text: "earlier answer"))
+        seedUserMessage(store, text: "original question", id: "target-entry")
+        store.messages.append(message(id: "abandoned-answer", role: .assistant, text: "answer to remove"))
 
         store.beginEditingLastMessage()
         store.draft = "corrected question"
         store.resubmitEditedMessage()
 
+        await waitUntil { runtime.commandCount("fork") == 1 }
+        XCTAssertEqual(runtime.lastPayload("fork")?["entryId"]?.stringValue, "target-entry")
+        XCTAssertEqual(runtime.commandCount("prompt"), 0, "The replacement waits until Pi confirms the fork")
+
+        let forkPath = directory.appendingPathComponent("fork.jsonl").path
+        runtime.sessionFile = forkPath
+        runtime.sessionID = "fork-session"
+        runtime.succeed("fork")
+
         await waitUntil { runtime.commandCount("prompt") == 1 }
-        XCTAssertEqual(runtime.commandCount("prompt"), 1, "Resubmitting while idle sends one fresh prompt")
         XCTAssertEqual(runtime.commandCount("abort"), 0, "There is nothing running, so nothing should be aborted")
         XCTAssertFalse(store.isEditingLastMessage)
         XCTAssertEqual(store.draft, "", "submitDraft's own clearing still applies")
+        XCTAssertEqual(store.selectedSession?.fileURL.path, forkPath)
+        XCTAssertTrue(store.messages.contains { $0.textContent == "corrected question" })
+        XCTAssertFalse(store.messages.contains { $0.textContent == "original question" })
+        XCTAssertFalse(store.messages.contains { $0.textContent == "answer to remove" })
     }
 
     func testResubmitWithEmptyContentCancelsInsteadOfSending() async throws {
@@ -189,8 +206,15 @@ final class AppStoreMessageEditingTests: XCTestCase {
         await waitUntil { runtime.commandCount("abort") == 1 }
         XCTAssertEqual(runtime.commandCount("prompt"), 1, "The resend must wait for the abort to actually settle")
 
-        // Pi confirms the run stopped.
+        // Pi confirms the run stopped. The optimistic message has no durable entry ID yet, so
+        // Desktop resolves it through Pi's fork-message list before issuing the fork.
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        await waitUntil { runtime.commandCount("get_fork_messages") == 1 }
+        runtime.succeed("get_fork_messages", data: forkMessages(entryID: "durable-original", text: "original question"))
+        await waitUntil { runtime.commandCount("fork") == 1 }
+        runtime.sessionFile = directory.appendingPathComponent("mid-turn-fork.jsonl").path
+        runtime.sessionID = "mid-turn-fork"
+        runtime.succeed("fork")
 
         await waitUntil { runtime.commandCount("prompt") == 2 }
         XCTAssertEqual(runtime.commandCount("prompt"), 2)
@@ -213,11 +237,18 @@ final class AppStoreMessageEditingTests: XCTestCase {
         // firing the event any earlier would race the guard this test exists to cover.
         await waitUntil { runtime.commandCount("abort") == 1 }
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        await waitUntil { runtime.commandCount("get_fork_messages") == 1 }
+        runtime.succeed("get_fork_messages", data: forkMessages(entryID: "durable-original", text: "original question"))
+        await waitUntil { runtime.commandCount("fork") == 1 }
+        runtime.sessionFile = directory.appendingPathComponent("single-fork.jsonl").path
+        runtime.sessionID = "single-fork"
+        runtime.succeed("fork")
         await waitUntil { runtime.commandCount("prompt") == 2 }
 
         // Give any stray second resubmission a chance to land before asserting it never did.
         try? await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(runtime.commandCount("prompt"), 2, "Exactly one resend, never two")
+        XCTAssertEqual(runtime.commandCount("fork"), 1, "Exactly one history rewrite, never two")
         XCTAssertEqual(runtime.commandCount("abort"), 1, "Exactly one abort, never two")
     }
 
@@ -245,12 +276,22 @@ final class AppStoreMessageEditingTests: XCTestCase {
         runtime.sessionID = session.id
     }
 
-    private func seedUserMessage(_ store: AppStore, text: String) {
-        store.messages.append(ChatMessage(
-            id: "seed-\(UUID().uuidString)", role: .user,
-            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))],
+    private func seedUserMessage(_ store: AppStore, text: String, id: String = "seed-\(UUID().uuidString)") {
+        store.messages.append(message(id: id, role: .user, text: text))
+    }
+
+    private func message(id: String, role: MessageRole, text: String) -> ChatMessage {
+        ChatMessage(
+            id: id, role: role,
+            blocks: [MessageBlock(id: "\(id)-text", kind: .text(text))],
             timestamp: Date(), raw: .null
-        ))
+        )
+    }
+
+    private func forkMessages(entryID: String, text: String) -> JSONValue {
+        .object(["messages": .array([.object([
+            "entryId": .string(entryID), "text": .string(text)
+        ])])])
     }
 
     private func summary(id: String, file: String) -> SessionSummary {

@@ -85,13 +85,15 @@ final class PiRPCSession: @unchecked Sendable {
     /// Waits specifically for the response to `id`, buffering (not discarding) every event seen
     /// while waiting so a caller that later drains events for `agent_settled` still sees them.
     func receiveMatching(id: String, timeout: TimeInterval) async throws -> PiJSONValue {
+        var deferred: [PiJSONValue] = []
+        defer { restoreBuffered(deferred) }
         let deadline = Date().addingTimeInterval(timeout)
         while true {
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { throw RunnerError.timedOut(afterSeconds: timeout) }
             guard let value = try await receiveNext(timeout: min(remaining, 5)) else { continue }
             if value["type"]?.stringValue == "response", value["id"]?.stringValue == id { return value }
-            pushBackBuffered(value)
+            deferred.append(value)
         }
     }
 
@@ -112,8 +114,9 @@ final class PiRPCSession: @unchecked Sendable {
         return buffer.isEmpty ? nil : buffer.removeFirst()
     }
 
-    private func pushBackBuffered(_ value: PiJSONValue) {
-        bufferLock.lock(); buffer.append(value); bufferLock.unlock()
+    private func restoreBuffered(_ values: [PiJSONValue]) {
+        guard !values.isEmpty else { return }
+        bufferLock.lock(); buffer.insert(contentsOf: values, at: 0); bufferLock.unlock()
     }
 
     /// Must only run on `ioQueue`. One `read()` can surface multiple JSONL records; the rest are

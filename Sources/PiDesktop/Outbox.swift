@@ -184,8 +184,9 @@ extension AppStore {
         let command = entry.delivery == .steer ? "steer" : "follow_up"
         let target = runtime
         let token = beginOutboxDispatch()
-        var payload: [String: JSONValue] = ["message": .string(entry.text)]
-        if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
+        let payload: [String: JSONValue] = [
+            "message": .string(ImageAttachment.prompt(text: entry.text, attachments: entry.attachments))
+        ]
         target.send(type: command, payload: payload) { [weak self] result in
             self?.finishOutboxDispatch(
                 owner: token.owner,

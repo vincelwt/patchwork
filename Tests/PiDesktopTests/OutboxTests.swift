@@ -38,7 +38,10 @@ final class OutboxPresentationTests: XCTestCase {
     }
 
     private func image(_ name: String) -> ImageAttachment {
-        ImageAttachment(data: Data([0x01]), mimeType: "image/png", fileName: name)
+        ImageAttachment(
+            data: Data([0x01]), mimeType: "image/png", fileName: name,
+            fileURL: URL(fileURLWithPath: "/tmp/\(name)")
+        )
     }
 
     /// Every test below is about content rules, so the runtime-ownership gate defaults open;

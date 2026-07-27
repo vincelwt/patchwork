@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import XCTest
 @testable import PiDesktop
 
@@ -82,6 +83,89 @@ final class SchedulesModelTests: XCTestCase {
         await model.reload()
         XCTAssertNotNil(model.error)
         XCTAssertTrue(model.entries.isEmpty)
+    }
+}
+
+@MainActor
+final class RunHistoryModelTests: XCTestCase {
+    private func run(
+        _ id: String,
+        schedule: String? = "a",
+        started: TimeInterval,
+        finished: TimeInterval? = nil,
+        status: RunStatus = .ok,
+        error: String? = nil,
+        summary: String? = nil
+    ) -> Run {
+        Run(
+            id: id,
+            scheduleId: schedule,
+            trigger: .schedule,
+            startedAt: Date(timeIntervalSince1970: started),
+            finishedAt: finished.map { Date(timeIntervalSince1970: $0) },
+            status: status,
+            error: error,
+            summary: summary
+        )
+    }
+
+    func testHistoryIsNewestFirstAndOnlyForTheAutomationThatWasOpened() async {
+        let service = InMemoryScheduleService(runs: [
+            run("a-old", started: 100),
+            run("b-new", schedule: "b", started: 900),
+            run("a-new", started: 500),
+            run("orphan", schedule: nil, started: 800)
+        ])
+        let model = RunHistoryModel(service: service, scheduleID: "a")
+        await model.reload()
+        XCTAssertEqual(model.runs.map(\.id), ["a-new", "a-old"])
+        XCTAssertNil(model.error)
+        XCTAssertFalse(model.isLoading)
+    }
+
+    func testHistoryStaysBoundedToWhatTheAPIRetains() async {
+        let service = InMemoryScheduleService(
+            runs: (0..<80).map { run("r\($0)", started: TimeInterval($0)) }
+        )
+        let model = RunHistoryModel(service: service, scheduleID: "a")
+        await model.reload()
+        XCTAssertEqual(model.runs.count, PiTheme.runHistoryLimit)
+        XCTAssertEqual(model.runs.first?.id, "r79", "The bound keeps the newest runs, not the oldest")
+    }
+
+    func testAFailedLoadIsReportedInsteadOfAnEmptyHistory() async {
+        let service = InMemoryScheduleService(runs: [run("a1", started: 1)])
+        service.failure = ScheduleServiceError.daemonUnavailable
+        let model = RunHistoryModel(service: service, scheduleID: "a")
+        await model.reload()
+        XCTAssertNotNil(model.error)
+        XCTAssertTrue(model.runs.isEmpty)
+    }
+
+    func testARunRowSaysWhatHappenedIncludingStatusesThisBuildHasNeverHeardOf() {
+        XCTAssertEqual(run("1", started: 0, status: .ok).statusLabel, "Succeeded")
+        XCTAssertEqual(run("1", started: 0, status: .timeout).statusLabel, "Timed out")
+        // A newer daemon's status is shown, not swallowed.
+        XCTAssertEqual(run("1", started: 0, status: .other("quarantined")).statusLabel, "Quarantined")
+        XCTAssertEqual(run("1", started: 0, status: .other("")).statusLabel, "Unknown")
+
+        // Duration only once a run has actually finished.
+        XCTAssertNil(run("1", started: 0).durationLabel)
+        XCTAssertEqual(run("1", started: 0, finished: 75).durationLabel, "1m 15s")
+
+        // The error is the headline when there is one; otherwise the summary.
+        let failed = run("1", started: 0, status: .failed, error: "  provider timeout ", summary: "ignored")
+        XCTAssertEqual(failed.detailText, "provider timeout")
+        XCTAssertTrue(failed.detailIsError)
+        let fine = run("1", started: 0, summary: "3 failures triaged")
+        XCTAssertEqual(fine.detailText, "3 failures triaged")
+        XCTAssertFalse(fine.detailIsError)
+        XCTAssertNil(run("1", started: 0, error: "   ", summary: nil).detailText)
+        // Nothing unbounded reaches the sheet.
+        XCTAssertEqual(
+            run("1", started: 0, summary: String(repeating: "x", count: 5_000)).detailText?.count,
+            PiTheme.sessionPreviewLimit
+        )
     }
 }
 

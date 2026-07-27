@@ -21,7 +21,7 @@ final class ComposerBridge {
 }
 
 /// An `NSTextAttachment` that remembers which `ImageAttachment` it renders, so the text view can
-/// map inline placeholders back to the RPC images array in order.
+/// map inline placeholders back to local image paths in order.
 final class ComposerImageAttachment: NSTextAttachment {
     let attachmentID: UUID
 
@@ -44,7 +44,7 @@ final class ComposerImageAttachment: NSTextAttachment {
 
 /// A native text view that previews pasted, dropped, and attached images inline at the caret.
 /// Deleting the placeholder character removes the attachment; sending strips the placeholders and
-/// maps the remaining attachments to the RPC `images` array in reading order.
+/// appends the remaining attachments' local file paths to the prompt in reading order.
 struct NativeComposerTextView: NSViewRepresentable {
     @Binding var content: ComposerContent
     let bridge: ComposerBridge
@@ -401,6 +401,9 @@ final class ComposerTextView: NSTextView {
 // MARK: - Import
 
 enum ImageImportService {
+    private static let temporaryImageCountLimit = 64
+    static let dropTypes: [UTType] = [.fileURL, .image]
+
     static func canReadImages(from pasteboard: NSPasteboard) -> Bool {
         pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]])
             || pasteboard.availableType(from: [.png, .tiff]) != nil
@@ -410,12 +413,14 @@ enum ImageImportService {
         let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]]) as? [URL] ?? []
         let files = attachments(from: urls)
         if !files.isEmpty { return files }
-        if let data = pasteboard.data(forType: .png), data.count <= PiTheme.imageByteLimit {
-            return [ImageAttachment(data: data, mimeType: "image/png", fileName: "Pasted image.png")]
+        if let data = pasteboard.data(forType: .png), data.count <= PiTheme.imageByteLimit,
+           let attachment = temporaryAttachment(data: data, mimeType: "image/png", fileName: "Pasted image.png") {
+            return [attachment]
         }
         if let tiff = pasteboard.data(forType: .tiff), tiff.count <= PiTheme.imageByteLimit,
-           let image = NSImage(data: tiff), let png = pngData(from: image), png.count <= PiTheme.imageByteLimit {
-            return [ImageAttachment(data: png, mimeType: "image/png", fileName: "Pasted image.png")]
+           let image = NSImage(data: tiff), let png = pngData(from: image), png.count <= PiTheme.imageByteLimit,
+           let attachment = temporaryAttachment(data: png, mimeType: "image/png", fileName: "Pasted image.png") {
+            return [attachment]
         }
         return []
     }
@@ -426,7 +431,120 @@ enum ImageImportService {
                   let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
                   size <= PiTheme.imageByteLimit,
                   let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-            return ImageAttachment(data: data, mimeType: type.preferredMIMEType ?? "image/\(url.pathExtension.lowercased())", fileName: url.lastPathComponent)
+            return ImageAttachment(
+                data: data,
+                mimeType: type.preferredMIMEType ?? "image/\(url.pathExtension.lowercased())",
+                fileName: url.lastPathComponent,
+                fileURL: url
+            )
+        }
+    }
+
+    @discardableResult
+    static func loadDroppedAttachments(
+        from providers: [NSItemProvider],
+        completion: @escaping ([ImageAttachment]) -> Void
+    ) -> Bool {
+        let providers = Array(providers.filter { provider in
+            dropTypes.contains { provider.hasItemConformingToTypeIdentifier($0.identifier) }
+        }.prefix(PiTheme.imageCountLimit))
+        guard !providers.isEmpty else { return false }
+
+        var loaded: [(Int, ImageAttachment)] = []
+        var remaining = providers.count
+        for (index, provider) in providers.enumerated() {
+            loadDroppedAttachment(from: provider) { attachment in
+                DispatchQueue.main.async {
+                    if let attachment { loaded.append((index, attachment)) }
+                    remaining -= 1
+                    if remaining == 0 { completion(loaded.sorted { $0.0 < $1.0 }.map(\.1)) }
+                }
+            }
+        }
+        return true
+    }
+
+    private static func loadDroppedAttachment(
+        from provider: NSItemProvider,
+        completion: @escaping (ImageAttachment?) -> Void
+    ) {
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let url = droppedURL(from: item), let attachment = attachments(from: [url]).first {
+                    completion(attachment)
+                } else {
+                    loadDroppedImage(from: provider, completion: completion)
+                }
+            }
+        } else {
+            loadDroppedImage(from: provider, completion: completion)
+        }
+    }
+
+    private static func loadDroppedImage(
+        from provider: NSItemProvider,
+        completion: @escaping (ImageAttachment?) -> Void
+    ) {
+        guard let identifier = provider.registeredTypeIdentifiers.first(where: {
+            UTType($0)?.conforms(to: .image) == true
+        }) else { completion(nil); return }
+        provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, _ in
+            guard let data, data.count <= PiTheme.imageByteLimit,
+                  let image = NSImage(data: data), let png = pngData(from: image),
+                  png.count <= PiTheme.imageByteLimit else { completion(nil); return }
+            completion(temporaryAttachment(data: png, mimeType: "image/png", fileName: "Dropped image.png"))
+        }
+    }
+
+    private static func droppedURL(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL { return url }
+        if let data = item as? Data { return URL(dataRepresentation: data, relativeTo: nil) }
+        if let value = item as? String { return URL(string: value) }
+        return nil
+    }
+
+    static func attachment(from image: ImagePayload) -> ImageAttachment? {
+        let fallbackName = "Image.\(UTType(mimeType: image.mimeType)?.preferredFilenameExtension ?? "png")"
+        return temporaryAttachment(
+            data: image.data,
+            mimeType: image.mimeType,
+            fileName: image.fileName ?? fallbackName
+        )
+    }
+
+    private static func temporaryAttachment(data: Data, mimeType: String, fileName: String) -> ImageAttachment? {
+        let manager = FileManager.default
+        let directory = ImageAttachment.temporaryDirectory
+        let id = UUID()
+        var url = directory.appendingPathComponent(id.uuidString)
+        let pathExtension = URL(fileURLWithPath: fileName).pathExtension
+        if !pathExtension.isEmpty { url.appendPathExtension(pathExtension) }
+        do {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            pruneTemporaryImages(in: directory, keeping: url)
+            return ImageAttachment(id: id, data: data, mimeType: mimeType, fileName: fileName, fileURL: url)
+        } catch {
+            return nil
+        }
+    }
+
+    static func pruneTemporaryImages(
+        in directory: URL,
+        keeping current: URL,
+        limit: Int = temporaryImageCountLimit
+    ) {
+        let files = ((try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: .skipsHiddenFiles
+        )) ?? []).sorted {
+            let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return left < right
+        }
+        for stale in files.filter({ $0 != current }).prefix(max(0, files.count - limit)) {
+            try? FileManager.default.removeItem(at: stale)
         }
     }
 

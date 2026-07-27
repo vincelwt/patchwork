@@ -97,6 +97,9 @@ enum PiTheme {
     /// Aggregate decoded-bitmap cache ceiling (decoded pixel cost, not encoded bytes).
     static let decodedImageCountLimit = 64
     static let decodedImageByteLimit = 64 * 1_024 * 1_024
+    /// The daemon retains a bounded run history; the automations page asks for, and shows, at
+    /// most this many records per automation.
+    static let runHistoryLimit = 50
     /// Git list starts collapsed and stays bounded even when expanded.
     static let gitFilePreviewCount = 12
     static let gitFileHardLimit = 400

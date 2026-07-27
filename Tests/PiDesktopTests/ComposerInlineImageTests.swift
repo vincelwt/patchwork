@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import XCTest
 @testable import PiDesktop
 
@@ -122,6 +123,7 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertEqual(attachments.count, 1)
         XCTAssertEqual(attachments.first?.fileName, "one.png")
         XCTAssertEqual(attachments.first?.mimeType, "image/png")
+        XCTAssertEqual(attachments.first?.fileURL, url.standardizedFileURL)
         XCTAssertNotNil(attachments.first?.image)
     }
 
@@ -141,6 +143,31 @@ final class ComposerInlineImageTests: XCTestCase {
         let attachments = ImageImportService.attachments(from: pasteboard)
         XCTAssertEqual(attachments.count, 1)
         XCTAssertEqual(attachments.first?.fileName, "Pasted image.png")
+        let path = try XCTUnwrap(attachments.first?.fileURL.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+
+        try FileManager.default.removeItem(atPath: path)
+        _ = ImageAttachment.prompt(text: "Inspect it", attachments: attachments)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path), "Sending recreates a pruned temporary image")
+    }
+
+    func testTemporaryImageCachePrunesTheOldestFiles() throws {
+        let cache = directory.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let files = (0..<3).map { cache.appendingPathComponent("\($0).png") }
+        for (index, file) in files.enumerated() {
+            try Data([UInt8(index)]).write(to: file)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: TimeInterval(index))],
+                ofItemAtPath: file.path
+            )
+        }
+
+        ImageImportService.pruneTemporaryImages(in: cache, keeping: files[2], limit: 2)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: files[0].path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: files[1].path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: files[2].path))
     }
 
     // MARK: - Inline placeholders
@@ -254,16 +281,39 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertTrue(textView.currentContent().attachments.isEmpty)
     }
 
-    func testWholeConversationRegistersTheImageFileDropTarget() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
+    func testFullConversationDropLoadsFileAndRawImageProvidersInOrder() async throws {
+        let source = try writePNG(named: "provider.png")
+        let fileProvider = NSItemProvider(item: source as NSURL, typeIdentifier: UTType.fileURL.identifier)
+        let rawProvider = NSItemProvider(
+            item: try Data(contentsOf: source) as NSData,
+            typeIdentifier: UTType.png.identifier
+        )
+        let attachments = await withCheckedContinuation { continuation in
+            XCTAssertTrue(ImageImportService.loadDroppedAttachments(from: [fileProvider, rawProvider]) {
+                continuation.resume(returning: $0)
+            })
+        }
+
+        XCTAssertEqual(attachments.count, 2)
+        XCTAssertEqual(attachments[0].fileURL, source.standardizedFileURL)
+        XCTAssertEqual(attachments[1].mimeType, "image/png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachments[1].fileURL.path))
+    }
+
+    func testExistingAndNewConversationAreasRegisterImageFileDropTargets() throws {
+        let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("Sources/PiDesktop/ConversationView.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        XCTAssertTrue(source.contains("conversationColumn\n                    .frame(maxWidth: .infinity, maxHeight: .infinity)"))
-        XCTAssertTrue(source.contains(".dropDestination(for: URL.self)"))
-        XCTAssertTrue(source.contains("store.addAttachments(images)"))
+        for file in ["ConversationView.swift", "NewChatView.swift"] {
+            let source = try String(
+                contentsOf: root.appendingPathComponent("Sources/PiDesktop/\(file)"),
+                encoding: .utf8
+            )
+            XCTAssertTrue(source.contains(".contentShape(Rectangle())"), file)
+            XCTAssertTrue(source.contains(".onDrop(of: ImageImportService.dropTypes"), file)
+            XCTAssertTrue(source.contains("store.addAttachments(images)"), file)
+        }
     }
 
     func testModeLabelKeepsItsIntrinsicWidth() throws {
@@ -298,23 +348,17 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertEqual(textView.currentContent().attachments.count, PiTheme.imageCountLimit)
     }
 
-    func testRPCPayloadOrderFollowsInlineOrder() throws {
+    func testPromptFilePathsFollowInlineOrder() throws {
         let textView = makeTextView()
         let first = try writePNG(named: "1.png", width: 4, height: 4)
         let second = try writePNG(named: "2.png", width: 5, height: 5)
         textView.insertImages(ImageImportService.attachments(from: [first, second]), at: nil)
 
-        let attachments = textView.currentContent().attachments
-        let payload = JSONValue.array(attachments.map(\.rpcValue))
-        let items = try XCTUnwrap(payload.arrayValue)
-        XCTAssertEqual(items.count, 2)
-        XCTAssertEqual(items.map { $0["type"]?.stringValue }, ["image", "image"])
-        XCTAssertEqual(items.map { $0["mimeType"]?.stringValue }, ["image/png", "image/png"])
-        // Distinct payloads, in the order they appear in the composer.
-        XCTAssertNotEqual(items[0]["data"]?.stringValue, items[1]["data"]?.stringValue)
+        let prompt = ImageAttachment.prompt(text: "Compare these", attachments: textView.currentContent().attachments)
         XCTAssertEqual(
-            items[0]["data"]?.stringValue,
-            attachments[0].data.base64EncodedString()
+            prompt,
+            "Compare these\n\nAttached image file paths:\n- \(first.path)\n- \(second.path)"
         )
+        XCTAssertFalse(prompt.contains(textView.currentContent().attachments[0].data.base64EncodedString()))
     }
 }

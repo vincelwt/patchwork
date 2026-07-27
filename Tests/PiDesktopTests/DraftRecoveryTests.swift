@@ -4,8 +4,14 @@ import XCTest
 
 final class DraftRecoveryTests: XCTestCase {
     func testFailedSubmissionRestoresAheadOfNewTypingWithoutDuplicatingImages() {
-        let sent = ImageAttachment(id: UUID(), data: Data("a".utf8), mimeType: "image/png", fileName: "a.png")
-        let current = ImageAttachment(id: UUID(), data: Data("b".utf8), mimeType: "image/png", fileName: "b.png")
+        let sent = ImageAttachment(
+            id: UUID(), data: Data("a".utf8), mimeType: "image/png", fileName: "a.png",
+            fileURL: URL(fileURLWithPath: "/tmp/a.png")
+        )
+        let current = ImageAttachment(
+            id: UUID(), data: Data("b".utf8), mimeType: "image/png", fileName: "b.png",
+            fileURL: URL(fileURLWithPath: "/tmp/b.png")
+        )
 
         XCTAssertEqual(DraftRecovery.restoredText(sent: "original", current: "typed while waiting"),
                        "original\ntyped while waiting")
