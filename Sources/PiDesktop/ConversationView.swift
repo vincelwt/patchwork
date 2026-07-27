@@ -107,7 +107,7 @@ struct ConversationView: View {
                 }
             }
         }
-        .toolbar { conversationToolbar }
+        .piPlainToolbar { conversationToolbar }
         // Without this the transcript scrolls visibly under a transparent toolbar.
         .toolbarBackground(.visible, for: .windowToolbar)
         // Switching conversations keeps the already-mounted composer first responder: the row's
