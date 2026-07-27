@@ -260,7 +260,90 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertNil(store.activeDialog)
     }
 
-    func testCancellationSendsCancelledAndClearsNativeState() throws {
+    // MARK: - Inline discoverability
+
+    func testInlineQuestionIsInteractiveOnlyAfterItsOwnRequestArrives() throws {
+        let (store, runtime, _) = makeStore()
+        runtime.emit(toolStart(arguments: oneQuestion))
+        XCTAssertNotNil(store.pendingQuestionnaire)
+        XCTAssertNil(store.activeQuestionnaire(for: "ask-1"), "Nothing is answerable before Pi asks")
+
+        runtime.emit(selectRequest(id: "q1"))
+        XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
+        XCTAssertNil(store.activeQuestionnaire(for: "another-call"), "Only the exact tool call row is live")
+    }
+
+    func testQuestionStartingWhileBrowsedAwayOnlyRendersForItsOwnConversation() throws {
+        let (store, runtime, _) = makeStore()
+        let session = try XCTUnwrap(store.sessions.first)
+        store.openNewChat()
+
+        runtime.emit(toolStart(arguments: oneQuestion))
+        runtime.emit(selectRequest(id: "q1"))
+        XCTAssertNil(store.activeQuestionnaireSession, "A parked runtime's question stays out of this route")
+
+        store.selectSession(session)
+        store.prepareComposerOptions()
+        XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
+    }
+
+    func testToolEndWhileBrowsedAwayClearsADeferredLaterQuestionRequest() throws {
+        let (store, runtime, _) = makeStore()
+        let session = try XCTUnwrap(store.sessions.first)
+        runtime.emit(toolStart(arguments: twoQuestions))
+        runtime.emit(selectRequest(id: "q1"))
+        store.saveQuestionnaireAnswer(QuestionnaireAnswer(optionIndexes: [0]), move: 1)
+        store.submitQuestionnaire(QuestionnaireAnswer(optionIndexes: [0, 1]))
+        XCTAssertEqual(runtime.responses.last?["id"]?.stringValue, "q1")
+
+        store.openNewChat()
+        runtime.emit(multiRequest(id: "q2"))
+        runtime.emit(.object(["type": .string("tool_execution_end"), "toolCallId": .string("ask-1")]))
+
+        store.selectSession(session)
+        store.prepareComposerOptions()
+        XCTAssertNil(store.pendingQuestionnaire)
+        XCTAssertNil(store.activeDialog, "A retired later question must not reappear as a generic sheet")
+        XCTAssertEqual(runtime.responses.last?["id"]?.stringValue, "q1", "The ended tool must not answer q2")
+    }
+
+    func testTurnEndDropsAQuestionQueuedBehindAGenericDialog() throws {
+        let (store, runtime, _) = makeStore()
+        runtime.emit(.object([
+            "type": .string("extension_ui_request"), "method": .string("confirm"),
+            "id": .string("generic"), "title": .string("Allow this command?")
+        ]))
+        runtime.emit(toolStart(arguments: oneQuestion))
+        runtime.emit(selectRequest(id: "q1"))
+        XCTAssertEqual(store.activeDialog?.id, "generic")
+        XCTAssertNil(store.activeQuestionnaire(for: "ask-1"), "The generic dialog still owns the FIFO head")
+
+        runtime.emit(.object(["type": .string("turn_end")]))
+        XCTAssertNil(store.pendingQuestionnaire)
+
+        store.respondToExtensionDialog(confirmed: true)
+        XCTAssertNil(store.activeDialog, "The retired question must not be promoted to a sheet")
+    }
+
+    /// The inline card is placed by tool call identity alone, so the transcript projection has to
+    /// keep carrying the same ID `pendingQuestionnaire` was created with.
+    func testTranscriptStepKeepsTheQuestionnaireToolCallID() throws {
+        let call = ToolCallPayload(id: "ask-1", name: "ask_user_question", arguments: oneQuestion)
+        let message = ChatMessage(
+            id: "m1", role: .assistant,
+            blocks: [MessageBlock(id: "b1", kind: .toolCall(call))],
+            timestamp: nil, raw: .null
+        )
+        let items = TranscriptPresenter.items(messages: [message], streaming: nil, isRunning: true)
+        let steps = items.compactMap { item -> [TranscriptActivityStep]? in
+            guard case let .work(block) = item else { return nil }
+            return block.activities.flatMap(\.steps)
+        }.flatMap { $0 }
+        XCTAssertEqual(steps.map(\.id), ["ask-1"])
+        XCTAssertEqual(steps.first?.kind, .question)
+    }
+
+    func testCancellationSendsCancelledAndClearsInlineState() throws {
         let (store, runtime, _) = makeStore()
         runtime.emit(toolStart(arguments: oneQuestion))
         runtime.emit(selectRequest(id: "q1"))

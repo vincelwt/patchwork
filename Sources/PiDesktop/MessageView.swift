@@ -135,6 +135,7 @@ struct ThinkingBlockView: View {
 struct TranscriptWorkView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @EnvironmentObject private var store: AppStore
 
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload) -> Void
@@ -143,7 +144,13 @@ struct TranscriptWorkView: View {
     @State private var userExpanded: Bool?
     @State private var hovering = false
 
-    private var isOpen: Bool { userExpanded ?? block.isActive }
+    /// A question Pi is waiting on must never be hidden under a collapsed work log.
+    private var holdsActiveQuestion: Bool {
+        guard let id = store.activeQuestionnaireSession?.toolCallID else { return false }
+        return block.activities.contains { $0.steps.contains { $0.id == id } }
+    }
+
+    private var isOpen: Bool { holdsActiveQuestion || (userExpanded ?? block.isActive) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
@@ -378,6 +385,9 @@ private struct DisclosureRow<Detail: View>: View {
     var favicon: URL?
     /// When this flips true, a disclosure that opened while work was live settles closed.
     var collapseSignal = false
+    /// Held open regardless of the user's own toggle, for a row the user must be able to act on
+    /// right now (an unanswered question). Normal behaviour resumes once it goes false.
+    var forceExpanded = false
     @ViewBuilder var detail: () -> Detail
 
     @State private var expanded: Bool
@@ -393,6 +403,7 @@ private struct DisclosureRow<Detail: View>: View {
         favicon: URL? = nil,
         initiallyExpanded: Bool = false,
         collapseSignal: Bool = false,
+        forceExpanded: Bool = false,
         @ViewBuilder detail: @escaping () -> Detail
     ) {
         self.symbol = symbol
@@ -403,13 +414,16 @@ private struct DisclosureRow<Detail: View>: View {
         self.showsProgress = showsProgress
         self.favicon = favicon
         self.collapseSignal = collapseSignal
+        self.forceExpanded = forceExpanded
         self.detail = detail
         _expanded = State(initialValue: initiallyExpanded)
     }
 
+    private var isOpen: Bool { forceExpanded || expanded }
+
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
-            Button { expanded.toggle() } label: {
+            Button { expanded = !isOpen } label: {
                 HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
                     Group {
                         if showsProgress { ProgressView().controlSize(.mini) }
@@ -435,8 +449,8 @@ private struct DisclosureRow<Detail: View>: View {
                             .lineLimit(1)
                     }
                     Spacer(minLength: PiTheme.space4)
-                    PiChevron(expanded: expanded)
-                        .opacity(hovering || expanded ? 1 : 0.35)
+                    PiChevron(expanded: isOpen)
+                        .opacity(hovering || isOpen ? 1 : 0.35)
                 }
                 .frame(minHeight: 18)
                 .contentShape(Rectangle())
@@ -444,7 +458,7 @@ private struct DisclosureRow<Detail: View>: View {
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
 
-            if expanded {
+            if isOpen {
                 detail()
                     .padding(.leading, PiTheme.gridTextInset)
             }
@@ -479,8 +493,14 @@ private struct ToolDetailText: View {
 // MARK: - Activity rollup
 
 struct TranscriptActivityGroupView: View {
+    @EnvironmentObject private var store: AppStore
     let group: TranscriptActivityGroup
     let onImage: (ImagePayload) -> Void
+
+    private var holdsActiveQuestion: Bool {
+        guard let id = store.activeQuestionnaireSession?.toolCallID else { return false }
+        return group.steps.contains { $0.id == id }
+    }
 
     var body: some View {
         DisclosureRow(
@@ -492,7 +512,8 @@ struct TranscriptActivityGroupView: View {
             // The one canonical live spinner is always the last transcript row.
             showsProgress: false,
             initiallyExpanded: group.shouldStartExpanded,
-            collapseSignal: !group.isActive
+            collapseSignal: !group.isActive,
+            forceExpanded: holdsActiveQuestion
         ) {
             VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
                 ForEach(group.steps) { step in
@@ -511,12 +532,14 @@ struct TranscriptActivityGroupView: View {
 }
 
 private struct ToolActivityStepRow: View {
+    @EnvironmentObject private var store: AppStore
     let step: TranscriptActivityStep
     /// A step left unfinished by a killed run must not spin forever in a historical transcript.
     let isLive: Bool
     let onImage: (ImagePayload) -> Void
 
     var body: some View {
+        let questionnaire = store.activeQuestionnaire(for: step.id)
         DisclosureRow(
             symbol: step.failed ? "xmark.circle" : (step.complete ? "checkmark.circle" : step.kind.symbol),
             title: step.displayName,
@@ -524,11 +547,12 @@ private struct ToolActivityStepRow: View {
             symbolTint: step.failed ? Color.piRed : .secondary,
             showsProgress: !step.complete && isLive,
             favicon: WebActivityLink.url(for: step),
-            initiallyExpanded: step.failed
+            initiallyExpanded: step.failed,
+            forceExpanded: questionnaire != nil
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
                 if step.kind == .question {
-                    QuestionnaireCallSummary(arguments: step.arguments)
+                    InlineQuestionnaire(session: questionnaire, arguments: step.arguments)
                 } else if step.arguments != .object([:]) {
                     Text("Arguments").font(PiFont.micro).foregroundStyle(.tertiary)
                     ToolDetailText(code: step.arguments.prettyPrinted(maxLength: 8_000))
@@ -574,11 +598,18 @@ private struct ConversationImage: View {
 }
 
 private struct ToolCallRow: View {
+    @EnvironmentObject private var store: AppStore
     let call: ToolCallPayload
     var body: some View {
-        DisclosureRow(symbol: ToolSymbol.forName(call.name), title: displayName, trailing: nil) {
-            if call.name == "ask_user_question" {
-                QuestionnaireCallSummary(arguments: call.arguments)
+        let questionnaire = store.activeQuestionnaire(for: call.id)
+        DisclosureRow(
+            symbol: ToolSymbol.forName(call.name),
+            title: displayName,
+            trailing: nil,
+            forceExpanded: questionnaire != nil
+        ) {
+            if call.name.lowercased() == "ask_user_question" {
+                InlineQuestionnaire(session: questionnaire, arguments: call.arguments)
             } else {
                 ToolDetailText(code: call.arguments.prettyPrinted(maxLength: 8_000))
             }
@@ -590,8 +621,24 @@ private struct ToolCallRow: View {
     }
 }
 
-/// `ask_user_question` is answered in the native sheet, so the transcript lists the questions
-/// that were asked instead of dumping the tool's raw JSON arguments.
+/// The `ask_user_question` row itself: the live control while Pi is waiting on this exact tool
+/// call, and a bounded read-only list of the questions once it is not.
+private struct InlineQuestionnaire: View {
+    let session: QuestionnaireSession?
+    let arguments: JSONValue
+
+    var body: some View {
+        if let session, let question = session.currentQuestion {
+            QuestionnaireCardView(session: session, question: question)
+                .id("\(session.toolCallID):\(question.id)")
+        } else {
+            QuestionnaireCallSummary(arguments: arguments)
+        }
+    }
+}
+
+/// A settled question: the transcript lists what was asked instead of dumping the tool's raw
+/// JSON arguments.
 private struct QuestionnaireCallSummary: View {
     let arguments: JSONValue
 
@@ -602,7 +649,7 @@ private struct QuestionnaireCallSummary: View {
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space4) {
             if questions.isEmpty {
-                Text("Asked in the native questionnaire")
+                Text("Asked inline in this conversation")
                     .font(PiFont.caption)
                     .foregroundStyle(.secondary)
             } else {
@@ -621,7 +668,7 @@ private struct QuestionnaireCallSummary: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Questions asked in the native questionnaire")
+        .accessibilityLabel("Questions asked inline in this conversation")
     }
 }
 

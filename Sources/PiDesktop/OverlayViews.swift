@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Generic extension dialogs only: `ask_user_question` renders inline in the transcript (see
+/// `QuestionnaireCardView`) and is filtered out of the sheet binding in `PiDesktopApp.swift`.
 struct ExtensionDialogView: View {
     @EnvironmentObject private var store: AppStore
     let request: ExtensionDialogRequest
@@ -12,24 +14,7 @@ struct ExtensionDialogView: View {
         _value = State(initialValue: request.prefill ?? "")
     }
 
-    @ViewBuilder var body: some View {
-        if let question = store.questionnaireQuestion(for: request),
-           let session = store.pendingQuestionnaire {
-            QuestionnaireDialogView(
-                request: request,
-                question: question,
-                questionCount: session.questions.count,
-                currentIndex: session.currentIndex,
-                headers: session.questions.map(\.header),
-                savedAnswer: session.answers[session.currentIndex]
-            )
-            .id(question.id)
-        } else {
-            genericDialog
-        }
-    }
-
-    private var genericDialog: some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space16) {
             HStack(alignment: .top, spacing: PiTheme.space10) {
                 Image(systemName: "puzzlepiece.extension.fill")
@@ -111,9 +96,11 @@ struct ExtensionDialogView: View {
     }
 }
 
-private struct QuestionnaireDialogView: View {
+/// The one questionnaire control, rendered inline in the transcript at the exact
+/// `ask_user_question` tool call row — no sheet, no scrim. It is responsive: the preview pane
+/// sits beside the options when the transcript is wide enough and stacks below when it is not.
+struct QuestionnaireCardView: View {
     @EnvironmentObject private var store: AppStore
-    let request: ExtensionDialogRequest
     let question: QuestionnaireQuestion
     let questionCount: Int
     let currentIndex: Int
@@ -125,19 +112,13 @@ private struct QuestionnaireDialogView: View {
     @State private var focusedOption = 0
     @FocusState private var customFocused: Bool
 
-    init(
-        request: ExtensionDialogRequest,
-        question: QuestionnaireQuestion,
-        questionCount: Int,
-        currentIndex: Int,
-        headers: [String],
-        savedAnswer: QuestionnaireAnswer?
-    ) {
-        self.request = request
+    init(session: QuestionnaireSession, question: QuestionnaireQuestion) {
         self.question = question
-        self.questionCount = questionCount
-        self.currentIndex = currentIndex
-        self.headers = headers
+        questionCount = session.questions.count
+        currentIndex = session.currentIndex
+        headers = session.questions.map(\.header)
+        let savedAnswer = session.answers.indices.contains(session.currentIndex)
+            ? session.answers[session.currentIndex] : nil
         _selected = State(initialValue: savedAnswer?.optionIndexes ?? [])
         _customText = State(initialValue: savedAnswer?.customText ?? "")
         _usesCustom = State(initialValue: savedAnswer?.customText != nil)
@@ -159,8 +140,13 @@ private struct QuestionnaireDialogView: View {
 
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: PiTheme.space16) {
-                    choices.frame(minWidth: 330, maxWidth: .infinity)
-                    if let preview = activePreview { previewPane(preview).frame(minWidth: 280, maxWidth: 380) }
+                    choices.frame(minWidth: PiTheme.questionnaireChoicesMinWidth, maxWidth: .infinity)
+                    if let preview = activePreview {
+                        previewPane(preview).frame(
+                            minWidth: PiTheme.questionnairePreviewMinWidth,
+                            maxWidth: PiTheme.questionnairePreviewMaxWidth
+                        )
+                    }
                 }
                 VStack(alignment: .leading, spacing: PiTheme.space12) {
                     choices
@@ -170,7 +156,6 @@ private struct QuestionnaireDialogView: View {
 
             HStack(spacing: PiTheme.space8) {
                 Button("Cancel", action: store.cancelQuestionnaire)
-                    .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Back") {
                     if answerIsValid { store.saveQuestionnaireAnswer(currentAnswer, move: -1) }
@@ -180,25 +165,33 @@ private struct QuestionnaireDialogView: View {
                 if currentIndex + 1 < questionCount {
                     Button("Next") { store.saveQuestionnaireAnswer(currentAnswer, move: 1) }
                         .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
                         .disabled(!answerIsValid)
                 } else {
                     Button("Submit") { store.submitQuestionnaire(currentAnswer) }
                         .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
                         .disabled(!answerIsValid || !otherQuestionsAnswered)
                 }
             }
         }
-        .padding(PiTheme.space20)
-        .frame(minWidth: 560, idealWidth: activePreview == nil ? 620 : 840, maxWidth: 920)
-        .background(Color.piTranscript)
-        .interactiveDismissDisabled()
+        .padding(PiTheme.space12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .piInset()
+        // Focusable so Return/Escape/space/arrows only ever act while focus is inside this card
+        // — never as window-wide default/cancel actions competing with the composer.
         .focusable()
         .onMoveCommand(perform: moveFocus)
         .onKeyPress(.space) {
             guard !customFocused else { return .ignored }
             choose(index: focusedOption)
+            return .handled
+        }
+        .onKeyPress(.return) {
+            guard !customFocused else { return .ignored }
+            submitOrAdvance()
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            store.cancelQuestionnaire()
             return .handled
         }
         .accessibilityElement(children: .contain)
@@ -336,8 +329,8 @@ private struct QuestionnaireDialogView: View {
                 MarkdownBlockView(text: preview)
                     .padding(PiTheme.space10)
             }
-            .frame(maxHeight: 320)
-            .piInset()
+            .frame(maxHeight: PiTheme.questionnairePreviewMaxHeight)
+            .piInset(strong: true)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Option preview")

@@ -26,7 +26,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, drop, file attach, preview, remove, open, zoom, and save for images
 - Subagent/background-process lifecycle presentation and Pi extension UI dialogs/status/widgets/title/editor bridge
-- A native `ask_user_question` sheet with option cards, previews, custom answers, and header-chip navigation across buffered questions. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
+- A native `ask_user_question` questionnaire rendered inline in the transcript at its own tool call row instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. The work log and its rows are held open while a question is unanswered so it cannot hide under a collapsed turn, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels
 
 No provider request is made when the app launches, browses sessions, inspects Git, or renames a session.

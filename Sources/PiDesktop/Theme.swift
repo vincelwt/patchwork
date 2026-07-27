@@ -34,6 +34,13 @@ enum PiTheme {
     /// inspector column is not reserved at all.
     static let conversationMinimumWidth: CGFloat = 560
 
+    /// The inline questionnaire lives inside an already-indented transcript row, so its two
+    /// panes only sit side by side when both still fit; below that `ViewThatFits` stacks them.
+    static let questionnaireChoicesMinWidth: CGFloat = 280
+    static let questionnairePreviewMinWidth: CGFloat = 220
+    static let questionnairePreviewMaxWidth: CGFloat = 380
+    static let questionnairePreviewMaxHeight: CGFloat = 320
+
     // Rows
     static let rowHeight: CGFloat = 28
     static let sidebarRowHeight: CGFloat = 27
