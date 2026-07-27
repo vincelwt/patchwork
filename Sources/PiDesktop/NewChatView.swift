@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 struct NewChatView: View {
@@ -10,7 +9,7 @@ struct NewChatView: View {
                 Spacer()
                 Text("Start a conversation")
                     .font(PiFont.displayTitle)
-                Text("Pi will work in the folder you choose.")
+                Text("Start globally, or choose a project folder.")
                     .font(PiFont.body)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -59,16 +58,23 @@ struct NewChatView: View {
         }
     }
 
+    private var isGlobal: Bool {
+        store.selectedFolder.map(WorkspaceOrganization.isGlobalWorkingDirectory) ?? true
+    }
+
+    private var workingFolders: [URL] { store.sidebarFolders }
+
     private var folderContext: some View {
         HStack(spacing: PiTheme.space8) {
-            Image(systemName: "folder")
+            Image(systemName: isGlobal ? "globe" : "folder")
                 .font(.system(size: PiIcon.small))
                 .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 0) {
-                Text(store.selectedFolder?.lastPathComponent ?? "Choose a working folder")
+                Text(isGlobal ? "Global" : (store.selectedFolder?.lastPathComponent ?? "Choose a working folder"))
                     .font(PiFont.rowEmphasis)
                     .lineLimit(1)
-                Text(store.selectedFolder?.path ?? "Pi uses this as its current directory")
+                Text(isGlobal ? "Not tied to a project folder" : (store.selectedFolder?.path ?? "Pi uses this as its current directory"))
                     .font(PiFont.micro)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -83,34 +89,36 @@ struct NewChatView: View {
                     .help(store.selectedGit.statusHint ?? "Git branch")
             }
             Menu {
-                if !store.recentFolders.isEmpty {
-                    ForEach(store.recentFolders, id: \.path) { folder in
-                        Button(folder.lastPathComponent.isEmpty ? folder.path : folder.lastPathComponent) {
-                            store.chooseFolder(folder)
-                        }
-                        .help(folder.path)
-                    }
-                    Divider()
+                Button {
+                    store.chooseFolder(WorkspaceOrganization.globalWorkingDirectory)
+                } label: {
+                    Label("Global", systemImage: isGlobal ? "checkmark" : "globe")
                 }
-                Button("Browse…", action: browseForFolder)
+                .accessibilityValue(isGlobal ? "Selected" : "")
+                if !workingFolders.isEmpty { Divider() }
+                ForEach(workingFolders, id: \.path) { folder in
+                    let selected = store.selectedFolder?.standardizedFileURL.path == folder.standardizedFileURL.path
+                    Button {
+                        store.chooseFolder(folder)
+                    } label: {
+                        Label(
+                            folder.lastPathComponent.isEmpty ? folder.path : folder.lastPathComponent,
+                            systemImage: selected ? "checkmark" : "folder"
+                        )
+                    }
+                    .help(folder.path)
+                    .accessibilityValue(selected ? "Selected" : folder.path)
+                }
             } label: {
                 Text("Choose…").font(PiFont.caption)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel("Conversation scope")
+            .accessibilityValue(isGlobal ? "Global" : (store.selectedFolder?.lastPathComponent ?? "No folder"))
         }
         .padding(.horizontal, PiTheme.space10)
         .frame(height: 40)
         .piInset()
-    }
-
-    private func browseForFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a working folder for Pi"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.directoryURL = store.selectedFolder
-        if panel.runModal() == .OK, let url = panel.url { store.chooseFolder(url) }
     }
 }

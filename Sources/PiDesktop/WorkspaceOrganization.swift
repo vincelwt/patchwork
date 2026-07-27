@@ -34,6 +34,14 @@ struct VirtualFolder: Identifiable, Codable, Hashable, Sendable {
 
 /// Pure CRUD/move/tree rules shared by persistence and tests.
 enum WorkspaceOrganization {
+    /// Pi requires a cwd even for a conversation that is not tied to a project.
+    static let globalWorkingDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Desktop", isDirectory: true)
+
+    static func isGlobalWorkingDirectory(_ url: URL) -> Bool {
+        url.standardizedFileURL.path == globalWorkingDirectory.standardizedFileURL.path
+    }
+
     static func cleanedName(_ name: String) -> String? {
         let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : String(value.prefix(80))
@@ -334,12 +342,6 @@ extension AppPersistence {
 
 @MainActor
 extension AppStore {
-    /// "Nowhere" is deliberately ordinary and safe: Pi starts in ~/Desktop until the user
-    /// chooses another cwd. This is the integration surface for NewChatView.
-    static var nowhereFolderURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop", isDirectory: true)
-    }
-
     var virtualFolders: [VirtualFolder] { persistence.state.virtualFolders }
     var virtualFolderAssignments: [String: String] { persistence.state.virtualFolderAssignments }
 
@@ -351,7 +353,7 @@ extension AppStore {
 
     func displayFolderName(for session: SessionSummary) -> String {
         guard let id = virtualFolderID(for: session), let folder = virtualFolders.first(where: { $0.id == id }) else {
-            return session.folderName
+            return WorkspaceOrganization.isGlobalWorkingDirectory(session.cwd) ? "Global" : session.folderName
         }
         return folder.name
     }
@@ -385,16 +387,15 @@ extension AppStore {
 
     /// Working directory for a chat started via a virtual folder's `+`/"New Chat Here"; see
     /// `WorkspaceOrganization.defaultWorkingDirectory` for the exact preference order.
-    /// `selectedFolder` stands in for "the current default" (its last tier): it already holds
-    /// whichever folder a plain "New chat" would use — the most recently used one, or the safe
-    /// home-directory fallback before any folder has ever been chosen.
+    /// `selectedFolder` stands in for the current default (its last tier). `openNewChat()` sets
+    /// it to the global Desktop cwd before a folder-scoped action chooses anything else.
     func defaultWorkingDirectory(forVirtualFolder folderID: String) -> URL {
         WorkspaceOrganization.defaultWorkingDirectory(
             forVirtualFolder: folderID,
             sessions: sessions,
             assignments: virtualFolderAssignments,
             folders: virtualFolders,
-            fallback: selectedFolder ?? Self.nowhereFolderURL
+            fallback: selectedFolder ?? WorkspaceOrganization.globalWorkingDirectory
         )
     }
 

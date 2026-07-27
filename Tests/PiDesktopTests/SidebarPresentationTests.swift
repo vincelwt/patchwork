@@ -60,6 +60,18 @@ final class SidebarPresentationTests: XCTestCase {
         XCTAssertEqual(snapshot.activeGroups.flatMap(\.sessions).map(\.id), ["kept"])
         XCTAssertEqual(snapshot.archivedGroups.flatMap(\.sessions).map(\.id), ["shelved"])
     }
+
+    func testGlobalDesktopConversationsAppearFirstUnderRecents() {
+        let desktop = WorkspaceOrganization.globalWorkingDirectory.standardizedFileURL.path
+        let snapshot = SidebarSnapshot(sessions: [
+            summary(id: "project", cwd: "/tmp/project", archived: false, modifiedAt: Date()),
+            summary(id: "global", cwd: desktop, archived: false, modifiedAt: .distantPast)
+        ], query: "")
+
+        XCTAssertEqual(snapshot.activeGroups.first?.name, "Recents")
+        XCTAssertTrue(snapshot.activeGroups.first?.isGlobal == true)
+        XCTAssertEqual(snapshot.activeGroups.first?.sessions.map(\.id), ["global"])
+    }
 }
 
 /// The sidebar retains semantic roles for weight and colour, but all roles resolve to the app's

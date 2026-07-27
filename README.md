@@ -7,7 +7,8 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 
 ## Features
 
-- Minimal three-column workspace: folder-grouped session sidebar, centered transcript/composer, and a reserved Environment inspector column
+- Minimal three-column workspace: global conversations under **Recents**, folder-grouped project sessions, a centered transcript/composer, and a reserved Environment inspector column
+- New conversations start globally (Pi uses `~/Desktop` as its neutral cwd); **Choose…** lists only projects already known from sidebar conversations
 - App-owned folders that nest at any depth, inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
 - Codex-style turns: streamed reasoning stays visible, tool calls roll up into fading live activity, and the work log smoothly collapses into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
@@ -176,7 +177,7 @@ Archiving never moves or edits a Pi JSONL file.
 - Abandoned branches and raw/base64 trees are not retained. A torn final JSONL line is invisible until complete.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
 - Streaming is rendered separately instead of allocating `messages + [streamingMessage]` on every token; transcript projection is memoized by content revision, scroll callbacks are coalesced, and route anchors no longer invalidate the view while the user scrolls.
-- Git refresh pauses while the app is inactive, refreshes the selected folder at a modest interval, and avoids a full session rescan/reload after every settled turn. A folder shown only as the passive pre-selection default (not yet chosen by the user, and not backing any real session) never triggers a refresh at all, so a fresh launch never touches a TCC-protected folder like Desktop just to draw the New Chat screen.
+- Git refresh pauses while the app is inactive, refreshes the selected project folder at a modest interval, and avoids a full session rescan/reload after every settled turn. Global mode's neutral `~/Desktop` cwd is always excluded from passive Git inspection, so drawing New Chat never touches Desktop; Pi uses it only after the user sends a prompt.
 - Image imports are limited to 8 images, 16 MB each and 64 MB total, with decoded `NSImage` reuse. Clipboard-only images are materialized in a temporary cache capped at 64 files / 1 GB so every prompt can carry a usable path.
 - The transcript cache bounds both entry count and estimated byte cost (text plus already-budgeted image bytes), evicting least-recently-used windows first.
 - Opening uses SwiftUI's native bottom anchor plus one explicit settled-position restore. TextKit supplies a nonzero first-pass measure even before SwiftUI proposes a width. A loading indicator is delayed 120 ms so ordinary page reads do not flash; cached windows can restore an in-memory row anchor, while unread sessions target the first unseen completion available in the loaded page.
