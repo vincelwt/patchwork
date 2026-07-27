@@ -12,7 +12,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Codex-style turns: streamed reasoning stays visible, tool calls roll up into fading live activity, and the work log smoothly collapses into one “Worked for 4m 1s” line as the answer starts. Compaction and branch summaries are shown as their own transcript events.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
-- Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Clicking a banner opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
+- Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, and a finished-turn notification shows the beginning of Pi's actual answer instead of a generic phrase.
 - Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - A Pi crash or disconnect mid-turn is shown persistently in the conversation (not just a toast) with the exact last message ready to resend in one click; provider/network failures and exhausted auto-retries are shown the same durable way
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening shows the latest 50 messages and scrolling upward pages through the active JSONL branch without an eager full-history parse
@@ -20,7 +20,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history continues to come from the session file/cache
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
-- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes
+- Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. Escape stops a running turn only when an app-held message is queued, promoting it to the follow-up that continues; double-Escape clears that queue and fully stops the run.
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
@@ -87,7 +87,7 @@ back to a bounded file heuristic. Opt out with
 
 ## Run during development
 
-Requirements: macOS 14+, Xcode command-line tools, and Pi installed.
+Requirements: macOS 14+, Xcode 26+ (for packaging the Icon Composer app icon), and Pi installed.
 
 ```bash
 cd /Users/vince/code/pi-desktop

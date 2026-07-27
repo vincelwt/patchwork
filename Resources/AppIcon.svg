@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Pi Desktop">
-  <!-- Transparent outside the icon; intentionally flat and monochrome. -->
-  <path fill="#fff" stroke="#111" stroke-width="8"
-        d="M256 100h512c100 0 156 56 156 156v512c0 100-56 156-156 156H256c-100 0-156-56-156-156V256c0-100 56-156 156-156Z"/>
-  <!-- Geometric lowercase pi. -->
-  <path fill="#000"
-        d="M252 296h520v108h-76v250c0 69 28 100 86 106v104c-126-4-198-78-198-206V404H440v254c0 128-72 202-198 206V760c58-6 86-37 86-106V404h-76V296Z"/>
-</svg>

@@ -181,6 +181,8 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertTrue(spy.presented.isEmpty, "Frontmost uses an in-app banner")
         let toast = try XCTUnwrap(store.toast)
         XCTAssertEqual(toast.sessionPath, session.fileURL.standardizedFileURL.path)
+        XCTAssertEqual(toast.text, NotificationTrigger.turnFinished.summary)
+        XCTAssertFalse(toast.text.contains(session.displayName), "In-app banners omit the conversation name")
         store.openToast(toast)
         XCTAssertEqual(store.selectedSession?.id, session.id)
     }
