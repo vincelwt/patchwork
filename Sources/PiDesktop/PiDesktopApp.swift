@@ -125,6 +125,8 @@ struct RootView: View {
             .frame(minWidth: 500)
         }
         .navigationSplitViewStyle(.balanced)
+        .toolbar(removing: .sidebarToggle)
+        .piPlainToolbar { sidebarToggleItem }
         // Extension `setTitle` drives the real window title, not just an inspector field.
         .navigationTitle(store.windowTitle)
         .onAppear { updateSidebar(for: geometry.size.width) }
@@ -175,6 +177,23 @@ struct RootView: View {
         }
         }
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+    }
+
+    /// Lives on the split view, not the sidebar column, so it survives the column being hidden.
+    /// Setting `columnVisibility` without arming `expectedPolicyVisibility` is deliberate: the
+    /// `onChange` above must read this as a user override, exactly as the automatic toggle did.
+    @ToolbarContentBuilder
+    private var sidebarToggleItem: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button {
+                columnVisibility = columnVisibility == .detailOnly ? .all : .detailOnly
+            } label: {
+                Image(systemName: "sidebar.left").font(.system(size: PiIcon.small, weight: .regular))
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Toggle Sidebar")
+            .help("Show or hide the sidebar")
+        }
     }
 
     /// An `ask_user_question` request keeps its place in the store — it still owns the response
