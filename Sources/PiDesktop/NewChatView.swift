@@ -47,6 +47,13 @@ struct NewChatView: View {
             .frame(maxWidth: .infinity)
             .background(Color.piTranscript)
         }
+        .contentShape(Rectangle())
+        .dropDestination(for: URL.self) { urls, _ in
+            let images = ImageImportService.attachments(from: urls)
+            guard !images.isEmpty else { return false }
+            store.addAttachments(images)
+            return true
+        }
     }
 
     private var folderContext: some View {

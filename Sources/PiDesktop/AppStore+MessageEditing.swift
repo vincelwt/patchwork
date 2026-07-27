@@ -55,9 +55,7 @@ extension AppStore {
         let state = editState
         guard !state.isResubmitting, let target = lastUserMessage else { return }
         draft = Self.editableText(from: target)
-        attachments = target.images.map {
-            ImageAttachment(data: $0.data, mimeType: $0.mimeType, fileName: $0.fileName ?? "Image.png")
-        }
+        attachments = target.images.compactMap(ImageImportService.attachment)
         state.targetMessageID = target.id
         state.targetSessionKey = editSessionKey
         objectWillChange.send()
