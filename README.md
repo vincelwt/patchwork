@@ -85,7 +85,7 @@ before the extension existed fall back to a bounded file heuristic. Opt out with
 
 ## Run during development
 
-Requirements: macOS 14+, Xcode command-line tools, and Pi installed.
+Requirements: macOS 14+, Xcode 26+ (for packaging the Icon Composer app icon), and Pi installed.
 
 ```bash
 cd /Users/vince/code/pi-desktop

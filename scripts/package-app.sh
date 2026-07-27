@@ -29,9 +29,23 @@ cp "$BIN_DIR/pi-deskd" "$APP/Contents/Helpers/pi-deskd"
 cp "$BIN_DIR/pidesk" "$APP/Contents/Helpers/pidesk"
 chmod +x "$APP/Contents/Helpers/pi-deskd" "$APP/Contents/Helpers/pidesk"
 
-# Keep the vector SVG as the source of truth and regenerate a complete iconset.
-swift scripts/make-icon.swift
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+# Compile the layered Icon Composer source. actool emits both the dynamic catalog used by
+# current macOS and a legacy .icns fallback for the app's macOS 14 minimum.
+ICON_OUT="$(mktemp -d)"
+trap 'rm -rf "$ICON_OUT"' EXIT
+xcrun actool "$ROOT/Resources/AppIcon.icon" \
+  --compile "$ICON_OUT" \
+  --output-format human-readable-text \
+  --notices --warnings \
+  --output-partial-info-plist "$ICON_OUT/generated.plist" \
+  --app-icon AppIcon \
+  --include-all-app-icons \
+  --enable-on-demand-resources NO \
+  --development-region en \
+  --target-device mac \
+  --minimum-deployment-target 14.0 \
+  --platform macosx
+cp "$ICON_OUT/AppIcon.icns" "$ICON_OUT/Assets.car" "$APP/Contents/Resources/"
 
 # Source of truth for the activity-heartbeat extension the app installs into
 # ~/.pi/agent/extensions/; see ActivityExtensionInstaller.swift.
@@ -53,6 +67,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>Pi Desktop</string>
