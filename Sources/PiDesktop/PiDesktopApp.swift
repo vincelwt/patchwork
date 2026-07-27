@@ -45,6 +45,7 @@ struct PiDesktopApp: App {
                     .keyboardShortcut("a", modifiers: [.command, .shift])
                     .disabled(store.selectedSession == nil)
                 Button("Rename…") { store.renameRequested = true }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(store.selectedSession == nil)
                 Button("Mark as Unread") { store.markSelectedUnread() }
                     .keyboardShortcut("u", modifiers: [.command, .option])

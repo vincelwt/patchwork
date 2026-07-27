@@ -1,7 +1,8 @@
-// pi-desktop-activity-version: 5
+// pi-desktop-activity-version: 6
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
-// active and routes thread-created schedules into Pi Desktop's durable Automations service.
+// active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
+// durable Automations service.
 // Activity reporting lets the app avoid matching `ps`/`lsof` output
 // (Pi's process title is indistinguishable from a bare interpreter) or a working directory
 // (several sessions can share one). Hand edits survive future Pi Desktop launches unless the
@@ -396,6 +397,35 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       },
     });
   }
+
+  pi.registerTool({
+    name: "set_conversation_name",
+    label: "Name Conversation",
+    description: "Set a concise display name for the current conversation when it does not already have one.",
+    promptSnippet: "Set a concise semantic name for a new conversation",
+    promptGuidelines: [
+      "After understanding the first user message in a new conversation, call set_conversation_name once with a concise 3-7 word title that describes the goal instead of copying the opening text. Do not rename an already named conversation.",
+    ],
+    parameters: Type.Object({
+      name: Type.String({ description: "Concise 3-7 word conversation title." }),
+    }),
+    async execute(_toolCallId, params) {
+      const current = pi.getSessionName();
+      if (current) {
+        return {
+          content: [{ type: "text", text: `Conversation is already named “${current}”.` }],
+          details: { name: current, changed: false },
+        };
+      }
+      const name = params.name.trim();
+      if (!name) throw new Error("Conversation name cannot be empty.");
+      pi.setSessionName(name);
+      return {
+        content: [{ type: "text", text: `Conversation named “${name}”.` }],
+        details: { name, changed: true },
+      };
+    },
+  });
 
   pi.registerTool({
     name: "schedule_automation",
