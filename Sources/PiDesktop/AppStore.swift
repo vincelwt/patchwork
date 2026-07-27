@@ -1406,6 +1406,23 @@ final class AppStore: ObservableObject {
         return session.currentQuestion
     }
 
+    /// The questionnaire Pi is actually waiting on in the conversation on screen. Nil until the
+    /// first matching `extension_ui_request` lands (there is nothing to answer before it), and
+    /// nil while another conversation is browsed, so the inline card never accepts input Pi has
+    /// not asked for.
+    var activeQuestionnaireSession: QuestionnaireSession? {
+        guard isSelectedRuntime, let session = pendingQuestionnaire,
+              let request = activeDialog, questionnaireQuestion(for: request) != nil else { return nil }
+        return session
+    }
+
+    /// Tool call identity is exact: `pendingQuestionnaire.toolCallID` is the tool call ID the
+    /// transcript row carries, so a question in another transcript can never match this row.
+    func activeQuestionnaire(for toolCallID: String) -> QuestionnaireSession? {
+        guard let session = activeQuestionnaireSession, session.toolCallID == toolCallID else { return nil }
+        return session
+    }
+
     func saveQuestionnaireAnswer(_ answer: QuestionnaireAnswer, move: Int) {
         guard var session = pendingQuestionnaire, !session.submitted,
               let question = session.currentQuestion,
@@ -1451,6 +1468,54 @@ final class AppStore: ObservableObject {
         guard pendingQuestionnaire != nil else { return }
         pendingQuestionnaire = nil
         respondToExtensionDialog(cancelled: true)
+    }
+
+    /// Drops the buffered questionnaire and any extension request still parked for it, so a tool
+    /// call that already ended can never resurface later as a generic sheet.
+    private func discardQuestionnaire() {
+        guard let session = pendingQuestionnaire else { return }
+        pendingQuestionnaire = nil
+        if let active = activeDialog, questionnaireRequest(active, belongsTo: session) {
+            advanceDialogQueue()
+        } else {
+            dialogQueue.removeAll { questionnaireRequest($0, belongsTo: session) }
+        }
+    }
+
+    /// The same cleanup for a parked runtime. Requests may be in its saved FIFO or still be raw
+    /// deferred events that have never reached `handleExtensionUI`.
+    private func discardQuestionnaire(from slot: RuntimeSlot) {
+        guard let session = slot.questionnaire else { return }
+        slot.questionnaire = nil
+        slot.dialogs.removeAll { questionnaireRequest($0, belongsTo: session) }
+        slot.deferredEvents.removeAll { deferredRequest($0, belongsTo: session) }
+    }
+
+    private func questionnaireRequest(
+        _ request: ExtensionDialogRequest,
+        belongsTo session: QuestionnaireSession
+    ) -> Bool {
+        if session.questions.contains(where: { QuestionnaireRPCBridge.matches(request, question: $0) }) {
+            return true
+        }
+        // A custom single-select answer produces one follow-up input request with no question
+        // title; the sequential bridge likewise identifies it solely by this pending value.
+        return session.awaitingCustomText != nil && request.method == .input
+    }
+
+    private func deferredRequest(_ event: JSONValue, belongsTo session: QuestionnaireSession) -> Bool {
+        guard event["type"]?.stringValue == "extension_ui_request",
+              let rawMethod = event["method"]?.stringValue,
+              let method = ExtensionDialogRequest.Method(rawValue: rawMethod) else { return false }
+        return questionnaireRequest(
+            ExtensionDialogRequest(
+                id: event["id"]?.stringValue ?? "",
+                method: method,
+                title: event["title"]?.stringValue ?? "Pi",
+                raw: .null
+            ),
+            belongsTo: session
+        )
     }
 
     private func sendExtensionResponse(
@@ -1884,7 +1949,7 @@ final class AppStore: ObservableObject {
                 state.isRetrying = false
             }
             slot.capability = nil
-            slot.questionnaire = nil
+            discardQuestionnaire(from: slot)
             slot.streamingMessage = nil
             slot.pendingTurn = nil
             let startedFollowUp = flushBackgroundOutbox(.followUp, slot: slot)
@@ -1956,11 +2021,11 @@ final class AppStore: ObservableObject {
         case "tool_execution_end":
             if let id = event["toolCallId"]?.stringValue {
                 if slot.capability?.sourceID == id { slot.capability = nil }
-                if slot.questionnaire?.toolCallID == id { slot.questionnaire = nil }
+                if slot.questionnaire?.toolCallID == id { discardQuestionnaire(from: slot) }
             }
         case "turn_end":
             slot.capability = nil
-            slot.questionnaire = nil
+            discardQuestionnaire(from: slot)
             _ = flushBackgroundOutbox(.steer, slot: slot)
         case "agent_end", "turn_start", "message_start", "tool_execution_update",
              "bash_execution_update", "summarization_retry_scheduled", "summarization_retry_attempt_start",
@@ -2065,6 +2130,7 @@ final class AppStore: ObservableObject {
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
             activeCapability = nil
+            discardQuestionnaire()
             streamingMessage = nil
             flushOutbox(.followUp)
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
@@ -2122,9 +2188,12 @@ final class AppStore: ObservableObject {
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
             activities[index].detail = extractResultText(event["partialResult"])?.suffixString(900)
         case "tool_execution_end":
-            guard selected, let id = event["toolCallId"]?.stringValue else { return }
+            guard let id = event["toolCallId"]?.stringValue else { return }
+            // The question belongs to the attached runtime, not to whatever is on screen, so it
+            // is retired here even while the user browses another conversation.
+            if pendingQuestionnaire?.toolCallID == id { discardQuestionnaire() }
+            guard selected else { return }
             if activeCapability?.sourceID == id { activeCapability = nil }
-            if pendingQuestionnaire?.toolCallID == id { pendingQuestionnaire = nil }
             if let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) {
                 activities[index].status = event["isError"]?.boolValue == true ? .failed : .succeeded
                 activities[index].endedAt = Date()
@@ -2157,7 +2226,7 @@ final class AppStore: ObservableObject {
         case "extension_error": showToast(event["error"]?.stringValue ?? "A Pi extension failed.", style: .error)
         case "turn_end":
             activeCapability = nil
-            pendingQuestionnaire = nil
+            discardQuestionnaire()
             // Pi delivers steering at exactly this boundary, so holding it until now costs
             // nothing and keeps it editable for as long as possible.
             flushOutbox(.steer)
@@ -2195,7 +2264,7 @@ final class AppStore: ObservableObject {
         }
         let question = session.questions[session.nextRPCQuestionIndex]
         guard QuestionnaireRPCBridge.matches(request, question: question) else { return false }
-        guard session.submitted else { return false } // The first request owns the native sheet.
+        guard session.submitted else { return false } // The first request owns the inline card.
         sendQuestionnaireResponse(request: request, questionIndex: session.nextRPCQuestionIndex, queued: false)
         return true
     }

@@ -144,7 +144,7 @@ struct RootView: View {
         } message: {
             Text("Virtual folders organize conversations without changing files on disk.")
         }
-        .sheet(item: $store.activeDialog) { request in
+        .sheet(item: sheetDialog) { request in
             ExtensionDialogView(request: request).environmentObject(store)
         }
         .sheet(item: $store.viewedImage) { item in ImageViewerView(payload: item.image) }
@@ -172,6 +172,16 @@ struct RootView: View {
         }
         }
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+    }
+
+    /// An `ask_user_question` request keeps its place in the store — it still owns the response
+    /// ID, the FIFO slot, and the timeout — but renders inline at its transcript row, so only
+    /// generic extension dialogs ever reach the sheet.
+    private var sheetDialog: Binding<ExtensionDialogRequest?> {
+        Binding(
+            get: { store.activeDialog.flatMap { store.questionnaireQuestion(for: $0) == nil ? $0 : nil } },
+            set: { _ in }
+        )
     }
 
     /// Automations is a page, not an `AppRoute`: `store.route` (and with it the selected

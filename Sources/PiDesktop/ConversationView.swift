@@ -234,6 +234,11 @@ struct MessageScrollView: View {
 
     private var lastUserMessageID: String? { messages.last(where: { $0.role == .user })?.id }
 
+    /// Changes when the inline questionnaire appears or moves to another buffered question.
+    private var questionnaireKey: String? {
+        store.activeQuestionnaireSession.map { "\($0.toolCallID):\($0.currentIndex)" }
+    }
+
     var body: some View {
         ScrollViewReader { reader in
             ScrollView {
@@ -311,6 +316,11 @@ struct MessageScrollView: View {
                 }
             }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in
+                scheduleBottomScroll(reader)
+            }
+            // Only when already pinned (`scheduleBottomScroll` checks): a question appearing must
+            // never yank a user who is reading history back to the bottom.
+            .onChange(of: questionnaireKey) { _, _ in
                 scheduleBottomScroll(reader)
             }
             .onDisappear { scrollTask?.cancel() }
