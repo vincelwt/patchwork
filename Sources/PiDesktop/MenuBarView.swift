@@ -18,6 +18,15 @@ enum MenuBarPanelLayout {
         let sessions = min(PiTheme.menuBarSessionsIdealHeight, max(0, budget - limits))
         return (sessions, limits)
     }
+
+    static func sessionHeight(count: Int, maxHeight: CGFloat) -> CGFloat {
+        guard count > 0 else { return 0 }
+        let rows = min(count, sessionDisplayLimit)
+        let contentHeight = CGFloat(rows) * PiTheme.menuBarSessionRowHeight
+            + CGFloat(rows - 1) * PiTheme.space2
+            + 2 * PiTheme.space4
+        return min(contentHeight, maxHeight)
+    }
 }
 
 /// Reuses the shared activity monitor; the menu bar never starts its own timer or file poll.
@@ -27,6 +36,9 @@ struct MenuBarContentView: View {
     private var account: CodexAccountStatus? { store.statusModel.codexAccount }
     private var heights: (sessions: CGFloat, limits: CGFloat) {
         MenuBarPanelLayout.heights(availableHeight: MenuBarPanelLayout.availableScreenHeight)
+    }
+    private var sessionHeight: CGFloat {
+        MenuBarPanelLayout.sessionHeight(count: running.count, maxHeight: heights.sessions)
     }
 
     var body: some View {
@@ -60,7 +72,7 @@ struct MenuBarContentView: View {
                     }
                     .padding(PiTheme.space4)
                 }
-                .frame(height: heights.sessions)
+                .frame(height: sessionHeight)
             }
 
             PiHairline()

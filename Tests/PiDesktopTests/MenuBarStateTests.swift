@@ -63,4 +63,10 @@ final class MenuBarPanelLayoutTests: XCTestCase {
         XCTAssertEqual(roomy.sessions, PiTheme.menuBarSessionsIdealHeight)
         XCTAssertEqual(roomy.limits, PiTheme.menuBarLimitsIdealHeight)
     }
+
+    func testSessionHeightFitsRowsThenCapsForScrolling() {
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 0, maxHeight: 480), 0)
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 3, maxHeight: 480), 126)
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 50, maxHeight: 300), 300)
+    }
 }
