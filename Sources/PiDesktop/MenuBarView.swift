@@ -27,6 +27,33 @@ enum MenuBarPanelLayout {
             + 2 * PiTheme.space4
         return min(contentHeight, maxHeight)
     }
+
+    /// x origin that centers a `panelWidth`-wide panel under `clickX`, kept inside `visibleFrame`.
+    static func anchoredX(clickX: CGFloat, panelWidth: CGFloat, visibleFrame: CGRect) -> CGFloat {
+        let rightmost = max(visibleFrame.minX, visibleFrame.maxX - panelWidth)
+        return min(max(clickX - panelWidth / 2, visibleFrame.minX), rightmost)
+    }
+
+    /// macOS 27 beta opens the `.window` MenuBarExtra panel at the screen's top-right instead of
+    /// under the clicked status item. Called as the panel's content appears — while the pointer is
+    /// still in the menu bar strip — this nudges only the panel's x origin back under that click.
+    /// Native y placement and dismissal are untouched.
+    /// ponytail: no version gate; centering under the click is correct on every macOS.
+    @MainActor
+    static func anchorPanelToClick() {
+        let click = NSEvent.mouseLocation
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(click) }) ?? NSScreen.main,
+              click.y >= screen.visibleFrame.maxY else { return }  // pointer is not in the menu bar
+        let visibleFrame = screen.visibleFrame
+        // The panel does not exist yet on this turn of the main loop.
+        DispatchQueue.main.async {
+            guard let panel = NSApplication.shared.windows.first(where: {
+                $0.isVisible && $0.level == .popUpMenu
+            }) else { return }
+            let x = anchoredX(clickX: click.x, panelWidth: panel.frame.width, visibleFrame: visibleFrame)
+            panel.setFrameOrigin(NSPoint(x: x, y: panel.frame.origin.y))
+        }
+    }
 }
 
 /// Reuses the shared activity monitor; the menu bar never starts its own timer or file poll.
@@ -92,6 +119,7 @@ struct MenuBarContentView: View {
             .padding(PiTheme.space4)
         }
         .frame(width: PiTheme.menuBarWidth)
+        .onAppear { MenuBarPanelLayout.anchorPanelToClick() }
     }
 
     private var runningTitle: String {
