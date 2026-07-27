@@ -1318,6 +1318,169 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Pi sessions are append-only, so editing a sent turn means forking immediately before the
+    /// original entry and continuing in the new session. Only the active transcript moves; the
+    /// abandoned answer remains available in the source session.
+    func forkAndSubmitEditedMessage(
+        targetID: String,
+        targetText: String,
+        messagesBeforeTarget: [ChatMessage],
+        completion: @escaping () -> Void
+    ) {
+        guard let source = selectedSession else { completion(); return }
+        let sourcePath = source.fileURL.standardizedFileURL.path
+        let fail: (String, ToastMessage.Style) -> Void = { [weak self] message, style in
+            self?.showToast(message, style: style)
+            completion()
+        }
+
+        ensureRuntime(cwd: source.cwd, sessionPath: source.fileURL) { [weak self] result in
+            guard let self else { completion(); return }
+            guard case let .success(slot) = result else {
+                if case let .failure(error) = result { fail(error.localizedDescription, .error) }
+                return
+            }
+            guard slot === activeRuntimeSlot,
+                  selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
+                completion()
+                return
+            }
+            guard !state(for: slot).isStreaming else {
+                fail("Pi did not stop the current turn, so the edit was not sent.", .warning)
+                return
+            }
+
+            let invalidateForkedRuntime = { [weak self, weak slot] in
+                guard let self, let slot else { return }
+                slot.isReady = false
+                slot.runtime.stop()
+                removeParkedReference(to: slot)
+                updateState(for: slot) { state in
+                    state.isConnected = false
+                    state.isStreaming = false
+                    state.phase = .idle
+                }
+            }
+
+            let sendFork: (String) -> Void = { [weak self, weak slot] entryID in
+                guard let self, let slot else { completion(); return }
+                slot.runtime.send(type: "fork", payload: ["entryId": .string(entryID)]) { [weak self, weak slot] result in
+                    guard let self, let slot else { completion(); return }
+                    switch result {
+                    case let .failure(error):
+                        if RPCFailureHandling.isOutcomeUnknown(error) { invalidateForkedRuntime() }
+                        fail(error.localizedDescription, RPCFailureHandling.isOutcomeUnknown(error) ? .warning : .error)
+                        return
+                    case let .success(response):
+                        if let error = responseError(response) { fail(error, .error); return }
+                        if response["data"]?["cancelled"]?.boolValue == true {
+                            fail("A Pi extension cancelled the edit.", .warning)
+                            return
+                        }
+                    }
+
+                    slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+                        guard let self, let slot else { completion(); return }
+                        guard slot === activeRuntimeSlot,
+                              selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
+                            invalidateForkedRuntime()
+                            completion()
+                            return
+                        }
+                        let response: JSONValue
+                        switch result {
+                        case let .failure(error):
+                            invalidateForkedRuntime()
+                            fail(error.localizedDescription, .error)
+                            return
+                        case let .success(value):
+                            response = value
+                        }
+                        guard responseError(response) == nil,
+                              let data = response["data"],
+                              let sessionFile = data["sessionFile"]?.stringValue,
+                              let sessionID = data["sessionId"]?.stringValue else {
+                            invalidateForkedRuntime()
+                            fail(responseError(response) ?? "Pi did not report the edited conversation.", .error)
+                            return
+                        }
+
+                        let url = URL(fileURLWithPath: sessionFile).standardizedFileURL
+                        guard url.path != sourcePath else {
+                            invalidateForkedRuntime()
+                            fail("Pi did not create an edited conversation.", .error)
+                            return
+                        }
+                        applyState(data, to: slot)
+                        slot.startedForNewChat = false
+
+                        let forked: SessionSummary
+                        if let existing = sessions.first(where: { $0.fileURL.standardizedFileURL.path == url.path }) {
+                            forked = existing
+                        } else {
+                            var provisional = SessionSummary(
+                                id: sessionID, fileURL: url, cwd: source.cwd,
+                                createdAt: Date(), modifiedAt: Date(), name: source.name,
+                                preview: source.preview, messageCount: messagesBeforeTarget.count,
+                                metrics: TokenMetrics()
+                            )
+                            provisional.prepareSearchKey()
+                            sessions.insert(provisional, at: 0)
+                            syncActivityMonitorPaths()
+                            observedActivityPaths.insert(url.path)
+                            forked = provisional
+                        }
+
+                        let editedDraft = draft
+                        let editedAttachments = attachments
+                        draft = ""
+                        attachments = []
+                        selectSession(forked)
+                        messages = enforcingLoadedImageBudget(messagesBeforeTarget)
+                        draft = editedDraft
+                        attachments = editedAttachments
+                        submitDraft()
+                        completion()
+                    }
+                }
+            }
+
+            if targetID.hasPrefix("local-") || targetID.hasPrefix("rpc-") {
+                slot.runtime.send(type: "get_fork_messages", payload: [:]) { [weak self, weak slot] result in
+                    guard let self, let slot else { completion(); return }
+                    guard slot === activeRuntimeSlot,
+                          selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
+                        completion()
+                        return
+                    }
+                    let response: JSONValue
+                    switch result {
+                    case let .failure(error):
+                        fail(error.localizedDescription, .error)
+                        return
+                    case let .success(value):
+                        response = value
+                    }
+                    if let error = responseError(response) {
+                        fail(error, .error)
+                        return
+                    }
+                    let original = Self.sanitizedMessage(targetText)
+                    let entryID = response["data"]?["messages"]?.arrayValue?.reversed().first(where: {
+                        Self.sanitizedMessage($0["text"]?.stringValue ?? "") == original
+                    })?["entryId"]?.stringValue
+                    guard let entryID else {
+                        fail("Pi could not find the original message to edit.", .error)
+                        return
+                    }
+                    sendFork(entryID)
+                }
+            } else {
+                sendFork(targetID)
+            }
+        }
+    }
+
     // MARK: - Extension commands
 
     /// Extension commands (`/mode`, `/codex-fast`, `/limits`) run through the normal prompt path.

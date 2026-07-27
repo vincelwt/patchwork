@@ -73,21 +73,14 @@ extension AppStore {
         objectWillChange.send()
     }
 
-    /// Resubmits the composer's current contents in place of the message `beginEditingLastMessage`
-    /// armed. Pi's RPC exposes a `fork` command that replaces history at a previous user message
-    /// instead of appending a duplicate turn, which is the documented preference here — but
-    /// issuing it needs the runtime handle `AppStore` keeps `private`, which lives in
-    /// `AppStore.swift` and is out of this worktree's ownership, so a new internal hook would be
-    /// required there to reach it. This implements the documented fallback instead: abort the
-    /// in-flight turn if there is one, wait for it to actually settle (steering into a run that
-    /// has not stopped yet would not replace anything), then resend as a fresh prompt through the
-    /// existing `submitDraft` path. The guard below plus `submitDraft`'s own immediate
-    /// draft-clearing make a double send impossible even if the affordance is invoked twice.
+    /// Replaces the armed user turn by forking immediately before it, then submitting the edited
+    /// composer into that fork. The abandoned answer stays in Pi's original append-only session,
+    /// while the visible conversation moves to the rewritten branch.
     func resubmitEditedMessage() {
         let state = editState
         guard !state.isResubmitting else { return }
         guard let targetID = state.targetMessageID, state.targetSessionKey == editSessionKey,
-              messages.contains(where: { $0.id == targetID }) else {
+              let targetIndex = messages.firstIndex(where: { $0.id == targetID }) else {
             cancelEditingLastMessage()
             return
         }
@@ -97,6 +90,8 @@ extension AppStore {
             return
         }
 
+        let target = messages[targetIndex]
+        let messagesBeforeTarget = Array(messages[..<targetIndex])
         state.isResubmitting = true
         state.targetMessageID = nil
         state.targetSessionKey = nil
@@ -104,10 +99,15 @@ extension AppStore {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { editState.isResubmitting = false }
             if isSelectedRuntime, runtimeState.isStreaming { abort() }
             await Self.waitUntilIdle(self)
-            submitDraft(delivery: .automatic)
+            forkAndSubmitEditedMessage(
+                targetID: target.id,
+                targetText: Self.editableText(from: target),
+                messagesBeforeTarget: messagesBeforeTarget
+            ) { [weak self] in
+                self?.editState.isResubmitting = false
+            }
         }
     }
 
