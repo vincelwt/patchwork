@@ -15,9 +15,12 @@ let piVersion = PiVersion.detect()
 // API (which reads and answers them), so they are created here and handed to both.
 let interactions = InteractionRegistry(logger: logger)
 let liveSessions = LiveSessionRegistry()
+let connectivity = DaemonConnectivityMonitor()
+connectivity.start()
 let executor = PiProcessRunExecutor(logger: logger, interactions: interactions, liveSessions: liveSessions)
 let core = DaemonCore(
-    settings: settings, logger: logger, executor: executor, piVersion: piVersion,
+    settings: settings, logger: logger, executor: executor,
+    networkAvailable: { connectivity.isOnline }, piVersion: piVersion,
     interactions: interactions, liveSessions: liveSessions
 )
 let router = DaemonRouter(routes: Routes.all(core))

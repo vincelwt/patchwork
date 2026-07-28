@@ -194,7 +194,7 @@ struct WireErrorEnvelope: Codable, Equatable {
 /// code. Anything not "ok" (including statuses this CLI doesn't know about yet) counts as
 /// non-success rather than being assumed fine.
 enum RunStatus {
-    static let terminal: Set<String> = ["ok", "failed", "skipped", "timeout"]
+    static let terminal: Set<String> = ["ok", "failed", "skipped", "timeout", "interrupted"]
     static func isSuccess(_ status: String?) -> Bool { status == "ok" }
     static func isTerminal(_ status: String?) -> Bool { status.map(terminal.contains) ?? false }
 }

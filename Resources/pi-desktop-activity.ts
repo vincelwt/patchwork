@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 7
+// pi-desktop-activity-version: 8
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -49,7 +49,7 @@ type ScheduleRequest = {
   target: { kind: "existingThread"; threadId: string };
   prompt: string;
   trigger: AutomationTrigger;
-  policy: { skipIfRunning: boolean; catchUpMissed: boolean; timeoutSeconds: number };
+  policy: { skipIfRunning: boolean; timeoutSeconds: number };
 };
 
 function isDaemonCron(expression: string): boolean {
@@ -221,7 +221,7 @@ async function createDesktopAutomation(
     target: { kind: "existingThread" as const, threadId: sessionId },
     prompt: input.prompt,
     trigger: parseAutomationSchedule(input.schedule),
-    policy: { skipIfRunning: true, catchUpMissed: false, timeoutSeconds: 3_600 },
+    policy: { skipIfRunning: true, timeoutSeconds: 3_600 },
   };
   const request: ScheduleRequest = {
     idempotencyKey: randomUUID(),

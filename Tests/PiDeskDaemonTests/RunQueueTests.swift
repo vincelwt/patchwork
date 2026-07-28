@@ -142,8 +142,8 @@ final class RunQueueTests: XCTestCase {
     func testEveryTransitionPublishesARunEvent() async {
         let (queue, _, bus, _) = makeQueue { _ in RunOutcome(status: .ok, error: nil, summary: nil) }
         var seenStatuses: [RunStatus] = []
-        let collected = expectation(description: "saw both events")
-        collected.expectedFulfillmentCount = 2
+        let collected = expectation(description: "saw queued, running, and finished events")
+        collected.expectedFulfillmentCount = 3
         _ = bus.subscribe { name, data in
             guard name == "run", let run = try? PiDeskJSON.decoder.decode(Run.self, from: data) else { return }
             seenStatuses.append(run.status)
@@ -151,12 +151,15 @@ final class RunQueueTests: XCTestCase {
         }
         await queue.enqueue(job(id: "run-4", thread: "t4"))
         await fulfillment(of: [collected], timeout: 2)
-        XCTAssertEqual(seenStatuses.sorted { $0.rawValue < $1.rawValue }, [.ok, .running].sorted { $0.rawValue < $1.rawValue })
+        XCTAssertEqual(
+            seenStatuses.sorted { $0.rawValue < $1.rawValue },
+            [.queued, .running, .ok].sorted { $0.rawValue < $1.rawValue }
+        )
     }
 
     // MARK: - Abort
 
-    func testAbortCancelsARunningJobAndItResolvesAsTimeout() async {
+    func testAbortCancelsARunningJobAndRecordsInterruption() async {
         let (queue, history, _, _) = makeQueue(behavior: FakeRunExecutor.hanging())
         await queue.enqueue(job(id: "run-5", thread: "t5"))
         let started = await poll { await history.get(id: "run-5")?.status == .running }
@@ -164,7 +167,7 @@ final class RunQueueTests: XCTestCase {
 
         let aborted = await queue.abort(threadId: "t5")
         XCTAssertTrue(aborted)
-        let finished = await poll(timeout: 3) { await history.get(id: "run-5")?.status == .timeout }
+        let finished = await poll(timeout: 3) { await history.get(id: "run-5")?.status == .interrupted }
         XCTAssertTrue(finished)
     }
 
@@ -177,7 +180,7 @@ final class RunQueueTests: XCTestCase {
 
         let aborted = await queue.abort(threadId: "t5")
         XCTAssertTrue(aborted)
-        let finished = await poll(timeout: 3) { await history.get(id: "running")?.status == .timeout }
+        let finished = await poll(timeout: 3) { await history.get(id: "running")?.status == .interrupted }
         XCTAssertTrue(finished)
         let queued = await queue.queuedCount()
         XCTAssertEqual(queued, 0)
@@ -219,7 +222,7 @@ final class RunQueueTests: XCTestCase {
         XCTAssertEqual(active, 0)
     }
 
-    func testShutdownCancelsAndResolvesAsTimeoutPastTheGracePeriod() async {
+    func testShutdownRecordsInterruptionPastTheGracePeriod() async {
         let (queue, history, _, _) = makeQueue(behavior: FakeRunExecutor.hanging())
         await queue.enqueue(job(id: "run-7", thread: "t7"))
         let started = await poll { await history.get(id: "run-7")?.status == .running }
@@ -230,10 +233,24 @@ final class RunQueueTests: XCTestCase {
         let elapsed = Date().timeIntervalSince(start)
 
         let run = await history.get(id: "run-7")
-        XCTAssertEqual(run?.status, .timeout, "abandoned past the grace period, recorded honestly rather than left running forever")
+        XCTAssertEqual(run?.status, .interrupted, "app shutdown is distinct from an execution timeout")
         XCTAssertLessThan(elapsed, 5, "must not block past the grace period plus a bounded cooperative unwind")
         let active = await queue.activeCount()
         XCTAssertEqual(active, 0, "no run may still read as active once shutdown returns")
+    }
+
+    func testShutdownNeverStartsQueuedWork() async {
+        let (queue, history, _, executor) = makeQueue(concurrency: 1, behavior: FakeRunExecutor.hanging())
+        await queue.enqueue(job(id: "active", thread: "active-thread"))
+        await queue.enqueue(job(id: "owed", thread: "owed-thread"))
+        let started = await poll { executor.executedJobs.count == 1 }
+        XCTAssertTrue(started)
+
+        await queue.shutdown(graceSeconds: 0.1)
+
+        XCTAssertEqual(executor.executedJobs.map(\.id), ["active"])
+        let owed = await history.get(id: "owed")
+        XCTAssertEqual(owed?.status, .queued)
     }
 
     func testShutdownDrainsEveryConcurrentRunNotJustOne() async {
@@ -247,8 +264,8 @@ final class RunQueueTests: XCTestCase {
 
         let first = await history.get(id: "run-8")
         let second = await history.get(id: "run-9")
-        XCTAssertEqual(first?.status, .timeout)
-        XCTAssertEqual(second?.status, .timeout)
+        XCTAssertEqual(first?.status, .interrupted)
+        XCTAssertEqual(second?.status, .interrupted)
         let active = await queue.activeCount()
         XCTAssertEqual(active, 0)
     }

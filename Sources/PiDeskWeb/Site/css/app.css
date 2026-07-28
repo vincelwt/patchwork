@@ -894,7 +894,8 @@ details.advanced[open] summary { color: var(--text); }
 }
 .status-ok, .status-succeeded { color: var(--green); }
 .status-failed, .status-timeout { color: var(--red); }
-.status-running { color: var(--accent); }
+.status-interrupted { color: var(--orange); }
+.status-queued, .status-running { color: var(--accent); }
 .status-skipped { color: var(--text-tertiary); }
 
 /* ---------- Token screen ---------- */

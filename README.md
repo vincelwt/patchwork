@@ -99,9 +99,16 @@ Automations also have their own page in the window: pick **Automations** in the 
 and resuming is the switch on each row, and the clock button opens **Run History** — the most
 recent 50 runs for that automation with their status, start time, duration, and stored error or
 summary; full output remains in the target conversation. When the background service is reachable,
-compatible scheduling requests from a thread use this same durable store, so they appear on the page and
-survive that Pi process exiting. The Agent extension's session-local scheduler remains the fallback
-for specialized subagent jobs or when the service is off.
+compatible scheduling requests from a thread use this same durable store, so they appear on the
+page and survive that Pi process exiting. The Agent extension's session-local scheduler remains the
+fallback for specialized subagent jobs or when the service is off.
+
+The default app-managed daemon still runs only while Pi Desktop is open. Missed one-shot, cron,
+and interval work is kept durably and coalesced into one catch-up run on the next launch; heartbeat
+checks simply resume. An offline Mac keeps work pending without consuming an attempt; temporary
+failures before prompt delivery retry with bounded persisted backoff, even across launches. Once
+prompt delivery begins, an interrupted run is never resent
+blindly, because arbitrary prompts can have side effects.
 
 ## Run state
 

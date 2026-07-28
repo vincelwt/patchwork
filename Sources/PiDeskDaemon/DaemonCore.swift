@@ -44,6 +44,8 @@ final class DaemonCore: @unchecked Sendable {
         relayIdentityFileURL: URL = PiDeskPaths.relayIdentity,
         relayWebSocketOrigin: String = RelayService.websocketOrigin,
         schedulerPollInterval: TimeInterval = 1,
+        schedulerRetryDelays: [TimeInterval] = Scheduler.defaultRetryDelays,
+        networkAvailable: @escaping @Sendable () -> Bool = { true },
         piVersion: String? = nil,
         interactions: InteractionRegistry = InteractionRegistry(),
         liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
@@ -74,7 +76,12 @@ final class DaemonCore: @unchecked Sendable {
 
         let queue = RunQueue(concurrencyLimit: settings.concurrency, executor: executor, historyStore: runHistoryStore, bus: bus, logger: logger)
         runQueue = queue
-        scheduler = Scheduler(scheduleStore: scheduleStore, runQueue: queue, threadStore: threadStore, leaseStore: leaseStore, bus: bus, logger: logger, pollInterval: schedulerPollInterval)
+        scheduler = Scheduler(
+            scheduleStore: scheduleStore, runHistoryStore: runHistoryStore,
+            runQueue: queue, threadStore: threadStore, leaseStore: leaseStore,
+            bus: bus, logger: logger, pollInterval: schedulerPollInterval,
+            retryDelays: schedulerRetryDelays, networkAvailable: networkAvailable
+        )
         activityService = ActivityService(
             logger: logger, threadStore: threadStore, leaseStore: leaseStore, activityDirectoryURL: activityDirectoryURL,
             daemonActiveThreadIDs: { await queue.activeThreadIDs() }

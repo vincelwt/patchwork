@@ -143,8 +143,10 @@ final class RunHistoryModelTests: XCTestCase {
     }
 
     func testARunRowSaysWhatHappenedIncludingStatusesThisBuildHasNeverHeardOf() {
+        XCTAssertEqual(run("1", started: 0, status: .queued).statusLabel, "Queued")
         XCTAssertEqual(run("1", started: 0, status: .ok).statusLabel, "Succeeded")
         XCTAssertEqual(run("1", started: 0, status: .timeout).statusLabel, "Timed out")
+        XCTAssertEqual(run("1", started: 0, status: .interrupted).statusLabel, "Interrupted")
         // A newer daemon's status is shown, not swallowed.
         XCTAssertEqual(run("1", started: 0, status: .other("quarantined")).statusLabel, "Quarantined")
         XCTAssertEqual(run("1", started: 0, status: .other("")).statusLabel, "Unknown")

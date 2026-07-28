@@ -21,7 +21,7 @@ struct PiProcessRunExecutor: RunExecuting {
             return try await runProtocol(job)
         } catch let error as RunnerError {
             logger.error("Run \(job.id) failed: \(error.localizedDescription)")
-            return .failed(error.localizedDescription)
+            return .failed(error.localizedDescription, retryable: error.retryableBeforePrompt)
         } catch {
             logger.error("Run \(job.id) failed with an unexpected error: \(error)")
             return .failed("\(error)")
@@ -60,11 +60,50 @@ struct PiProcessRunExecutor: RunExecuting {
             }
         }
 
-        let promptID = try session.send(type: "prompt", payload: ["message": .string(job.prompt)])
-        let promptResponse = try await session.receiveMatching(id: promptID, timeout: 300)
-        if let message = Self.responseError(promptResponse) {
-            return RunOutcome(status: .failed, error: message, summary: nil, resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath)
+        // Persist the ambiguous-delivery boundary before writing a byte of the real prompt. If
+        // that durable transition fails, stop: executing without it could duplicate side effects
+        // after a crash and restart.
+        let promptStartedAt = Date()
+        if let onPromptDispatch = job.onPromptDispatch {
+            switch await onPromptDispatch(promptStartedAt) {
+            case .ready:
+                break
+            case .retry:
+                return RunOutcome(
+                    status: .failed, error: "Could not persist this automation before prompt delivery.", summary: nil,
+                    resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                    retryable: true
+                )
+            case .cancelled:
+                return RunOutcome(
+                    status: .interrupted, error: "This automation was removed before prompt delivery.", summary: nil,
+                    resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath
+                )
+            }
         }
+
+        let promptResponse: PiJSONValue
+        do {
+            let promptID = try session.send(type: "prompt", payload: ["message": .string(job.prompt)])
+            promptResponse = try await session.receiveMatching(id: promptID, timeout: 300)
+        } catch {
+            // Bytes may have reached Pi even without an acknowledgement. Never blindly resend an
+            // arbitrary prompt whose delivery outcome is unknown.
+            return RunOutcome(
+                status: .interrupted, error: "Prompt delivery was interrupted; its outcome is unknown.", summary: nil,
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt
+            )
+        }
+        if let message = Self.responseError(promptResponse) {
+            return RunOutcome(
+                status: .failed, error: message, summary: nil,
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt
+            )
+        }
+        let promptAcceptedAt = Date()
+        await job.onPromptAccepted?(promptAcceptedAt)
 
         // Only published once Pi has accepted the prompt and only until admission is closed at a
         // settle boundary: outside that window there is no turn to steer into, and a caller must
@@ -79,13 +118,19 @@ struct PiProcessRunExecutor: RunExecuting {
         do {
             let outcome = try await consumeUntilSettled(
                 session, job: job, liveThreadID: liveThreadID,
-                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt, promptAcceptedAt: promptAcceptedAt
             )
             await finishLive(session, liveThreadID: liveThreadID, job: job)
             return outcome
         } catch {
             await finishLive(session, liveThreadID: liveThreadID, job: job)
-            throw error
+            logger.error("Run \(job.id) was interrupted after Pi accepted its prompt: \(error)")
+            return RunOutcome(
+                status: .interrupted, error: "The accepted run was interrupted before it settled.", summary: nil,
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt, promptAcceptedAt: promptAcceptedAt
+            )
         }
     }
 
@@ -121,7 +166,8 @@ struct PiProcessRunExecutor: RunExecuting {
     /// seconds instead of only after the next Pi event arrives.
     private func consumeUntilSettled(
         _ session: PiRPCSession, job: RunJob, liveThreadID: String?,
-        resolvedThreadId: String?, resolvedThreadPath: String?
+        resolvedThreadId: String?, resolvedThreadPath: String?,
+        promptStartedAt: Date, promptAcceptedAt: Date
     ) async throws -> RunOutcome {
         var lastAssistantText: String?
         var lastAssistantIsError = false
@@ -136,7 +182,8 @@ struct PiProcessRunExecutor: RunExecuting {
         func timedOut() -> RunOutcome {
             RunOutcome(
                 status: .timeout, error: "Run exceeded its \(job.timeoutSeconds)s timeout.",
-                summary: lastAssistantText, resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath
+                summary: lastAssistantText, resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt, promptAcceptedAt: promptAcceptedAt
             )
         }
 
@@ -148,7 +195,10 @@ struct PiProcessRunExecutor: RunExecuting {
             if retryingClose, let liveThreadID, let liveSessions {
                 switch liveSessions.closeAdmission(threadID: liveThreadID, runID: job.id) {
                 case .closed:
-                    return settledOutcome(lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath)
+                    return settledOutcome(
+                        lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
+                        promptStartedAt, promptAcceptedAt
+                    )
                 case .continueConsuming:
                     retryingClose = false
                     deadline = Self.extendedDeadline(deadline)
@@ -181,11 +231,17 @@ struct PiProcessRunExecutor: RunExecuting {
                 // and closing admission is what makes that safe: a steer accepted moments ago owns
                 // the turn now starting, and stopping the session here would discard it.
                 guard let liveThreadID, let liveSessions else {
-                    return settledOutcome(lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath)
+                    return settledOutcome(
+                        lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
+                        promptStartedAt, promptAcceptedAt
+                    )
                 }
                 switch liveSessions.closeAdmission(threadID: liveThreadID, runID: job.id) {
                 case .closed:
-                    return settledOutcome(lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath)
+                    return settledOutcome(
+                        lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
+                        promptStartedAt, promptAcceptedAt
+                    )
                 case .continueConsuming:
                     deadline = Self.extendedDeadline(deadline)
                 case .busy:
@@ -204,13 +260,15 @@ struct PiProcessRunExecutor: RunExecuting {
         max(current, Date().addingTimeInterval(turnGraceSeconds))
     }
 
-    private func settledOutcome(_ text: String?, _ isError: Bool, _ threadId: String?, _ threadPath: String?) -> RunOutcome {
+    private func settledOutcome(
+        _ text: String?, _ isError: Bool, _ threadId: String?, _ threadPath: String?,
+        _ promptStartedAt: Date, _ promptAcceptedAt: Date
+    ) -> RunOutcome {
         RunOutcome(
             status: isError ? .failed : .ok,
             error: isError ? (text ?? "The run finished with an error.") : nil,
-            summary: text,
-            resolvedThreadId: threadId,
-            resolvedThreadPath: threadPath
+            summary: text, resolvedThreadId: threadId, resolvedThreadPath: threadPath,
+            promptStartedAt: promptStartedAt, promptAcceptedAt: promptAcceptedAt
         )
     }
 

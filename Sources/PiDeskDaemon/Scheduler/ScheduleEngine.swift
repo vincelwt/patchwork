@@ -12,8 +12,8 @@ enum ScheduleEngine {
         case fire(target: ScheduleTarget, prompt: String, mode: String?)
         /// Record a skipped run (the target thread was already busy and `skipIfRunning` is on).
         case skip(reason: String)
-        /// Nothing happens this tick: heartbeat found the thread busy, a missed occurrence was
-        /// dropped, or quiet hours are active. No `Run` is recorded.
+        /// Nothing happens this tick: heartbeat found the thread busy or quiet hours are active.
+        /// No `Run` is recorded.
         case none
     }
 
@@ -22,9 +22,6 @@ enum ScheduleEngine {
         var action: Action
     }
 
-    /// How late a due occurrence can be before it counts as "missed" (asleep, or the daemon was
-    /// down) rather than ordinary poll-loop jitter.
-    static let missedGraceWindow: TimeInterval = 60
     static let defaultTimeoutSeconds = 3_600
 
     /// `nil` means "nothing to do for this schedule right now": disabled, not yet due, or an
@@ -51,15 +48,6 @@ enum ScheduleEngine {
             return Decision(updatedSchedule: applying(schedule, nextRunAt: next), action: .none)
         }
 
-        // Missed by more than the grace window and not catching up: drop this occurrence and
-        // resync the grid to `now` instead of `due`, so a long sleep does not queue a burst of
-        // now-meaningless runs the moment the daemon wakes.
-        let lateness = now.timeIntervalSince(due)
-        if !isHeartbeat, lateness > missedGraceWindow, !schedule.policy.catchUpMissed {
-            let next = TriggerEngine.nextRunAt(for: schedule.trigger, after: now, lastRunAt: schedule.lastRunAt)
-            return Decision(updatedSchedule: applying(schedule, nextRunAt: next), action: .none)
-        }
-
         // Quiet hours: defer without recording; `nextRunAt` becomes quiet-hours-end, so the very
         // next tick after the window closes re-evaluates this occurrence from scratch.
         if !isHeartbeat, let quietHours = schedule.policy.quietHours, QuietHoursEvaluator.isActive(quietHours, at: now) {
@@ -67,9 +55,10 @@ enum ScheduleEngine {
             return Decision(updatedSchedule: applying(schedule, nextRunAt: next), action: .none)
         }
 
-        // This occurrence is being resolved one way or another now: advance the grid from the
-        // nominal `due` time, not `now`, so cadence never drifts with poll timing or lateness.
-        let next = TriggerEngine.nextRunAt(for: schedule.trigger, after: due, lastRunAt: due)
+        // Globally coalesce however many times were missed while Pi Desktop was closed: fire one
+        // occurrence, then jump directly to the first future grid point. `once` naturally has no
+        // next point, and heartbeat resumes from the current availability window.
+        let next = TriggerEngine.nextRunAt(for: schedule.trigger, after: now, lastRunAt: due)
 
         if let threadID, isThreadBusy(threadID), schedule.policy.skipIfRunning {
             let updated = applying(schedule, nextRunAt: next, lastRunAt: due, lastStatus: .skipped)

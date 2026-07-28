@@ -105,6 +105,9 @@ private struct RunHistoryRow: View {
                             .font(PiFont.micro.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
+                    if let attempt = run.attempt, attempt > 1 {
+                        Text("· Attempt \(attempt)").font(PiFont.micro).foregroundStyle(.tertiary)
+                    }
                 }
                 if let detail = run.detailText {
                     Text(detail)
@@ -127,11 +130,13 @@ extension Run {
     /// A status a newer daemon invented still reads as itself rather than disappearing.
     var statusLabel: String {
         switch status {
+        case .queued: "Queued"
         case .running: "Running"
         case .ok: "Succeeded"
         case .failed: "Failed"
         case .skipped: "Skipped"
         case .timeout: "Timed out"
+        case .interrupted: "Interrupted"
         default: status.rawValue.isEmpty ? "Unknown" : status.rawValue.capitalized
         }
     }
@@ -140,8 +145,8 @@ extension Run {
         switch status {
         case .ok: .piGreen
         case .failed, .timeout: .piRed
-        case .skipped: .piOrange
-        case .running: .piBlue
+        case .skipped, .interrupted: .piOrange
+        case .queued, .running: .piBlue
         default: .secondary
         }
     }
@@ -155,9 +160,15 @@ extension Run {
     /// Whatever the daemon stored: the failure reason if there is one, otherwise the summary.
     /// Bounded like every other retained string in the app.
     var detailText: String? {
-        let raw = (error ?? summary)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let raw, !raw.isEmpty else { return nil }
-        return String(raw.prefix(PiTheme.sessionPreviewLimit))
+        var parts: [String] = []
+        if let raw = (error ?? summary)?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            parts.append(raw)
+        }
+        if let nextAttemptAt {
+            parts.append("Retry scheduled \(nextAttemptAt.formatted(date: .abbreviated, time: .shortened)).")
+        }
+        guard !parts.isEmpty else { return nil }
+        return String(parts.joined(separator: " ").prefix(PiTheme.sessionPreviewLimit))
     }
 
     var detailIsError: Bool {

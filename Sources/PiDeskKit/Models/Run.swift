@@ -1,18 +1,20 @@
 import Foundation
 
-/// `running|ok|failed|skipped|timeout`. Also reused for `Schedule.lastStatus`, whose doc'd range
-/// (`ok|failed|skipped`) is a subset — one enum, no duplicated tolerant-decode boilerplate.
+/// `queued|running|ok|failed|skipped|timeout|interrupted`. Also reused for
+/// `Schedule.lastStatus` — one enum, no duplicated tolerant-decode boilerplate.
 public struct RunStatus: TolerantRawRepresentable {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 
+    public static let queued = RunStatus(rawValue: "queued")
     public static let running = RunStatus(rawValue: "running")
     public static let ok = RunStatus(rawValue: "ok")
     public static let failed = RunStatus(rawValue: "failed")
     public static let skipped = RunStatus(rawValue: "skipped")
     public static let timeout = RunStatus(rawValue: "timeout")
+    public static let interrupted = RunStatus(rawValue: "interrupted")
 
-    public static var knownCases: [RunStatus] { [.running, .ok, .failed, .skipped, .timeout] }
+    public static var knownCases: [RunStatus] { [.queued, .running, .ok, .failed, .skipped, .timeout, .interrupted] }
     public static func other(_ rawValue: String) -> RunStatus { RunStatus(rawValue: rawValue) }
 }
 
@@ -40,6 +42,13 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
     public var status: RunStatus
     public var error: String?
     public var summary: String?
+    public var occurrenceId: String?
+    public var scheduledAt: Date?
+    public var attempt: Int?
+    public var nextAttemptAt: Date?
+    public var promptStartedAt: Date?
+    public var promptAcceptedAt: Date?
+    public var retryable: Bool?
 
     public init(
         id: String,
@@ -50,7 +59,14 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         finishedAt: Date? = nil,
         status: RunStatus,
         error: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        occurrenceId: String? = nil,
+        scheduledAt: Date? = nil,
+        attempt: Int? = nil,
+        nextAttemptAt: Date? = nil,
+        promptStartedAt: Date? = nil,
+        promptAcceptedAt: Date? = nil,
+        retryable: Bool? = nil
     ) {
         self.id = id
         self.scheduleId = scheduleId
@@ -61,6 +77,13 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         self.status = status
         self.error = error
         self.summary = summary
+        self.occurrenceId = occurrenceId
+        self.scheduledAt = scheduledAt
+        self.attempt = attempt
+        self.nextAttemptAt = nextAttemptAt
+        self.promptStartedAt = promptStartedAt
+        self.promptAcceptedAt = promptAcceptedAt
+        self.retryable = retryable
     }
 
     public init(from decoder: Decoder) throws {
@@ -74,6 +97,13 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         status = try container.decodeIfPresent(RunStatus.self, forKey: .status) ?? .other("unknown")
         error = try container.decodeIfPresent(String.self, forKey: .error)
         summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        occurrenceId = try container.decodeIfPresent(String.self, forKey: .occurrenceId)
+        scheduledAt = try container.decodeIfPresent(Date.self, forKey: .scheduledAt)
+        attempt = try container.decodeIfPresent(Int.self, forKey: .attempt)
+        nextAttemptAt = try container.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
+        promptStartedAt = try container.decodeIfPresent(Date.self, forKey: .promptStartedAt)
+        promptAcceptedAt = try container.decodeIfPresent(Date.self, forKey: .promptAcceptedAt)
+        retryable = try container.decodeIfPresent(Bool.self, forKey: .retryable)
     }
 }
 
