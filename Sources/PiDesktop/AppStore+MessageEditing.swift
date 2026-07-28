@@ -71,9 +71,8 @@ extension AppStore {
         objectWillChange.send()
     }
 
-    /// Replaces the armed user turn by forking immediately before it, then submitting the edited
-    /// composer into that fork. The abandoned answer stays in Pi's original append-only session,
-    /// while the visible conversation moves to the rewritten branch.
+    /// Replaces the armed user turn by branching immediately before it in the same session, then
+    /// submitting the edited composer. The abandoned answer remains in Pi's append-only tree.
     func resubmitEditedMessage() {
         let state = editState
         guard !state.isResubmitting else { return }
@@ -99,7 +98,7 @@ extension AppStore {
             guard let self else { return }
             if isSelectedRuntime, runtimeState.isStreaming { abort() }
             await Self.waitUntilIdle(self)
-            forkAndSubmitEditedMessage(
+            branchAndSubmitEditedMessage(
                 targetID: target.id,
                 targetText: Self.editableText(from: target),
                 messagesBeforeTarget: messagesBeforeTarget

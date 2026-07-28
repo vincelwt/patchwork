@@ -130,7 +130,7 @@ final class AppStoreMessageEditingTests: XCTestCase {
 
     // MARK: - Resubmitting while idle
 
-    func testResubmitWhileIdleForksBeforeTheMessageAndRewritesVisibleHistory() async throws {
+    func testResubmitWhileIdleBranchesInTheSameSessionAndRewritesVisibleHistory() async throws {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
         seedUserMessage(store, text: "earlier question", id: "earlier")
@@ -142,23 +142,48 @@ final class AppStoreMessageEditingTests: XCTestCase {
         store.draft = "corrected question"
         store.resubmitEditedMessage()
 
-        await waitUntil { runtime.commandCount("fork") == 1 }
-        XCTAssertEqual(runtime.lastPayload("fork")?["entryId"]?.stringValue, "target-entry")
-        XCTAssertEqual(runtime.commandCount("prompt"), 0, "The replacement waits until Pi confirms the fork")
-
-        let forkPath = directory.appendingPathComponent("fork.jsonl").path
-        runtime.sessionFile = forkPath
-        runtime.sessionID = "fork-session"
-        runtime.succeed("fork")
-
+        await waitUntil { runtime.commandCount("get_commands") == 1 }
+        runtime.succeed("get_commands", data: editCommands())
         await waitUntil { runtime.commandCount("prompt") == 1 }
+        let editCommand = try XCTUnwrap(runtime.lastPayload("prompt")?["message"]?.stringValue)
+        let token = try XCTUnwrap(editCommand.split(separator: " ").last.map(String.init))
+        XCTAssertTrue(editCommand.hasPrefix("/pi-desktop-edit-message target-entry "))
+        runtime.succeed("prompt")
+
+        await waitUntil { runtime.commandCount("get_entries") == 1 }
+        XCTAssertEqual(runtime.lastPayload("get_entries")?["since"]?.stringValue, "target-entry")
+        runtime.succeed("get_entries", data: editMarker(targetID: "target-entry", token: token))
+
+        await waitUntil { runtime.commandCount("prompt") == 2 }
+        XCTAssertEqual(runtime.commandCount("fork"), 0, "Editing must stay inside the source session")
         XCTAssertEqual(runtime.commandCount("abort"), 0, "There is nothing running, so nothing should be aborted")
         XCTAssertFalse(store.isEditingLastMessage)
         XCTAssertEqual(store.draft, "", "submitDraft's own clearing still applies")
-        XCTAssertEqual(store.selectedSession?.fileURL.path, forkPath)
+        XCTAssertEqual(store.selectedSession?.fileURL.path, session.fileURL.path)
+        XCTAssertEqual(store.sessions.count, 1, "Editing must not add another sidebar conversation")
+        XCTAssertEqual(runtime.sessionFile, session.fileURL.path)
         XCTAssertTrue(store.messages.contains { $0.textContent == "corrected question" })
         XCTAssertFalse(store.messages.contains { $0.textContent == "original question" })
         XCTAssertFalse(store.messages.contains { $0.textContent == "answer to remove" })
+    }
+
+    func testMissingEditCommandNeverFallsThroughToAProviderPrompt() async throws {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        seedUserMessage(store, text: "original question", id: "target-entry")
+        store.messages.append(message(id: "answer", role: .assistant, text: "answer"))
+        store.beginEditingLastMessage()
+        store.draft = "corrected question"
+
+        store.resubmitEditedMessage()
+        await waitUntil { runtime.commandCount("get_commands") == 1 }
+        runtime.succeed("get_commands", data: .object(["commands": .array([])]))
+        await waitUntil { !runtime.isRunning }
+
+        XCTAssertEqual(runtime.commandCount("prompt"), 0, "An unavailable extension command must never become an LLM prompt")
+        XCTAssertEqual(runtime.commandCount("fork"), 0)
+        XCTAssertEqual(store.selectedSession?.fileURL.path, session.fileURL.path)
+        XCTAssertEqual(store.draft, "corrected question", "The unsent edit stays recoverable")
     }
 
     func testResubmitWithEmptyContentCancelsInsteadOfSending() async throws {
@@ -207,17 +232,16 @@ final class AppStoreMessageEditingTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("prompt"), 1, "The resend must wait for the abort to actually settle")
 
         // Pi confirms the run stopped. The optimistic message has no durable entry ID yet, so
-        // Desktop resolves it through Pi's fork-message list before issuing the fork.
+        // Desktop resolves it through Pi's user-message list before navigating in place.
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
         await waitUntil { runtime.commandCount("get_fork_messages") == 1 }
         runtime.succeed("get_fork_messages", data: forkMessages(entryID: "durable-original", text: "original question"))
-        await waitUntil { runtime.commandCount("fork") == 1 }
-        runtime.sessionFile = directory.appendingPathComponent("mid-turn-fork.jsonl").path
-        runtime.sessionID = "mid-turn-fork"
-        runtime.succeed("fork")
+        try await completeEditNavigation(runtime, targetID: "durable-original")
 
-        await waitUntil { runtime.commandCount("prompt") == 2 }
-        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+        await waitUntil { runtime.commandCount("prompt") == 3 }
+        XCTAssertEqual(runtime.commandCount("prompt"), 3)
+        XCTAssertEqual(runtime.commandCount("fork"), 0)
+        XCTAssertEqual(store.selectedSession?.fileURL.path, session.fileURL.path)
         XCTAssertTrue(store.runtimeState.isStreaming, "The resend itself starts a new turn")
     }
 
@@ -239,16 +263,13 @@ final class AppStoreMessageEditingTests: XCTestCase {
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
         await waitUntil { runtime.commandCount("get_fork_messages") == 1 }
         runtime.succeed("get_fork_messages", data: forkMessages(entryID: "durable-original", text: "original question"))
-        await waitUntil { runtime.commandCount("fork") == 1 }
-        runtime.sessionFile = directory.appendingPathComponent("single-fork.jsonl").path
-        runtime.sessionID = "single-fork"
-        runtime.succeed("fork")
-        await waitUntil { runtime.commandCount("prompt") == 2 }
+        try await completeEditNavigation(runtime, targetID: "durable-original")
+        await waitUntil { runtime.commandCount("prompt") == 3 }
 
         // Give any stray second resubmission a chance to land before asserting it never did.
         try? await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertEqual(runtime.commandCount("prompt"), 2, "Exactly one resend, never two")
-        XCTAssertEqual(runtime.commandCount("fork"), 1, "Exactly one history rewrite, never two")
+        XCTAssertEqual(runtime.commandCount("prompt"), 3, "One original, one navigation command, and one resend")
+        XCTAssertEqual(runtime.commandCount("fork"), 0, "The rewrite stays in the source session")
         XCTAssertEqual(runtime.commandCount("abort"), 1, "Exactly one abort, never two")
     }
 
@@ -292,6 +313,37 @@ final class AppStoreMessageEditingTests: XCTestCase {
         .object(["messages": .array([.object([
             "entryId": .string(entryID), "text": .string(text)
         ])])])
+    }
+
+    private func editCommands() -> JSONValue {
+        .object(["commands": .array([.object([
+            "name": .string("pi-desktop-edit-message"), "source": .string("extension")
+        ])])])
+    }
+
+    private func editMarker(targetID: String, token: String) -> JSONValue {
+        .object([
+            "entries": .array([.object([
+                "type": .string("custom"), "id": .string("edit-marker"),
+                "customType": .string("pi-desktop-edit-ready"),
+                "data": .object(["targetId": .string(targetID), "token": .string(token)])
+            ])]),
+            "leafId": .string("edit-marker")
+        ])
+    }
+
+    private func completeEditNavigation(_ runtime: FakeRuntime, targetID: String) async throws {
+        await waitUntil { runtime.commandCount("get_commands") == 1 }
+        runtime.succeed("get_commands", data: editCommands())
+        await waitUntil {
+            runtime.lastPayload("prompt")?["message"]?.stringValue?.hasPrefix("/pi-desktop-edit-message ") == true
+        }
+        let command = try XCTUnwrap(runtime.lastPayload("prompt")?["message"]?.stringValue)
+        let token = try XCTUnwrap(command.split(separator: " ").last.map(String.init))
+        XCTAssertTrue(command.hasPrefix("/pi-desktop-edit-message \(targetID) "))
+        runtime.succeed("prompt")
+        await waitUntil { runtime.commandCount("get_entries") == 1 }
+        runtime.succeed("get_entries", data: editMarker(targetID: targetID, token: token))
     }
 
     private func summary(id: String, file: String) -> SessionSummary {
