@@ -122,8 +122,7 @@ struct ConversationView: View {
                     }
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
-                        text: $store.draft,
-                        attachments: $store.attachments,
+                        model: store.composer,
                         isStreaming: store.isSelectedRuntime && store.runtimeState.isStreaming,
                         autofocus: true,
                         focusSignal: composerFocusTick,
@@ -344,9 +343,6 @@ struct MessageScrollView: View {
                                 )
                                 .equatable()
                                 .padding(.top, PiTheme.space6)
-                            case let .compaction(note):
-                                CompactionRowView(note: note)
-                                    .padding(.vertical, PiTheme.space6)
                             }
                         }
                         .id(item.id)

@@ -171,8 +171,27 @@ final class AppStore: ObservableObject {
     @Published private(set) var initialScrollTargetMessageID: String?
     @Published var conversationError: String?
 
-    @Published var draft = ""
-    @Published var attachments: [ImageAttachment] = []
+    /// Composer edits have their own observation scope so a key-repeat burst does not invalidate
+    /// the transcript, sidebar, inspector, and menu-bar trees.
+    let composer = ComposerModel()
+    var draft: String {
+        get { composer.content.text }
+        set {
+            var value = composer.content
+            value.text = newValue
+            guard value != composer.content else { return }
+            composer.content = value
+        }
+    }
+    var attachments: [ImageAttachment] {
+        get { composer.content.attachments }
+        set {
+            var value = composer.content
+            value.attachments = newValue
+            guard value != composer.content else { return }
+            composer.content = value
+        }
+    }
     @Published var selectedFolder: URL?
     @Published var runtimeState = RuntimeState()
     @Published private(set) var isOffline = false
@@ -258,12 +277,14 @@ final class AppStore: ObservableObject {
     private var gitRefreshTask: Task<Void, Never>?
     private var selectedGitTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
+    private var conversationRefreshTask: Task<Void, Never>?
     private var earlierMessagesTask: Task<Void, Never>?
     private var activityProjectionTask: Task<Void, Never>?
     private var conversationLoadGeneration = 0
     private var loadedConversationPage: ConversationPage?
     private var loadedConversationPath: String?
     private var loadedConversationFingerprint: SessionFileFingerprint?
+    private var refreshingConversationFingerprint: SessionFileFingerprint?
     private var initialPreviousSeenCompletionID: String?
     private var toastTask: Task<Void, Never>?
     private var dialogTimeoutTask: Task<Void, Never>?
@@ -366,10 +387,10 @@ final class AppStore: ObservableObject {
             }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
-            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
-            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
             .store(in: &appCancellables)
         self.activityMonitor.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -378,11 +399,14 @@ final class AppStore: ObservableObject {
             .sink { [weak self] activities in self?.handleActivitySnapshot(activities) }
             .store(in: &appCancellables)
         self.notificationService.onSelectSession = { [weak self] path in self?.focusSession(atPath: path) }
-        $draft
+        composer.$content
+            .map(\.text)
             .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] text in
                 guard let self else { return }
-                persistDraftText(text, for: currentDraftKey)
+                persistIdleComposerDraft(text, for: currentDraftKey)
             }
             .store(in: &appCancellables)
         self.connectivityMonitor?.start { [weak self] isOnline in
@@ -933,6 +957,11 @@ final class AppStore: ObservableObject {
     /// The first snapshot establishes a quiet baseline; every later distinct ID is persisted
     /// before notification gating so duplicate observations and relaunches stay silent.
     private func handleActivitySnapshot(_ activities: [String: SessionActivity]) {
+        if let selectedPath = selectedSession?.fileURL.standardizedFileURL.path,
+           activities[selectedPath] != nil {
+            refreshSelectedConversationIfNeeded()
+        }
+
         for (path, activity) in activities {
             let hadBaseline = observedActivityPaths.contains(path)
             observedActivityPaths.insert(path)
@@ -1259,6 +1288,7 @@ final class AppStore: ObservableObject {
         publishConversationPage(page, path: path, fingerprint: fingerprint)
         cachePage(page, for: session.fileURL, fingerprint: fingerprint)
         isConversationLoading = false
+        refreshSelectedConversationIfNeeded()
         ConversationPerformance.mark("Conversation first publish", path: path, count: page.messages.count)
 
         let projectionStartedAt = Date()
@@ -1273,6 +1303,79 @@ final class AppStore: ObservableObject {
         await refreshGit(for: session.cwd)
         guard conversationLoadGeneration == generation else { return }
         schedulePrefetch(around: session)
+    }
+
+    /// Refreshes only the selected page's changed tail. Existing rows and any loaded earlier
+    /// pages keep their identity, so text selection, disclosure state, and scroll state survive.
+    private func refreshSelectedConversationIfNeeded() {
+        guard !isConversationLoading, !isLoadingEarlierMessages,
+              let session = selectedSession,
+              loadedConversationPage != nil else { return }
+        let path = session.fileURL.standardizedFileURL.path
+        guard loadedConversationPath == path,
+              let fingerprint = fileFingerprint(for: session.fileURL),
+              fingerprint != loadedConversationFingerprint,
+              fingerprint != refreshingConversationFingerprint else { return }
+
+        let generation = conversationLoadGeneration
+        conversationRefreshTask?.cancel()
+        refreshingConversationFingerprint = fingerprint
+        conversationRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let page = try await repository.loadNewestConversationPage(from: session.fileURL)
+                try Task.checkCancellation()
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path,
+                      let current = loadedConversationPage else {
+                    finishConversationRefresh(fingerprint)
+                    return
+                }
+                mergeNewestConversationPage(page, current: current, path: path, fingerprint: fingerprint)
+                finishConversationRefresh(fingerprint)
+            } catch {
+                finishConversationRefresh(fingerprint)
+            }
+        }
+    }
+
+    private func finishConversationRefresh(_ fingerprint: SessionFileFingerprint) {
+        guard refreshingConversationFingerprint == fingerprint else { return }
+        refreshingConversationFingerprint = nil
+        conversationRefreshTask = nil
+    }
+
+    private func mergeNewestConversationPage(
+        _ newest: ConversationPage,
+        current: ConversationPage,
+        path: String,
+        fingerprint: SessionFileFingerprint
+    ) {
+        let overlap = newest.messages.lazy.compactMap { message in
+            current.messages.firstIndex(where: { $0.id == message.id })
+        }.first
+        let combined = overlap.map { Array(current.messages[..<$0]) + newest.messages } ?? newest.messages
+        let exceededLimit = combined.count > Self.loadedMessageLimit
+        let retained = enforcingLoadedImageBudget(combined)
+        let preservedHistory = overlap != nil
+        let merged = ConversationPage(
+            messages: retained,
+            olderCursor: preservedHistory ? current.olderCursor : newest.olderCursor,
+            leafID: newest.leafID,
+            rawEntryCount: max(current.rawEntryCount, newest.rawEntryCount),
+            scannedEntryCount: max(current.scannedEntryCount, newest.scannedEntryCount),
+            scannedByteCount: max(current.scannedByteCount, newest.scannedByteCount),
+            isTruncated: preservedHistory ? (current.isTruncated || newest.isTruncated) : newest.isTruncated
+        )
+        loadedConversationPage = merged
+        loadedConversationPath = path
+        loadedConversationFingerprint = fingerprint
+        replaceLoadedMessages(with: retained)
+        conversationHistoryLimitReached = exceededLimit
+            || (merged.olderCursor != nil && retained.count >= Self.loadedMessageLimit)
+            || (merged.isTruncated && merged.olderCursor == nil)
+        hasEarlierMessages = merged.olderCursor != nil && !conversationHistoryLimitReached
+        cachePage(merged, for: URL(fileURLWithPath: path), fingerprint: fingerprint)
     }
 
     func loadEarlierMessages() {
@@ -1298,6 +1401,7 @@ final class AppStore: ObservableObject {
                 if let merged = loadedConversationPage {
                     cachePage(merged, for: session.fileURL, fingerprint: loadedConversationFingerprint)
                 }
+                refreshSelectedConversationIfNeeded()
                 ConversationPerformance.mark(
                     "Conversation page prepend", path: path, count: prepended,
                     milliseconds: Date().timeIntervalSince(startedAt) * 1_000
@@ -1312,6 +1416,7 @@ final class AppStore: ObservableObject {
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
                 isLoadingEarlierMessages = false
+                refreshSelectedConversationIfNeeded()
                 showToast("Couldn’t load earlier history: \(error.localizedDescription)", style: .warning)
             }
         }
@@ -1377,6 +1482,7 @@ final class AppStore: ObservableObject {
         loadedConversationPage = nil
         loadedConversationPath = nil
         loadedConversationFingerprint = nil
+        refreshingConversationFingerprint = nil
         hasEarlierMessages = false
         isLoadingEarlierMessages = false
         conversationHistoryLimitReached = false
@@ -1565,6 +1671,19 @@ final class AppStore: ObservableObject {
         let evicted = draftStore.set(text, for: key)
         for stale in evicted { attachmentsByKey.removeValue(forKey: stale) }
         scheduleDraftPersistence()
+    }
+
+    private func persistIdleComposerDraft(_ text: String, for key: String) {
+        persistDraftText(text, for: key)
+        if runtimeMatchesCurrentRoute {
+            let slot = activeRuntimeSlot
+            resetRuntimeRetirementLease(for: slot)
+        }
+    }
+
+    private func flushCurrentDraftPersistence() {
+        persistDraftText(draft, for: currentDraftKey)
+        flushDraftPersistence()
     }
 
     /// Idle typing debounce: writing `state.json` on every keystroke is unacceptable, so a burst
@@ -2080,8 +2199,15 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Actual editor mutations prewarm Pi; merely rendering or navigating to a composer does not.
-    func composerContentDidChange() { prepareComposerOptions() }
+    /// The first editor mutation prewarms Pi. Later keys stay on AppKit's input path instead of
+    /// cancelling and rebuilding the same runtime lease; the idle draft publisher touches it once.
+    func composerContentDidChange() {
+        if runtimeMatchesCurrentRoute {
+            let slot = activeRuntimeSlot
+            guard !slot.isStarting, !slot.optionsLoading, !slot.optionsPrepared else { return }
+        }
+        prepareComposerOptions()
+    }
 
     /// Starts or attaches the route's RPC runtime and loads picker choices. These are query-only
     /// commands and never send a provider prompt.
@@ -2959,7 +3085,8 @@ final class AppStore: ObservableObject {
                 }
             }
         }
-        messages = enforcingLoadedImageBudget(merged)
+        let bounded = enforcingLoadedImageBudget(merged)
+        if messages != bounded { messages = bounded }
     }
 
     private func enforcingLoadedImageBudget(_ source: [ChatMessage]) -> [ChatMessage] {
@@ -3110,6 +3237,20 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        if event["type"]?.stringValue == "session_info_changed" {
+            let name = event["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            updateState(for: slot) { $0.sessionName = name?.isEmpty == false ? name : nil }
+            if let session = session(for: slot) {
+                if let name, !name.isEmpty,
+                   let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    sessions[index].name = name
+                    sessions[index].prepareSearchKey()
+                } else {
+                    Task { await self.refreshSummary(for: session) }
+                }
+            }
+            return
+        }
         if slot === activeRuntimeSlot, !activePresentationDetached {
             handleRPCEvent(event)
         } else {
@@ -3846,11 +3987,14 @@ final class AppStore: ObservableObject {
 
     private func cancelConversationLoad() {
         conversationLoadTask?.cancel()
+        conversationRefreshTask?.cancel()
         earlierMessagesTask?.cancel()
         activityProjectionTask?.cancel()
         conversationLoadTask = nil
+        conversationRefreshTask = nil
         earlierMessagesTask = nil
         activityProjectionTask = nil
+        refreshingConversationFingerprint = nil
         isConversationLoading = false
         isLoadingEarlierMessages = false
     }
@@ -3868,8 +4012,8 @@ final class AppStore: ObservableObject {
     }
 
     deinit {
-        gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel(); earlierMessagesTask?.cancel()
-        activityProjectionTask?.cancel()
+        gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel(); conversationRefreshTask?.cancel()
+        earlierMessagesTask?.cancel(); activityProjectionTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel(); cancelRuntimeRetirement?()
         for task in finalDurabilityTasks.values { task.cancel() }

@@ -124,11 +124,13 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     }
 
     func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary {
-        let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        let fingerprint = SessionFileFingerprint(url: fileURL, values: values)
+        // NSURL can retain resource values across an append; recreate it before validating the cache.
+        let fresh = URL(fileURLWithPath: fileURL.path)
+        let values = try fresh.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let fingerprint = SessionFileFingerprint(url: fresh, values: values)
         if let cached = await summaryCache.summary(for: fingerprint, archivedIDs: archivedIDs) { return cached }
         let summary = try await Self.detached(priority: .utility) {
-            try SessionParser.summary(at: fileURL, archivedIDs: archivedIDs)
+            try SessionParser.summary(at: fresh, archivedIDs: archivedIDs)
         }
         await summaryCache.store(summary, fingerprint: fingerprint)
         try? await summaryCache.persist()

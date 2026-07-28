@@ -204,6 +204,33 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(store.sessions.first { $0.id == sessionA.id }?.displayName, "Renamed from the sidebar")
     }
 
+    func testSessionNameEventsImmediatelyUpdateTheirOwningConversation() {
+        let (store, runtimeA, _, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+
+        runtimeA.onEvent?(.object([
+            "type": .string("session_info_changed"),
+            "name": .string("Selected conversation name")
+        ]))
+
+        XCTAssertEqual(store.sessions.first { $0.id == sessionA.id }?.displayName, "Selected conversation name")
+        XCTAssertEqual(store.runtimeState.sessionName, "Selected conversation name")
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        runtimeA.onEvent?(.object([
+            "type": .string("session_info_changed"),
+            "name": .string("Background conversation name")
+        ]))
+
+        XCTAssertEqual(store.sessions.first { $0.id == sessionA.id }?.displayName, "Background conversation name")
+        XCTAssertEqual(store.selectedSession?.id, sessionB.id)
+        XCTAssertNil(store.runtimeState.sessionName, "A background rename must not alter B's runtime state")
+    }
+
     func testSettledBackgroundRuntimeIsRetiredWithoutStoppingTheSelectedRun() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
 
