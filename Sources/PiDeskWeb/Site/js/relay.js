@@ -44,6 +44,11 @@ export function relayPairingState() {
   return pairing;
 }
 
+/** A new QR may reach an already-open Safari tab as fragment-only navigation. */
+export function shouldReloadPairingLink(pathname, hash) {
+  return /^\/pair\/[A-Za-z0-9_-]{32}$/.test(pathname) && String(hash || "").startsWith("#ticket=");
+}
+
 export function startRelay() {
   if (!isRelayMode() || started) return;
   started = true;
