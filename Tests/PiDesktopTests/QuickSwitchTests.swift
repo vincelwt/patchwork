@@ -326,6 +326,7 @@ final class SidebarFolderDefaultTests: XCTestCase {
             isRunning: { $0.name == "running" },
             isUnread: { _ in false },
             isAutomated: { $0.name == "automated" },
+            runningAt: \.modifiedAt,
             modifiedAt: \.modifiedAt
         )
         XCTAssertEqual(groups.map(\.section), [.running, .automated], "Unread and Done are empty, so they do not render")
@@ -345,6 +346,7 @@ final class SidebarFolderDefaultTests: XCTestCase {
             isRunning: { $0.name == "all" },
             isUnread: { ["all", "unread"].contains($0.name) },
             isAutomated: { ["all", "unread", "automated"].contains($0.name) },
+            runningAt: \.modifiedAt,
             modifiedAt: \.modifiedAt
         )
         XCTAssertEqual(groups.map(\.section), [.running, .unread, .done, .automated])
@@ -352,20 +354,28 @@ final class SidebarFolderDefaultTests: XCTestCase {
         XCTAssertEqual(groups.flatMap(\.sessions).count, 4, "Archived stays out and nothing is filed twice")
     }
 
-    func testSectionsSortNewestFirstOnTheSuppliedLiveDate() {
+    func testRunningSortStaysOnTurnStartWhileOtherSectionsFollowLiveUpdates() {
         let now = Date()
-        // Every summary claims the same stale mtime; only the live date differs.
+        var early = summary(modifiedAt: now); early.name = "early"
+        var late = summary(modifiedAt: now); late.name = "late"
         var old = summary(modifiedAt: now); old.name = "old"
         var fresh = summary(modifiedAt: now); fresh.name = "fresh"
-        let live: [String: Date] = ["old": now.addingTimeInterval(-500), "fresh": now]
+        // Live writes favor the early run, but its older turn must stay below the later run.
+        let running: [String: Date] = ["early": now.addingTimeInterval(-500), "late": now]
+        let live: [String: Date] = [
+            "early": now, "late": now.addingTimeInterval(-500),
+            "old": now.addingTimeInterval(-500), "fresh": now
+        ]
         let groups = SidebarStatusGroup.groups(
-            [old, fresh],
-            isRunning: { _ in false },
+            [early, late, old, fresh],
+            isRunning: { ["early", "late"].contains($0.name) },
             isUnread: { _ in false },
             isAutomated: { _ in false },
+            runningAt: { running[$0.name] ?? $0.modifiedAt },
             modifiedAt: { live[$0.name] ?? $0.modifiedAt }
         )
-        XCTAssertEqual(groups.first?.sessions.map(\.name), ["fresh", "old"])
+        XCTAssertEqual(groups.first { $0.section == .running }?.sessions.map(\.name), ["late", "early"])
+        XCTAssertEqual(groups.first { $0.section == .done }?.sessions.map(\.name), ["fresh", "old"])
     }
 
     func testSnapshotGroupsAndFiltersOnTheBoundedSearchKey() {
