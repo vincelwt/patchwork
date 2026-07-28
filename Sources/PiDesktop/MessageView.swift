@@ -287,12 +287,8 @@ struct TranscriptWorkView: View, Equatable {
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
-        .animation(reduceMotion || reduceTransparency ? nil : .easeOut(duration: 0.18), value: block.latestThinkingText)
+        .animation(reduceMotion || reduceTransparency ? nil : .easeOut(duration: 0.18), value: block.latestStatusText)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
-        // A resumed turn returns to the same collapsed latest-thought default as a new one.
-        .onChange(of: block.isActive) { _, active in
-            if active { userExpanded = nil }
-        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
         .accessibilityValue(isOpen ? "work details expanded" : "work details collapsed")
@@ -303,23 +299,57 @@ struct TranscriptWorkView: View, Equatable {
         return max(0.45, 1 - 0.15 * Double(block.entries.count - index - 1))
     }
 
+    private var showsStatusHeadline: Bool {
+        block.isActive || block.answerFailed || block.endsWithCompaction
+    }
+
     private var headline: some View {
-        Text(block.isActive ? (block.latestThinkingText ?? "Working") : block.title)
-            .font(PiFont.caption)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.head)
-            .contentTransition(.opacity)
+        HStack(spacing: PiTheme.space6) {
+            Text(showsStatusHeadline ? (block.latestStatusText ?? block.title) : block.title)
+                .font(PiFont.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.head)
+                .contentTransition(.opacity)
+            if block.isActive {
+                ActiveWorkElapsedView(block: block)
+            } else if showsStatusHeadline, let duration = block.duration {
+                Text("· \(NumberFormatting.duration(duration))")
+                    .font(PiFont.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
+            }
+        }
     }
 }
 
-/// Mid-turn narration reads as log, not as the answer, so it stays quiet inside the work block.
+/// A leaf timeline updates the clock without publishing a per-second AppStore change or
+/// invalidating the surrounding transcript and its AppKit text selections.
+private struct ActiveWorkElapsedView: View {
+    let block: TranscriptWorkBlock
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            if let elapsed = block.elapsed(at: context.date) {
+                Text("· \(NumberFormatting.duration(elapsed))")
+                    .font(PiFont.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .fixedSize()
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Mid-turn narration reads as log, while exceptional messages keep their distinct treatment.
 private struct WorkNoteView: View {
     let message: ChatMessage
     let onImage: (ImagePayload, [ImagePayload]) -> Void
 
     var body: some View {
-        if message.role == .assistant {
+        if let compaction = TranscriptCompaction(message: message) {
+            CompactionRowView(note: compaction)
+        } else if message.role == .assistant, !message.isError {
             PiGridRow(symbol: "text.bubble") {
                 MarkdownBlockView(text: message.textContent)
                     .foregroundStyle(.secondary)
@@ -336,8 +366,8 @@ private struct WorkNoteView: View {
     }
 }
 
-/// Compaction is a real event in the session, so it gets its own visible marker instead of
-/// hiding inside a generic system row.
+/// Compaction stays recognizable inside the turn's collapsed work log and reveals its summary
+/// only on demand.
 struct CompactionRowView: View {
     let note: TranscriptCompaction
     @State private var expanded = false

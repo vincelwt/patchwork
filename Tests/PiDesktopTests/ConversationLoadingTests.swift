@@ -311,6 +311,47 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.filter { $0.textContent == "Durable answer" }.count, 2)
     }
 
+    func testOpenConversationRefreshesItsChangedDiskTailWithoutReselection() async throws {
+        let file = temporaryDirectory.appendingPathComponent("live-tail.jsonl")
+        try writeLinearConversation(prefix: "live", messageCount: 60, to: file)
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: temporaryDirectory.appendingPathComponent("heartbeats", isDirectory: true)
+        )
+        let store = makeStore(
+            repository: FileSessionRepository(rootURL: temporaryDirectory),
+            activityMonitor: monitor
+        )
+        let session = try makeSummary(id: "live", fileURL: file)
+        store.sessions = [session]
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path) != nil }
+
+        store.selectSession(session)
+        try await waitUntil { store.messages.count == 50 }
+        store.loadEarlierMessages()
+        try await waitUntil { store.messages.count == 60 }
+        let firstID = store.messages.first?.id
+
+        let entry: [String: Any] = [
+            "type": "message", "id": "live-thinking", "parentId": "live-entry-59",
+            "message": [
+                "role": "assistant",
+                "content": [["type": "thinking", "thinking": "Fresh live thought"]]
+            ]
+        ]
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: JSONSerialization.data(withJSONObject: entry) + Data([0x0A]))
+        try handle.close()
+        monitor.tickNow()
+
+        try await waitUntil { store.messages.last?.id == "live-thinking" }
+        XCTAssertEqual(store.messages.first?.id, firstID, "Refreshing the tail must preserve loaded earlier rows")
+        XCTAssertEqual(store.messages.last?.textContent, "Fresh live thought")
+        XCTAssertNil(store.initialScrollTargetMessageID, "A passive refresh must not re-arm initial scrolling")
+    }
+
     func testDuplicatePiSessionIDsStillSelectByFilePath() async throws {
         let fileA = temporaryDirectory.appendingPathComponent("duplicate-a.jsonl")
         let fileB = temporaryDirectory.appendingPathComponent("duplicate-b.jsonl")
@@ -364,14 +405,16 @@ final class ConversationLoadingTests: XCTestCase {
         repository: SessionRepositoryProtocol,
         gitService: GitStatusProviding = FakeGitService(),
         runtime: PiRuntimeProtocol = FakeRuntime(),
-        persistence: AppPersistence? = nil
+        persistence: AppPersistence? = nil,
+        activityMonitor: SessionActivityMonitor? = nil
     ) -> AppStore {
         AppStore(
             repository: repository,
             gitService: gitService,
             runtime: runtime,
             persistence: persistence ?? AppPersistence(baseURL: temporaryDirectory),
-            activityPresenter: ActivityPresenter()
+            activityPresenter: ActivityPresenter(),
+            activityMonitor: activityMonitor
         )
     }
 

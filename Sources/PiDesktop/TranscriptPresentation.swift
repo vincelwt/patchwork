@@ -128,14 +128,45 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
         return nil
     }
 
+    /// The newest thought or exceptional event worth surfacing while the details stay collapsed.
+    var latestStatusText: String? {
+        for entry in entries.reversed() {
+            switch entry {
+            case let .thinking(thinking):
+                return thinking.text.replacingOccurrences(of: "**", with: "")
+            case let .note(message):
+                if let compaction = TranscriptCompaction(message: message) { return compaction.title }
+                guard message.isError else { continue }
+                let detail = message.blocks.compactMap { block -> String? in
+                    guard case let .text(text) = block.kind else { return nil }
+                    return text
+                }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                return detail.isEmpty ? "Pi error" : "Pi error: \(detail)"
+            case .activity:
+                continue
+            }
+        }
+        return nil
+    }
+
+    var endsWithCompaction: Bool {
+        guard case let .note(message) = entries.last else { return false }
+        return TranscriptCompaction(message: message) != nil
+    }
+
     /// At least one tool step failed somewhere in the log. Individual steps still show red where
     /// they are, but this alone must never drive the collapsed header's "· failed" label.
     var hasFailure: Bool { activities.contains(where: \.hasFailure) }
 
+    func elapsed(at now: Date) -> TimeInterval? {
+        guard let startedAt else { return nil }
+        let value = now.timeIntervalSince(startedAt)
+        return value >= 0 ? value : nil
+    }
+
     var duration: TimeInterval? {
-        guard let startedAt, let endedAt else { return nil }
-        let value = endedAt.timeIntervalSince(startedAt)
-        return value > 0 ? value : nil
+        guard let endedAt else { return nil }
+        return elapsed(at: endedAt)
     }
 
     /// The settled headline. A missing or nonsensical timestamp pair falls back to step counts
@@ -147,7 +178,7 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
     }
 }
 
-/// Compaction and branch summaries are session-level events: always visible, never buried.
+/// Compaction and branch summaries retain their distinct in-log disclosure treatment.
 struct TranscriptCompaction: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
@@ -207,7 +238,6 @@ struct TranscriptActivityGroup: Identifiable, Hashable, Sendable {
 enum TranscriptItem: Identifiable, Hashable, Sendable {
     case message(ChatMessage, streaming: Bool)
     case work(TranscriptWorkBlock)
-    case compaction(TranscriptCompaction)
 
     var id: String {
         switch self {
@@ -218,7 +248,6 @@ enum TranscriptItem: Identifiable, Hashable, Sendable {
         case let .message(message, _):
             "message:\(message.id):\(message.blocks.first?.id ?? "")"
         case let .work(block): block.id
-        case let .compaction(note): "compaction:\(note.id)"
         }
     }
 }
@@ -262,28 +291,37 @@ private struct TurnBuilder {
     init(isLive: Bool) { self.isLive = isLive }
 
     mutating func consume(_ message: ChatMessage, streaming: Bool) {
-        if let timestamp = message.timestamp { lastTimestamp = timestamp }
-
-        switch message.role {
-        case .user:
+        if message.role == .user {
+            // Close with Pi's last timestamp, not the next user's later reply time.
             closeTurn(active: false)
+            lastTimestamp = message.timestamp
             userImageData = message.images.map(\.data)
             turnStart = message.timestamp
             result.append(.message(message, streaming: streaming))
+            return
+        }
+
+        switch message.role {
         case .assistant:
             consumeAssistant(message, streaming: streaming)
         case .tool, .bash:
             attachResult(message)
         case .system:
-            if let note = TranscriptCompaction(message: message) {
-                closeTurn(active: false)
-                result.append(.compaction(note))
+            if TranscriptCompaction(message: message) != nil {
+                demoteTrailing()
+                closeActivity()
+                entries.append(.note(message))
             } else {
                 log(message, streaming: streaming)
             }
         case .custom, .unknown:
             log(message, streaming: streaming)
+        case .user:
+            break
         }
+        // Any turn boundary discovered above belongs to the prior message; only then does this
+        // message become the newest timestamp for the work now in progress.
+        if let timestamp = message.timestamp { lastTimestamp = timestamp }
     }
 
     mutating func finish() -> [TranscriptItem] {
@@ -331,9 +369,21 @@ private struct TurnBuilder {
                 prose.append(block)
             }
         }
+        // Transport/model errors are retry events inside the same work log, not answers that
+        // split one uninterrupted run into several transcript turns.
+        if message.isError {
+            demoteTrailing()
+            turnAnswerFailed = true
+            if let error = proseMessage() {
+                closeActivity()
+                entries.append(.note(error))
+            }
+            return
+        }
+
         // Recorded after the blocks, not before them: a `demoteTrailing()` inside the loop can
         // close the previous turn, whose header must report *that* turn's answer, not this one.
-        turnAnswerFailed = message.isError
+        turnAnswerFailed = false
         if let answer = proseMessage() {
             // Prose that follows this turn's own work or carries a terminal stop reason is the
             // answer, not narration. Later custom/system updates must never bury a plain final.
