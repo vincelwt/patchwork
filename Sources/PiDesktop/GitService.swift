@@ -14,8 +14,8 @@ extension GitStatusProviding {
     func worktreeInfo(for directory: URL) async -> GitWorktreeInfo? { nil }
 }
 
-/// Present only when the session's cwd is a linked worktree. `name`/`mainName` are last path
-/// components, sized for a compact inspector row; `path`/`mainWorktreePath` back its tooltip.
+/// Present only when the inspected directory is a linked worktree. `name`/`mainName` are last
+/// path components, sized for a compact inspector row; full paths back its tooltip.
 struct GitWorktreeInfo: Hashable, Sendable {
     let path: String
     let branch: String?
@@ -23,6 +23,72 @@ struct GitWorktreeInfo: Hashable, Sendable {
 
     var name: String { URL(fileURLWithPath: path).lastPathComponent }
     var mainName: String { URL(fileURLWithPath: mainWorktreePath).lastPathComponent }
+}
+
+/// Finds explicit workspace moves in tool calls. Reads are intentionally ignored: inspecting a
+/// file elsewhere does not move the conversation, while an explicit cwd or edited file does.
+enum ConversationWorkspaceDetector {
+    private static let directoryKeys: Set<String> = [
+        "cwd", "workdir", "workingdirectory", "working_directory", "worktreepath", "worktree_path"
+    ]
+    private static let fileKeys: Set<String> = ["path", "file", "file_path"]
+    private static let shellDirectoryPattern = try! NSRegularExpression(
+        pattern: #"(?:^|[;&|]\s*)(?:cd|git\s+-C)\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))"#
+    )
+
+    static func latestDirectory(in messages: [ChatMessage], relativeTo base: URL) -> URL? {
+        for message in messages.reversed() {
+            for block in message.blocks.reversed() {
+                guard case let .toolCall(call) = block.kind,
+                      let directory = directory(toolName: call.name, arguments: call.arguments, relativeTo: base)
+                else { continue }
+                return directory
+            }
+        }
+        return nil
+    }
+
+    static func directory(toolName: String, arguments: JSONValue, relativeTo base: URL) -> URL? {
+        let name = toolName.split(separator: ".").last.map(String.init)?.lowercased() ?? toolName.lowercased()
+        if let cwd = string(in: arguments, keys: directoryKeys) {
+            return resolved(cwd, relativeTo: base, isFile: false)
+        }
+        if ["edit", "write", "patch", "apply_patch"].contains(name),
+           let path = string(in: arguments, keys: fileKeys) {
+            return resolved(path, relativeTo: base, isFile: true)
+        }
+        guard name == "bash", let command = arguments["command"]?.stringValue,
+              let path = shellDirectory(in: String(command.prefix(20_000))) else { return nil }
+        return resolved(path, relativeTo: base, isFile: false)
+    }
+
+    private static func string(in arguments: JSONValue, keys: Set<String>) -> String? {
+        arguments.objectValue?.first { keys.contains($0.key.lowercased()) }?.value.stringValue
+    }
+
+    private static func shellDirectory(in command: String) -> String? {
+        let matches = shellDirectoryPattern.matches(
+            in: command,
+            range: NSRange(command.startIndex..., in: command)
+        )
+        guard let match = matches.last else { return nil }
+        for index in 1..<match.numberOfRanges {
+            guard let range = Range(match.range(at: index), in: command) else { continue }
+            return String(command[range])
+        }
+        return nil
+    }
+
+    private static func resolved(_ raw: String, relativeTo base: URL, isFile: Bool) -> URL? {
+        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean.count <= 4_096,
+              !clean.contains("\0"), !clean.contains("$"), !clean.contains("`") else { return nil }
+        let path = (clean as NSString).expandingTildeInPath
+        let url = path.hasPrefix("/")
+            ? URL(fileURLWithPath: path, isDirectory: !isFile)
+            : base.standardizedFileURL.appendingPathComponent(path, isDirectory: !isFile)
+        return (isFile ? url.deletingLastPathComponent() : url).standardizedFileURL
+    }
 }
 
 struct GitService: GitStatusProviding {
@@ -68,14 +134,19 @@ struct GitService: GitStatusProviding {
         guard gitDir != commonDir else { return nil } // Main checkout, or a repo with no worktrees.
 
         let mainWorktreePath = URL(fileURLWithPath: commonDir).deletingLastPathComponent().path
+        let topLevel = run(["-C", directory.path, "rev-parse", "--show-toplevel"])
+        let worktreePath = topLevel.status == 0
+            ? resolvedGitPath(topLevel.output, relativeTo: directory)
+            : directory.resolvingSymlinksInPath().path
         guard !Task.isCancelled else { return nil }
         let list = run(["-C", directory.path, "worktree", "list", "--porcelain"])
-        guard list.status == 0, let entry = matchingWorktreeEntry(in: list.output, containing: directory) else {
-            // We know it is a worktree (the dirs differ) but could not pin down its registered
-            // root; fall back to the cwd itself rather than dropping the indicator entirely.
-            return GitWorktreeInfo(path: directory.resolvingSymlinksInPath().path, branch: nil, mainWorktreePath: mainWorktreePath)
-        }
-        return GitWorktreeInfo(path: entry.path, branch: entry.branch, mainWorktreePath: mainWorktreePath)
+        let branch = list.status == 0
+            ? matchingWorktreeEntry(
+                in: list.output,
+                containing: URL(fileURLWithPath: worktreePath, isDirectory: true)
+            )?.branch
+            : nil
+        return GitWorktreeInfo(path: worktreePath, branch: branch, mainWorktreePath: mainWorktreePath)
     }
 
     /// `--git-dir`/`--git-common-dir` can come back relative (e.g. `../../.git`) or absolute

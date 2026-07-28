@@ -204,9 +204,8 @@ final class AppStore: ObservableObject {
 
     @Published var folderGit: [String: GitSnapshot] = [:]
     @Published var selectedGit = GitSnapshot.none
-    /// Present only for a cwd that resolves to a linked git worktree; refreshed on the exact
-    /// same cadence and cache keys as `folderGit`/`selectedGit` (Task 2), just kept in a sibling
-    /// dictionary instead of a field on `GitSnapshot`. Absent entirely for a plain checkout.
+    /// Present only for directories that resolve to linked Git worktrees. The selected entry may
+    /// follow an explicit tool cwd/edit path away from the session's original cwd.
     @Published var folderWorktrees: [String: GitWorktreeInfo] = [:]
     @Published var selectedWorktree: GitWorktreeInfo?
     @Published var activities: [ActivityItem] = []
@@ -274,8 +273,12 @@ final class AppStore: ObservableObject {
         get { activeRuntimeSlot.startedForNewChat }
         set { activeRuntimeSlot.startedForNewChat = newValue }
     }
+    private var selectedGitDirectoryPath: String?
+    private var selectedGitCandidatePath: String?
+    private var selectedGitGeneration = 0
     private var gitRefreshTask: Task<Void, Never>?
     private var selectedGitTask: Task<Void, Never>?
+    private var selectedWorkspaceTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
     private var conversationRefreshTask: Task<Void, Never>?
     private var earlierMessagesTask: Task<Void, Never>?
@@ -373,7 +376,9 @@ final class AppStore: ObservableObject {
         self.isActiveOverride = isActiveOverride
         // Pi requires a cwd even for a global conversation; Desktop is the neutral default and
         // passive Git inspection explicitly skips it until a real prompt starts Pi.
-        selectedFolder = WorkspaceOrganization.globalWorkingDirectory
+        let globalFolder = WorkspaceOrganization.globalWorkingDirectory
+        selectedFolder = globalFolder
+        selectedGitDirectoryPath = globalFolder.standardizedFileURL.path
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
@@ -1183,6 +1188,7 @@ final class AppStore: ObservableObject {
         // Release the previous conversation's decoded bitmaps promptly.
         DecodedImageCache.purge()
         selectedFolder = newFolder
+        resetSelectedGitDirectory(to: newFolder)
         refreshSelectedGit()
     }
 
@@ -1222,9 +1228,7 @@ final class AppStore: ObservableObject {
         attachments = attachmentsByKey[path] ?? []
         flushDraftPersistence()
         DecodedImageCache.purge()
-        let cwdPath = session.cwd.standardizedFileURL.path
-        selectedGit = folderGit[cwdPath] ?? .none
-        selectedWorktree = folderWorktrees[cwdPath]
+        resetSelectedGitDirectory(to: session.cwd)
 
         // A parked questionnaire is already backed by a live runtime. Reattach it immediately;
         // waiting for the user to edit the composer leaves the inline question impossible to answer.
@@ -1237,14 +1241,13 @@ final class AppStore: ObservableObject {
         if let (cached, fingerprint) = cachedPage(for: session.fileURL) {
             publishConversationPage(cached, path: path, fingerprint: fingerprint)
             isConversationLoading = false
+            updateSelectedWorkspace(from: cached.messages, for: session)
             conversationLoadTask = Task { [weak self] in
                 guard let self else { return }
                 let projected = await projectActivities(from: cached.messages)
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
                 activities = projected
-                await refreshGit(for: session.cwd)
-                guard conversationLoadGeneration == generation else { return }
                 schedulePrefetch(around: session)
             }
             return
@@ -1288,6 +1291,7 @@ final class AppStore: ObservableObject {
         publishConversationPage(page, path: path, fingerprint: fingerprint)
         cachePage(page, for: session.fileURL, fingerprint: fingerprint)
         isConversationLoading = false
+        updateSelectedWorkspace(from: page.messages, for: session)
         refreshSelectedConversationIfNeeded()
         ConversationPerformance.mark("Conversation first publish", path: path, count: page.messages.count)
 
@@ -1300,8 +1304,6 @@ final class AppStore: ObservableObject {
             "Transcript activity projection", path: path, count: projected.count,
             milliseconds: Date().timeIntervalSince(projectionStartedAt) * 1_000
         )
-        await refreshGit(for: session.cwd)
-        guard conversationLoadGeneration == generation else { return }
         schedulePrefetch(around: session)
     }
 
@@ -1371,6 +1373,7 @@ final class AppStore: ObservableObject {
         loadedConversationPath = path
         loadedConversationFingerprint = fingerprint
         replaceLoadedMessages(with: retained)
+        if let session = selectedSession { updateSelectedWorkspace(from: retained, for: session) }
         conversationHistoryLimitReached = exceededLimit
             || (merged.olderCursor != nil && retained.count >= Self.loadedMessageLimit)
             || (merged.isTruncated && merged.olderCursor == nil)
@@ -1622,6 +1625,7 @@ final class AppStore: ObservableObject {
         }
         selectedFolder = folder
         if !WorkspaceOrganization.isGlobalWorkingDirectory(folder) { persistence.rememberFolder(folder) }
+        if selectedSession == nil { resetSelectedGitDirectory(to: folder) }
         refreshSelectedGit()
     }
 
@@ -2628,13 +2632,77 @@ final class AppStore: ObservableObject {
         selectedGitTask = Task { [weak self] in await self?.refreshSelectedGitAndWait() }
     }
 
-    /// One awaited refresh at a time; the caller (menu action or polling loop) never spawns
-    /// overlapping git command chains. A project session's cwd is fair game because Pi already
-    /// reads/writes there; a bare `selectedFolder` refreshes only after explicit selection.
-    /// `fetchGitState` always skips the neutral Desktop cwd used by global conversations.
+    private func resetSelectedGitDirectory(to url: URL) {
+        selectedGitTask?.cancel()
+        selectedWorkspaceTask?.cancel()
+        selectedGitGeneration &+= 1
+        selectedGitCandidatePath = nil
+        let path = url.standardizedFileURL.path
+        selectedGitDirectoryPath = path
+        selectedGit = folderGit[path] ?? .none
+        selectedWorktree = folderWorktrees[path]
+    }
+
+    private func updateSelectedWorkspace(from messages: [ChatMessage], for session: SessionSummary) {
+        guard let directory = ConversationWorkspaceDetector.latestDirectory(in: messages, relativeTo: session.cwd) else {
+            if selectedGitCandidatePath == nil { refreshSelectedGit() }
+            return
+        }
+        observeSelectedWorkspace(directory, for: session)
+    }
+
+    /// A tool call is only adopted after Git confirms the explicit cwd/edit path belongs to a
+    /// repository. A separate task prevents an ordinary status refresh from cancelling the move.
+    private func observeSelectedWorkspace(_ directory: URL, for session: SessionSummary) {
+        let sessionPath = session.fileURL.standardizedFileURL.path
+        guard selectedSession?.fileURL.standardizedFileURL.path == sessionPath else { return }
+        let sessionCwd = session.cwd.standardizedFileURL.resolvingSymlinksInPath().path
+        let candidate = directory.standardizedFileURL.resolvingSymlinksInPath().path
+        let candidatePath = (candidate == sessionCwd || candidate.hasPrefix(sessionCwd + "/"))
+            ? session.cwd.standardizedFileURL.path
+            : directory.standardizedFileURL.path
+        if let currentRoot = selectedWorktree.map({ URL(fileURLWithPath: $0.path, isDirectory: true).resolvingSymlinksInPath().path }),
+           candidate == currentRoot || candidate.hasPrefix(currentRoot + "/") {
+            selectedGitCandidatePath = candidatePath
+            return
+        }
+        guard selectedGitCandidatePath != candidatePath else { return }
+
+        selectedWorkspaceTask?.cancel()
+        selectedGitGeneration &+= 1
+        let generation = selectedGitGeneration
+        selectedGitCandidatePath = candidatePath
+        let service = gitService
+        selectedWorkspaceTask = Task { [weak self] in
+            guard let self else { return }
+            let (_, snapshot, worktree) = await Self.fetchGitState(candidatePath, service: service)
+            guard !Task.isCancelled, selectedGitGeneration == generation,
+                  selectedSession?.fileURL.standardizedFileURL.path == sessionPath else { return }
+            guard snapshot.isRepository || worktree != nil else {
+                selectedGitCandidatePath = nil
+                selectedWorkspaceTask = nil
+                return
+            }
+
+            let targetPath = worktree.map { URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL.path }
+                ?? candidatePath
+            selectedGitDirectoryPath = targetPath
+            folderGit[targetPath] = snapshot
+            if let worktree { folderWorktrees[targetPath] = worktree }
+            else { folderWorktrees.removeValue(forKey: targetPath) }
+            selectedGit = snapshot
+            selectedWorktree = worktree
+            selectedWorkspaceTask = nil
+        }
+    }
+
+    /// One awaited refresh at a time; a session follows the latest confirmed tool workspace,
+    /// while a bare `selectedFolder` refreshes only after explicit selection. Global Desktop is
+    /// still skipped by `fetchGitState`.
     private func refreshSelectedGitAndWait() async {
         if let session = selectedSession {
-            await refreshGit(for: session.cwd)
+            let directory = selectedGitDirectoryPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? session.cwd
+            await refreshGit(for: directory)
             return
         }
         guard let folder = selectedFolder, hasOptedIntoGitRefresh(folder) else {
@@ -2642,7 +2710,8 @@ final class AppStore: ObservableObject {
             selectedWorktree = nil
             return
         }
-        await refreshGit(for: folder)
+        let directory = selectedGitDirectoryPath.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? folder
+        await refreshGit(for: directory)
     }
 
     /// A project folder counts as opted into once the user chose it or it backs a real session.
@@ -3268,6 +3337,18 @@ final class AppStore: ObservableObject {
                 }
             }
             return
+        }
+        if event["type"]?.stringValue == "tool_execution_start",
+           slot === activeRuntimeSlot, !activePresentationDetached,
+           let session = session(for: slot),
+           selectedSession?.fileURL.standardizedFileURL.path == session.fileURL.standardizedFileURL.path,
+           let name = event["toolName"]?.stringValue,
+           let directory = ConversationWorkspaceDetector.directory(
+               toolName: name,
+               arguments: event["args"] ?? .object([:]),
+               relativeTo: session.cwd
+           ) {
+            observeSelectedWorkspace(directory, for: session)
         }
         if slot === activeRuntimeSlot, !activePresentationDetached {
             handleRPCEvent(event)
@@ -3957,7 +4038,7 @@ final class AppStore: ObservableObject {
             while let (path, snapshot, worktree) = await group.next() {
                 folderGit[path] = snapshot
                 folderWorktrees[path] = worktree
-                if selectedSession?.cwd.standardizedFileURL.path == path {
+                if selectedGitDirectoryPath == path {
                     selectedGit = snapshot
                     selectedWorktree = worktree
                 }
@@ -3973,8 +4054,7 @@ final class AppStore: ObservableObject {
         let (_, snapshot, worktree) = await Self.fetchGitState(normalized.path, service: gitService)
         folderGit[normalized.path] = snapshot
         folderWorktrees[normalized.path] = worktree
-        let selectedPath = selectedSession?.cwd.standardizedFileURL.path ?? selectedFolder?.standardizedFileURL.path
-        if selectedPath == normalized.path {
+        if selectedGitDirectoryPath == normalized.path {
             selectedGit = snapshot
             selectedWorktree = worktree
         }

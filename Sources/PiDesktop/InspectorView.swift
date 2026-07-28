@@ -8,7 +8,7 @@ struct InspectorView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: PiTheme.space16) {
-                if store.selectedGit.isRepository {
+                if store.selectedGit.isRepository || store.selectedWorktree != nil {
                     GitSection(snapshot: store.selectedGit)
                 }
 
@@ -74,26 +74,25 @@ private struct GitSection: View {
                 .help("Refresh Git")
             }
 
-            InspectorRow(symbol: "plusminus", title: "Changes") {
-                if snapshot.isDirty {
-                    Text("+\(snapshot.additions)").foregroundStyle(Color.piGreen)
-                    Text("−\(snapshot.deletions)").foregroundStyle(Color.piRed)
-                } else {
-                    Text("clean").foregroundStyle(.tertiary)
+            if snapshot.isRepository {
+                InspectorRow(symbol: "plusminus", title: "Changes") {
+                    if snapshot.isDirty {
+                        Text("+\(snapshot.additions)").foregroundStyle(Color.piGreen)
+                        Text("−\(snapshot.deletions)").foregroundStyle(Color.piRed)
+                    } else {
+                        Text("clean").foregroundStyle(.tertiary)
+                    }
                 }
+
+                InspectorRow(symbol: "arrow.triangle.branch", title: snapshot.branch ?? "Worktree") {
+                    if snapshot.isDetached { Text("detached").foregroundStyle(.tertiary) }
+                }
+                .help(snapshot.statusHint ?? "Git worktree")
             }
 
-            InspectorRow(symbol: "arrow.triangle.branch", title: snapshot.branch ?? "Worktree") {
-                if snapshot.isDetached { Text("detached").foregroundStyle(.tertiary) }
-            }
-            .help(snapshot.statusHint ?? "Git worktree")
-
-            // Honest, at-a-glance signal that this thread runs in a linked worktree rather than
-            // the main checkout — easy to miss otherwise since the branch row above looks the
-            // same either way.
             if let worktree = store.selectedWorktree {
                 InspectorRow(symbol: "arrow.branch", title: "Worktree") {
-                    Text(worktree.name)
+                    Text(worktree.name).lineLimit(1).truncationMode(.middle)
                 }
                 .help("Linked from \(worktree.mainName) \u{b7} \(worktree.path)")
             }
