@@ -970,4 +970,35 @@ final class StatusCacheMergeTests: XCTestCase {
         XCTAssertEqual(model.codexAccount?.account, "vince@example.com", "the known account must survive")
         XCTAssertNotNil(model.fastPriority)
     }
+
+    func testClearedModeStatusIsNotRetainedByTheComposer() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let persistence = AppPersistence(baseURL: directory)
+        let store = AppStore(
+            repository: FakeRepository(),
+            gitService: FakeGitService(),
+            runtime: FakeRuntime(),
+            persistence: persistence,
+            activityPresenter: ActivityPresenter()
+        )
+        store.handleRPCEventForTesting(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.modeKey),
+            "statusText": .string("mode:smart")
+        ]))
+        XCTAssertEqual(store.statusModel.mode, .smart)
+
+        store.handleRPCEventForTesting(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.modeKey)
+        ]))
+        XCTAssertNil(store.statusModel.mode)
+        XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.modeKey])
+    }
 }
