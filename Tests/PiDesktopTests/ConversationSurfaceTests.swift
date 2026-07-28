@@ -778,3 +778,43 @@ final class LimitsBridgeTests: XCTestCase {
         XCTAssertNotNil(store.lastError)
     }
 }
+
+@MainActor
+final class StatusDotAnimationTests: XCTestCase {
+    /// The pulse must be a render-server CA animation, not a SwiftUI repeat-forever animation
+    /// that ticks the window's view graph every frame (measured stealing scroll headroom with
+    /// several running conversations visible).
+    func testPulsingDotInstallsItsLayerAnimationOnAttachAndReinstallsOnReattach() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: true
+        )
+        defer { window.orderOut(nil) }
+        let dot = PulsingDotView.DotView()
+
+        window.contentView?.addSubview(dot)
+        XCTAssertNotNil(
+            dot.layer?.animation(forKey: PulsingDotView.DotView.animationKey),
+            "Attaching installs the pulse"
+        )
+
+        dot.removeFromSuperview()
+        // CA purges a detached layer's animations at commit time; the guarantee that matters is
+        // that every (re)attach ends with the pulse installed.
+        dot.layer?.removeAnimation(forKey: PulsingDotView.DotView.animationKey)
+        window.contentView?.addSubview(dot)
+        XCTAssertNotNil(
+            dot.layer?.animation(forKey: PulsingDotView.DotView.animationKey),
+            "Reattaching must reinstall the pulse"
+        )
+    }
+
+    func testStatusDotSourceUsesTheLayerPulseNotAViewGraphAnimation() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop/Theme.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertFalse(source.contains(".repeatForever("), "The pulse must stay off the SwiftUI view graph")
+        XCTAssertTrue(source.contains("CABasicAnimation"), "The pulse is a Core Animation layer animation")
+    }
+}
