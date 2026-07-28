@@ -397,15 +397,31 @@ actor RelayService {
         let expiresAt = Date().addingTimeInterval(Self.pairingLifetime)
         let expiresAtMilliseconds = Int64(expiresAt.timeIntervalSince1970 * 1_000)
         var message = RelayWireMessage(type: "pairOffer")
-        message.id = UUID().uuidString
+        let offerID = UUID().uuidString
+        message.id = offerID
         message.ticketHash = Data(SHA256.hash(data: Data(ticket.utf8))).base64URLEncoded
         message.expiresAt = expiresAtMilliseconds
         message.hostPublicKey = try identity.agreementKey.publicKey.x963Representation.base64URLEncoded
         try await sendAndAwaitAck(message)
         activePairingOffer = ActivePairingOffer(ticket: ticket, expiresAt: expiresAtMilliseconds)
 
-        let url = "\(Self.webOrigin)/pair/\(identity.installationID)#ticket=\(ticket)&host=\(message.hostPublicKey!)"
-        return RemotePairingOffer(url: url, expiresAt: expiresAt)
+        return RemotePairingOffer(
+            url: Self.pairingURL(
+                installationID: identity.installationID,
+                offerID: offerID,
+                ticket: ticket,
+                hostPublicKey: message.hostPublicKey!
+            ),
+            expiresAt: expiresAt
+        )
+    }
+
+    /// The query is deliberately non-secret but unique per QR. Safari treats a new fragment on
+    /// the same `/pair/<installation>` URL as in-page navigation and can reuse a stale tab without
+    /// running the pairing bootstrap. A changing query forces a real document load while the
+    /// ticket and host key remain fragment-only and therefore never reach Cloudflare.
+    static func pairingURL(installationID: String, offerID: String, ticket: String, hostPublicKey: String) -> String {
+        "\(webOrigin)/pair/\(installationID)?offer=\(offerID)#ticket=\(ticket)&host=\(hostPublicKey)"
     }
 
     func decidePairing(id: String, approved: Bool) async throws -> RemoteAccessStatus {

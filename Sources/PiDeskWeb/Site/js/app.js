@@ -13,6 +13,7 @@ import {
   hasRelayDevice,
   isRelayMode,
   relayPairingState,
+  shouldReloadPairingLink,
   startRelay
 } from "./relay.js";
 import { renderTokenScreen } from "./views/token.js";
@@ -344,6 +345,11 @@ function resolveRoute(pathname) {
 }
 
 window.addEventListener("popstate", mountRoute);
+// iPhone Safari can reuse the existing `/pair/<installation>` tab when only the fragment changed.
+// Reload so the new fragment is consumed instead of leaving the expired pairing screen in place.
+window.addEventListener("hashchange", () => {
+  if (hosted && shouldReloadPairingLink(location.pathname, location.hash)) location.reload();
+});
 window.addEventListener("pi:unauthorized", () => {
   stopEvents();
   clearToken();

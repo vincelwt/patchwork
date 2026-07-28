@@ -39,6 +39,24 @@ final class RelayPairingProofTests: XCTestCase {
         ))
     }
 
+    func testPairingURLForcesANewSafariLoadWithoutLeakingSecretsBeforeTheFragment() throws {
+        let first = RelayService.pairingURL(
+            installationID: "installation", offerID: "offer-one",
+            ticket: "secret-ticket", hostPublicKey: "secret-host-key"
+        )
+        let second = RelayService.pairingURL(
+            installationID: "installation", offerID: "offer-two",
+            ticket: "secret-ticket", hostPublicKey: "secret-host-key"
+        )
+        let components = try XCTUnwrap(URLComponents(string: first))
+
+        XCTAssertEqual(components.path, "/pair/installation")
+        XCTAssertEqual(components.queryItems, [URLQueryItem(name: "offer", value: "offer-one")])
+        XCTAssertEqual(components.fragment, "ticket=secret-ticket&host=secret-host-key")
+        XCTAssertFalse(first.split(separator: "#", maxSplits: 1)[0].contains("secret"))
+        XCTAssertNotEqual(first.split(separator: "#", maxSplits: 1)[0], second.split(separator: "#", maxSplits: 1)[0])
+    }
+
     func testMutationCounterRejectsReplaysAcrossCounterGaps() {
         var highest: UInt64 = 0
         XCTAssertTrue(RelayMutationCounter.accept(1, highest: &highest))

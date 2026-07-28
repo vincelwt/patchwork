@@ -22,8 +22,10 @@ Pair a browser once:
 4. Optionally add the site to the phone's Home Screen.
 
 The QR link expires after five minutes and is single-use. It contains a random installation ID,
-one-time ticket, and the Mac's public encryption key. It contains no provider credential,
-session data, or reusable daemon bearer token.
+a non-secret per-offer reload nonce, one-time ticket, and the Mac's public encryption key. The
+nonce makes iPhone Safari load each newly scanned QR instead of reusing an expired pairing tab;
+the ticket and key remain in the URL fragment. The link contains no provider credential, session
+data, or reusable daemon bearer token.
 
 After approval, the browser keeps non-exportable P-256 authentication and key-agreement keys in
 IndexedDB. The URL-fragment ticket never goes to the relay: the browser sends its SHA-256 hash
