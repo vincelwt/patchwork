@@ -123,8 +123,11 @@ The hosted relay does not use this listener or token and does not expose a port 
 
 `Sources/PiDeskWeb/Site/` is plain HTML/CSS/JavaScript with no framework, CDN, or build step.
 `PiDeskWeb.asset(for:)` bundles it for loopback use, while Wrangler serves the same directory on
-the hosted origin. Local mode uses HTTP + authenticated SSE; hosted mode swaps only the transport
-for the encrypted relay WebSocket. The views and `/v1` response contract are shared.
+the hosted origin. Hosted JavaScript and CSS bypass conditional caching because Safari 27 can
+receive a `304` from memory and then refuse access to the cached module body; the Worker forces a
+full response with `Cache-Control: no-store`. Local mode uses HTTP + authenticated SSE; hosted mode
+swaps only the transport for the encrypted relay WebSocket. The views and `/v1` response contract
+are shared.
 
 Pure logic lives in `.mjs` modules with no DOM (`markdown`, `time`, `trigger`, `relayCrypto`,
 `pending`, `folders`) and is tested directly with `node --test docs/js-checks/*.test.mjs`. The
