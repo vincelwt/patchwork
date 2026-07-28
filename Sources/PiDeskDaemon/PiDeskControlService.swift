@@ -68,23 +68,33 @@ public final class PiDeskControlService: @unchecked Sendable {
 
     public func start() async throws {
         guard claimStart() else { return }
+        guard !Task.isCancelled else {
+            markStopped()
+            throw CancellationError()
+        }
 
         // A disconnected CLI/browser is routine. The host process must receive EPIPE rather than
         // terminate, whether the host is Pi Desktop or the optional standalone executable.
         signal(SIGPIPE, SIG_IGN)
         logger.info("Pi Desktop control service starting (concurrency=\(settings.concurrency), remoteEnabled=\(settings.remoteEnabled), port=\(settings.port))")
         connectivity?.start()
+        var coreStarted = false
         do {
             try server.start(
                 unixSocketPath: unixSocketPath,
                 tcpPort: settings.remoteEnabled ? settings.port : nil
             )
+            try Task.checkCancellation()
             await core.runHistoryStore.reconcileAfterHostRestart()
+            try Task.checkCancellation()
             await core.start()
+            coreStarted = true
+            try Task.checkCancellation()
             await core.startRelay(router: router)
             logger.info("Pi Desktop control service ready")
         } catch {
             server.stop()
+            if coreStarted { await core.stop(graceSeconds: 0) }
             connectivity?.stop()
             logger.error("Could not start Pi Desktop control service: \(error)")
             logger.flush()

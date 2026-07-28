@@ -39,21 +39,22 @@ counter makes captured mutations fail closed if replayed. Clearing site data, us
 browsing, or revoking the device requires pairing again. Each browser has its own identity and
 can be revoked independently from the same sheet.
 
-The Mac must be online and `pi-deskd` must be running to execute or read conversations. The
+The Mac must be online and either Pi Desktop or the optional `pi-deskd` host must be running to
+execute or read conversations. The
 relay deliberately does not queue mutations while the host is offline, avoiding an ambiguous
 "did this prompt run twice?" failure after reconnect.
 
 ### Hosted topology
 
 ```text
-browser/PWA -- encrypted WSS --> Cloudflare Worker + Durable Object <-- WSS -- pi-deskd
+browser/PWA -- encrypted WSS --> Cloudflare Worker + Durable Object <-- WSS -- active Mac host
 ```
 
 One hibernatable Durable Object coordinates each random installation ID. It retains only the
 host-token hash, public device keys, device labels/timestamps, and one bounded pairing offer
 (ticket hash, expiry, and host public key). Pending approvals expire at the same five-minute
 deadline. There is no D1, KV, R2, plaintext conversation cache, or offline prompt queue. Static
-files are the same `Sources/PiDeskWeb/Site/` assets bundled into the daemon.
+files are the same `Sources/PiDeskWeb/Site/` assets bundled into Pi Desktop and the standalone host.
 
 Deployment lives in `CloudflareRelay/`:
 
@@ -78,7 +79,7 @@ pidesk remote token
 pidesk remote disable
 ```
 
-Restart the daemon after changing this setting. The token lives at:
+After changing this setting, reopen Pi Desktop or restart the LaunchAgent host. The token lives at:
 
 ```text
 ~/Library/Application Support/Pi Desktop/daemon-token

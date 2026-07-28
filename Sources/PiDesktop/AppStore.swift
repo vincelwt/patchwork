@@ -53,6 +53,12 @@ private struct LiveMessageKey: Equatable {
     let id: String
 }
 
+private enum ManagedWriterState: Sendable {
+    case none
+    case heartbeat
+    case fileFallback
+}
+
 /// One independent Pi process plus the route-visible state that must follow it when the user
 /// switches conversations mid-turn. Idle processes are still reused; only live work is parked.
 private final class RuntimeSlot {
@@ -111,6 +117,8 @@ typealias ManagedTurnResumer = @MainActor (
     _ instruction: String,
     _ clientID: String
 ) async throws -> Void
+
+typealias ManagedTurnWriterProbe = @MainActor (_ sessionPath: String) async -> Bool
 
 /// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
 /// bound across months of use. Recency is tracked purely in memory (never persisted itself);
@@ -266,6 +274,7 @@ final class AppStore: ObservableObject {
     private let runtimeRetirementDelay: TimeInterval
     private let runtimeRetirementScheduler: RuntimeRetirementScheduler
     private let managedTurnResumer: ManagedTurnResumer
+    private let managedTurnWriterProbe: ManagedTurnWriterProbe?
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -378,11 +387,28 @@ final class AppStore: ObservableObject {
             return { task.cancel() }
         },
         managedTurnResumer: @escaping ManagedTurnResumer = { path, instruction, clientID in
-            _ = try await PiDeskKit.PiDeskClient.unixSocket(requestTimeout: 5).sendMessage(
+            let client = PiDeskKit.PiDeskClient.unixSocket(requestTimeout: 5)
+            var ready = false
+            var lastError: Error?
+            for delay in [UInt64(0), 500_000_000, 1_000_000_000] {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                do {
+                    _ = try await client.health()
+                    ready = true
+                    break
+                } catch {
+                    lastError = error
+                }
+            }
+            guard ready else { throw lastError ?? ScheduleServiceError.daemonUnavailable }
+            // Exactly one side-effecting request. A lost response is outcome-unknown even with a
+            // stable client ID because an optional standalone host could restart and forget it.
+            _ = try await client.sendMessage(
                 threadId: path,
                 PiDeskKit.SendMessageRequest(text: instruction, clientId: clientID)
             )
-        }
+        },
+        managedTurnWriterProbe: ManagedTurnWriterProbe? = nil
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -390,6 +416,7 @@ final class AppStore: ObservableObject {
         self.runtimeRetirementDelay = runtimeRetirementDelay
         self.runtimeRetirementScheduler = runtimeRetirementScheduler
         self.managedTurnResumer = managedTurnResumer
+        self.managedTurnWriterProbe = managedTurnWriterProbe
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
@@ -1007,10 +1034,14 @@ final class AppStore: ObservableObject {
         let baseline = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
             ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
             ?? visibleBaseline
+        let heartbeatObserved = ActivityHeartbeatStore.scan(
+            directory: ActivityHeartbeatStore.defaultDirectory()
+        )[path] != nil
         persistence.updateState {
             $0.setManagedTurnRecovery(ManagedTurnRecovery(
                 id: UUID(), sessionPath: path, phase: ManagedTurnRecovery.dispatching,
-                baselineCompletionID: baseline, activeToolCallIDs: [], startedAt: Date()
+                baselineCompletionID: baseline, activeToolCallIDs: [],
+                heartbeatObserved: heartbeatObserved, startedAt: Date()
             ))
         }
     }
@@ -1040,15 +1071,37 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func latestManagedCompletionID(at path: String) async -> String? {
+        await Task.detached(priority: .utility) {
+            let url = URL(fileURLWithPath: path)
+            return SessionActivityClassifier.readTail(at: url, limit: SessionParser.tailScanWindowBytes)
+                .flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))?.id
+        }.value
+    }
+
     private func liveWriterRemains(at path: String) async -> Bool {
-        for attempt in 0..<6 {
-            let live = await Task.detached(priority: .utility) {
-                ActivityHeartbeatStore.scan(directory: ActivityHeartbeatStore.defaultDirectory())[path]?.contains {
-                    ActivityHeartbeatClassifier.isRunning($0, now: Date())
-                } == true
+        for attempt in 0..<32 {
+            let source = await Task.detached(priority: .utility) { () -> ManagedWriterState in
+                let heartbeats = ActivityHeartbeatStore.scan(
+                    directory: ActivityHeartbeatStore.defaultDirectory()
+                )[path] ?? []
+                // Any live attached process wins, including an idle/suspended terminal whose
+                // heartbeat timestamp is old. If no heartbeat exists, retain the bounded file
+                // fallback for terminals running without the extension.
+                if heartbeats.contains(where: { ActivityHeartbeatClassifier.isProcessAlive(pid: $0.pid) }) {
+                    return .heartbeat
+                }
+                // Dead heartbeat files are not proof that nobody else is writing: a direct
+                // terminal without the extension may share this path, so still consult the file.
+                return SessionActivityClassifier.classifyFile(at: URL(fileURLWithPath: path))?.state == .running
+                    ? .fileFallback : .none
             }.value
-            if !live { return false }
-            if attempt < 5 { try? await Task.sleep(nanoseconds: 500_000_000) }
+            if source == .none { return false }
+            // A live PID gets a short teardown window. The file-only fallback needs its own
+            // 15-second stale window to distinguish the killed app worker from a terminal that
+            // keeps writing without the extension.
+            if source == .heartbeat, attempt >= 5 { return true }
+            if attempt < 31 { try? await Task.sleep(nanoseconds: 500_000_000) }
         }
         return true
     }
@@ -1064,17 +1117,18 @@ final class AppStore: ObservableObject {
         for original in recoveries {
             guard sessions.contains(where: { $0.fileURL.standardizedFileURL.path == original.sessionPath }) else { continue }
             let path = original.sessionPath
-            let currentCompletion = await Task.detached(priority: .utility) {
-                let url = URL(fileURLWithPath: path)
-                return SessionActivityClassifier.readTail(at: url, limit: SessionParser.tailScanWindowBytes)
-                    .flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))?.id
-            }.value
+            let currentCompletion = await latestManagedCompletionID(at: path)
             if let currentCompletion, currentCompletion != original.baselineCompletionID {
                 clearManagedTurnRecovery(path: path)
                 continue
             }
 
-            if await liveWriterRemains(at: path) {
+            let writerRemains = if let managedTurnWriterProbe {
+                await managedTurnWriterProbe(path)
+            } else {
+                await liveWriterRemains(at: path)
+            }
+            if writerRemains {
                 var review = original
                 review.phase = ManagedTurnRecovery.needsReview
                 persistence.updateState { $0.setManagedTurnRecovery(review) }
@@ -1086,8 +1140,17 @@ final class AppStore: ObservableObject {
                 continue
             }
 
+            // The writer may have settled during the bounded liveness wait. Re-read the durable
+            // tail immediately before dispatch so a completed answer never gets a continuation.
+            if let completionAfterWait = await latestManagedCompletionID(at: path),
+               completionAfterWait != original.baselineCompletionID {
+                clearManagedTurnRecovery(path: path)
+                continue
+            }
+
             guard original.phase == ManagedTurnRecovery.accepted,
-                  original.activeToolCallIDs.isEmpty else {
+                  original.activeToolCallIDs.isEmpty,
+                  original.heartbeatObserved == true else {
                 var review = original
                 review.phase = ManagedTurnRecovery.needsReview
                 persistence.updateState { $0.setManagedTurnRecovery(review) }
@@ -1103,30 +1166,18 @@ final class AppStore: ObservableObject {
             recovering.phase = ManagedTurnRecovery.recovering
             persistence.updateState { $0.setManagedTurnRecovery(recovering) }
 
-            var delivered = false
-            var lastError: Error?
-            for delay in [UInt64(0), 500_000_000, 1_000_000_000] {
-                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
-                do {
-                    try await managedTurnResumer(
-                        path,
-                        Self.relaunchRecoveryInstruction,
-                        "recovery-\(original.id.uuidString)"
-                    )
-                    delivered = true
-                    break
-                } catch {
-                    lastError = error
-                }
-            }
-
-            if delivered {
+            do {
+                try await managedTurnResumer(
+                    path,
+                    Self.relaunchRecoveryInstruction,
+                    "recovery-\(original.id.uuidString)"
+                )
                 showToast("Resuming an interrupted turn.", style: .info, sessionPath: path)
-            } else {
+            } catch {
                 recovering.phase = ManagedTurnRecovery.needsReview
                 persistence.updateState { $0.setManagedTurnRecovery(recovering) }
                 showToast(
-                    "Could not resume an interrupted turn: \(lastError?.localizedDescription ?? "control service unavailable")",
+                    "Could not confirm recovery; review the interrupted turn before continuing.",
                     style: .warning,
                     sessionPath: path
                 )

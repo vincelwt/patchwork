@@ -464,6 +464,9 @@ struct ManagedTurnRecovery: Codable, Equatable {
     var phase: String
     var baselineCompletionID: String?
     var activeToolCallIDs: Set<String>
+    /// Recovery is automatic only when this app observed the activity extension for the session.
+    /// Without that ownership signal, a plain terminal process may be invisible and wins safety.
+    var heartbeatObserved: Bool? = nil
     var startedAt: Date
 }
 

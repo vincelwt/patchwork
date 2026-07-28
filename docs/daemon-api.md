@@ -52,7 +52,8 @@ socket. A leftover socket file is not evidence of a live host; `POSIXListener` p
 rebinds when nothing answers.
 
 **Ownership and migration.** In default mode `daemon-owner.json` contains the Pi Desktop process
-PID, preserving `pidesk daemon status` compatibility. A previous release may have left an
+PID plus an app-host marker, preserving `pidesk daemon status` compatibility without mistaking a
+second live app instance for the legacy child process. A previous release may have left an
 app-spawned `pi-deskd` child alive after a crash; the first new launch retires only that recorded
 legacy PID before binding in-process. Ownerless and LaunchAgent hosts are never stopped by the
 app.
@@ -64,9 +65,10 @@ scheduled occurrences remain durable for the next launch. Pre-prompt scheduled w
 while work whose prompt delivery began is marked `interrupted` and never resent blindly.
 Process-local API/manual queue records are also reconciled to `interrupted` on restart instead of
 remaining falsely `running`. Native UI turns keep a separate bounded app-owned recovery marker:
-an accepted turn with no tool in flight gets one continuation against the same session after
-relaunch; unknown prompt delivery, an active tool, or a second interrupted recovery requires
-review. Sessions launched by plain terminal `pi` never get that marker and are not adopted. The
+a heartbeat-verified accepted turn with no live writer or tool in flight gets one continuation
+against the same session after relaunch; unknown ownership or prompt delivery, an active tool, or
+a second interrupted recovery requires review. Sessions launched by plain terminal `pi` never
+get that marker and are not adopted. The
 standalone host keeps its existing ten-second finish-naturally grace on SIGTERM/SIGINT before
 cancellation.
 
@@ -435,7 +437,7 @@ forward-compatibility rule the app applies to Pi's own RPC events.
   daemon-token         bearer token for the loopback listener (0600)
   daemon.json          daemon settings: port, concurrency, loopback remote enabled
   relay-identity.json  hosted installation/host keys, approved device keys, replay counters (0600)
-  daemon-owner.json    pid + start time of the active app-hosted service, if any — local
+  daemon-owner.json    pid + start time + host kind of the active app-hosted service, if any — local
                        coordination between Pi Desktop and pidesk, not part of this API
   schedules.json       every Schedule, written atomically
   runs.jsonl           append-only run history, rotated at a bounded size

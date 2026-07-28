@@ -28,6 +28,7 @@ enum DaemonModeClassifier {
 struct DaemonOwnerRecord: Codable, Equatable, Sendable {
     var pid: Int32
     var startedAt: Date
+    var host: String? = nil
 }
 
 enum DaemonOwnership {
