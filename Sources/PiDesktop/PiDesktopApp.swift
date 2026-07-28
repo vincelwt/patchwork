@@ -153,7 +153,6 @@ struct RootView: View {
         .sheet(item: sheetDialog) { request in
             ExtensionDialogView(request: request).environmentObject(store)
         }
-        .sheet(item: $store.viewedImage) { item in ImageViewerView(selection: item) }
         .overlay {
             if store.quickSwitchPresented {
                 QuickSwitchOverlay()
@@ -174,6 +173,13 @@ struct RootView: View {
                 .padding(.top, PiTheme.space32 + PiTheme.space24)
                 .transition(.move(edge: .top).combined(with: .opacity))
                 .zIndex(10)
+            }
+        }
+        // Last root overlay on purpose: the viewer covers quick switch and toasts.
+        .overlay {
+            if let viewed = store.viewedImage {
+                ImageViewerView(selection: viewed) { store.viewedImage = nil }
+                    .id(viewed.id)
             }
         }
         }

@@ -116,6 +116,10 @@ enum PiTheme {
     static let transcriptImageMaxWidth: CGFloat = 460
     static let transcriptImageMaxHeight: CGFloat = 300
 
+    /// Image viewer panel ceiling. No minimum: the panel shrinks with the window.
+    static let imageViewerMaxWidth: CGFloat = 1100
+    static let imageViewerMaxHeight: CGFloat = 800
+
     /// Quick switcher.
     static let quickSwitchWidth: CGFloat = 560
     static let quickSwitchRowHeight: CGFloat = 34
