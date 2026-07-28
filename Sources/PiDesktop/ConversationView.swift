@@ -166,9 +166,6 @@ struct ConversationView: View {
                     .font(PiFont.rowEmphasis)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                if let session = store.selectedSession, store.isRunning(session) {
-                    StatusDot(color: .piGreen, pulsing: true)
-                }
                 Menu {
                     Button("Rename…") {
                         renameValue = store.selectedSession?.displayName ?? ""
