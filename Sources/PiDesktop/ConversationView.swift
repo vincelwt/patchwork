@@ -177,9 +177,6 @@ struct ConversationView: View {
                     // Truncated on screen, complete on hover and to VoiceOver.
                     .help(breadcrumb)
                     .accessibilityLabel(breadcrumb)
-                if let session = store.selectedSession, store.isRunning(session) {
-                    StatusDot(color: .piGreen, pulsing: true)
-                }
                 Menu {
                     Button("Rename…") {
                         renameValue = store.selectedSession?.displayName ?? ""
