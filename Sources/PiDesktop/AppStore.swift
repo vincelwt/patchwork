@@ -164,6 +164,13 @@ final class AppStore: ObservableObject {
     /// Plain revision counter for memoizing transcript projection. It deliberately is not
     /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
     private(set) var transcriptRevision = 0
+    /// Streaming deltas are coalesced to this cadence before publishing: each publish reprojects
+    /// the whole loaded transcript, and raw `message_update` bursts arrive far faster than the
+    /// user can read. Parsing is deferred with the publish, so skipped deltas cost nothing.
+    static let streamingPublishInterval: TimeInterval = 0.08
+    private var streamingPublishTask: Task<Void, Never>?
+    private var pendingStreamingUpdate: JSONValue?
+    private var lastStreamingPublish = Date.distantPast
     @Published var isConversationLoading = false
     @Published private(set) var isLoadingEarlierMessages = false
     @Published private(set) var hasEarlierMessages = false
@@ -1375,7 +1382,11 @@ final class AppStore: ObservableObject {
             rawEntryCount: max(current.rawEntryCount, newest.rawEntryCount),
             scannedEntryCount: max(current.scannedEntryCount, newest.scannedEntryCount),
             scannedByteCount: max(current.scannedByteCount, newest.scannedByteCount),
-            isTruncated: preservedHistory ? (current.isTruncated || newest.isTruncated) : newest.isTruncated
+            // When the refresh page overlapped the loaded history, its own scan-budget truncation
+            // is irrelevant: only the overlap tail was consumed. Mixing `newest.isTruncated` in
+            // here used to flip "history is outside the bounded window" on for a fully loaded
+            // conversation whenever a large live turn made the refresh scan hit its byte cap.
+            isTruncated: preservedHistory ? current.isTruncated : newest.isTruncated
         )
         loadedConversationPage = merged
         loadedConversationPath = path
@@ -3368,6 +3379,38 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Publishes a live streaming delta, coalesced to `streamingPublishInterval`. The first
+    /// delta after a quiet period publishes immediately; a burst keeps exactly one trailing
+    /// publish scheduled with the newest payload.
+    private func publishStreamingUpdate(_ partial: JSONValue) {
+        let now = Date()
+        if streamingPublishTask == nil, now.timeIntervalSince(lastStreamingPublish) >= Self.streamingPublishInterval {
+            lastStreamingPublish = now
+            if let parsed = SessionParser.chatMessage(fromAgentMessage: partial) { streamingMessage = parsed }
+            return
+        }
+        pendingStreamingUpdate = partial
+        guard streamingPublishTask == nil else { return }
+        let route = self.route
+        streamingPublishTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let wait = Self.streamingPublishInterval - Date().timeIntervalSince(lastStreamingPublish)
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000)) }
+            streamingPublishTask = nil
+            guard !Task.isCancelled, self.route == route, let pending = pendingStreamingUpdate else { return }
+            pendingStreamingUpdate = nil
+            lastStreamingPublish = Date()
+            if let parsed = SessionParser.chatMessage(fromAgentMessage: pending) { streamingMessage = parsed }
+        }
+    }
+
+    /// A settled or ended stream must never be resurrected by a stale trailing publish.
+    private func cancelPendingStreamingPublish() {
+        streamingPublishTask?.cancel()
+        streamingPublishTask = nil
+        pendingStreamingUpdate = nil
+    }
+
     private func recordRuntimeOutput(for slot: RuntimeSlot) {
         updateState(for: slot) { $0.phase = .working }
         guard let beganAt = slot.promptBeganAt else { return }
@@ -3644,6 +3687,7 @@ final class AppStore: ObservableObject {
             if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
             if abortPreflight { sendSoftAbort(to: activeRuntimeSlot) }
         case "agent_settled":
+            cancelPendingStreamingPublish()
             let waitingForNetwork = runtimeState.isWaitingForNetwork
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
@@ -3672,10 +3716,11 @@ final class AppStore: ObservableObject {
             scheduleFinalDurabilityCheck(for: activeRuntimeSlot, retireWhenDone: false)
         case "message_update":
             recordRuntimeOutput(for: activeRuntimeSlot)
-            guard selected, let partial = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: partial) else { return }
-            streamingMessage = parsed
+            guard selected, let partial = event["message"] else { return }
+            publishStreamingUpdate(partial)
         case "message_end":
             recordRuntimeOutput(for: activeRuntimeSlot)
+            cancelPendingStreamingPublish()
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
             if SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? "") {

@@ -49,9 +49,31 @@ struct MarkdownListItem: Equatable, Hashable, Sendable {
 enum MarkdownBlockParser {
     private static let fenceCharacters: Set<Character> = ["`", "~"]
 
+    /// SwiftUI re-evaluates message bodies on hover and row realization; parsing the same
+    /// settled markdown again each time is pure waste. NSCache is thread-safe and evicts on
+    /// its own; streaming text naturally misses (it changes every delta) and short-lived
+    /// entries age out under the count limit.
+    private final class ParsedBlocks {
+        let blocks: [MarkdownBlock]
+        init(_ blocks: [MarkdownBlock]) { self.blocks = blocks }
+    }
+    private static let cache: NSCache<NSString, ParsedBlocks> = {
+        let cache = NSCache<NSString, ParsedBlocks>()
+        cache.countLimit = 256
+        return cache
+    }()
+
     /// Splits source Markdown into blocks. Blank lines separate blocks; newlines inside a
     /// paragraph are preserved so hard breaks survive to the renderer.
     static func blocks(from source: String) -> [MarkdownBlock] {
+        let key = source as NSString
+        if let cached = cache.object(forKey: key) { return cached.blocks }
+        let parsed = parse(source)
+        cache.setObject(ParsedBlocks(parsed), forKey: key)
+        return parsed
+    }
+
+    private static func parse(_ source: String) -> [MarkdownBlock] {
         let normalized = source
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")

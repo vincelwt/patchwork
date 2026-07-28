@@ -205,11 +205,30 @@ private struct SelectableTextBlock: NSViewRepresentable {
         return nsView.fittingSize(for: proposal.width)
     }
 
+    /// Building the attributed string for a long answer is the expensive part of realizing its
+    /// row. Rows are torn down and re-realized as the user scrolls a lazy transcript, so the
+    /// built product is kept in a bounded shared cache keyed by the same content-derived key.
+    private final class BuiltBox {
+        let built: AnswerAttributedTextBuilder.Built
+        init(_ built: AnswerAttributedTextBuilder.Built) { self.built = built }
+    }
+    private static let builtCache: NSCache<NSString, BuiltBox> = {
+        let cache = NSCache<NSString, BuiltBox>()
+        cache.countLimit = 128
+        return cache
+    }()
+
     private func applyContent(to view: AnswerTextView, context: Context) {
         let key = blocks.map(\.id).joined(separator: "|") + "@\(PiFont.size)"
         guard context.coordinator.lastKey != key else { return }
         context.coordinator.lastKey = key
-        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
+        if let cached = Self.builtCache.object(forKey: key as NSString) {
+            view.apply(cached.built)
+            return
+        }
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
+        Self.builtCache.setObject(BuiltBox(built), forKey: key as NSString)
+        view.apply(built)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
