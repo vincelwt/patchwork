@@ -1022,6 +1022,10 @@ final class AppStore: ObservableObject {
         runningSince(session) ?? session.modifiedAt
     }
 
+    func resourceUsage(_ session: SessionSummary) -> ThreadResourceUsage? {
+        activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.resources
+    }
+
     /// Menu bar / badge source: every non-archived session currently working, newest run first.
     var runningSessions: [SessionSummary] {
         sessions
@@ -1033,6 +1037,13 @@ final class AppStore: ObservableObject {
                     ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
                     : left > right
             }
+    }
+
+    var runningResourceUsage: ThreadResourceUsage? {
+        let running = runningSessions
+        let values = running.compactMap(resourceUsage)
+        guard values.count == running.count else { return nil }
+        return ThreadResourceUsage.sum(values)
     }
 
     private func managedTurnPath(for slot: RuntimeSlot) -> String? {

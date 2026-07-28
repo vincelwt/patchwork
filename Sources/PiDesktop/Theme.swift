@@ -581,6 +581,18 @@ enum NumberFormatting {
         value < 0.01 ? String(format: "$%.4f", value) : String(format: "$%.2f", value)
     }
 
+    static func cpuPercent(_ value: Double) -> String {
+        value < 10 ? String(format: "%.1f%%", max(0, value)) : String(format: "%.0f%%", value)
+    }
+
+    static func memoryBytes(_ value: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(min(value, UInt64(Int64.max))), countStyle: .memory)
+    }
+
+    static func resources(_ usage: ThreadResourceUsage) -> String {
+        "\(cpuPercent(usage.cpuPercent)) · \(memoryBytes(usage.memoryBytes))"
+    }
+
     /// `4m 1s` style duration for turn headers. Seconds are dropped past an hour, where they
     /// stop carrying information.
     static func duration(_ interval: TimeInterval) -> String {
