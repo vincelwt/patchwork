@@ -180,15 +180,22 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertEqual(created.schedule.name, "Nightly triage")
         XCTAssertNotNil(created.schedule.nextRunAt, "creation must compute an initial nextRunAt")
         let id = created.schedule.id
+        var withPending = created.schedule
+        withPending.pendingOccurrence = ScheduleOccurrence(
+            id: "occ-preserved", scheduledAt: Date(), notBefore: Date()
+        )
+        try await core.scheduleStore.upsert(withPending)
 
         let list = try await client.listSchedules()
         XCTAssertEqual(list.schedules.map(\.id), [id])
 
         let updated = try await client.updateSchedule(id: id, ScheduleUpdateRequest(name: "Renamed"))
         XCTAssertEqual(updated.schedule.name, "Renamed")
+        XCTAssertEqual(updated.schedule.pendingOccurrence?.id, "occ-preserved")
 
         let paused = try await client.pauseSchedule(id: id, paused: true)
         XCTAssertFalse(paused.schedule.enabled)
+        XCTAssertEqual(paused.schedule.pendingOccurrence?.id, "occ-preserved")
 
         let detail = try await client.getSchedule(id: id)
         XCTAssertEqual(detail.schedule.id, id)

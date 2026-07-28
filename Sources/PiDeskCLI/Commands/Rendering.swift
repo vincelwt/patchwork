@@ -29,7 +29,7 @@ enum Rendering {
         let enabled = schedule.enabled ?? true
         if !enabled { return colorize("paused", ANSI.dim, enabled: colorEnabled) }
         switch schedule.lastStatus {
-        case "failed": return colorize("enabled (last failed)", ANSI.red, enabled: colorEnabled)
+        case "failed", "timeout", "interrupted": return colorize("enabled (last failed)", ANSI.red, enabled: colorEnabled)
         default: return colorize("enabled", ANSI.green, enabled: colorEnabled)
         }
     }
@@ -60,7 +60,7 @@ enum Rendering {
         switch run.status {
         case "ok": statusColor = ANSI.green
         case "failed", "timeout": statusColor = ANSI.red
-        case "running": statusColor = ANSI.yellow
+        case "interrupted", "queued", "running": statusColor = ANSI.yellow
         default: statusColor = nil
         }
         let status = statusColor.map { colorize(run.status ?? "-", $0, enabled: colorEnabled) } ?? (run.status ?? "-")

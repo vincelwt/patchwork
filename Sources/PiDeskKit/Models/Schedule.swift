@@ -141,8 +141,43 @@ extension ScheduleTrigger: Codable {
     }
 }
 
+/// One globally resilient scheduled occurrence. Presence means the work is still owed; there can
+/// never be more than one per schedule, so a long time away coalesces instead of building a burst.
+public struct ScheduleOccurrence: Codable, Hashable, Sendable {
+    public struct Phase: TolerantRawRepresentable {
+        public let rawValue: String
+        public init(rawValue: String) { self.rawValue = rawValue }
+
+        public static let pending = Phase(rawValue: "pending")
+        public static let dispatching = Phase(rawValue: "dispatching")
+        public static let accepted = Phase(rawValue: "accepted")
+        public static var knownCases: [Phase] { [.pending, .dispatching, .accepted] }
+        public static func other(_ rawValue: String) -> Phase { Phase(rawValue: rawValue) }
+    }
+
+    public var id: String
+    public var scheduledAt: Date
+    public var phase: Phase
+    public var attemptCount: Int
+    public var notBefore: Date
+    public var runId: String?
+
+    public init(
+        id: String, scheduledAt: Date, phase: Phase = .pending,
+        attemptCount: Int = 0, notBefore: Date, runId: String? = nil
+    ) {
+        self.id = id
+        self.scheduledAt = scheduledAt
+        self.phase = phase
+        self.attemptCount = attemptCount
+        self.notBefore = notBefore
+        self.runId = runId
+    }
+}
+
 public struct SchedulePolicy: Codable, Hashable, Sendable {
     public var skipIfRunning: Bool
+    /// Retained for API compatibility. The scheduler now catches up globally and ignores this.
     public var catchUpMissed: Bool
     public var timeoutSeconds: Int?
     public var quietHours: QuietHours?
@@ -177,6 +212,9 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
     public var lastRunAt: Date?
     public var lastStatus: RunStatus?
     public var nextRunAt: Date?
+    /// Durable work owed by this schedule. Optional so every pre-resilience schedules.json still
+    /// decodes unchanged.
+    public var pendingOccurrence: ScheduleOccurrence?
 
     public init(
         id: String,
@@ -191,7 +229,8 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         updatedAt: Date,
         lastRunAt: Date? = nil,
         lastStatus: RunStatus? = nil,
-        nextRunAt: Date? = nil
+        nextRunAt: Date? = nil,
+        pendingOccurrence: ScheduleOccurrence? = nil
     ) {
         self.id = id
         self.name = name
@@ -206,6 +245,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         self.lastRunAt = lastRunAt
         self.lastStatus = lastStatus
         self.nextRunAt = nextRunAt
+        self.pendingOccurrence = pendingOccurrence
     }
 
     public init(from decoder: Decoder) throws {
@@ -223,6 +263,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         lastRunAt = try container.decodeIfPresent(Date.self, forKey: .lastRunAt)
         lastStatus = try container.decodeIfPresent(RunStatus.self, forKey: .lastStatus)
         nextRunAt = try container.decodeIfPresent(Date.self, forKey: .nextRunAt)
+        pendingOccurrence = try container.decodeIfPresent(ScheduleOccurrence.self, forKey: .pendingOccurrence)
     }
 }
 

@@ -16,7 +16,7 @@
 export const PENDING_LIMIT = 8;
 
 /** Run statuses that mean the text will never produce a user message. */
-const FAILED_RUN_STATUSES = new Set(["failed", "timeout", "skipped"]);
+const FAILED_RUN_STATUSES = new Set(["failed", "timeout", "skipped", "interrupted"]);
 
 /**
  * Whitespace-insensitive comparison key. The daemon trims the text it accepts and Pi re-emits it

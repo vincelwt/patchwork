@@ -1,10 +1,9 @@
 import Foundation
 import PiDeskKit
 
-/// Owns `runs.jsonl`. A run is appended once when it starts (`status: running`, so it is visible
-/// immediately) and again when it finishes; both are cheap append-only writes, and startup
-/// replay dedupes by id (keeping the last line written) so a restart never resurrects a stale
-/// "running" ghost for a run that actually finished before the daemon last stopped.
+/// Owns `runs.jsonl`. A run is appended as it moves through queued/running/final states; startup
+/// replay dedupes by id (keeping the last line written), and `Scheduler` reconciles any durable
+/// scheduled occurrence whose last attempt was interrupted by a daemon exit.
 ///
 /// Bounded twice over, per the doc's "bound everything": the in-memory view keeps only the most
 /// recent `maxInMemory` runs (older ones are simply not queryable any more), and the file itself

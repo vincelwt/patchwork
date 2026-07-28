@@ -141,7 +141,6 @@ export function renderScheduleForm(state, actions) {
 
   // --- Advanced policy ---
   const skipIfRunning = h("input", { type: "checkbox", id: "policy-skip", checked: true });
-  const catchUpMissed = h("input", { type: "checkbox", id: "policy-catchup" });
   const timeoutInput = h("input", { type: "text", id: "sched-timeout", placeholder: "1h" });
   // A single visible "Quiet hours" label describes this pair, but a <label for> can only target
   // one control, so each input also gets its own accessible name for screen readers.
@@ -164,7 +163,6 @@ export function renderScheduleForm(state, actions) {
       { class: "advanced" },
       h("summary", null, "Advanced"),
       h("div", { class: "checkbox-row" }, skipIfRunning, h("label", { for: "policy-skip" }, "Skip if the thread is already running")),
-      h("div", { class: "checkbox-row" }, catchUpMissed, h("label", { for: "policy-catchup" }, "Catch up once if a trigger was missed while asleep")),
       h("div", { class: "field" }, h("label", { for: "sched-timeout" }, "Timeout (optional)"), timeoutInput, h("div", { class: "field-hint" }, "e.g. 30m, 1h")),
       h(
         "div",
@@ -198,7 +196,7 @@ export function renderScheduleForm(state, actions) {
     });
     if (triggerResult.error) return showError(triggerResult.error);
 
-    const policy = { skipIfRunning: skipIfRunning.checked, catchUpMissed: catchUpMissed.checked };
+    const policy = { skipIfRunning: skipIfRunning.checked };
     if (timeoutInput.value.trim()) {
       const timeoutSeconds = parseDurationToSeconds(timeoutInput.value);
       if (!timeoutSeconds) return showError("Timeout must look like 30m or 1h.");

@@ -67,39 +67,42 @@ enum ScheduleHandlers {
             },
 
             Route("PATCH", "/v1/schedules/:id") { request, params in
-                let existing = try await requireSchedule(core, params)
+                guard let id = params["id"], !id.isEmpty else {
+                    throw DaemonHTTPError.badRequest(code: "missing_id", message: "Missing schedule id.")
+                }
                 let body = try request.decodeJSON(ScheduleUpdateRequest.self)
-                var updated = existing
+                let cleanName = body.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let cleanName, cleanName.isEmpty {
+                    throw DaemonHTTPError.badRequest(code: "invalid_name", message: "name must not be empty.")
+                }
+                let cleanPrompt = body.prompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let cleanPrompt, cleanPrompt.isEmpty {
+                    throw DaemonHTTPError.badRequest(code: "invalid_prompt", message: "prompt must not be empty.")
+                }
+                if let target = body.target { try validate(target) }
+                if let trigger = body.trigger { try validate(trigger) }
+                if let quietHours = body.policy?.quietHours { try validate(quietHours) }
+                let nextRunAt = if let trigger = body.trigger {
+                    await core.scheduler.computeInitialNextRunAt(for: trigger)
+                } else {
+                    nil as Date?
+                }
+                let now = Date()
 
-                if let name = body.name {
-                    let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !clean.isEmpty else { throw DaemonHTTPError.badRequest(code: "invalid_name", message: "name must not be empty.") }
-                    updated.name = clean
-                }
-                if let enabled = body.enabled { updated.enabled = enabled }
-                if let target = body.target { try validate(target); updated.target = target }
-                if let prompt = body.prompt {
-                    let clean = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !clean.isEmpty else { throw DaemonHTTPError.badRequest(code: "invalid_prompt", message: "prompt must not be empty.") }
-                    updated.prompt = clean
-                }
-                if let mode = body.mode { updated.mode = mode }
-                var triggerChanged = false
-                if let trigger = body.trigger {
-                    try validate(trigger)
-                    updated.trigger = trigger
-                    triggerChanged = true
-                }
-                if let policy = body.policy {
-                    if let quietHours = policy.quietHours { try validate(quietHours) }
-                    updated.policy = policy
-                }
-                if triggerChanged {
-                    updated.nextRunAt = await core.scheduler.computeInitialNextRunAt(for: updated.trigger)
-                }
-                updated.updatedAt = Date()
-
-                let saved = try await core.scheduleStore.upsert(updated)
+                guard let saved = try await core.scheduleStore.update(id: id, { updated in
+                    if let cleanName { updated.name = cleanName }
+                    if let enabled = body.enabled { updated.enabled = enabled }
+                    if let target = body.target { updated.target = target }
+                    if let cleanPrompt { updated.prompt = cleanPrompt }
+                    if let mode = body.mode { updated.mode = mode }
+                    if let trigger = body.trigger {
+                        updated.trigger = trigger
+                        updated.nextRunAt = nextRunAt
+                    }
+                    if let policy = body.policy { updated.policy = policy }
+                    updated.updatedAt = now
+                    return true
+                }) else { throw DaemonHTTPError.notFound("Schedule \(id)") }
                 core.bus.publish(.schedule(saved))
                 return .json(ScheduleResponse(schedule: saved))
             },
@@ -117,12 +120,16 @@ enum ScheduleHandlers {
             },
 
             Route("POST", "/v1/schedules/:id/pause") { request, params in
-                let existing = try await requireSchedule(core, params)
+                guard let id = params["id"], !id.isEmpty else {
+                    throw DaemonHTTPError.badRequest(code: "missing_id", message: "Missing schedule id.")
+                }
                 let body = try request.decodeJSON(SchedulePauseRequest.self)
-                var updated = existing
-                updated.enabled = !body.paused
-                updated.updatedAt = Date()
-                let saved = try await core.scheduleStore.upsert(updated)
+                let now = Date()
+                guard let saved = try await core.scheduleStore.update(id: id, { updated in
+                    updated.enabled = !body.paused
+                    updated.updatedAt = now
+                    return true
+                }) else { throw DaemonHTTPError.notFound("Schedule \(id)") }
                 core.bus.publish(.schedule(saved))
                 return .json(ScheduleResponse(schedule: saved))
             }

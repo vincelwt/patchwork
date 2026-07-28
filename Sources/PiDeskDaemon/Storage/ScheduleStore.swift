@@ -26,15 +26,32 @@ actor ScheduleStore {
 
     @discardableResult
     func upsert(_ schedule: Schedule) throws -> Schedule {
-        schedules[schedule.id] = schedule
-        try persist()
+        var updated = schedules
+        updated[schedule.id] = schedule
+        try persist(updated)
+        schedules = updated
+        return schedule
+    }
+
+    /// Atomically transforms the latest in-memory value and only publishes it after the file
+    /// write succeeds. Returning false leaves the schedule untouched (stale occurrence/version).
+    @discardableResult
+    func update(id: String, _ transform: (inout Schedule) -> Bool) throws -> Schedule? {
+        guard var schedule = schedules[id], transform(&schedule) else { return nil }
+        var updated = schedules
+        updated[id] = schedule
+        try persist(updated)
+        schedules = updated
         return schedule
     }
 
     @discardableResult
     func remove(id: String) throws -> Bool {
-        guard schedules.removeValue(forKey: id) != nil else { return false }
-        try persist()
+        guard schedules[id] != nil else { return false }
+        var updated = schedules
+        updated.removeValue(forKey: id)
+        try persist(updated)
+        schedules = updated
         return true
     }
 
@@ -71,7 +88,7 @@ actor ScheduleStore {
         return (loaded, issues)
     }
 
-    private func persist() throws {
+    private func persist(_ schedules: [String: Schedule]) throws {
         try PiDeskFile.writeAtomic(Array(schedules.values), to: fileURL)
     }
 }

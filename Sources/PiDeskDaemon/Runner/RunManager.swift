@@ -24,7 +24,13 @@ struct RunManager: Sendable {
                 return .failed("The run produced no outcome.")
             }
             if let outcome = first { return outcome }
-            return RunOutcome(status: .timeout, error: "Run exceeded its \(job.timeoutSeconds)s timeout.", summary: nil)
+            // If the scheduler's durable occurrence still says prompt delivery never began,
+            // this is definite non-delivery and may be retried. Dispatching/accepted state always
+            // wins over this hint and suppresses a resend.
+            return RunOutcome(
+                status: .timeout, error: "Run exceeded its \(job.timeoutSeconds)s timeout.",
+                summary: nil, retryable: true
+            )
         }
     }
 }

@@ -105,30 +105,24 @@ final class ScheduleEngineTests: XCTestCase {
 
     // MARK: - Missed occurrences / catch-up
 
-    func testMissedOccurrenceWithoutCatchUpIsDroppedAndResyncedToNow() {
-        let missedBy = ScheduleEngine.missedGraceWindow + 3_600
-        let sched = schedule(trigger: .interval(everySeconds: 60, startAt: nil), catchUpMissed: false, nextRunAt: now.addingTimeInterval(-missedBy))
-        guard let decision = ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false }) else {
-            return XCTFail("expected a decision")
+    func testEveryMissedIntervalCatchesUpOnceRegardlessOfLegacyPolicy() {
+        for legacyCatchUpValue in [false, true] {
+            let due = now.addingTimeInterval(-3_600)
+            let sched = schedule(
+                trigger: .interval(everySeconds: 60, startAt: nil),
+                catchUpMissed: legacyCatchUpValue, nextRunAt: due
+            )
+            guard let decision = ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false }) else {
+                return XCTFail("expected a decision")
+            }
+            guard case .fire = decision.action else { return XCTFail("expected .fire") }
+            XCTAssertEqual(decision.updatedSchedule.lastRunAt, due)
+            XCTAssertGreaterThan(decision.updatedSchedule.nextRunAt!, now, "missed periods coalesce instead of replaying")
         }
-        XCTAssertEqual(decision.action, .none)
-        XCTAssertNil(decision.updatedSchedule.lastRunAt, "a dropped occurrence must not be recorded as having run")
-        // Resynced from `now`, not the ancient `due`: within one interval of `now`.
-        XCTAssertLessThanOrEqual(decision.updatedSchedule.nextRunAt!.timeIntervalSince(now), 60)
     }
 
-    func testMissedOccurrenceWithCatchUpStillFires() {
-        let missedBy = ScheduleEngine.missedGraceWindow + 3_600
-        let sched = schedule(trigger: .interval(everySeconds: 60, startAt: nil), catchUpMissed: true, nextRunAt: now.addingTimeInterval(-missedBy))
-        let decision = ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false })
-        guard case .fire = decision?.action else { return XCTFail("expected .fire") }
-        XCTAssertNotNil(decision?.updatedSchedule.lastRunAt)
-    }
-
-    func testOrdinaryPollJitterUnderTheGraceWindowIsNotTreatedAsMissed() {
-        // 10s late, well inside the 60s grace window: must fire normally even with
-        // catchUpMissed == false.
-        let sched = schedule(trigger: .interval(everySeconds: 60, startAt: nil), catchUpMissed: false, nextRunAt: now.addingTimeInterval(-10))
+    func testOrdinaryPollJitterStillFires() {
+        let sched = schedule(trigger: .interval(everySeconds: 60, startAt: nil), nextRunAt: now.addingTimeInterval(-10))
         let decision = ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false })
         guard case .fire = decision?.action else { return XCTFail("expected .fire") }
     }
@@ -171,6 +165,17 @@ final class ScheduleEngineTests: XCTestCase {
     }
 
     // MARK: - Cron integration (not just TriggerEngine in isolation)
+
+    func testMissedCronCoalescesToOneRunAndTheNextFutureBoundary() {
+        let sched = schedule(
+            trigger: .cron(expression: "*/5 * * * *", timeZone: "UTC"),
+            nextRunAt: now.addingTimeInterval(-86_400)
+        )
+        let decision = ScheduleEngine.evaluate(schedule: sched, now: now, isThreadBusy: { _ in false })
+        guard case .fire = decision?.action,
+              let next = decision?.updatedSchedule.nextRunAt else { return XCTFail("expected one catch-up run") }
+        XCTAssertGreaterThan(next, now)
+    }
 
     func testCronTriggerIntegratesThroughTheFullEngine() {
         let expr = "0 9 * * *" // daily at 09:00 UTC

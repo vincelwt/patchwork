@@ -68,6 +68,8 @@ enum TestSupport {
         executor: RunExecuting = FakeRunExecutor(),
         concurrency: Int = 2,
         schedulerPollInterval: TimeInterval = 1,
+        schedulerRetryDelays: [TimeInterval] = Scheduler.defaultRetryDelays,
+        networkAvailable: @escaping @Sendable () -> Bool = { true },
         interactions: InteractionRegistry = InteractionRegistry(),
         liveSessions: LiveSessionRegistry = LiveSessionRegistry()
     ) -> DaemonCore {
@@ -88,6 +90,8 @@ enum TestSupport {
             runHistoryFileURL: directory.appendingPathComponent("runs.jsonl"),
             overlayFileURL: directory.appendingPathComponent("overlay.json"),
             schedulerPollInterval: schedulerPollInterval,
+            schedulerRetryDelays: schedulerRetryDelays,
+            networkAvailable: networkAvailable,
             interactions: interactions,
             liveSessions: liveSessions,
             // Never the real app's `state.json`: the folder endpoint must read a fixture, and

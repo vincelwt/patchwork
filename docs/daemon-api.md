@@ -78,8 +78,10 @@ counts against a currently-stable one.
 scheduling new runs immediately, then gives whatever is already running up to 10 seconds to
 finish naturally, then cancels anything still going — the same cooperative cancellation
 `POST /v1/threads/{id}/abort` uses, so an in-flight `pi` process still gets a graceful
-SIGTERM-then-SIGKILL instead of being abandoned, and the run is recorded as `timeout` rather than
-left `running` forever. A run cancelled with a steer/follow-up still being written adds that
+SIGTERM-then-SIGKILL instead of being abandoned, and the run is recorded as `interrupted` rather
+than left `running` forever. Queued scheduled occurrences stay durable for the next app launch;
+an interrupted pre-prompt attempt may retry, while one whose prompt delivery began is never sent
+again blindly. A run cancelled with a steer/follow-up still being written adds that
 delivery's bounded drain (at most three seconds) before its process is stopped, so no message is
 killed while its caller is still waiting to hear what happened. Only once that has actually
 finished does the daemon process itself exit.
@@ -290,12 +292,17 @@ the key for different content is rejected.
   "trigger": { … see below … },
   "policy": {
     "skipIfRunning": true,             // never stack runs on a busy thread
-    "catchUpMissed": false,            // fire once on wake for a trigger missed while asleep
+    "catchUpMissed": false,            // deprecated compatibility field; global catch-up wins
     "timeoutSeconds": 3600,
     "quietHours": {"from":"23:00","to":"07:00","timeZone":"Europe/Paris"}
   },
   "createdAt": "…", "updatedAt": "…",
-  "lastRunAt": "…", "lastStatus": "ok|failed|skipped", "nextRunAt": "…"
+  "lastRunAt": "…", "lastStatus": "queued|ok|failed|skipped|timeout|interrupted",
+  "nextRunAt": "…",
+  "pendingOccurrence": {               // daemon-owned durable work; at most one per schedule
+    "id":"occ_…", "scheduledAt":"…", "phase":"pending|dispatching|accepted",
+    "attemptCount":1, "notBefore":"…", "runId":"run_…"
+  }
 }
 
 // Triggers
@@ -319,8 +326,11 @@ GET /v1/runs/{id}                            → {"run":Run}
 ```jsonc
 // Run
 { "id":"run_…","scheduleId":"sch_…","threadId":"…","trigger":"schedule|manual|api",
-  "startedAt":"…","finishedAt":"…","status":"running|ok|failed|skipped|timeout",
-  "error":null,"summary":"first line of the answer" }
+  "startedAt":"…","finishedAt":"…",
+  "status":"queued|running|ok|failed|skipped|timeout|interrupted",
+  "error":null,"summary":"first line of the answer",
+  "occurrenceId":"occ_…","scheduledAt":"…","attempt":1,
+  "nextAttemptAt":null,"promptStartedAt":null,"promptAcceptedAt":null,"retryable":false }
 ```
 
 ### Limits
@@ -440,6 +450,13 @@ touching the files, so there is exactly one writer.
 ## Execution model
 
 - At most `concurrency` (default 2) runs at once; the rest queue in FIFO order.
+- When the app-managed daemon returns, overdue once/cron/interval triggers globally coalesce into
+  one durable occurrence per schedule, ordered by their original due time. Heartbeats resume from
+  now and never replay an old check. The legacy `catchUpMissed` field is ignored.
+- A macOS network path reported offline leaves occurrences pending without spending an attempt.
+  Definite temporary failures before prompt delivery retry after 1m, 5m, 30m, 2h, and 8h; the
+  attempt and deadline live in `schedules.json`, so closing the app only pauses the backoff. A
+  prompt whose delivery began is outcome-ambiguous after interruption and is never auto-sent again.
 - A run spawns `pi --mode rpc` for the target session, applies `mode` if requested, sends the
   prompt, streams events until `agent_settled`, then stops the runtime. A run that exceeds
   `timeoutSeconds` is aborted and recorded as `timeout`.
