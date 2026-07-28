@@ -833,6 +833,111 @@ details.advanced[open] summary { color: var(--text); }
 .msg-skeleton .skeleton:nth-child(2) { width: 90%; }
 .msg-skeleton .skeleton:nth-child(3) { width: 65%; }
 
+/* ---------- Turn work log ----------
+   One quiet collapsed row per turn (reasoning, narration, tool activity), matching the Mac app.
+   Every level is a native `details`/`summary`, so keyboard and screen-reader behaviour is the
+   browser's; only the marker and spacing are restyled. */
+
+.work, .act, .step, .work-compaction { min-width: 0; }
+.work > summary, .act > summary, .step > summary, .work-compaction > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* A comfortable touch target without the row reading as a button. */
+  min-height: 32px;
+  padding: var(--space-1) 0;
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+.work > summary::-webkit-details-marker,
+.act > summary::-webkit-details-marker,
+.step > summary::-webkit-details-marker,
+.work-compaction > summary::-webkit-details-marker { display: none; }
+.work > summary::before,
+.act > summary::before,
+.step > summary::before,
+.work-compaction > summary::before {
+  content: "\203a";
+  flex: none;
+  width: 10px;
+  color: var(--text-tertiary);
+  transition: transform var(--duration) var(--ease);
+}
+.work[open] > summary::before,
+.act[open] > summary::before,
+.step[open] > summary::before,
+.work-compaction[open] > summary::before { transform: rotate(90deg); }
+.work > summary:focus-visible,
+.act > summary:focus-visible,
+.step > summary:focus-visible,
+.work-compaction > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-s); }
+
+.work-headline {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.work-count, .work-elapsed {
+  flex: none;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.work-failed { flex: none; color: var(--red); }
+.work > summary .dot {
+  flex: none;
+  animation: work-pulse 1.5s ease-in-out infinite;
+}
+@keyframes work-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .work > summary .dot { animation: none; }
+}
+
+.work-body, .act-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) 0 var(--space-2) var(--space-3);
+  border-left: 1px solid var(--hairline);
+  margin-left: 4px;
+}
+.work-think, .work-note .prose {
+  font-size: var(--fs-label);
+  color: var(--text-secondary);
+}
+.work-note-error .prose, .work-note-error .work-label { color: var(--red); }
+.act-failed > summary .work-headline, .step-failed > summary .work-headline { color: var(--red); }
+.step-failed > summary .work-count { color: var(--red); }
+
+.work-label {
+  font-size: var(--fs-caption);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.step-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-1) 0 var(--space-2) var(--space-3);
+}
+/* Tool payloads wrap instead of scrolling: a phone has no horizontal room to spare, and the
+   daemon already bounds what arrives here. */
+.tool-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.work-compaction-flat, .work-compaction > summary { color: var(--text-tertiary); }
+.work-compaction-body { font-size: var(--fs-label); color: var(--text-secondary); padding-left: var(--space-3); }
+
 /* ---------- Composer ---------- */
 
 .composer-dock {

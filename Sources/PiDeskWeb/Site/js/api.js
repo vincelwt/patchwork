@@ -72,7 +72,7 @@ async function request(path, options = {}) {
     if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
     let response;
     try {
-      response = await fetch(path, { ...options, headers });
+      response = await fetch(path, { cache: "no-store", ...options, headers });
     } catch (err) {
       throw new NetworkError(err instanceof Error ? err.message : "Network request failed");
     }

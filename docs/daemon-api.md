@@ -218,6 +218,25 @@ first), 1 MB decoded per image. `imageId` is `"<jsonlRecordOrdinal>-c<blockIndex
 block or `…-a<n>` for an `attachments` entry; Pi only appends, so an id stays valid for the life of
 the file.
 
+**Structure is additive; `text` never changes.** `Message.text` stays the flattened projection of
+the whole message (`[thinking] …`, `[tool: name]` markers included), so a client that knows nothing
+about the fields below renders exactly what it always did. Everything else is optional and absent
+when it has nothing to say:
+
+- `blocks` — ordered content blocks, sent only for assistant messages (where block order is what
+  separates mid-turn narration from the turn's answer) and for compaction/branch summaries (title
+  block, then summary block). A `toolCall` block carries `callId`, `name`, and `arguments`, the
+  last as bounded pretty-printed *text* rather than nested JSON, since a client only displays it.
+  An unrecognised block `type` keeps its position instead of being dropped.
+- `toolCallId` / `toolName` — on a `toolResult`, the call it answers, so a client can attach a
+  result to the exact call rather than guessing by position.
+- `stopReason` — Pi's own terminal reason (`stop`, `length`, `error`, `aborted`).
+
+Bounds: at most 40 blocks per message, and one shared 4,000-character budget per message across all
+block text and tool arguments — so a transcript carrying blocks stays the same order of magnitude as
+one carrying only `text`. Tool calls are admitted even once that budget is spent, because their
+identity is what makes results attachable.
+
 ```jsonc
 // Thread
 {
@@ -231,7 +250,12 @@ the file.
 // Message
 { "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false,
   "images":[{"id":"12-c1","mimeType":"image/png","byteCount":8321,"fileName":"shot.png",
-             "status":"ok|omitted|tooLarge|invalid","note":null}] }
+             "status":"ok|omitted|tooLarge|invalid","note":null}],
+  // optional, additive
+  "blocks":[{"type":"thinking","text":"…"},
+            {"type":"text","text":"Running the suite."},
+            {"type":"toolCall","callId":"call_1","name":"bash","arguments":"{\n  \"command\": \"swift test\"\n}"}],
+  "toolCallId":"call_1", "toolName":"bash", "stopReason":"stop" }
 ```
 
 ### Folders

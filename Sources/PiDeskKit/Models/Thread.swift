@@ -162,8 +162,46 @@ public struct MessageImageResponse: Codable, Hashable, Sendable {
     }
 }
 
+/// One ordered piece of a message's content: the block order a client needs to tell reasoning,
+/// mid-turn narration, and tool calls apart. `type` is deliberately a free string so a block kind
+/// a newer Pi introduces arrives intact instead of being dropped.
+///
+/// `arguments` is bounded *pretty-printed text*, not nested JSON: a client only ever displays it,
+/// and a flat string is the one shape that cannot smuggle an unbounded payload onto the wire.
+public struct MessageBlock: Codable, Hashable, Sendable {
+    public var type: String
+    public var text: String?
+    /// Tool-call identity, matched against `Message.toolCallId` on the result that answers it.
+    public var callId: String?
+    public var name: String?
+    public var arguments: String?
+
+    public init(type: String, text: String? = nil, callId: String? = nil, name: String? = nil, arguments: String? = nil) {
+        self.type = type
+        self.text = text
+        self.callId = callId
+        self.name = name
+        self.arguments = arguments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decodeIfPresent(String.self, forKey: .type) ?? "unknown"
+        text = try container.decodeIfPresent(String.self, forKey: .text)
+        callId = try container.decodeIfPresent(String.self, forKey: .callId)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        arguments = try container.decodeIfPresent(String.self, forKey: .arguments)
+    }
+}
+
 /// `{ "id":"…", "role":"user|assistant|toolResult|system", "text":"…", "at":"…", "isError":false,
-///    "images":[MessageImage] }`
+///    "images":[MessageImage], "blocks":[MessageBlock], "toolCallId":"…", "toolName":"…",
+///    "stopReason":"…" }`
+///
+/// `text` stays the flattened projection of the whole message and remains the only field an older
+/// client needs. Everything added after it is optional and additive: a client that ignores
+/// `blocks` renders exactly what it rendered before, and a daemon that never sends them still
+/// decodes here.
 public struct Message: Codable, Hashable, Sendable, Identifiable {
     public var id: String
     public var role: MessageRole
@@ -171,14 +209,38 @@ public struct Message: Codable, Hashable, Sendable, Identifiable {
     public var at: Date
     public var isError: Bool
     public var images: [MessageImage]
+    /// Present only where block order carries meaning `text` cannot (an assistant turn, a
+    /// compaction's title/summary split); `nil` everywhere else, so the wire stays small.
+    public var blocks: [MessageBlock]?
+    /// On a `toolResult`: the id of the `toolCall` block it answers.
+    public var toolCallId: String?
+    public var toolName: String?
+    /// Pi's own terminal reason (`stop`/`length`/`error`/`aborted`), used to tell a turn's final
+    /// answer from mid-turn narration.
+    public var stopReason: String?
 
-    public init(id: String, role: MessageRole, text: String, at: Date, isError: Bool = false, images: [MessageImage] = []) {
+    public init(
+        id: String,
+        role: MessageRole,
+        text: String,
+        at: Date,
+        isError: Bool = false,
+        images: [MessageImage] = [],
+        blocks: [MessageBlock]? = nil,
+        toolCallId: String? = nil,
+        toolName: String? = nil,
+        stopReason: String? = nil
+    ) {
         self.id = id
         self.role = role
         self.text = text
         self.at = at
         self.isError = isError
         self.images = images
+        self.blocks = blocks
+        self.toolCallId = toolCallId
+        self.toolName = toolName
+        self.stopReason = stopReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -189,6 +251,10 @@ public struct Message: Codable, Hashable, Sendable, Identifiable {
         at = try container.decodeIfPresent(Date.self, forKey: .at) ?? .distantPast
         isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
         images = try container.decodeIfPresent([MessageImage].self, forKey: .images) ?? []
+        blocks = try container.decodeIfPresent([MessageBlock].self, forKey: .blocks)
+        toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        stopReason = try container.decodeIfPresent(String.self, forKey: .stopReason)
     }
 }
 

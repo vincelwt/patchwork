@@ -178,6 +178,95 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(SessionScanner.discoverSessionFiles(rootURL: missing), [])
     }
 
+    // MARK: - Structured blocks
+
+    func testAssistantBlocksKeepOrderToolIdentityAndArgumentsWhileTextStaysFlattened() throws {
+        let url = write([
+            """
+            {"type":"message","id":"m1","message":{"role":"assistant","timestamp":1,"stopReason":"toolUse","content":[\
+            {"type":"thinking","thinking":"weigh the options"},\
+            {"type":"text","text":"Running the suite."},\
+            {"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"swift test"}}]}}
+            """
+        ])
+        let message = try XCTUnwrap(try SessionThreadParser.messages(at: url, limit: 10).first)
+
+        let blocks = try XCTUnwrap(message.blocks)
+        XCTAssertEqual(blocks.map(\.type), ["thinking", "text", "toolCall"], "order is what separates narration from the answer")
+        XCTAssertEqual(blocks[0].text, "weigh the options")
+        XCTAssertEqual(blocks[1].text, "Running the suite.")
+        XCTAssertEqual(blocks[2].callId, "call_1")
+        XCTAssertEqual(blocks[2].name, "bash")
+        XCTAssertEqual(blocks[2].arguments?.contains("swift test"), true)
+        XCTAssertEqual(message.stopReason, "toolUse")
+
+        // The flattened projection older clients read is untouched.
+        XCTAssertEqual(message.text, "[thinking] weigh the options\nRunning the suite.\n[tool: bash]")
+    }
+
+    func testToolResultsCarryTheCallTheyAnswerAndNoBlocks() throws {
+        let url = write([
+            """
+            {"type":"message","id":"m1","message":{"role":"toolResult","timestamp":1,"toolCallId":"call_1","toolName":"bash","content":"42 tests passed"}}
+            """
+        ])
+        let message = try XCTUnwrap(try SessionThreadParser.messages(at: url, limit: 10).first)
+        XCTAssertEqual(message.toolCallId, "call_1")
+        XCTAssertEqual(message.toolName, "bash")
+        XCTAssertEqual(message.text, "42 tests passed")
+        XCTAssertNil(message.blocks, "only an assistant turn's block order says something `text` cannot")
+    }
+
+    func testCompactionSplitsTitleFromSummaryWhileKeepingItsFlattenedLine() throws {
+        let url = write([
+            #"{"type":"compaction","id":"e1","summary":"dropped the middle","timestamp":1}"#,
+            #"{"type":"branch_summary","id":"e2","summary":"forked here","timestamp":2}"#
+        ])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        XCTAssertEqual(messages[0].blocks?.compactMap(\.text), ["Context compacted", "dropped the middle"])
+        XCTAssertEqual(messages[0].text, "Context compacted: dropped the middle")
+        XCTAssertEqual(messages[1].blocks?.compactMap(\.text), ["Branch summary", "forked here"])
+    }
+
+    func testBlocksShareOneBoundedTextBudgetAndSurviveUnknownBlockKinds() throws {
+        let long = String(repeating: "x", count: 3_000)
+        let url = write([
+            """
+            {"type":"message","id":"m1","message":{"role":"assistant","timestamp":1,"content":[\
+            {"type":"text","text":"\(long)"},{"type":"text","text":"\(long)"},\
+            {"type":"image","mimeType":"image/png","data":""},\
+            {"type":"a_future_block","whatever":true},\
+            {"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"\(long)"}}]}}
+            """
+        ])
+        let blocks = try XCTUnwrap(try SessionThreadParser.messages(at: url, limit: 10).first?.blocks)
+
+        XCTAssertEqual(blocks.map(\.type), ["text", "text", "image", "a_future_block", "toolCall"], "an unknown kind keeps its place")
+        let carried = blocks.compactMap(\.text).reduce(0) { $0 + $1.count }
+            + blocks.compactMap(\.arguments).reduce(0) { $0 + $1.count }
+        XCTAssertLessThanOrEqual(carried, SessionThreadParser.blockTextLimit + 8, "one message cannot outgrow the shared budget")
+        XCTAssertEqual(blocks[4].callId, "call_1", "a tool call keeps its identity even once the budget is spent")
+    }
+
+    func testRichFieldsAreOptionalOnTheWireInBothDirections() throws {
+        // An older daemon's payload: none of the new keys, and it must still decode.
+        let legacy = Data(#"{"id":"m1","role":"assistant","text":"hello","at":"2026-01-01T00:00:00.000Z"}"#.utf8)
+        let decoded = try PiDeskJSON.decoder.decode(Message.self, from: legacy)
+        XCTAssertEqual(decoded.text, "hello")
+        XCTAssertNil(decoded.blocks)
+        XCTAssertNil(decoded.toolCallId)
+        XCTAssertNil(decoded.stopReason)
+
+        // And a message with nothing structured to say does not put empty keys on the wire.
+        let json = String(decoding: try PiDeskJSON.encoder.encode(decoded), as: UTF8.self)
+        XCTAssertFalse(json.contains("blocks"))
+        XCTAssertFalse(json.contains("toolCallId"))
+
+        // A block kind from a newer daemon round-trips instead of failing the whole message.
+        let future = Data(#"{"id":"m2","role":"assistant","text":"hi","blocks":[{"type":"videoClip","text":"x"}]}"#.utf8)
+        XCTAssertEqual(try PiDeskJSON.decoder.decode(Message.self, from: future).blocks?.first?.type, "videoClip")
+    }
+
     // MARK: - Real session directory smoke test
 
     /// Mirrors the app's own `testInstalledSessionDirectorySmokeWhenRequested` convention
