@@ -12,6 +12,21 @@ final class ConversationToolbarTests: XCTestCase {
     }
 }
 
+final class ConversationImageStripTests: XCTestCase {
+    func testMultiplePreviewsUseOneHorizontalLazyStrip() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop/MessageView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let callers = try XCTUnwrap(source.components(separatedBy: "private struct ConversationImageStrip").first)
+
+        XCTAssertTrue(source.contains("ScrollView(.horizontal)"))
+        XCTAssertTrue(source.contains("LazyHStack(alignment: .top"))
+        XCTAssertFalse(callers.contains("ConversationImage(image:"),
+                       "Message paths must share the strip instead of stacking thumbnails directly")
+    }
+}
+
 final class ConversationScrollMetricsTests: XCTestCase {
     func testPinningUsesViewportGeometry() {
         XCTAssertTrue(ConversationScrollMetrics(
@@ -262,6 +277,7 @@ final class TranscriptPresenterTests: XCTestCase {
 
     func testWorkBlockIdentifiesImagesAndQuestionnairesForTurnLevelPresentation() throws {
         let image = ImagePayload(id: "generated-image", data: Data([0]), mimeType: "image/png", fileName: nil)
+        let secondImage = ImagePayload(id: "second-image", data: Data([1]), mimeType: "image/png", fileName: nil)
         let imageResult = ChatMessage(
             id: "image-result",
             role: .tool,
@@ -270,12 +286,22 @@ final class TranscriptPresenterTests: XCTestCase {
             toolCallID: "image-call",
             raw: .null
         )
+        let secondImageResult = ChatMessage(
+            id: "second-image-result",
+            role: .tool,
+            blocks: [MessageBlock(id: "second-image-block", kind: .image(secondImage))],
+            timestamp: nil,
+            toolCallID: "second-image-call",
+            raw: .null
+        )
         let messages = [
             assistant(id: "a1", blocks: [call("read-call", "read", [:])]),
             result(id: "read-result", callID: "read-call", text: "plain text"),
             assistant(id: "a2", blocks: [call("image-call", "computer_js", [:])]),
             imageResult,
-            assistant(id: "a3", blocks: [call("question-call", "ask_user_question", [:])]),
+            assistant(id: "a3", blocks: [call("second-image-call", "computer_js", [:])]),
+            secondImageResult,
+            assistant(id: "a4", blocks: [call("question-call", "ask_user_question", [:])]),
             result(id: "question-result", callID: "question-call", text: "answered"),
             assistant(id: "done", blocks: [text("Done.")])
         ]
@@ -283,8 +309,9 @@ final class TranscriptPresenterTests: XCTestCase {
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
         guard case let .work(block) = items.first else { return XCTFail("Expected a work block") }
         XCTAssertFalse(block.isActive)
-        XCTAssertEqual(block.prominentSteps.map(\.id), ["image-call", "question-call"])
-        XCTAssertEqual(block.prominentSteps.first?.result?.images.map(\.id), ["generated-image"])
+        XCTAssertEqual(block.prominentSteps.map(\.id), ["image-call", "second-image-call", "question-call"])
+        XCTAssertEqual(block.prominentImages.map(\.id), ["generated-image", "second-image"])
+        XCTAssertEqual(block.firstProminentImageStepID, "image-call")
         XCTAssertTrue(block.prominentSteps.first?.resultTextBlocks.isEmpty == true,
                       "The nested tool detail must not render a second copy of the image")
     }

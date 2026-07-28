@@ -62,6 +62,32 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertEqual(detail.messages.first?.text, "hello there")
     }
 
+    func testShowReusesTheListedThreadInsteadOfRefreshingEverySession() async throws {
+        let file = TestSupport.writeSessionFile(
+            in: directory, id: "sess-fast", cwd: "/tmp/project",
+            lines: [#"{"type":"message","id":"m1","message":{"role":"user","content":"older","timestamp":1}}"#],
+            name: "Before"
+        )
+        _ = try await client.listThreads()
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("""
+        {"type":"session_info","id":"rename","name":"After"}
+        {"type":"message","id":"m2","message":{"role":"assistant","content":"newer","timestamp":2}}
+
+        """.utf8))
+        try handle.close()
+
+        let detail = try await client.getThread(id: "sess-fast")
+        XCTAssertEqual(detail.thread.name, "Before", "detail lookup reuses the list snapshot")
+        XCTAssertEqual(detail.messages.map(\.text), ["older", "newer"], "messages still read the current tail")
+        let markedRead = try await client.markThreadRead(id: "sess-fast", unread: false)
+        XCTAssertEqual(markedRead.thread.name, "Before", "marking the open thread read also stays on the point-lookup path")
+        let refreshedList = try await client.listThreads()
+        XCTAssertEqual(refreshedList.threads.first?.name, "After", "the next list refreshes metadata")
+    }
+
     func testGetUnknownThreadReturns404() async throws {
         do {
             _ = try await client.getThread(id: "no-such-thread")
@@ -103,6 +129,8 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertFalse(runningThread.unread, "A running turn is not unread yet")
 
         try writeHeartbeat("idle")
+        let idleDetail = try await client.getThread(id: "sess-running")
+        XCTAssertFalse(idleDetail.thread.running, "point lookup refreshes heartbeat state without rescanning sessions")
         let idleList = try await client.listThreads()
         let idleThread = try XCTUnwrap(idleList.threads.first)
         XCTAssertFalse(idleThread.running)

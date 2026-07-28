@@ -10,7 +10,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Minimal three-column workspace: global conversations under **Recents**, folder-grouped project sessions, a centered transcript/composer, and a reserved Environment inspector column
 - New conversations start globally (Pi uses `~/Desktop` as its neutral cwd); **Choose…** lists only projects already known from sidebar conversations
 - App-owned folders created from the sidebar context menu, nesting at any depth inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
-- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations newest-first under **Running**, **Unread**, **Done**, and **Automated** — each conversation in exactly one section, with a quiet location hint on the row. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
+- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations under **Running**, **Unread**, **Done**, and **Automated** — each in exactly one section, with a quiet location hint. Running order follows the stable turn start in both the sidebar and menu bar, so tool writes never reshuffle it; other sections remain newest-first. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
 - Codex-style turns: running work stays collapsed to a live latest-reasoning/error/compaction line with elapsed time and a pulsing green dot, expands into borderless details on demand, and settles into one “Worked for 4m 1s” line as the answer starts. Retried errors, compaction, and branch summaries stay inside that same work log.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
@@ -30,7 +30,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - A status bar that stays quiet when idle: session cost with the full token breakdown on hover, context usage, provider/model, thinking level, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
-- Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. An opened image opens fitted to the viewer (large screenshots scale down with their aspect ratio, small images stay at intrinsic size, zoom scrolls) and closes on Escape, Done, or a click outside the panel. It steps to the previous/next image of the same message with Left/Right (or the viewer's arrow buttons), stopping at the first and last. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
+- Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. An opened image opens fitted to the viewer (large screenshots scale down with their aspect ratio, small images stay at intrinsic size, zoom scrolls) and closes on Escape, Done, or a click outside the panel. It steps to the previous/next image of the same message with Left/Right (or the viewer's arrow buttons), stopping at the first and last. Multiple previews sit side by side in a horizontally scrolling strip instead of stacking down the transcript. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
 - Subagent/background-process lifecycle presentation, with compact agent type, model, tool-call count, and runtime metadata, plus Pi extension UI dialogs/status/widgets/title/editor bridge
 - A native `ask_user_question` questionnaire rendered inline in the transcript outside nested tool disclosures instead of in a modal sheet, with option cards, previews, custom answers, and header-chip navigation across buffered questions. While unanswered it stays visible even when the work log is collapsed, its thread uses a purple sidebar status dot, and Return/Escape/space/arrows act only while focus is inside the card. A multi-select question can be submitted with nothing selected, which is sent to Pi as an empty answer; a single-select question still requires one option or custom text.
 - Native keyboard commands and VoiceOver labels
@@ -49,9 +49,10 @@ the window is closed. The wire contract is `docs/daemon-api.md`; the CLI referen
 | CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
 | Web remote | `remote.ai.gloom.sh` | QR-paired, end-to-end encrypted phone UI for threads and schedules |
 
-Click the phone button in the sidebar footer to pair a browser. The hosted relay starts with the
-daemon and needs no VPN, inbound port, or tunnel; each browser stays paired until its site data
-is cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
+Click the phone button in the sidebar footer only to pair or manage a browser. After that, the
+hosted relay starts automatically with Pi Desktop and the phone reconnects whenever the app is
+open; no VPN, inbound port, or tunnel is needed. A browser stays paired until its site data is
+cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
 
 The phone UI covers the daily loop, not just reading:
 
@@ -59,8 +60,9 @@ The phone UI covers the daily loop, not just reading:
   reasoning, narration, tool calls and their results, retried errors, and compaction, then Pi's
   answer. A live turn shows its latest thought and a running clock; opening the row reveals the
   log, with tool detail nested one disclosure deeper. Answers, images, and question cards stay
-  outside it. While a run is in flight the open thread refreshes on its own, and a refresh that
-  changes nothing leaves the transcript, its open disclosures, and the scroll position alone.
+  outside it. Opening reads the newest messages directly from a bounded file tail instead of
+  rescanning the whole session. While a run is in flight the open thread refreshes on its own,
+  and an unchanged refresh leaves the transcript, its open disclosures, and scroll position alone.
 - **Sending is optimistic and honest.** The composer clears immediately and the message shows as
   queued / working / steering / failed until Pi's own session file confirms it. A failed send
   keeps its text with Retry, and a per-message submission id means a retry after a lost response

@@ -157,6 +157,11 @@ does not know is displayed rather than dropped.
 A daemon that predates the structured fields sends only `text`; the same projection then yields one
 block per message, which still reads as turns.
 
+Opening a thread reuses the metadata snapshot already shown in the list and reads recent JSONL
+records backward from EOF. Latency therefore follows the visible tail rather than total session
+size; if a pathological tail exceeds the bounded reverse window, the daemon falls back to its full
+scanner rather than hiding history.
+
 ## Live updates
 
 While a thread is running — a message sent from here, or a run the Mac app or a terminal started —

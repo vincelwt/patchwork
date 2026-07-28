@@ -163,8 +163,8 @@ private struct SidebarFooter: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Remote access")
-            .accessibilityLabel("Remote access")
+            .help("Pair or manage phone access")
+            .accessibilityLabel("Pair or manage phone access")
             .sheet(isPresented: $remoteAccessPresented) { RemoteAccessView() }
             if archivedCount > 0 {
                 Button { archiveExpanded.toggle() } label: {
@@ -387,14 +387,15 @@ struct SidebarStatusGroup: Identifiable {
     var id: String { section.rawValue }
 
     /// Files every non-archived conversation exactly once — running, else unread, else targeted by
-    /// an automation, else done — then sorts each bucket newest-first on the supplied (live, not
-    /// stale summary) date and drops the empty ones. Pure: the caller hands in the store's
-    /// predicates, so the partition is testable without a runtime.
+    /// an automation, else done — then sorts running by its stable turn start and everything
+    /// else by live modification date. Pure: the caller hands in the store's predicates and
+    /// dates, so the partition is testable without a runtime.
     static func groups(
         _ sessions: [SessionSummary],
         isRunning: (SessionSummary) -> Bool,
         isUnread: (SessionSummary) -> Bool,
         isAutomated: (SessionSummary) -> Bool,
+        runningAt: (SessionSummary) -> Date,
         modifiedAt: (SessionSummary) -> Date
     ) -> [SidebarStatusGroup] {
         var buckets: [SidebarStatusSection: [SessionSummary]] = [:]
@@ -409,9 +410,11 @@ struct SidebarStatusGroup: Identifiable {
             // The file path breaks a tie, so equal timestamps still order deterministically
             // instead of letting an unstable sort reshuffle rows between renders.
             let sorted = bucket.sorted {
-                modifiedAt($0) == modifiedAt($1)
+                let left = section == .running ? runningAt($0) : modifiedAt($0)
+                let right = section == .running ? runningAt($1) : modifiedAt($1)
+                return left == right
                     ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
-                    : modifiedAt($0) > modifiedAt($1)
+                    : left > right
             }
             return SidebarStatusGroup(section: section, sessions: sorted)
         }
@@ -448,6 +451,7 @@ private struct StatusListView: View {
             isRunning: { store.isRunning($0) },
             isUnread: { store.isUnread($0) },
             isAutomated: { store.scheduledThreadIDs.contains($0.id) },
+            runningAt: { store.runningSortDate($0) },
             modifiedAt: { store.liveModifiedAt($0) }
         )
     }

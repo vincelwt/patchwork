@@ -190,9 +190,10 @@ thread detail would otherwise exceed the hosted relay's per-payload ceiling.
 
 Anything other than `ok` carries a `note` to show in place of the picture rather than dropping it
 silently. Bounds: at most 8 images per message, 40 marked `ok` per `GET /v1/threads/{id}` (newest
-first), 1 MB decoded per image. `imageId` is `"<jsonlRecordOrdinal>-c<blockIndex>"` for a `content`
-block or `…-a<n>` for an `attachments` entry; Pi only appends, so an id stays valid for the life of
-the file.
+first), 1 MB decoded per image. New `imageId`s use `"b<byteOffset>-c<blockIndex>"` for a `content`
+block or `…-a<n>` for an attachment, so the daemon can seek straight to bytes without scanning a
+large session. Legacy ordinal IDs remain accepted during upgrades; Pi only appends, so both forms
+stay valid for the life of the file.
 
 **Structure is additive; `text` never changes.** `Message.text` stays the flattened projection of
 the whole message (`[thinking] …`, `[tool: name]` markers included), so a client that knows nothing
