@@ -181,6 +181,97 @@ final class QuickSwitchNavigationTests: XCTestCase {
     }
 }
 
+final class SidebarCategorizationTests: XCTestCase {
+    private func session(name: String, cwd: String, path: String = "/tmp/s.jsonl") -> SessionSummary {
+        SessionSummary(
+            id: name,
+            fileURL: URL(fileURLWithPath: path),
+            cwd: URL(fileURLWithPath: cwd, isDirectory: true),
+            createdAt: Date(),
+            modifiedAt: Date(),
+            name: name,
+            preview: "",
+            messageCount: 0,
+            metrics: TokenMetrics()
+        )
+    }
+
+    func testUnassignedSessionsSitUnderTheirProjectOrRecents() {
+        let project = session(name: "convo", cwd: "/Users/vince/code/lexirise")
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(of: project, folders: [], assignments: [:]),
+            ["lexirise", "convo"]
+        )
+        let global = session(name: "convo", cwd: WorkspaceOrganization.globalWorkingDirectory.path)
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(of: global, folders: [], assignments: [:]),
+            ["Recents", "convo"]
+        )
+    }
+
+    func testNestedFolderWalksFromItsProjectDownToTheAssignedFolder() {
+        var folders: [VirtualFolder] = []
+        let product = WorkspaceOrganization.create(named: "product", parentID: "/Users/vince/code/lexirise", in: &folders)!
+        let growth = WorkspaceOrganization.create(
+            named: "growth", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: product.id), in: &folders
+        )!
+        // The session's own cwd is a different project: the assignment, not the cwd, decides.
+        let convo = session(name: "convo name", cwd: "/Users/vince/code/elsewhere")
+        let path = convo.fileURL.standardizedFileURL.path
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(of: convo, folders: folders, assignments: [path: growth.id]),
+            ["lexirise", "product", "growth", "convo name"]
+        )
+    }
+
+    func testTopLevelFolderNeverInventsAProjectAncestor() {
+        var folders: [VirtualFolder] = []
+        let inbox = WorkspaceOrganization.create(named: "inbox", in: &folders)!
+        let child = WorkspaceOrganization.create(
+            named: "child", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: inbox.id), in: &folders
+        )!
+        let convo = session(name: "convo", cwd: "/Users/vince/code/lexirise")
+        let path = convo.fileURL.standardizedFileURL.path
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(of: convo, folders: folders, assignments: [path: child.id]),
+            ["inbox", "child", "convo"]
+        )
+    }
+
+    func testDanglingAndCyclicStateStayBoundedAndVisible() {
+        let convo = session(name: "convo", cwd: "/Users/vince/code/lexirise")
+        let path = convo.fileURL.standardizedFileURL.path
+
+        // An assignment to a folder that no longer exists falls back to the project group, which
+        // is exactly where `SidebarSnapshot` renders such a session.
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(of: convo, folders: [], assignments: [path: "gone"]),
+            ["lexirise", "convo"]
+        )
+
+        // Hand-edited mutual parents: bounded output, no infinite walk.
+        let a = VirtualFolder(id: "a", name: "a", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: "b"))
+        let b = VirtualFolder(id: "b", name: "b", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: "a"))
+        let cyclic = WorkspaceOrganization.categorization(of: convo, folders: [a, b], assignments: [path: "a"])
+        XCTAssertEqual(cyclic.last, "convo")
+        XCTAssertLessThanOrEqual(cyclic.count, 3)
+
+        // A chain longer than the cap truncates instead of growing without bound.
+        let deep = (0..<80).map {
+            VirtualFolder(
+                id: "f\($0)",
+                name: "f\($0)",
+                parentID: $0 == 79 ? nil : WorkspaceOrganization.groupID(forVirtualFolderID: "f\($0 + 1)")
+            )
+        }
+        let bounded = WorkspaceOrganization.categorization(
+            of: convo, folders: deep, assignments: [path: "f0"], maxDepth: 8
+        )
+        XCTAssertEqual(bounded.count, 9, "Eight ancestors plus the conversation")
+        XCTAssertEqual(bounded.last, "convo")
+    }
+}
+
 final class ElapsedFormattingTests: XCTestCase {
     func testCompactElapsedLabels() {
         let now = Date()
@@ -224,6 +315,57 @@ final class SidebarFolderDefaultTests: XCTestCase {
     func testGroupNameFallsBackToThePathWhenThereIsNoLastComponent() {
         XCTAssertEqual(SessionFolderGroup(path: "/", sessions: []).name, "/")
         XCTAssertEqual(SessionFolderGroup(path: "/Users/vince/code", sessions: []).name, "code")
+    }
+
+    func testStatusSectionsRenderInFixedOrderAndHideEmptyOnes() {
+        let now = Date()
+        var running = summary(modifiedAt: now); running.name = "running"
+        var automated = summary(modifiedAt: now); automated.name = "automated"
+        let groups = SidebarStatusGroup.groups(
+            [automated, running],
+            isRunning: { $0.name == "running" },
+            isUnread: { _ in false },
+            isAutomated: { $0.name == "automated" },
+            modifiedAt: \.modifiedAt
+        )
+        XCTAssertEqual(groups.map(\.section), [.running, .automated], "Unread and Done are empty, so they do not render")
+        XCTAssertEqual(SidebarStatusSection.allCases, [.running, .unread, .done, .automated], "Done is shown before Automated")
+    }
+
+    func testEveryConversationIsFiledExactlyOnceByPriority() {
+        let now = Date()
+        var all = summary(modifiedAt: now); all.name = "all"          // running + unread + automated
+        var unread = summary(modifiedAt: now); unread.name = "unread" // unread + automated
+        var automated = summary(modifiedAt: now); automated.name = "automated"
+        var done = summary(modifiedAt: now); done.name = "done"
+        var archived = summary(modifiedAt: now); archived.name = "archived"; archived.isArchived = true
+
+        let groups = SidebarStatusGroup.groups(
+            [all, unread, automated, done, archived],
+            isRunning: { $0.name == "all" },
+            isUnread: { ["all", "unread"].contains($0.name) },
+            isAutomated: { ["all", "unread", "automated"].contains($0.name) },
+            modifiedAt: \.modifiedAt
+        )
+        XCTAssertEqual(groups.map(\.section), [.running, .unread, .done, .automated])
+        XCTAssertEqual(groups.map { $0.sessions.map(\.name) }, [["all"], ["unread"], ["done"], ["automated"]])
+        XCTAssertEqual(groups.flatMap(\.sessions).count, 4, "Archived stays out and nothing is filed twice")
+    }
+
+    func testSectionsSortNewestFirstOnTheSuppliedLiveDate() {
+        let now = Date()
+        // Every summary claims the same stale mtime; only the live date differs.
+        var old = summary(modifiedAt: now); old.name = "old"
+        var fresh = summary(modifiedAt: now); fresh.name = "fresh"
+        let live: [String: Date] = ["old": now.addingTimeInterval(-500), "fresh": now]
+        let groups = SidebarStatusGroup.groups(
+            [old, fresh],
+            isRunning: { _ in false },
+            isUnread: { _ in false },
+            isAutomated: { _ in false },
+            modifiedAt: { live[$0.name] ?? $0.modifiedAt }
+        )
+        XCTAssertEqual(groups.first?.sessions.map(\.name), ["fresh", "old"])
     }
 
     func testSnapshotGroupsAndFiltersOnTheBoundedSearchKey() {
