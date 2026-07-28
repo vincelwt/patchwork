@@ -2,10 +2,9 @@ import Foundation
 
 /// The doc defines `daemon.json`'s fields ("port, concurrency, remote enabled") but no HTTP
 /// endpoint to change them — every other schedule/thread mutation goes through `/v1/...`, but
-/// remote on/off is daemon-process configuration, not run state. `enable`/`disable` therefore
-/// edit `daemon.json` directly (0600/0700, same as the daemon's other storage) and tell the
-/// caller to restart the daemon to pick it up. See docs/cli.md and the report for the rationale;
-/// this is the one place this CLI writes a daemon-owned file instead of calling the API.
+/// remote on/off is host-startup configuration, not run state. `enable`/`disable` therefore
+/// edit `daemon.json` directly and tell the caller to restart whichever host is active. This is
+/// the one place this CLI writes control-service storage instead of calling the API.
 enum RemoteCommand {
     static let groupHelp = GroupHelp(
         name: "remote",
@@ -27,9 +26,9 @@ enum RemoteCommand {
 
     private static let enableHelp = CommandHelp(
         usage: "pidesk remote enable [--port 7717] [--json]",
-        summary: "Enable the loopback TCP listener. Restart the daemon for this to take effect.",
+        summary: "Enable the loopback TCP listener. Restart the active host for this to take effect.",
         flags: [FlagSpec("--port", takesValue: true, placeholder: "PORT", help: "listener port (default 7717)")],
-        examples: ["pidesk remote enable", "pidesk remote enable --port 7900 && pidesk daemon restart"]
+        examples: ["pidesk remote enable", "pidesk remote enable --port 7900"]
     )
 
     private static func enable(_ args: [String], context: CommandContext) async -> Int32 {
@@ -44,9 +43,9 @@ enum RemoteCommand {
 
     private static let disableHelp = CommandHelp(
         usage: "pidesk remote disable [--json]",
-        summary: "Disable the loopback TCP listener. Restart the daemon for this to take effect.",
+        summary: "Disable the loopback TCP listener. Restart the active host for this to take effect.",
         flags: [],
-        examples: ["pidesk remote disable && pidesk daemon restart"]
+        examples: ["pidesk remote disable"]
     )
 
     private static func disable(_ args: [String], context: CommandContext) async -> Int32 {
@@ -90,7 +89,7 @@ enum RemoteCommand {
             return
         }
         context.out.line("Remote \(enabled ? "enabled" : "disabled"): \(urlString)")
-        context.out.info("Restart the daemon for this to take effect: pidesk daemon restart")
+        context.out.info("Restart the active host: reopen Pi Desktop, or run `pidesk daemon restart` for a LaunchAgent.")
     }
 
     private static func resolvePort(_ raw: String?) throws -> Int {

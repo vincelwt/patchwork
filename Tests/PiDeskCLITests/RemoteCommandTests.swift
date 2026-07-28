@@ -16,6 +16,7 @@ final class RemoteCommandTests: XCTestCase {
         XCTAssertTrue(settings.enabled)
         XCTAssertEqual(settings.port, 7900)
         XCTAssertTrue(FileManager.default.fileExists(atPath: tokenPath.path))
+        XCTAssertTrue(result.stderr.contains("reopen Pi Desktop"))
         XCTAssertTrue(result.stderr.contains("daemon restart"))
     }
 

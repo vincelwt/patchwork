@@ -51,10 +51,10 @@ actor Scheduler {
     }
 
     func start() async {
-        guard loopTask == nil else { return }
+        guard loopTask == nil, !Task.isCancelled else { return }
         isStopping = false
         await recoverPendingOccurrences(now: Date())
-        guard !isStopping else { return }
+        guard !isStopping, !Task.isCancelled else { return }
         logger.info("Scheduler started (poll interval \(pollInterval)s).")
         loopTask = Task { [weak self] in
             while !Task.isCancelled {

@@ -116,6 +116,10 @@ private struct FakeGitService: GitStatusProviding {
     func snapshot(for directory: URL) async -> GitSnapshot { .none }
 }
 
+private final class RecoveryCapture {
+    var calls: [(path: String, instruction: String, clientID: String)] = []
+}
+
 // MARK: - Tests
 
 @MainActor
@@ -270,6 +274,154 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
                       "The optimistic message stays: Pi may already be answering it")
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testManagedTurnRecoveryTracksAcceptanceToolsAndSettlement() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "long-running work"
+        store.submitDraft()
+
+        let path = session.fileURL.standardizedFileURL.path
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.phase, ManagedTurnRecovery.dispatching)
+
+        runtime.delaysStateResponse = true
+        runtime.succeed("prompt", data: .object([:]))
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.phase, ManagedTurnRecovery.accepted)
+
+        runtime.onEvent?(.object([
+            "type": .string("tool_execution_start"),
+            "toolCallId": .string("tool-1"),
+            "toolName": .string("read")
+        ]))
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.activeToolCallIDs, Set(["tool-1"]))
+
+        runtime.onEvent?(.object([
+            "type": .string("tool_execution_end"),
+            "toolCallId": .string("tool-1")
+        ]))
+        XCTAssertTrue(store.persistence.state.managedTurnRecoveries[path]?.activeToolCallIDs.isEmpty == true)
+
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertNil(store.persistence.state.managedTurnRecoveries[path])
+    }
+
+    func testAcceptedManagedTurnQueuesOneRelaunchContinuation() async throws {
+        let capture = RecoveryCapture()
+        let (store, _, session, _) = makeStore(
+            managedTurnResumer: { path, instruction, clientID in
+                capture.calls.append((path, instruction, clientID))
+            },
+            managedTurnWriterProbe: { _ in false }
+        )
+        try "{\"type\":\"session\",\"id\":\"session-a\",\"cwd\":\"/tmp\"}\n"
+            .write(to: session.fileURL, atomically: true, encoding: .utf8)
+        let path = session.fileURL.standardizedFileURL.path
+        store.persistence.updateState {
+            $0.setManagedTurnRecovery(ManagedTurnRecovery(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                sessionPath: path,
+                phase: ManagedTurnRecovery.accepted,
+                baselineCompletionID: nil,
+                activeToolCallIDs: [],
+                heartbeatObserved: true,
+                startedAt: Date()
+            ))
+        }
+
+        await store.recoverManagedTurnsForTesting()
+
+        XCTAssertEqual(capture.calls.count, 1)
+        XCTAssertEqual(capture.calls.first?.path, path)
+        XCTAssertTrue(capture.calls.first?.instruction.contains("continue from where it stopped") == true)
+        XCTAssertEqual(capture.calls.first?.clientID, "recovery-00000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.phase, ManagedTurnRecovery.recovering)
+    }
+
+    func testUnconfirmedRecoveryIsNeverRetried() async throws {
+        let capture = RecoveryCapture()
+        let (store, _, session, _) = makeStore(
+            managedTurnResumer: { path, instruction, clientID in
+                capture.calls.append((path, instruction, clientID))
+                throw PiRPCError.outcomeUnknown("recovery")
+            },
+            managedTurnWriterProbe: { _ in false }
+        )
+        try "{\"type\":\"session\",\"id\":\"session-a\",\"cwd\":\"/tmp\"}\n"
+            .write(to: session.fileURL, atomically: true, encoding: .utf8)
+        let path = session.fileURL.standardizedFileURL.path
+        store.persistence.updateState {
+            $0.setManagedTurnRecovery(ManagedTurnRecovery(
+                id: UUID(), sessionPath: path, phase: ManagedTurnRecovery.accepted,
+                baselineCompletionID: nil, activeToolCallIDs: [], heartbeatObserved: true,
+                startedAt: Date()
+            ))
+        }
+
+        await store.recoverManagedTurnsForTesting()
+
+        XCTAssertEqual(capture.calls.count, 1)
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.phase, ManagedTurnRecovery.needsReview)
+    }
+
+    func testRelaunchNeverContinuesWhileAnotherWriterIsAttached() async throws {
+        let capture = RecoveryCapture()
+        let (store, _, session, _) = makeStore(
+            managedTurnResumer: { path, instruction, clientID in
+                capture.calls.append((path, instruction, clientID))
+            },
+            managedTurnWriterProbe: { _ in true }
+        )
+        try "{\"type\":\"session\",\"id\":\"session-a\",\"cwd\":\"/tmp\"}\n"
+            .write(to: session.fileURL, atomically: true, encoding: .utf8)
+        let path = session.fileURL.standardizedFileURL.path
+        store.persistence.updateState {
+            $0.setManagedTurnRecovery(ManagedTurnRecovery(
+                id: UUID(), sessionPath: path, phase: ManagedTurnRecovery.accepted,
+                baselineCompletionID: nil, activeToolCallIDs: [], heartbeatObserved: true,
+                startedAt: Date()
+            ))
+        }
+
+        await store.recoverManagedTurnsForTesting()
+
+        XCTAssertTrue(capture.calls.isEmpty)
+        XCTAssertEqual(store.persistence.state.managedTurnRecoveries[path]?.phase, ManagedTurnRecovery.needsReview)
+    }
+
+    func testRelaunchDoesNotContinueATurnThatSettlesDuringWriterWait() async throws {
+        let capture = RecoveryCapture()
+        let (store, _, session, _) = makeStore(
+            managedTurnResumer: { path, instruction, clientID in
+                capture.calls.append((path, instruction, clientID))
+            },
+            managedTurnWriterProbe: { path in
+                let line = "{\"type\":\"message\",\"id\":\"answer\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n"
+                if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: Data(line.utf8))
+                    try? handle.close()
+                }
+                return false
+            }
+        )
+        try "{\"type\":\"session\",\"id\":\"session-a\",\"cwd\":\"/tmp\"}\n"
+            .write(to: session.fileURL, atomically: true, encoding: .utf8)
+        let path = session.fileURL.standardizedFileURL.path
+        store.persistence.updateState {
+            $0.setManagedTurnRecovery(ManagedTurnRecovery(
+                id: UUID(), sessionPath: path, phase: ManagedTurnRecovery.accepted,
+                baselineCompletionID: nil, activeToolCallIDs: [], heartbeatObserved: true,
+                startedAt: Date()
+            ))
+        }
+
+        await store.recoverManagedTurnsForTesting()
+
+        XCTAssertTrue(capture.calls.isEmpty)
+        XCTAssertNil(store.persistence.state.managedTurnRecoveries[path])
     }
 
     func testHandledPromptWithoutAgentStartReconcilesToIdle() {
@@ -708,7 +860,10 @@ final class AppStoreRollbackTests: XCTestCase {
         ])
     }
 
-    private func makeStore() -> (AppStore, FakeRuntime, SessionSummary, SessionSummary) {
+    private func makeStore(
+        managedTurnResumer: @escaping ManagedTurnResumer = { _, _, _ in },
+        managedTurnWriterProbe: ManagedTurnWriterProbe? = nil
+    ) -> (AppStore, FakeRuntime, SessionSummary, SessionSummary) {
         let runtime = FakeRuntime()
         let store = AppStore(
             repository: FakeRepository(),
@@ -716,7 +871,9 @@ final class AppStoreRollbackTests: XCTestCase {
             runtime: runtime,
             runtimeFactory: { FakeRuntime() },
             persistence: AppPersistence(baseURL: temporaryDirectory),
-            activityPresenter: ActivityPresenter()
+            activityPresenter: ActivityPresenter(),
+            managedTurnResumer: managedTurnResumer,
+            managedTurnWriterProbe: managedTurnWriterProbe
         )
         let a = summary(id: "session-a", file: "a.jsonl")
         let b = summary(id: "session-b", file: "b.jsonl")

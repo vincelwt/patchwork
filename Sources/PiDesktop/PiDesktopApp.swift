@@ -8,9 +8,8 @@ struct PiDesktopApp: App {
         connectivityMonitor: ConnectivityMonitor(),
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
     )
-    // Owns pi-deskd's lifecycle; see AppDelegate and DaemonSupervisor. Kept on the app delegate
-    // (not a second @StateObject here) so applicationDidFinishLaunching/applicationShouldTerminate
-    // and the Settings scene below always share the exact same instance.
+    // Owns the in-process control service lifecycle. Kept on the app delegate (not a second
+    // @StateObject) so launch/quit and the Settings scene share the exact same instance.
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {

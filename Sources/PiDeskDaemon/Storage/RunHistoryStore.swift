@@ -50,8 +50,24 @@ actor RunHistoryStore {
         return matches
     }
 
-    /// Every currently-running run, for `/v1/health`'s `runningRuns` and the queue's own
-    /// bookkeeping cross-check.
+    /// A process-local API/manual queue cannot survive its host. Scheduled occurrences have
+    /// their own durable recovery state and are reconciled by `Scheduler`; every other stale
+    /// queued/running record becomes visibly interrupted instead of reading as live forever.
+    func reconcileAfterHostRestart(now: Date = Date()) {
+        for index in recent.indices where recent[index].trigger != .schedule
+            && (recent[index].status == .queued || recent[index].status == .running) {
+            var run = recent[index]
+            run.status = .interrupted
+            run.finishedAt = now
+            run.retryable = false
+            run.error = run.promptStartedAt == nil
+                ? "Pi Desktop closed before this run started."
+                : "Pi Desktop closed after prompt delivery began; the run was not resent."
+            record(run)
+        }
+    }
+
+    /// Every currently-running run, for diagnostics and bookkeeping cross-checks.
     func runningCount() -> Int { recent.filter { $0.status == .running }.count }
 
     /// A plain static function, not an instance method: an actor's `init` cannot synchronously

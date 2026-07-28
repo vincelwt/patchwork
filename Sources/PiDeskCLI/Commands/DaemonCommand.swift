@@ -55,7 +55,7 @@ enum DaemonCommand {
                     context.out.json(DaemonStatusJSON(mode: mode.rawValue, modeDetail: modeDetail(for: mode), health: health))
                 } else {
                     context.out.line("mode: \(modeSummary(for: mode))")
-                    context.out.line("pi-deskd is running (v\(health.version ?? "?"), api \(health.api.map(String.init) ?? "?"))")
+                    context.out.line("control service is running (v\(health.version ?? "?"), api \(health.api.map(String.init) ?? "?"))")
                     context.out.line("pi: \(health.piVersion ?? "-")   running runs: \(health.runningRuns ?? 0)   queued: \(health.queuedRuns ?? 0)")
                     context.out.line("schedules enabled: \(health.schedulesEnabled == true ? "yes" : "no")   started at: \(FlexibleDate.displayLocal(health.startedAt))")
                 }
@@ -67,7 +67,7 @@ enum DaemonCommand {
                     context.out.json(JSONErrorEnvelope(code: "unreachable", message: failure.message, mode: mode.rawValue))
                 } else {
                     context.out.line("mode: \(modeSummary(for: mode))")
-                    context.out.errorLine("pi-deskd is not reachable: \(failure.message)")
+                    context.out.errorLine("control service is not reachable: \(failure.message)")
                     if let hint = failure.hint { context.out.errorLine(hint) }
                 }
                 return failure.exitCode.rawValue
@@ -83,7 +83,7 @@ enum DaemonCommand {
     /// (no `default:`) so a new case is a compile error here, not a silently blank status line.
     private static func modeSummary(for mode: DaemonRunMode) -> String {
         switch mode {
-        case .appManaged: "app-managed (started by Pi Desktop.app)"
+        case .appManaged: "app-managed (hosted inside Pi Desktop.app)"
         case .launchAgent: "LaunchAgent (\(DaemonControl.label), starts at login)"
         case .external: "running, but not managed by Pi Desktop.app or the LaunchAgent"
         case .notRunning: "not running"

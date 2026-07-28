@@ -17,6 +17,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, settled errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, errors Pi is still retrying stay silent, and a finished-turn notification shows a plain-text beginning of Pi's actual latest answer instead of a generic phrase.
 - Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - Network path loss is detected natively: once Pi reports a transient provider failure, Desktop pauses its retry budget and automatically continues the interrupted turn when connectivity returns. The installed helper makes that continuation hidden and context-only (with a visible plain continuation fallback if the helper is unavailable), never a replay of the original prompt. Crashes and non-network failures still remain visible with the exact draft ready to resend.
+- App-owned accepted turns survive an app restart as durable recovery records. A heartbeat-verified provider-only interruption queues one continuation against the same Pi session on launch; unknown ownership or prompt delivery, a live writer, an active tool, or a previously interrupted recovery is surfaced for review instead of being replayed. Plain terminal `pi` sessions are never adopted.
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page; opening reads at least 50 messages through the current turn boundary, fills a short viewport automatically, and pages upward through the active JSONL branch without an eager full-history parse
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row), rename even while Pi is working, HTML export, reveal, and compaction
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
@@ -80,11 +81,12 @@ The phone UI covers the daily loop, not just reading:
 - **The thread list mirrors the sidebar's folder tree**, read-only, with collapsible groups and
   unread/running markers.
 
-The daemon starts and stops with the app by default: `Pi Desktop.app` bundles `pi-deskd`/`pidesk`
-in `Contents/Helpers/` and supervises them (start on launch if nothing is already running,
-restart on an unexpected crash with a bounded backoff, stop on quit — never a daemon it did not
-start itself). Turn it off in **Pi Desktop → Settings…** if you'd rather run it yourself; the
-automations page says plainly when it's off instead of a bare connection error.
+By default the control service runs directly inside `Pi Desktop.app`: the Unix-socket API,
+scheduler, remote relay, and their Pi workers start and stop with the app, with no separate
+`pi-deskd` child to supervise. The bundle still includes `pidesk` and the optional standalone
+host so the explicit LaunchAgent mode below remains available. If a LaunchAgent or manually
+started host already owns the socket, the app defers to it rather than starting a competing
+service.
 
 For a daemon that runs without the app at all — a headless machine, or automations that must
 survive the app never being opened — install it as a LaunchAgent instead:
@@ -113,12 +115,13 @@ compatible scheduling requests from a thread use this same durable store, so the
 page and survive that Pi process exiting. The Agent extension's session-local scheduler remains the
 fallback for specialized subagent jobs or when the service is off.
 
-The default app-managed daemon still runs only while Pi Desktop is open. Missed one-shot, cron,
-and interval work is kept durably and coalesced into one catch-up run on the next launch; heartbeat
+The default app-hosted service runs only while Pi Desktop is open. On quit it stops its own Pi
+workers; direct terminal `pi` processes remain external and untouched. Missed one-shot, cron, and
+interval work is kept durably and coalesced into one catch-up run on the next launch; heartbeat
 checks simply resume. An offline Mac keeps work pending without consuming an attempt; temporary
 failures before prompt delivery retry with bounded persisted backoff, even across launches. Once
-prompt delivery begins, an interrupted run is never resent
-blindly, because arbitrary prompts can have side effects.
+prompt delivery begins, an interrupted run is never resent blindly, because arbitrary prompts
+can have side effects.
 
 ## Run state
 
@@ -159,10 +162,10 @@ On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-act
 open "/Applications/Pi Desktop.app"
 ```
 
-The script builds, bundles, ad-hoc signs, and installs `/Applications/Pi Desktop.app`. It includes
-`PiDesktop` plus the `pi-deskd`/`pidesk` helpers it starts and stops (`Contents/Helpers/`, each
-signed individually before the whole-bundle pass so `codesign --verify --deep --strict` still
-passes). Pi and Node are intentionally not bundled.
+The script builds, bundles, ad-hoc signs, and installs `/Applications/Pi Desktop.app`. The app
+contains the default control service directly; `Contents/Helpers/` carries `pidesk` plus the
+optional standalone `pi-deskd` LaunchAgent host, each signed before the whole-bundle pass. Pi and
+Node are intentionally not bundled.
 
 ## Keyboard and queue behavior
 
