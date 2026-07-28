@@ -472,15 +472,15 @@ final class SessionActivityMonitorTests: XCTestCase {
         let heartbeatDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
         let heartbeat = heartbeatDirectory.appendingPathComponent("s.json")
+        let pid = ProcessInfo.processInfo.processIdentifier
         try Data("""
-        {"sessionId":"s","sessionFile":"\(file.path)","pid":4242,"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","completionId":"old"}
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":\(pid),"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","completionId":"old"}
         """.utf8).write(to: heartbeat)
 
-        let monitor = SessionActivityMonitor(
-            isActiveOverride: true, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in true }
-        )
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: heartbeatDirectory)
         monitor.setTrackedPaths([file.path])
-        try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+        try await waitUntil { monitor.activity(forPath: file.path)?.resources != nil }
+        XCTAssertGreaterThan(try XCTUnwrap(monitor.activity(forPath: file.path)?.resources).memoryBytes, 0)
 
         try FileManager.default.removeItem(at: heartbeat)
         monitor.tickNow()

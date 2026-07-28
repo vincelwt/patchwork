@@ -22,6 +22,8 @@ struct SessionActivity: Equatable, Sendable {
     /// enrich a cross-terminal "turn finished" notification; never re-derived by reading the
     /// whole file.
     var preview: String?
+    /// Live Pi process-tree usage, available only for heartbeat-backed running sessions.
+    var resources: ThreadResourceUsage? = nil
 }
 
 /// Pure classification of a session's liveness from its JSONL file alone (mtime plus the last
@@ -165,6 +167,7 @@ final class SessionActivityMonitor: ObservableObject {
     private var trackedPaths: [String] = []
     private var fingerprints: [String: Fingerprint] = [:]
     private var heartbeatSnapshots: [String: [ActivityHeartbeat]] = [:]
+    private var resourceSamples: [Int32: ProcessResourceSample] = [:]
     private var pollTask: Task<Void, Never>?
     private var tickInFlight = false
     private var fallbackCursor = 0
@@ -272,9 +275,10 @@ final class SessionActivityMonitor: ObservableObject {
         let isProcessAlive = isProcessAlive
         let cursor = fallbackCursor
         let knownHeartbeats = heartbeatSnapshots
+        let knownResourceSamples = resourceSamples
 
         let result = await Task.detached(priority: .utility) {
-            () -> ([String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int) in
+            () -> ([String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int, [Int32: ProcessResourceSample]) in
             let now = Date()
             var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
             for path in Array(heartbeats.keys) {
@@ -283,6 +287,19 @@ final class SessionActivityMonitor: ObservableObject {
                 }
             }
             let heartbeatPaths = Set(heartbeats.keys)
+            let trackedPathSet = Set(paths)
+            let rootsByPath = heartbeats.reduce(into: [String: Set<Int32>]()) { result, entry in
+                guard trackedPathSet.contains(entry.key) else { return }
+                let roots = entry.value.filter {
+                    ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+                }.map(\.pid)
+                if !roots.isEmpty { result[entry.key] = Set(roots) }
+            }
+            let resourceSnapshot = ProcessResourceSampler.sample(
+                rootsByPath: rootsByPath,
+                previous: knownResourceSamples,
+                now: now
+            )
             let heartbeatPathsToPoll = Self.heartbeatPathsRequiringPoll(
                 paths: paths,
                 heartbeats: heartbeats,
@@ -390,7 +407,8 @@ final class SessionActivityMonitor: ObservableObject {
                         latestCompletedEntryID: completionID,
                         lastStopReason: completionStopReason ?? newest?.stopReason,
                         preview: completionPreview
-                            ?? (completionID == old?.latestCompletedEntryID ? old?.preview : nil)
+                            ?? (completionID == old?.latestCompletedEntryID ? old?.preview : nil),
+                        resources: resolved == .running ? resourceSnapshot.usageByPath[path] : nil
                     )
                     continue
                 }
@@ -413,7 +431,8 @@ final class SessionActivityMonitor: ObservableObject {
                     latestCompletedEntryID: completionID,
                     lastStopReason: completionStopReason
                         ?? (readTail ? SessionActivityClassifier.stopReason(ofLastEntry: entry) : old?.lastStopReason),
-                    preview: completionID == old?.latestCompletedEntryID ? old?.preview : nil
+                    preview: completionID == old?.latestCompletedEntryID ? old?.preview : nil,
+                    resources: nil
                 )
             }
             let tracked = Set(paths)
@@ -421,12 +440,13 @@ final class SessionActivityMonitor: ObservableObject {
             for path in deferredHeartbeatPaths {
                 if let previous = knownHeartbeats[path] { nextHeartbeats[path] = previous }
             }
-            return (states, stamps, nextHeartbeats, selection.nextCursor)
+            return (states, stamps, nextHeartbeats, selection.nextCursor, resourceSnapshot.samples)
         }.value
 
         fingerprints = result.1
         heartbeatSnapshots = result.2
         fallbackCursor = result.3
+        resourceSamples = result.4
         if activities != result.0 { activities = result.0 }
     }
 

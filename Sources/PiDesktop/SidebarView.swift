@@ -144,15 +144,17 @@ private struct SidebarFooter: View {
     let archiveForcedOpen: Bool
     @State private var remoteAccessPresented = false
     private var runningCount: Int { store.runningSessions.count }
+    private var resourceUsage: ThreadResourceUsage? { store.runningResourceUsage }
     private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
             StatusDot(color: runningCount > 0 ? .piGreen : .secondary, pulsing: runningCount > 0)
             if let label {
-                Text(label).font(SidebarTypography.status).foregroundStyle(.secondary).lineLimit(1)
+                Text(label).font(SidebarTypography.status.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                    .help(activityDescription)
                     .accessibilityLabel("Session activity")
-                    .accessibilityValue(label)
+                    .accessibilityValue(activityDescription)
             }
             Spacer(minLength: PiTheme.space4)
             Button { remoteAccessPresented = true } label: {
@@ -203,9 +205,16 @@ private struct SidebarFooter: View {
 
     /// `nil` when idle: there is deliberately no "ready"/"idle" copy, only real activity.
     private var label: String? {
+        if let resourceUsage { return NumberFormatting.resources(resourceUsage) }
         if runningCount == 1 { return "1 session running" }
         if runningCount > 1 { return "\(runningCount) sessions running" }
         return nil
+    }
+
+    private var activityDescription: String {
+        let sessions = runningCount == 1 ? "1 session running" : "\(runningCount) sessions running"
+        guard let resourceUsage else { return sessions }
+        return "\(sessions), \(NumberFormatting.cpuPercent(resourceUsage.cpuPercent)) CPU, \(NumberFormatting.memoryBytes(resourceUsage.memoryBytes)) memory"
     }
 }
 
@@ -681,6 +690,7 @@ private struct SessionRow: View {
     private var running: Bool { store.isRunning(session) }
     private var unread: Bool { store.isUnread(session) }
     private var scheduled: Bool { store.scheduledThreadIDs.contains(session.id) }
+    private var resourceUsage: ThreadResourceUsage? { store.resourceUsage(session) }
     private var git: GitSnapshot { store.folderGit[session.cwd.standardizedFileURL.path] ?? .none }
     private var indent: CGFloat { CGFloat(min(depth, PiTheme.sidebarMaxFolderDepth)) * PiTheme.sidebarIndentStep }
 
@@ -734,7 +744,7 @@ private struct SessionRow: View {
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
         .help(hint ?? session.cwd.path)
-        .accessibilityLabel("\(session.displayName)\(hint.map { ", in \($0)" } ?? ""), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
+        .accessibilityLabel("\(session.displayName)\(hint.map { ", in \($0)" } ?? ""), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(resourceUsage.map { ", \(NumberFormatting.cpuPercent($0.cpuPercent)) CPU, \(NumberFormatting.memoryBytes($0.memoryBytes)) memory" } ?? "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
     /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
@@ -767,6 +777,12 @@ private struct SessionRow: View {
         HStack(spacing: PiTheme.space6) {
             if hovering {
                 Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
+            } else if running, let resourceUsage {
+                Text(NumberFormatting.resources(resourceUsage))
+                    .font(SidebarTypography.metadata.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .help("\(NumberFormatting.cpuPercent(resourceUsage.cpuPercent)) CPU · \(NumberFormatting.memoryBytes(resourceUsage.memoryBytes)) memory")
+                    .accessibilityHidden(true)
             } else if GitIndicatorPolicy.showsBranchIndicator(git) {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
