@@ -168,7 +168,7 @@ final class TranscriptPresenterTests: XCTestCase {
             messages: [
                 user(id: "u", text: "Go", at: nil),
                 assistant(id: "a1", blocks: [thinking("First thought")]),
-                assistant(id: "a2", blocks: [thinking("**Latest thought**")])
+                assistant(id: "a2", blocks: [thinking("**Earlier line**\n\n**Latest thought**")])
             ],
             streaming: nil,
             isRunning: true
@@ -178,6 +178,7 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertTrue(block.isActive)
         XCTAssertFalse(block.shouldStartExpanded)
         XCTAssertEqual(block.latestThinkingText, "Latest thought")
+        XCTAssertEqual(block.latestStatusText, "Latest thought")
     }
 
     func testLiveTurnStaysActiveAndReportsProgress() throws {
@@ -301,7 +302,7 @@ final class TranscriptPresenterTests: XCTestCase {
     }
 
     func testHeaderShowsFailedWhenTheFinalAnswerErrored() throws {
-        var errorMessage = assistant(id: "a2", blocks: [text("Something went wrong.")])
+        var errorMessage = assistant(id: "a2", blocks: [text("Something went wrong.\n\nInternal retry detail.")])
         errorMessage.isError = true
         let messages = [
             user(id: "u", text: "try", at: nil),

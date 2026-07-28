@@ -123,7 +123,7 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
 
     var latestThinkingText: String? {
         for case let .thinking(thinking) in entries.reversed() {
-            return thinking.text.replacingOccurrences(of: "**", with: "")
+            return Self.statusLine(in: thinking.text, latest: true)
         }
         return nil
     }
@@ -133,20 +133,30 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
         for entry in entries.reversed() {
             switch entry {
             case let .thinking(thinking):
-                return thinking.text.replacingOccurrences(of: "**", with: "")
+                return Self.statusLine(in: thinking.text, latest: true)
             case let .note(message):
                 if let compaction = TranscriptCompaction(message: message) { return compaction.title }
                 guard message.isError else { continue }
                 let detail = message.blocks.compactMap { block -> String? in
                     guard case let .text(text) = block.kind else { return nil }
                     return text
-                }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-                return detail.isEmpty ? "Pi error" : "Pi error: \(detail)"
+                }.joined(separator: "\n")
+                let line = Self.statusLine(in: detail, latest: false)
+                return line.isEmpty ? "Pi error" : "Pi error: \(line)"
             case .activity:
                 continue
             }
         }
         return nil
+    }
+
+    /// A collapsed headline is deliberately one line: newest line for progressive thinking,
+    /// first line for an error whose remaining detail is available when expanded.
+    private static func statusLine(in text: String, latest: Bool) -> String {
+        let lines = text.split(whereSeparator: { $0.isNewline })
+        guard let line = latest ? lines.last : lines.first else { return "" }
+        return line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            .replacingOccurrences(of: "**", with: "")
     }
 
     var endsWithCompaction: Bool {
