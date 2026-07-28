@@ -150,6 +150,7 @@ enum ExtensionStatusParser {
     static let codexAccountKey = "codex-account"
     static let modeKey = "mode"
     static let fastPriorityKey = "fast-priority"
+    static let subagentsKey = "subagents"
 
     /// Keys rendered by dedicated status-bar controls rather than the generic chip list.
     static let specialKeys: Set<String> = [codexAccountKey, modeKey, fastPriorityKey]
