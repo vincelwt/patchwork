@@ -112,6 +112,27 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         XCTAssertEqual(runtime.startedCwd?.standardizedFileURL.path, desktopPath)
     }
 
+    func testArchivingTheSelectedConversationOpensTheNextActiveConversation() {
+        let store = makeStore()
+        func session(_ id: String, archived: Bool = false) -> SessionSummary {
+            var value = SessionSummary(
+                id: id, fileURL: directory.appendingPathComponent("\(id).jsonl"), cwd: directory,
+                createdAt: Date(), modifiedAt: Date(), name: id, preview: "",
+                messageCount: 0, metrics: TokenMetrics(), isArchived: archived
+            )
+            value.prepareSearchKey()
+            return value
+        }
+        let current = session("current")
+        store.sessions = [current, session("archived", archived: true), session("next")]
+        store.selectSession(current)
+
+        store.toggleArchive(current)
+
+        XCTAssertTrue(store.sessions[0].isArchived)
+        XCTAssertEqual(store.selectedSession?.id, "next")
+    }
+
     func testFolderChoicesContainKnownProjectsOnceButNeverGlobalDesktop() throws {
         let store = makeStore()
         func session(_ id: String, cwd: URL) -> SessionSummary {
