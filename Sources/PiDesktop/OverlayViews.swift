@@ -393,24 +393,54 @@ struct QuestionnaireCardView: View {
     }
 }
 
+/// A dimmed scrim plus the viewer panel, presented as the last root overlay rather than a sheet,
+/// so a click outside dismisses it exactly like the ⌘K palette.
 struct ImageViewerView: View {
-    @Environment(\.dismiss) private var dismiss
-    /// Local state, so arrowing through the group never re-presents the sheet.
+    /// Local state, so arrowing through the group never re-presents the viewer.
     @State private var selection: ViewedImage
     @State private var zoom = 1.0
+    private let onDismiss: () -> Void
 
-    init(selection: ViewedImage) { _selection = State(initialValue: selection) }
+    init(selection: ViewedImage, onDismiss: @escaping () -> Void) {
+        _selection = State(initialValue: selection)
+        self.onDismiss = onDismiss
+    }
 
     private var payload: ImagePayload { selection.image }
 
+    /// At zoom 1 an image fits the viewport with its aspect ratio intact and is never upscaled
+    /// past its intrinsic size; above 1 it outgrows the viewport and the scroll view takes over.
+    /// Pure geometry, so the fit is testable without a window.
+    static func fittedSize(for imageSize: CGSize, in viewport: CGSize, zoom: CGFloat) -> CGSize {
+        guard imageSize.width > 0, imageSize.height > 0,
+              viewport.width > 0, viewport.height > 0, zoom > 0 else { return .zero }
+        let scale = min(1, viewport.width / imageSize.width, viewport.height / imageSize.height) * zoom
+        return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+    }
+
     var body: some View {
+        ZStack {
+            Color.black.opacity(0.3)
+                .ignoresSafeArea()
+                .onTapGesture(perform: onDismiss)
+            panel
+                .padding(PiTheme.space24)
+        }
+        .onExitCommand(perform: onDismiss)
+        .transition(.opacity)
+        .zIndex(30)
+    }
+
+    private var panel: some View {
         VStack(spacing: 0) {
             HStack(spacing: PiTheme.space8) {
                 Text(payload.fileName ?? "Conversation image")
                     .font(PiFont.rowEmphasis)
-                Spacer()
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: PiTheme.space8)
                 if selection.images.count > 1 {
-                    Button { selection.goToPrevious() } label: { Image(systemName: "chevron.left") }
+                    Button { step(-1) } label: { Image(systemName: "chevron.left") }
                         .keyboardShortcut(.leftArrow, modifiers: [])
                         .disabled(!selection.hasPrevious)
                         .help("Previous image in this message")
@@ -419,8 +449,9 @@ struct ImageViewerView: View {
                         .font(PiFont.caption)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
+                        .fixedSize()
                         .accessibilityLabel("Image \(selection.index + 1) of \(selection.images.count)")
-                    Button { selection.goToNext() } label: { Image(systemName: "chevron.right") }
+                    Button { step(1) } label: { Image(systemName: "chevron.right") }
                         .keyboardShortcut(.rightArrow, modifiers: [])
                         .disabled(!selection.hasNext)
                         .help("Next image in this message")
@@ -431,32 +462,58 @@ struct ImageViewerView: View {
                 Slider(value: $zoom, in: 0.25...3)
                     .frame(width: 110)
                     .accessibilityLabel("Image zoom")
-                Button("Done") { dismiss() }
+                Button("Done", action: onDismiss)
                     .keyboardShortcut(.cancelAction)
             }
-            .padding(12)
+            .padding(PiTheme.space12)
             .background(.bar)
 
-            ScrollView([.horizontal, .vertical]) {
-                if let image = payload.nsImage {
-                    Image(nsImage: image)
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFit()
-                        .frame(
-                            width: max(300, image.size.width * zoom),
-                            height: max(240, image.size.height * zoom)
-                        )
-                        .padding(24)
-                } else {
-                    PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
-                        .frame(width: 500, height: 400)
+            GeometryReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    image(fitting: proxy.size)
+                        .padding(PiTheme.space24)
+                        // Centers anything smaller than the viewport; anything larger scrolls.
+                        .frame(minWidth: proxy.size.width, minHeight: proxy.size.height)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.black.opacity(0.88))
         }
-        .frame(minWidth: 720, minHeight: 520)
+        .frame(maxWidth: PiTheme.imageViewerMaxWidth, maxHeight: PiTheme.imageViewerMaxHeight)
+        .background(Color.piTranscript)
+        .clipShape(RoundedRectangle(cornerRadius: PiTheme.panelRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: PiTheme.panelRadius, style: .continuous)
+                .stroke(Color.piHairline, lineWidth: PiTheme.hairline)
+        }
+        .shadow(color: .black.opacity(0.22), radius: PiTheme.space24, y: PiTheme.space10)
+        // The solid panel eats its own clicks; controls and the image still get theirs first.
+        .contentShape(Rectangle())
+        .onTapGesture {}
+    }
+
+    @ViewBuilder
+    private func image(fitting available: CGSize) -> some View {
+        if let image = payload.nsImage {
+            let viewport = CGSize(
+                width: available.width - 2 * PiTheme.space24,
+                height: available.height - 2 * PiTheme.space24
+            )
+            let size = Self.fittedSize(for: image.size, in: viewport, zoom: zoom)
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: size.width, height: size.height)
+        } else {
+            PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
+                .frame(width: 500, height: 400)
+        }
+    }
+
+    /// Each image opens fitted, so zoom does not carry over from the previous one.
+    private func step(_ delta: Int) {
+        if delta < 0 { selection.goToPrevious() } else { selection.goToNext() }
+        zoom = 1
     }
 
     private func save() {
