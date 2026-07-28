@@ -284,7 +284,7 @@ private struct ComposerRuntimeLabel: View {
                     .foregroundStyle(Color.piOrange)
             } else if let label = store.currentRouteRuntimePhase?.label {
                 HStack(spacing: PiTheme.space4) {
-                    ProgressView().controlSize(.mini)
+                    StatusDot(color: .piGreen)
                     Text(label)
                 }
                 .foregroundStyle(.secondary)

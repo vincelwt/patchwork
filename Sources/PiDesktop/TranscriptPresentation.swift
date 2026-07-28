@@ -209,14 +209,6 @@ enum TranscriptItem: Identifiable, Hashable, Sendable {
     case work(TranscriptWorkBlock)
     case compaction(TranscriptCompaction)
 
-    var sourceMessageID: String? {
-        switch self {
-        case let .message(message, _): message.id
-        case let .compaction(note): note.id
-        case .work: nil
-        }
-    }
-
     var id: String {
         switch self {
         // Identity is the durable source message plus the block it starts at (one assistant

@@ -87,7 +87,7 @@ private struct RuntimeStateLabel: View {
                 if let symbol = activity.symbol {
                     Image(systemName: symbol).font(PiFont.micro)
                 } else {
-                    ProgressView().controlSize(.mini)
+                    StatusDot(color: .piGreen)
                 }
                 Text(activity.text)
                     .font(PiFont.micro)

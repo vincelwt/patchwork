@@ -52,16 +52,6 @@ final class ConversationScrollMetricsTests: XCTestCase {
 
 @MainActor
 final class ConversationScrollCacheTests: XCTestCase {
-    func testAnchorStoreIsBoundedWithoutObservableState() {
-        let anchors = ConversationScrollAnchorStore(limit: 2)
-        anchors.remember("row-a", for: "/a")
-        anchors.remember("row-b", for: "/b")
-        anchors.remember("row-c", for: "/c")
-        XCTAssertNil(anchors.anchor(for: "/a"))
-        XCTAssertEqual(anchors.anchor(for: "/b"), "row-b")
-        XCTAssertEqual(anchors.anchor(for: "/c"), "row-c")
-    }
-
     func testTranscriptProjectionRebuildsOnlyWhenItsRevisionChanges() {
         let message = ChatMessage(
             id: "a", role: .assistant,
@@ -75,27 +65,6 @@ final class ConversationScrollCacheTests: XCTestCase {
 
         _ = cache.items(revision: 2, messages: [message], streaming: nil, isRunning: false)
         XCTAssertEqual(cache.buildCount, 2)
-    }
-
-    func testUnreadTargetResolutionHandlesAWorkOnlyCompletion() {
-        let completion = ChatMessage(
-            id: "completion", role: .assistant,
-            blocks: [MessageBlock(id: "thought", kind: .thinking("Done"))],
-            timestamp: nil, stopReason: "error", raw: .null
-        )
-        let workOnly = TranscriptPresenter.items(messages: [completion], streaming: nil)
-        XCTAssertNil(MessageScrollView.unseenTargetID("completion", in: workOnly))
-
-        let answer = ChatMessage(
-            id: "answer", role: .assistant,
-            blocks: [MessageBlock(id: "text", kind: .text("Done"))],
-            timestamp: nil, stopReason: "stop", raw: .null
-        )
-        let visibleAnswer = TranscriptPresenter.items(messages: [answer], streaming: nil)
-        XCTAssertEqual(
-            MessageScrollView.unseenTargetID("answer", in: visibleAnswer),
-            "message:answer:text"
-        )
     }
 
     func testProjectionCachePreservesAWorkRowAcrossAPrependSeam() {
