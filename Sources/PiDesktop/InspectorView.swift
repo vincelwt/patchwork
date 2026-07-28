@@ -279,7 +279,7 @@ private struct AgentMetadataLine: View {
 
     @ViewBuilder var body: some View {
         if [.running, .waiting, .queued].contains(item.status), item.startedAt != nil {
-            TimelineView(.periodic(from: .now, by: 1)) { context in
+            TimelineView(.periodic(from: .now, by: 60)) { context in
                 label(at: context.date)
             }
         } else {
