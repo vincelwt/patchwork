@@ -961,11 +961,24 @@ final class AppStore: ObservableObject {
         activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.runningSince
     }
 
-    /// Menu bar / badge source: every non-archived session currently working, most recent first.
+    /// The user-turn/run boundary stays fixed while tool and assistant writes keep changing mtime.
+    /// A runtime can briefly precede the monitor's first observation; the summary date is stable
+    /// during that gap and avoids reordering on every subsequent write.
+    func runningSortDate(_ session: SessionSummary) -> Date {
+        runningSince(session) ?? session.modifiedAt
+    }
+
+    /// Menu bar / badge source: every non-archived session currently working, newest run first.
     var runningSessions: [SessionSummary] {
         sessions
             .filter { !$0.isArchived && isRunning($0) }
-            .sorted { liveModifiedAt($0) > liveModifiedAt($1) }
+            .sorted {
+                let left = runningSortDate($0)
+                let right = runningSortDate($1)
+                return left == right
+                    ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
+                    : left > right
+            }
     }
 
     /// Completion IDs, not run-state or mtime transitions, are the sole finished-answer signal.
