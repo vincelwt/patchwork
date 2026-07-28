@@ -393,14 +393,22 @@ final class TranscriptPresenterTests: XCTestCase {
 
     // MARK: - The answer is never buried in the work log
 
-    func testProcessUpdateAfterTheAnswerFoldsIntoWorkWithoutHidingTheAnswer() throws {
-        // Background-process completions are sideband work updates, not new transcript turns.
-        let update = ChatMessage(
-            id: "custom-1",
+    func testSidebandUpdatesAfterTheAnswerFoldIntoWorkWithoutHidingTheAnswer() throws {
+        // Background completions are sideband work updates, not new transcript turns.
+        let processUpdate = ChatMessage(
+            id: "process-update",
             role: .custom,
             blocks: [text("Process 'tests' completed successfully (14s)")],
             timestamp: nil,
             customType: "ad-process:update",
+            raw: .null
+        )
+        let webUpdate = ChatMessage(
+            id: "web-update",
+            role: .custom,
+            blocks: [text("Content fetched for 5/5 URLs")],
+            timestamp: nil,
+            customType: "web-search-content-ready",
             raw: .null
         )
         let messages = [
@@ -408,7 +416,8 @@ final class TranscriptPresenterTests: XCTestCase {
             assistant(id: "a1", blocks: [call("c1", "bash", ["command": .string("swift test")])]),
             result(id: "r1", callID: "c1", text: "ok"),
             assistant(id: "a2", blocks: [text("All 44 tests pass.")]),
-            update
+            processUpdate,
+            webUpdate
         ]
 
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
@@ -416,11 +425,11 @@ final class TranscriptPresenterTests: XCTestCase {
             return XCTFail("The answer must stay a visible transcript message, not work-log detail")
         }
         XCTAssertEqual(answer.textContent, "All 44 tests pass.")
-        XCTAssertEqual(items.count, 3, "The process update must not leak out as a standalone row")
+        XCTAssertEqual(items.count, 3, "Sideband updates must not leak out as standalone rows")
         guard case let .work(block) = items[1] else { return XCTFail("Expected the turn's work block above it") }
         XCTAssertEqual(
             block.entries.compactMap { if case let .note(message) = $0 { return message.id }; return nil },
-            ["custom-1"]
+            ["process-update", "web-update"]
         )
     }
 

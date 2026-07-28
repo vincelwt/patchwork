@@ -417,7 +417,8 @@ private struct TurnBuilder {
     /// System, custom, and unknown entries join the work log when a turn is in flight and stand
     /// on their own otherwise, so an extension message is never silently swallowed.
     private mutating func log(_ message: ChatMessage, streaming: Bool) {
-        if message.customType == "ad-process:update", trailingIsAnswer {
+        if trailingIsAnswer,
+           message.customType == "ad-process:update" || message.customType == "web-search-content-ready" {
             closeActivity()
             entries.append(.note(message))
             return
