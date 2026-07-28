@@ -465,12 +465,33 @@ enum MarkdownBlockParser {
 // MARK: - Inline parsing
 
 enum MarkdownInline {
+    /// One row realization calls `attributed` once per paragraph/list item, and SwiftUI
+    /// re-evaluates bodies freely; parsing plus data detection is ~0.25 ms per call, which
+    /// multiplies into visible scroll hitches. Styled results are immutable, so they are cached.
+    private final class StyledBox {
+        let value: AttributedString
+        init(_ value: AttributedString) { self.value = value }
+    }
+    private static let styledCache: NSCache<NSString, StyledBox> = {
+        let cache = NSCache<NSString, StyledBox>()
+        cache.countLimit = 512
+        return cache
+    }()
+
     /// Parses inline spans only, preserving the block's own whitespace and newlines. Code spans
     /// are restyled to SF Mono with a recessed background; links stay clickable.
     static func attributed(
         _ text: String,
         baseWeight: Font.Weight = .regular
     ) -> AttributedString {
+        let key = "\(baseWeight)|\(text)" as NSString
+        if let cached = styledCache.object(forKey: key) { return cached.value }
+        let parsed = parseAttributed(text, baseWeight: baseWeight)
+        styledCache.setObject(StyledBox(parsed), forKey: key)
+        return parsed
+    }
+
+    private static func parseAttributed(_ text: String, baseWeight: Font.Weight) -> AttributedString {
         var result: AttributedString
         if let parsed = try? AttributedString(
             markdown: text,
@@ -513,8 +534,12 @@ enum MarkdownInline {
     /// finds `http(s)://` runs Apple's parser left as plain text (never inside an existing link
     /// or a code span) and turns them into real links using the same `.link` attribute, so they
     /// render with the identical styling `Text` already gives markdown-authored links.
+    /// Detector creation compiles matching machinery and is far more expensive than a match, so
+    /// one shared instance serves every call.
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
     private static func linkifyBareURLs(in string: inout AttributedString) {
-        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return }
+        guard let detector = linkDetector else { return }
         let plain = String(string.characters)
         guard !plain.isEmpty else { return }
         let matches = detector.matches(in: plain, range: NSRange(plain.startIndex..., in: plain))

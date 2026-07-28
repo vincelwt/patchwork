@@ -80,8 +80,8 @@ final class TranscriptRowMetricsTests: XCTestCase {
         let theme = try String(contentsOf: sourceRoot.appendingPathComponent("Theme.swift"), encoding: .utf8)
         let messages = try String(contentsOf: sourceRoot.appendingPathComponent("MessageView.swift"), encoding: .utf8)
 
-        XCTAssertTrue(theme.contains("pulsing && !reduceMotion"))
-        XCTAssertTrue(theme.contains(".repeatForever(autoreverses: true)"))
+        XCTAssertTrue(theme.contains("if pulsing, !reduceMotion"), "The pulse honors Reduce Motion")
+        XCTAssertTrue(theme.contains("CABasicAnimation"), "The pulse is a render-server layer animation, not a view-graph one")
         XCTAssertTrue(messages.contains("if block.isActive { StatusDot(color: .piGreen, pulsing: true) }"))
         XCTAssertTrue(messages.contains("if isOpen {\n                PiHairline()"))
         XCTAssertFalse(messages.contains("            PiHairline()\n\n            if isOpen"))

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 
 struct TokenMetrics: Hashable, Codable, Sendable {
     var input = 0
@@ -117,12 +118,76 @@ struct ImagePayload: Identifiable, Hashable, Sendable {
     let mimeType: String
     let fileName: String?
 
+    /// Full-resolution decode for the image viewer. Transcript rows must use
+    /// `ImageThumbnailer` instead: decoding a 5K screenshot to draw a 460 pt row is what made
+    /// scrolling image-heavy conversations drop frames.
     var nsImage: NSImage? {
         let key = "message-\(id)-\(data.count)" as NSString
         if let cached = DecodedImageCache.shared.values.object(forKey: key) { return cached }
         guard let image = NSImage(data: data) else { return nil }
         DecodedImageCache.shared.values.setObject(image, forKey: key, cost: DecodedImageCache.decodedCost(of: image))
         return image
+    }
+}
+
+/// Downsampled transcript bitmaps. `CGImageSource` reads the header without decoding, and its
+/// thumbnailing decodes straight to the bounded pixel size — never the full bitmap.
+enum ImageThumbnailer {
+    /// Retina-density pixel budget for the largest transcript display bound.
+    static var transcriptMaxPixel: CGFloat {
+        2 * max(PiTheme.transcriptImageMaxWidth, PiTheme.transcriptImageMaxHeight)
+    }
+
+    /// The size the image lays out at in points (from header DPI metadata, matching how
+    /// `NSImage` reports it), plus its pixel dimensions. No decode happens here, so a
+    /// transcript row can reserve its exact final frame before the thumbnail exists.
+    static func layoutPointSize(of payload: ImagePayload) -> CGSize? {
+        guard let source = CGImageSourceCreateWithData(payload.data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let pixelWidth = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let pixelHeight = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+              pixelWidth > 0, pixelHeight > 0 else { return nil }
+        let dpiWidth = properties[kCGImagePropertyDPIWidth] as? CGFloat
+        let dpiHeight = properties[kCGImagePropertyDPIHeight] as? CGFloat
+        let scaleX = (dpiWidth ?? 0) > 0 ? 72 / dpiWidth! : 1
+        let scaleY = (dpiHeight ?? 0) > 0 ? 72 / dpiHeight! : 1
+        return CGSize(width: pixelWidth * scaleX, height: pixelHeight * scaleY)
+    }
+
+    static func cachedThumbnail(for payload: ImagePayload) -> NSImage? {
+        DecodedImageCache.shared.values.object(forKey: cacheKey(payload))
+    }
+
+    /// Bounded decode, safe to call off the main thread; repeat calls are cache hits. Falls back
+    /// to the full decode only when thumbnailing fails outright, so exotic-but-valid images
+    /// still render.
+    static func thumbnail(for payload: ImagePayload) -> NSImage? {
+        let key = cacheKey(payload)
+        if let cached = DecodedImageCache.shared.values.object(forKey: key) { return cached }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: transcriptMaxPixel
+        ]
+        guard let source = CGImageSourceCreateWithData(payload.data as CFData, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return payload.nsImage
+        }
+        // Keeping the original's point size preserves the exact layout the full decode had:
+        // AppKit scales the smaller bitmap into the same frame.
+        let pointSize = layoutPointSize(of: payload) ?? CGSize(width: cgImage.width, height: cgImage.height)
+        let image = NSImage(cgImage: cgImage, size: pointSize)
+        // Cost from the real backing bitmap: the snapshot rep NSImage wraps a CGImage in reports
+        // point size × screen scale as its pixel dimensions, which would overcharge the cache
+        // several times over and thrash it.
+        let cost = max(1, cgImage.width * cgImage.height * 4)
+        DecodedImageCache.shared.values.setObject(image, forKey: key, cost: cost)
+        return image
+    }
+
+    private static func cacheKey(_ payload: ImagePayload) -> NSString {
+        "thumb-\(payload.id)-\(payload.data.count)" as NSString
     }
 }
 

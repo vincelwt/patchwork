@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import XCTest
 @testable import PiDesktop
 
@@ -26,6 +27,13 @@ final class ImageViewerTests: XCTestCase {
         XCTAssertFalse(selection.hasPrevious)
         selection.goToPrevious() // no wrap
         XCTAssertEqual(selection.image.id, "a")
+    }
+
+    func testOnlyArrowKeysMapToImageNavigation() {
+        XCTAssertEqual(ImageViewerView.navigationDelta(for: .leftArrow), -1)
+        XCTAssertEqual(ImageViewerView.navigationDelta(for: .rightArrow), 1)
+        XCTAssertNil(ImageViewerView.navigationDelta(for: .upArrow))
+        XCTAssertNil(ImageViewerView.navigationDelta(for: .downArrow))
     }
 
     func testZoomOneFitsLargeImagesWithoutUpscalingSmallOnes() {
