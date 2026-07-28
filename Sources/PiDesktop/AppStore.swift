@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import PiDeskKit
 import SwiftUI
 
 /// Where a submission came from. A late failure may only touch the draft when the user is
@@ -104,6 +105,12 @@ typealias RuntimeRetirementScheduler = (
     _ delay: TimeInterval,
     _ action: @escaping @MainActor () -> Void
 ) -> () -> Void
+
+typealias ManagedTurnResumer = @MainActor (
+    _ sessionPath: String,
+    _ instruction: String,
+    _ clientID: String
+) async throws -> Void
 
 /// Bounds and LRU-evicts persisted conversation drafts so `state.json` cannot grow without
 /// bound across months of use. Recency is tracked purely in memory (never persisted itself);
@@ -258,6 +265,7 @@ final class AppStore: ObservableObject {
     private let connectivityMonitor: ConnectivityMonitor?
     private let runtimeRetirementDelay: TimeInterval
     private let runtimeRetirementScheduler: RuntimeRetirementScheduler
+    private let managedTurnResumer: ManagedTurnResumer
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -345,6 +353,8 @@ final class AppStore: ObservableObject {
     private static let connectivityResumeDescription = "Resume an interrupted turn after network connectivity returns"
     private static let connectivityResumeInstruction =
         "Network connectivity interrupted the previous turn. Continue from where it stopped without repeating completed work."
+    private static let relaunchRecoveryInstruction =
+        "Pi Desktop restarted during the previous turn. Inspect the durable conversation and continue from where it stopped. Do not repeat completed actions; if an outcome is uncertain, explain that and ask before repeating it."
 
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
@@ -366,6 +376,12 @@ final class AppStore: ObservableObject {
                 action()
             }
             return { task.cancel() }
+        },
+        managedTurnResumer: @escaping ManagedTurnResumer = { path, instruction, clientID in
+            _ = try await PiDeskKit.PiDeskClient.unixSocket(requestTimeout: 5).sendMessage(
+                threadId: path,
+                PiDeskKit.SendMessageRequest(text: instruction, clientId: clientID)
+            )
         }
     ) {
         self.repository = repository
@@ -373,6 +389,7 @@ final class AppStore: ObservableObject {
         self.runtimeFactory = runtimeFactory
         self.runtimeRetirementDelay = runtimeRetirementDelay
         self.runtimeRetirementScheduler = runtimeRetirementScheduler
+        self.managedTurnResumer = managedTurnResumer
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
@@ -631,6 +648,7 @@ final class AppStore: ObservableObject {
             "message": .string(ImageAttachment.prompt(text: entry.text, attachments: entry.attachments))
         ]
         if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
+        beginManagedTurnRecovery(for: slot)
         slot.runtime.send(type: "prompt", payload: payload) { [weak self, weak slot] result in
             guard let self, let slot, !slot.isSuperseded else { return }
             let definitelyRejected: Bool
@@ -640,7 +658,12 @@ final class AppStore: ObservableObject {
             case let .failure(error):
                 definitelyRejected = !RPCFailureHandling.isOutcomeUnknown(error)
             }
-            if definitelyRejected { restoreOutboxEntry(entry, owner: token.owner) }
+            if definitelyRejected {
+                clearManagedTurnRecovery(for: slot)
+                restoreOutboxEntry(entry, owner: token.owner)
+            } else if case let .success(response) = result, responseError(response) == nil {
+                updateManagedTurn(for: slot) { $0.phase = ManagedTurnRecovery.accepted }
+            }
             finishOutboxDispatch(
                 owner: token.owner,
                 dispatch: token.dispatch,
@@ -675,6 +698,7 @@ final class AppStore: ObservableObject {
                 slot.promptPreflightID = nil
                 slot.promptBeganAt = nil
                 slot.outboxDispatches.remove(token.dispatch)
+                clearManagedTurnRecovery(for: slot)
                 if !dispatchNextFollowUp(for: slot) {
                     if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
                     else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
@@ -968,6 +992,150 @@ final class AppStore: ObservableObject {
             .sorted { liveModifiedAt($0) > liveModifiedAt($1) }
     }
 
+    private func managedTurnPath(for slot: RuntimeSlot) -> String? {
+        guard let path = slot.sessionPath ?? state(for: slot).sessionFile, !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    private func beginManagedTurnRecovery(for slot: RuntimeSlot) {
+        guard let path = managedTurnPath(for: slot) else { return }
+        let visibleBaseline = selectedSession?.fileURL.standardizedFileURL.path == path
+            ? messages.reversed().first(where: {
+                $0.role == .assistant && SessionParser.terminalAssistantStopReasons.contains($0.stopReason ?? "")
+            })?.id
+            : nil
+        let baseline = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+            ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
+            ?? visibleBaseline
+        persistence.updateState {
+            $0.setManagedTurnRecovery(ManagedTurnRecovery(
+                id: UUID(), sessionPath: path, phase: ManagedTurnRecovery.dispatching,
+                baselineCompletionID: baseline, activeToolCallIDs: [], startedAt: Date()
+            ))
+        }
+    }
+
+    private func updateManagedTurn(for slot: RuntimeSlot, _ update: (inout ManagedTurnRecovery) -> Void) {
+        guard let path = managedTurnPath(for: slot),
+              var recovery = persistence.state.managedTurnRecoveries[path] else { return }
+        update(&recovery)
+        persistence.updateState { $0.setManagedTurnRecovery(recovery) }
+    }
+
+    private func clearManagedTurnRecovery(for slot: RuntimeSlot) {
+        guard let path = managedTurnPath(for: slot) else { return }
+        clearManagedTurnRecovery(path: path)
+    }
+
+    private func clearManagedTurnRecovery(path: String) {
+        guard persistence.state.managedTurnRecoveries[path] != nil else { return }
+        persistence.updateState { $0.removeManagedTurnRecovery(path: path) }
+    }
+
+    private func updateManagedTool(_ event: JSONValue, running: Bool, slot: RuntimeSlot) {
+        guard let id = event["toolCallId"]?.stringValue else { return }
+        updateManagedTurn(for: slot) { recovery in
+            if running { recovery.activeToolCallIDs.insert(id) }
+            else { recovery.activeToolCallIDs.remove(id) }
+        }
+    }
+
+    private func liveWriterRemains(at path: String) async -> Bool {
+        for attempt in 0..<6 {
+            let live = await Task.detached(priority: .utility) {
+                ActivityHeartbeatStore.scan(directory: ActivityHeartbeatStore.defaultDirectory())[path]?.contains {
+                    ActivityHeartbeatClassifier.isRunning($0, now: Date())
+                } == true
+            }.value
+            if !live { return false }
+            if attempt < 5 { try? await Task.sleep(nanoseconds: 500_000_000) }
+        }
+        return true
+    }
+
+    /// A dead provider stream cannot be reattached. For an app-owned accepted turn with no tool
+    /// left in an outcome-ambiguous state, enqueue one new continuation against the same durable
+    /// Pi session. Dispatching/tool-active/prior-recovery states require review instead of a
+    /// blind replay. Plain terminal sessions have no app-owned record and are never touched.
+    private func recoverManagedTurnsAfterLaunch() async {
+        let recoveries = persistence.state.managedTurnRecoveries.values.sorted { $0.startedAt < $1.startedAt }
+        guard !recoveries.isEmpty else { return }
+
+        for original in recoveries {
+            guard sessions.contains(where: { $0.fileURL.standardizedFileURL.path == original.sessionPath }) else { continue }
+            let path = original.sessionPath
+            let currentCompletion = await Task.detached(priority: .utility) {
+                let url = URL(fileURLWithPath: path)
+                return SessionActivityClassifier.readTail(at: url, limit: SessionParser.tailScanWindowBytes)
+                    .flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))?.id
+            }.value
+            if let currentCompletion, currentCompletion != original.baselineCompletionID {
+                clearManagedTurnRecovery(path: path)
+                continue
+            }
+
+            if await liveWriterRemains(at: path) {
+                var review = original
+                review.phase = ManagedTurnRecovery.needsReview
+                persistence.updateState { $0.setManagedTurnRecovery(review) }
+                showToast(
+                    "This interrupted thread is still active in another Pi process; it was not resumed.",
+                    style: .warning,
+                    sessionPath: path
+                )
+                continue
+            }
+
+            guard original.phase == ManagedTurnRecovery.accepted,
+                  original.activeToolCallIDs.isEmpty else {
+                var review = original
+                review.phase = ManagedTurnRecovery.needsReview
+                persistence.updateState { $0.setManagedTurnRecovery(review) }
+                showToast(
+                    "A previous turn was interrupted and needs review before continuing.",
+                    style: .warning,
+                    sessionPath: path
+                )
+                continue
+            }
+
+            var recovering = original
+            recovering.phase = ManagedTurnRecovery.recovering
+            persistence.updateState { $0.setManagedTurnRecovery(recovering) }
+
+            var delivered = false
+            var lastError: Error?
+            for delay in [UInt64(0), 500_000_000, 1_000_000_000] {
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                do {
+                    try await managedTurnResumer(
+                        path,
+                        Self.relaunchRecoveryInstruction,
+                        "recovery-\(original.id.uuidString)"
+                    )
+                    delivered = true
+                    break
+                } catch {
+                    lastError = error
+                }
+            }
+
+            if delivered {
+                showToast("Resuming an interrupted turn.", style: .info, sessionPath: path)
+            } else {
+                recovering.phase = ManagedTurnRecovery.needsReview
+                persistence.updateState { $0.setManagedTurnRecovery(recovering) }
+                showToast(
+                    "Could not resume an interrupted turn: \(lastError?.localizedDescription ?? "control service unavailable")",
+                    style: .warning,
+                    sessionPath: path
+                )
+            }
+        }
+    }
+
+    func recoverManagedTurnsForTesting() async { await recoverManagedTurnsAfterLaunch() }
+
     /// Completion IDs, not run-state or mtime transitions, are the sole finished-answer signal.
     /// The first snapshot establishes a quiet baseline; every later distinct ID is persisted
     /// before notification gating so duplicate observations and relaunches stay silent.
@@ -981,6 +1149,10 @@ final class AppStore: ObservableObject {
             let hadBaseline = observedActivityPaths.contains(path)
             observedActivityPaths.insert(path)
             guard let completionID = activity.latestCompletedEntryID else { continue }
+            if let recovery = persistence.state.managedTurnRecoveries[path],
+               completionID != recovery.baselineCompletionID {
+                clearManagedTurnRecovery(path: path)
+            }
             let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
             // Pi may append an error before its automatic retry. Do not persist or notify that
             // completion until the session settles; a recovered answer will replace it first.
@@ -1114,6 +1286,7 @@ final class AppStore: ObservableObject {
             if selectedFolder == nil {
                 selectedFolder = WorkspaceOrganization.globalWorkingDirectory
             }
+            await recoverManagedTurnsAfterLaunch()
             // Warm the transcript cache after the scan settles, so opening a recent conversation
             // is instant even before the user selects anything.
             schedulePrefetch(around: selectedSession)
@@ -2165,6 +2338,7 @@ final class AppStore: ObservableObject {
 
         // A stop is final: discard every app-held and Pi-owned continuation, retire the process,
         // and ignore any event already en route from its superseded generation.
+        clearManagedTurnRecovery(for: slot)
         slot.isSuperseded = true
         slot.isReady = false
         slot.isStarting = false
@@ -3039,6 +3213,7 @@ final class AppStore: ObservableObject {
                 state.isStreaming = true
                 state.phase = .waitingForModel
             }
+            beginManagedTurnRecovery(for: slot)
         }
 
         slot.runtime.send(type: command, payload: payload) { [weak self, weak slot] result in
@@ -3052,6 +3227,9 @@ final class AppStore: ObservableObject {
                 isOutcomeUnknown = RPCFailureHandling.isOutcomeUnknown(error)
             }
             guard let errorText else {
+                if command == "prompt" {
+                    updateManagedTurn(for: slot) { $0.phase = ManagedTurnRecovery.accepted }
+                }
                 if command == "steer" { showToast("Steering message queued", style: .info) }
                 if command == "follow_up" { showToast("Follow-up queued", style: .info) }
                 if let preflightID { reconcilePromptPreflight(preflightID, slot: slot) }
@@ -3064,6 +3242,7 @@ final class AppStore: ObservableObject {
                 return
             }
             if command == "prompt" {
+                clearManagedTurnRecovery(for: slot)
                 updateState(for: slot) { state in
                     state.isStreaming = wasStreaming
                     state.phase = previousPhase
@@ -3100,6 +3279,7 @@ final class AppStore: ObservableObject {
             slot.promptPreflightID = nil
             slot.promptBeganAt = nil
             slot.pendingTurn = nil
+            clearManagedTurnRecovery(for: slot)
             if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
             else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
         }
@@ -3346,6 +3526,12 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        switch event["type"]?.stringValue {
+        case "tool_execution_start": updateManagedTool(event, running: true, slot: slot)
+        case "tool_execution_end": updateManagedTool(event, running: false, slot: slot)
+        case "agent_settled": clearManagedTurnRecovery(for: slot)
+        default: break
+        }
         if event["type"]?.stringValue == "session_info_changed" {
             let name = event["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             updateState(for: slot) { $0.sessionName = name?.isEmpty == false ? name : nil }
@@ -3977,6 +4163,7 @@ final class AppStore: ObservableObject {
 
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        clearManagedTurnRecovery(for: slot)
         slot.outboxDispatches.removeAll()
         slot.outboxPromptPreflighting = false
         slot.outboxPromptAbortRequested = false

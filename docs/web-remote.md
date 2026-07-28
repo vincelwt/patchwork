@@ -1,7 +1,7 @@
 # Web remote
 
 Pi Desktop can be used from a phone or another browser without a VPN, inbound port, or tunnel.
-The daemon opens an outbound WebSocket to the Cloudflare relay at
+The active control service opens an outbound WebSocket to the Cloudflare relay at
 [`remote.ai.gloom.sh`](https://remote.ai.gloom.sh); the same phone-first static app remains
 available over the older loopback listener for local/tunnel use.
 
@@ -10,9 +10,9 @@ event envelopes but never receives Pi provider credentials or session files.
 
 ## Hosted remote
 
-The hosted connection starts automatically with `pi-deskd`. Since the app supervises the daemon
-by default, opening Pi Desktop also starts the remote connection. If `pi-deskd` is installed as a
-LaunchAgent, it stays reachable after the window app quits.
+The hosted connection starts with Pi Desktop’s in-process control service. If the optional
+`pi-deskd` LaunchAgent is installed, it hosts the same connection and stays reachable after the
+window app quits.
 
 Pair a browser once:
 

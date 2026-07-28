@@ -2,8 +2,8 @@
 
 Pi Desktop grows a headless half so threads can run, be scheduled, and be driven when the
 window is closed — from a CLI, from another agent, or from a phone. This document is the
-contract between the four pieces. It is normative: the daemon, the CLI, the web remote, and the
-app all implement exactly what is written here.
+contract between the four pieces. It is normative: the service host, CLI, web remote, and app
+all implement exactly what is written here.
 
 ```
         pidesk (CLI)        web remote (browser)        Pi Desktop.app
@@ -11,90 +11,64 @@ app all implement exactly what is written here.
                \                   |                       /
                 +-------- HTTP/JSON control API ----------+
                                    |
-                            pi-deskd (daemon)
+                 in-app service (default) or pi-deskd
                                    |
                      spawns `pi --mode rpc` per run
                                    |
                         ~/.pi/agent/sessions/*.jsonl
 ```
 
-Pi stays the source of truth. The daemon never writes a session file itself; it drives the Pi
-CLI exactly like the app does. Schedules, tokens, and run history are app-owned metadata.
+Pi stays the source of truth. The control service never writes a session file itself; it drives
+the Pi CLI exactly like the conversation UI does. Schedules, tokens, and run history are
+app-owned metadata.
 
 ## Processes
 
 | Piece | Target | Binary | Role |
 |---|---|---|---|
-| Daemon | `PiDeskDaemon` | `pi-deskd` | Scheduler, thread runner, control API |
+| Service | `PiDeskDaemon` | linked into the app | Scheduler, thread runner, control API |
+| Standalone host | `PiDeskDaemonMain` | `pi-deskd` | Optional LaunchAgent host for the same service |
 | CLI | `PiDeskCLI` | `pidesk` | Thin client over the control API |
-| Shared | `PiDeskKit` | — | Wire models, client, paths, shared by all three and by the app |
-| App | `PiDesktop` | `Pi Desktop.app` | Window UI; a client of the same API for schedules |
+| Shared | `PiDeskKit` | — | Wire models, client, and shared paths |
+| App | `PiDesktop` | `Pi Desktop.app` | Window UI and default service host |
 
-The daemon must be safe to run with no app open, and safe to have no daemon at all: the app
-degrades to local-only behaviour and says so.
+The service must be safe to host either inside the app or in the optional standalone process.
 
 ## Lifecycle
 
-There are two supported ways to run `pi-deskd`, and exactly one runs at a time:
+There are two hosts for one `PiDeskControlService`, and exactly one owns the control socket:
 
-- **App-managed (default).** Pi Desktop.app bundles `pi-deskd` and `pidesk` inside
-  `Contents/Helpers/` and owns their process lifecycle itself (`Sources/PiDesktop/
-  DaemonSupervisor.swift`): it starts the daemon on launch if nothing is already serving the
-  control socket, restarts it if it dies while the app is running, and stops it on quit. No
-  install step; this is what a person who never heard of `pidesk` gets by default.
-- **LaunchAgent (opt-in, always-on).** `scripts/install-daemon.sh` (or `pidesk daemon install`)
-  registers `pi-deskd` as a per-user LaunchAgent (`dev.pi.desktop.daemon`) that starts at login
-  and restarts on crash, independent of whether the app is even installed. For a headless
-  machine, or automations that must keep running with the window app never opened.
+- **Inside Pi Desktop (default).** The scheduler, API, relay, run queue, and Pi workers are linked
+  into `Pi Desktop.app` and created from `AppDelegate`. There is no child daemon process. The app
+  stops accepting work, cancels its service-owned runs cooperatively, and waits for teardown
+  before it exits.
+- **LaunchAgent (explicit, always-on).** `scripts/install-daemon.sh` (or
+  `pidesk daemon install`) runs the small `pi-deskd` host at login. It uses the same service code
+  and storage but remains independent of the window app.
 
-Both write and read the exact same `~/Library/Application Support/Pi Desktop/*` files, so
-schedules and run history are identical either way; only who launches the process differs.
+Both modes use the same `~/Library/Application Support/Pi Desktop/*` files. Before starting its
+in-process host, the app defers to an installed LaunchAgent or any healthy owner of the Unix
+socket. A leftover socket file is not evidence of a live host; `POSIXListener` probes it and
+rebinds when nothing answers.
 
-**Only one daemon at a time.** Before starting anything, the app probes `GET /v1/health` on the
-control socket. A *file* at the socket path is not evidence of a running daemon — a crash can
-leave one behind — so the app never treats the file's existence as "already running"; only a
-successful health response does. A stale socket file left by a crash needs no special handling
-from the app either way: `pi-deskd`'s own listener setup (`POSIXListener.unixSocket`) probes it
-first and unlinks-and-rebinds automatically when nothing answers. If a LaunchAgent is installed,
-the app defers to it unconditionally — never starts its own, never stops the LaunchAgent's — even
-while it is momentarily unreachable (e.g. between a crash and launchd's restart). Installing the
-LaunchAgent while the app is already running its own is also safe: the app notices within one
-poll interval (a few seconds) and relinquishes, and launchd's own throttled retries pick it up.
+**Ownership and migration.** In default mode `daemon-owner.json` contains the Pi Desktop process
+PID, preserving `pidesk daemon status` compatibility. A previous release may have left an
+app-spawned `pi-deskd` child alive after a crash; the first new launch retires only that recorded
+legacy PID before binding in-process. Ownerless and LaunchAgent hosts are never stopped by the
+app.
 
-**Ownership.** When the app spawns `pi-deskd` itself, it records the pid and start time in
-`daemon-owner.json` (see Storage below). That file is the *only* thing that makes a running
-daemon "the app's to stop" — a daemon started by the LaunchAgent or by hand
-(`pidesk daemon start`) never has one, so the app can never mistake either for its own, on this
-launch or a later one (the record survives an app crash, so a relaunched app still recognises and
-continues supervising the same still-alive daemon rather than spawning a duplicate).
-
-**Restart.** If the app-managed daemon dies while the app is running, the app restarts it with
-exponential backoff (2s, 4s, 8s, 16s, 32s, capped at 60s) up to 5 attempts; a 6th failure in that
-window gives up and surfaces a clear "not responding" state in Settings instead of looping
-silently. A daemon that stays up clears the failure count, so an old crash from hours ago never
-counts against a currently-stable one.
-
-**Shutdown.** On quit (or a plain `SIGTERM`/`SIGINT`, however it was sent), the daemon stops
-scheduling new runs immediately, then gives whatever is already running up to 10 seconds to
-finish naturally, then cancels anything still going — the same cooperative cancellation
-`POST /v1/threads/{id}/abort` uses, so an in-flight `pi` process still gets a graceful
-SIGTERM-then-SIGKILL instead of being abandoned, and the run is recorded as `interrupted` rather
-than left `running` forever. Queued scheduled occurrences stay durable for the next app launch;
-an interrupted pre-prompt attempt may retry, while one whose prompt delivery began is never sent
-again blindly. A run cancelled with a steer/follow-up still being written adds that
-delivery's bounded drain (at most three seconds) before its process is stopped, so no message is
-killed while its caller is still waiting to hear what happened. Only once that has actually
-finished does the daemon process itself exit.
-The app, in turn, waits up to 15 seconds (comfortably above the daemon's own worst case) for the
-process to exit before force-killing its whole process group as a last resort — which only
-abandons a run if the daemon failed to shut down on its own in that window. In short: a scheduled
-run in progress when the app quits gets a real but bounded chance to finish, never a silent
-half-written result, and never an orphaned process either way.
-
-**Turning it off.** "Automatically run the background service with this app" in Pi Desktop.app's
-Settings persists (`UserDefaults`) and can be turned off entirely; a stopped-by-setting daemon
-stops just like a quit does. With it off, automations say so explicitly instead of a bare
-"unreachable" error (`ScheduleServiceError.daemonUnavailable`).
+**Shutdown and recovery.** Quitting Pi Desktop stops scheduling immediately and cancels every
+run owned by its in-process service. Each Pi child still receives cooperative SIGTERM with a
+bounded SIGKILL fallback; direct terminal `pi` processes are unrelated and untouched. Queued
+scheduled occurrences remain durable for the next launch. Pre-prompt scheduled work may retry,
+while work whose prompt delivery began is marked `interrupted` and never resent blindly.
+Process-local API/manual queue records are also reconciled to `interrupted` on restart instead of
+remaining falsely `running`. Native UI turns keep a separate bounded app-owned recovery marker:
+an accepted turn with no tool in flight gets one continuation against the same session after
+relaunch; unknown prompt delivery, an active tool, or a second interrupted recovery requires
+review. Sessions launched by plain terminal `pi` never get that marker and are not adopted. The
+standalone host keeps its existing ten-second finish-naturally grace on SIGTERM/SIGINT before
+cancellation.
 
 ## Transports
 
@@ -461,21 +435,21 @@ forward-compatibility rule the app applies to Pi's own RPC events.
   daemon-token         bearer token for the loopback listener (0600)
   daemon.json          daemon settings: port, concurrency, loopback remote enabled
   relay-identity.json  hosted installation/host keys, approved device keys, replay counters (0600)
-  daemon-owner.json    pid + start time of the pi-deskd Pi Desktop.app itself started, if any —
-                       local coordination between the app and pidesk, not part of this API
+  daemon-owner.json    pid + start time of the active app-hosted service, if any — local
+                       coordination between Pi Desktop and pidesk, not part of this API
   schedules.json       every Schedule, written atomically
   runs.jsonl           append-only run history, rotated at a bounded size
-  state.json           existing app state (archive, folders, drafts, unread) — unchanged
+  state.json           app state (archive, folders, drafts, unread, bounded native-turn recovery)
 ~/Library/Logs/Pi Desktop/daemon.log
 ```
 
-The daemon owns `schedules.json` and `runs.jsonl`. The app reads them through the API, never by
-touching the files, so there is exactly one writer.
+The active control-service host owns `schedules.json` and `runs.jsonl`. UI code reads them through
+the API, never by touching the files, so there is exactly one writer.
 
 ## Execution model
 
 - At most `concurrency` (default 2) runs at once; the rest queue in FIFO order.
-- When the app-managed daemon returns, overdue once/cron/interval triggers globally coalesce into
+- When the app-hosted service returns, overdue once/cron/interval triggers globally coalesce into
   one durable occurrence per schedule, ordered by their original due time. Heartbeats resume from
   now and never replay an old check. The legacy `catchUpMissed` field is ignored.
 - A macOS network path reported offline leaves occurrences pending without spending an attempt.

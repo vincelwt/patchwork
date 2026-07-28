@@ -388,6 +388,20 @@ struct ViewedImage: Identifiable {
     mutating func goToNext() { if hasNext { index += 1 } }
 }
 
+struct ManagedTurnRecovery: Codable, Equatable {
+    static let dispatching = "dispatching"
+    static let accepted = "accepted"
+    static let recovering = "recovering"
+    static let needsReview = "needsReview"
+
+    var id: UUID
+    var sessionPath: String
+    var phase: String
+    var baselineCompletionID: String?
+    var activeToolCallIDs: Set<String>
+    var startedAt: Date
+}
+
 struct PersistedAppState: Codable {
     var archivedSessionIDs: Set<String> = []
     var recentFolders: [String] = []
@@ -411,6 +425,9 @@ struct PersistedAppState: Codable {
     /// key for the new-chat route. Bounded and LRU-evicted by `DraftStore`; image attachments
     /// never appear here.
     var drafts: [String: String] = [:]
+    /// App-owned turns that had not settled when the process last wrote state. External terminal
+    /// sessions never appear here, so relaunch recovery cannot take over work it does not own.
+    var managedTurnRecoveries: [String: ManagedTurnRecovery] = [:]
 
     init() {}
 
@@ -434,18 +451,39 @@ struct PersistedAppState: Codable {
         lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
         manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
         drafts = try container.decodeIfPresent([String: String].self, forKey: .drafts) ?? [:]
+        let recoveries = try container.decodeIfPresent(
+            [String: ManagedTurnRecovery].self, forKey: .managedTurnRecoveries
+        ) ?? [:]
+        managedTurnRecoveries = Dictionary(uniqueKeysWithValues: recoveries.values
+            .sorted { $0.startedAt < $1.startedAt }
+            .suffix(Self.maxManagedTurnRecoveries)
+            .map { ($0.sessionPath, $0) })
     }
 
     static let maxRetainedCompletionSessions = 2_000
+    static let maxManagedTurnRecoveries = 32
 
     /// Keeps completion metadata bounded even for hand-edited state, and optionally drops paths
     /// no longer discovered. `preferredPath` is the just-observed session and is never evicted.
+    mutating func setManagedTurnRecovery(_ recovery: ManagedTurnRecovery) {
+        managedTurnRecoveries[recovery.sessionPath] = recovery
+        if managedTurnRecoveries.count > Self.maxManagedTurnRecoveries {
+            let stale = managedTurnRecoveries.values.min { $0.startedAt < $1.startedAt }
+            if let stale { managedTurnRecoveries.removeValue(forKey: stale.sessionPath) }
+        }
+    }
+
+    mutating func removeManagedTurnRecovery(path: String) {
+        managedTurnRecoveries.removeValue(forKey: path)
+    }
+
     mutating func pruneCompletionState(retaining paths: Set<String>? = nil, preferredPath: String? = nil) {
         if let paths {
             latestCompletedEntryIDBySessionPath = latestCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
             lastSeenCompletedEntryIDBySessionPath = lastSeenCompletedEntryIDBySessionPath.filter { paths.contains($0.key) }
             lastReadAt = lastReadAt.filter { paths.contains($0.key) }
             manuallyUnreadSessionPaths.formIntersection(paths)
+            managedTurnRecoveries = managedTurnRecoveries.filter { paths.contains($0.key) }
         }
         var keys = Set(latestCompletedEntryIDBySessionPath.keys)
             .union(lastSeenCompletedEntryIDBySessionPath.keys)

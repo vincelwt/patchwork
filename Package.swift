@@ -9,8 +9,8 @@ let package = Package(
     ],
     products: [
         .executable(name: "PiDesktop", targets: ["PiDesktop"]),
-        // The headless half: a scheduler/runner daemon and its client CLI. See docs/daemon-api.md.
-        .executable(name: "pi-deskd", targets: ["PiDeskDaemon"]),
+        // Optional always-on host for the same control service embedded in Pi Desktop.
+        .executable(name: "pi-deskd", targets: ["PiDeskDaemonMain"]),
         .executable(name: "pidesk", targets: ["PiDeskCLI"]),
         .library(name: "PiDeskKit", targets: ["PiDeskKit"]),
         .library(name: "PiDeskWeb", targets: ["PiDeskWeb"])
@@ -22,13 +22,18 @@ let package = Package(
         ),
         .executableTarget(
             name: "PiDesktop",
-            dependencies: ["PiDeskKit"],
+            dependencies: ["PiDeskKit", "PiDeskDaemon"],
             path: "Sources/PiDesktop"
         ),
-        .executableTarget(
+        .target(
             name: "PiDeskDaemon",
             dependencies: ["PiDeskKit", "PiDeskWeb"],
             path: "Sources/PiDeskDaemon"
+        ),
+        .executableTarget(
+            name: "PiDeskDaemonMain",
+            dependencies: ["PiDeskDaemon"],
+            path: "Sources/PiDeskDaemonMain"
         ),
         .executableTarget(
             name: "PiDeskCLI",

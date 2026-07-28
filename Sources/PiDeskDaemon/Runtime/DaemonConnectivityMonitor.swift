@@ -22,5 +22,7 @@ final class DaemonConnectivityMonitor: @unchecked Sendable {
         monitor.start(queue: queue)
     }
 
-    deinit { monitor.cancel() }
+    func stop() { monitor.cancel() }
+
+    deinit { stop() }
 }

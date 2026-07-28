@@ -6,9 +6,8 @@ set -euo pipefail
 # daemon must not depend on one surviving), writes the plist, and (re)loads it.
 #
 # Only needed for always-on use without Pi Desktop.app (e.g. a headless machine): by default the
-# app starts and stops its own bundled pi-deskd as it launches and quits (docs/daemon-api.md,
-# "Lifecycle"). If both are present, the app defers to the LaunchAgent installed here rather than
-# running a second daemon.
+# app hosts the same control service in-process. If this LaunchAgent is installed, the app defers
+# to it rather than binding a competing service (docs/daemon-api.md, "Lifecycle").
 #
 # Usage:
 #   scripts/install-daemon.sh              build, install/update, (re)load

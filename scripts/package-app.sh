@@ -20,11 +20,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 cp "$BIN_DIR/PiDesktop" "$APP/Contents/MacOS/PiDesktop"
 chmod +x "$APP/Contents/MacOS/PiDesktop"
 
-# The control-plane daemon and its CLI, bundled so the app can start/stop its own background
-# service instead of requiring scripts/install-daemon.sh (docs/daemon-api.md, "Lifecycle").
-# `Contents/Helpers/` rather than `Contents/MacOS/` because these are auxiliary tools the app
-# launches itself, not alternate entry points for the bundle — `DaemonSupervisor`/`DaemonControl`
-# both know to look here first.
+# Pi Desktop hosts the control service in-process. Keep the standalone host only for the explicit
+# `pidesk daemon install` LaunchAgent path, and bundle the CLI for direct terminal access.
 cp "$BIN_DIR/pi-deskd" "$APP/Contents/Helpers/pi-deskd"
 cp "$BIN_DIR/pidesk" "$APP/Contents/Helpers/pidesk"
 ditto "$BIN_DIR/PiDesktop_PiDeskWeb.bundle" "$APP/Contents/Resources/PiDesktop_PiDeskWeb.bundle"
@@ -94,9 +91,8 @@ PLIST
 # Ad-hoc signing avoids a damaged-app warning for local builds. Distribution
 # signing/notarization can replace this identity later.
 if command -v codesign >/dev/null 2>&1; then
-    # Each helper is launched as its own process (never loaded into PiDesktop's address space),
-    # so it needs a valid signature of its own — sign both before the whole-bundle pass below,
-    # which then reseals the outer bundle's resource envelope around the now-signed helpers.
+    # The optional standalone host and CLI are separate executables, so sign them before the
+    # whole-bundle pass reseals the outer resource envelope.
     codesign --force --sign - "$APP/Contents/Helpers/pi-deskd" >/dev/null
     codesign --force --sign - "$APP/Contents/Helpers/pidesk" >/dev/null
     codesign --force --deep --sign - "$APP" >/dev/null
@@ -109,4 +105,4 @@ ditto "$APP" "$INSTALLED_APP"
 echo "Created: $APP"
 echo "Installed: $INSTALLED_APP"
 echo "Run with: open '$INSTALLED_APP'"
-echo "Bundled helpers: Contents/Helpers/pi-deskd, Contents/Helpers/pidesk"
+echo "Bundled CLI/optional host: Contents/Helpers/pidesk, Contents/Helpers/pi-deskd"

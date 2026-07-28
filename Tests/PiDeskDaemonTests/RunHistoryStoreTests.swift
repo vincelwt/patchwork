@@ -92,6 +92,31 @@ final class RunHistoryStoreTests: XCTestCase {
         XCTAssertEqual(count, 2)
     }
 
+    func testRestartInterruptsOnlyProcessLocalRuns() async {
+        let store = RunHistoryStore(fileURL: directory.appendingPathComponent("runs.jsonl"), logger: TestSupport.logger(in: directory))
+        let began = Date(timeIntervalSince1970: 10)
+        await store.record(Run(
+            id: "api", threadId: "t1", trigger: .api, startedAt: began,
+            status: .running, promptStartedAt: began
+        ))
+        await store.record(Run(id: "manual", threadId: "t2", trigger: .manual, startedAt: began, status: .queued))
+        await store.record(Run(
+            id: "scheduled", scheduleId: "s1", threadId: "t3", trigger: .schedule,
+            startedAt: began, status: .running
+        ))
+
+        await store.reconcileAfterHostRestart(now: Date(timeIntervalSince1970: 20))
+
+        let api = await store.get(id: "api")
+        let manual = await store.get(id: "manual")
+        let scheduled = await store.get(id: "scheduled")
+        XCTAssertEqual(api?.status, .interrupted)
+        XCTAssertEqual(api?.error, "Pi Desktop closed after prompt delivery began; the run was not resent.")
+        XCTAssertEqual(manual?.status, .interrupted)
+        XCTAssertEqual(manual?.error, "Pi Desktop closed before this run started.")
+        XCTAssertEqual(scheduled?.status, .running, "Scheduler owns durable occurrence recovery")
+    }
+
     func testInMemoryViewIsBoundedByMaxInMemory() async {
         let store = RunHistoryStore(fileURL: directory.appendingPathComponent("runs.jsonl"), logger: TestSupport.logger(in: directory), maxInMemory: 3)
         for index in 0..<10 {

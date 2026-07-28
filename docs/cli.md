@@ -183,17 +183,16 @@ pidesk daemon logs [-f] [--lines N] [--json]
 
 `pidesk daemon status` reports reachability itself — when the daemon is down this is expected
 output, not a crash, but it still exits `3` (consistent with every other command) so scripts can
-branch on it. It also reports **mode**: `app-managed` (Pi Desktop.app's own bundled daemon, the
-default — see daemon-api.md's "Lifecycle"), `LaunchAgent` (installed with `install` below or
+branch on it. It also reports **mode**: `app-managed` (hosted inside Pi Desktop.app by default —
+see daemon-api.md's "Lifecycle"), `LaunchAgent` (installed with `install` below or
 `scripts/install-daemon.sh`), reachable-but-neither ("external" — started by hand, or by
 `daemon start`'s own fallback), or not running at all. `install` registers `pi-deskd` as a
 LaunchAgent (`dev.pi.desktop.daemon`, starts at login, restarts on crash but not on a clean
 exit); `start`/`stop`/`restart` drive that LaunchAgent via `launchctl`. If it was never installed,
 `start` falls back to a direct, non-persistent spawn (logged to the same log file) so a one-off
 local session still works; `stop`/`restart` in that case tell you so rather than pretending to
-manage a process they never tracked — including a process Pi Desktop.app itself is managing,
-which `pidesk daemon stop` never touches (quit the app, or turn off its background-service
-setting, to stop that one).
+manage a process they never tracked — including Pi Desktop.app itself, which
+`pidesk daemon stop` never terminates (quit the app to stop its in-process service).
 
 `logs` shows the last 100 lines by default (bounded read from the tail of the file, never the
 whole file); `-f` follows new output.
@@ -210,10 +209,10 @@ pidesk remote token [--json]
 **Design note:** the control-plane contract defines `daemon.json`'s fields (port, concurrency,
 remote-enabled) but no HTTP endpoint to change them — everything else in the contract is an
 API call, but toggling the loopback listener is daemon-process configuration. `enable`/`disable`
-therefore write `daemon.json` directly (same `0600`/`0700` permissions the daemon uses) and print
-a reminder to `pidesk daemon restart`, since the daemon only reads this file at startup. If a
-future contract revision adds a settings endpoint, this is the one command group that should move
-over to it.
+therefore write `daemon.json` directly (same `0600`/`0700` permissions the service uses) and
+print a restart reminder, since settings are read at host startup. Restart the LaunchAgent with
+`pidesk daemon restart`; for app-hosted mode, quit and reopen Pi Desktop. If a future contract
+revision adds a settings endpoint, this is the one command group that should move over to it.
 
 `token` reads (or, on first use, generates: 32 random bytes, base64url, `0600`) the bearer token
 at `~/Library/Application Support/Pi Desktop/daemon-token` — the same file `remote enable` seeds.

@@ -69,25 +69,3 @@ final class DaemonOwnershipTests: XCTestCase {
         XCTAssertNil(DaemonOwnership.read(from: dir.appendingPathComponent("nope.json")))
     }
 }
-
-final class RestartPolicyTests: XCTestCase {
-    func testDelayGrowsExponentiallyThenCaps() {
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 1), 2)
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 2), 4)
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 3), 8)
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 4), 16)
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 5), 32)
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 6), 60, "would be 64 uncapped")
-    }
-
-    func testZeroFailuresHasNoDelay() {
-        XCTAssertEqual(RestartPolicy.delay(forFailureCount: 0), 0)
-    }
-
-    func testExhaustionIsBounded() {
-        for n in 1...RestartPolicy.maxAttempts {
-            XCTAssertFalse(RestartPolicy.hasExhausted(failureCount: n), "attempt \(n) must still retry")
-        }
-        XCTAssertTrue(RestartPolicy.hasExhausted(failureCount: RestartPolicy.maxAttempts + 1))
-    }
-}

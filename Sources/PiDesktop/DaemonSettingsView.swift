@@ -1,17 +1,11 @@
 import SwiftUI
 
-/// The one Settings pane so far: whether Pi Desktop.app manages `pi-deskd` itself, and its
-/// current state. Deliberately plain — this is the only place `DaemonSupervisor`'s state needs a
-/// window, so it doesn't need the sidebar/tab chrome a bigger settings surface would.
 struct DaemonSettingsView: View {
     @EnvironmentObject private var supervisor: DaemonSupervisor
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space16) {
-            Text("Background Service").font(PiFont.title)
-
-            Toggle("Automatically run the background service with this app", isOn: $supervisor.autoManageEnabled)
-                .toggleStyle(.switch)
+            Text("Control Service").font(PiFont.title)
 
             HStack(spacing: PiTheme.space8) {
                 StatusDot(color: statusColor)
@@ -22,15 +16,14 @@ struct DaemonSettingsView: View {
                 Text(detail).font(PiFont.caption).foregroundStyle(.tertiary)
             }
 
-            if showsRetry {
+            if case .unavailable = supervisor.state {
                 Button("Try Again") { Task { await supervisor.retry() } }
             }
 
             Divider()
 
-            Text("Automations (Cron/scheduled prompts) need this service running. Turning it off "
-                + "stops it if this app started it; a background service you installed with "
-                + "`pidesk daemon install` is never touched here.")
+            Text("Pi Desktop hosts threads, automations, CLI access, and remote access inside the app process. "
+                + "They stop when the app quits. An explicitly installed `pi-deskd` login item remains independent.")
                 .font(PiFont.caption)
                 .foregroundStyle(.tertiary)
         }
@@ -41,22 +34,19 @@ struct DaemonSettingsView: View {
     private var statusColor: Color {
         switch supervisor.state {
         case .running, .deferringToLaunchAgent, .deferringToExternalProcess: .piGreen
-        case .starting, .restarting: .yellow
-        case .crashLooped, .unavailable: .red
-        case .idle, .disabledByUser, .stopped: .secondary
+        case .starting: .yellow
+        case .unavailable: .red
+        case .idle, .stopped: .secondary
         }
     }
 
     private var statusLine: String {
         switch supervisor.state {
         case .idle: "Checking…"
-        case .disabledByUser: "Off"
-        case .deferringToLaunchAgent: "Running (installed as a login item)"
-        case .deferringToExternalProcess: "Running (started outside this app)"
-        case .starting: "Starting…"
-        case .running: "Running"
-        case let .restarting(attempt): "Restarting… (attempt \(attempt))"
-        case .crashLooped: "Not responding"
+        case .deferringToLaunchAgent: "Running as a login item"
+        case .deferringToExternalProcess: "Running outside this app"
+        case .starting: "Starting inside Pi Desktop…"
+        case .running: "Running inside Pi Desktop"
         case .unavailable: "Unavailable"
         case .stopped: "Off"
         }
@@ -64,16 +54,10 @@ struct DaemonSettingsView: View {
 
     private var statusDetail: String? {
         switch supervisor.state {
-        case let .crashLooped(detail), let .unavailable(detail): detail
-        case .deferringToLaunchAgent: "Managed by launchd, not this app; `pidesk daemon uninstall` removes it."
+        case let .unavailable(detail): detail
+        case .deferringToLaunchAgent: "Managed by launchd; `pidesk daemon uninstall` returns hosting to Pi Desktop."
+        case .deferringToExternalProcess: "Quit the standalone service before restarting Pi Desktop to return to app-hosted mode."
         default: nil
-        }
-    }
-
-    private var showsRetry: Bool {
-        switch supervisor.state {
-        case .crashLooped, .unavailable: true
-        default: false
         }
     }
 }
