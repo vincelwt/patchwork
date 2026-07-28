@@ -227,6 +227,39 @@ final class NotificationTriggerWiringTests: XCTestCase {
         XCTAssertTrue(spy.presented.isEmpty, "The interrupted attempt is not terminal while Desktop will continue it")
     }
 
+    func testRunningProviderErrorWaitsForSettlementBeforeNotifying() async throws {
+        let (store, _, spy, session) = makeStore(isActive: false)
+        let path = session.fileURL.standardizedFileURL.path
+        let heartbeatDirectory = directory.appendingPathComponent("heartbeats")
+        try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        try Data("{\"type\":\"message\",\"id\":\"baseline\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: session.fileURL)
+        store.activityMonitor.setTrackedPaths([path])
+        try await waitUntil { store.activityMonitor.activity(forPath: path)?.latestCompletedEntryID == "baseline" }
+
+        let handle = try FileHandle(forWritingTo: session.fileURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"retry-error\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\"}}\n".utf8))
+        try handle.close()
+        let heartbeat = heartbeatDirectory.appendingPathComponent("s.json")
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","stopReason":"error","completionId":"retry-error"}
+        """.utf8).write(to: heartbeat)
+        store.activityMonitor.tickNow()
+        try await waitUntil {
+            store.activityMonitor.activity(forPath: path)?.latestCompletedEntryID == "retry-error"
+                && store.activityMonitor.activity(forPath: path)?.state == .running
+        }
+        XCTAssertTrue(spy.presented.isEmpty, "An error Pi is already retrying stays silent")
+
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","stopReason":"error","completionId":"retry-error"}
+        """.utf8).write(to: heartbeat)
+        store.activityMonitor.tickNow()
+        try await waitUntil { spy.presented.count == 1 }
+        XCTAssertEqual(spy.presented.first?.body, NotificationTrigger.turnFailed.summary)
+    }
+
     func testBackgroundCompletionsNotifyOncePerDistinctIDWithoutAStateTransition() async throws {
         let (store, _, spy, session) = makeStore(isActive: false)
         let path = session.fileURL.standardizedFileURL.path
