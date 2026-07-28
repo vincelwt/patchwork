@@ -1082,7 +1082,11 @@ final class AppStore: ObservableObject {
         }
 
         let targetKey = RuntimeRouteKey.session(path)
-        if runtimeKey(for: activeRuntimeSlot) != targetKey { detachActiveRuntimePresentation() }
+        if runtimeKey(for: activeRuntimeSlot) != targetKey {
+            detachActiveRuntimePresentation()
+        } else if !activePresentationDetached, pendingQuestionnaire?.submitted == false {
+            saveActiveRuntimePresentation()
+        }
         conversationLoadGeneration += 1
         let generation = conversationLoadGeneration
         route = .session(path)
@@ -1099,6 +1103,12 @@ final class AppStore: ObservableObject {
         let cwdPath = session.cwd.standardizedFileURL.path
         selectedGit = folderGit[cwdPath] ?? .none
         selectedWorktree = folderWorktrees[cwdPath]
+
+        // A parked questionnaire is already backed by a live runtime. Reattach it immediately;
+        // waiting for the user to edit the composer leaves the inline question impossible to answer.
+        if let slot = currentRouteRuntimeSlot, slot.questionnaire?.submitted == false {
+            activateRuntime(slot)
+        }
 
         // A page-cache hit publishes synchronously in the selection tick. Activity projection is
         // inspector data and stays off the main actor so it cannot delay the transcript frame.
