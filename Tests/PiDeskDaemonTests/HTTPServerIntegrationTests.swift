@@ -82,6 +82,8 @@ final class HTTPServerIntegrationTests: XCTestCase {
         let detail = try await client.getThread(id: "sess-fast")
         XCTAssertEqual(detail.thread.name, "Before", "detail lookup reuses the list snapshot")
         XCTAssertEqual(detail.messages.map(\.text), ["older", "newer"], "messages still read the current tail")
+        let markedRead = try await client.markThreadRead(id: "sess-fast", unread: false)
+        XCTAssertEqual(markedRead.thread.name, "Before", "marking the open thread read also stays on the point-lookup path")
         let refreshedList = try await client.listThreads()
         XCTAssertEqual(refreshedList.threads.first?.name, "After", "the next list refreshes metadata")
     }
