@@ -362,7 +362,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.stopCount, 1)
     }
 
-    func testIdleLeaseIs120SecondsResettableAndNeverRetiresWaitingOrDialogRuntime() {
+    func testRepeatedComposerEditsDoNotChurnIdleLeaseOrRetireBusyAndDialogRuntimes() {
         let runtime = IntentRuntime()
         let lease = ManualRuntimeLease()
         let store = makeStore(runtime: runtime, lease: lease)
@@ -370,14 +370,18 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.sessions = [session]
         store.selectSession(session)
         store.composerContentDidChange()
-        XCTAssertEqual(lease.entries.first?.delay, 120)
+        XCTAssertEqual(lease.entries.last?.delay, 120)
+        let activeLease = lease.entries.count - 1
+        XCTAssertFalse(lease.entries[activeLease].cancelled)
         store.composerContentDidChange()
-        XCTAssertTrue(lease.entries[0].cancelled)
-        lease.fire(0)
-        XCTAssertEqual(runtime.stopCount, 0)
+        XCTAssertEqual(lease.entries.count - 1, activeLease)
+        XCTAssertFalse(lease.entries[activeLease].cancelled)
 
         store.draft = "waiting"
         store.submitDraft()
+        XCTAssertTrue(lease.entries[activeLease].cancelled)
+        lease.fire(activeLease)
+        XCTAssertEqual(runtime.stopCount, 0)
         runtime.onEvent?(.object(["type": .string("agent_start")]))
         lease.fire(lease.entries.count - 1)
         XCTAssertEqual(runtime.stopCount, 0)

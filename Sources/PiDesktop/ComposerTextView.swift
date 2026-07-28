@@ -11,6 +11,21 @@ struct ComposerContent: Equatable {
     static let empty = ComposerContent(text: "", attachments: [])
 
     var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.text == rhs.text
+            && lhs.attachments.count == rhs.attachments.count
+            && zip(lhs.attachments, rhs.attachments).allSatisfy { $0.id == $1.id }
+    }
+}
+
+/// Keeps high-frequency editor state out of `AppStore.objectWillChange`: only the composer needs
+/// to redraw while AppKit handles a key-repeat burst.
+@MainActor
+final class ComposerModel: ObservableObject {
+    @Published var content: ComposerContent
+
+    init(content: ComposerContent = .empty) { self.content = content }
 }
 
 /// Imperative hooks the SwiftUI composer uses to reach into the AppKit text view (insert an
@@ -183,27 +198,23 @@ final class ComposerTextView: NSTextView {
 
     // MARK: Content projection
 
-    /// Walks the attributed string once, producing the plain text (placeholders removed) and the
-    /// attachments in inline order.
+    /// Projects the plain string and, when present, walks attachments once to preserve inline
+    /// order. Ordinary typing avoids rebuilding attributed substrings on every key event.
     func currentContent() -> ComposerContent {
         guard let storage = textStorage else { return .empty }
-        var text = String()
+        // Any stray placeholder from an unknown attachment source is dropped, never sent.
+        let text = storage.string.replacingOccurrences(of: "\u{FFFC}", with: "")
+        guard !known.isEmpty else { return ComposerContent(text: text, attachments: []) }
+
         var ordered: [ImageAttachment] = []
         var seen: Set<UUID> = []
-
-        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
-            if let attachment = value as? ComposerImageAttachment {
-                if let model = known[attachment.attachmentID], seen.insert(attachment.attachmentID).inserted {
-                    ordered.append(model)
-                }
-                return
-            }
-            if value != nil { return }
-            text.append(storage.attributedSubstring(from: range).string)
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+            guard let attachment = value as? ComposerImageAttachment,
+                  let model = known[attachment.attachmentID],
+                  seen.insert(attachment.attachmentID).inserted else { return }
+            ordered.append(model)
         }
-
-        // Any stray placeholder from an unknown attachment source is dropped, never sent.
-        return ComposerContent(text: text.replacingOccurrences(of: "\u{FFFC}", with: ""), attachments: ordered)
+        return ComposerContent(text: text, attachments: ordered)
     }
 
     /// Rebuilds the view from a model value (draft restore, `set_editor_text`, send clearing).

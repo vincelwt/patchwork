@@ -23,8 +23,7 @@ enum ComposerSubmitRoute: Equatable {
 
 struct ComposerView: View {
     @EnvironmentObject private var store: AppStore
-    @Binding var text: String
-    @Binding var attachments: [ImageAttachment]
+    @ObservedObject var model: ComposerModel
     var isStreaming: Bool
     var placeholder = "Ask Pi anything…"
     var autofocus = false
@@ -38,17 +37,31 @@ struct ComposerView: View {
 
     @State private var bridge = ComposerBridge()
     @State private var editorHeight: CGFloat = PiTheme.composerMinEditorHeight
+    /// Starting Pi is a first-edit side effect, not work every repeated key should perform.
+    @State private var preparedRuntimeRouteID: String?
 
     private var content: Binding<ComposerContent> {
         Binding(
-            get: { ComposerContent(text: text, attachments: attachments) },
+            get: { model.content },
             set: { value in
-                guard text != value.text || attachments != value.attachments else { return }
-                text = value.text
-                attachments = value.attachments
-                store.composerContentDidChange()
+                guard model.content != value else { return }
+                model.content = value
+                let routeID = runtimeRouteID
+                if preparedRuntimeRouteID != routeID {
+                    preparedRuntimeRouteID = routeID
+                    store.composerContentDidChange()
+                }
             }
         )
+    }
+
+    private var text: String { model.content.text }
+    private var attachments: [ImageAttachment] { model.content.attachments }
+    private var runtimeRouteID: String {
+        switch store.route {
+        case let .session(path): return "session:\(path)"
+        case .newChat: return "new-chat:\(store.selectedFolder?.path ?? "")"
+        }
     }
 
     var body: some View {
@@ -138,8 +151,7 @@ struct ComposerView: View {
             direct()
         case let .queue(delivery):
             store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments)
-            text = ""
-            attachments = []
+            model.content = .empty
         }
     }
 }

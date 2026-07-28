@@ -30,8 +30,7 @@ struct NewChatView: View {
                 folderContext
                 ExtensionWidgetStrip(placement: .aboveEditor)
                 ComposerView(
-                    text: $store.draft,
-                    attachments: $store.attachments,
+                    model: store.composer,
                     isStreaming: false,
                     placeholder: "Describe a task for Pi…",
                     autofocus: true,
