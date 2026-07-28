@@ -16,20 +16,35 @@ struct ConversationScrollMetrics: Equatable {
     var isUnderfilled: Bool {
         documentHeight > 1 && viewportHeight > 1 && documentHeight <= viewportHeight + 1
     }
-    var shouldRequestEarlierHistory: Bool { isNearTop && (direction == .up || isUnderfilled) }
+    var shouldRequestEarlierHistory: Bool {
+        (direction == .up && originY <= PiTheme.transcriptHistoryPrefetchDistance)
+            || (isNearTop && isUnderfilled)
+    }
 }
 
+/// The SwiftUI side's handle into the AppKit coordinator that owns scroll corrections.
 @MainActor
 final class ConversationScrollBridge {
-    fileprivate var capturePrependImpl: (() -> Void)?
-    fileprivate var restorePrependImpl: (() -> Void)?
+    fileprivate weak var coordinator: ConversationScrollObserver.Coordinator?
 
-    func captureBeforePrepend() { capturePrependImpl?() }
-    func restoreAfterPrepend() { restorePrependImpl?() }
+    /// Arm before a history page is requested: subsequent document growth is treated as content
+    /// inserted above the viewport and compensated in the same layout pass.
+    func armPrepend() { coordinator?.armPrepend() }
+    func disarmPrepend() { coordinator?.disarmPrepend() }
+    /// Pin to the newest content and keep following it as the document grows.
+    func pinToBottom() { coordinator?.pinToBottom() }
 }
 
-/// Observes the real AppKit clip view beneath SwiftUI's `ScrollView`. Lazy-row realization is
-/// not a reliable proxy for whether the viewport is pinned, but the clip/document geometry is.
+/// Observes and *corrects* the real AppKit scroll view beneath SwiftUI's `ScrollView`.
+///
+/// Two behaviors live here, both applied synchronously inside the document's own layout pass
+/// (notifications are delivered on the posting thread, not queued), so the user never sees an
+/// intermediate frame at the wrong offset:
+/// - While pinned to the bottom, any document height change re-pins the viewport to the bottom.
+///   This is what keeps streaming turns, image decodes, and lazily settling rows glued to the
+///   newest content without a trailing `scrollTo` task racing the layout.
+/// - While a history prepend is armed, document growth shifts the origin by the added height, so
+///   the rows the user was reading stay exactly where they were.
 struct ConversationScrollObserver: NSViewRepresentable {
     let bridge: ConversationScrollBridge
     let onChange: (ConversationScrollMetrics) -> Void
@@ -39,13 +54,13 @@ struct ConversationScrollObserver: NSViewRepresentable {
     func makeNSView(context: Context) -> AttachmentView {
         let view = AttachmentView()
         view.coordinator = context.coordinator
-        context.coordinator.installBridge(bridge)
+        bridge.coordinator = context.coordinator
         return view
     }
 
     func updateNSView(_ view: AttachmentView, context: Context) {
         context.coordinator.parent = self
-        context.coordinator.installBridge(bridge)
+        bridge.coordinator = context.coordinator
         context.coordinator.attach(from: view)
     }
 
@@ -80,61 +95,135 @@ struct ConversationScrollObserver: NSViewRepresentable {
     final class Coordinator: NSObject {
         var parent: ConversationScrollObserver
         private weak var scrollView: NSScrollView?
+        private weak var documentView: NSView?
         private var boundsObserver: NSObjectProtocol?
+        private var frameObserver: NSObjectProtocol?
+        private var lastDocumentHeight: CGFloat = 0
         private var previousOriginY: CGFloat?
-        private var prependSnapshot: (origin: NSPoint, documentHeight: CGFloat)?
+        /// A conversation opens pinned; only a real user scroll can unpin it.
+        private(set) var pinned = true
+        private var prependArmed = false
+        private var isAdjusting = false
         private var pendingMetrics: ConversationScrollMetrics?
         private var metricsCallbackScheduled = false
-        private var isRestoring = false
 
         init(parent: ConversationScrollObserver) { self.parent = parent }
 
-        func installBridge(_ bridge: ConversationScrollBridge) {
-            bridge.capturePrependImpl = { [weak self] in self?.captureBeforePrepend() }
-            bridge.restorePrependImpl = { [weak self] in self?.scheduleRestoreAfterPrepend() }
+        func armPrepend() { prependArmed = true }
+        func disarmPrepend() { prependArmed = false }
+
+        func pinToBottom() {
+            prependArmed = false
+            pinned = true
+            scrollToBottom()
+            publish(direction: .stationary)
         }
 
         func attach(from view: NSView) {
             guard let candidate = view.enclosingScrollView else { return }
-            if candidate === scrollView {
-                publish()
+            if candidate === scrollView, candidate.documentView === documentView {
+                publish(direction: .stationary)
                 return
             }
             detach()
             scrollView = candidate
+            documentView = candidate.documentView
             candidate.contentView.postsBoundsChangedNotifications = true
+            // `queue: nil` on purpose: both notifications post on the main thread during layout,
+            // and handling them in that same pass is what makes corrections invisible.
             boundsObserver = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
                 object: candidate.contentView,
-                queue: .main
+                queue: nil
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.publish() }
+                MainActor.assumeIsolated { self?.handleBoundsChange() }
             }
-            publish()
+            if let document = candidate.documentView {
+                document.postsFrameChangedNotifications = true
+                frameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification,
+                    object: document,
+                    queue: nil
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.handleDocumentFrameChange() }
+                }
+                lastDocumentHeight = document.bounds.height
+            }
+            if pinned { scrollToBottom() }
+            publish(direction: .stationary)
         }
 
         func detach() {
             if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
+            if let frameObserver { NotificationCenter.default.removeObserver(frameObserver) }
             boundsObserver = nil
+            frameObserver = nil
             scrollView = nil
+            documentView = nil
             previousOriginY = nil
-            prependSnapshot = nil
             pendingMetrics = nil
         }
 
-        private func publish() {
+        /// Document height changed: content grew or shrank. Correct the origin before this pass
+        /// draws, then report. User pin state never changes here — growth is not a scroll.
+        private func handleDocumentFrameChange() {
             guard let scrollView, let document = scrollView.documentView else { return }
+            let newHeight = document.bounds.height
+            let oldHeight = lastDocumentHeight
+            lastDocumentHeight = newHeight
+            guard abs(newHeight - oldHeight) > 0.5 else { return }
+            if pinned {
+                scrollToBottom()
+            } else if prependArmed, let target = ConversationScrollObserver.restoredOriginY(
+                originalY: scrollView.contentView.bounds.origin.y,
+                oldDocumentHeight: oldHeight,
+                newDocumentHeight: newHeight,
+                viewportHeight: scrollView.contentView.bounds.height
+            ) {
+                setOrigin(target)
+            }
+            publish(direction: .stationary)
+        }
+
+        /// Clip bounds changed at constant document height: the user scrolled. This is the only
+        /// place pin state changes.
+        private func handleBoundsChange() {
+            guard !isAdjusting, let scrollView, let document = scrollView.documentView else { return }
+            guard abs(document.bounds.height - lastDocumentHeight) <= 0.5 else { return }
             let visible = scrollView.contentView.bounds
             let originY = visible.origin.y
             let direction: ConversationScrollMetrics.Direction
-            if isRestoring || previousOriginY == nil || abs(originY - previousOriginY!) < 0.5 {
+            if previousOriginY == nil || abs(originY - previousOriginY!) < 0.5 {
                 direction = .stationary
             } else {
                 direction = originY < previousOriginY! ? .up : .down
             }
             previousOriginY = originY
+            pinned = document.bounds.height - (originY + visible.height) <= PiTheme.transcriptScrollEdgeThreshold
+            publish(direction: direction)
+        }
+
+        private func scrollToBottom() {
+            guard let scrollView, let document = scrollView.documentView else { return }
+            setOrigin(max(0, document.bounds.height - scrollView.contentView.bounds.height))
+        }
+
+        private func setOrigin(_ y: CGFloat) {
+            guard let scrollView else { return }
+            isAdjusting = true
+            scrollView.contentView.scroll(to: NSPoint(x: scrollView.contentView.bounds.origin.x, y: y))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            isAdjusting = false
+            previousOriginY = y
+        }
+
+        /// Metrics reach SwiftUI coalesced and asynchronously — state must not mutate inside the
+        /// layout pass the notifications arrive in. Corrections above stay synchronous.
+        private func publish(direction: ConversationScrollMetrics.Direction) {
+            guard let scrollView, let document = scrollView.documentView else { return }
+            let visible = scrollView.contentView.bounds
             pendingMetrics = ConversationScrollMetrics(
-                originY: originY,
+                originY: visible.origin.y,
                 viewportHeight: visible.height,
                 documentHeight: document.bounds.height,
                 direction: direction
@@ -148,44 +237,6 @@ struct ConversationScrollObserver: NSViewRepresentable {
                 pendingMetrics = nil
                 parent.onChange(metrics)
             }
-        }
-
-        private func captureBeforePrepend() {
-            guard let scrollView, let document = scrollView.documentView else { return }
-            prependSnapshot = (scrollView.contentView.bounds.origin, document.bounds.height)
-        }
-
-        private func scheduleRestoreAfterPrepend() {
-            DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(attempt: 0) }
-        }
-
-        private func restoreAfterPrepend(attempt: Int) {
-            guard let scrollView, let document = scrollView.documentView, let snapshot = prependSnapshot else { return }
-            document.layoutSubtreeIfNeeded()
-            scrollView.layoutSubtreeIfNeeded()
-            let documentHeight = document.bounds.height
-            guard let targetY = ConversationScrollObserver.restoredOriginY(
-                originalY: snapshot.origin.y,
-                oldDocumentHeight: snapshot.documentHeight,
-                newDocumentHeight: documentHeight,
-                viewportHeight: scrollView.contentView.bounds.height
-            ) else {
-                if attempt < 3 {
-                    DispatchQueue.main.async { [weak self] in self?.restoreAfterPrepend(attempt: attempt + 1) }
-                } else {
-                    prependSnapshot = nil
-                }
-                return
-            }
-
-            let target = NSPoint(x: snapshot.origin.x, y: targetY)
-            isRestoring = true
-            scrollView.contentView.scroll(to: target)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            previousOriginY = target.y
-            isRestoring = false
-            prependSnapshot = nil
-            publish()
         }
     }
 }

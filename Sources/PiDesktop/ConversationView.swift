@@ -249,7 +249,6 @@ struct ConversationView: View {
                 streaming: store.streamingMessage,
                 isRunning: conversationIsRunning,
                 transcriptRevision: store.transcriptRevision,
-                unseenMessageID: store.initialScrollTargetMessageID,
                 onEditLastMessage: {
                     store.beginEditingLastMessage()
                     composerFocusTick += 1
@@ -267,19 +266,14 @@ struct MessageScrollView: View {
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
     let transcriptRevision: Int
-    let unseenMessageID: String?
     /// Wired only to the conversation's single most recent user message; every earlier turn's
     /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
     var onEditLastMessage: (() -> Void)?
-    @State private var scrollTask: Task<Void, Never>?
     @State private var isPinnedToBottom = true
     @State private var scrollBridge = ConversationScrollBridge()
-    @State private var prependPending = false
-    @State private var didRestoreInitialAnchor = false
     @State private var underfillPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
     @State private var projectionCache = TranscriptProjectionCache()
-    private let bottomID = "conversation-bottom"
 
     private var transcriptItems: [TranscriptItem] {
         projectionCache.items(
@@ -297,137 +291,114 @@ struct MessageScrollView: View {
         store.activeQuestionnaireSession.map { "\($0.toolCallID):\($0.currentIndex)" }
     }
 
-    /// An image can arrive inside an existing work block without changing the transcript count.
-    private func prominentImageIDs(in items: [TranscriptItem]) -> [String] {
-        items.flatMap { item -> [String] in
-            guard case let .work(block) = item else { return [] }
-            return block.prominentSteps.flatMap { $0.result?.images.map(\.id) ?? [] }
-        }
-    }
-
     var body: some View {
         let items = transcriptItems
-        let imageIDs = prominentImageIDs(in: items)
-        ScrollViewReader { reader in
-            ScrollView {
-                // A single small gap between entries keeps consecutive tool rows on an even
-                // rhythm; paragraphs get their breathing room from the block renderer.
-                LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                    if store.isLoadingEarlierMessages {
-                        ProgressView().controlSize(.small)
-                            .frame(maxWidth: .infinity)
-                            .accessibilityLabel("Loading earlier messages")
-                    } else if store.hasEarlierMessages {
-                        Button("Load earlier messages") { requestEarlierMessages() }
-                            .buttonStyle(.plain)
-                            .font(PiFont.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                    } else if store.conversationHistoryLimitReached {
-                        Text("Earlier history is outside this bounded window.")
-                            .font(PiFont.caption)
-                            .foregroundStyle(.tertiary)
-                            .frame(maxWidth: .infinity)
-                    }
+        ScrollView {
+            // A single small gap between entries keeps consecutive tool rows on an even
+            // rhythm; paragraphs get their breathing room from the block renderer.
+            LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
+                if store.isLoadingEarlierMessages {
+                    ProgressView().controlSize(.small)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityLabel("Loading earlier messages")
+                } else if store.hasEarlierMessages {
+                    Button("Load earlier messages") { requestEarlierMessages() }
+                        .buttonStyle(.plain)
+                        .font(PiFont.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                } else if store.conversationHistoryLimitReached {
+                    Text("Earlier history is outside this bounded window.")
+                        .font(PiFont.caption)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                }
 
-                    ForEach(items) { item in
-                        Group {
-                            switch item {
-                            case let .message(message, isStreaming):
-                                MessageView(
-                                    message: message,
-                                    isStreaming: isStreaming,
-                                    onImage: store.showImage,
-                                    showsActions: true,
-                                    onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
-                                )
-                                .equatable()
-                                .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
-                            case let .work(block):
-                                TranscriptWorkView(
-                                    block: block,
-                                    onImage: store.showImage,
-                                    questionnaireKey: questionnaireKey
-                                )
-                                .equatable()
-                                .padding(.top, PiTheme.space6)
-                            }
-                        }
-                        .id(item.id)
-                        .onAppear {
-                            guard !didMarkFirstTextPaint else { return }
-                            didMarkFirstTextPaint = true
-                            ConversationPerformance.mark(
-                                "Conversation first text paint",
-                                path: store.selectedSession?.fileURL.path ?? "new-chat",
-                                count: items.count
+                ForEach(items) { item in
+                    Group {
+                        switch item {
+                        case let .message(message, isStreaming):
+                            MessageView(
+                                message: message,
+                                isStreaming: isStreaming,
+                                onImage: store.showImage,
+                                showsActions: true,
+                                onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
                             )
+                            .equatable()
+                            .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
+                        case let .work(block):
+                            TranscriptWorkView(
+                                block: block,
+                                onImage: store.showImage,
+                                questionnaireKey: questionnaireKey
+                            )
+                            .equatable()
+                            .padding(.top, PiTheme.space6)
                         }
                     }
-                    Color.clear.frame(height: 1).id(bottomID)
-                }
-                .padding(.top, PiTheme.space24)
-                .padding(.bottom, PiTheme.space8)
-                .frame(maxWidth: PiTheme.transcriptMaxWidth, alignment: .leading)
-                .padding(.horizontal, PiTheme.space20)
-                .frame(maxWidth: .infinity)
-                .background(
-                    ConversationScrollObserver(bridge: scrollBridge) { metrics in
-                        handleScrollMetrics(metrics)
+                    .id(item.id)
+                    .onAppear {
+                        guard !didMarkFirstTextPaint else { return }
+                        didMarkFirstTextPaint = true
+                        ConversationPerformance.mark(
+                            "Conversation first text paint",
+                            path: store.selectedSession?.fileURL.path ?? "new-chat",
+                            count: items.count
+                        )
                     }
-                )
-            }
-            // Every route opens at its newest durable/live result; paging preserves position only
-            // within that visit.
-            .defaultScrollAnchor(.bottom)
-            .scrollDismissesKeyboard(.interactively)
-            .onAppear { restoreInitialBottomIfPossible(reader: reader) }
-            .onChange(of: messages.first?.id) { _, _ in
-                restoreInitialBottomIfPossible(reader: reader)
-                if didRestoreInitialAnchor, isPinnedToBottom, !prependPending { scheduleBottomScroll(reader) }
-            }
-            .onChange(of: store.isConversationLoading) { wasLoading, isLoading in
-                if wasLoading, !isLoading { restoreInitialBottomIfPossible(reader: reader) }
-            }
-            .onChange(of: messages.last?.id) { _, _ in scheduleBottomScroll(reader) }
-            .onChange(of: streaming?.textContent.count ?? 0) { _, _ in scheduleBottomScroll(reader) }
-            .onChange(of: imageIDs) { _, _ in scheduleBottomScroll(reader) }
-            // Only when already pinned: a question appearing must never yank a user reading history.
-            .onChange(of: questionnaireKey) { _, _ in scheduleBottomScroll(reader) }
-            .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
-                guard wasLoading, !isLoading else { return }
-                if prependPending {
-                    scrollBridge.restoreAfterPrepend()
-                    prependPending = false
                 }
             }
-            .onDisappear { scrollTask?.cancel() }
-            .overlay(alignment: .bottom) {
-                if !isPinnedToBottom {
-                    Button {
-                        scrollTask?.cancel()
-                        isPinnedToBottom = true
-                        withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
-                    } label: {
-                        Label("Jump to latest", systemImage: "arrow.down")
-                            .font(PiFont.caption)
-                            .padding(.horizontal, PiTheme.space10)
-                            .padding(.vertical, PiTheme.space6)
-                    }
-                    .buttonStyle(.plain)
-                    .background(Color.piTranscript, in: Capsule())
-                    .overlay { Capsule().stroke(Color.piHairline, lineWidth: PiTheme.hairline) }
-                    .padding(.bottom, PiTheme.space10)
-                    .transition(.opacity)
-                    .help("Scroll to the newest message")
+            .padding(.top, PiTheme.space24)
+            .padding(.bottom, PiTheme.space8)
+            .frame(maxWidth: PiTheme.transcriptMaxWidth, alignment: .leading)
+            .padding(.horizontal, PiTheme.space20)
+            .frame(maxWidth: .infinity)
+            .background(
+                ConversationScrollObserver(bridge: scrollBridge) { metrics in
+                    handleScrollMetrics(metrics)
                 }
+            )
+        }
+        // The native anchor positions the first frame at the bottom; from then on the AppKit
+        // coordinator keeps the viewport pinned through streaming growth, image decodes, and
+        // lazily settling rows — synchronously, inside each layout pass.
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
+        .onAppear { store.consumeInitialScrollTarget() }
+        .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
+            guard wasLoading, !isLoading else { return }
+            // The prepended rows land over the next few layout passes; keep the origin
+            // compensation armed briefly so each pass is corrected, then release it.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if !store.isLoadingEarlierMessages { scrollBridge.disarmPrepend() }
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if !isPinnedToBottom {
+                Button {
+                    isPinnedToBottom = true
+                    scrollBridge.pinToBottom()
+                } label: {
+                    Label("Jump to latest", systemImage: "arrow.down")
+                        .font(PiFont.caption)
+                        .padding(.horizontal, PiTheme.space10)
+                        .padding(.vertical, PiTheme.space6)
+                }
+                .buttonStyle(.plain)
+                .background(Color.piTranscript, in: Capsule())
+                .overlay { Capsule().stroke(Color.piHairline, lineWidth: PiTheme.hairline) }
+                .padding(.bottom, PiTheme.space10)
+                .transition(.opacity)
+                .help("Scroll to the newest message")
             }
         }
     }
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
         if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
-        guard didRestoreInitialAnchor, metrics.shouldRequestEarlierHistory else { return }
+        guard metrics.shouldRequestEarlierHistory else { return }
         if metrics.isUnderfilled {
             guard underfillPageAttempts < 2 else { return }
             if requestEarlierMessages() { underfillPageAttempts += 1 }
@@ -438,34 +409,10 @@ struct MessageScrollView: View {
 
     @discardableResult
     private func requestEarlierMessages() -> Bool {
-        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !prependPending else { return false }
-        prependPending = true
-        scrollBridge.captureBeforePrepend()
+        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages else { return false }
+        scrollBridge.armPrepend()
         store.loadEarlierMessages()
         return true
-    }
-
-    private func restoreInitialBottomIfPossible(reader: ScrollViewProxy) {
-        guard !didRestoreInitialAnchor, !store.isConversationLoading else { return }
-        didRestoreInitialAnchor = true
-        DispatchQueue.main.async {
-            reader.scrollTo(bottomID, anchor: .bottom)
-            if unseenMessageID != nil { store.consumeInitialScrollTarget() }
-            ConversationPerformance.mark("Conversation bottom restore", path: store.selectedSession?.fileURL.path ?? "new-chat")
-        }
-        // Lazy rows can settle one pass after the native anchor; correct once more unless the user
-        // has already started scrolling away.
-        scheduleBottomScroll(reader)
-    }
-
-    private func scheduleBottomScroll(_ reader: ScrollViewProxy) {
-        guard isPinnedToBottom else { return }
-        scrollTask?.cancel()
-        scrollTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 90_000_000)
-            guard !Task.isCancelled, isPinnedToBottom else { return }
-            reader.scrollTo(bottomID, anchor: .bottom)
-        }
     }
 }
 

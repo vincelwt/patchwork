@@ -78,6 +78,9 @@ enum PiTheme {
     static let transcriptEntrySpacing: CGFloat = 12
     static let transcriptTurnSpacing: CGFloat = 24
     static let transcriptScrollEdgeThreshold: CGFloat = 80
+    /// Earlier history starts loading this far before the viewport reaches the top, so the page
+    /// is usually already prepended by the time the user gets there.
+    static let transcriptHistoryPrefetchDistance: CGFloat = 600
 
     // Radii — one small, one medium, one for the composer. No other values.
     static let radiusSmall: CGFloat = 5

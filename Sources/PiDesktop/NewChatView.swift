@@ -18,8 +18,7 @@ struct NewChatView: View {
                     messages: store.messages,
                     streaming: store.streamingMessage,
                     isRunning: true,
-                    transcriptRevision: store.transcriptRevision,
-                    unseenMessageID: nil
+                    transcriptRevision: store.transcriptRevision
                 )
             }
         }

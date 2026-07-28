@@ -37,6 +37,21 @@ final class ConversationScrollMetricsTests: XCTestCase {
         ).shouldRequestEarlierHistory)
     }
 
+    func testHistoryPrefetchStartsBeforeTheViewportReachesTheTop() {
+        XCTAssertTrue(ConversationScrollMetrics(
+            originY: PiTheme.transcriptHistoryPrefetchDistance - 1, viewportHeight: 500,
+            documentHeight: 5_000, direction: .up
+        ).shouldRequestEarlierHistory, "Scrolling up inside the prefetch distance requests the next page")
+        XCTAssertFalse(ConversationScrollMetrics(
+            originY: PiTheme.transcriptHistoryPrefetchDistance - 1, viewportHeight: 500,
+            documentHeight: 5_000, direction: .down
+        ).shouldRequestEarlierHistory, "Scrolling back down never requests history")
+        XCTAssertFalse(ConversationScrollMetrics(
+            originY: PiTheme.transcriptHistoryPrefetchDistance + 200, viewportHeight: 500,
+            documentHeight: 5_000, direction: .up
+        ).shouldRequestEarlierHistory)
+    }
+
     func testPrependRestorationPreservesTheOriginalViewportOffset() {
         XCTAssertEqual(
             ConversationScrollObserver.restoredOriginY(

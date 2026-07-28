@@ -58,7 +58,38 @@ private struct DelayedRepository: SessionRepositoryProtocol {
     }
 }
 
+/// Returns scripted newest pages so the refresh-merge path can be exercised with page flags
+/// (like a scan-budget truncation) that a tiny fixture file can never produce through the real
+/// parser's default limits.
+private final class ScriptedPagingRepository: SessionRepositoryProtocol, @unchecked Sendable {
+    let rootURL = FileManager.default.temporaryDirectory
+    private let lock = NSLock()
+    private var newestQueue: [ConversationPage]
+
+    init(newestPages: [ConversationPage]) { newestQueue = newestPages }
+
+    private func nextNewestPage() -> ConversationPage {
+        lock.lock()
+        defer { lock.unlock() }
+        return newestQueue.count > 1 ? newestQueue.removeFirst() : newestQueue[0]
+    }
+
+    func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] { [] }
+    func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary {
+        throw ConversationPagingError.unsupported
+    }
+    func loadConversation(from fileURL: URL) async throws -> SessionConversation {
+        let page = nextNewestPage()
+        return SessionConversation(messages: page.messages, leafID: page.leafID, rawEntryCount: page.rawEntryCount)
+    }
+    func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage {
+        nextNewestPage()
+    }
+}
+
 // MARK: - Tests
+
+
 
 /// End-to-end coverage for Task 1 ("opening a thread must be instant, with no layout shift"),
 /// exercised through the real `FileSessionRepository`/`SessionParser`/`TranscriptCache` rather
@@ -355,6 +386,103 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.first?.id, firstID, "Refreshing the tail must preserve loaded earlier rows")
         XCTAssertEqual(store.messages.last?.textContent, "Fresh live thought")
         XCTAssertNil(store.initialScrollTargetMessageID, "A passive refresh must not re-arm initial scrolling")
+    }
+
+    func testLiveRefreshScanTruncationDoesNotFlagLoadedHistoryOutsideTheWindow() async throws {
+        // Regression: a live refresh whose newest-page scan hit its byte budget used to OR its
+        // own `isTruncated` into the merged page. With the loaded history complete (no older
+        // cursor), that flipped "Earlier history is outside this bounded window" on for a
+        // conversation whose history was fully loaded.
+        let file = temporaryDirectory.appendingPathComponent("scripted.jsonl")
+        try writeLinearConversation(prefix: "scripted", messageCount: 4, to: file)
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: temporaryDirectory.appendingPathComponent("heartbeats", isDirectory: true)
+        )
+
+        func message(_ id: String, role: MessageRole, text: String) -> ChatMessage {
+            ChatMessage(id: id, role: role, blocks: [MessageBlock(id: "\(id)-text", kind: .text(text))], timestamp: nil, raw: .null)
+        }
+        let m1 = message("m1", role: .user, text: "question")
+        let m2 = message("m2", role: .assistant, text: "answer")
+        let m3 = message("m3", role: .assistant, text: "appended")
+        let initial = ConversationPage(
+            messages: [m1, m2], olderCursor: nil, leafID: "m2",
+            rawEntryCount: 2, scannedEntryCount: 2, scannedByteCount: 10, isTruncated: false
+        )
+        let truncatedRefresh = ConversationPage(
+            messages: [m2, m3], olderCursor: nil, leafID: "m3",
+            rawEntryCount: 2, scannedEntryCount: 2, scannedByteCount: 10, isTruncated: true
+        )
+        let store = makeStore(
+            repository: ScriptedPagingRepository(newestPages: [initial, truncatedRefresh]),
+            activityMonitor: monitor
+        )
+        let session = try makeSummary(id: "scripted", fileURL: file)
+        store.sessions = [session]
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path) != nil }
+
+        store.selectSession(session)
+        try await waitUntil { store.messages.count == 2 }
+        XCTAssertFalse(store.conversationHistoryLimitReached)
+        XCTAssertFalse(store.hasEarlierMessages)
+
+        // Change the fingerprint so the next activity snapshot triggers a newest-page refresh.
+        let entry: [String: Any] = [
+            "type": "message", "id": "scripted-entry-4", "parentId": "scripted-entry-3",
+            "message": ["role": "assistant", "content": "scripted-4"]
+        ]
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: JSONSerialization.data(withJSONObject: entry) + Data([0x0A]))
+        try handle.close()
+        monitor.tickNow()
+
+        try await waitUntil { store.messages.count == 3 }
+        XCTAssertEqual(store.messages.map(\.id), ["m1", "m2", "m3"], "The refresh merges through the overlap")
+        XCTAssertFalse(
+            store.conversationHistoryLimitReached,
+            "A refresh page's own scan truncation must not mark fully loaded history as outside the window"
+        )
+        XCTAssertFalse(store.hasEarlierMessages)
+    }
+
+    func testStreamingDeltasCoalesceAndAMessageEndCancelsThePendingPublish() async throws {
+        let file = temporaryDirectory.appendingPathComponent("stream.jsonl")
+        try writeLinearConversation(prefix: "stream", messageCount: 2, to: file)
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
+        let session = try makeSummary(id: "stream", fileURL: file)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.renameSession(session, to: "Attach runtime")
+        try await waitUntil { store.isSelectedRuntime }
+
+        func update(_ text: String) -> JSONValue {
+            .object([
+                "type": .string("message_update"),
+                "message": .object(["role": .string("assistant"), "content": .string(text)])
+            ])
+        }
+
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.handleRPCEventForTesting(update("first"))
+        XCTAssertEqual(store.streamingMessage?.textContent, "first", "The first delta publishes immediately")
+
+        store.handleRPCEventForTesting(update("second"))
+        store.handleRPCEventForTesting(update("third"))
+        XCTAssertEqual(store.streamingMessage?.textContent, "first", "A burst coalesces instead of publishing per delta")
+        try await waitUntil { store.streamingMessage?.textContent == "third" }
+
+        store.handleRPCEventForTesting(update("stale trailing"))
+        store.handleRPCEventForTesting(.object([
+            "type": .string("message_end"),
+            "message": .object(["role": .string("assistant"), "content": .string("done")])
+        ]))
+        XCTAssertNil(store.streamingMessage)
+        XCTAssertEqual(store.messages.last?.textContent, "done")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertNil(store.streamingMessage, "A cancelled trailing publish must never resurrect a settled stream")
     }
 
     func testDuplicatePiSessionIDsStillSelectByFilePath() async throws {
