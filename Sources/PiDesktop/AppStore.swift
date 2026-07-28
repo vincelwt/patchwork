@@ -974,6 +974,10 @@ final class AppStore: ObservableObject {
             let hadBaseline = observedActivityPaths.contains(path)
             observedActivityPaths.insert(path)
             guard let completionID = activity.latestCompletedEntryID else { continue }
+            let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
+            // Pi may append an error before its automatic retry. Do not persist or notify that
+            // completion until the session settles; a recovered answer will replace it first.
+            if activity.lastStopReason == "error", activity.state == .running { continue }
             // A transport error is intermediate while Desktop owns a pending continuation.
             // Deferring it avoids an error notification immediately followed by a success one.
             if isWaitingForConnectivity(at: path) { continue }
@@ -993,7 +997,6 @@ final class AppStore: ObservableObject {
 
             guard hadBaseline, previousID != completionID,
                   let session = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) else { continue }
-            let failed = activity.lastStopReason == "error" || activity.lastStopReason == "aborted"
             notify(
                 failed ? .turnFailed : .turnFinished,
                 session: session,
