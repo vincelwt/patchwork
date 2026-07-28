@@ -101,7 +101,7 @@ actor ThreadStore {
     func setArchived(_ archived: Bool, idOrPath: String) async throws -> PiThread {
         guard let existing = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         try await overlay.setArchived(archived, threadID: existing.id)
-        guard let refreshed = await refreshedThread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
+        guard let refreshed = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         return refreshed
     }
 
@@ -110,7 +110,7 @@ actor ThreadStore {
     func setUnread(_ unread: Bool, idOrPath: String) async throws -> PiThread {
         guard let existing = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         try await overlay.setUnread(unread, path: existing.path)
-        guard let refreshed = await refreshedThread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
+        guard let refreshed = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         return refreshed
     }
 
