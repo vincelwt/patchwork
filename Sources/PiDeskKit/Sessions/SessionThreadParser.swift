@@ -1,13 +1,11 @@
 import Foundation
 
-/// Reads a Pi session JSONL into the control API's wire shapes. Deliberately not a port of the
-/// app's full `SessionParser` (`Sources/PiDesktop/SessionParser.swift`): the daemon never renders
-/// a transcript, so there is no need for content blocks, images, tool-call payloads, or active-
-/// branch reconstruction — only the scalar fields `PiThread`/`Message` actually carry. Where the
-/// two overlap in spirit (title/preview heuristics) this intentionally follows the doc's wire
-/// contract rather than the app's own field semantics, since the two differ: the app's sidebar
-/// preview is the first user prompt, but `docs/daemon-api.md` defines `Thread.preview` as "first
-/// line of the last assistant message".
+/// Reads a Pi session JSONL into the control API's bounded wire shapes. This stays smaller than
+/// the app's full `SessionParser` (`Sources/PiDesktop/SessionParser.swift`): it carries only what
+/// remote clients render, not active-branch reconstruction or native image payloads. Where the two
+/// overlap in spirit (title/preview heuristics) this follows the wire contract, since the app's
+/// sidebar preview is the first user prompt while `docs/daemon-api.md` defines `Thread.preview` as
+/// the first line of the last assistant message.
 public enum SessionThreadParser {
     public static let previewLimit = 160
     public static let titleLimit = 74
@@ -16,6 +14,8 @@ public enum SessionThreadParser {
     /// Ceiling on structured blocks projected for one message. Order past this is lost, but the
     /// message itself (and its flattened `text`) is not.
     static let blocksPerMessageLimit = 40
+    /// IDs, names, reasons, and future block kinds are structural metadata, not payload text.
+    static let blockMetadataLimit = 256
 
     /// Largest decoded image `GET /v1/threads/{id}/images/{imageId}` will ever return. Chosen so
     /// one image plus its base64 expansion (~4/3) and JSON envelope still fits inside the hosted
@@ -165,7 +165,7 @@ public enum SessionThreadParser {
         switch type {
         case "message":
             guard let message = entry["message"] else { return nil }
-            let roleName = message["role"]?.stringValue ?? "unknown"
+            let roleName = boundedMetadata(message["role"]?.stringValue) ?? "unknown"
             // "toolResult" is the closest of the four wire roles to a shell result.
             let role = roleName == "bashExecution" ? MessageRole.toolResult : MessageRole(rawValue: roleName)
             let text = plainText(from: message["content"]) ?? ""
@@ -177,9 +177,9 @@ public enum SessionThreadParser {
                 // Only an assistant turn's block order says something `text` cannot: which prose
                 // is narration before a tool call and which is the answer after it.
                 blocks: role == .assistant ? contentBlocks(from: message["content"]) : nil,
-                toolCallId: message["toolCallId"]?.stringValue,
-                toolName: message["toolName"]?.stringValue,
-                stopReason: message["stopReason"]?.stringValue
+                toolCallId: boundedMetadata(message["toolCallId"]?.stringValue),
+                toolName: boundedMetadata(message["toolName"]?.stringValue),
+                stopReason: boundedMetadata(message["stopReason"]?.stringValue)
             )
         case "compaction":
             return summaryMessage(id: id, title: "Context compacted", entry: entry, fallback: "Earlier context was compacted.")
@@ -193,7 +193,10 @@ public enum SessionThreadParser {
     /// Compaction and branch summaries keep their single flattened `text` for older clients, and
     /// split title from summary in `blocks` so a client can show the title and reveal the rest.
     private static func summaryMessage(id: String, title: String, entry: [String: PiJSONValue], fallback: String) -> Message {
-        let summary = bounded(entry["summary"]?.stringValue ?? fallback, max: blockTextLimit)
+        let summary = bounded(
+            entry["summary"]?.stringValue ?? fallback,
+            max: blockTextLimit - title.count
+        )
         return Message(
             id: id,
             role: .system,
@@ -213,9 +216,9 @@ public enum SessionThreadParser {
         var result: [MessageBlock] = []
 
         func take(_ value: String?) -> String? {
-            guard let value, !value.isEmpty else { return nil }
-            let text = bounded(value, max: max(budget, 0))
-            budget -= min(value.count, max(budget, 0))
+            guard let value, !value.isEmpty, budget > 0 else { return nil }
+            let text = bounded(value, max: budget)
+            budget -= text.count
             return text
         }
 
@@ -228,8 +231,8 @@ public enum SessionThreadParser {
             case "toolCall":
                 result.append(MessageBlock(
                     type: "toolCall",
-                    callId: block["id"]?.stringValue,
-                    name: block["name"]?.stringValue ?? "tool",
+                    callId: boundedMetadata(block["id"]?.stringValue),
+                    name: boundedMetadata(block["name"]?.stringValue) ?? "tool",
                     arguments: take(prettyJSON(block["arguments"]))
                 ))
             case "image":
@@ -237,7 +240,7 @@ public enum SessionThreadParser {
                 // where the image sat relative to the prose around it.
                 result.append(MessageBlock(type: "image"))
             case let other:
-                result.append(MessageBlock(type: other ?? "unknown"))
+                result.append(MessageBlock(type: boundedMetadata(other) ?? "unknown"))
             }
         }
         return result.isEmpty ? nil : result
@@ -431,8 +434,16 @@ public enum SessionThreadParser {
         }
     }
 
+    private static func boundedMetadata(_ value: String?) -> String? {
+        value.map { bounded($0, max: blockMetadataLimit) }
+    }
+
+    /// Includes the ellipsis in `max`; every caller can rely on the declared ceiling exactly.
     private static func bounded(_ value: String, max: Int) -> String {
-        value.count <= max ? value : String(value.prefix(max)) + "\u{2026}"
+        guard max > 0 else { return "" }
+        guard value.count > max else { return value }
+        guard max > 1 else { return "\u{2026}" }
+        return String(value.prefix(max - 1)) + "\u{2026}"
     }
 }
 

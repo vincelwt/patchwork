@@ -232,10 +232,11 @@ when it has nothing to say:
   result to the exact call rather than guessing by position.
 - `stopReason` — Pi's own terminal reason (`stop`, `length`, `error`, `aborted`).
 
-Bounds: at most 40 blocks per message, and one shared 4,000-character budget per message across all
-block text and tool arguments — so a transcript carrying blocks stays the same order of magnitude as
-one carrying only `text`. Tool calls are admitted even once that budget is spent, because their
-identity is what makes results attachable.
+Bounds: at most 40 blocks per message; one shared 4,000-character budget per message across all
+block text and tool arguments; and 256 characters for each structural value (block type, call ID,
+tool name, role, and stop reason). A transcript carrying blocks therefore stays the same order of
+magnitude as one carrying only `text`. Tool calls are admitted even once the text budget is spent,
+because their bounded identity is what makes results attachable.
 
 ```jsonc
 // Thread
