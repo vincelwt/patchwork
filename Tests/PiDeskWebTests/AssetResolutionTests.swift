@@ -35,11 +35,10 @@ final class AssetResolutionTests: XCTestCase {
         }
     }
 
-    func testThreadListKeepsSignOutControl() throws {
+    func testThreadListOmitsSignOutControl() throws {
         let asset = try XCTUnwrap(PiDeskWeb.asset(for: "/js/views/threadList.js"))
         let source = String(decoding: asset.data, as: UTF8.self)
-        XCTAssertTrue(source.contains(#""aria-label": "Sign out""#))
-        XCTAssertTrue(source.contains("actions.signOut()"))
+        XCTAssertFalse(source.contains(#""aria-label": "Sign out""#))
     }
 
     func testUnknownRouteFallsBackToIndexForSPARouting() throws {
