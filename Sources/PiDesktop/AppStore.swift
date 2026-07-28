@@ -2309,7 +2309,9 @@ final class AppStore: ObservableObject {
     }
 
     func removeAttachment(_ id: UUID) { attachments.removeAll { $0.id == id } }
-    func showImage(_ image: ImagePayload) { viewedImage = ViewedImage(image: image) }
+    func showImage(_ image: ImagePayload, in group: [ImagePayload]) {
+        viewedImage = ViewedImage(image: image, group: group)
+    }
 
     func refreshSelectedGit() {
         selectedGitTask?.cancel()

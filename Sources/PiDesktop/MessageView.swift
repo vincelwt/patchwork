@@ -63,7 +63,9 @@ private extension TranscriptWorkBlock {
 struct MessageView: View, Equatable {
     let message: ChatMessage
     let isStreaming: Bool
-    let onImage: (ImagePayload) -> Void
+    /// Clicked image plus the images of the message it came from, so the viewer can arrow within
+    /// that group.
+    let onImage: (ImagePayload, [ImagePayload]) -> Void
     /// Answers get a hover action row; the same view reused inside a work log does not.
     var showsActions = false
     /// Set only for the conversation's most recent user message, this reveals the hover "edit
@@ -153,7 +155,7 @@ struct MessageView: View, Equatable {
                     }
                 }
             case let .image(image):
-                ConversationImage(image: image, onOpen: { onImage(image) })
+                ConversationImage(image: image, onOpen: { onImage(image, message.images) })
             case let .thinking(text):
                 if showThinking, !text.isEmpty {
                     ThinkingBlockView(text: text, streaming: isStreaming)
@@ -206,7 +208,7 @@ struct TranscriptWorkView: View, Equatable {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     let block: TranscriptWorkBlock
-    let onImage: (ImagePayload) -> Void
+    let onImage: (ImagePayload, [ImagePayload]) -> Void
     /// Busts the equatable transcript-row cache when a live questionnaire appears, moves, or ends.
     let questionnaireKey: String?
 
@@ -281,7 +283,7 @@ struct TranscriptWorkView: View, Equatable {
                     )
                 }
                 ForEach(step.result?.images ?? []) { image in
-                    ConversationImage(image: image, onOpen: { onImage(image) })
+                    ConversationImage(image: image, onOpen: { onImage(image, step.result?.images ?? []) })
                 }
             }
         }
@@ -315,7 +317,7 @@ struct TranscriptWorkView: View, Equatable {
 /// Mid-turn narration reads as log, not as the answer, so it stays quiet inside the work block.
 private struct WorkNoteView: View {
     let message: ChatMessage
-    let onImage: (ImagePayload) -> Void
+    let onImage: (ImagePayload, [ImagePayload]) -> Void
 
     var body: some View {
         if message.role == .assistant {
@@ -736,7 +738,7 @@ private struct QuestionnaireCallSummary: View {
 
 private struct ToolResultRow: View {
     let message: ChatMessage
-    let onImage: (ImagePayload) -> Void
+    let onImage: (ImagePayload, [ImagePayload]) -> Void
 
     var body: some View {
         DisclosureRow(
@@ -751,7 +753,7 @@ private struct ToolResultRow: View {
                     case let .text(text):
                         if !text.isEmpty { ToolDetailText(code: text) }
                     case let .image(image):
-                        ConversationImage(image: image, onOpen: { onImage(image) })
+                        ConversationImage(image: image, onOpen: { onImage(image, message.images) })
                     default: EmptyView()
                     }
                 }
@@ -767,7 +769,7 @@ private struct ToolResultRow: View {
 
 private struct CustomMessageRow: View {
     let message: ChatMessage
-    let onImage: (ImagePayload) -> Void
+    let onImage: (ImagePayload, [ImagePayload]) -> Void
 
     var body: some View {
         DisclosureRow(
@@ -781,7 +783,7 @@ private struct CustomMessageRow: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(message.images) { image in
-                    ConversationImage(image: image, onOpen: { onImage(image) })
+                    ConversationImage(image: image, onOpen: { onImage(image, message.images) })
                 }
             }
         }
