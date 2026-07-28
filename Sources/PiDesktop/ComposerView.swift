@@ -284,7 +284,7 @@ private struct ComposerRuntimeLabel: View {
                     .foregroundStyle(Color.piOrange)
             } else if let label = store.currentRouteRuntimePhase?.label {
                 HStack(spacing: PiTheme.space4) {
-                    StatusDot(color: .piGreen)
+                    StatusDot(color: .piGreen, pulsing: true)
                     Text(label)
                 }
                 .foregroundStyle(.secondary)

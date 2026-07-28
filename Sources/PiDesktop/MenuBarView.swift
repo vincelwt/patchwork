@@ -71,7 +71,7 @@ struct MenuBarContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: PiTheme.space8) {
-                if !running.isEmpty { StatusDot(color: .piGreen) }
+                if !running.isEmpty { StatusDot(color: .piGreen, pulsing: true) }
                 Text(runningTitle).font(PiFont.rowEmphasis)
                 Spacer()
                 Text("Pi Desktop").font(PiFont.micro).foregroundStyle(.tertiary)
@@ -137,7 +137,7 @@ private struct RunningSessionRow: View {
     var body: some View {
         Button { activate() } label: {
             HStack(spacing: PiTheme.space8) {
-                StatusDot(color: .piGreen)
+                StatusDot(color: .piGreen, pulsing: true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(session.displayName)
                         .font(PiFont.row).lineLimit(1).truncationMode(.tail)

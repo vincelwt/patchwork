@@ -168,7 +168,7 @@ struct ConversationView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 if let session = store.selectedSession, store.isRunning(session) {
-                    StatusDot(color: .piGreen)
+                    StatusDot(color: .piGreen, pulsing: true)
                 }
                 Menu {
                     Button("Rename…") {
