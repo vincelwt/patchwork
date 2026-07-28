@@ -262,6 +262,16 @@ final class QuestionnaireStateMachineTests: XCTestCase {
 
     // MARK: - Inline discoverability
 
+    func testWorkRowEquatableBoundaryTracksQuestionnairePresentation() {
+        let block = TranscriptWorkBlock(id: "work", entries: [], isActive: true)
+        let inactive = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: nil)
+        let active = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: "ask-1:0")
+        let next = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: "ask-1:1")
+
+        XCTAssertNotEqual(inactive, active)
+        XCTAssertNotEqual(active, next)
+    }
+
     func testInlineQuestionIsInteractiveOnlyAfterItsOwnRequestArrives() throws {
         let (store, runtime, _) = makeStore()
         let session = try XCTUnwrap(store.sessions.first)
