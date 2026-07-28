@@ -45,6 +45,36 @@ final class SessionSummaryCacheTests: XCTestCase {
         XCTAssertEqual(remaining, 0)
     }
 
+    func testRefreshSummarySeesAnAppendThroughADiscoveredURL() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiDesktopCacheRefresh-\(UUID().uuidString)", isDirectory: true)
+        let project = root.appendingPathComponent("--project--", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let file = project.appendingPathComponent("session.jsonl")
+        try fixture().write(to: file)
+        let repository = FileSessionRepository(
+            rootURL: root,
+            summaryCache: SessionSummaryCache(fileURL: root.appendingPathComponent("cache.json"))
+        )
+        let discovered = try await repository.discoverSessions(archivedIDs: [])
+        let original = try XCTUnwrap(discovered.first)
+        _ = try original.fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+
+        let entry = try JSONSerialization.data(withJSONObject: [
+            "type": "session_info", "id": "name", "parentId": "user", "name": "Fresh title"
+        ])
+        let writer = try FileHandle(forWritingTo: file)
+        try writer.seekToEnd()
+        try writer.write(contentsOf: entry)
+        try writer.write(contentsOf: Data([0x0A]))
+        try writer.close()
+
+        let refreshed = try await repository.refreshSummary(at: original.fileURL, archivedIDs: [])
+        XCTAssertEqual(refreshed.displayName, "Fresh title")
+    }
+
     private func fixture() throws -> Data {
         let lines: [[String: Any]] = [
             ["type": "session", "version": 3, "id": "cache-session", "timestamp": "2026-01-01T12:00:00.000Z", "cwd": "/tmp/project"],
