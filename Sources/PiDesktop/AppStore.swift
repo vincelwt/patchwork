@@ -968,7 +968,7 @@ final class AppStore: ObservableObject {
         runningSince(session) ?? session.modifiedAt
     }
 
-    /// Menu bar / badge source: every non-archived session currently working, newest run first.
+    /// Menu bar source: every non-archived session currently working, newest run first.
     var runningSessions: [SessionSummary] {
         sessions
             .filter { !$0.isArchived && isRunning($0) }
@@ -979,6 +979,18 @@ final class AppStore: ObservableObject {
                     ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
                     : left > right
             }
+    }
+
+    /// Dock badge source: the same Done bucket shown by the sidebar's Status view.
+    var doneSessionCount: Int {
+        sessions.reduce(0) { count, session in
+            count + (SidebarStatusGroup.section(
+                for: session,
+                isRunning: isRunning(session),
+                isUnread: isUnread(session),
+                isAutomated: scheduledThreadIDs.contains(session.id)
+            ) == .done ? 1 : 0)
+        }
     }
 
     /// Completion IDs, not run-state or mtime transitions, are the sole finished-answer signal.

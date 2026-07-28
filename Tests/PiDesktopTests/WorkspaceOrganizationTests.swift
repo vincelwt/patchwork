@@ -413,6 +413,24 @@ final class WorkspaceOrganizationTests: XCTestCase {
     }
 
     @MainActor
+    func testDoneSessionCountUsesTheSidebarStatusPriority() {
+        let base = temporaryDirectory("DoneBadge")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = AppStore(
+            persistence: AppPersistence(baseURL: base),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+        let done = summary(id: "done", cwd: "/tmp")
+        var archived = summary(id: "archived", cwd: "/tmp")
+        archived.isArchived = true
+        store.sessions = [done, archived]
+
+        XCTAssertEqual(store.doneSessionCount, 1)
+        store.markUnread(done)
+        XCTAssertEqual(store.doneSessionCount, 0, "Unread wins over Done, and archived threads never count")
+    }
+
+    @MainActor
     func testSameMtimeNewCompletionBecomesUnreadByEntryID() async throws {
         let base = temporaryDirectory("SameMtimeUnread")
         defer { try? FileManager.default.removeItem(at: base) }

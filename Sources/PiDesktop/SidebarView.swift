@@ -386,6 +386,20 @@ struct SidebarStatusGroup: Identifiable {
     let sessions: [SessionSummary]
     var id: String { section.rawValue }
 
+    /// The shared status priority used by the sidebar and Dock badge.
+    static func section(
+        for session: SessionSummary,
+        isRunning: Bool,
+        isUnread: Bool,
+        isAutomated: Bool
+    ) -> SidebarStatusSection? {
+        guard !session.isArchived else { return nil }
+        if isRunning { return .running }
+        if isUnread { return .unread }
+        if isAutomated { return .automated }
+        return .done
+    }
+
     /// Files every non-archived conversation exactly once — running, else unread, else targeted by
     /// an automation, else done — then sorts running by its stable turn start and everything
     /// else by live modification date. Pure: the caller hands in the store's predicates and
@@ -399,10 +413,13 @@ struct SidebarStatusGroup: Identifiable {
         modifiedAt: (SessionSummary) -> Date
     ) -> [SidebarStatusGroup] {
         var buckets: [SidebarStatusSection: [SessionSummary]] = [:]
-        for session in sessions where !session.isArchived {
-            let section: SidebarStatusSection = isRunning(session) ? .running
-                : isUnread(session) ? .unread
-                : isAutomated(session) ? .automated : .done
+        for session in sessions {
+            guard let section = Self.section(
+                for: session,
+                isRunning: isRunning(session),
+                isUnread: isUnread(session),
+                isAutomated: isAutomated(session)
+            ) else { continue }
             buckets[section, default: []].append(session)
         }
         return SidebarStatusSection.allCases.compactMap { section in

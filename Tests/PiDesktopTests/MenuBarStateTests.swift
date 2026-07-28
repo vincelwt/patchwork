@@ -42,6 +42,14 @@ final class MenuBarCircleStateTests: XCTestCase {
     }
 }
 
+final class ThreadCountBadgeTests: XCTestCase {
+    func testPositiveCountsRenderAndZeroStaysHidden() {
+        XCTAssertNil(ThreadCountBadge.label(for: 0))
+        XCTAssertEqual(ThreadCountBadge.label(for: 1), "1")
+        XCTAssertEqual(ThreadCountBadge.label(for: 42), "42")
+    }
+}
+
 final class MenuBarPanelLayoutTests: XCTestCase {
     func testScrollableRegionsFitCommonDisplayHeights() {
         for available in [300, 600, 875, 1440] as [CGFloat] {
