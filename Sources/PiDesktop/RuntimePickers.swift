@@ -139,7 +139,6 @@ struct ModelPickerControl: View {
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
-                .fixedSize()
                 .help(help(label))
             case .cycle:
                 Button(action: store.cycleModel) {
