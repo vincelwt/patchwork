@@ -88,6 +88,42 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(binaryFile.linesUnavailable)
     }
 
+    func testConversationWorkspaceDetectorUsesExplicitToolLocations() {
+        let base = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+        let worktree = URL(fileURLWithPath: "/tmp/feature worktree", isDirectory: true)
+        let source = worktree.appendingPathComponent("Sources/App.swift")
+
+        XCTAssertEqual(
+            ConversationWorkspaceDetector.directory(
+                toolName: "functions.edit",
+                arguments: .object(["path": .string(source.path)]),
+                relativeTo: base
+            ),
+            source.deletingLastPathComponent().standardizedFileURL
+        )
+        XCTAssertEqual(
+            ConversationWorkspaceDetector.directory(
+                toolName: "bash",
+                arguments: .object(["command": .string("cd \"\(worktree.path)\" && swift test")]),
+                relativeTo: base
+            ),
+            worktree.standardizedFileURL
+        )
+        XCTAssertEqual(
+            ConversationWorkspaceDetector.directory(
+                toolName: "process",
+                arguments: .object(["cwd": .string("../feature")]),
+                relativeTo: base
+            )?.path,
+            "/tmp/feature"
+        )
+        XCTAssertNil(ConversationWorkspaceDetector.directory(
+            toolName: "read",
+            arguments: .object(["path": .string(source.path)]),
+            relativeTo: base
+        ))
+    }
+
     func testCancellingASnapshotStopsTheGitCommandChain() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiDesktopGitCancel-\(UUID().uuidString)", isDirectory: true)

@@ -26,7 +26,12 @@ private final class FakeRuntime: PiRuntimeProtocol {
 private struct FakeGitService: GitStatusProviding {
     var worktree: GitWorktreeInfo?
     func snapshot(for directory: URL) async -> GitSnapshot { GitSnapshot(isRepository: true) }
-    func worktreeInfo(for directory: URL) async -> GitWorktreeInfo? { worktree }
+    func worktreeInfo(for directory: URL) async -> GitWorktreeInfo? {
+        guard let worktree else { return nil }
+        let target = directory.resolvingSymlinksInPath().path
+        let root = URL(fileURLWithPath: worktree.path, isDirectory: true).resolvingSymlinksInPath().path
+        return target == root || target.hasPrefix(root + "/") ? worktree : nil
+    }
 }
 
 /// Wraps a real `FileSessionRepository` and adds a fixed delay before every load, so a test can
@@ -385,6 +390,72 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.selectedWorktree?.mainName, "main")
     }
 
+    func testConversationFollowsAWorktreeRecordedInItsToolCalls() async throws {
+        let project = temporaryDirectory.appendingPathComponent("project", isDirectory: true)
+        let worktreeRoot = temporaryDirectory.appendingPathComponent("feature-inspector", isDirectory: true)
+        let source = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+
+        let file = temporaryDirectory.appendingPathComponent("moved.jsonl")
+        try writeJSONL([
+            ["type": "session", "version": 3, "id": "moved", "cwd": project.path],
+            ["type": "message", "id": "user", "parentId": NSNull(), "message": ["role": "user", "content": "Fix it"]],
+            [
+                "type": "message", "id": "assistant", "parentId": "user",
+                "message": [
+                    "role": "assistant", "stopReason": "toolUse",
+                    "content": [[
+                        "type": "toolCall", "id": "edit-1", "name": "edit",
+                        "arguments": ["path": source.path]
+                    ]]
+                ]
+            ]
+        ], to: file)
+        let worktree = GitWorktreeInfo(path: worktreeRoot.path, branch: "feat/inspector", mainWorktreePath: project.path)
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory), gitService: FakeGitService(worktree: worktree))
+        let session = try makeSummary(id: "moved", fileURL: file, cwd: project)
+        store.sessions = [session]
+
+        store.selectSession(session)
+        try await waitUntil { store.selectedWorktree?.name == "feature-inspector" }
+        XCTAssertEqual(store.selectedWorktree?.path, worktreeRoot.path)
+    }
+
+    func testLiveToolCallMovesConversationIntoNamedWorktree() async throws {
+        let project = temporaryDirectory.appendingPathComponent("live-project", isDirectory: true)
+        let worktreeRoot = temporaryDirectory.appendingPathComponent("live-feature", isDirectory: true)
+        let source = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let file = temporaryDirectory.appendingPathComponent("live-worktree.jsonl")
+        try writeLinearConversation(prefix: "live-worktree", messageCount: 2, to: file)
+
+        let runtime = FakeRuntime()
+        runtime.sessionFile = file.path
+        runtime.sessionID = "live-worktree"
+        let worktree = GitWorktreeInfo(path: worktreeRoot.path, branch: "feat/live", mainWorktreePath: project.path)
+        let store = makeStore(
+            repository: FileSessionRepository(rootURL: temporaryDirectory),
+            gitService: FakeGitService(worktree: worktree),
+            runtime: runtime
+        )
+        let session = try makeSummary(id: "live-worktree", fileURL: file, cwd: project)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.renameSession(session, to: "Attach runtime")
+        try await waitUntil { store.isSelectedRuntime }
+
+        store.handleRPCEventForTesting(.object([
+            "type": .string("tool_execution_start"),
+            "toolCallId": .string("edit-live"),
+            "toolName": .string("edit"),
+            "args": .object(["path": .string(source.path)])
+        ]))
+
+        try await waitUntil { store.selectedWorktree?.name == "live-feature" }
+    }
+
     func testAPlainCheckoutNeverPopulatesSelectedWorktree() async throws {
         let file = temporaryDirectory.appendingPathComponent("plain.jsonl")
         try writeLinearConversation(prefix: "plain", messageCount: 2, to: file)
@@ -418,9 +489,9 @@ final class ConversationLoadingTests: XCTestCase {
         )
     }
 
-    private func makeSummary(id: String, fileURL: URL) throws -> SessionSummary {
+    private func makeSummary(id: String, fileURL: URL, cwd: URL? = nil) throws -> SessionSummary {
         var value = SessionSummary(
-            id: id, fileURL: fileURL, cwd: temporaryDirectory,
+            id: id, fileURL: fileURL, cwd: cwd ?? temporaryDirectory,
             createdAt: Date(), modifiedAt: Date(), name: id, preview: "preview",
             messageCount: 0, metrics: TokenMetrics()
         )
@@ -441,6 +512,10 @@ final class ConversationLoadingTests: XCTestCase {
             ])
             parent = id
         }
+        try writeJSONL(lines, to: url)
+    }
+
+    private func writeJSONL(_ lines: [[String: Any]], to url: URL) throws {
         let data = try lines.reduce(into: Data()) { output, line in
             output.append(try JSONSerialization.data(withJSONObject: line))
             output.append(0x0A)
