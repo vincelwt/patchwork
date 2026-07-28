@@ -399,6 +399,8 @@ struct ImageViewerView: View {
     /// Local state, so arrowing through the group never re-presents the viewer.
     @State private var selection: ViewedImage
     @State private var zoom = 1.0
+    // A root overlay does not inherit the composer's focus, so it must claim its own key events.
+    @FocusState private var hasKeyboardFocus: Bool
     private let onDismiss: () -> Void
 
     init(selection: ViewedImage, onDismiss: @escaping () -> Void) {
@@ -426,9 +428,28 @@ struct ImageViewerView: View {
             panel
                 .padding(PiTheme.space24)
         }
+        .focusable()
+        .focused($hasKeyboardFocus)
+        .focusEffectDisabled()
+        .onAppear { hasKeyboardFocus = true }
+        .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+            guard let delta = Self.navigationDelta(for: press.key) else { return .ignored }
+            step(delta)
+            return .handled
+        }
         .onExitCommand(perform: onDismiss)
         .transition(.opacity)
         .zIndex(30)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Image viewer")
+    }
+
+    static func navigationDelta(for key: KeyEquivalent) -> Int? {
+        switch key {
+        case .leftArrow: -1
+        case .rightArrow: 1
+        default: nil
+        }
     }
 
     private var panel: some View {
@@ -441,7 +462,6 @@ struct ImageViewerView: View {
                 Spacer(minLength: PiTheme.space8)
                 if selection.images.count > 1 {
                     Button { step(-1) } label: { Image(systemName: "chevron.left") }
-                        .keyboardShortcut(.leftArrow, modifiers: [])
                         .disabled(!selection.hasPrevious)
                         .help("Previous image in this message")
                         .accessibilityLabel("Previous image")
@@ -452,7 +472,6 @@ struct ImageViewerView: View {
                         .fixedSize()
                         .accessibilityLabel("Image \(selection.index + 1) of \(selection.images.count)")
                     Button { step(1) } label: { Image(systemName: "chevron.right") }
-                        .keyboardShortcut(.rightArrow, modifiers: [])
                         .disabled(!selection.hasNext)
                         .help("Next image in this message")
                         .accessibilityLabel("Next image")
@@ -512,6 +531,7 @@ struct ImageViewerView: View {
 
     /// Each image opens fitted, so zoom does not carry over from the previous one.
     private func step(_ delta: Int) {
+        guard delta < 0 ? selection.hasPrevious : selection.hasNext else { return }
         if delta < 0 { selection.goToPrevious() } else { selection.goToNext() }
         zoom = 1
     }
