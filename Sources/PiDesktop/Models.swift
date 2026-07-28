@@ -473,6 +473,8 @@ struct ManagedTurnRecovery: Codable, Equatable {
 struct PersistedAppState: Codable {
     var archivedSessionIDs: Set<String> = []
     var recentFolders: [String] = []
+    /// One app-wide choice: changing conversations or relaunching never reopens a panel the user closed.
+    var inspectorVisible = true
     /// Sidebar folders the user explicitly opened or closed. Anything absent falls back to the
     /// recency/running default, so a fresh install still opens the folders that matter.
     var expandedFolders: Set<String> = []
@@ -505,6 +507,7 @@ struct PersistedAppState: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
+        inspectorVisible = try container.decodeIfPresent(Bool.self, forKey: .inspectorVisible) ?? true
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
