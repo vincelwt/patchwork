@@ -48,9 +48,10 @@ the window is closed. The wire contract is `docs/daemon-api.md`; the CLI referen
 | CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
 | Web remote | `remote.ai.gloom.sh` | QR-paired, end-to-end encrypted phone UI for threads and schedules |
 
-Click the phone button in the sidebar footer to pair a browser. The hosted relay starts with the
-daemon and needs no VPN, inbound port, or tunnel; each browser stays paired until its site data
-is cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
+Click the phone button in the sidebar footer only to pair or manage a browser. After that, the
+hosted relay starts automatically with Pi Desktop and the phone reconnects whenever the app is
+open; no VPN, inbound port, or tunnel is needed. A browser stays paired until its site data is
+cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
 
 The phone UI covers the daily loop, not just reading:
 
@@ -58,8 +59,9 @@ The phone UI covers the daily loop, not just reading:
   reasoning, narration, tool calls and their results, retried errors, and compaction, then Pi's
   answer. A live turn shows its latest thought and a running clock; opening the row reveals the
   log, with tool detail nested one disclosure deeper. Answers, images, and question cards stay
-  outside it. While a run is in flight the open thread refreshes on its own, and a refresh that
-  changes nothing leaves the transcript, its open disclosures, and the scroll position alone.
+  outside it. Opening reads the newest messages directly from a bounded file tail instead of
+  rescanning the whole session. While a run is in flight the open thread refreshes on its own,
+  and an unchanged refresh leaves the transcript, its open disclosures, and scroll position alone.
 - **Sending is optimistic and honest.** The composer clears immediately and the message shows as
   queued / working / steering / failed until Pi's own session file confirms it. A failed send
   keeps its text with Retry, and a per-message submission id means a retry after a lost response

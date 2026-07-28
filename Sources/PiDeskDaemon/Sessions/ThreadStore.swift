@@ -7,9 +7,9 @@ import PiDeskKit
 /// re-parsed \u2014 real session files run tens of megabytes, so re-parsing all of them on every
 /// request would make `threads list` and the scheduler's own bookkeeping needlessly slow.
 ///
-/// `running`/`archived`/`unread` are overlaid fresh on every call from the heartbeat directory,
-/// a read-only peek at the app's `state.json`, and the daemon's own `DaemonOverlayStore` \u2014
-/// never cached, since those change independently of the session file itself.
+/// `running`/`archived`/`unread` are overlaid on each list refresh from the heartbeat directory,
+/// a read-only peek at the app's `state.json`, and the daemon's own `DaemonOverlayStore`. Point
+/// lookups reuse that presented snapshot so opening one thread never reparses every changed file.
 actor ThreadStore {
     private struct Fingerprint: Equatable { let size: Int64; let modifiedAt: TimeInterval }
     private struct CacheEntry { let fingerprint: Fingerprint; let thread: PiThread }
@@ -19,6 +19,9 @@ actor ThreadStore {
     private let logger: DaemonLogger
     private let overlay: DaemonOverlayStore
     private var cache: [String: CacheEntry] = [:]
+    /// Last fully overlaid, sorted list. The web view loads this before opening a detail, so a
+    /// point lookup stays O(thread count) instead of refreshing every session on disk.
+    private var presented: [PiThread] = []
 
     init(
         rootURL: URL = SessionScanner.defaultRootURL(),
@@ -52,6 +55,22 @@ actor ThreadStore {
 
     func thread(idOrPath: String) async -> PiThread? {
         let standardizedPath = URL(fileURLWithPath: idOrPath).standardizedFileURL.path
+        if var cached = presented.first(where: { $0.id == idOrPath || $0.path == standardizedPath }),
+           FileManager.default.fileExists(atPath: cached.path) {
+            let freshURL = URL(fileURLWithPath: cached.path)
+            if let modified = try? freshURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+                cached.updatedAt = modified
+            }
+            let counts = Dictionary(grouping: presented, by: \.id).mapValues(\.count)
+            return await applyingOverlays(to: [cached], sessionIDCounts: counts).first
+        }
+        return await refreshedThread(idOrPath: idOrPath)
+    }
+
+    /// Mutations that need freshly overlaid fields may pay for a list refresh; ordinary detail,
+    /// image, send, and scheduler lookups should use `thread(idOrPath:)` above.
+    func refreshedThread(idOrPath: String) async -> PiThread? {
+        let standardizedPath = URL(fileURLWithPath: idOrPath).standardizedFileURL.path
         return await allThreadsSorted().first { $0.id == idOrPath || $0.path == standardizedPath }
     }
 
@@ -82,7 +101,7 @@ actor ThreadStore {
     func setArchived(_ archived: Bool, idOrPath: String) async throws -> PiThread {
         guard let existing = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         try await overlay.setArchived(archived, threadID: existing.id)
-        guard let refreshed = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
+        guard let refreshed = await refreshedThread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         return refreshed
     }
 
@@ -91,12 +110,14 @@ actor ThreadStore {
     func setUnread(_ unread: Bool, idOrPath: String) async throws -> PiThread {
         guard let existing = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         try await overlay.setUnread(unread, path: existing.path)
-        guard let refreshed = await thread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
+        guard let refreshed = await refreshedThread(idOrPath: idOrPath) else { throw DaemonHTTPError.notFound("Thread \(idOrPath)") }
         return refreshed
     }
 
-    private func allThreadsSorted() async -> [PiThread] {
-        let files = SessionScanner.discoverSessionFiles(rootURL: rootURL)
+    private func applyingOverlays(
+        to source: [PiThread],
+        sessionIDCounts suppliedCounts: [String: Int]? = nil
+    ) async -> [PiThread] {
         let appState = AppStatePeek.load()
         let overlayState = await overlay.snapshot()
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
@@ -112,7 +133,37 @@ actor ThreadStore {
         let runningHeartbeats = heartbeats.filter { ActivityReader.isRunning($0) }
         let runningIDs = Set(runningHeartbeats.filter { $0.sessionFile == nil }.map(\.sessionId))
         let runningPaths = Set(runningHeartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
+        let sessionIDCounts = suppliedCounts ?? Dictionary(grouping: source, by: \.id).mapValues(\.count)
 
+        var results = source
+        for index in results.indices {
+            let path = URL(fileURLWithPath: results[index].path).standardizedFileURL.path
+            results[index].archived = appState.isArchived(sessionID: results[index].id)
+                || overlayState.isArchived(results[index].id)
+            let completion = latestHeartbeatCompletionByPath[path]
+                ?? (sessionIDCounts[results[index].id] == 1 ? latestHeartbeatCompletionBySessionID[results[index].id] : nil)
+            results[index].unread = overlayState.unreadOverride(
+                path: results[index].path,
+                updatedAt: results[index].updatedAt
+            ) ?? appState.isUnread(
+                path: results[index].path,
+                latestCompletionID: completion,
+                modifiedAt: results[index].updatedAt
+            )
+            let fallbackRunning = !heartbeatPaths.contains(path)
+                && !heartbeatIDs.contains(results[index].id)
+                && Date().timeIntervalSince(results[index].updatedAt) <= FileRunStateFallback.idleAfter
+                && FileRunStateFallback.isRunning(sessionFile: URL(fileURLWithPath: path))
+            results[index].running = runningPaths.contains(path)
+                || fallbackRunning
+                || (sessionIDCounts[results[index].id] == 1 && runningIDs.contains(results[index].id))
+            if results[index].running { results[index].unread = false }
+        }
+        return results
+    }
+
+    private func allThreadsSorted() async -> [PiThread] {
+        let files = SessionScanner.discoverSessionFiles(rootURL: rootURL)
         var results: [PiThread] = []
         results.reserveCapacity(files.count)
         var stillPresent: Set<String> = []
@@ -139,42 +190,17 @@ actor ThreadStore {
             results.append(thread)
         }
 
-        let sessionIDCounts = Dictionary(grouping: results, by: \.id).mapValues(\.count)
-        var fallbackRunningPaths: Set<String> = []
-        for index in results.indices {
-            let path = URL(fileURLWithPath: results[index].path).standardizedFileURL.path
-            results[index].archived = appState.isArchived(sessionID: results[index].id)
-                || overlayState.isArchived(results[index].id)
-            let completion = latestHeartbeatCompletionByPath[path]
-                ?? (sessionIDCounts[results[index].id] == 1 ? latestHeartbeatCompletionBySessionID[results[index].id] : nil)
-            results[index].unread = overlayState.unreadOverride(
-                path: results[index].path,
-                updatedAt: results[index].updatedAt
-            ) ?? appState.isUnread(
-                path: results[index].path,
-                latestCompletionID: completion,
-                modifiedAt: results[index].updatedAt
-            )
-            // A session the extension has never seen still has to report honestly, so its file
-            // decides. Freshly written files are the only ones worth reading a tail for.
-            if !heartbeatPaths.contains(path), !heartbeatIDs.contains(results[index].id),
-               Date().timeIntervalSince(results[index].updatedAt) <= FileRunStateFallback.idleAfter,
-               FileRunStateFallback.isRunning(sessionFile: URL(fileURLWithPath: path)) {
-                fallbackRunningPaths.insert(path)
-            }
-            results[index].running = runningPaths.contains(path)
-                || fallbackRunningPaths.contains(path)
-                || (sessionIDCounts[results[index].id] == 1 && runningIDs.contains(results[index].id))
-            if results[index].running { results[index].unread = false }
-        }
+        results = await applyingOverlays(to: results)
 
         // Drop cache entries for files that disappeared (archived out from under Pi, deleted).
         if cache.count != stillPresent.count || !cache.keys.allSatisfy(stillPresent.contains) {
             cache = cache.filter { stillPresent.contains($0.key) }
         }
 
-        return results.sorted { lhs, rhs in
+        let sorted = results.sorted { lhs, rhs in
             lhs.updatedAt == rhs.updatedAt ? lhs.name < rhs.name : lhs.updatedAt > rhs.updatedAt
         }
+        presented = sorted
+        return sorted
     }
 }

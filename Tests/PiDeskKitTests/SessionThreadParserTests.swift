@@ -156,6 +156,22 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(try SessionThreadParser.messages(at: url, limit: 0), [])
     }
 
+    func testMessagesReadOnlyTheTailOfALargeSession() throws {
+        let hugeIgnoredRecord = String(repeating: "x", count: SessionThreadParser.initialTailBytes + 1_024)
+        let url = write([
+            hugeIgnoredRecord,
+            messageLine(role: "user", text: "older", id: "old"),
+            imageContentLine(id: "new", data: Self.tinyPNG)
+        ])
+
+        let messages = try SessionThreadParser.messages(at: url, limit: 2)
+        XCTAssertEqual(messages.map(\.text), ["older", "see this\n[image]"])
+        XCTAssertNotNil(try SessionThreadParser.tailMessages(at: url, limit: 2), "the bounded tail was sufficient; no full scan was needed")
+        let imageID = try XCTUnwrap(messages.last?.images.first?.id)
+        XCTAssertTrue(imageID.hasPrefix("b"), "tail projections identify the record by byte offset")
+        XCTAssertNotNil(try SessionThreadParser.image(at: url, imageId: imageID), "byte-offset image lookup seeks directly to the record")
+    }
+
     // MARK: - SessionScanner
 
     func testScannerFindsRootAndOneLevelProjectFilesButNotDeeperNesting() throws {
@@ -353,7 +369,7 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(image.mimeType, "image/png")
         XCTAssertEqual(image.fileName, "shot.png")
         XCTAssertGreaterThan(image.byteCount, 0)
-        XCTAssertEqual(image.id, "0-c1", "record ordinal plus the content block index")
+        XCTAssertEqual(image.id, "b0-c1", "record byte offset plus the content block index")
 
         // The transcript itself must stay small: no payload travels inside the message.
         let encoded = try PiDeskJSON.encoder.encode(messages)
@@ -367,7 +383,7 @@ final class SessionThreadParserTests: XCTestCase {
             """
         ])
         let messages = try SessionThreadParser.messages(at: url, limit: 10)
-        XCTAssertEqual(messages[0].images.map(\.id), ["0-a0"])
+        XCTAssertEqual(messages[0].images.map(\.id), ["b0-a0"])
         XCTAssertEqual(messages[0].images.first?.status, .ok)
     }
 

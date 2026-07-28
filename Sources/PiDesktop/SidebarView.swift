@@ -163,8 +163,8 @@ private struct SidebarFooter: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Remote access")
-            .accessibilityLabel("Remote access")
+            .help("Pair or manage phone access")
+            .accessibilityLabel("Pair or manage phone access")
             .sheet(isPresented: $remoteAccessPresented) { RemoteAccessView() }
             if archivedCount > 0 {
                 Button { archiveExpanded.toggle() } label: {

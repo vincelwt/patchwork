@@ -173,7 +173,7 @@ enum ThreadHandlers {
                 } catch let error as RunnerError {
                     throw DaemonHTTPError.conflict(code: "rename_failed", message: error.localizedDescription)
                 }
-                guard let refreshed = await core.threadStore.thread(idOrPath: thread.id) else { throw DaemonHTTPError.notFound("Thread \(thread.id)") }
+                guard let refreshed = await core.threadStore.refreshedThread(idOrPath: thread.id) else { throw DaemonHTTPError.notFound("Thread \(thread.id)") }
                 return .json(ThreadResponse(thread: refreshed))
             },
 

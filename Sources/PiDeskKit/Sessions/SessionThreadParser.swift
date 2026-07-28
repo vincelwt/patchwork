@@ -16,6 +16,12 @@ public enum SessionThreadParser {
     static let blocksPerMessageLimit = 40
     /// IDs, names, reasons, and future block kinds are structural metadata, not payload text.
     static let blockMetadataLimit = 256
+    /// Read recent messages from EOF first. Pathological tails fall back to the full scanner once
+    /// this bounded window is exhausted, so speed never comes at the cost of missing history.
+    static let initialTailBytes = 4 * 1_024 * 1_024
+    static let maxTailBytes = 64 * 1_024 * 1_024
+    /// Enough for eight maximum-sized remote images in one JSONL record, while still bounded.
+    static let maxImageRecordBytes = 32 * 1_024 * 1_024
 
     /// Largest decoded image `GET /v1/threads/{id}/images/{imageId}` will ever return. Chosen so
     /// one image plus its base64 expansion (~4/3) and JSON envelope still fits inside the hosted
@@ -116,26 +122,66 @@ public enum SessionThreadParser {
         )
     }
 
-    /// The last `limit` messages in file order. Bounded to roughly `2 * limit` transient entries
-    /// at any moment (periodic trims, not one per append) so scanning a huge session for a small
-    /// tail stays cheap and never retains the whole file.
+    /// The last `limit` messages in file order. Reads backward from EOF so opening a 120 MB
+    /// conversation costs roughly the size of its visible tail, not the size of its history.
     public static func messages(at url: URL, limit: Int) throws -> [Message] {
         guard limit > 0 else { return [] }
+        if let tail = try tailMessages(at: url, limit: limit) {
+            return applyImageBudget(to: tail)
+        }
+        return applyImageBudget(to: try forwardMessages(at: url, limit: limit))
+    }
+
+    /// `nil` means the bounded reverse window did not contain enough complete records, so the
+    /// caller must use the slower full scan rather than silently return incomplete history.
+    static func tailMessages(at url: URL, limit: Int) throws -> [Message]? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let end = try handle.seekToEnd()
+        var window = min(end, UInt64(initialTailBytes))
+
+        while true {
+            try Task.checkCancellation()
+            let start = end - window
+            try handle.seek(toOffset: start)
+            let data = try handle.read(upToCount: Int(window)) ?? Data()
+            let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+            var messages: [Message] = []
+            messages.reserveCapacity(min(limit, 512))
+
+            for line in lines.dropFirst(start > 0 ? 1 : 0).reversed() where !line.isEmpty {
+                try Task.checkCancellation()
+                var record = Data(line)
+                if record.last == 0x0D { record.removeLast() }
+                let offset = start + UInt64(line.startIndex)
+                guard let value = try? PiJSONValue.decode(record), let object = value.objectValue,
+                      let message = wireMessage(from: object, locator: .offset(offset)) else { continue }
+                messages.append(message)
+                if messages.count == limit { return Array(messages.reversed()) }
+            }
+
+            if start == 0 { return Array(messages.reversed()) }
+            let ceiling = min(end, UInt64(maxTailBytes))
+            guard window < ceiling else { return nil }
+            window = min(ceiling, window * 2)
+        }
+    }
+
+    private static func forwardMessages(at url: URL, limit: Int) throws -> [Message] {
         var buffer: [Message] = []
         buffer.reserveCapacity(min(limit, 512))
         var ordinal = 0
-
         try JSONLFileReader.read(url: url) { data in
             try Task.checkCancellation()
             let entryOrdinal = ordinal
             ordinal += 1
             guard let value = try? PiJSONValue.decode(data), let object = value.objectValue,
-                  let message = Self.wireMessage(from: object, ordinal: entryOrdinal) else { return }
+                  let message = wireMessage(from: object, locator: .ordinal(entryOrdinal)) else { return }
             buffer.append(message)
             if buffer.count > limit * 2 { buffer.removeFirst(buffer.count - limit) }
         }
         if buffer.count > limit { buffer.removeFirst(buffer.count - limit) }
-        return applyImageBudget(to: buffer)
+        return buffer
     }
 
     /// The per-request image ceiling is applied *after* trimming, walking newest first, so the
@@ -158,7 +204,19 @@ public enum SessionThreadParser {
         return result
     }
 
-    private static func wireMessage(from entry: [String: PiJSONValue], ordinal: Int) -> Message? {
+    private enum RecordLocator {
+        case ordinal(Int)
+        case offset(UInt64)
+
+        var imageIDPrefix: String {
+            switch self {
+            case let .ordinal(value): String(value)
+            case let .offset(value): "b\(value)"
+            }
+        }
+    }
+
+    private static func wireMessage(from entry: [String: PiJSONValue], locator: RecordLocator) -> Message? {
         let type = entry["type"]?.stringValue ?? "unknown"
         let id = entry["id"]?.stringValue ?? UUID().uuidString
 
@@ -173,7 +231,7 @@ public enum SessionThreadParser {
             let at = timestamp(from: message["timestamp"]) ?? .distantPast
             return Message(
                 id: id, role: role, text: text, at: at, isError: isError,
-                images: imageRefs(in: message, ordinal: ordinal),
+                images: imageRefs(in: message, locator: locator),
                 // Only an assistant turn's block order says something `text` cannot: which prose
                 // is narration before a tool call and which is the answer after it.
                 blocks: role == .assistant ? contentBlocks(from: message["content"]) : nil,
@@ -299,17 +357,18 @@ public enum SessionThreadParser {
     /// `{"type":"image","content":"<base64>","mimeType":…}`. Only lengths are read here; the
     /// base64 itself is never retained, so a transcript scan stays flat in memory no matter how
     /// many screenshots a conversation contains.
-    static func imageRefs(in message: PiJSONValue, ordinal: Int) -> [MessageImage] {
+    private static func imageRefs(in message: PiJSONValue, locator: RecordLocator) -> [MessageImage] {
         var refs: [MessageImage] = []
+        let prefix = locator.imageIDPrefix
         for (index, block) in (message["content"]?.arrayValue ?? []).enumerated() {
             guard block["type"]?.stringValue == "image" else { continue }
             guard refs.count < imagesPerMessageLimit else { break }
-            refs.append(imageRef(id: "\(ordinal)-c\(index)", encoded: block["data"]?.stringValue, block: block))
+            refs.append(imageRef(id: "\(prefix)-c\(index)", encoded: block["data"]?.stringValue, block: block))
         }
         for (index, block) in (message["attachments"]?.arrayValue ?? []).enumerated() {
             guard block["type"]?.stringValue == "image" else { continue }
             guard refs.count < imagesPerMessageLimit else { break }
-            refs.append(imageRef(id: "\(ordinal)-a\(index)", encoded: block["content"]?.stringValue, block: block))
+            refs.append(imageRef(id: "\(prefix)-a\(index)", encoded: block["content"]?.stringValue, block: block))
         }
         return refs
     }
@@ -368,28 +427,53 @@ public enum SessionThreadParser {
     static func decodedByteEstimate(encodedLength: Int) -> Int { encodedLength / 4 * 3 }
 
     /// Reads exactly one image back out of the session file by the id `messages(at:limit:)`
-    /// handed out. Stops scanning at the target record, and refuses anything that does not decode
-    /// or exceeds `imageByteLimit`, so an unbounded or corrupt payload can never reach a response.
+    /// handed out. New byte-offset ids seek directly to the record; legacy ordinal ids still scan
+    /// forward, so an in-memory older client survives a daemon upgrade.
     public static func image(at url: URL, imageId: String) throws -> MessageImageResponse? {
         guard let target = ImageRef(id: imageId) else { return nil }
-        var ordinal = 0
-        var found: MessageImageResponse?
-
-        do {
-            try JSONLFileReader.read(url: url) { data in
-                try Task.checkCancellation()
-                let current = ordinal
-                ordinal += 1
-                guard current == target.ordinal else { return }
-                found = decodedImage(from: data, target: target, imageId: imageId)
-                // The record the id names has been handled either way; reading the rest of a
-                // multi-megabyte session file would be pure waste.
-                throw ScanFinished()
+        switch target.location {
+        case let .offset(offset):
+            guard let data = try record(at: offset, in: url) else { return nil }
+            return decodedImage(from: data, target: target, imageId: imageId)
+        case let .ordinal(targetOrdinal):
+            var ordinal = 0
+            var found: MessageImageResponse?
+            do {
+                try JSONLFileReader.read(url: url) { data in
+                    try Task.checkCancellation()
+                    let current = ordinal
+                    ordinal += 1
+                    guard current == targetOrdinal else { return }
+                    found = decodedImage(from: data, target: target, imageId: imageId)
+                    throw ScanFinished()
+                }
+            } catch is ScanFinished {
+                // Expected early exit.
             }
-        } catch is ScanFinished {
-            // Expected early exit.
+            return found
         }
-        return found
+    }
+
+    private static func record(at offset: UInt64, in url: URL) throws -> Data? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let end = try handle.seekToEnd()
+        guard offset < end else { return nil }
+        try handle.seek(toOffset: offset)
+
+        var record = Data()
+        while record.count < maxImageRecordBytes {
+            try Task.checkCancellation()
+            let remaining = min(256 * 1_024, maxImageRecordBytes - record.count)
+            guard let chunk = try handle.read(upToCount: remaining), !chunk.isEmpty else { break }
+            if let newline = chunk.firstIndex(of: 0x0A) {
+                record.append(chunk[..<newline])
+                if record.last == 0x0D { record.removeLast() }
+                return record.isEmpty ? nil : record
+            }
+            record.append(chunk)
+        }
+        return record.isEmpty || record.count == maxImageRecordBytes ? nil : record
     }
 
     private struct ScanFinished: Error {}
@@ -414,21 +498,29 @@ public enum SessionThreadParser {
         )
     }
 
-    /// `"<entryOrdinal>-c<blockIndex>"` (a `content` block) or `"<entryOrdinal>-a<blockIndex>"`
-    /// (an `attachments` entry). Ordinals are JSONL record positions, and Pi only ever appends,
-    /// so an id stays valid for the life of the session file.
+    /// `"b<byteOffset>-c<blockIndex>"` for new tail projections; the old
+    /// `"<entryOrdinal>-c<blockIndex>"` form remains accepted for compatibility. `a` replaces
+    /// `c` for an attachment.
     struct ImageRef {
-        let ordinal: Int
+        enum Location { case ordinal(Int), offset(UInt64) }
+
+        let location: Location
         let isAttachment: Bool
         let blockIndex: Int
 
         init?(id: String) {
             let parts = id.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2, let ordinal = Int(parts[0]), ordinal >= 0 else { return nil }
+            guard parts.count == 2 else { return nil }
+            if parts[0].first == "b", let offset = UInt64(parts[0].dropFirst()) {
+                location = .offset(offset)
+            } else if let ordinal = Int(parts[0]), ordinal >= 0 {
+                location = .ordinal(ordinal)
+            } else {
+                return nil
+            }
             let tail = parts[1]
             guard let marker = tail.first, marker == "c" || marker == "a",
                   let blockIndex = Int(tail.dropFirst()), blockIndex >= 0 else { return nil }
-            self.ordinal = ordinal
             isAttachment = marker == "a"
             self.blockIndex = blockIndex
         }
