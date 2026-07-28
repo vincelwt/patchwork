@@ -416,21 +416,75 @@ struct StatusDot: View {
     /// Off by default: only a dot that means "work is happening right now" breathes.
     var pulsing = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var phase = false
-
-    private var animates: Bool { pulsing && !reduceMotion }
 
     var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 6, height: 6)
-            .opacity(phase ? 0.3 : 1)
-            .animation(animates ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : nil, value: phase)
-            // Phase follows `animates` rather than being set once: a recycled row that turns
-            // from a static dot into a pulsing one (or back, or when Reduce Motion flips) still
-            // gets the transition the repeating animation needs to start.
-            .onAppear { phase = animates }
-            .onChange(of: animates) { _, on in phase = on }
+        // The pulse is a Core Animation layer animation on purpose: a SwiftUI `repeatForever`
+        // animation ticks the whole window's view graph on the main thread at display-link
+        // frequency for as long as one dot is visible. With several running conversations in
+        // the sidebar that continuous work was measurable against scrolling. The CA animation
+        // runs on the render server and costs the main thread nothing per frame.
+        if pulsing, !reduceMotion {
+            PulsingDotView(color: color)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+        } else {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+        }
+    }
+}
+
+/// Internal (not private) so tests can verify the layer animation reinstalls on reattach.
+struct PulsingDotView: NSViewRepresentable {
+    let color: Color
+
+    func makeNSView(context: Context) -> DotView { DotView() }
+
+    func updateNSView(_ view: DotView, context: Context) {
+        view.dotColor = NSColor(color)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: DotView, context: Context) -> CGSize? {
+        CGSize(width: 6, height: 6)
+    }
+
+    final class DotView: NSView {
+        static let animationKey = "pi-pulse"
+
+        var dotColor: NSColor = .systemGreen {
+            didSet { layer?.backgroundColor = dotColor.cgColor }
+        }
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            layer?.cornerRadius = 3
+            layer?.backgroundColor = dotColor.cgColor
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            // CA removes animations whenever the layer leaves the tree, so reinstall on every
+            // attach (row recycling, window moves) rather than only once.
+            guard window != nil, let layer, layer.animation(forKey: Self.animationKey) == nil else { return }
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1
+            pulse.toValue = 0.3
+            pulse.duration = 0.9
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(pulse, forKey: Self.animationKey)
+        }
+
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            layer?.backgroundColor = dotColor.cgColor
+        }
     }
 }
 
