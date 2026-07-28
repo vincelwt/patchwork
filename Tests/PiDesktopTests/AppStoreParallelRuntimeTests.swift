@@ -137,6 +137,30 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testSwitchingBackImmediatelyRestoresQueuedMessages() {
+        let (store, runtimeA, _, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "local follow-up", delivery: .followUp)
+        runtimeA.onEvent?(.object([
+            "type": .string("queue_update"),
+            "followUp": .array([.string("Pi follow-up")])
+        ]))
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        XCTAssertTrue(store.outbox.isEmpty)
+
+        store.selectSession(sessionA)
+
+        XCTAssertTrue(store.isSelectedRuntime)
+        XCTAssertEqual(store.outbox.map(\.text), ["local follow-up"])
+        XCTAssertEqual(store.runtimeState.followUpQueue, ["Pi follow-up"])
+    }
+
     func testSelectedParkedConversationCanStopWithoutComposerPrewarm() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
         store.selectSession(sessionA)

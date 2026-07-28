@@ -1234,9 +1234,10 @@ final class AppStore: ObservableObject {
         DecodedImageCache.purge()
         resetSelectedGitDirectory(to: session.cwd)
 
-        // A parked questionnaire is already backed by a live runtime. Reattach it immediately;
-        // waiting for the user to edit the composer leaves the inline question impossible to answer.
-        if let slot = currentRouteRuntimeSlot, slot.questionnaire?.submitted == false {
+        // Transient queues and questions belong to the live runtime. Reattach it immediately
+        // instead of hiding them until the user next edits the composer.
+        if let slot = currentRouteRuntimeSlot,
+           slot !== activeRuntimeSlot || activePresentationDetached || slot.questionnaire?.submitted == false {
             activateRuntime(slot)
         }
 
@@ -1745,6 +1746,7 @@ final class AppStore: ObservableObject {
         let sentText = draft
         let sentAttachments = attachments
         let origin = DraftOrigin(route: route, sessionPath: sessionPath?.standardizedFileURL.path)
+        let submittedDraftKey = currentDraftKey
         let optimisticID: String?
         if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
             let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
@@ -1753,6 +1755,8 @@ final class AppStore: ObservableObject {
         } else {
             optimisticID = nil
         }
+        persistDraftText("", for: submittedDraftKey)
+        attachmentsByKey.removeValue(forKey: submittedDraftKey)
         draft = ""
         attachments = []
         var completedSynchronously = false
