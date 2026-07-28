@@ -743,6 +743,42 @@ final class AppStoreRollbackTests: XCTestCase {
 
 @MainActor
 final class StatusCacheMergeTests: XCTestCase {
+    func testTransientSubagentStatusIsLiveOnlyAndOldCacheIsPurged() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let persistence = AppPersistence(baseURL: directory)
+        persistence.cacheExtensionStatuses([ExtensionStatusParser.subagentsKey: "1 running agent"])
+        let store = AppStore(
+            repository: FakeRepository(),
+            gitService: FakeGitService(),
+            runtime: FakeRuntime(),
+            persistence: persistence,
+            activityPresenter: ActivityPresenter()
+        )
+
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.subagentsKey])
+        XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.subagentsKey])
+
+        store.handleRPCEventForTesting(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.subagentsKey),
+            "statusText": .string("1 running agent")
+        ]))
+        XCTAssertEqual(store.statusModel.values[ExtensionStatusParser.subagentsKey], "1 running agent")
+        XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.subagentsKey])
+
+        store.handleRPCEventForTesting(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.subagentsKey)
+        ]))
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.subagentsKey])
+    }
+
     func testAPartialLiveUpdateNeverErasesTheKnownAccount() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)

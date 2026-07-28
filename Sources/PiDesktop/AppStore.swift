@@ -380,6 +380,9 @@ final class AppStore: ObservableObject {
         selectedFolder = globalFolder
         selectedGitDirectoryPath = globalFolder.standardizedFileURL.path
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
+        if cachedStatuses.removeValue(forKey: ExtensionStatusParser.subagentsKey) != nil {
+            self.persistence.cacheExtensionStatuses(cachedStatuses)
+        }
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
 
@@ -2078,7 +2081,7 @@ final class AppStore: ObservableObject {
         probe.stop()
         isProbingStatuses = false
         if !probeStatuses.isEmpty {
-            cachedStatuses.merge(probeStatuses) { _, fresh in fresh }
+            cachedStatuses.merge(probeStatuses.filter { $0.key != ExtensionStatusParser.subagentsKey }) { _, fresh in fresh }
             persistence.cacheExtensionStatuses(cachedStatuses)
         }
     }
@@ -3505,11 +3508,12 @@ final class AppStore: ObservableObject {
             if let value = event["statusText"]?.stringValue, !ANSI.strip(value).isEmpty {
                 let clean = ANSI.strip(value).suffixString(500)
                 slot.statuses[key] = clean
-                cachedStatuses[key] = clean
-                persistence.cacheExtensionStatuses(cachedStatuses)
+                if key != ExtensionStatusParser.subagentsKey { cachedStatuses[key] = clean }
             } else {
                 slot.statuses.removeValue(forKey: key)
+                cachedStatuses.removeValue(forKey: key)
             }
+            persistence.cacheExtensionStatuses(cachedStatuses)
             if slot === activeRuntimeSlot, !activePresentationDetached { extensionStatuses = slot.statuses }
         case "setWidget":
             guard let key = event["widgetKey"]?.stringValue else { return }
@@ -3892,10 +3896,12 @@ final class AppStore: ObservableObject {
                 extensionStatuses[key] = ANSI.strip(value).suffixString(500)
                 // Merge, never replace: a runtime that has only reported `mode` so far must not
                 // erase the last known `codex-account`, which is what made the status bar fall
-                // back to a bare “Codex account” placeholder mid-session.
-                cachedStatuses[key] = extensionStatuses[key]
+                // back to a bare “Codex account” placeholder mid-session. Subagent activity is
+                // runtime-local and must never survive the process that reported it.
+                if key != ExtensionStatusParser.subagentsKey { cachedStatuses[key] = extensionStatuses[key] }
             } else {
                 extensionStatuses.removeValue(forKey: key)
+                cachedStatuses.removeValue(forKey: key)
             }
             persistence.cacheExtensionStatuses(cachedStatuses)
         case "setWidget":
