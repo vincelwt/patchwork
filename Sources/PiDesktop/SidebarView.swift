@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Which shape the sidebar lists conversations in. Deliberately local view state: it is a way of
 /// looking at the same sessions, not a setting worth persisting.
-enum SidebarMode: String, CaseIterable {
+enum SidebarMode: String {
     case tree = "Tree"
     case status = "Status"
 }
@@ -30,11 +30,14 @@ struct SidebarView: View {
             .padding(.bottom, PiTheme.space6)
 
             Picker("View", selection: $mode) {
-                ForEach(SidebarMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                Label("Tree", systemImage: "tree").tag(SidebarMode.tree)
+                Label("Status", systemImage: "circle.fill").tag(SidebarMode.status)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .controlSize(.small)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, PiTheme.space6)
             .padding(.bottom, PiTheme.space6)
             .help("Tree groups by project and folder; Status groups every project's conversations by what they need")
