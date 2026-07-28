@@ -240,7 +240,9 @@ final class AppStore: ObservableObject {
     @Published var toast: ToastMessage?
     @Published var viewedImage: ViewedImage?
     @Published var windowTitle = "Pi Desktop"
-    @Published var inspectorVisible = true
+    @Published var inspectorVisible = true {
+        didSet { persistence.updateState { $0.inspectorVisible = inspectorVisible } }
+    }
     @Published var quickSwitchPresented = false
     /// Shared request surface: sidebar and application menu present the same creation alert.
     @Published var newVirtualFolderRequested = false
@@ -420,6 +422,7 @@ final class AppStore: ObservableObject {
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
+        inspectorVisible = self.persistence.state.inspectorVisible
         self.activityPresenter = activityPresenter
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
         self.probeRuntimeFactory = probeRuntimeFactory

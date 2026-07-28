@@ -173,6 +173,18 @@ final class DraftPersistenceIntegrationTests: XCTestCase {
         XCTAssertEqual(store.draft, "draft for A", "Switching back restores what was typed")
     }
 
+    func testInspectorVisibilityPersistsGloballyAcrossRelaunches() {
+        let firstStore = makeStore(persistence: AppPersistence(baseURL: directory))
+        XCTAssertTrue(firstStore.inspectorVisible)
+
+        firstStore.inspectorVisible = false
+        let secondStore = makeStore(persistence: AppPersistence(baseURL: directory))
+        XCTAssertFalse(secondStore.inspectorVisible)
+
+        secondStore.inspectorVisible = true
+        XCTAssertTrue(makeStore(persistence: AppPersistence(baseURL: directory)).inspectorVisible)
+    }
+
     func testReinstantiatingPersistenceFromTheSameFileKeepsTheDraft() {
         let a = summary(id: "a", file: "a.jsonl")
 
