@@ -254,14 +254,18 @@ final class ComposerInlineImageTests: XCTestCase {
 
     // MARK: - Key handling
 
-    func testEscapeStopsImmediately() {
+    func testFirstEscapeSoftStopsImmediatelyAndSecondFullyStops() {
         let textView = ComposerTextView()
-        var stopCount = 0
-        textView.onEscape = { stopCount += 1 }
+        var fullyStops: [Bool] = []
+        textView.onEscape = { fullyStops.append($0) }
 
         textView.keyDown(with: escapeEvent(at: 1))
+        textView.resetEscapeSequence() // Route changes must not carry A's first Escape into B.
+        textView.keyDown(with: escapeEvent(at: 1.1))
+        textView.keyDown(with: escapeEvent(at: 1.2))
+        textView.keyDown(with: escapeEvent(at: 2))
 
-        XCTAssertEqual(stopCount, 1)
+        XCTAssertEqual(fullyStops, [false, false, true, false])
     }
 
     // MARK: - Finder drop

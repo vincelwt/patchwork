@@ -61,7 +61,7 @@ struct ComposerView: View {
                 placeholder: placeholder,
                 autofocus: autofocus,
                 onSubmit: handleSend,
-                onEscape: store.canStopCurrentThread ? { store.abort() } : nil,
+                onEscape: { store.stopFromEscape(fully: $0) },
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )
@@ -84,7 +84,10 @@ struct ComposerView: View {
             RoundedRectangle(cornerRadius: PiTheme.composerRadius, style: .continuous)
                 .stroke(Color.piHairline, lineWidth: PiTheme.hairline)
         }
-        .onChange(of: focusSignal) { _, _ in bridge.focus?() }
+        .onChange(of: focusSignal) { _, _ in
+            bridge.resetEscapeSequence?()
+            bridge.focus?()
+        }
     }
 
     private var canSend: Bool {
@@ -169,7 +172,7 @@ private struct ComposerToolbar: View {
             ModeSlider()
 
             if store.canStopCurrentThread, let onAbort {
-                IconButton(symbol: "stop.fill", help: "Stop Thread (Esc or ⌘.)", action: onAbort)
+                IconButton(symbol: "stop.fill", help: "Stop Thread (⌘.)", action: onAbort)
                     .accessibilityLabel("Stop Thread")
             }
 
