@@ -223,35 +223,37 @@ private struct ComposerToolbar: View {
 }
 
 /// `/mode` as a continuous choice from quickest to strongest, which is how the modes actually
-/// differ (model, thinking level, subagents). Unknown or missing status degrades to a label.
+/// differ (model, thinking level, subagents). It disappears as soon as Pi reports a manual
+/// configuration outside that ladder.
 struct ModeSlider: View {
     @EnvironmentObject private var store: AppStore
 
     private var mode: PiMode? { store.statusModel.mode }
 
+    @ViewBuilder
     var body: some View {
-        HStack(spacing: PiTheme.space6) {
-            Text(mode?.label ?? "mode")
-                .font(mode == .ultra ? PiFont.captionEmphasis : PiFont.caption)
-                .foregroundStyle(mode.map { $0.piTint } ?? Color.secondary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+        if let mode {
+            HStack(spacing: PiTheme.space6) {
+                Text(mode.label)
+                    .font(mode == .ultra ? PiFont.captionEmphasis : PiFont.caption)
+                    .foregroundStyle(mode.piTint)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
 
-            // AppKit's slider cannot be restyled, so effort gets its own calm-to-hot track.
-            PiEffortTrack(mode: mode) { store.setMode($0) }
-                .frame(width: PiTheme.effortTrackWidth, height: PiTheme.effortUltraKnobDiameter)
-                .disabled(mode == nil)
-        }
-        .opacity(mode == nil ? 0.55 : 1)
-        .help(mode.map { "Mode \($0.label) · \($0.detail)" } ?? "The mode extension is not loaded")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Effort")
-        .accessibilityValue(mode.map { "\($0.label), \($0.detail)" } ?? "unavailable")
-        .accessibilityAdjustableAction { direction in
-            guard let mode, let current = PiMode.allCases.firstIndex(of: mode) else { return }
-            let next = direction == .increment ? current + 1 : current - 1
-            guard PiMode.allCases.indices.contains(next) else { return }
-            store.setMode(PiMode.allCases[next])
+                // AppKit's slider cannot be restyled, so effort gets its own calm-to-hot track.
+                PiEffortTrack(mode: mode) { store.setMode($0) }
+                    .frame(width: PiTheme.effortTrackWidth, height: PiTheme.effortUltraKnobDiameter)
+            }
+            .help("Mode \(mode.label) · \(mode.detail)")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Effort")
+            .accessibilityValue("\(mode.label), \(mode.detail)")
+            .accessibilityAdjustableAction { direction in
+                guard let current = PiMode.allCases.firstIndex(of: mode) else { return }
+                let next = direction == .increment ? current + 1 : current - 1
+                guard PiMode.allCases.indices.contains(next) else { return }
+                store.setMode(PiMode.allCases[next])
+            }
         }
     }
 }

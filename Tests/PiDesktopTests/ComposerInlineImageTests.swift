@@ -344,7 +344,7 @@ final class ComposerInlineImageTests: XCTestCase {
             .deletingLastPathComponent()
             .appendingPathComponent("Sources/PiDesktop/ComposerView.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        XCTAssertTrue(source.contains(".lineLimit(1)\n                .fixedSize(horizontal: true, vertical: false)"))
+        XCTAssertTrue(source.contains(".lineLimit(1)\n                    .fixedSize(horizontal: true, vertical: false)"))
         XCTAssertFalse(source.contains(".frame(width: 34, alignment: .trailing)"))
     }
 
