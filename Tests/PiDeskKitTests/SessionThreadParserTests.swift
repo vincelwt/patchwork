@@ -244,8 +244,42 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(blocks.map(\.type), ["text", "text", "image", "a_future_block", "toolCall"], "an unknown kind keeps its place")
         let carried = blocks.compactMap(\.text).reduce(0) { $0 + $1.count }
             + blocks.compactMap(\.arguments).reduce(0) { $0 + $1.count }
-        XCTAssertLessThanOrEqual(carried, SessionThreadParser.blockTextLimit + 8, "one message cannot outgrow the shared budget")
+        XCTAssertLessThanOrEqual(carried, SessionThreadParser.blockTextLimit, "one message cannot outgrow the shared budget")
         XCTAssertEqual(blocks[4].callId, "call_1", "a tool call keeps its identity even once the budget is spent")
+    }
+
+    func testStructuredMetadataAndCompactionBlocksAreExactlyBounded() throws {
+        let long = String(repeating: "x", count: SessionThreadParser.blockMetadataLimit + 100)
+        let summary = String(repeating: "s", count: SessionThreadParser.blockTextLimit + 100)
+        let url = write([
+            """
+            {"type":"message","id":"m1","message":{"role":"assistant","stopReason":"\(long)","content":[\
+            {"type":"toolCall","id":"\(long)","name":"\(long)","arguments":{}},\
+            {"type":"\(long)"}]}}
+            """,
+            """
+            {"type":"message","id":"m2","message":{"role":"toolResult","toolCallId":"\(long)","toolName":"\(long)","content":"done"}}
+            """,
+            """
+            {"type":"message","id":"m3","message":{"role":"\(long)","content":"future"}}
+            """,
+            #"{"type":"compaction","id":"c1","summary":"\#(summary)"}"#
+        ])
+        let messages = try SessionThreadParser.messages(at: url, limit: 10)
+        let call = try XCTUnwrap(messages[0].blocks?.first)
+        let future = try XCTUnwrap(messages[0].blocks?.last)
+
+        XCTAssertEqual(call.callId?.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertEqual(call.name?.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertEqual(future.type.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertEqual(messages[0].stopReason?.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertEqual(messages[1].toolCallId, call.callId, "bounded call ids still match their result")
+        XCTAssertEqual(messages[1].toolName?.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertEqual(messages[2].role.rawValue.count, SessionThreadParser.blockMetadataLimit)
+        XCTAssertLessThanOrEqual(
+            messages[3].blocks?.compactMap(\.text).reduce(0) { $0 + $1.count } ?? Int.max,
+            SessionThreadParser.blockTextLimit
+        )
     }
 
     func testRichFieldsAreOptionalOnTheWireInBothDirections() throws {
