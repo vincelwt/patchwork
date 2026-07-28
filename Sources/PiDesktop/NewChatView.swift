@@ -19,9 +19,7 @@ struct NewChatView: View {
                     streaming: store.streamingMessage,
                     isRunning: true,
                     transcriptRevision: store.transcriptRevision,
-                    restoredAnchorID: nil,
-                    unseenMessageID: nil,
-                    onVisibleAnchorChange: { _ in }
+                    unseenMessageID: nil
                 )
             }
         }

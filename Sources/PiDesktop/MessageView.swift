@@ -222,11 +222,10 @@ struct TranscriptWorkView: View, Equatable {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
             Button { userExpanded = !isOpen } label: {
                 HStack(spacing: PiTheme.gridGutter) {
-                    // The icon column is always reserved — spinner while live, empty once
-                    // settled — so the headline's text starts at the exact same origin as every
-                    // row inside the log below it, active or not.
+                    // The icon column is always reserved while live or settled, so the headline
+                    // starts at the same origin as every row inside the log below it.
                     Group {
-                        if block.isActive { ProgressView().controlSize(.mini) }
+                        if block.isActive { StatusDot(color: .piGreen) }
                     }
                     .frame(width: PiTheme.gridIconColumn, alignment: .center)
                     headline
@@ -495,7 +494,7 @@ private struct DisclosureRow<Detail: View>: View {
             Button { expanded = !isOpen } label: {
                 HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
                     Group {
-                        if showsProgress { ProgressView().controlSize(.mini) }
+                        if showsProgress { StatusDot(color: .piGreen) }
                         else {
                             Image(systemName: symbol)
                                 .font(.system(size: PiIcon.small, weight: .regular))

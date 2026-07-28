@@ -77,7 +77,7 @@ private struct RuntimeStateLabel: View {
     var body: some View {
         if let activity {
             HStack(spacing: PiTheme.space4) {
-                ProgressView().controlSize(.mini)
+                StatusDot(color: .piGreen)
                 Text(activity.text)
                     .font(PiFont.micro)
                     .foregroundStyle(.secondary)

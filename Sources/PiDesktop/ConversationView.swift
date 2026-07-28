@@ -9,25 +9,6 @@ extension PiTheme {
 }
 
 @MainActor
-final class ConversationScrollAnchorStore {
-    private var anchors: [String: String] = [:]
-    private var order: [String] = []
-    private let limit: Int
-
-    init(limit: Int = 32) { self.limit = limit }
-
-    func anchor(for path: String) -> String? { anchors[path] }
-
-    func remember(_ anchor: String, for path: String) {
-        guard anchors[path] != anchor else { return }
-        anchors[path] = anchor
-        order.removeAll { $0 == path }
-        order.append(path)
-        while order.count > limit { anchors.removeValue(forKey: order.removeFirst()) }
-    }
-}
-
-@MainActor
 final class TranscriptProjectionCache {
     private var revision = -1
     private var isRunning = false
@@ -72,9 +53,6 @@ struct ConversationView: View {
     /// Bumped whenever the last message's edit affordance fires, so the composer (which owns the
     /// actual `NSTextView`) knows to reclaim first responder after its content is replaced.
     @State private var composerFocusTick = 0
-    /// In-memory only: recent routes reopen at the row the user was reading. The transcript page
-    /// cache carries the matching rows; both structures stay bounded.
-    @State private var scrollAnchors = ConversationScrollAnchorStore()
 
     var body: some View {
         GeometryReader { proxy in
@@ -190,7 +168,7 @@ struct ConversationView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 if let session = store.selectedSession, store.isRunning(session) {
-                    ProgressView().controlSize(.mini)
+                    StatusDot(color: .piGreen)
                 }
                 Menu {
                     Button("Rename…") {
@@ -254,15 +232,12 @@ struct ConversationView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            let path = store.selectedSession?.fileURL.standardizedFileURL.path ?? "new-chat"
             MessageScrollView(
                 messages: store.messages,
                 streaming: store.streamingMessage,
                 isRunning: conversationIsRunning,
                 transcriptRevision: store.transcriptRevision,
-                restoredAnchorID: scrollAnchors.anchor(for: path),
                 unseenMessageID: store.initialScrollTargetMessageID,
-                onVisibleAnchorChange: { rememberScrollAnchor($0, for: path) },
                 onEditLastMessage: {
                     store.beginEditingLastMessage()
                     composerFocusTick += 1
@@ -270,10 +245,6 @@ struct ConversationView: View {
             )
             .id(store.route)
         }
-    }
-
-    private func rememberScrollAnchor(_ anchor: String, for path: String) {
-        scrollAnchors.remember(anchor, for: path)
     }
 }
 
@@ -284,9 +255,7 @@ struct MessageScrollView: View {
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
     let transcriptRevision: Int
-    let restoredAnchorID: String?
     let unseenMessageID: String?
-    let onVisibleAnchorChange: (String) -> Void
     /// Wired only to the conversation's single most recent user message; every earlier turn's
     /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
     var onEditLastMessage: (() -> Void)?
@@ -295,26 +264,10 @@ struct MessageScrollView: View {
     @State private var scrollBridge = ConversationScrollBridge()
     @State private var prependPending = false
     @State private var didRestoreInitialAnchor = false
-    @State private var autoPageAttempts = 0
     @State private var underfillPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
-    @State private var initialDefaultScrollAnchor: UnitPoint?
     @State private var projectionCache = TranscriptProjectionCache()
     private let bottomID = "conversation-bottom"
-    private let coordinateSpaceName = "conversation-scroll"
-
-    static func unseenTargetID(_ sourceID: String?, in items: [TranscriptItem]) -> String? {
-        guard let sourceID else { return nil }
-        return items.first(where: { $0.sourceMessageID == sourceID })?.id
-    }
-
-    private func requestedDefaultScrollAnchor(items: [TranscriptItem]) -> UnitPoint {
-        if unseenMessageID != nil,
-           store.isConversationLoading || Self.unseenTargetID(unseenMessageID, in: items) != nil { return .top }
-        if let restoredAnchorID, restoredAnchorID != bottomID,
-           items.contains(where: { $0.id == restoredAnchorID }) { return .top }
-        return .bottom
-    }
 
     private var transcriptItems: [TranscriptItem] {
         projectionCache.items(
@@ -390,14 +343,6 @@ struct MessageScrollView: View {
                                     .padding(.vertical, PiTheme.space6)
                             }
                         }
-                        .background(
-                            GeometryReader { proxy in
-                                Color.clear.preference(
-                                    key: TranscriptRowFramesKey.self,
-                                    value: [item.id: proxy.frame(in: .named(coordinateSpaceName))]
-                                )
-                            }
-                        )
                         .id(item.id)
                         .onAppear {
                             guard !didMarkFirstTextPaint else { return }
@@ -422,22 +367,17 @@ struct MessageScrollView: View {
                     }
                 )
             }
-            // Native initial anchoring prevents a top-frame flash before any scrollTo callback.
-            .defaultScrollAnchor(initialDefaultScrollAnchor ?? requestedDefaultScrollAnchor(items: items))
-            .coordinateSpace(name: coordinateSpaceName)
+            // Every route opens at its newest durable/live result; paging preserves position only
+            // within that visit.
+            .defaultScrollAnchor(.bottom)
             .scrollDismissesKeyboard(.interactively)
-            .onAppear {
-                if initialDefaultScrollAnchor == nil {
-                    initialDefaultScrollAnchor = requestedDefaultScrollAnchor(items: items)
-                }
-                restoreInitialAnchorIfPossible(items: items, reader: reader)
-            }
+            .onAppear { restoreInitialBottomIfPossible(reader: reader) }
             .onChange(of: messages.first?.id) { _, _ in
-                restoreInitialAnchorIfPossible(items: items, reader: reader)
+                restoreInitialBottomIfPossible(reader: reader)
                 if didRestoreInitialAnchor, isPinnedToBottom, !prependPending { scheduleBottomScroll(reader) }
             }
             .onChange(of: store.isConversationLoading) { wasLoading, isLoading in
-                if wasLoading, !isLoading { restoreInitialAnchorIfPossible(items: items, reader: reader) }
+                if wasLoading, !isLoading { restoreInitialBottomIfPossible(reader: reader) }
             }
             .onChange(of: messages.last?.id) { _, _ in scheduleBottomScroll(reader) }
             .onChange(of: streaming?.textContent.count ?? 0) { _, _ in scheduleBottomScroll(reader) }
@@ -449,14 +389,7 @@ struct MessageScrollView: View {
                 if prependPending {
                     scrollBridge.restoreAfterPrepend()
                     prependPending = false
-                } else {
-                    restoreInitialAnchorIfPossible(items: items, reader: reader)
                 }
-            }
-            .onPreferenceChange(TranscriptRowFramesKey.self) { frames in
-                guard !isPinnedToBottom,
-                      let top = frames.filter({ $0.value.maxY > 0 }).min(by: { $0.value.minY < $1.value.minY }) else { return }
-                onVisibleAnchorChange(top.key)
             }
             .onDisappear { scrollTask?.cancel() }
             .overlay(alignment: .bottom) {
@@ -464,7 +397,6 @@ struct MessageScrollView: View {
                     Button {
                         scrollTask?.cancel()
                         isPinnedToBottom = true
-                        onVisibleAnchorChange(bottomID)
                         withAnimation(.easeOut(duration: 0.18)) { reader.scrollTo(bottomID, anchor: .bottom) }
                     } label: {
                         Label("Jump to latest", systemImage: "arrow.down")
@@ -485,7 +417,6 @@ struct MessageScrollView: View {
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
         if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
-        if metrics.isNearBottom { onVisibleAnchorChange(bottomID) }
         guard didRestoreInitialAnchor, metrics.shouldRequestEarlierHistory else { return }
         if metrics.isUnderfilled {
             guard underfillPageAttempts < 2 else { return }
@@ -504,40 +435,17 @@ struct MessageScrollView: View {
         return true
     }
 
-    private func restoreInitialAnchorIfPossible(items: [TranscriptItem], reader: ScrollViewProxy) {
-        guard !didRestoreInitialAnchor else { return }
-        let target: String?
-        if unseenMessageID != nil {
-            if let unseenTarget = Self.unseenTargetID(unseenMessageID, in: items) {
-                target = unseenTarget
-            } else if store.isConversationLoading {
-                return
-            } else {
-                // Empty/error completions can fold into a work row and have no standalone target.
-                target = bottomID
-            }
-        } else if let restoredAnchorID {
-            if restoredAnchorID == bottomID || items.contains(where: { $0.id == restoredAnchorID }) {
-                target = restoredAnchorID
-            } else if store.isLoadingEarlierMessages {
-                return
-            } else if store.hasEarlierMessages, autoPageAttempts < 2 {
-                autoPageAttempts += 1
-                store.loadEarlierMessages()
-                return
-            } else {
-                target = bottomID
-            }
-        } else {
-            target = bottomID
-        }
+    private func restoreInitialBottomIfPossible(reader: ScrollViewProxy) {
+        guard !didRestoreInitialAnchor, !store.isConversationLoading else { return }
         didRestoreInitialAnchor = true
-        guard let target else { return }
         DispatchQueue.main.async {
-            reader.scrollTo(target, anchor: target == bottomID ? .bottom : .top)
+            reader.scrollTo(bottomID, anchor: .bottom)
             if unseenMessageID != nil { store.consumeInitialScrollTarget() }
-            ConversationPerformance.mark("Conversation anchor restore", path: store.selectedSession?.fileURL.path ?? "new-chat")
+            ConversationPerformance.mark("Conversation bottom restore", path: store.selectedSession?.fileURL.path ?? "new-chat")
         }
+        // Lazy rows can settle one pass after the native anchor; correct once more unless the user
+        // has already started scrolling away.
+        scheduleBottomScroll(reader)
     }
 
     private func scheduleBottomScroll(_ reader: ScrollViewProxy) {
@@ -570,13 +478,6 @@ private struct DelayedConversationLoadingView: View {
             guard !Task.isCancelled else { return }
             isVisible = true
         }
-    }
-}
-
-private struct TranscriptRowFramesKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }
 

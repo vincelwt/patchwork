@@ -637,7 +637,7 @@ private struct SessionRow: View {
             if waitingForQuestion {
                 StatusDot(color: .piPurple).help("Waiting for your answer")
             } else if running {
-                StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
+                StatusDot(color: .piGreen).help("Pi is working")
             } else if unread {
                 StatusDot(color: .piBlue).help("Unread")
             }

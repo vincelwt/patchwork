@@ -164,7 +164,7 @@ private struct CapabilitySection: View {
         VStack(alignment: .leading, spacing: PiTheme.space6) {
             PiSectionHeader(title: capability.kind.rawValue, trailing: "active")
             InspectorRow(symbol: capability.kind.symbol, title: capability.title) {
-                ProgressView().controlSize(.mini)
+                StatusDot(color: .piGreen)
             }
             if let target = capability.target {
                 Text(target)
@@ -260,7 +260,7 @@ private struct ActivityRow: View {
 
     @ViewBuilder private var status: some View {
         switch item.status {
-        case .running, .waiting: ProgressView().controlSize(.mini)
+        case .running, .waiting: StatusDot(color: .piGreen)
         case .succeeded: symbol("checkmark.circle.fill", Color.piGreen)
         case .failed: symbol("xmark.circle.fill", Color.piRed)
         case .stopped: symbol("stop.circle", .secondary)
