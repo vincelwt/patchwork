@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 8
+// pi-desktop-activity-version: 9
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -398,6 +398,29 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     });
   }
 
+  pi.registerCommand("pi-desktop-edit-message", {
+    description: "Branch before a user message for Pi Desktop editing",
+    handler: async (args, ctx) => {
+      await ctx.waitForIdle();
+      const [entryId, token, ...extra] = args.trim().split(/\s+/);
+      const entry = entryId ? ctx.sessionManager.getEntry(entryId) : undefined;
+      if (!entryId || !/^[0-9a-f-]{36}$/i.test(token ?? "") || extra.length > 0
+          || entry?.type !== "message" || entry.message.role !== "user") {
+        throw new Error("Pi Desktop supplied an invalid message edit target.");
+      }
+      // `navigateTree` treats its current leaf as a no-op. A hidden state entry gives it a child
+      // to leave behind when the unanswered user message itself is the leaf.
+      if (ctx.sessionManager.getLeafId() === entryId) {
+        pi.appendEntry("pi-desktop-edit-anchor", { targetId: entryId });
+      }
+      const result = await ctx.navigateTree(entryId, { summarize: false });
+      if (result.cancelled) throw new Error("A Pi extension cancelled the message edit.");
+      // This marker both persists the selected branch and lets Desktop verify navigation before
+      // it sends the replacement prompt.
+      pi.appendEntry("pi-desktop-edit-ready", { targetId: entryId, token });
+    },
+  });
+
   pi.registerCommand("pi-desktop-resume", {
     description: "Resume an interrupted turn after network connectivity returns",
     handler: async () => {
@@ -513,6 +536,13 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     }
   });
 
+  pi.on("session_tree", async (_event, ctx) => {
+    completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());
+    preview = undefined;
+    stopReason = undefined;
+    syncHeartbeat();
+  });
+
   pi.on("agent_start", async () => {
     agentRunning = true;
     syncHeartbeat();
@@ -523,7 +553,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     syncHeartbeat();
   });
 
-  pi.on("turn_end", async (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     try {
       const message = (event as { message?: { role?: string; content?: unknown; stopReason?: unknown } })
         .message;

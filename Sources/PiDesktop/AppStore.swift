@@ -1770,10 +1770,9 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Pi sessions are append-only, so editing a sent turn means forking immediately before the
-    /// original entry and continuing in the new session. Only the active transcript moves; the
-    /// abandoned answer remains available in the source session.
-    func forkAndSubmitEditedMessage(
+    /// Pi sessions are append-only trees. Editing moves the current runtime immediately before
+    /// the original entry, then appends the replacement on a new branch in the same session file.
+    func branchAndSubmitEditedMessage(
         targetID: String,
         targetText: String,
         messagesBeforeTarget: [ChatMessage],
@@ -1781,6 +1780,7 @@ final class AppStore: ObservableObject {
     ) {
         guard let source = selectedSession else { completion(); return }
         let sourcePath = source.fileURL.standardizedFileURL.path
+        let commandName = "pi-desktop-edit-message"
         let fail: (String, ToastMessage.Style) -> Void = { [weak self] message, style in
             self?.showToast(message, style: style)
             completion()
@@ -1802,7 +1802,7 @@ final class AppStore: ObservableObject {
                 return
             }
 
-            let invalidateForkedRuntime = { [weak self, weak slot] in
+            let discardNavigatedRuntime = { [weak self, weak slot] in
                 guard let self, let slot else { return }
                 slot.isReady = false
                 slot.runtime.stop()
@@ -1814,85 +1814,103 @@ final class AppStore: ObservableObject {
                 }
             }
 
-            let sendFork: (String) -> Void = { [weak self, weak slot] entryID in
+            let navigateAndSubmit: (String) -> Void = { [weak self, weak slot] entryID in
                 guard let self, let slot else { completion(); return }
-                slot.runtime.send(type: "fork", payload: ["entryId": .string(entryID)]) { [weak self, weak slot] result in
+                slot.runtime.send(type: "get_commands", payload: [:]) { [weak self, weak slot] result in
                     guard let self, let slot else { completion(); return }
+                    guard slot === activeRuntimeSlot,
+                          selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
+                        completion()
+                        return
+                    }
+                    let response: JSONValue
                     switch result {
                     case let .failure(error):
-                        if RPCFailureHandling.isOutcomeUnknown(error) { invalidateForkedRuntime() }
-                        fail(error.localizedDescription, RPCFailureHandling.isOutcomeUnknown(error) ? .warning : .error)
+                        fail(error.localizedDescription, .error)
                         return
-                    case let .success(response):
-                        if let error = responseError(response) { fail(error, .error); return }
-                        if response["data"]?["cancelled"]?.boolValue == true {
-                            fail("A Pi extension cancelled the edit.", .warning)
-                            return
-                        }
+                    case let .success(value):
+                        response = value
+                    }
+                    if let error = responseError(response) {
+                        fail(error, .error)
+                        return
+                    }
+                    let commandAvailable = response["data"]?["commands"]?.arrayValue?.contains {
+                        $0["name"]?.stringValue == commandName && $0["source"]?.stringValue == "extension"
+                    } == true
+                    guard commandAvailable else {
+                        discardNavigatedRuntime()
+                        fail("Pi Desktop’s message editing helper is unavailable. Restart Pi Desktop and try again.", .warning)
+                        return
                     }
 
-                    slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+                    let token = UUID().uuidString
+                    let command = "/\(commandName) \(entryID) \(token)"
+                    slot.runtime.send(type: "prompt", payload: ["message": .string(command)]) { [weak self, weak slot] result in
                         guard let self, let slot else { completion(); return }
                         guard slot === activeRuntimeSlot,
                               selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
-                            invalidateForkedRuntime()
+                            discardNavigatedRuntime()
                             completion()
                             return
                         }
-                        let response: JSONValue
                         switch result {
                         case let .failure(error):
-                            invalidateForkedRuntime()
-                            fail(error.localizedDescription, .error)
+                            discardNavigatedRuntime()
+                            fail(error.localizedDescription, RPCFailureHandling.isOutcomeUnknown(error) ? .warning : .error)
                             return
-                        case let .success(value):
-                            response = value
-                        }
-                        guard responseError(response) == nil,
-                              let data = response["data"],
-                              let sessionFile = data["sessionFile"]?.stringValue,
-                              let sessionID = data["sessionId"]?.stringValue else {
-                            invalidateForkedRuntime()
-                            fail(responseError(response) ?? "Pi did not report the edited conversation.", .error)
-                            return
+                        case let .success(response):
+                            if let error = responseError(response) {
+                                discardNavigatedRuntime()
+                                fail(error, .error)
+                                return
+                            }
                         }
 
-                        let url = URL(fileURLWithPath: sessionFile).standardizedFileURL
-                        guard url.path != sourcePath else {
-                            invalidateForkedRuntime()
-                            fail("Pi did not create an edited conversation.", .error)
-                            return
-                        }
-                        applyState(data, to: slot)
-                        slot.startedForNewChat = false
+                        slot.runtime.send(type: "get_entries", payload: ["since": .string(entryID)]) { [weak self, weak slot] result in
+                            guard let self, let slot else { completion(); return }
+                            guard slot === activeRuntimeSlot,
+                                  selectedSession?.fileURL.standardizedFileURL.path == sourcePath else {
+                                discardNavigatedRuntime()
+                                completion()
+                                return
+                            }
+                            let response: JSONValue
+                            switch result {
+                            case let .failure(error):
+                                discardNavigatedRuntime()
+                                fail(error.localizedDescription, .error)
+                                return
+                            case let .success(value):
+                                response = value
+                            }
+                            let entries = response["data"]?["entries"]?.arrayValue
+                            let marker = entries?.last(where: {
+                                $0["type"]?.stringValue == "custom"
+                                    && $0["customType"]?.stringValue == "pi-desktop-edit-ready"
+                                    && $0["data"]?["targetId"]?.stringValue == entryID
+                                    && $0["data"]?["token"]?.stringValue == token
+                            })
+                            guard responseError(response) == nil,
+                                  let markerID = marker?["id"]?.stringValue,
+                                  response["data"]?["leafId"]?.stringValue == markerID else {
+                                discardNavigatedRuntime()
+                                fail(responseError(response) ?? "Pi did not switch to the edited history.", .error)
+                                return
+                            }
 
-                        let forked: SessionSummary
-                        if let existing = sessions.first(where: { $0.fileURL.standardizedFileURL.path == url.path }) {
-                            forked = existing
-                        } else {
-                            var provisional = SessionSummary(
-                                id: sessionID, fileURL: url, cwd: source.cwd,
-                                createdAt: Date(), modifiedAt: Date(), name: source.name,
-                                preview: source.preview, messageCount: messagesBeforeTarget.count,
-                                metrics: TokenMetrics()
-                            )
-                            provisional.prepareSearchKey()
-                            sessions.insert(provisional, at: 0)
-                            syncActivityMonitorPaths()
-                            observedActivityPaths.insert(url.path)
-                            forked = provisional
+                            finalDurabilityTasks.removeValue(forKey: slot.id)?.cancel()
+                            transcriptCache.remove(sourcePath)
+                            liveMessagesByPath.removeValue(forKey: sourcePath)
+                            liveMessageOrder.removeAll { $0.path == sourcePath }
+                            removePendingFinal(path: sourcePath)
+                            // Reselecting the same route preserves its draft while rebuilding the
+                            // bounded page and pagination cursor from Pi's new active branch.
+                            selectSession(source)
+                            messages = enforcingLoadedImageBudget(messagesBeforeTarget)
+                            submitDraft()
+                            completion()
                         }
-
-                        let editedDraft = draft
-                        let editedAttachments = attachments
-                        draft = ""
-                        attachments = []
-                        selectSession(forked)
-                        messages = enforcingLoadedImageBudget(messagesBeforeTarget)
-                        draft = editedDraft
-                        attachments = editedAttachments
-                        submitDraft()
-                        completion()
                     }
                 }
             }
@@ -1925,10 +1943,10 @@ final class AppStore: ObservableObject {
                         fail("Pi could not find the original message to edit.", .error)
                         return
                     }
-                    sendFork(entryID)
+                    navigateAndSubmit(entryID)
                 }
             } else {
-                sendFork(targetID)
+                navigateAndSubmit(targetID)
             }
         }
     }

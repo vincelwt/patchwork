@@ -24,6 +24,7 @@ enum RPCTimeoutPolicy {
         "get_state",
         "get_session_stats",
         "get_fork_messages",
+        "get_entries",
         "get_commands"
     ]
 
