@@ -23,6 +23,7 @@ final class AssetResolutionTests: XCTestCase {
             ("/css/app.css", "text/css; charset=utf-8"),
             ("/js/app.js", "text/javascript; charset=utf-8"),
             ("/js/markdown.mjs", "text/javascript; charset=utf-8"),
+            ("/js/transcript.mjs", "text/javascript; charset=utf-8"),
             ("/manifest.webmanifest", "application/manifest+json"),
             ("/favicon.svg", "image/svg+xml"),
             ("/icons/icon-256.png", "image/png")
@@ -32,6 +33,13 @@ final class AssetResolutionTests: XCTestCase {
             XCTAssertEqual(asset.contentType, contentType, "wrong content type for \(path)")
             XCTAssertFalse(asset.data.isEmpty, "\(path) should not be empty")
         }
+    }
+
+    func testThreadListKeepsSignOutControl() throws {
+        let asset = try XCTUnwrap(PiDeskWeb.asset(for: "/js/views/threadList.js"))
+        let source = String(decoding: asset.data, as: UTF8.self)
+        XCTAssertTrue(source.contains(#""aria-label": "Sign out""#))
+        XCTAssertTrue(source.contains("actions.signOut()"))
     }
 
     func testUnknownRouteFallsBackToIndexForSPARouting() throws {

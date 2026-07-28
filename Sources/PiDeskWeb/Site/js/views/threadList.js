@@ -31,7 +31,8 @@ export function renderThreadList(state, actions) {
       "header",
       { class: "topbar" },
       h("h1", { tabindex: "-1" }, "Threads"),
-      refreshBtn
+      refreshBtn,
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Sign out", onclick: () => actions.signOut() }, "\u23fb")
     ),
     indicator,
     scroll,
