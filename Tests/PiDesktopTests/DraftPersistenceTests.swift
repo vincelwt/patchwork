@@ -216,6 +216,27 @@ final class DraftPersistenceIntegrationTests: XCTestCase {
         XCTAssertEqual(store.draft, "", "A's draft stays cleared after sending, even after navigating away and back")
     }
 
+    func testSubmittedNewChatOpenerIsNotReusedAsTheNextDraft() {
+        let runtime = FakeRuntime()
+        let store = makeStore(persistence: AppPersistence(baseURL: directory), runtime: runtime)
+        let existing = summary(id: "existing", file: "existing.jsonl")
+        store.sessions = [existing]
+
+        store.draft = "opening message"
+        store.selectSession(existing) // Parks the new-chat draft.
+        store.openNewChat()
+        XCTAssertEqual(store.draft, "opening message")
+
+        let newSession = directory.appendingPathComponent("new.jsonl").standardizedFileURL
+        runtime.sessionFile = newSession.path
+        runtime.sessionID = "new"
+        store.submitDraft()
+        XCTAssertEqual(store.route, .session(newSession.path))
+
+        store.openNewChat()
+        XCTAssertEqual(store.draft, "")
+    }
+
     func testOversizedDraftIsTruncatedWhenPersisted() {
         let persistence = AppPersistence(baseURL: directory)
         let store = makeStore(persistence: persistence)
