@@ -117,6 +117,15 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
         activities.flatMap(\.steps).filter { $0.kind == .question || !($0.result?.images.isEmpty ?? true) }
     }
 
+    /// One gallery for the whole turn, including screenshots produced by separate tool calls.
+    var prominentImages: [ImagePayload] {
+        prominentSteps.flatMap { $0.result?.images ?? [] }
+    }
+
+    var firstProminentImageStepID: String? {
+        prominentSteps.first { !($0.result?.images.isEmpty ?? true) }?.id
+    }
+
     var stepCount: Int { activities.reduce(0) { $0 + $1.steps.count } }
     /// Live details are opt-in; the collapsed row carries the latest thought instead.
     var shouldStartExpanded: Bool { false }

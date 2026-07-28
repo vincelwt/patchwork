@@ -1,6 +1,17 @@
 import SwiftUI
 
+private extension MessageBlock {
+    var imagePayload: ImagePayload? {
+        guard case let .image(image) = kind else { return nil }
+        return image
+    }
+}
+
 private extension ChatMessage {
+    func imageRun(startingAt index: Int) -> [ImagePayload] {
+        blocks[index...].prefix { $0.imagePayload != nil }.compactMap(\.imagePayload)
+    }
+
     func isRenderEquivalent(to other: ChatMessage) -> Bool {
         guard id == other.id, role == other.role, timestamp == other.timestamp,
               toolCallID == other.toolCallID, toolName == other.toolName,
@@ -140,7 +151,7 @@ struct MessageView: View, Equatable {
 
     @ViewBuilder
     private func blockList(showThinking: Bool, fillWidth: Bool = true, isAnswer: Bool = false) -> some View {
-        ForEach(message.blocks) { block in
+        ForEach(Array(message.blocks.enumerated()), id: \.element.id) { index, block in
             switch block.kind {
             case let .text(text):
                 if !text.isEmpty {
@@ -154,8 +165,13 @@ struct MessageView: View, Equatable {
                         MarkdownBlockView(text: text, streaming: isStreaming, fillWidth: fillWidth)
                     }
                 }
-            case let .image(image):
-                ConversationImage(image: image, onOpen: { onImage(image, message.images) })
+            case .image:
+                if index == 0 || message.blocks[index - 1].imagePayload == nil {
+                    ConversationImageStrip(
+                        images: message.imageRun(startingAt: index),
+                        onOpen: { onImage($0, message.images) }
+                    )
+                }
             case let .thinking(text):
                 if showThinking, !text.isEmpty {
                     ThinkingBlockView(text: text, streaming: isStreaming)
@@ -281,8 +297,11 @@ struct TranscriptWorkView: View, Equatable {
                         showsSummaryWhenInactive: false
                     )
                 }
-                ForEach(step.result?.images ?? []) { image in
-                    ConversationImage(image: image, onOpen: { onImage(image, step.result?.images ?? []) })
+                if step.id == block.firstProminentImageStepID {
+                    ConversationImageStrip(
+                        images: block.prominentImages,
+                        onOpen: { onImage($0, block.prominentImages) }
+                    )
                 }
             }
         }
@@ -668,6 +687,27 @@ private struct ToolActivityStepRow: View {
 
 // MARK: - Rows
 
+/// Multiple previews share one bounded-height strip instead of making image-heavy turns grow by
+/// one full preview height per image.
+private struct ConversationImageStrip: View {
+    let images: [ImagePayload]
+    let onOpen: (ImagePayload) -> Void
+
+    @ViewBuilder var body: some View {
+        if images.count == 1, let image = images.first {
+            ConversationImage(image: image, onOpen: { onOpen(image) })
+        } else if !images.isEmpty {
+            ScrollView(.horizontal) {
+                LazyHStack(alignment: .top, spacing: PiTheme.transcriptBlockSpacing) {
+                    ForEach(images) { image in
+                        ConversationImage(image: image, onOpen: { onOpen(image) })
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Renders the bounded thumbnail, never the full bitmap: a cache hit draws synchronously, a
 /// miss reserves the image's exact final frame (header-only size read) and decodes off the main
 /// thread, so realizing an image-heavy row while scrolling costs no decode on the main thread
@@ -819,12 +859,17 @@ private struct ToolResultRow: View {
             symbolTint: message.isError ? Color.piRed : .secondary
         ) {
             VStack(alignment: .leading, spacing: PiTheme.space8) {
-                ForEach(message.blocks) { block in
+                ForEach(Array(message.blocks.enumerated()), id: \.element.id) { index, block in
                     switch block.kind {
                     case let .text(text):
                         if !text.isEmpty { ToolDetailText(code: text) }
-                    case let .image(image):
-                        ConversationImage(image: image, onOpen: { onImage(image, message.images) })
+                    case .image:
+                        if index == 0 || message.blocks[index - 1].imagePayload == nil {
+                            ConversationImageStrip(
+                                images: message.imageRun(startingAt: index),
+                                onOpen: { onImage($0, message.images) }
+                            )
+                        }
                     default: EmptyView()
                     }
                 }
@@ -853,9 +898,7 @@ private struct CustomMessageRow: View {
                     MarkdownBlockView(text: message.textContent)
                         .foregroundStyle(.secondary)
                 }
-                ForEach(message.images) { image in
-                    ConversationImage(image: image, onOpen: { onImage(image, message.images) })
-                }
+                ConversationImageStrip(images: message.images, onOpen: { onImage($0, message.images) })
             }
         }
     }
