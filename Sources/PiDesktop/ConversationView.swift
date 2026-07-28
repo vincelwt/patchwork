@@ -344,9 +344,6 @@ struct MessageScrollView: View {
                                 )
                                 .equatable()
                                 .padding(.top, PiTheme.space6)
-                            case let .compaction(note):
-                                CompactionRowView(note: note)
-                                    .padding(.vertical, PiTheme.space6)
                             }
                         }
                         .id(item.id)

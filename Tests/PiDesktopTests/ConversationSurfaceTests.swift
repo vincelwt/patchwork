@@ -310,9 +310,13 @@ final class TranscriptPresenterTests: XCTestCase {
             errorMessage
         ]
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
+        XCTAssertEqual(items.count, 2, "The error belongs inside the collapsed work log")
         guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
         XCTAssertFalse(block.hasFailure, "No individual step failed")
         XCTAssertTrue(block.answerFailed, "The turn's own answer failed")
+        XCTAssertEqual(block.latestStatusText, "Pi error: Something went wrong.")
+        guard case let .note(error) = block.entries.last else { return XCTFail("Expected the error in the work log") }
+        XCTAssertTrue(error.isError)
     }
 
     func testEarlierErrorThatPiRecoveredFromDoesNotFlagTheSettledTurn() throws {
@@ -330,6 +334,8 @@ final class TranscriptPresenterTests: XCTestCase {
         let items = TranscriptPresenter.items(messages: messages, streaming: nil)
         guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
         XCTAssertFalse(block.answerFailed, "The turn's final answer is what matters, not an earlier retried error")
+        XCTAssertTrue(block.entries.contains { if case let .note(message) = $0 { return message.isError }; return false },
+                      "The retried error remains available when the work log is expanded")
     }
 
     // MARK: - The answer is never buried in the work log
@@ -395,7 +401,6 @@ final class TranscriptPresenterTests: XCTestCase {
             switch item {
             case .message: "message"
             case .work: "work"
-            case .compaction: "compaction"
             }
         }
         XCTAssertEqual(shape, ["message", "work", "message", "work", "message"])
@@ -495,7 +500,9 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(both, settledIDs)
     }
 
-    func testCompactionIsShownAsItsOwnTranscriptEvent() throws {
+    func testErrorsAndCompactionStayInOneCollapsedWorkThread() throws {
+        var error = assistant(id: "error", blocks: [text("Server overloaded.")])
+        error.isError = true
         let compaction = ChatMessage(
             id: "compaction-1",
             role: .system,
@@ -503,13 +510,43 @@ final class TranscriptPresenterTests: XCTestCase {
             timestamp: nil,
             raw: .null
         )
-        let items = TranscriptPresenter.items(
-            messages: [user(id: "u", text: "hi", at: nil), compaction, assistant(id: "a", blocks: [text("done")])],
-            streaming: nil
+        let userMessage = user(id: "u", text: "hi", at: nil)
+        let thought = assistant(id: "thinking", blocks: [thinking("Trying the request")])
+        let beforeCompaction = TranscriptPresenter.items(
+            messages: [userMessage, thought, error],
+            streaming: nil,
+            isRunning: true
         )
-        guard case let .compaction(note) = items[1] else { return XCTFail("Expected a compaction marker") }
-        XCTAssertEqual(note.title, "Context compacted")
+        guard case let .work(errorBlock) = beforeCompaction[1] else { return XCTFail("Expected live work") }
+        XCTAssertEqual(errorBlock.latestStatusText, "Pi error: Server overloaded.")
+
+        let afterCompaction = TranscriptPresenter.items(
+            messages: [userMessage, thought, error, compaction],
+            streaming: nil,
+            isRunning: true
+        )
+        XCTAssertEqual(afterCompaction.count, 2, "Compaction must not create a standalone transcript row")
+        guard case let .work(block) = afterCompaction[1] else { return XCTFail("Expected one work block") }
+        XCTAssertEqual(block.id, errorBlock.id)
+        XCTAssertEqual(block.latestStatusText, "Context compacted")
+        guard case let .note(message) = block.entries.last,
+              let note = TranscriptCompaction(message: message) else {
+            return XCTFail("Expected the compaction inside the work log")
+        }
         XCTAssertEqual(note.summary, "Summarized the first 40 turns.")
+    }
+
+    func testNextUserReplyDoesNotInflateThePreviousWorkDuration() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let items = TranscriptPresenter.items(messages: [
+            user(id: "u1", text: "Go", at: start),
+            assistant(id: "thinking", blocks: [thinking("Working")], at: start.addingTimeInterval(10)),
+            assistant(id: "answer", blocks: [text("Done")], at: start.addingTimeInterval(20)),
+            user(id: "u2", text: "Much later", at: start.addingTimeInterval(1_000))
+        ], streaming: nil)
+
+        guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
+        XCTAssertEqual(block.title, "Worked for 20s")
     }
 
     func testWorkBlockFallsBackToStepCountsWithoutUsableTimestamps() {
@@ -525,6 +562,11 @@ final class TranscriptPresenterTests: XCTestCase {
             endedAt: nil
         )
         XCTAssertEqual(block.title, "Worked · 1 step")
+        var active = block
+        active.startedAt = Date(timeIntervalSince1970: 100)
+        active.isActive = true
+        XCTAssertEqual(active.elapsed(at: Date(timeIntervalSince1970: 161)), 61)
+        XCTAssertNil(active.elapsed(at: Date(timeIntervalSince1970: 99)))
         XCTAssertEqual(NumberFormatting.duration(0), "0s")
         XCTAssertEqual(NumberFormatting.duration(61), "1m 1s")
         XCTAssertEqual(NumberFormatting.duration(3_725), "1h 2m")
