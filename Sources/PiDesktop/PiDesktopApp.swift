@@ -153,7 +153,7 @@ struct RootView: View {
         .sheet(item: sheetDialog) { request in
             ExtensionDialogView(request: request).environmentObject(store)
         }
-        .sheet(item: $store.viewedImage) { item in ImageViewerView(payload: item.image) }
+        .sheet(item: $store.viewedImage) { item in ImageViewerView(selection: item) }
         .overlay {
             if store.quickSwitchPresented {
                 QuickSwitchOverlay()

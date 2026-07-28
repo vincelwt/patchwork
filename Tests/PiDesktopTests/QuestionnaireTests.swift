@@ -264,9 +264,9 @@ final class QuestionnaireStateMachineTests: XCTestCase {
 
     func testWorkRowEquatableBoundaryTracksQuestionnairePresentation() {
         let block = TranscriptWorkBlock(id: "work", entries: [], isActive: true)
-        let inactive = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: nil)
-        let active = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: "ask-1:0")
-        let next = TranscriptWorkView(block: block, onImage: { _ in }, questionnaireKey: "ask-1:1")
+        let inactive = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: nil)
+        let active = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: "ask-1:0")
+        let next = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: "ask-1:1")
 
         XCTAssertNotEqual(inactive, active)
         XCTAssertNotEqual(active, next)

@@ -395,15 +395,37 @@ struct QuestionnaireCardView: View {
 
 struct ImageViewerView: View {
     @Environment(\.dismiss) private var dismiss
-    let payload: ImagePayload
+    /// Local state, so arrowing through the group never re-presents the sheet.
+    @State private var selection: ViewedImage
     @State private var zoom = 1.0
+
+    init(selection: ViewedImage) { _selection = State(initialValue: selection) }
+
+    private var payload: ImagePayload { selection.image }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: PiTheme.space8) {
                 Text(payload.fileName ?? "Conversation image")
                     .font(PiFont.rowEmphasis)
                 Spacer()
+                if selection.images.count > 1 {
+                    Button { selection.goToPrevious() } label: { Image(systemName: "chevron.left") }
+                        .keyboardShortcut(.leftArrow, modifiers: [])
+                        .disabled(!selection.hasPrevious)
+                        .help("Previous image in this message")
+                        .accessibilityLabel("Previous image")
+                    Text("\(selection.index + 1) of \(selection.images.count)")
+                        .font(PiFont.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Image \(selection.index + 1) of \(selection.images.count)")
+                    Button { selection.goToNext() } label: { Image(systemName: "chevron.right") }
+                        .keyboardShortcut(.rightArrow, modifiers: [])
+                        .disabled(!selection.hasNext)
+                        .help("Next image in this message")
+                        .accessibilityLabel("Next image")
+                }
                 Button(action: save) { Image(systemName: "square.and.arrow.down") }
                     .help("Save image")
                 Slider(value: $zoom, in: 0.25...3)

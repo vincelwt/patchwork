@@ -362,7 +362,31 @@ struct ToastMessage: Identifiable, Hashable {
     let sessionPath: String?
 }
 
-struct ViewedImage: Identifiable { let id = UUID(); let image: ImagePayload }
+/// The image opened in the viewer plus the sibling images of the same message, so Left/Right can
+/// step through that one group. Never empty: a group that does not contain the clicked image
+/// falls back to that image alone.
+struct ViewedImage: Identifiable {
+    let id = UUID()
+    let images: [ImagePayload]
+    private(set) var index: Int
+
+    init(image: ImagePayload, group: [ImagePayload]) {
+        if let start = group.firstIndex(where: { $0.id == image.id }) {
+            images = group
+            index = start
+        } else {
+            images = [image]
+            index = 0
+        }
+    }
+
+    var image: ImagePayload { images[index] }
+    // ponytail: clamped, not wrapping — the first/last image is the end of the group.
+    var hasPrevious: Bool { index > 0 }
+    var hasNext: Bool { index + 1 < images.count }
+    mutating func goToPrevious() { if hasPrevious { index -= 1 } }
+    mutating func goToNext() { if hasNext { index += 1 } }
+}
 
 struct PersistedAppState: Codable {
     var archivedSessionIDs: Set<String> = []
