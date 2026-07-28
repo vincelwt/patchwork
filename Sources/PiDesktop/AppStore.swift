@@ -1887,8 +1887,19 @@ final class AppStore: ObservableObject {
 
     func toggleArchive(_ session: SessionSummary) {
         let archived = !session.isArchived
+        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
         persistence.setArchived(archived, sessionID: session.id)
-        if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index].isArchived = archived }
+        if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+            sessions[index].isArchived = archived
+            if archived, selectedPath == session.fileURL.standardizedFileURL.path {
+                if let next = sessions[(index + 1)...].first(where: { !$0.isArchived })
+                    ?? sessions[..<index].last(where: { !$0.isArchived }) {
+                    selectSession(next)
+                } else {
+                    openNewChat()
+                }
+            }
+        }
         showToast(archived ? "Conversation archived" : "Conversation restored", style: .info)
     }
 
