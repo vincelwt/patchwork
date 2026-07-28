@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 9
+// pi-desktop-activity-version: 10
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -11,7 +11,7 @@
 //
 // Writes one small JSON file per process to ~/.pi/agent/desktop-activity/<sessionId>-<pid>.json:
 //   { sessionId, sessionFile, sessionDir, cwd, pid, state: "running" | "idle",
-//     startedAt, updatedAt, preview, stopReason, completionId }
+//     startedAt, updatedAt, preview, previewCompletionId, stopReason, completionId }
 // Every heartbeat write is atomic (temp file + rename), and every activity handler is wrapped
 // in try/catch: heartbeat failures must never interrupt the user's actual Pi session.
 
@@ -328,6 +328,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         startedAt,
         updatedAt: new Date().toISOString(),
         preview,
+        previewCompletionId: preview ? completionId : undefined,
         stopReason,
         completionId,
       };
@@ -379,9 +380,9 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       ) as { text?: unknown } | undefined;
       if (block && typeof block.text === "string") text = block.text;
     }
-    const singleLine = text.replace(/\s+/g, " ").trim();
-    if (!singleLine) return undefined;
-    return singleLine.length > PREVIEW_LIMIT ? `${singleLine.slice(0, PREVIEW_LIMIT)}…` : singleLine;
+    const trimmed = text.trim();
+    if (!trimmed) return undefined;
+    return trimmed.length > PREVIEW_LIMIT ? `${trimmed.slice(0, PREVIEW_LIMIT)}…` : trimmed;
   }
 
   if (process.env.PI_DESKTOP_AUTOMATION_SELF_TEST === "1"
@@ -549,6 +550,8 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   });
 
   pi.on("turn_start", async () => {
+    preview = undefined;
+    stopReason = undefined;
     agentRunning = true;
     syncHeartbeat();
   });
@@ -558,10 +561,10 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       const message = (event as { message?: { role?: string; content?: unknown; stopReason?: unknown } })
         .message;
       if (message && message.role === "assistant") {
-        preview = extractPreview(message.content) ?? preview;
         stopReason = typeof message.stopReason === "string" ? message.stopReason : stopReason;
         if (typeof message.stopReason === "string" && TERMINAL_STOP_REASONS.has(message.stopReason)) {
-          completionId = latestCompletedEntryID(ctx.sessionManager.getBranch()) ?? completionId;
+          preview = extractPreview(message.content);
+          completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());
         }
       }
       syncHeartbeat();

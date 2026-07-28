@@ -490,6 +490,34 @@ final class SessionActivityMonitorTests: XCTestCase {
         }
     }
 
+    func testNewCompletionRejectsAnUnpairedStalePreview() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("session.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"a1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: file)
+        let heartbeat = heartbeats.appendingPathComponent("s.json")
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":1,"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"Earlier answer","previewCompletionId":"a1","stopReason":"stop","completionId":"a1"}
+        """.utf8).write(to: heartbeat, options: .atomic)
+
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: heartbeats)
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.preview == "Earlier answer" }
+
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":1,"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date().addingTimeInterval(1)))","preview":"Earlier answer","stopReason":"stop","completionId":"a2"}
+        """.utf8).write(to: heartbeat, options: .atomic)
+        monitor.tickNow()
+        try await waitUntil { monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a2" }
+
+        XCTAssertNil(monitor.activity(forPath: file.path)?.preview)
+    }
+
     func testDisappearedHeartbeatsBeyondTailLimitKeepPriorityForTheNextTick() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)

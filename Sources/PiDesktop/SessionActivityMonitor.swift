@@ -18,9 +18,9 @@ struct SessionActivity: Equatable, Sendable {
     /// completion semantics; mtime and running/idle transitions never stand in for an answer.
     var latestCompletedEntryID: String?
     var lastStopReason: String?
-    /// A short bounded preview of the last assistant text, when a heartbeat supplied one. Used
-    /// only to enrich a cross-terminal "turn finished" notification; never re-derived by reading
-    /// the whole file.
+    /// A short bounded preview paired with `latestCompletedEntryID` by a heartbeat. Used only to
+    /// enrich a cross-terminal "turn finished" notification; never re-derived by reading the
+    /// whole file.
     var preview: String?
 }
 
@@ -355,13 +355,18 @@ final class SessionActivityMonitor: ObservableObject {
                 var completionID = old?.latestCompletedEntryID
                 var completionStopReason = old?.lastStopReason
                 var completionWriter: ActivityHeartbeat?
+                var completionPreview: String?
                 if heartbeatCompletionIDs.count == 1, let heartbeatCompletionID = heartbeatCompletionIDs.first {
                     completionID = heartbeatCompletionID
-                    completionWriter = writers?
-                        .filter { $0.completionId == heartbeatCompletionID }
+                    let matchingWriters = writers?.filter { $0.completionId == heartbeatCompletionID }
+                    completionWriter = matchingWriters?.max {
+                        (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
+                    }
+                    completionPreview = matchingWriters?
+                        .filter { $0.previewCompletionId == heartbeatCompletionID && $0.preview != nil }
                         .max {
                             (Date.piDate($0.updatedAt) ?? .distantPast) < (Date.piDate($1.updatedAt) ?? .distantPast)
-                        }
+                        }?.preview
                     if let reason = completionWriter?.stopReason,
                        SessionParser.terminalAssistantStopReasons.contains(reason) {
                         completionStopReason = reason
@@ -384,7 +389,8 @@ final class SessionActivityMonitor: ObservableObject {
                         runningSince: resolved == .running ? (old?.runningSince ?? modifiedAt) : nil,
                         latestCompletedEntryID: completionID,
                         lastStopReason: completionStopReason ?? newest?.stopReason,
-                        preview: completionWriter?.preview ?? newest?.preview ?? old?.preview
+                        preview: completionPreview
+                            ?? (completionID == old?.latestCompletedEntryID ? old?.preview : nil)
                     )
                     continue
                 }
@@ -407,7 +413,7 @@ final class SessionActivityMonitor: ObservableObject {
                     latestCompletedEntryID: completionID,
                     lastStopReason: completionStopReason
                         ?? (readTail ? SessionActivityClassifier.stopReason(ofLastEntry: entry) : old?.lastStopReason),
-                    preview: old?.preview
+                    preview: completionID == old?.latestCompletedEntryID ? old?.preview : nil
                 )
             }
             let tracked = Set(paths)
