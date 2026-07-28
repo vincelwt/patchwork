@@ -122,7 +122,7 @@ private struct SidebarFooter: View {
 
     var body: some View {
         HStack(spacing: PiTheme.space6) {
-            StatusDot(color: runningCount > 0 ? .piGreen : .secondary)
+            StatusDot(color: runningCount > 0 ? .piGreen : .secondary, pulsing: runningCount > 0)
             if let label {
                 Text(label).font(SidebarTypography.status).foregroundStyle(.secondary).lineLimit(1)
                     .accessibilityLabel("Session activity")
@@ -398,7 +398,7 @@ private struct SessionFolderSection: View {
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
                         .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
-                    if hasRunning { StatusDot(color: .piGreen) }
+                    if hasRunning { StatusDot(color: .piGreen, pulsing: true) }
                     Spacer(minLength: PiTheme.space4)
                     newChatButton
                 }
@@ -649,7 +649,7 @@ private struct SessionRow: View {
             if waitingForQuestion {
                 StatusDot(color: .piPurple).help("Waiting for your answer")
             } else if running {
-                StatusDot(color: .piGreen).help("Pi is working")
+                StatusDot(color: .piGreen, pulsing: true).help("Pi is working")
             } else if unread {
                 StatusDot(color: .piBlue).help("Unread")
             }

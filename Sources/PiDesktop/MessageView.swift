@@ -230,7 +230,7 @@ struct TranscriptWorkView: View, Equatable {
                     // The icon column is always reserved while live or settled, so the headline
                     // starts at the same origin as every row inside the log below it.
                     Group {
-                        if block.isActive { StatusDot(color: .piGreen) }
+                        if block.isActive { StatusDot(color: .piGreen, pulsing: true) }
                     }
                     .frame(width: PiTheme.gridIconColumn, alignment: .center)
                     headline
@@ -250,9 +250,9 @@ struct TranscriptWorkView: View, Equatable {
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
 
-            PiHairline()
-
             if isOpen {
+                PiHairline()
+
                 VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
                     ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
                         Group {
@@ -499,7 +499,7 @@ private struct DisclosureRow<Detail: View>: View {
             Button { expanded = !isOpen } label: {
                 HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
                     Group {
-                        if showsProgress { StatusDot(color: .piGreen) }
+                        if showsProgress { StatusDot(color: .piGreen, pulsing: true) }
                         else {
                             Image(systemName: symbol)
                                 .font(.system(size: PiIcon.small, weight: .regular))
@@ -575,7 +575,7 @@ struct TranscriptActivityGroupView: View {
             titleTint: group.hasFailure ? Color.piRed : .secondary,
             trailing: group.progressText,
             symbolTint: group.hasFailure ? Color.piRed : .secondary,
-            // The one canonical live spinner is always the last transcript row.
+            // The canonical live indicator lives on the work headline.
             showsProgress: false,
             initiallyExpanded: group.shouldStartExpanded,
             collapseSignal: !group.isActive

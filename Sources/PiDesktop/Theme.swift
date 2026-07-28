@@ -410,11 +410,24 @@ extension PiUnavailableView where Actions == EmptyView {
 
 struct StatusDot: View {
     let color: Color
+    /// Off by default: only a dot that means "work is happening right now" breathes.
+    var pulsing = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var phase = false
+
+    private var animates: Bool { pulsing && !reduceMotion }
 
     var body: some View {
         Circle()
             .fill(color)
             .frame(width: 6, height: 6)
+            .opacity(phase ? 0.3 : 1)
+            .animation(animates ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : nil, value: phase)
+            // Phase follows `animates` rather than being set once: a recycled row that turns
+            // from a static dot into a pulsing one (or back, or when Reduce Motion flips) still
+            // gets the transition the repeating animation needs to start.
+            .onAppear { phase = animates }
+            .onChange(of: animates) { _, on in phase = on }
     }
 }
 

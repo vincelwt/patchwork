@@ -70,6 +70,22 @@ final class TranscriptRowMetricsTests: XCTestCase {
         XCTAssertFalse(contents.contains("bodySize -"), "Transcript rows never derive a smaller font")
         XCTAssertFalse(contents.contains("rowDetail"), "Transcript rows do not maintain a parallel size role")
     }
+
+    func testLiveDotsPulseAndCollapsedWorkHasNoDivider() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop", isDirectory: true)
+        let theme = try String(contentsOf: sourceRoot.appendingPathComponent("Theme.swift"), encoding: .utf8)
+        let messages = try String(contentsOf: sourceRoot.appendingPathComponent("MessageView.swift"), encoding: .utf8)
+
+        XCTAssertTrue(theme.contains("pulsing && !reduceMotion"))
+        XCTAssertTrue(theme.contains(".repeatForever(autoreverses: true)"))
+        XCTAssertTrue(messages.contains("if block.isActive { StatusDot(color: .piGreen, pulsing: true) }"))
+        XCTAssertTrue(messages.contains("if isOpen {\n                PiHairline()"))
+        XCTAssertFalse(messages.contains("            PiHairline()\n\n            if isOpen"))
+    }
 }
 
 final class TranscriptRhythmTests: XCTestCase {
