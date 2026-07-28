@@ -20,6 +20,7 @@ public enum PiDeskPaths {
     public static var controlSocket: URL { supportDirectory.appendingPathComponent("daemon.sock") }
     public static var tokenFile: URL { supportDirectory.appendingPathComponent("daemon-token") }
     public static var daemonSettings: URL { supportDirectory.appendingPathComponent("daemon.json") }
+    public static var relayIdentity: URL { supportDirectory.appendingPathComponent("relay-identity.json") }
     public static var schedules: URL { supportDirectory.appendingPathComponent("schedules.json") }
     public static var runHistory: URL { supportDirectory.appendingPathComponent("runs.jsonl") }
 

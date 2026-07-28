@@ -29,5 +29,7 @@ enum Routes {
             + ScheduleHandlers.routes(core)
             + RunHandlers.routes(core)
             + LimitsHandlers.routes(core)
+            + InteractionHandlers.routes(core)
+            + RemoteHandlers.routes(core)
     }
 }

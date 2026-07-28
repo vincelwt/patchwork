@@ -262,6 +262,16 @@ final class QuestionnaireStateMachineTests: XCTestCase {
 
     // MARK: - Inline discoverability
 
+    func testWorkRowEquatableBoundaryTracksQuestionnairePresentation() {
+        let block = TranscriptWorkBlock(id: "work", entries: [], isActive: true)
+        let inactive = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: nil)
+        let active = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: "ask-1:0")
+        let next = TranscriptWorkView(block: block, onImage: { _, _ in }, questionnaireKey: "ask-1:1")
+
+        XCTAssertNotEqual(inactive, active)
+        XCTAssertNotEqual(active, next)
+    }
+
     func testInlineQuestionIsInteractiveOnlyAfterItsOwnRequestArrives() throws {
         let (store, runtime, _) = makeStore()
         let session = try XCTUnwrap(store.sessions.first)
@@ -276,7 +286,7 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertTrue(store.isWaitingForQuestion(session))
     }
 
-    func testQuestionStartingWhileBrowsedAwayOnlyRendersForItsOwnConversation() throws {
+    func testQuestionStartingWhileBrowsedAwayActivatesWhenItsConversationIsSelected() throws {
         let (store, runtime, _) = makeStore()
         let session = try XCTUnwrap(store.sessions.first)
         store.openNewChat()
@@ -287,7 +297,6 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertTrue(store.isWaitingForQuestion(session), "The sidebar still marks the parked thread")
 
         store.selectSession(session)
-        store.prepareComposerOptions()
         XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
         XCTAssertTrue(store.isWaitingForQuestion(session))
     }

@@ -38,6 +38,20 @@ final class SessionParserTests: XCTestCase {
         XCTAssertEqual(conversation.messages.last?.role, .unknown)
     }
 
+    func testUserImagePromptHidesThePathFooter() throws {
+        let imageData = Data("pixels".utf8)
+        let message = SessionParser.chatMessage(fromAgentMessage: .object([
+            "role": .string("user"),
+            "content": .array([
+                .object(["type": .string("text"), "text": .string("Build this\n\nAttached image file paths:\n- /tmp/image.png")]),
+                .object(["type": .string("image"), "data": .string(imageData.base64EncodedString()), "mimeType": .string("image/png")])
+            ])
+        ]))
+
+        XCTAssertEqual(message?.textContent, "Build this")
+        XCTAssertEqual(message?.images.map(\.data), [imageData])
+    }
+
     func testTwoPassParserSkipsLargeAbandonedPayloadAndDiscardsKnownRawTrees() throws {
         let file = temporaryDirectory.appendingPathComponent("large-branch.jsonl")
         let smallImage = Data("active-image".utf8).base64EncodedString()
@@ -65,6 +79,30 @@ final class SessionParserTests: XCTestCase {
         XCTAssertFalse(conversation.messages.contains { $0.textContent.contains(String(repeating: "x", count: 100)) })
         XCTAssertEqual(conversation.messages.first?.images.count, 1)
         XCTAssertTrue(conversation.messages.allSatisfy { $0.raw == .null }, "Known messages must not retain duplicate raw/base64 trees")
+    }
+
+    func testExplicitlyHiddenCustomMessagesStayOutOfTheTranscript() throws {
+        XCTAssertNil(SessionParser.chatMessage(fromAgentMessage: .object([
+            "role": .string("custom"),
+            "customType": .string("pi-desktop-connectivity-resume"),
+            "content": .string("continue"),
+            "display": .bool(false)
+        ])))
+
+        let file = temporaryDirectory.appendingPathComponent("hidden-custom.jsonl")
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "hidden", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "user", "parentId": NSNull(),
+             "message": ["role": "user", "content": "start"]],
+            ["type": "custom_message", "id": "resume", "parentId": "user",
+             "customType": "pi-desktop-connectivity-resume", "content": "continue", "display": false],
+            ["type": "message", "id": "answer", "parentId": "resume",
+             "message": ["role": "assistant", "content": "done"]]
+        ], to: file)
+
+        let conversation = try SessionParser.conversation(at: file)
+        XCTAssertEqual(conversation.messages.map(\.textContent), ["start", "done"])
+        XCTAssertEqual(conversation.leafID, "answer", "The hidden context entry stays on Pi's active branch")
     }
 
     func testAggregateImageBudgetReplacesExcessImagesWithPlaceholders() throws {

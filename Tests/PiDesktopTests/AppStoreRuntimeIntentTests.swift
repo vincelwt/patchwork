@@ -185,6 +185,29 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("get_messages"), 0)
     }
 
+    func testStopDuringStartupPreventsThePendingPromptFromDispatching() {
+        let runtime = IntentRuntime()
+        runtime.delayState = true
+        let store = makeStore(runtime: runtime)
+        let session = summary("a", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.draft = "never send this"
+        store.submitDraft()
+        XCTAssertTrue(store.canStopCurrentThread)
+        XCTAssertEqual(runtime.count("prompt"), 0)
+
+        store.abort()
+        runtime.finishState()
+
+        XCTAssertFalse(store.canStopCurrentThread)
+        XCTAssertEqual(runtime.count("abort"), 1)
+        XCTAssertEqual(runtime.count("prompt"), 0)
+        XCTAssertEqual(runtime.stopCount, 1)
+        XCTAssertEqual(store.draft, "never send this")
+        XCTAssertFalse(store.messages.contains { $0.textContent == "never send this" })
+    }
+
     func testPendingModelOptionsDoNotGatePromptDispatch() {
         let runtime = IntentRuntime()
         runtime.delayModels = true
@@ -199,7 +222,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("prompt"), 1)
     }
 
-    func testImageAttachmentsAreSentAsFilePathsInsteadOfRPCImages() throws {
+    func testImageAttachmentsStayVisibleOnTheUserMessage() throws {
         let runtime = IntentRuntime()
         let store = makeStore(runtime: runtime)
         let session = summary("a", cwd: root)
@@ -208,9 +231,10 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.composerContentDidChange()
 
         let imageURL = root.appendingPathComponent("reference image.png")
+        let imageData = Data("pixels".utf8)
         store.draft = "Build this"
         store.attachments = [ImageAttachment(
-            data: Data("pixels".utf8),
+            data: imageData,
             mimeType: "image/png",
             fileName: imageURL.lastPathComponent,
             fileURL: imageURL
@@ -222,8 +246,9 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
             payload["message"]?.stringValue,
             "Build this\n\nAttached image file paths:\n- \(imageURL.path)"
         )
-        XCTAssertNil(payload["images"])
-        XCTAssertTrue(store.messages.last?.images.isEmpty == true)
+        XCTAssertEqual(payload["images"]?.arrayValue?.count, 1)
+        XCTAssertEqual(store.messages.last?.textContent, "Build this")
+        XCTAssertEqual(store.messages.last?.images.map(\.data), [imageData])
     }
 
     func testIdleSameCwdProcessSwitchesSavedAndNewRoutesButCrossCwdColdStarts() throws {

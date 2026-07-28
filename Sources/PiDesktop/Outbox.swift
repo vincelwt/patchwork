@@ -156,19 +156,6 @@ extension AppStore {
         outbox.removeAll { $0.id == id }
     }
 
-    /// One Escape turns app-held messages into follow-ups before stopping the current turn.
-    /// Double-Escape drops them instead, so nothing restarts after the abort settles.
-    func stopFromEscape(fully: Bool) {
-        guard isCurrentRouteRuntime, runtimeState.isStreaming else { return }
-        if fully {
-            outbox.removeAll()
-        } else {
-            guard !outbox.isEmpty else { return }
-            for index in outbox.indices { outbox[index].delivery = .followUp }
-        }
-        abort()
-    }
-
     /// Hands every entry due at this boundary to Pi, oldest first. Anything the runtime rejects
     /// stays visible as an error rather than disappearing silently.
     func flushOutbox(_ boundary: OutboxEntry.Delivery) {
@@ -184,9 +171,10 @@ extension AppStore {
         let command = entry.delivery == .steer ? "steer" : "follow_up"
         let target = runtime
         let token = beginOutboxDispatch()
-        let payload: [String: JSONValue] = [
+        var payload: [String: JSONValue] = [
             "message": .string(ImageAttachment.prompt(text: entry.text, attachments: entry.attachments))
         ]
+        if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
         target.send(type: command, payload: payload) { [weak self] result in
             self?.finishOutboxDispatch(
                 owner: token.owner,

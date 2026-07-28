@@ -121,6 +121,11 @@ enum PiTheme {
     static let quickSwitchRowHeight: CGFloat = 34
     static let quickSwitchResultLimit = 60
 
+    // Hosted remote pairing sheet.
+    static let remoteAccessWidth: CGFloat = 560
+    static let remoteAccessHeight: CGFloat = 620
+    static let remoteQRCodeSize: CGFloat = 208
+
     // Menu bar panel.
     static let menuBarWidth: CGFloat = 320
     static let menuBarHeaderHeight: CGFloat = 38
@@ -292,6 +297,16 @@ extension View {
             selected ? Color.piSelection : (hovering ? Color.piHover : Color.clear),
             in: RoundedRectangle(cornerRadius: radius, style: .continuous)
         )
+    }
+
+    /// A toolbar without macOS 26's shared glass capsule.
+    @ViewBuilder
+    func piPlainToolbar<C: ToolbarContent>(@ToolbarContentBuilder content: () -> C) -> some View {
+        if #available(macOS 26.0, *) {
+            toolbar { content().sharedBackgroundVisibility(.hidden) }
+        } else {
+            toolbar(content: content)
+        }
     }
 }
 

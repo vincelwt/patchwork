@@ -13,8 +13,8 @@ export function renderSchedules(state, actions) {
       "header",
       { class: "topbar" },
       h("h1", { tabindex: "-1" }, "Schedules"),
-      h("button", { class: "icon-btn", "aria-label": "Refresh schedules", onclick: () => actions.refreshSchedules() }, "\u21bb"),
-      h("button", { class: "icon-btn", "aria-label": "New schedule", onclick: () => actions.navigate("/schedules/new") }, "+")
+      h("button", { class: "icon-btn", type: "button", "aria-label": "Refresh schedules", onclick: () => actions.refreshSchedules() }, "\u21bb"),
+      h("button", { class: "icon-btn", type: "button", "aria-label": "New schedule", onclick: () => actions.navigate("/schedules/new") }, "+")
     ),
     h("div", { class: "scroll" }, listBody)
   );
@@ -26,30 +26,61 @@ export function renderSchedules(state, actions) {
 }
 
 function paint(container, state, actions) {
-  if (state.schedulesError) {
-    mount(container, [
-      h("div", { class: "content-pad" }, h("div", { class: "inline-error", role: "alert" }, state.schedulesError)),
-      h("div", { class: "content-pad" }, h("button", { class: "btn", onclick: () => actions.refreshSchedules() }, "Retry"))
-    ]);
+  // Same rule as the thread list: a failed refresh never wipes a list that is already on screen.
+  container.setAttribute("aria-busy", String(state.schedulesLoading));
+  if (state.schedulesError && !state.schedules.length) {
+    mount(
+      container,
+      h(
+        "div",
+        { class: "error-block" },
+        h("div", { class: "inline-error", role: "alert" }, state.schedulesError),
+        h("button", { class: "btn", type: "button", onclick: () => actions.refreshSchedules() }, "Try again")
+      )
+    );
     return;
   }
   if (!state.schedules.length) {
-    mount(container, h("div", { class: "empty-state" }, state.schedulesLoading ? "Loading\u2026" : "No schedules yet. Tap + to add one."));
+    mount(
+      container,
+      state.schedulesLoading
+        ? Array.from({ length: 4 }, () =>
+            h(
+              "div",
+              { class: "skeleton-row", "aria-hidden": "true" },
+              h("div", { class: "skeleton skeleton-title" }),
+              h("div", { class: "skeleton skeleton-sub" })
+            )
+          )
+        : h(
+            "div",
+            { class: "empty-state" },
+            h("div", { class: "empty-glyph", "aria-hidden": "true" }, "\u23f0"),
+            h("p", { class: "empty-title" }, "No schedules yet"),
+            h("p", { class: "empty-body" }, "Schedule a prompt to run once, on a timer, or when Pi goes idle."),
+            h("button", { class: "btn btn-primary", type: "button", onclick: () => actions.navigate("/schedules/new") }, "New schedule")
+          )
+    );
     return;
   }
-  mount(
-    container,
-    state.schedules.map((schedule) => renderRow(schedule, actions))
-  );
+  mount(container, [
+    state.schedulesError ? h("div", { class: "banner banner-error", role: "status" }, state.schedulesError) : null,
+    ...state.schedules.map((schedule) => renderRow(schedule, actions))
+  ]);
 }
 
 function renderRow(schedule, actions) {
   return h(
     "button",
-    { class: "row", type: "button", onclick: () => actions.navigate(`/schedules/${encodeURIComponent(schedule.id)}`) },
+    {
+      class: "row",
+      type: "button",
+      "aria-label": [schedule.name, triggerSummary(schedule.trigger), schedule.enabled ? null : "paused"].filter(Boolean).join(", "),
+      onclick: () => actions.navigate(`/schedules/${encodeURIComponent(schedule.id)}`)
+    },
     h(
       "div",
-      { class: "row-main" },
+      { class: "row-main", "aria-hidden": "true" },
       h(
         "div",
         { class: "row-title-line" },
@@ -72,7 +103,11 @@ export function renderScheduleDetail(state, actions, scheduleId) {
     h(
       "header",
       { class: "topbar" },
-      h("button", { class: "icon-btn", "aria-label": "Back to schedules", onclick: () => actions.navigate("/schedules") }, "\u2039"),
+      h(
+        "button",
+        { class: "icon-btn icon-btn-back", type: "button", "aria-label": "Back to schedules", onclick: () => actions.navigate("/schedules") },
+        "\u2039"
+      ),
       titleEl
     ),
     h("div", { class: "scroll" }, body)

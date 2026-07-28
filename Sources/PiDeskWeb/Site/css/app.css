@@ -1,27 +1,37 @@
-/* Pi Desktop web remote — phone-first, minimal, visually consistent with the native app:
-   near-white/true-dark surfaces, no gradients, no drop shadows, restrained accent color. */
+/* Pi Desktop web remote — phone-first, scales to a desktop two-column shell. Visually consistent
+   with the native app: near-white/true-dark surfaces, hairlines instead of shadows, one restrained
+   accent. Layout, spacing, type and color live here as tokens; views never hardcode padding. */
 
 :root {
   color-scheme: light dark;
 
   --bg: #ffffff;
-  --surface: #f6f6f7;
-  --surface-strong: #ececed;
-  --bubble: #f0f0f1;
-  --text: #1c1c1e;
-  --text-secondary: rgba(0, 0, 0, 0.56);
-  --text-tertiary: rgba(0, 0, 0, 0.34);
-  --hairline: rgba(0, 0, 0, 0.12);
+  --bg-elevated: #ffffff;
+  --surface: #f4f4f6;
+  --surface-strong: #e9e9ec;
+  --bubble: #eceef2;
+  --text: #16161a;
+  --text-secondary: rgba(0, 0, 0, 0.58);
+  --text-tertiary: rgba(0, 0, 0, 0.38);
+  --hairline: rgba(0, 0, 0, 0.11);
+  --hairline-strong: rgba(0, 0, 0, 0.18);
   --hover: rgba(0, 0, 0, 0.045);
+  --pressed: rgba(0, 0, 0, 0.08);
+  --skeleton: rgba(0, 0, 0, 0.07);
+  --skeleton-hi: rgba(0, 0, 0, 0.12);
 
   --accent: #0066ff;
-  --green: #24a148;
-  --red: #e0333f;
-  --orange: #c2680b;
+  --accent-quiet: rgba(0, 102, 255, 0.12);
+  --on-accent: #ffffff;
+  --green: #1d8f3f;
+  --red: #d92b38;
+  --red-quiet: rgba(217, 43, 56, 0.1);
+  --orange: #b45f06;
 
   --radius-s: 6px;
   --radius-m: 10px;
-  --radius-bubble: 16px;
+  --radius-l: 14px;
+  --radius-bubble: 18px;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -29,31 +39,82 @@
   --space-4: 16px;
   --space-5: 24px;
   --space-6: 32px;
+  --space-7: 48px;
+
+  /* Type scale. Body stays >=15px on phone; inputs are pinned to 16px further down so iOS
+     Safari never zooms the viewport on focus. */
+  --fs-caption: 11.5px;
+  --fs-small: 13px;
+  --fs-label: 13.5px;
+  --fs-body: 15.5px;
+  --fs-title: 17px;
+  --fs-large: 22px;
 
   --safe-t: env(safe-area-inset-top, 0px);
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-l: env(safe-area-inset-left, 0px);
   --safe-r: env(safe-area-inset-right, 0px);
 
-  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  /* Software-keyboard overlap, published by app.js from visualViewport. iOS does not shrink the
+     layout viewport for the keyboard, so the shell subtracts this instead. */
+  --kb: 0px;
+
+  /* Minimum comfortable hit area (Apple HIG / WCAG 2.5.5). Every interactive element below is
+     at least this tall, even when its visible box is smaller. */
+  --tap: 44px;
+
+  /* Reading column. Wider viewports letterbox content to this width without a media query:
+     the centering term goes negative on a phone, so `max()` falls back to the gutter. */
+  --content-max: 720px;
+  --gutter: var(--space-4);
+  --pad-l: max(calc(var(--gutter) + var(--safe-l)), calc((100% - var(--content-max)) / 2));
+  --pad-r: max(calc(var(--gutter) + var(--safe-r)), calc((100% - var(--content-max)) / 2));
+
+  --duration: 180ms;
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #000000;
-    --surface: #1c1c1e;
-    --surface-strong: #2c2c2e;
-    --bubble: #26262a;
-    --text: #f2f2f3;
-    --text-secondary: rgba(255, 255, 255, 0.62);
-    --text-tertiary: rgba(255, 255, 255, 0.4);
-    --hairline: rgba(255, 255, 255, 0.14);
+    --bg-elevated: #0d0d0f;
+    --surface: #1a1a1d;
+    --surface-strong: #26262a;
+    --bubble: #232327;
+    --text: #f2f2f4;
+    --text-secondary: rgba(255, 255, 255, 0.64);
+    --text-tertiary: rgba(255, 255, 255, 0.42);
+    --hairline: rgba(255, 255, 255, 0.13);
+    --hairline-strong: rgba(255, 255, 255, 0.22);
     --hover: rgba(255, 255, 255, 0.06);
-    --accent: #3d8bff;
+    --pressed: rgba(255, 255, 255, 0.11);
+    --skeleton: rgba(255, 255, 255, 0.08);
+    --skeleton-hi: rgba(255, 255, 255, 0.14);
+
+    --accent: #4a90ff;
+    --accent-quiet: rgba(74, 144, 255, 0.18);
     --green: #35d461;
-    --red: #ff5b5b;
+    --red: #ff6060;
+    --red-quiet: rgba(255, 96, 96, 0.14);
     --orange: #ffab3d;
+  }
+}
+
+/* Higher-contrast palette for users who ask the OS for one. */
+@media (prefers-contrast: more) {
+  :root {
+    --text-secondary: var(--text);
+    --text-tertiary: rgba(0, 0, 0, 0.6);
+    --hairline: rgba(0, 0, 0, 0.32);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text-tertiary: rgba(255, 255, 255, 0.7);
+      --hairline: rgba(255, 255, 255, 0.36);
+    }
   }
 }
 
@@ -65,20 +126,26 @@
    line keeps `hidden` authoritative everywhere, present and future. */
 [hidden] { display: none !important; }
 
-html, body {
+html {
   height: 100%;
-  margin: 0;
-  background: var(--bg);
+  -webkit-text-size-adjust: 100%;
 }
 
+/* The shell owns all scrolling: the page itself never scrolls, so iOS cannot rubber-band the
+   whole document out from under a sticky composer, and the keyboard inset math stays valid. */
 body {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 15.5px;
+  font-size: var(--fs-body);
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
-  overscroll-behavior-y: none;
+  overscroll-behavior: none;
+  touch-action: manipulation; /* no double-tap zoom delay on buttons */
 }
 
 button, input, textarea, select {
@@ -93,14 +160,14 @@ a { color: var(--accent); }
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+  border-radius: var(--radius-s);
 }
 
 /* app.js moves DOM focus to each screen's heading on navigation so assistive tech announces
    the new screen; that is not a keyboard interaction a sighted mouse/touch user needs a ring
    for, so the ring is suppressed on exactly this programmatic target. Every other focusable
    element keeps its normal :focus-visible ring. */
-h1[tabindex="-1"]:focus-visible,
-h2[tabindex="-1"]:focus-visible {
+[tabindex="-1"]:focus-visible {
   outline: none;
 }
 
@@ -115,12 +182,29 @@ ul, ol { padding-inline-start: 1.3em; }
   white-space: nowrap;
 }
 
+/* Motion is decoration here — every transition is a fade/slide over state that is already
+   correct without it, so reduced motion can switch them all off. The spinner is a status
+   indicator, not decoration: it keeps turning, just slower (see .spinner). */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .skeleton { animation: none !important; }
+  .view-enter { animation: none !important; }
+}
+
 /* ---------- App shell ---------- */
 
+/* Rows: [banner][content][tab rail]. On a phone the rail is the bottom tab bar (row 3); from
+   the desktop breakpoint down below it becomes a left column instead. */
 #app {
   display: flex;
   flex-direction: column;
-  min-height: 100dvh;
+  height: 100dvh;
+  height: calc(100dvh - var(--kb));
+  overflow: hidden;
+  background: var(--bg);
 }
 
 .topbar {
@@ -129,17 +213,18 @@ ul, ol { padding-inline-start: 1.3em; }
   z-index: 10;
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  padding: calc(var(--space-2) + var(--safe-t)) var(--space-4) var(--space-2);
-  padding-left: calc(var(--space-4) + var(--safe-l));
-  padding-right: calc(var(--space-4) + var(--safe-r));
+  gap: var(--space-1);
+  min-height: calc(var(--tap) + var(--space-2));
+  padding: var(--space-1) var(--pad-r) var(--space-1) var(--pad-l);
+  padding-top: calc(var(--space-1) + var(--safe-t));
   background: var(--bg);
   border-bottom: 1px solid var(--hairline);
 }
 
 .topbar h1, .topbar h2 {
-  font-size: 17px;
+  font-size: var(--fs-title);
   font-weight: 600;
+  letter-spacing: -0.01em;
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -156,28 +241,39 @@ ul, ol { padding-inline-start: 1.3em; }
 main {
   flex: 1;
   min-height: 0;
-  padding-left: var(--safe-l);
-  padding-right: var(--safe-r);
+  display: flex;
+  flex-direction: column;
 }
 
 .screen {
   display: flex;
   flex-direction: column;
-  min-height: 100%;
+  flex: 1;
+  min-height: 0;
 }
 
 .scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
 }
 
 .content-pad {
-  padding: var(--space-4);
-  padding-bottom: calc(var(--space-6) + var(--safe-b));
+  padding: var(--space-4) var(--pad-r) calc(var(--space-6) + var(--safe-b)) var(--pad-l);
 }
 
-/* ---------- Icon buttons / buttons ---------- */
+/* Screens fade in on navigation; purely decorative, disabled under reduced motion. */
+.view-enter { animation: view-enter var(--duration) var(--ease) both; }
+@keyframes view-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---------- Buttons ---------- */
 
 .btn {
   appearance: none;
@@ -185,20 +281,21 @@ main {
   background: var(--surface);
   color: var(--text);
   border-radius: var(--radius-m);
-  padding: 10px 16px;
+  padding: 11px 18px;
   font-size: 15px;
   font-weight: 500;
-  min-height: 40px;
+  min-height: var(--tap);
   cursor: pointer;
+  transition: background var(--duration) var(--ease), opacity var(--duration) var(--ease);
 }
 .btn:active { background: var(--surface-strong); }
 .btn:disabled { opacity: 0.45; cursor: default; }
 
 .btn-primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
-.btn-primary:active { opacity: 0.85; }
+.btn-primary:active { background: var(--accent); opacity: 0.82; }
 
 .btn-danger { color: var(--red); }
 
@@ -209,18 +306,23 @@ main {
   border: none;
   background: transparent;
   color: var(--text-secondary);
-  width: 40px;
-  height: 40px;
-  min-width: 40px;
+  width: var(--tap);
+  height: var(--tap);
+  min-width: var(--tap);
   border-radius: var(--radius-m);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   font-size: 18px;
+  line-height: 1;
+  transition: background var(--duration) var(--ease), color var(--duration) var(--ease);
 }
-.icon-btn:active { background: var(--hover); }
-.icon-btn[aria-pressed="true"] { color: var(--accent); }
+.icon-btn:active { background: var(--pressed); }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
+.icon-btn[aria-pressed="true"] { color: var(--accent); background: var(--accent-quiet); }
+.icon-btn.btn-danger { color: var(--red); }
+.icon-btn-back { font-size: 26px; margin-inline-start: calc(var(--space-2) * -1); }
 
 .link-btn {
   appearance: none;
@@ -229,9 +331,13 @@ main {
   color: var(--accent);
   font-size: 14.5px;
   font-weight: 500;
-  padding: var(--space-1) 0;
+  padding: var(--space-2) var(--space-1);
+  min-height: var(--tap);
+  border-radius: var(--radius-s);
   cursor: pointer;
+  text-align: left;
 }
+.link-btn:active { background: var(--hover); }
 
 /* ---------- Forms ---------- */
 
@@ -242,7 +348,7 @@ main {
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.03em;
   margin-bottom: var(--space-1);
 }
 .field-hint {
@@ -258,18 +364,24 @@ input[type="number"], input[type="time"], textarea, select {
   background: var(--surface);
   color: var(--text);
   border-radius: var(--radius-m);
-  padding: 10px 12px;
+  padding: 11px 12px;
+  min-height: var(--tap);
   font-size: 16px; /* >=16px avoids iOS Safari auto-zoom on focus */
+  transition: border-color var(--duration) var(--ease), background var(--duration) var(--ease);
 }
-textarea { resize: vertical; min-height: 72px; }
+input:focus, textarea:focus, select:focus { border-color: var(--hairline-strong); }
+textarea { resize: vertical; min-height: 84px; line-height: 1.45; }
+select { appearance: none; padding-right: var(--space-5); }
 
 .checkbox-row {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   padding: var(--space-2) 0;
+  min-height: var(--tap);
 }
-.checkbox-row input { width: 18px; height: 18px; }
+.checkbox-row input { width: 22px; height: 22px; min-height: 0; accent-color: var(--accent); }
+.checkbox-row label { margin: 0; text-transform: none; letter-spacing: 0; font-size: 15px; font-weight: 400; color: var(--text); }
 
 .chip-row {
   display: flex;
@@ -280,15 +392,18 @@ textarea { resize: vertical; min-height: 72px; }
 .chip {
   border: 1px solid var(--hairline);
   background: var(--surface);
+  color: var(--text);
   border-radius: 999px;
-  padding: 7px 14px;
+  padding: 8px 14px;
+  min-height: 38px;
   font-size: 13.5px;
   cursor: pointer;
+  transition: background var(--duration) var(--ease), border-color var(--duration) var(--ease);
 }
 .chip[aria-pressed="true"] {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .segmented {
@@ -304,14 +419,16 @@ textarea { resize: vertical; min-height: 72px; }
   border: none;
   background: var(--surface);
   color: var(--text);
-  padding: 9px 4px;
+  padding: 10px 4px;
+  min-height: var(--tap);
   font-size: 13.5px;
   font-weight: 500;
   cursor: pointer;
   border-left: 1px solid var(--hairline);
+  transition: background var(--duration) var(--ease), color var(--duration) var(--ease);
 }
 .segmented button:first-child { border-left: none; }
-.segmented button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.segmented button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
 
 details.advanced { margin-top: var(--space-2); margin-bottom: var(--space-4); }
 details.advanced summary {
@@ -319,7 +436,7 @@ details.advanced summary {
   font-weight: 600;
   color: var(--text-secondary);
   cursor: pointer;
-  padding: var(--space-2) 0;
+  padding: var(--space-3) 0;
 }
 details.advanced[open] summary { color: var(--text); }
 
@@ -329,17 +446,20 @@ details.advanced[open] summary { color: var(--text); }
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--hairline);
-  cursor: pointer;
-  background: var(--bg);
   width: 100%;
+  min-height: 60px;
+  padding: var(--space-3) var(--pad-r) var(--space-3) var(--pad-l);
   text-align: left;
+  background: var(--bg);
   border: none;
   border-bottom: 1px solid var(--hairline);
   appearance: none;
+  cursor: pointer;
+  color: inherit;
+  transition: background var(--duration) var(--ease);
 }
-.row:active { background: var(--hover); }
+.row:active { background: var(--pressed); }
+.row:focus-visible { outline-offset: -2px; }
 
 .row-main { flex: 1; min-width: 0; }
 .row-title-line {
@@ -348,8 +468,9 @@ details.advanced[open] summary { color: var(--text); }
   gap: var(--space-2);
 }
 .row-title {
-  font-size: 15.5px;
+  font-size: var(--fs-body);
   font-weight: 600;
+  letter-spacing: -0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -359,9 +480,10 @@ details.advanced[open] summary { color: var(--text); }
   font-size: 12.5px;
   color: var(--text-tertiary);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .row-sub {
-  font-size: 13px;
+  font-size: var(--fs-small);
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -370,12 +492,13 @@ details.advanced[open] summary { color: var(--text); }
 }
 .row-folder {
   display: inline-block;
-  font-size: 11.5px;
+  font-size: var(--fs-caption);
   font-weight: 600;
   color: var(--text-tertiary);
   text-transform: uppercase;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.03em;
 }
+.row-unread .row-title { font-weight: 700; }
 
 .dot {
   display: inline-block; /* a <span> is inline by default and ignores width/height without this */
@@ -391,24 +514,63 @@ details.advanced[open] summary { color: var(--text); }
 
 .spinner {
   display: inline-block; /* see .dot above */
-  width: 14px;
-  height: 14px;
+  width: 15px;
+  height: 15px;
   border-radius: 50%;
-  border: 2px solid var(--hairline);
-  border-top-color: var(--text-secondary);
+  border: 2px solid var(--hairline-strong);
+  border-top-color: var(--accent);
   animation: spin 0.7s linear infinite;
   flex: none;
 }
+/* Still animates under reduced motion: it is the only signal that a run is in flight. Slowed
+   so it reads as a status light rather than a spin. */
 @media (prefers-reduced-motion: reduce) {
-  .spinner { animation-duration: 1.6s; }
+  .spinner { animation-duration: 1.8s; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---------- Empty / loading / error states ---------- */
+
 .empty-state {
-  padding: var(--space-6) var(--space-4);
+  padding: var(--space-7) var(--pad-r) var(--space-6) var(--pad-l);
   text-align: center;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+.empty-glyph {
+  font-size: 34px;
+  line-height: 1;
   color: var(--text-tertiary);
-  font-size: 14px;
+  margin-bottom: var(--space-1);
+}
+.empty-title { font-size: var(--fs-title); font-weight: 600; color: var(--text); }
+.empty-body { font-size: 14px; color: var(--text-secondary); max-width: 30ch; }
+.empty-state .btn { margin-top: var(--space-3); }
+
+.skeleton-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 60px;
+  padding: var(--space-4) var(--pad-r) var(--space-4) var(--pad-l);
+  border-bottom: 1px solid var(--hairline);
+}
+.skeleton {
+  height: 11px;
+  border-radius: 999px;
+  background: var(--skeleton);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.skeleton-title { width: 45%; height: 13px; }
+.skeleton-sub { width: 72%; }
+.skeleton-row:nth-child(2n) .skeleton-title { width: 60%; }
+.skeleton-row:nth-child(3n) .skeleton-sub { width: 55%; }
+@keyframes pulse {
+  0%, 100% { background: var(--skeleton); }
+  50% { background: var(--skeleton-hi); }
 }
 
 /* ---------- Pull to refresh ---------- */
@@ -421,36 +583,38 @@ details.advanced[open] summary { color: var(--text); }
   overflow: hidden;
   color: var(--text-tertiary);
   font-size: 12.5px;
-  transition: height 0.15s ease;
+  transition: height 0.15s var(--ease);
 }
 
 /* ---------- Floating action button ---------- */
 
 .fab {
-  position: fixed;
+  position: absolute;
   right: calc(var(--space-4) + var(--safe-r));
   bottom: calc(var(--space-4) + var(--safe-b));
   width: 56px;
   height: 56px;
   border-radius: 50%;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
-  font-size: 26px;
+  font-size: 28px;
   line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 15;
+  transition: transform var(--duration) var(--ease), opacity var(--duration) var(--ease);
 }
-.fab:active { opacity: 0.85; }
+.fab:active { transform: scale(0.94); opacity: 0.9; }
+/* The FAB is positioned against the screen, not the viewport, so it stays put when the
+   on-screen keyboard resizes the shell. */
+.screen { position: relative; }
 
-/* ---------- Bottom nav ---------- */
+/* ---------- Tab bar (phone) / rail (desktop) ---------- */
 
 .tabbar {
-  position: sticky;
-  bottom: 0;
   z-index: 10;
   display: flex;
   border-top: 1px solid var(--hairline);
@@ -458,6 +622,7 @@ details.advanced[open] summary { color: var(--text); }
   padding-bottom: var(--safe-b);
   padding-left: var(--safe-l);
   padding-right: var(--safe-r);
+  flex: none;
 }
 .tabbar button {
   flex: 1;
@@ -465,28 +630,40 @@ details.advanced[open] summary { color: var(--text); }
   border: none;
   background: none;
   color: var(--text-tertiary);
-  padding: 8px 4px 6px;
+  padding: 7px 4px 5px;
+  min-height: var(--tap);
   font-size: 11px;
   font-weight: 600;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 3px;
+  justify-content: center;
+  gap: 2px;
   cursor: pointer;
+  transition: color var(--duration) var(--ease);
 }
-.tabbar button .tab-icon { font-size: 19px; }
+.tabbar button .tab-icon { font-size: 20px; line-height: 1.1; }
 .tabbar button[aria-current="true"] { color: var(--accent); }
 
 /* ---------- Banners ---------- */
 
 .banner {
   padding: var(--space-2) var(--space-4);
-  font-size: 13px;
+  padding-top: calc(var(--space-2) + var(--safe-t));
+  font-size: var(--fs-small);
   font-weight: 500;
   text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  flex: none;
 }
-.banner-offline { background: var(--orange); color: #1c1c1e; }
-.banner-error { background: var(--red); color: #fff; }
+/* The banner sits above the top bar and already carries the safe-area inset, so the bar must
+   not add it a second time. */
+#banner:not(:empty) + main .topbar { padding-top: var(--space-1); }
+.banner-offline { background: var(--orange); color: #ffffff; }
+.banner-error { background: var(--red); color: #ffffff; }
 .banner button {
   appearance: none;
   border: none;
@@ -495,25 +672,36 @@ details.advanced[open] summary { color: var(--text); }
   text-decoration: underline;
   font: inherit;
   cursor: pointer;
-  margin-left: var(--space-2);
+  min-height: 32px;
+  padding: 0 var(--space-1);
 }
 
 .inline-error {
-  background: var(--surface);
+  background: var(--red-quiet);
   border: 1px solid var(--red);
   color: var(--red);
   border-radius: var(--radius-m);
-  padding: var(--space-2) var(--space-3);
-  font-size: 13.5px;
+  padding: var(--space-3);
+  font-size: var(--fs-label);
   margin-bottom: var(--space-3);
 }
+.error-block {
+  padding: var(--space-5) var(--pad-r) var(--space-5) var(--pad-l);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  text-align: center;
+}
+.error-block .inline-error { margin-bottom: 0; text-align: left; width: 100%; }
 
 /* ---------- Thread view / messages ---------- */
 
 .thread-header {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  justify-content: center;
+  gap: 1px;
   flex: 1;
   min-width: 0;
 }
@@ -525,6 +713,7 @@ details.advanced[open] summary { color: var(--text); }
   text-align: left;
   font-size: 16px;
   font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--text);
   max-width: 100%;
   overflow: hidden;
@@ -535,10 +724,11 @@ details.advanced[open] summary { color: var(--text); }
 .thread-header input[type="text"] {
   font-size: 16px;
   font-weight: 600;
-  padding: 2px 6px;
+  padding: 3px 8px;
+  min-height: 34px;
 }
 .thread-header .cwd {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -550,13 +740,16 @@ details.advanced[open] summary { color: var(--text); }
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+  /* Keeps the reading position pinned to the newest message while streamed content grows. */
+  overflow-anchor: auto;
 }
 
 .msg { display: flex; flex-direction: column; max-width: 100%; }
 .msg-meta {
-  font-size: 11px;
+  font-size: var(--fs-caption);
   color: var(--text-tertiary);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
+  font-variant-numeric: tabular-nums;
 }
 .msg-user { align-items: flex-end; }
 .msg-user .msg-meta { align-self: flex-end; }
@@ -565,24 +758,36 @@ details.advanced[open] summary { color: var(--text); }
   border-radius: var(--radius-bubble);
   padding: 10px 14px;
   max-width: 88%;
+  overflow-wrap: anywhere;
 }
 .msg-assistant .prose { max-width: 100%; }
 .msg-tool .prose, .msg-system .prose {
   color: var(--text-secondary);
-  font-size: 13.5px;
+  font-size: var(--fs-label);
   background: var(--surface);
   border-radius: var(--radius-m);
   padding: var(--space-2) var(--space-3);
 }
 .msg-error .bubble, .msg-error .prose {
   border: 1px solid var(--red);
+  background: var(--red-quiet);
+}
+/* New messages slide in; state is already correct without it (see the reduced-motion block). */
+.msg-new { animation: msg-in var(--duration) var(--ease) both; }
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-new { animation: none; }
 }
 
-.prose { font-size: 15.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.prose { font-size: var(--fs-body); line-height: 1.55; overflow-wrap: anywhere; }
 .prose > * + * { margin-top: 0.6em; }
 .prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
   font-weight: 600;
   line-height: 1.3;
+  letter-spacing: -0.01em;
 }
 .prose h1 { font-size: 1.35em; }
 .prose h2 { font-size: 1.22em; }
@@ -617,46 +822,77 @@ details.advanced[open] summary { color: var(--text); }
 }
 .prose th { background: var(--surface); font-weight: 600; }
 .prose a { word-break: break-word; }
+.prose blockquote {
+  border-left: 3px solid var(--hairline-strong);
+  padding-left: var(--space-3);
+  color: var(--text-secondary);
+}
+
+.msg-skeleton { display: flex; flex-direction: column; gap: var(--space-2); }
+.msg-skeleton .skeleton:nth-child(1) { width: 35%; }
+.msg-skeleton .skeleton:nth-child(2) { width: 90%; }
+.msg-skeleton .skeleton:nth-child(3) { width: 65%; }
 
 /* ---------- Composer ---------- */
 
+.composer-dock {
+  flex: none;
+  background: var(--bg);
+  border-top: 1px solid var(--hairline);
+  padding-bottom: var(--safe-b);
+}
+/* The keyboard already covers the home indicator, so its inset would double the gap. */
+#app[data-keyboard="open"] .composer-dock { padding-bottom: 0; }
+
+.run-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--pad-r) var(--space-2) var(--pad-l);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--hairline);
+}
+.run-status .link-btn { margin-left: auto; min-height: 32px; }
+
 .composer {
-  position: sticky;
-  bottom: 0;
   display: flex;
   align-items: flex-end;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
-  padding-bottom: calc(var(--space-2) + var(--safe-b));
-  background: var(--bg);
-  border-top: 1px solid var(--hairline);
+  padding: var(--space-2) var(--pad-r) var(--space-2) var(--pad-l);
 }
 .composer textarea {
   flex: 1;
-  max-height: 160px;
-  min-height: 40px;
+  max-height: 40vh;
+  min-height: var(--tap);
+  padding: 11px 14px;
+  border-radius: var(--radius-l);
+  resize: none;
+  overflow-y: auto;
 }
+.composer .btn { padding-inline: var(--space-4); }
 .composer-menu {
   display: flex;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
-  border-top: 1px solid var(--hairline);
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--pad-r) var(--space-2) var(--pad-l);
+  border-bottom: 1px solid var(--hairline);
 }
+.composer-error { margin: var(--space-2) var(--space-4) 0; }
 
 /* ---------- Schedule detail runs ---------- */
 
-.runs-list { display: flex; flex-direction: column; gap: var(--space-2); }
+.runs-list { display: flex; flex-direction: column; gap: var(--space-1); }
 .run-row {
   display: flex;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-3);
   background: var(--surface);
   border-radius: var(--radius-m);
-  font-size: 13px;
+  font-size: var(--fs-small);
 }
-.status-ok { color: var(--green); }
+.status-ok, .status-succeeded { color: var(--green); }
 .status-failed, .status-timeout { color: var(--red); }
 .status-running { color: var(--accent); }
 .status-skipped { color: var(--text-tertiary); }
@@ -665,15 +901,415 @@ details.advanced[open] summary { color: var(--text); }
 
 .token-screen {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: var(--space-5);
-  padding-bottom: calc(var(--space-5) + var(--safe-b));
+  padding: var(--space-5) calc(var(--space-5) + var(--safe-r)) calc(var(--space-5) + var(--safe-b)) calc(var(--space-5) + var(--safe-l));
   gap: var(--space-4);
   max-width: 420px;
   margin: 0 auto;
   width: 100%;
 }
-.token-screen h1 { font-size: 22px; text-align: center; }
+.token-screen h1 { font-size: var(--fs-large); text-align: center; letter-spacing: -0.02em; }
 .token-screen p { color: var(--text-secondary); font-size: 14px; text-align: center; }
+.token-screen code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface);
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+  overflow-wrap: anywhere;
+}
+.pairing-screen { align-items: center; }
+.pairing-mark {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-l);
+  background: var(--text);
+  color: var(--bg);
+  font-family: Georgia, serif;
+  font-size: 34px;
+  line-height: 1;
+}
+.pairing-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+}
+.pairing-code {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: var(--fs-large);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  font-variant-numeric: tabular-nums;
+}
+.pairing-body .muted { color: var(--text-tertiary); }
+
+/* ---------- Desktop ---------- */
+
+@media (min-width: 800px) {
+  :root { --gutter: var(--space-5); }
+
+  /* Tab bar becomes a left rail. `auto` collapses the column to nothing when app.js hides the
+     rail (signed out), so no extra rule is needed for that case. */
+  #app {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto 1fr;
+  }
+  #banner { grid-column: 1 / -1; }
+  .tabbar {
+    grid-column: 1;
+    grid-row: 2;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: var(--space-1);
+    width: 84px;
+    padding: var(--space-3) var(--space-1);
+    border-top: none;
+    border-right: 1px solid var(--hairline);
+    background: var(--surface);
+  }
+  .tabbar button {
+    flex: none;
+    border-radius: var(--radius-m);
+    padding: var(--space-2) var(--space-1);
+    min-height: 56px;
+    font-size: 11.5px;
+  }
+  .tabbar button:hover { color: var(--text); background: var(--hover); }
+  .tabbar button[aria-current="true"] { background: var(--accent-quiet); }
+  main { grid-column: 2; grid-row: 2; min-height: 0; }
+
+  /* Hover affordances only where a real pointer exists. */
+  .row:hover { background: var(--hover); }
+  .btn:hover:not(:disabled) { background: var(--surface-strong); }
+  .btn-primary:hover:not(:disabled) { background: var(--accent); opacity: 0.9; }
+  .icon-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+  .link-btn:hover { background: var(--hover); }
+  .chip:hover { border-color: var(--hairline-strong); }
+  .fab:hover { opacity: 0.92; }
+
+  .topbar { min-height: 56px; }
+  .composer textarea { max-height: 240px; }
+}
+
+/* Landscape phones have almost no vertical room: trim the tab bar and composer chrome. */
+@media (max-height: 480px) and (orientation: landscape) {
+  .tabbar button { flex-direction: row; gap: var(--space-2); min-height: 38px; }
+  .tabbar button .tab-icon { font-size: 15px; }
+  .composer textarea { max-height: 28vh; }
+  .empty-state { padding-top: var(--space-4); padding-bottom: var(--space-4); }
+}
+
+/* ---------- Folder tree (thread list) ---------- */
+
+/* One indentation token drives both row kinds, so a folder header and the threads inside it stay
+   aligned at every depth. threadList.js clamps the step count, so a deep tree still leaves room
+   for a title on a narrow phone. */
+.row,
+.group-row {
+  padding-left: calc(var(--pad-l) + var(--depth, 0) * var(--space-3));
+}
+
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--tap);
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+  padding-right: var(--pad-r);
+  text-align: left;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid var(--hairline);
+  appearance: none;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: var(--fs-label);
+  font-weight: 600;
+}
+.group-row:active { background: var(--pressed); }
+.group-row:focus-visible { outline-offset: -2px; }
+.group-caret {
+  width: 14px;
+  flex: none;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+.group-glyph { flex: none; color: var(--text-tertiary); font-size: 11px; }
+.group-virtual .group-glyph { color: var(--accent); }
+.group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.group-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  color: var(--text-tertiary);
+}
+
+/* ---------- Pending (unconfirmed) messages ---------- */
+
+/* Held at reduced opacity rather than a different colour: it is the same message, just not yet
+   confirmed by Pi's own session file. A failed one drops the dimming and gains the error tint. */
+.messages-pending {
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+.messages-pending:empty { display: none; }
+.msg-pending .bubble {
+  opacity: 0.72;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg-pending.msg-error .bubble { opacity: 1; }
+.msg-pending-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-end;
+  margin-top: var(--space-1);
+  font-size: var(--fs-caption);
+  color: var(--text-tertiary);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.msg-error .msg-pending-status { color: var(--red); }
+
+/* ---------- Inline images ---------- */
+
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  max-width: 100%;
+}
+.msg-user .msg-images { justify-content: flex-end; }
+
+.img-tile {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 96px;
+  min-height: 72px;
+  max-width: 100%;
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m);
+  overflow: hidden;
+  cursor: pointer;
+  appearance: none;
+  color: var(--text-tertiary);
+  font-size: var(--fs-caption);
+}
+.img-tile:active { opacity: 0.8; }
+.thumb {
+  display: block;
+  /* Responsive by construction: a wide screenshot shrinks to the column, a tall one is capped so
+     one image never fills the whole transcript. */
+  max-width: min(100%, 320px);
+  max-height: 240px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+.img-loading { padding: var(--space-2) var(--space-3); text-align: center; }
+.img-failed { color: var(--red); }
+
+.img-placeholder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px dashed var(--hairline-strong);
+  border-radius: var(--radius-m);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  max-width: 100%;
+}
+.img-glyph { color: var(--text-tertiary); }
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: calc(var(--space-3) + var(--safe-t)) var(--space-3) calc(var(--space-3) + var(--safe-b));
+  background: rgba(0, 0, 0, 0.92);
+}
+.lightbox-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: #fff;
+}
+.lightbox-bar .icon-btn, .lightbox-bar .link-btn { color: #fff; }
+.lightbox-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-small);
+}
+.lightbox-img {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+}
+
+/* ---------- Interaction (questionnaire / approval) ---------- */
+
+.interactions { display: flex; flex-direction: column; gap: var(--space-4); }
+.interactions:empty { display: none; }
+
+.interaction {
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent-quiet);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-l);
+}
+.interaction-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+.interaction-chip {
+  font-size: var(--fs-caption);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.interaction-step { font-size: var(--fs-caption); color: var(--text-tertiary); }
+.interaction-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-title);
+  font-weight: 650;
+  line-height: 1.3;
+}
+.interaction-message,
+.interaction-hint {
+  margin: 0 0 var(--space-3);
+  font-size: var(--fs-small);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.interaction-options,
+.interaction-form { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.interaction-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-height: var(--tap);
+  padding: var(--space-3);
+  background: var(--surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius-m);
+  cursor: pointer;
+}
+.interaction-option:focus-within { border-color: var(--accent); }
+.interaction-option input { margin-top: 3px; flex: none; width: 20px; height: 20px; accent-color: var(--accent); }
+.interaction-option-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.interaction-option-label { font-size: var(--fs-body); font-weight: 550; }
+.interaction-option-desc { font-size: var(--fs-small); color: var(--text-secondary); }
+.interaction-option-preview {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  max-height: 180px;
+  overflow: auto;
+  background: var(--bg);
+  border-radius: var(--radius-s);
+  font-size: var(--fs-caption);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.interaction-text,
+.interaction-custom {
+  width: 100%;
+  /* 16px minimum, like every other field here, so iOS Safari never zooms on focus. */
+  font: inherit;
+  font-size: 16px;
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m);
+  resize: vertical;
+}
+.interaction-text:focus-visible,
+.interaction-custom:focus-visible { border-color: var(--accent); }
+
+.interaction-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.interaction-actions:empty { display: none; }
+
+@media (min-width: 800px) {
+  .group-row:hover { background: var(--surface-strong); }
+  .img-tile:hover { border-color: var(--hairline-strong); }
+  .interaction-option:hover { border-color: var(--hairline-strong); }
+}
+
+/* ---------- Review follow-ups ---------- */
+
+/* Scroll lock while the lightbox is open: without it the transcript scrolls underneath a
+   full-screen overlay on every touch drag. */
+body.modal-open { overflow: hidden; }
+
+/* `inert` is honoured natively where supported; this keeps the background visibly and
+   interactively out of the way everywhere else too. */
+[inert] { pointer-events: none; user-select: none; }
+
+/* Native grouping for option lists — no border/padding of its own, the rows carry the styling. */
+.interaction-fieldset {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: none;
+  min-width: 0;
+}
+
+/* An option whose preview sits outside the label, so scrolling the sample cannot toggle it. */
+.interaction-option-group { display: flex; flex-direction: column; gap: var(--space-1); }
+.interaction-option-group .interaction-option-preview { margin-left: calc(20px + var(--space-3)); }
+
+/* An image beyond the automatic budget is a deliberate tap, so its tile reads as an action. */
+.img-tile .img-loading { color: var(--accent); }
+.img-tile .img-failed { color: var(--red); }

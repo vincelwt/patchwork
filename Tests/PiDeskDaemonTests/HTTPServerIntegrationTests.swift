@@ -305,6 +305,38 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertTrue(snapshot.report.accounts.isEmpty)
     }
 
+    // MARK: - Hosted remote
+
+    func testHostedRemoteStatusIsAvailableLocallyWithoutStartingANetworkConnection() async throws {
+        let status = try await client.remoteAccessStatus()
+        XCTAssertEqual(status.connection, .offline)
+        XCTAssertEqual(status.relayURL, "https://remote.ai.gloom.sh")
+        XCTAssertTrue(status.devices.isEmpty)
+    }
+
+    func testPairingClearlyReportsAnOfflineRelay() async throws {
+        do {
+            _ = try await client.createRemotePairing()
+            XCTFail("expected relay_offline")
+        } catch let PiDeskClientError.server(status, code, _) {
+            XCTAssertEqual(status, 503)
+            XCTAssertEqual(code, "relay_offline")
+        }
+    }
+
+    func testRelayCannotCallLocalPairingManagementRoutes() async throws {
+        let router = DaemonRouter(routes: Routes.all(core))
+        let response = await router.handle(HTTPRequest(
+            method: "GET",
+            path: "/v1/remote",
+            query: [:],
+            headers: [:],
+            body: Data(),
+            origin: .relay
+        ))
+        XCTAssertEqual(response.status, 401)
+    }
+
     // MARK: - Events (SSE)
 
     func testEventsStreamDeliversAScheduleEvent() async throws {

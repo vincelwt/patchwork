@@ -14,6 +14,17 @@ public enum SessionThreadParser {
     /// Per-block text bound so one huge message cannot make a summary scan retain unbounded text.
     static let blockTextLimit = 4_000
 
+    /// Largest decoded image `GET /v1/threads/{id}/images/{imageId}` will ever return. Chosen so
+    /// one image plus its base64 expansion (~4/3) and JSON envelope still fits inside the hosted
+    /// relay's 1.5 MB encrypted-plaintext ceiling; anything bigger is reported as `tooLarge`
+    /// rather than truncated into a corrupt picture.
+    public static let imageByteLimit = 1_000_000
+    /// Per-message ceiling on how many image references one projected message may carry.
+    public static let imagesPerMessageLimit = 8
+    /// Ceiling across one `messages(at:limit:)` projection. Newest images win; the rest are
+    /// still listed, as `omitted`, so nothing silently disappears from the transcript.
+    public static let imagesPerRequestLimit = 40
+
     public enum ParseError: Error { case notASession }
 
     /// Single forward pass: every retained value is a scalar accumulator, so memory use does not
@@ -109,19 +120,42 @@ public enum SessionThreadParser {
         guard limit > 0 else { return [] }
         var buffer: [Message] = []
         buffer.reserveCapacity(min(limit, 512))
+        var ordinal = 0
 
         try JSONLFileReader.read(url: url) { data in
             try Task.checkCancellation()
+            let entryOrdinal = ordinal
+            ordinal += 1
             guard let value = try? PiJSONValue.decode(data), let object = value.objectValue,
-                  let message = Self.wireMessage(from: object) else { return }
+                  let message = Self.wireMessage(from: object, ordinal: entryOrdinal) else { return }
             buffer.append(message)
             if buffer.count > limit * 2 { buffer.removeFirst(buffer.count - limit) }
         }
         if buffer.count > limit { buffer.removeFirst(buffer.count - limit) }
-        return buffer
+        return applyImageBudget(to: buffer)
     }
 
-    private static func wireMessage(from entry: [String: PiJSONValue]) -> Message? {
+    /// The per-request image ceiling is applied *after* trimming, walking newest first, so the
+    /// newest images are the ones a client loads without being asked. `omitted` bounds automatic
+    /// loading, not availability: the id stays valid, and a client may still fetch it on demand.
+    static func applyImageBudget(to messages: [Message]) -> [Message] {
+        var remaining = imagesPerRequestLimit
+        var result = messages
+        for index in result.indices.reversed() {
+            guard !result[index].images.isEmpty else { continue }
+            for imageIndex in result[index].images.indices where result[index].images[imageIndex].status == .ok {
+                if remaining > 0 {
+                    remaining -= 1
+                } else {
+                    result[index].images[imageIndex].status = .omitted
+                    result[index].images[imageIndex].note = "Not loaded automatically — this view reached its image limit."
+                }
+            }
+        }
+        return result
+    }
+
+    private static func wireMessage(from entry: [String: PiJSONValue], ordinal: Int) -> Message? {
         let type = entry["type"]?.stringValue ?? "unknown"
         let id = entry["id"]?.stringValue ?? UUID().uuidString
 
@@ -134,7 +168,7 @@ public enum SessionThreadParser {
             let text = plainText(from: message["content"]) ?? ""
             let isError = message["isError"]?.boolValue ?? (message["stopReason"]?.stringValue == "error")
             let at = timestamp(from: message["timestamp"]) ?? .distantPast
-            return Message(id: id, role: role, text: text, at: at, isError: isError)
+            return Message(id: id, role: role, text: text, at: at, isError: isError, images: imageRefs(in: message, ordinal: ordinal))
         case "compaction":
             let summary = entry["summary"]?.stringValue ?? "Earlier context was compacted."
             return Message(id: id, role: .system, text: "Context compacted: \(bounded(summary, max: blockTextLimit))", at: timestamp(from: entry["timestamp"]) ?? .distantPast)
@@ -180,6 +214,148 @@ public enum SessionThreadParser {
         }
         guard !parts.isEmpty else { return nil }
         return bounded(parts.joined(separator: "\n"), max: blockTextLimit)
+    }
+
+    // MARK: - Inline images
+
+    /// The two shapes Pi actually writes, matching the app's own transcript parser: a `content`
+    /// block `{"type":"image","data":"<base64>","mimeType":…}` and an `attachments` entry
+    /// `{"type":"image","content":"<base64>","mimeType":…}`. Only lengths are read here; the
+    /// base64 itself is never retained, so a transcript scan stays flat in memory no matter how
+    /// many screenshots a conversation contains.
+    static func imageRefs(in message: PiJSONValue, ordinal: Int) -> [MessageImage] {
+        var refs: [MessageImage] = []
+        for (index, block) in (message["content"]?.arrayValue ?? []).enumerated() {
+            guard block["type"]?.stringValue == "image" else { continue }
+            guard refs.count < imagesPerMessageLimit else { break }
+            refs.append(imageRef(id: "\(ordinal)-c\(index)", encoded: block["data"]?.stringValue, block: block))
+        }
+        for (index, block) in (message["attachments"]?.arrayValue ?? []).enumerated() {
+            guard block["type"]?.stringValue == "image" else { continue }
+            guard refs.count < imagesPerMessageLimit else { break }
+            refs.append(imageRef(id: "\(ordinal)-a\(index)", encoded: block["content"]?.stringValue, block: block))
+        }
+        return refs
+    }
+
+    private static func imageRef(id: String, encoded: String?, block: PiJSONValue) -> MessageImage {
+        let mimeType = block["mimeType"]?.stringValue ?? "image/png"
+        let fileName = block["fileName"]?.stringValue.map { bounded($0, max: 200) }
+        guard let encoded, !encoded.isEmpty else {
+            return MessageImage(
+                id: id, mimeType: mimeType, byteCount: 0, fileName: fileName,
+                status: .invalid, note: "Image omitted because it was empty or unreadable."
+            )
+        }
+        let byteCount = decodedByteEstimate(encodedLength: encoded.count)
+        guard byteCount <= imageByteLimit else {
+            return MessageImage(
+                id: id, mimeType: mimeType, byteCount: byteCount, fileName: fileName,
+                status: .tooLarge, note: "Image is too large to open remotely; view it on the Mac."
+            )
+        }
+        // `ok` is a promise that fetching this id will return bytes. Validating the encoding here
+        // — without allocating the decoded image — keeps that promise honest instead of handing a
+        // client a thumbnail that can only ever fail to load.
+        guard isWellFormedBase64(encoded) else {
+            return MessageImage(
+                id: id, mimeType: mimeType, byteCount: byteCount, fileName: fileName,
+                status: .invalid, note: "Image omitted because it was empty or unreadable."
+            )
+        }
+        return MessageImage(id: id, mimeType: mimeType, byteCount: byteCount, fileName: fileName)
+    }
+
+    /// Standard base64: a multiple of four characters from the base64 alphabet, with at most two
+    /// `=` and only at the very end. One allocation-free pass, so validating every image in a
+    /// transcript scan costs no memory beyond the string already decoded from the JSONL record.
+    static func isWellFormedBase64(_ value: String) -> Bool {
+        let scalars = value.unicodeScalars
+        guard !scalars.isEmpty, scalars.count % 4 == 0 else { return false }
+        var padding = 0
+        for scalar in scalars {
+            switch scalar {
+            case "A"..<"[", "a"..<"{", "0"..<":", "+", "/":
+                // A payload character after padding has started is malformed.
+                if padding > 0 { return false }
+            case "=":
+                padding += 1
+                if padding > 2 { return false }
+            default:
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Decoded size of a base64 payload, ignoring padding subtleties (over-estimates by <=2 bytes).
+    static func decodedByteEstimate(encodedLength: Int) -> Int { encodedLength / 4 * 3 }
+
+    /// Reads exactly one image back out of the session file by the id `messages(at:limit:)`
+    /// handed out. Stops scanning at the target record, and refuses anything that does not decode
+    /// or exceeds `imageByteLimit`, so an unbounded or corrupt payload can never reach a response.
+    public static func image(at url: URL, imageId: String) throws -> MessageImageResponse? {
+        guard let target = ImageRef(id: imageId) else { return nil }
+        var ordinal = 0
+        var found: MessageImageResponse?
+
+        do {
+            try JSONLFileReader.read(url: url) { data in
+                try Task.checkCancellation()
+                let current = ordinal
+                ordinal += 1
+                guard current == target.ordinal else { return }
+                found = decodedImage(from: data, target: target, imageId: imageId)
+                // The record the id names has been handled either way; reading the rest of a
+                // multi-megabyte session file would be pure waste.
+                throw ScanFinished()
+            }
+        } catch is ScanFinished {
+            // Expected early exit.
+        }
+        return found
+    }
+
+    private struct ScanFinished: Error {}
+
+    private static func decodedImage(from data: Data, target: ImageRef, imageId: String) -> MessageImageResponse? {
+        guard let value = try? PiJSONValue.decode(data), let message = value["message"],
+              let blocks = (target.isAttachment ? message["attachments"] : message["content"])?.arrayValue,
+              blocks.indices.contains(target.blockIndex) else { return nil }
+        let block = blocks[target.blockIndex]
+        guard block["type"]?.stringValue == "image",
+              let encoded = (target.isAttachment ? block["content"] : block["data"])?.stringValue,
+              !encoded.isEmpty,
+              decodedByteEstimate(encodedLength: encoded.count) <= imageByteLimit,
+              let decoded = Data(base64Encoded: encoded, options: [.ignoreUnknownCharacters]),
+              !decoded.isEmpty, decoded.count <= imageByteLimit else { return nil }
+        return MessageImageResponse(
+            id: imageId,
+            mimeType: block["mimeType"]?.stringValue ?? "image/png",
+            byteCount: decoded.count,
+            fileName: block["fileName"]?.stringValue.map { bounded($0, max: 200) },
+            data: decoded.base64EncodedString()
+        )
+    }
+
+    /// `"<entryOrdinal>-c<blockIndex>"` (a `content` block) or `"<entryOrdinal>-a<blockIndex>"`
+    /// (an `attachments` entry). Ordinals are JSONL record positions, and Pi only ever appends,
+    /// so an id stays valid for the life of the session file.
+    struct ImageRef {
+        let ordinal: Int
+        let isAttachment: Bool
+        let blockIndex: Int
+
+        init?(id: String) {
+            let parts = id.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, let ordinal = Int(parts[0]), ordinal >= 0 else { return nil }
+            let tail = parts[1]
+            guard let marker = tail.first, marker == "c" || marker == "a",
+                  let blockIndex = Int(tail.dropFirst()), blockIndex >= 0 else { return nil }
+            self.ordinal = ordinal
+            isAttachment = marker == "a"
+            self.blockIndex = blockIndex
+        }
     }
 
     private static func bounded(_ value: String, max: Int) -> String {

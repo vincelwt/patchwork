@@ -94,7 +94,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionLetsPiNameANewConversation() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 6)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 7)
         XCTAssertTrue(bundled.contains("name: \"set_conversation_name\""))
         XCTAssertTrue(bundled.contains("After understanding the first user message"))
         XCTAssertTrue(bundled.contains("const current = pi.getSessionName()"))
@@ -103,12 +103,21 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 6)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 7)
         XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
         XCTAssertTrue(bundled.contains("/v1/schedules"))
         XCTAssertTrue(bundled.contains("event.toolName.toLowerCase() !== \"agent\""))
         XCTAssertTrue(bundled.contains("completionId"))
         XCTAssertTrue(bundled.contains("latestCompletedEntryID(ctx.sessionManager.getBranch())"))
+    }
+
+    func testBundledExtensionCanResumeWithoutAVisibleUserMessage() throws {
+        let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 7)
+        XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-resume\""))
+        XCTAssertTrue(bundled.contains("customType: \"pi-desktop-connectivity-resume\""))
+        XCTAssertTrue(bundled.contains("display: false"))
+        XCTAssertTrue(bundled.contains("triggerTurn: true"))
     }
 
     // MARK: - Disable setting

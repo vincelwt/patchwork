@@ -8,6 +8,9 @@ public enum PiDeskEvent: Sendable {
     case activity(ActivitySnapshot)
     case run(Run)
     case schedule(Schedule)
+    /// A daemon run is blocked on a dialog, or has just stopped being blocked on one
+    /// (`resolvedAt` set). See `PendingInteraction`.
+    case interaction(PendingInteraction)
     case unknown(name: String, data: PiJSONValue)
 
     /// The SSE `event:` field this frame was published under.
@@ -17,6 +20,7 @@ public enum PiDeskEvent: Sendable {
         case .activity: "activity"
         case .run: "run"
         case .schedule: "schedule"
+        case .interaction: "interaction"
         case let .unknown(name, _): name
         }
     }

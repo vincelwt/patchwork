@@ -11,8 +11,15 @@ let logger = DaemonLogger()
 logger.info("pi-deskd starting (concurrency=\(settings.concurrency), remoteEnabled=\(settings.remoteEnabled), port=\(settings.port))")
 
 let piVersion = PiVersion.detect()
-let executor = PiProcessRunExecutor(logger: logger)
-let core = DaemonCore(settings: settings, logger: logger, executor: executor, piVersion: piVersion)
+// Both registries are shared between the executor (which fills them while a run streams) and the
+// API (which reads and answers them), so they are created here and handed to both.
+let interactions = InteractionRegistry(logger: logger)
+let liveSessions = LiveSessionRegistry()
+let executor = PiProcessRunExecutor(logger: logger, interactions: interactions, liveSessions: liveSessions)
+let core = DaemonCore(
+    settings: settings, logger: logger, executor: executor, piVersion: piVersion,
+    interactions: interactions, liveSessions: liveSessions
+)
 let router = DaemonRouter(routes: Routes.all(core))
 let server = HTTPServer(router: router, logger: logger, bus: core.bus, tokenProvider: {
     settings.remoteEnabled ? (try? DaemonToken.loadOrCreate()) : nil
@@ -26,7 +33,10 @@ do {
     exit(1)
 }
 
-Task { await core.start() }
+Task {
+    await core.start()
+    await core.startRelay(router: router)
+}
 
 // GCD signal sources (not the raw libc handler) so shutdown runs real Swift code \u2014 stopping the
 // scheduler and flushing the log \u2014 instead of being restricted to async-signal-safe calls only.

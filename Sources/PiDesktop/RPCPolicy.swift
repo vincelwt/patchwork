@@ -23,7 +23,8 @@ enum RPCTimeoutPolicy {
     static let stateQueries: Set<String> = [
         "get_state",
         "get_session_stats",
-        "get_fork_messages"
+        "get_fork_messages",
+        "get_commands"
     ]
 
     static func outcome(for command: String) -> Outcome {

@@ -1,7 +1,7 @@
-// Fetch wrapper for the daemon's control API (docs/daemon-api.md). Every request is same-origin
-// (the daemon serves both this site and /v1/*), carries `Authorization: Bearer <token>`, and
-// never logs the token — it is read from storage right before each request and never assigned to
-// a variable that outlives the call.
+// One API wrapper for both transports: same-origin fetch + bearer token on the daemon's legacy
+// loopback site, or encrypted RPC over the hosted relay. Views keep the exact same `/v1` contract.
+
+import { isRelayMode, relayRequest } from "./relay.js";
 
 const TOKEN_KEY = "pi-desktop-web-token";
 
@@ -47,7 +47,7 @@ export class NetworkError extends Error {}
 
 /** A short, user-facing message for anything this module can throw. Never includes the token. */
 export function describeError(err) {
-  if (err instanceof NetworkError) return "Can\u2019t reach the daemon. Check your connection or tunnel.";
+  if (err instanceof NetworkError) return "Can\u2019t reach your Mac. Check that Pi Desktop is running and online.";
   if (err instanceof ApiError) return err.message;
   return "Something went wrong.";
 }
@@ -57,25 +57,38 @@ export function describeError(err) {
  * one place, regardless of which call triggered it.
  */
 async function request(path, options = {}) {
-  const headers = { Authorization: `Bearer ${getToken()}`, ...(options.headers || {}) };
-  if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-
-  let response;
-  try {
-    response = await fetch(path, { ...options, headers });
-  } catch (err) {
-    throw new NetworkError(err instanceof Error ? err.message : "Network request failed");
+  let status;
+  let text;
+  if (isRelayMode()) {
+    try {
+      const response = await relayRequest(options.method || "GET", path, options.body);
+      status = response.status;
+      text = response.body;
+    } catch (err) {
+      throw new NetworkError(err instanceof Error ? err.message : "Relay request failed");
+    }
+  } else {
+    const headers = { Authorization: `Bearer ${getToken()}`, ...(options.headers || {}) };
+    if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+    let response;
+    try {
+      response = await fetch(path, { ...options, headers });
+    } catch (err) {
+      throw new NetworkError(err instanceof Error ? err.message : "Network request failed");
+    }
+    status = response.status;
+    text = status === 204 ? "" : await response.text();
   }
 
-  if (response.status === 401) {
-    window.dispatchEvent(new CustomEvent("pi:unauthorized"));
+  if (status === 401) {
+    if (!isRelayMode()) window.dispatchEvent(new CustomEvent("pi:unauthorized"));
     throw new ApiError(401, "unauthorized", "Sign in again.");
   }
-  if (!response.ok) {
+  if (status < 200 || status >= 300) {
     let code = "error";
-    let message = `Request failed (${response.status})`;
+    let message = `Request failed (${status})`;
     try {
-      const body = await response.json();
+      const body = JSON.parse(text);
       if (body && body.error) {
         code = body.error.code || code;
         message = body.error.message || message;
@@ -83,10 +96,8 @@ async function request(path, options = {}) {
     } catch {
       /* body was not JSON; keep the generic message */
     }
-    throw new ApiError(response.status, code, message);
+    throw new ApiError(status, code, message);
   }
-  if (response.status === 204) return null;
-  const text = await response.text();
   return text ? JSON.parse(text) : null;
 }
 
@@ -117,6 +128,18 @@ export const api = {
   archiveThread: (id, archived) => post(`/v1/threads/${encodeURIComponent(id)}/archive`, { archived }),
   renameThread: (id, name) => post(`/v1/threads/${encodeURIComponent(id)}/name`, { name }),
   markThreadRead: (id, unread) => post(`/v1/threads/${encodeURIComponent(id)}/read`, { unread }),
+  // Metadata only travels in the thread detail; each image is fetched separately so one
+  // screenshot-heavy transcript cannot exceed the relay's per-payload ceiling.
+  threadImage: (id, imageId) =>
+    request(`/v1/threads/${encodeURIComponent(id)}/images/${encodeURIComponent(imageId)}`),
+
+  // Read-only projection of the Mac app's own folder tree; never written from here.
+  folders: () => request("/v1/folders"),
+
+  // The authoritative list of dialogs a daemon run is blocked on. The `interaction` SSE event is
+  // only a hint that something changed — this is what a reconnecting client rehydrates from.
+  interactions: (threadId) => request(`/v1/interactions${toQuery({ threadId })}`),
+  respondInteraction: (id, body) => post(`/v1/interactions/${encodeURIComponent(id)}/respond`, body),
 
   activity: () => request("/v1/activity"),
 

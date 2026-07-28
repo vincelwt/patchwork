@@ -257,6 +257,7 @@ private struct TurnBuilder {
     /// The last assistant message's error state seen so far this turn — overwritten, not OR'd,
     /// so a transient error Pi auto-retried past does not leave the settled turn flagged failed.
     private var turnAnswerFailed = false
+    private var userImageData: [Data] = []
 
     init(isLive: Bool) { self.isLive = isLive }
 
@@ -266,6 +267,7 @@ private struct TurnBuilder {
         switch message.role {
         case .user:
             closeTurn(active: false)
+            userImageData = message.images.map(\.data)
             turnStart = message.timestamp
             result.append(.message(message, streaming: streaming))
         case .assistant:
@@ -372,7 +374,14 @@ private struct TurnBuilder {
         ))
     }
 
-    private mutating func attachResult(_ message: ChatMessage) {
+    private mutating func attachResult(_ source: ChatMessage) {
+        var message = source
+        if !userImageData.isEmpty {
+            message.blocks.removeAll { block in
+                guard case let .image(image) = block.kind else { return false }
+                return userImageData.contains(image.data)
+            }
+        }
         let callID = message.toolCallID ?? message.id
         if let index = pending?.steps.lastIndex(where: { $0.id == callID }) {
             pending?.steps[index].result = message

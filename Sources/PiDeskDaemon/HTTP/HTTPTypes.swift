@@ -3,7 +3,7 @@ import PiDeskKit
 
 /// Which listener accepted this connection. Authorization differs entirely by origin: the Unix
 /// socket trusts filesystem permissions, loopback TCP requires a bearer token.
-enum RequestOrigin: Sendable { case unixSocket, tcp }
+enum RequestOrigin: Sendable, Equatable { case unixSocket, tcp, relay }
 
 struct HTTPRequest: Sendable {
     var method: String
@@ -58,6 +58,7 @@ struct HTTPResponse: Sendable {
         case 413: "Payload Too Large"
         case 429: "Too Many Requests"
         case 500: "Internal Server Error"
+        case 503: "Service Unavailable"
         default: "Error"
         }
     }
@@ -71,6 +72,7 @@ enum DaemonHTTPError: Error {
     case unauthorized
     case notFound(String)
     case conflict(code: String, message: String)
+    case serviceUnavailable(code: String, message: String)
 
     var response: HTTPResponse {
         switch self {
@@ -78,6 +80,7 @@ enum DaemonHTTPError: Error {
         case .unauthorized: .error(401, code: "unauthorized", message: "Missing or invalid bearer token.")
         case let .notFound(what): .error(404, code: "not_found", message: "\(what) was not found.")
         case let .conflict(code, message): .error(409, code: code, message: message)
+        case let .serviceUnavailable(code, message): .error(503, code: code, message: message)
         }
     }
 }

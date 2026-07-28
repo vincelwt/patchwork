@@ -19,10 +19,15 @@ enum AppStatePeek {
         var latestCompletedEntryIDBySessionPath: [String: String] = [:]
         var lastSeenCompletedEntryIDBySessionPath: [String: String] = [:]
         var lastReadAt: [String: Date] = [:]
+        /// App-owned organisational folders, exposed read-only by `GET /v1/folders`. Absent in
+        /// state written before folders existed, which decodes as "no folders", not as a failure.
+        var virtualFolders: [StoredVirtualFolder] = []
+        var virtualFolderAssignments: [String: String] = [:]
 
         private enum CodingKeys: String, CodingKey {
             case archivedSessionIDs, manuallyUnreadSessionPaths
             case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
+            case virtualFolders, virtualFolderAssignments
         }
 
         init() {}
@@ -38,6 +43,21 @@ enum AppStatePeek {
                 [String: String].self, forKey: .lastSeenCompletedEntryIDBySessionPath
             ) ?? [:]
             lastReadAt = try container.decodeIfPresent([String: Date].self, forKey: .lastReadAt) ?? [:]
+            // One malformed folder record must not cost the caller the whole tree, so folders are
+            // decoded independently of everything above and default to empty on any failure.
+            virtualFolders = (try? container.decodeIfPresent([StoredVirtualFolder].self, forKey: .virtualFolders)) ?? []
+            virtualFolderAssignments = (try? container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments)) ?? [:]
+        }
+
+        /// The cycle-safe, depth-capped projection `GET /v1/folders` returns. Assignment keys are
+        /// standardized the same way `ThreadStore` standardizes `Thread.path`, so a client can
+        /// look one up directly by the path it already has.
+        var folderTree: FolderTreeResponse {
+            let standardized = Dictionary(
+                virtualFolderAssignments.map { (URL(fileURLWithPath: $0.key).standardizedFileURL.path, $0.value) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            return FolderTree.response(folders: virtualFolders, assignments: standardized)
         }
 
         func isArchived(sessionID: String) -> Bool { archivedSessionIDs.contains(sessionID) }
@@ -52,8 +72,15 @@ enum AppStatePeek {
         }
     }
 
+    /// The app's own `state.json` is a few hundred KB at worst. Reading it is unavoidable, but
+    /// reading an arbitrarily large one is not: past this the daemon reports "no state" rather
+    /// than pulling a corrupted or hostile file into memory on every folder request.
+    static let maxStateBytes = 8 * 1_024 * 1_024
+
     static func load(from url: URL = AppStatePeek.defaultURL()) -> Snapshot {
-        guard let data = FileManager.default.contents(atPath: url.path) else { return Snapshot() }
+        guard let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,
+              size <= maxStateBytes,
+              let data = FileManager.default.contents(atPath: url.path) else { return Snapshot() }
         // The app writes this file with a plain, default-configured `JSONEncoder` (no ISO 8601
         // strategy), so `Date` fields are `.deferredToDate` (seconds since the 2001 reference
         // date) \u2014 a plain decoder matches that; `PiDeskJSON.decoder` would reject every date.

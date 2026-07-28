@@ -224,7 +224,7 @@ final class HTTPServer: @unchecked Sendable {
         return (method, path, query, headers)
     }
 
-    private static func splitTarget(_ target: String) -> (String, [String: String]) {
+    static func splitTarget(_ target: String) -> (String, [String: String]) {
         guard let questionMark = target.firstIndex(of: "?") else { return (target, [:]) }
         let path = String(target[target.startIndex..<questionMark])
         var query: [String: String] = [:]
