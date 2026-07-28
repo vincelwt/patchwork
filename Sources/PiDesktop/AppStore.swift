@@ -3110,6 +3110,20 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        if event["type"]?.stringValue == "session_info_changed" {
+            let name = event["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            updateState(for: slot) { $0.sessionName = name?.isEmpty == false ? name : nil }
+            if let session = session(for: slot) {
+                if let name, !name.isEmpty,
+                   let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    sessions[index].name = name
+                    sessions[index].prepareSearchKey()
+                } else {
+                    Task { await self.refreshSummary(for: session) }
+                }
+            }
+            return
+        }
         if slot === activeRuntimeSlot, !activePresentationDetached {
             handleRPCEvent(event)
         } else {
