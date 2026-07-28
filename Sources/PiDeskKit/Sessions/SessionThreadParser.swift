@@ -13,6 +13,9 @@ public enum SessionThreadParser {
     public static let titleLimit = 74
     /// Per-block text bound so one huge message cannot make a summary scan retain unbounded text.
     static let blockTextLimit = 4_000
+    /// Ceiling on structured blocks projected for one message. Order past this is lost, but the
+    /// message itself (and its flattened `text`) is not.
+    static let blocksPerMessageLimit = 40
 
     /// Largest decoded image `GET /v1/threads/{id}/images/{imageId}` will ever return. Chosen so
     /// one image plus its base64 expansion (~4/3) and JSON envelope still fits inside the hosted
@@ -168,16 +171,86 @@ public enum SessionThreadParser {
             let text = plainText(from: message["content"]) ?? ""
             let isError = message["isError"]?.boolValue ?? (message["stopReason"]?.stringValue == "error")
             let at = timestamp(from: message["timestamp"]) ?? .distantPast
-            return Message(id: id, role: role, text: text, at: at, isError: isError, images: imageRefs(in: message, ordinal: ordinal))
+            return Message(
+                id: id, role: role, text: text, at: at, isError: isError,
+                images: imageRefs(in: message, ordinal: ordinal),
+                // Only an assistant turn's block order says something `text` cannot: which prose
+                // is narration before a tool call and which is the answer after it.
+                blocks: role == .assistant ? contentBlocks(from: message["content"]) : nil,
+                toolCallId: message["toolCallId"]?.stringValue,
+                toolName: message["toolName"]?.stringValue,
+                stopReason: message["stopReason"]?.stringValue
+            )
         case "compaction":
-            let summary = entry["summary"]?.stringValue ?? "Earlier context was compacted."
-            return Message(id: id, role: .system, text: "Context compacted: \(bounded(summary, max: blockTextLimit))", at: timestamp(from: entry["timestamp"]) ?? .distantPast)
+            return summaryMessage(id: id, title: "Context compacted", entry: entry, fallback: "Earlier context was compacted.")
         case "branch_summary":
-            let summary = entry["summary"]?.stringValue ?? "Branch context summary."
-            return Message(id: id, role: .system, text: "Branch summary: \(bounded(summary, max: blockTextLimit))", at: timestamp(from: entry["timestamp"]) ?? .distantPast)
+            return summaryMessage(id: id, title: "Branch summary", entry: entry, fallback: "Branch context summary.")
         default:
             return nil
         }
+    }
+
+    /// Compaction and branch summaries keep their single flattened `text` for older clients, and
+    /// split title from summary in `blocks` so a client can show the title and reveal the rest.
+    private static func summaryMessage(id: String, title: String, entry: [String: PiJSONValue], fallback: String) -> Message {
+        let summary = bounded(entry["summary"]?.stringValue ?? fallback, max: blockTextLimit)
+        return Message(
+            id: id,
+            role: .system,
+            text: "\(title): \(summary)",
+            at: timestamp(from: entry["timestamp"]) ?? .distantPast,
+            blocks: [MessageBlock(type: "text", text: title), MessageBlock(type: "text", text: summary)]
+        )
+    }
+
+    /// Ordered structured blocks for one message's content, sharing a single text budget so a
+    /// transcript carrying blocks stays the same order of magnitude as one carrying only `text`.
+    /// Tool calls are always admitted even once the budget is spent — their identity is what lets
+    /// a client attach results — but their arguments shrink with everything else.
+    static func contentBlocks(from content: PiJSONValue?) -> [MessageBlock]? {
+        guard let blocks = content?.arrayValue else { return nil }
+        var budget = blockTextLimit
+        var result: [MessageBlock] = []
+
+        func take(_ value: String?) -> String? {
+            guard let value, !value.isEmpty else { return nil }
+            let text = bounded(value, max: max(budget, 0))
+            budget -= min(value.count, max(budget, 0))
+            return text
+        }
+
+        for block in blocks.prefix(blocksPerMessageLimit) {
+            switch block["type"]?.stringValue {
+            case "text":
+                if let text = take(block["text"]?.stringValue) { result.append(MessageBlock(type: "text", text: text)) }
+            case "thinking":
+                if let text = take(block["thinking"]?.stringValue) { result.append(MessageBlock(type: "thinking", text: text)) }
+            case "toolCall":
+                result.append(MessageBlock(
+                    type: "toolCall",
+                    callId: block["id"]?.stringValue,
+                    name: block["name"]?.stringValue ?? "tool",
+                    arguments: take(prettyJSON(block["arguments"]))
+                ))
+            case "image":
+                // Bytes and placement already travel in `Message.images`; the block only marks
+                // where the image sat relative to the prose around it.
+                result.append(MessageBlock(type: "image"))
+            case let other:
+                result.append(MessageBlock(type: other ?? "unknown"))
+            }
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    /// Display text for a tool call's arguments. Pretty-printed and key-sorted so the same call
+    /// always reads the same way, and truncated by the caller's budget like any other block text.
+    private static func prettyJSON(_ value: PiJSONValue?) -> String? {
+        guard let value, value != .object([:]) else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(value) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// Milliseconds-since-epoch (Pi's own JSONL convention) or an ISO 8601 string.

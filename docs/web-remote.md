@@ -130,8 +130,43 @@ swaps only the transport for the encrypted relay WebSocket. The views and `/v1` 
 are shared.
 
 Pure logic lives in `.mjs` modules with no DOM (`markdown`, `time`, `trigger`, `relayCrypto`,
-`pending`, `folders`) and is tested directly with `node --test docs/js-checks/*.test.mjs`. The
-`.js` view files are the only ones that touch the DOM.
+`pending`, `folders`, `transcript`) and is tested directly with `node --test docs/js-checks/*.test.mjs`.
+The `.js` view files are the only ones that touch the DOM.
+
+## Reading a conversation
+
+A thread reads the way it does in the Mac app, not as a dump of wire messages: one user message,
+one quiet **work** row, then Pi's answer. `js/transcript.mjs` is a port of the app's own
+`TranscriptPresenter`, so both clients fold a turn by the same rules.
+
+The work row is collapsed by default and carries everything that is not the answer: reasoning,
+narration Pi wrote before a tool call, every tool call with its arguments and result, errors Pi
+retried past, and compaction summaries. While the turn is live the row shows Pi's latest thought
+with a green dot and a running clock; once it settles it becomes `Worked for 12s`. Opening it
+reveals the log, and tool activity nests two more levels — one disclosure per activity group, one
+per individual call — so routine tool traffic is never dumped into the transcript. Each are native
+`details`/`summary` controls, so keyboard and screen-reader behaviour is the browser's own.
+
+What stays outside the collapsed row: the answer itself, images (an answer's own and any a tool
+produced), and question cards Pi is blocked on. A failed *step* stays red where it is; only a turn
+whose own answer failed marks the collapsed row `failed`. A tool result whose call is outside the
+loaded window still shows as its own step rather than disappearing, and a message role this build
+does not know is displayed rather than dropped.
+
+A daemon that predates the structured fields sends only `text`; the same projection then yields one
+block per message, which still reads as turns.
+
+## Live updates
+
+While a thread is running — a message sent from here, or a run the Mac app or a terminal started —
+the open thread re-reads its transcript at least every 2.5 seconds, on top of the debounced refresh
+an SSE `thread`/`run` event triggers. Events carry no message bodies (see `docs/daemon-api.md`), so
+polling is what makes a long turn visibly progress.
+
+The poll is deliberately dull: one timer, never two fetches in flight, and it stops entirely once
+nothing is running. A refresh that returns an identical transcript does not touch the DOM at all,
+so nothing re-animates, disclosures stay open, and a reader who has scrolled up is not dragged back
+to the bottom. The elapsed clock updates as text, without repainting the turn.
 
 ## Sending a message
 

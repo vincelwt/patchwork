@@ -17,10 +17,22 @@ import {
 import { applyInteractionLoad } from "../interactions.mjs";
 import { imageCache, ImageCacheBusyError } from "../imagecache.mjs";
 import { renderInteraction } from "./interaction.js";
+import {
+  activityProgress,
+  activitySummary,
+  compactionOf,
+  durationSeconds,
+  formatDuration,
+  projectTranscript
+} from "../transcript.mjs";
 
 const INITIAL_MESSAGE_COUNT = 50;
 const REFRESH_DEBOUNCE_MS = 700;
 const NEAR_BOTTOM_PX = 120;
+// While the thread is running the SSE `thread` event is only a hint, and a run that writes no
+// session-file update for a while would otherwise look frozen. This is the floor on how often a
+// running thread re-reads its transcript; it stops entirely once nothing is in flight.
+const LIVE_POLL_MS = 2500;
 
 // A physical keyboard means Enter should send and Shift+Enter should break the line, the way
 // every desktop chat client behaves. On a touch keyboard Enter stays a newline — the Send button
@@ -44,6 +56,14 @@ export function renderThreadView(state, actions, threadId) {
   let renderedCount = 0;
   let loadedOnce = false;
   let lastRunSignature = "";
+  // The exact input `paintMessages` last rendered. A poll that brings back the same transcript
+  // must not rebuild the DOM: that would restart animations, drop text selection, and fight the
+  // reader's scroll position several times a second.
+  let paintedSignature = null;
+  // Disclosures the reader opened, by projection key, so a repaint reopens exactly what was open.
+  const openDisclosures = new Set();
+  let livePollTimer = null;
+  let liveClockTimer = null;
   // Messages accepted by the daemon but not yet visible in Pi's own session file. See
   // js/pending.mjs for why this exists and how entries are reconciled away.
   let pending = [];
@@ -353,6 +373,39 @@ export function renderThreadView(state, actions, threadId) {
     runStatus.hidden = !thread?.running;
     archiveBtn.setAttribute("aria-pressed", String(!!thread?.archived));
     archiveBtn.setAttribute("aria-label", thread?.archived ? "Unarchive thread" : "Archive thread");
+    syncLive();
+  }
+
+  /**
+   * Polling exists only while something is actually in flight — a daemon send, or a run the app
+   * or terminal started — and stops the moment the thread settles. One timer, never overlapping
+   * fetches, and a second timer that only advances the elapsed clocks already on screen.
+   */
+  function syncLive() {
+    const live = !disposed && (thread?.running === true || pending.some((entry) => entry.status !== "failed"));
+    if (live && !livePollTimer) {
+      livePollTimer = setInterval(() => {
+        // A slow response must not queue a second one behind it.
+        if (!fetchingMessages) loadMessages();
+      }, LIVE_POLL_MS);
+    } else if (!live && livePollTimer) {
+      clearInterval(livePollTimer);
+      livePollTimer = null;
+    }
+    if (live && !liveClockTimer) liveClockTimer = setInterval(tickElapsed, 1000);
+    else if (!live && liveClockTimer) {
+      clearInterval(liveClockTimer);
+      liveClockTimer = null;
+    }
+    tickElapsed();
+  }
+
+  /// Text-only updates to the clocks already in the tree, so a running turn never repaints.
+  function tickElapsed() {
+    for (const el of messagesEl.querySelectorAll(".work-elapsed[data-since]")) {
+      const seconds = durationSeconds(el.dataset.since, new Date().toISOString());
+      el.textContent = seconds === null ? "" : `\u00b7 ${formatDuration(seconds)}`;
+    }
   }
 
   function loadMessages() {
@@ -372,12 +425,15 @@ export function renderThreadView(state, actions, threadId) {
         loadedOnce = true;
         lastMessages = messages;
         paintHeader();
-        paintMessages(messages);
+        const changed = paintMessages(messages);
         pending = reconcile(pending, messages);
         paintPending();
         loadEarlierBtn.hidden = messages.length < messageLimit;
         loadEarlierBtn.disabled = false;
         loadEarlierBtn.textContent = "Load earlier";
+        // A poll that changed nothing must not move the reader, smooth-scroll, or fight a
+        // deliberate scroll back through history.
+        if (!changed) return;
         if (nearBottom) scrollToBottom(renderedCount ? "smooth" : "auto");
         // Older messages were prepended: hold the reading position instead of jumping.
         else scroll.scrollTop = scroll.scrollHeight - distanceFromBottom;
@@ -385,6 +441,7 @@ export function renderThreadView(state, actions, threadId) {
       .catch((err) => {
         mount(messagesEl, h("div", { class: "inline-error", role: "alert" }, describeError(err)));
         renderedCount = 0;
+        paintedSignature = null;
       })
       .finally(() => {
         fetchingMessages = false;
@@ -421,6 +478,7 @@ export function renderThreadView(state, actions, threadId) {
   }
 
   function paintPending() {
+    syncLive();
     mount(
       pendingEl,
       pending.map((entry) =>
@@ -528,20 +586,57 @@ export function renderThreadView(state, actions, threadId) {
     if (wasEmpty && interactions.length) scrollToBottom();
   }
 
+  /**
+   * Projects the wire messages into the same turns the Mac app shows — one user message, one
+   * collapsed work log, then the answer — and paints them. Returns whether anything changed, so a
+   * poll that brought back an identical transcript costs one string comparison and nothing else.
+   */
   function paintMessages(messages) {
+    const signature = JSON.stringify([messages, thread?.running === true]);
+    if (signature === paintedSignature) return false;
+    paintedSignature = signature;
+
     if (!messages.length) {
       mount(messagesEl, h("div", { class: "empty-state" }, h("p", { class: "empty-body" }, "No messages yet. Send the first one below.")));
       renderedCount = 0;
-      return;
+      return true;
     }
-    // Only genuinely new trailing messages animate in; a plain refresh of the same list must not
+    const items = projectTranscript(messages, { running: thread?.running === true });
+    // Only genuinely new trailing rows animate in; a plain refresh of the same turn must not
     // flash the whole transcript.
-    const firstNew = renderedCount && messages.length > renderedCount ? renderedCount : messages.length;
-    mount(
-      messagesEl,
-      messages.map((message, index) => renderMessage(message, index >= firstNew, threadId, imageHost))
+    const firstNew = renderedCount && items.length > renderedCount ? renderedCount : items.length;
+    mount(messagesEl, items.map((item, index) => renderItem(item, index >= firstNew)));
+    renderedCount = items.length;
+    tickElapsed();
+    return true;
+  }
+
+  function renderItem(item, isNew) {
+    return item.kind === "work"
+      ? renderWork(item, isNew, threadId, imageHost, disclosure)
+      : renderMessage(item.message, isNew, threadId, imageHost, disclosure);
+  }
+
+  /**
+   * A `details`/`summary` pair — a native disclosure, so keyboard and screen-reader behaviour come
+   * from the browser — whose open state is keyed by the projection so a live repaint reopens
+   * exactly what the reader had opened.
+   */
+  function disclosure(key, className, summaryChildren, body) {
+    const node = h(
+      "details",
+      {
+        class: className,
+        open: openDisclosures.has(key),
+        ontoggle: () => {
+          if (node.open) openDisclosures.add(key);
+          else openDisclosures.delete(key);
+        }
+      },
+      h("summary", { class: `${className}-sum` }, summaryChildren),
+      body
     );
-    renderedCount = messages.length;
+    return node;
   }
 
   function scheduleRefetch() {
@@ -563,6 +658,8 @@ export function renderThreadView(state, actions, threadId) {
       imageObserver?.disconnect();
       if (refetchTimer) clearTimeout(refetchTimer);
       if (interactionRetryTimer) clearTimeout(interactionRetryTimer);
+      if (livePollTimer) clearInterval(livePollTimer);
+      if (liveClockTimer) clearInterval(liveClockTimer);
     },
     onStateChange(next) {
       // A dropped tunnel is exactly when a poll fails and a dialog is answered on the Mac
@@ -618,7 +715,16 @@ function newClientId() {
   return `web-${random}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 128);
 }
 
-function renderMessage(message, isNew, threadId, view) {
+function renderMessage(message, isNew, threadId, view, disclosure) {
+  // A compaction outside any turn keeps the same quiet treatment it has inside one.
+  const compaction = compactionOf(message);
+  if (compaction) {
+    return h(
+      "div",
+      { class: `msg msg-system${isNew ? " msg-new" : ""}` },
+      renderCompaction(`compaction:${message.id}`, compaction, disclosure)
+    );
+  }
   const role = ["user", "assistant", "toolResult", "system"].includes(message.role) ? message.role : "system";
   const roleClass = { user: "msg-user", assistant: "msg-assistant", toolResult: "msg-tool", system: "msg-system" }[role];
   const classes = ["msg", roleClass];
@@ -626,12 +732,111 @@ function renderMessage(message, isNew, threadId, view) {
   if (isNew) classes.push("msg-new");
   const bodyClass = role === "user" ? "bubble" : "prose";
   const images = Array.isArray(message.images) ? message.images : [];
+  const time = clockTime(message.at);
+  const meta = role === "assistant" ? time : [roleLabel(role), time].filter(Boolean).join(" \u00b7 ");
   return h(
     "div",
     { class: classes.join(" ") },
-    h("div", { class: "msg-meta" }, `${roleLabel(role)} \u00b7 ${clockTime(message.at)}`),
+    meta ? h("div", { class: "msg-meta" }, meta) : null,
     message.text ? h("div", { class: bodyClass, html: renderMarkdown(message.text) }) : null,
     images.length ? h("div", { class: "msg-images" }, images.map((image) => renderImage(image, threadId, view))) : null
+  );
+}
+
+/**
+ * One turn's work log: a single quiet row that says what Pi is doing (or how long it took) and
+ * opens on demand. Reasoning and narration read as log; tool activity and each individual call
+ * are their own nested disclosures, so routine arguments and results are never dumped into the
+ * transcript. Images a tool produced stay outside the collapsed row.
+ */
+function renderWork(item, isNew, threadId, view, disclosure) {
+  const elapsed = item.active && item.startedAt ? h("span", { class: "work-elapsed", "data-since": item.startedAt }) : null;
+  const settledDuration =
+    !item.active && item.showsStatus && item.duration !== null
+      ? h("span", { class: "work-elapsed" }, `\u00b7 ${formatDuration(item.duration)}`)
+      : null;
+  const details = disclosure(
+    item.key,
+    "work",
+    [
+      item.active ? h("span", { class: "dot dot-green", "aria-hidden": "true" }) : null,
+      h("span", { class: "work-headline" }, item.headline),
+      elapsed,
+      settledDuration,
+      item.answerFailed ? h("span", { class: "work-failed" }, "\u00b7 failed") : null
+    ],
+    h("div", { class: "work-body" }, item.entries.map((entry) => renderWorkEntry(entry, threadId, view, disclosure)))
+  );
+  // `details`/`summary` announces expanded state on its own; this only names the row, and keeps
+  // the live status in the label rather than replacing it with a generic "working".
+  details.querySelector("summary").setAttribute("aria-label", item.active ? `Pi is working: ${item.headline}` : item.title);
+
+  return h(
+    "div",
+    { class: `msg msg-work${isNew ? " msg-new" : ""}` },
+    details,
+    item.images.length
+      ? h("div", { class: "msg-images" }, item.images.map((image) => renderImage(image, threadId, view)))
+      : null
+  );
+}
+
+function renderWorkEntry(entry, threadId, view, disclosure) {
+  if (entry.kind === "thinking") return h("div", { class: "work-think prose", html: renderMarkdown(entry.text) });
+  if (entry.kind === "activity") return renderActivity(entry, disclosure);
+  if (entry.compaction) return renderCompaction(entry.key, entry.compaction, disclosure);
+
+  const message = entry.message;
+  const images = Array.isArray(message.images) ? message.images : [];
+  return h(
+    "div",
+    { class: `work-note${message.isError ? " work-note-error" : ""}` },
+    message.isError ? h("div", { class: "work-label" }, "Pi error") : null,
+    message.text ? h("div", { class: "prose", html: renderMarkdown(message.text) }) : null,
+    images.length ? h("div", { class: "msg-images" }, images.map((image) => renderImage(image, threadId, view))) : null
+  );
+}
+
+function renderActivity(entry, disclosure) {
+  const node = disclosure(
+    entry.key,
+    "act",
+    [
+      h("span", { class: "work-headline" }, activitySummary(entry)),
+      h("span", { class: "work-count" }, activityProgress(entry))
+    ],
+    h("div", { class: "act-body" }, entry.steps.map((step) => renderStep(step, entry.active, disclosure)))
+  );
+  if (entry.steps.some((step) => step.failed)) node.classList.add("act-failed");
+  return node;
+}
+
+function renderStep(step, isLive, disclosure) {
+  // A step left unfinished by a run that ended must not read as still running.
+  const status = step.failed ? "failed" : step.complete ? null : isLive ? "running" : "no result";
+  const detail = [];
+  if (step.arguments) detail.push(h("div", { class: "work-label" }, "Arguments"), h("pre", { class: "tool-text" }, step.arguments));
+  const resultText = step.result?.text;
+  if (resultText) detail.push(h("div", { class: "work-label" }, "Result"), h("pre", { class: "tool-text" }, resultText));
+  if (!detail.length) detail.push(h("div", { class: "work-label" }, step.complete ? "No text result." : "Waiting for a result\u2026"));
+
+  const node = disclosure(
+    step.key,
+    "step",
+    [h("span", { class: "work-headline" }, step.label), status ? h("span", { class: "work-count" }, status) : null],
+    h("div", { class: "step-detail" }, detail)
+  );
+  if (step.failed) node.classList.add("step-failed");
+  return node;
+}
+
+function renderCompaction(key, compaction, disclosure) {
+  if (!compaction.summary) return h("div", { class: "work-compaction-flat" }, compaction.title);
+  return disclosure(
+    key,
+    "work-compaction",
+    [h("span", { class: "work-headline" }, compaction.title)],
+    h("div", { class: "prose work-compaction-body", html: renderMarkdown(compaction.summary) })
   );
 }
 
