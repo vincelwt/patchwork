@@ -286,7 +286,7 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertTrue(store.isWaitingForQuestion(session))
     }
 
-    func testQuestionStartingWhileBrowsedAwayOnlyRendersForItsOwnConversation() throws {
+    func testQuestionStartingWhileBrowsedAwayActivatesWhenItsConversationIsSelected() throws {
         let (store, runtime, _) = makeStore()
         let session = try XCTUnwrap(store.sessions.first)
         store.openNewChat()
@@ -297,7 +297,6 @@ final class QuestionnaireStateMachineTests: XCTestCase {
         XCTAssertTrue(store.isWaitingForQuestion(session), "The sidebar still marks the parked thread")
 
         store.selectSession(session)
-        store.prepareComposerOptions()
         XCTAssertEqual(store.activeQuestionnaire(for: "ask-1")?.toolCallID, "ask-1")
         XCTAssertTrue(store.isWaitingForQuestion(session))
     }
