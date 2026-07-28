@@ -1031,7 +1031,8 @@ final class AppStore: ObservableObject {
         if isApplicationActive {
             showToast(body, style: trigger.toastStyle, sessionPath: key)
         } else {
-            notificationService.presentDesktopNotification(sessionKey: key, title: session.displayName, body: body)
+            let title = NotificationPreviewFormatter.format(session.displayName) ?? "Pi"
+            notificationService.presentDesktopNotification(sessionKey: key, title: title, body: body)
         }
     }
 

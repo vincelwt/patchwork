@@ -35,7 +35,8 @@ enum NotificationPreviewFormatter {
 
     static func format(_ text: String?) -> String? {
         guard let text else { return nil }
-        let collapsed = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        let plain = AnswerAttributedTextBuilder.plainText(blocks: MarkdownBlockParser.blocks(from: text))
+        let collapsed = plain.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !collapsed.isEmpty else { return nil }
         return collapsed.count <= limit ? collapsed : String(collapsed.prefix(limit)) + "…"

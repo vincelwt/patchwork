@@ -94,7 +94,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionLetsPiNameANewConversation() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 9)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 10)
         XCTAssertTrue(bundled.contains("name: \"set_conversation_name\""))
         XCTAssertTrue(bundled.contains("After understanding the first user message"))
         XCTAssertTrue(bundled.contains("const current = pi.getSessionName()"))
@@ -103,7 +103,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 9)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 10)
         XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
         XCTAssertTrue(bundled.contains("/v1/schedules"))
         XCTAssertTrue(bundled.contains("event.toolName.toLowerCase() !== \"agent\""))
@@ -113,7 +113,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionBranchesEditedMessagesInsideTheCurrentSession() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 9)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 10)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-edit-message\""))
         XCTAssertTrue(bundled.contains("ctx.navigateTree(entryId, { summarize: false })"))
         XCTAssertTrue(bundled.contains("pi.appendEntry(\"pi-desktop-edit-ready\""))
@@ -122,11 +122,21 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionCanResumeWithoutAVisibleUserMessage() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 9)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 10)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-resume\""))
         XCTAssertTrue(bundled.contains("customType: \"pi-desktop-connectivity-resume\""))
         XCTAssertTrue(bundled.contains("display: false"))
         XCTAssertTrue(bundled.contains("triggerTurn: true"))
+    }
+
+    func testBundledExtensionCouplesPreviewToTheCompletedAnswer() throws {
+        let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 10)
+        XCTAssertTrue(bundled.contains("preview = extractPreview(message.content);"))
+        XCTAssertTrue(bundled.contains("previewCompletionId: preview ? completionId : undefined"))
+        XCTAssertTrue(bundled.contains("completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());"))
+        XCTAssertFalse(bundled.contains("preview = extractPreview(message.content) ?? preview"))
+        XCTAssertFalse(bundled.contains("text.replace(/\\s+/g"))
     }
 
     // MARK: - Disable setting

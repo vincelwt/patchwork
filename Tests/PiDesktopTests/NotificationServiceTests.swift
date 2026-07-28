@@ -15,6 +15,22 @@ final class NotificationGateTests: XCTestCase {
     }
 }
 
+final class NotificationPreviewFormatterTests: XCTestCase {
+    func testMarkdownIsRenderedAsOnePlainTextLine() {
+        let markdown = """
+        # **Done**
+
+        See [the fix](https://example.com).
+
+        ```swift
+        let value = 1
+        ```
+        """
+
+        XCTAssertEqual(NotificationPreviewFormatter.format(markdown), "Done See the fix. let value = 1")
+    }
+}
+
 final class NotificationCoalescerTests: XCTestCase {
     func testARepeatInsideTheWindowDoesNotEmitAgain() {
         var coalescer = NotificationCoalescer()
@@ -264,7 +280,7 @@ final class NotificationTriggerWiringTests: XCTestCase {
         try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"toolResult\"}}\n".utf8).write(to: file)
         var session = SessionSummary(
             id: "cross", fileURL: file, cwd: directory, createdAt: Date(), modifiedAt: Date(),
-            name: "Cross-terminal", preview: "preview", messageCount: 0, metrics: TokenMetrics()
+            name: "**Cross-terminal**", preview: "preview", messageCount: 0, metrics: TokenMetrics()
         )
         session.prepareSearchKey()
         store.sessions = [session]
@@ -277,12 +293,13 @@ final class NotificationTriggerWiringTests: XCTestCase {
         try await waitUntil { store.activityMonitor.activity(forPath: file.path)?.state == .running }
 
         try Data("""
-        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"Done: renamed the export helper.","stopReason":"stop","completionId":"answer"}
+        {"sessionId":"cross","sessionFile":"\(file.path)","pid":\(ProcessInfo.processInfo.processIdentifier),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","preview":"**Done:** renamed the export helper.","previewCompletionId":"answer","stopReason":"stop","completionId":"answer"}
         """.utf8).write(to: heartbeatDirectory.appendingPathComponent("cross.json"))
         store.activityMonitor.tickNow()
         try await waitUntil { !spy.presented.isEmpty }
 
-        XCTAssertTrue(spy.presented.first!.body.contains("Done: renamed the export helper"), "Body: \(spy.presented.first!.body)")
+        XCTAssertEqual(spy.presented.first?.title, "Cross-terminal")
+        XCTAssertEqual(spy.presented.first?.body, "Done: renamed the export helper.")
     }
 
     // MARK: - Task 5: only actionable extension notices become a toast

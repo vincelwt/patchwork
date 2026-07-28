@@ -13,6 +13,7 @@ struct ActivityHeartbeat: Decodable, Equatable, Sendable {
     let state: String
     var updatedAt: String
     var preview: String?
+    var previewCompletionId: String? = nil
     var stopReason: String?
     var completionId: String? = nil
 
