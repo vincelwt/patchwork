@@ -17,6 +17,13 @@ final class OutboxPolicyTests: XCTestCase {
         XCTAssertEqual(entries.last?.text, "m\(OutboxPolicy.limit + 4)")
     }
 
+    func testRejectedEntryReturnsToItsOriginalFIFOPosition() {
+        let older = OutboxEntry(text: "older", delivery: .followUp, queuedAt: Date(timeIntervalSince1970: 1))
+        let newer = OutboxEntry(text: "newer", delivery: .followUp, queuedAt: Date(timeIntervalSince1970: 2))
+
+        XCTAssertEqual(OutboxPolicy.restoring(older, to: [newer]).map(\.text), ["older", "newer"])
+    }
+
     func testEachBoundaryOnlyFlushesItsOwnMessages() {
         let entries = [
             entry("steer one", .steer),

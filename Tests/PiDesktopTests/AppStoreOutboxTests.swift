@@ -12,6 +12,9 @@ private final class FakeRuntime: PiRuntimeProtocol {
     private(set) var sent: [(type: String, payload: [String: JSONValue])] = []
     var sessionFile = ""
     var sessionID = ""
+    var followUpError: Error?
+    var delayNextState = false
+    private var pendingState: ((Result<JSONValue, Error>) -> Void)?
 
     func start(cwd: URL, sessionPath: URL?) throws { isRunning = true }
     func stop() { isRunning = false; stopCount += 1 }
@@ -19,15 +22,14 @@ private final class FakeRuntime: PiRuntimeProtocol {
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append((type, payload))
         switch type {
+        case "prompt", "follow_up":
+            if let followUpError { completion?(.failure(followUpError)) }
+            else { completion?(.success(.object(["success": .bool(true), "data": .object([:])]))) }
+        case "get_state" where delayNextState:
+            delayNextState = false
+            pendingState = completion
         case "get_state":
-            completion?(.success(.object([
-                "type": .string("response"), "success": .bool(true),
-                "data": .object([
-                    "isStreaming": .bool(false),
-                    "sessionFile": .string(sessionFile),
-                    "sessionId": .string(sessionID)
-                ])
-            ])))
+            completion?(stateResponse())
         default:
             completion?(.success(.object(["success": .bool(true), "data": .object([:])])))
         }
@@ -35,8 +37,20 @@ private final class FakeRuntime: PiRuntimeProtocol {
 
     func sendUncorrelated(_ value: JSONValue) {}
 
+    func finishDelayedState() { pendingState?(stateResponse()); pendingState = nil }
     func commandCount(_ command: String) -> Int { sent.filter { $0.type == command }.count }
     func lastPayload(_ command: String) -> [String: JSONValue]? { sent.last { $0.type == command }?.payload }
+
+    private func stateResponse() -> Result<JSONValue, Error> {
+        .success(.object([
+            "type": .string("response"), "success": .bool(true),
+            "data": .object([
+                "isStreaming": .bool(false),
+                "sessionFile": .string(sessionFile),
+                "sessionId": .string(sessionID)
+            ])
+        ]))
+    }
 }
 
 private struct FakeRepository: SessionRepositoryProtocol {
@@ -124,8 +138,8 @@ final class AppStoreOutboxTests: XCTestCase {
         store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
 
         XCTAssertEqual(store.outbox.map(\.text), ["steer me"], "Only the follow-up entry flushes at agent_settled")
-        XCTAssertEqual(runtime.commandCount("follow_up"), 1)
-        XCTAssertEqual(runtime.lastPayload("follow_up")?["message"]?.stringValue, "later please")
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "later please")
     }
 
     func testOldestQueuedEntryOfAKindFlushesFirst() {
@@ -176,7 +190,76 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(store.outbox.map(\.text), ["move me"], "Still queued, now waiting for agent_settled")
 
         store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(runtime.commandCount("follow_up"), 1)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testSingleEscapeStopsCurrentTurnWithoutAQueuedMessage() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+
+        store.stopFromEscape(fully: false)
+
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
+        XCTAssertEqual(runtime.stopCount, 0)
+    }
+
+    func testSecondEscapeFullyStopsAfterTheFirstAlreadySettled() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+
+        store.stopFromEscape(fully: false)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertFalse(store.canStopCurrentThread)
+
+        store.stopFromEscape(fully: true)
+        XCTAssertEqual(runtime.stopCount, 1)
+    }
+
+    func testSingleEscapeSendsEveryQueuedMessageAfterCurrentTurnSettles() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "steer later", delivery: .steer)
+        store.enqueueOutbox(text: "follow later", delivery: .followUp)
+        store.handleRPCEventForTesting(.object([
+            "type": .string("queue_update"),
+            "followUp": .array([.string("runtime follow-up")])
+        ]))
+
+        store.stopFromEscape(fully: false)
+
+        XCTAssertEqual(store.outbox.map(\.delivery), [.followUp, .followUp])
+        XCTAssertEqual(store.runtimeState.followUpQueue, ["runtime follow-up"])
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
+        XCTAssertEqual(runtime.commandCount("follow_up"), 0)
+        XCTAssertEqual(runtime.stopCount, 0)
+        runtime.delayNextState = true
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(runtime.sent.filter { $0.type == "prompt" }.compactMap { $0.payload["message"]?.stringValue }, ["steer later"])
+
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        runtime.finishDelayedState() // A stale first-prompt query must not dispatch a duplicate.
+
+        let continuations = runtime.sent.filter { $0.type == "prompt" }
+        XCTAssertEqual(continuations.compactMap { $0.payload["message"]?.stringValue }, ["steer later", "follow later"])
+    }
+
+    func testSingleEscapeRestoresAFollowUpThatPiDefinitelyRejects() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        runtime.followUpError = PiRPCError.notRunning
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "do not lose this", delivery: .followUp)
+
+        store.stopFromEscape(fully: false)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+
+        XCTAssertEqual(store.outbox.map(\.text), ["do not lose this"])
+        XCTAssertEqual(store.outbox.map(\.delivery), [.followUp])
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
     }
 
     func testStopImmediatelyClearsEveryQueueAndRetiresTheRuntime() {
@@ -191,7 +274,7 @@ final class AppStoreOutboxTests: XCTestCase {
             "followUp": .array([.string("also accepted")])
         ]))
 
-        store.abort()
+        store.stopFromEscape(fully: true)
 
         XCTAssertTrue(store.outbox.isEmpty)
         XCTAssertTrue(store.runtimeState.steeringQueue.isEmpty)
@@ -207,6 +290,7 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("abort"), 1, "Repeated stop is a no-op")
         XCTAssertEqual(runtime.commandCount("steer"), 0)
         XCTAssertEqual(runtime.commandCount("follow_up"), 0)
+        XCTAssertEqual(runtime.commandCount("prompt"), 0)
     }
 
     // MARK: - Helpers

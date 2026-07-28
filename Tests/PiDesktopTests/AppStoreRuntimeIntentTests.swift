@@ -320,6 +320,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.composerContentDidChange()
         store.draft = "working"
         store.submitDraft()
+        busy.onEvent?(.object(["type": .string("agent_start")]))
         store.selectSession(b)
         store.composerContentDidChange()
         XCTAssertEqual(busy.stopCount, 0)
@@ -377,6 +378,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
 
         store.draft = "waiting"
         store.submitDraft()
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
         lease.fire(lease.entries.count - 1)
         XCTAssertEqual(runtime.stopCount, 0)
         runtime.onEvent?(.object(["type": .string("agent_settled")]))

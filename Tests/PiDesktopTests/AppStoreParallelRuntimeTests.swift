@@ -31,11 +31,11 @@ private final class ParallelFakeRuntime: PiRuntimeProtocol {
 
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
         sent.append((type, payload))
-        if type == "prompt" { return } // Keep the turn live until the test emits agent_settled.
-        if type == "follow_up", let followUpError {
+        if (type == "prompt" || type == "follow_up"), let followUpError {
             completion?(.failure(followUpError))
             return
         }
+        if type == "prompt" { return } // Keep the turn live until the test emits agent_settled.
         let data: JSONValue
         switch type {
         case "get_state":
@@ -161,6 +161,30 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertFalse(store.canStopCurrentThread)
     }
 
+    func testSingleEscapePreservesFollowUpOnASelectedParkedConversation() {
+        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(.object(["type": .string("agent_start")]))
+        store.enqueueOutbox(text: "continue A", delivery: .followUp)
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        runtimeB.onEvent?(.object(["type": .string("agent_start")]))
+
+        store.selectSession(sessionA)
+        store.stopFromEscape(fully: false)
+
+        XCTAssertEqual(runtimeA.commandCount("abort"), 1)
+        XCTAssertEqual(runtimeA.stopCount, 0)
+        XCTAssertEqual(runtimeB.stopCount, 0)
+        XCTAssertEqual(store.outbox.map(\.text), ["continue A"])
+        runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(runtimeA.commandCount("prompt"), 2)
+        XCTAssertEqual(runtimeA.commandCount("follow_up"), 0)
+    }
+
     func testRunningConversationsCanBeRenamedWithoutChangingTheSelectedRuntime() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
         store.selectSession(sessionA)
@@ -197,6 +221,23 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertTrue(store.isRunning(sessionB))
     }
 
+    func testRejectedBackgroundFollowUpReturnsToItsOwningOutbox() {
+        let (store, runtimeA, _, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.followUpError = PiRPCError.notRunning
+        store.enqueueOutbox(text: "keep A", delivery: .followUp)
+        store.selectSession(sessionB)
+
+        runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
+        store.selectSession(sessionA)
+        store.prepareComposerOptions()
+
+        XCTAssertEqual(store.outbox.map(\.text), ["keep A"])
+        XCTAssertEqual(store.outbox.map(\.delivery), [.followUp])
+    }
+
     func testAcceptedFollowUpCanBeStoppedBeforeItsNextAgentStart() {
         let (store, runtimeA, _, sessionA, _) = makeStore()
         store.selectSession(sessionA)
@@ -205,8 +246,8 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         store.enqueueOutbox(text: "continue A", delivery: .followUp)
 
         runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(runtimeA.commandCount("follow_up"), 1)
-        XCTAssertFalse(store.runtimeState.isStreaming)
+        XCTAssertEqual(runtimeA.commandCount("prompt"), 2)
+        XCTAssertTrue(store.runtimeState.isStreaming, "Queued prompt owns the runtime during preflight")
         XCTAssertTrue(store.canStopCurrentThread, "Accepted follow-up remains stoppable before agent_start")
 
         store.abort()
@@ -216,12 +257,40 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertFalse(store.canStopCurrentThread)
     }
 
-    func testUnconfirmedFollowUpRemainsStoppable() {
+    func testEscapeDuringDirectPromptPreflightAbortsWhenAgentActuallyStarts() {
         let (store, runtimeA, _, sessionA, _) = makeStore()
-        runtimeA.followUpError = PiRPCError.outcomeUnknown("follow_up")
         store.selectSession(sessionA)
         store.draft = "task A"
         store.submitDraft()
+
+        store.stopFromEscape(fully: false)
+        XCTAssertEqual(runtimeA.commandCount("abort"), 0, "Preflight has no active agent to abort yet")
+
+        runtimeA.onEvent?(.object(["type": .string("agent_start")]))
+        XCTAssertEqual(runtimeA.commandCount("abort"), 1)
+    }
+
+    func testEscapeDuringFollowUpPreflightAbortsWhenAgentActuallyStarts() {
+        let (store, runtimeA, _, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        store.enqueueOutbox(text: "continue A", delivery: .followUp)
+        runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
+
+        store.stopFromEscape(fully: false)
+        XCTAssertEqual(runtimeA.commandCount("abort"), 0, "Preflight has no active agent to abort yet")
+
+        runtimeA.onEvent?(.object(["type": .string("agent_start")]))
+        XCTAssertEqual(runtimeA.commandCount("abort"), 1)
+    }
+
+    func testUnconfirmedFollowUpRemainsStoppable() {
+        let (store, runtimeA, _, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.followUpError = PiRPCError.outcomeUnknown("follow_up")
         store.enqueueOutbox(text: "maybe accepted", delivery: .followUp)
 
         runtimeA.onEvent?(.object(["type": .string("agent_settled")]))

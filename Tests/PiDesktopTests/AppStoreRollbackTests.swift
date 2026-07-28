@@ -195,6 +195,28 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.textContent), ["show this now"])
     }
 
+    func testEscapeDuringStartupAbortsThePromptAtAgentStart() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        runtime.delaysStateResponse = true
+        store.draft = "stop during startup"
+        store.submitDraft()
+
+        store.stopFromEscape(fully: false)
+        runtime.succeed("get_state", data: .object([
+            "isStreaming": .bool(false),
+            "sessionFile": .string(session.fileURL.path),
+            "sessionId": .string(session.id)
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
+
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertEqual(runtime.commandCount("abort"), 1)
+        XCTAssertEqual(runtime.stopCount, 0)
+    }
+
     func testNewChatMessageAppearsBeforeSessionPromotion() throws {
         let (store, runtime, _, _) = makeStore()
         store.openNewChat()
@@ -248,6 +270,20 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
                       "The optimistic message stays: Pi may already be answering it")
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
+    }
+
+    func testHandledPromptWithoutAgentStartReconcilesToIdle() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "/mode"
+        store.submitDraft()
+
+        runtime.succeed("prompt", data: .object([:]))
+
+        XCTAssertFalse(store.runtimeState.isStreaming)
+        XCTAssertFalse(store.canStopCurrentThread)
     }
 
     /// Task 2: a crash mid-turn restores the exact last user message for a one-click resend, and
@@ -432,6 +468,7 @@ final class AppStoreRollbackTests: XCTestCase {
         store.draft = "stop here"
         store.submitDraft()
         runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
         store.setConnectivityForTesting(isOnline: false)
 
         store.abort()

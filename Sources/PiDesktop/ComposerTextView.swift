@@ -18,6 +18,7 @@ struct ComposerContent: Equatable {
 final class ComposerBridge {
     var insertImages: (([ImageAttachment]) -> Void)?
     var focus: (() -> Void)?
+    var resetEscapeSequence: (() -> Void)?
 }
 
 /// An `NSTextAttachment` that remembers which `ImageAttachment` it renders, so the text view can
@@ -51,7 +52,7 @@ struct NativeComposerTextView: NSViewRepresentable {
     var placeholder = ""
     var autofocus = false
     let onSubmit: () -> Void
-    var onEscape: (() -> Void)? = nil
+    var onEscape: ((Bool) -> Void)? = nil
     /// Applies the image budgets and returns the accepted subset.
     let admitImages: ([ImageAttachment], [ImageAttachment]) -> [ImageAttachment]
     /// Intrinsic content height, so the composer grows with the text (and inline images)
@@ -105,6 +106,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         bridge.focus = { [weak textView] in
             textView?.window?.makeFirstResponder(textView)
         }
+        bridge.resetEscapeSequence = { [weak textView] in textView?.resetEscapeSequence() }
 
         scroll.documentView = textView
         return scroll
@@ -153,13 +155,15 @@ struct NativeComposerTextView: NSViewRepresentable {
 
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
-    var onEscape: (() -> Void)?
+    var onEscape: ((Bool) -> Void)? { didSet { if onEscape == nil { firstEscapeTime = nil } } }
     var onHeightChange: ((CGFloat) -> Void)?
     var placeholder = "" { didSet { needsDisplay = true } }
     var autofocusOnWindow = false
     weak var coordinator: NativeComposerTextView.Coordinator?
     private var reportedHeight: CGFloat = 0
     private var didAutofocus = false
+    private var firstEscapeTime: TimeInterval?
+    private static let doubleEscapeInterval: TimeInterval = 0.5
     /// Attachments currently represented by an inline placeholder, keyed by identity.
     private var known: [UUID: ImageAttachment] = [:]
 
@@ -316,12 +320,20 @@ final class ComposerTextView: NSTextView {
 
     // MARK: Key handling
 
+    func resetEscapeSequence() { firstEscapeTime = nil }
+
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection([.shift, .option, .command, .control])
         if event.keyCode == 53, modifiers.isEmpty, !hasMarkedText(), let onEscape {
-            if !event.isARepeat { onEscape() }
+            guard !event.isARepeat else { return }
+            let fullyStops = firstEscapeTime.map {
+                event.timestamp >= $0 && event.timestamp - $0 < Self.doubleEscapeInterval
+            } ?? false
+            firstEscapeTime = fullyStops ? nil : event.timestamp
+            onEscape(fullyStops)
             return
         }
+        firstEscapeTime = nil
         let isReturn = event.keyCode == 36 || event.keyCode == 76
         if isReturn, !hasMarkedText(), !modifiers.contains(.shift) { onSubmit?(); return }
         super.keyDown(with: event)

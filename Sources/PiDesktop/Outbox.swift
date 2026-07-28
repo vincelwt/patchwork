@@ -58,6 +58,10 @@ enum OutboxPolicy {
     static func removing(_ delivery: OutboxEntry.Delivery, from entries: [OutboxEntry]) -> [OutboxEntry] {
         entries.filter { $0.delivery != delivery }
     }
+
+    static func restoring(_ entry: OutboxEntry, to entries: [OutboxEntry]) -> [OutboxEntry] {
+        Array((entries + [entry]).sorted { $0.queuedAt < $1.queuedAt }.suffix(limit))
+    }
 }
 
 /// What the strip above the composer actually shows. Every entry the app is holding is listed
@@ -156,15 +160,27 @@ extension AppStore {
         outbox.removeAll { $0.id == id }
     }
 
+    /// One Escape stops only the current turn and preserves every queued message as a follow-up.
+    /// A second Escape is the explicit full-stop gesture.
+    func stopFromEscape(fully: Bool) {
+        if fully { abortFromEscapeSequence(); return }
+        guard activateCurrentRouteRuntimeForEscape(),
+              runtimeState.isStreaming || currentRouteHasPendingStartupPrompt else { return }
+        for index in outbox.indices { outbox[index].delivery = .followUp }
+        abortCurrentTurnPreservingQueues()
+    }
+
     /// Hands every entry due at this boundary to Pi, oldest first. Anything the runtime rejects
     /// stays visible as an error rather than disappearing silently.
     func flushOutbox(_ boundary: OutboxEntry.Delivery) {
+        if boundary == .followUp {
+            dispatchNextActiveFollowUp()
+            return
+        }
         let due = OutboxPolicy.due(outbox, at: boundary)
         guard !due.isEmpty, runtime.isRunning else { return }
         outbox = OutboxPolicy.removing(boundary, from: outbox)
-        for entry in due {
-            dispatchOutboxEntry(entry)
-        }
+        for entry in due { dispatchOutboxEntry(entry) }
     }
 
     private func dispatchOutboxEntry(_ entry: OutboxEntry) {
@@ -176,7 +192,16 @@ extension AppStore {
         ]
         if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
         target.send(type: command, payload: payload) { [weak self] result in
-            self?.finishOutboxDispatch(
+            guard let self else { return }
+            let definitelyRejected: Bool
+            switch result {
+            case let .success(response):
+                definitelyRejected = response["success"]?.boolValue == false
+            case let .failure(error):
+                definitelyRejected = !RPCFailureHandling.isOutcomeUnknown(error)
+            }
+            if definitelyRejected { restoreOutboxEntry(entry, owner: token.owner) }
+            finishOutboxDispatch(
                 owner: token.owner,
                 dispatch: token.dispatch,
                 delivery: entry.delivery,

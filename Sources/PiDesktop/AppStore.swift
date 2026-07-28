@@ -76,6 +76,10 @@ private final class RuntimeSlot {
     var streamingMessage: ChatMessage?
     var pendingTurn: PendingUserTurn?
     var outboxDispatches: Set<UUID> = []
+    var outboxPromptPreflighting = false
+    var outboxPromptAbortRequested = false
+    var promptPreflightID: UUID?
+    var pendingStartupPrompts = 0
     var deferredEvents: [JSONValue] = []
     var connectivityRetryAbortRequested = false
     var connectivityResumeCancelled = false
@@ -561,10 +565,99 @@ final class AppStore: ObservableObject {
         beginOutboxDispatch(for: activeRuntimeSlot)
     }
 
+    @discardableResult
+    func dispatchNextActiveFollowUp() -> Bool {
+        guard !activePresentationDetached else { return false }
+        return dispatchNextFollowUp(for: activeRuntimeSlot)
+    }
+
+    @discardableResult
+    private func dispatchNextFollowUp(for slot: RuntimeSlot) -> Bool {
+        let usesLivePresentation = slot === activeRuntimeSlot && !activePresentationDetached
+        let entries = usesLivePresentation ? outbox : slot.outbox
+        guard let entry = entries.first(where: { $0.delivery == .followUp }), slot.runtime.isRunning else { return false }
+        if usesLivePresentation { outbox.removeAll { $0.id == entry.id } }
+        else { slot.outbox.removeAll { $0.id == entry.id } }
+
+        let token = beginOutboxDispatch(for: slot)
+        slot.outboxPromptPreflighting = true
+        slot.outboxPromptAbortRequested = false
+        slot.promptPreflightID = token.dispatch
+        slot.promptBeganAt = Date()
+        updateState(for: slot) { state in
+            state.isStreaming = true
+            state.phase = .waitingForModel
+        }
+        var payload: [String: JSONValue] = [
+            "message": .string(ImageAttachment.prompt(text: entry.text, attachments: entry.attachments))
+        ]
+        if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
+        slot.runtime.send(type: "prompt", payload: payload) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            let definitelyRejected: Bool
+            switch result {
+            case let .success(response):
+                definitelyRejected = responseError(response) != nil
+            case let .failure(error):
+                definitelyRejected = !RPCFailureHandling.isOutcomeUnknown(error)
+            }
+            if definitelyRejected { restoreOutboxEntry(entry, owner: token.owner) }
+            finishOutboxDispatch(
+                owner: token.owner,
+                dispatch: token.dispatch,
+                delivery: entry.delivery,
+                result: result
+            )
+            guard !definitelyRejected else {
+                slot.outboxPromptPreflighting = false
+                slot.outboxPromptAbortRequested = false
+                slot.promptPreflightID = nil
+                slot.promptBeganAt = nil
+                updateState(for: slot) { state in
+                    state.isStreaming = false
+                    state.phase = .idle
+                }
+                return
+            }
+            guard case let .success(response) = result, responseError(response) == nil else { return }
+            slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+                guard let self, let slot, !slot.isSuperseded,
+                      slot.outboxDispatches.contains(token.dispatch),
+                      slot.promptPreflightID == token.dispatch,
+                      case let .success(response) = result, responseError(response) == nil,
+                      let isStreaming = response["data"]?["isStreaming"]?.boolValue else { return }
+                updateState(for: slot) { state in
+                    state.isStreaming = isStreaming
+                    if !isStreaming { state.phase = .idle }
+                }
+                guard !isStreaming else { return }
+                slot.outboxPromptPreflighting = false
+                slot.outboxPromptAbortRequested = false
+                slot.promptPreflightID = nil
+                slot.promptBeganAt = nil
+                slot.outboxDispatches.remove(token.dispatch)
+                if !dispatchNextFollowUp(for: slot) {
+                    if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                    else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
+                }
+            }
+        }
+        return true
+    }
+
     private func beginOutboxDispatch(for slot: RuntimeSlot) -> (owner: UUID, dispatch: UUID) {
         let dispatch = UUID()
         slot.outboxDispatches.insert(dispatch)
         return (slot.id, dispatch)
+    }
+
+    func restoreOutboxEntry(_ entry: OutboxEntry, owner: UUID) {
+        guard let slot = runtimeSlot(id: owner), !slot.isSuperseded else { return }
+        if slot === activeRuntimeSlot, !activePresentationDetached {
+            outbox = OutboxPolicy.restoring(entry, to: outbox)
+        } else {
+            slot.outbox = OutboxPolicy.restoring(entry, to: slot.outbox)
+        }
     }
 
     func finishOutboxDispatch(
@@ -1535,7 +1628,11 @@ final class AppStore: ObservableObject {
         }
         draft = ""
         attachments = []
+        var completedSynchronously = false
+        weak var startupSlot: RuntimeSlot?
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
+            completedSynchronously = true
+            if let startupSlot { startupSlot.pendingStartupPrompts = max(0, startupSlot.pendingStartupPrompts - 1) }
             guard let self else { return }
             switch result {
             case let .success(slot):
@@ -1547,6 +1644,10 @@ final class AppStore: ObservableObject {
                 let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
                 showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
             }
+        }
+        if !completedSynchronously, let slot = currentRouteRuntimeSlot {
+            startupSlot = slot
+            slot.pendingStartupPrompts += 1
         }
     }
 
@@ -1840,8 +1941,59 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func abort() {
-        guard canStopCurrentThread, let slot = currentRouteRuntimeSlot else { return }
+    func activateCurrentRouteRuntimeForEscape() -> Bool {
+        guard let slot = currentRouteRuntimeSlot else { return false }
+        if slot !== activeRuntimeSlot || activePresentationDetached { activateRuntime(slot) }
+        return runtimeMatchesCurrentRoute
+    }
+
+    var currentRouteHasPendingStartupPrompt: Bool {
+        runtimeMatchesCurrentRoute && activeRuntimeSlot.pendingStartupPrompts > 0
+    }
+
+    /// Stops the active turn without retiring its runtime or touching queued continuations.
+    /// Escape uses this path so Pi can start the preserved follow-up after settlement.
+    func abortCurrentTurnPreservingQueues() {
+        guard runtimeMatchesCurrentRoute else { return }
+        let slot = activeRuntimeSlot
+        slot.connectivityResumeCancelled = true
+        if slot.pendingStartupPrompts > 0 {
+            slot.outboxPromptAbortRequested = true
+            return
+        }
+        if runtimeState.isWaitingForNetwork {
+            clearConnectivityWait(for: slot)
+            guard runtimeState.isStreaming else {
+                resetRuntimeRetirementLease(for: slot)
+                return
+            }
+        }
+        guard runtimeState.isStreaming else { return }
+        if slot.outboxPromptPreflighting {
+            slot.outboxPromptAbortRequested = true
+            return
+        }
+        sendSoftAbort(to: slot)
+    }
+
+    private func sendSoftAbort(to slot: RuntimeSlot) {
+        slot.runtime.send(type: "abort", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            switch result {
+            case let .success(response):
+                if let error = responseError(response) { showToast(error, style: .error) }
+            case let .failure(error):
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+    }
+
+    func abort() { fullyStopCurrentRuntime(allowIdle: false) }
+
+    func abortFromEscapeSequence() { fullyStopCurrentRuntime(allowIdle: true) }
+
+    private func fullyStopCurrentRuntime(allowIdle: Bool) {
+        guard (allowIdle || canStopCurrentThread), let slot = currentRouteRuntimeSlot else { return }
         let ownsLivePresentation = slot === activeRuntimeSlot && !activePresentationDetached
         let readyWaiters = slot.readyWaiters
         if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
@@ -1857,6 +2009,10 @@ final class AppStore: ObservableObject {
         slot.optionsLoading = false
         slot.outbox.removeAll()
         slot.outboxDispatches.removeAll()
+        slot.outboxPromptPreflighting = false
+        slot.outboxPromptAbortRequested = false
+        slot.promptPreflightID = nil
+        slot.pendingStartupPrompts = 0
         slot.deferredEvents.removeAll()
         slot.pendingTurn = nil
         slot.streamingMessage = nil
@@ -2461,6 +2617,10 @@ final class AppStore: ObservableObject {
         slot.streamingMessage = nil
         slot.pendingTurn = nil
         slot.outboxDispatches.removeAll()
+        slot.outboxPromptPreflighting = false
+        slot.outboxPromptAbortRequested = false
+        slot.promptPreflightID = nil
+        slot.pendingStartupPrompts = 0
         slot.deferredEvents.removeAll()
         slot.connectivityRetryAbortRequested = false
         slot.connectivityResumeCancelled = false
@@ -2634,7 +2794,10 @@ final class AppStore: ObservableObject {
         if !sentAttachments.isEmpty { payload["images"] = .array(sentAttachments.map(\.rpcValue)) }
         let wasStreaming = state(for: slot).isStreaming
         let previousPhase = state(for: slot).phase
+        let preflightID = command == "prompt" ? UUID() : nil
         if command == "prompt" {
+            slot.outboxPromptPreflighting = true
+            slot.promptPreflightID = preflightID
             slot.promptBeganAt = Date()
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
@@ -2656,6 +2819,7 @@ final class AppStore: ObservableObject {
             guard let errorText else {
                 if command == "steer" { showToast("Steering message queued", style: .info) }
                 if command == "follow_up" { showToast("Follow-up queued", style: .info) }
+                if let preflightID { reconcilePromptPreflight(preflightID, slot: slot) }
                 return
             }
             // An unconfirmed side-effecting command may already have reached Pi. Only settle or
@@ -2669,6 +2833,11 @@ final class AppStore: ObservableObject {
                     state.isStreaming = wasStreaming
                     state.phase = previousPhase
                 }
+                if slot.promptPreflightID == preflightID {
+                    slot.outboxPromptPreflighting = false
+                    slot.outboxPromptAbortRequested = false
+                    slot.promptPreflightID = nil
+                }
                 slot.promptBeganAt = nil
                 slot.pendingTurn = nil
             }
@@ -2677,6 +2846,27 @@ final class AppStore: ObservableObject {
             showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
             if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
             else if !state(for: slot).isBusy { retireBackgroundRuntime(slot) }
+        }
+    }
+
+    private func reconcilePromptPreflight(_ preflightID: UUID, slot: RuntimeSlot) {
+        slot.runtime.send(type: "get_state", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded,
+                  slot.promptPreflightID == preflightID,
+                  case let .success(response) = result, responseError(response) == nil,
+                  let isStreaming = response["data"]?["isStreaming"]?.boolValue else { return }
+            updateState(for: slot) { state in
+                state.isStreaming = isStreaming
+                if !isStreaming { state.phase = .idle }
+            }
+            guard !isStreaming else { return }
+            slot.outboxPromptPreflighting = false
+            slot.outboxPromptAbortRequested = false
+            slot.promptPreflightID = nil
+            slot.promptBeganAt = nil
+            slot.pendingTurn = nil
+            if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+            else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
         }
     }
 
@@ -2941,12 +3131,17 @@ final class AppStore: ObservableObject {
         let type = event["type"]?.stringValue ?? "unknown"
         switch type {
         case "agent_start":
+            let abortPreflight = slot.outboxPromptAbortRequested
             slot.outboxDispatches.removeAll()
+            slot.outboxPromptPreflighting = false
+            slot.outboxPromptAbortRequested = false
+            slot.promptPreflightID = nil
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
                 state.isStreaming = true
                 if state.phase != .waitingForModel { state.phase = .working }
             }
+            if abortPreflight { sendSoftAbort(to: slot) }
         case "agent_settled":
             let waitingForNetwork = state(for: slot).isWaitingForNetwork
             updateState(for: slot) { state in
@@ -3106,6 +3301,7 @@ final class AppStore: ObservableObject {
 
     @discardableResult
     private func flushBackgroundOutbox(_ boundary: OutboxEntry.Delivery, slot: RuntimeSlot) -> Bool {
+        if boundary == .followUp { return dispatchNextFollowUp(for: slot) }
         let due = OutboxPolicy.due(slot.outbox, at: boundary)
         guard !due.isEmpty, slot.runtime.isRunning else { return false }
         slot.outbox = OutboxPolicy.removing(boundary, from: slot.outbox)
@@ -3117,7 +3313,16 @@ final class AppStore: ObservableObject {
             ]
             if !entry.attachments.isEmpty { payload["images"] = .array(entry.attachments.map(\.rpcValue)) }
             slot.runtime.send(type: command, payload: payload) { [weak self] result in
-                self?.finishOutboxDispatch(
+                guard let self else { return }
+                let definitelyRejected: Bool
+                switch result {
+                case let .success(response):
+                    definitelyRejected = response["success"]?.boolValue == false
+                case let .failure(error):
+                    definitelyRejected = !RPCFailureHandling.isOutcomeUnknown(error)
+                }
+                if definitelyRejected { restoreOutboxEntry(entry, owner: token.owner) }
+                finishOutboxDispatch(
                     owner: token.owner,
                     dispatch: token.dispatch,
                     delivery: entry.delivery,
@@ -3177,10 +3382,15 @@ final class AppStore: ObservableObject {
         let selected = isSelectedRuntime
         switch type {
         case "agent_start":
+            let abortPreflight = activeRuntimeSlot.outboxPromptAbortRequested
             activeRuntimeSlot.outboxDispatches.removeAll()
+            activeRuntimeSlot.outboxPromptPreflighting = false
+            activeRuntimeSlot.outboxPromptAbortRequested = false
+            activeRuntimeSlot.promptPreflightID = nil
             cancelRuntimeRetirementLease()
             runtimeState.isStreaming = true
             if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
+            if abortPreflight { sendSoftAbort(to: activeRuntimeSlot) }
         case "agent_settled":
             let waitingForNetwork = runtimeState.isWaitingForNetwork
             runtimeState.isStreaming = false
@@ -3469,6 +3679,10 @@ final class AppStore: ObservableObject {
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
         slot.outboxDispatches.removeAll()
+        slot.outboxPromptPreflighting = false
+        slot.outboxPromptAbortRequested = false
+        slot.promptPreflightID = nil
+        slot.pendingStartupPrompts = 0
         slot.connectivityRetryAbortRequested = false
         slot.connectivityResumeCancelled = false
         slot.connectivityResumePreparing = false
