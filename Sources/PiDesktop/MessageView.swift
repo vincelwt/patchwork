@@ -309,7 +309,7 @@ struct TranscriptWorkView: View, Equatable {
                 .font(PiFont.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-                .truncationMode(.head)
+                .truncationMode(.tail)
                 .contentTransition(.opacity)
             if block.isActive {
                 ActiveWorkElapsedView(block: block)
