@@ -207,6 +207,8 @@ struct TranscriptWorkView: View, Equatable {
 
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload) -> Void
+    /// Busts the equatable transcript-row cache when a live questionnaire appears, moves, or ends.
+    let questionnaireKey: String?
 
     /// `nil` until the user decides; the run's own state owns it until then.
     @State private var userExpanded: Bool?
@@ -214,6 +216,7 @@ struct TranscriptWorkView: View, Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.block.isRenderEquivalent(to: rhs.block)
+            && lhs.questionnaireKey == rhs.questionnaireKey
     }
 
     private var isOpen: Bool { userExpanded ?? block.shouldStartExpanded }
@@ -677,8 +680,8 @@ private struct ToolCallRow: View {
     }
 }
 
-/// The `ask_user_question` row itself observes the live store instead of a memoized transcript
-/// snapshot, so the control cannot disappear until another transcript or focus update arrives.
+/// The `ask_user_question` row reads live state; `TranscriptWorkView.questionnaireKey` also
+/// invalidates its equatable parent when this otherwise-empty control must appear or disappear.
 private struct InlineQuestionnaire: View {
     @EnvironmentObject private var store: AppStore
     let toolCallID: String

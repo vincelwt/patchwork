@@ -386,7 +386,8 @@ struct MessageScrollView: View {
                             case let .work(block):
                                 TranscriptWorkView(
                                     block: block,
-                                    onImage: store.showImage
+                                    onImage: store.showImage,
+                                    questionnaireKey: questionnaireKey
                                 )
                                 .equatable()
                                 .padding(.top, PiTheme.space6)
