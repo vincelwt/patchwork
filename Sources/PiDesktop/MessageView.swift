@@ -668,14 +668,26 @@ private struct ToolActivityStepRow: View {
 
 // MARK: - Rows
 
+/// Renders the bounded thumbnail, never the full bitmap: a cache hit draws synchronously, a
+/// miss reserves the image's exact final frame (header-only size read) and decodes off the main
+/// thread, so realizing an image-heavy row while scrolling costs no decode on the main thread
+/// and never shifts layout when the bitmap lands.
 private struct ConversationImage: View {
     let image: ImagePayload
     let onOpen: () -> Void
+    @State private var decoded: NSImage?
+    @State private var decodeFailed = false
+
     var body: some View {
         Button(action: onOpen) {
             Group {
-                if let nsImage = image.nsImage { Image(nsImage: nsImage).resizable().scaledToFit() }
-                else { PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark") }
+                if let thumbnail = decoded ?? ImageThumbnailer.cachedThumbnail(for: image) {
+                    Image(nsImage: thumbnail).resizable().scaledToFit()
+                } else if decodeFailed {
+                    PiUnavailableView("Image unavailable", systemImage: "photo.badge.exclamationmark")
+                } else {
+                    placeholder
+                }
             }
             .frame(maxWidth: PiTheme.transcriptImageMaxWidth, maxHeight: PiTheme.transcriptImageMaxHeight)
             .clipShape(RoundedRectangle(cornerRadius: PiTheme.radiusMedium, style: .continuous))
@@ -684,6 +696,36 @@ private struct ConversationImage: View {
         .help("Open image")
         .accessibilityLabel(image.fileName.map { "Image \($0)" } ?? "Conversation image")
         .accessibilityHint("Opens the image viewer")
+        .task(id: image.id) {
+            guard decoded == nil, ImageThumbnailer.cachedThumbnail(for: image) == nil else { return }
+            let payload = image
+            let thumbnail = await Task.detached(priority: .userInitiated) {
+                ImageThumbnailer.thumbnail(for: payload)
+            }.value
+            guard !Task.isCancelled, payload.id == image.id else { return }
+            if let thumbnail { decoded = thumbnail } else { decodeFailed = true }
+        }
+    }
+
+    /// The exact frame the thumbnail will occupy, so the swap is invisible to layout. Unknown
+    /// dimensions fall back to a modest fixed panel rather than a zero-size flash.
+    private var placeholder: some View {
+        let size = placeholderSize
+        return Color.piInset
+            .frame(width: size.width, height: size.height)
+            .accessibilityHidden(true)
+    }
+
+    private var placeholderSize: CGSize {
+        guard let points = ImageThumbnailer.layoutPointSize(of: image), points.width > 0, points.height > 0 else {
+            return CGSize(width: PiTheme.transcriptImageMaxWidth / 2, height: PiTheme.transcriptImageMaxHeight / 2)
+        }
+        let scale = min(
+            PiTheme.transcriptImageMaxWidth / points.width,
+            PiTheme.transcriptImageMaxHeight / points.height,
+            1
+        )
+        return CGSize(width: points.width * scale, height: points.height * scale)
     }
 }
 

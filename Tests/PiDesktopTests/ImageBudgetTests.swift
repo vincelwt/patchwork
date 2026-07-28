@@ -105,3 +105,55 @@ final class TokenMetricsTests: XCTestCase {
         XCTAssertEqual(metrics.latestCacheHitPercent, 50)
     }
 }
+
+final class ImageThumbnailerTests: XCTestCase {
+    /// A real PNG at a controlled pixel size, so thumbnail bounds are exercised deterministically.
+    private func pngData(width: Int, height: Int) throws -> Data {
+        let representation = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ))
+        return try XCTUnwrap(representation.representation(using: .png, properties: [:]))
+    }
+
+    func testThumbnailIsBoundedAndKeepsTheOriginalLayoutSize() throws {
+        let payload = ImagePayload(
+            id: "thumb-large", data: try pngData(width: 2_000, height: 1_000),
+            mimeType: "image/png", fileName: nil
+        )
+        let thumbnail = try XCTUnwrap(ImageThumbnailer.thumbnail(for: payload))
+        // The backing bitmap, not the snapshot rep: NSImage reports point size × screen scale
+        // through `representations`, which says nothing about the decoded pixels.
+        let backing = try XCTUnwrap(thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        XCTAssertLessThanOrEqual(CGFloat(max(backing.width, backing.height)), ImageThumbnailer.transcriptMaxPixel)
+        XCTAssertEqual(thumbnail.size.width, 2_000, accuracy: 1, "Layout size stays the original's point size")
+        XCTAssertEqual(thumbnail.size.height, 1_000, accuracy: 1)
+
+        XCTAssertNotNil(ImageThumbnailer.cachedThumbnail(for: payload), "The decode populates the cache")
+        XCTAssertTrue(ImageThumbnailer.thumbnail(for: payload) === thumbnail, "A repeat call is a cache hit")
+    }
+
+    func testLayoutPointSizeReadsTheHeaderWithoutDecoding() throws {
+        let payload = ImagePayload(
+            id: "thumb-size", data: try pngData(width: 640, height: 480),
+            mimeType: "image/png", fileName: nil
+        )
+        let size = try XCTUnwrap(ImageThumbnailer.layoutPointSize(of: payload))
+        XCTAssertEqual(size.width, 640, accuracy: 1)
+        XCTAssertEqual(size.height, 480, accuracy: 1)
+        XCTAssertNil(ImageThumbnailer.layoutPointSize(of: ImagePayload(
+            id: "junk", data: Data([0x00, 0x01]), mimeType: "image/png", fileName: nil
+        )))
+    }
+
+    func testSmallImagesRemainAtIntrinsicSizeAfterThumbnailing() throws {
+        let payload = ImagePayload(
+            id: "thumb-small", data: try pngData(width: 200, height: 120),
+            mimeType: "image/png", fileName: nil
+        )
+        let thumbnail = try XCTUnwrap(ImageThumbnailer.thumbnail(for: payload))
+        XCTAssertEqual(thumbnail.size.width, 200, accuracy: 1)
+        XCTAssertEqual(thumbnail.size.height, 120, accuracy: 1)
+    }
+}
