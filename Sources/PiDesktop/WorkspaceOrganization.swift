@@ -185,6 +185,48 @@ enum WorkspaceOrganization {
         return roots.flatMap { orderedChildren(of: $0, in: folders) }
     }
 
+    // MARK: - Categorization path
+
+    /// Where a conversation actually sits in the sidebar, outermost ancestor first and the
+    /// conversation itself last, so a breadcrumb can never disagree with the tree that
+    /// `SidebarSnapshot` draws from the same `parentID`/assignment state:
+    /// unassigned filesystem session → `[project, conversation]`, unassigned global session →
+    /// `["Recents", conversation]`, assigned session → its folder chain from the top, prefixed by
+    /// a project only when that chain really ends in one.
+    ///
+    /// Cycle- and dangling-safe: it walks with `effectiveParentID`, keeps a visited set, and stops
+    /// at `maxDepth`, so hand-edited state yields a bounded, visible path instead of looping.
+    static func categorization(
+        of session: SessionSummary,
+        folders: [VirtualFolder],
+        assignments: [String: String],
+        maxDepth: Int = 48
+    ) -> [String] {
+        let assigned = assignments[session.fileURL.standardizedFileURL.path]
+        guard let assigned, var folder = folders.first(where: { $0.id == assigned }) else {
+            return [label(forProjectPath: session.cwd.standardizedFileURL.path), session.displayName]
+        }
+        var chain = [folder.name]
+        var visited: Set<String> = [folder.id]
+        var projectPath: String?
+        while chain.count < maxDepth {
+            guard let parent = effectiveParentID(of: folder, in: folders) else { break }
+            guard let parentFolderID = virtualFolderID(fromGroupID: parent) else { projectPath = parent; break }
+            guard let next = folders.first(where: { $0.id == parentFolderID }),
+                  visited.insert(parentFolderID).inserted else { break }
+            chain.append(next.name)
+            folder = next
+        }
+        return (projectPath.map { [label(forProjectPath: $0)] } ?? []) + chain.reversed() + [session.displayName]
+    }
+
+    /// The same name the sidebar's own project group shows for a working directory.
+    private static func label(forProjectPath path: String) -> String {
+        isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
+            ? "Recents"
+            : SessionFolderGroup.projectName(forPath: path)
+    }
+
     // MARK: - Default working directory for a folder-scoped new chat
 
     /// The working directory offered when starting a chat "inside" a virtual folder (the
@@ -349,6 +391,11 @@ extension AppStore {
         let path = session.fileURL.standardizedFileURL.path
         let candidate = persistence.state.virtualFolderAssignments[path]
         return virtualFolders.contains(where: { $0.id == candidate }) ? candidate : nil
+    }
+
+    /// Sidebar categorization path for a conversation; see `WorkspaceOrganization.categorization`.
+    func categorization(of session: SessionSummary) -> [String] {
+        WorkspaceOrganization.categorization(of: session, folders: virtualFolders, assignments: virtualFolderAssignments)
     }
 
     func displayFolderName(for session: SessionSummary) -> String {

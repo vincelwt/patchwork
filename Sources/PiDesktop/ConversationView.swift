@@ -152,6 +152,14 @@ struct ConversationView: View {
         return store.isRunning(session)
     }
 
+    /// The open conversation's full sidebar categorization, e.g.
+    /// `lexirise > product > growth > convo name`, so the toolbar says where it lives and not only
+    /// what it is called. Same helper the sidebar's Status rows use.
+    private var breadcrumb: String {
+        guard let session = store.selectedSession else { return "Conversation" }
+        return store.categorization(of: session).joined(separator: " > ")
+    }
+
     @ToolbarContentBuilder
     private var conversationToolbar: some ToolbarContent {
         // Leading placement, so the title reads as the conversation pane's header rather than a
@@ -162,10 +170,13 @@ struct ConversationView: View {
                 Image(systemName: "folder")
                     .font(.system(size: PiIcon.small))
                     .foregroundStyle(.tertiary)
-                Text(store.selectedSession?.displayName ?? "Conversation")
+                Text(breadcrumb)
                     .font(PiFont.rowEmphasis)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    // Truncated on screen, complete on hover and to VoiceOver.
+                    .help(breadcrumb)
+                    .accessibilityLabel(breadcrumb)
                 if let session = store.selectedSession, store.isRunning(session) {
                     StatusDot(color: .piGreen, pulsing: true)
                 }

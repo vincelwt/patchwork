@@ -1,9 +1,17 @@
 import AppKit
 import SwiftUI
 
+/// Which shape the sidebar lists conversations in. Deliberately local view state: it is a way of
+/// looking at the same sessions, not a setting worth persisting.
+enum SidebarMode: String, CaseIterable {
+    case tree = "Tree"
+    case status = "Status"
+}
+
 struct SidebarView: View {
     @EnvironmentObject private var store: AppStore
     @State private var archiveExpanded = false
+    @State private var mode: SidebarMode = .tree
 
     var body: some View {
         let snapshot = SidebarSnapshot(
@@ -20,6 +28,16 @@ struct SidebarView: View {
                 selected: store.schedulesPresented
             )
             .padding(.bottom, PiTheme.space6)
+
+            Picker("View", selection: $mode) {
+                ForEach(SidebarMode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .padding(.horizontal, PiTheme.space6)
+            .padding(.bottom, PiTheme.space6)
+            .help("Tree groups by project and folder; Status groups every project's conversations by what they need")
 
             if store.isScanning, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
                 VStack(spacing: PiTheme.space8) {
@@ -39,16 +57,21 @@ struct SidebarView: View {
                     systemImage: store.searchText.isEmpty ? "bubble.left" : "magnifyingglass"
                 )
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
-                        ForEach(snapshot.activeGroups) { group in
-                            SessionFolderSection(group: group, forceExpanded: snapshot.isFiltering)
+                if mode == .status {
+                    // Archived stay out of the sections here; they keep the pinned area below.
+                    StatusListView(sessions: snapshot.all)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
+                            ForEach(snapshot.activeGroups) { group in
+                                SessionFolderSection(group: group, forceExpanded: snapshot.isFiltering)
+                            }
                         }
+                        .padding(.horizontal, PiTheme.space6)
+                        .padding(.bottom, PiTheme.space12)
                     }
-                    .padding(.horizontal, PiTheme.space6)
-                    .padding(.bottom, PiTheme.space12)
+                    .scrollIndicators(.automatic)
                 }
-                .scrollIndicators(.automatic)
 
                 // Pinned below the scroller instead of living inside it, so Archived always
                 // sits in the same quiet spot above the footer instead of floating mid-list.
@@ -344,6 +367,96 @@ struct SessionFolderGroup: Identifiable {
     }
 }
 
+// MARK: - Status view
+
+/// The flat cross-project buckets. Declaration order is the *visible* order; the priority a
+/// conversation is filed by is deliberately different (see `SidebarStatusGroup.groups`).
+enum SidebarStatusSection: String, CaseIterable {
+    case running = "Running"
+    case unread = "Unread"
+    case done = "Done"
+    case automated = "Automated"
+}
+
+struct SidebarStatusGroup: Identifiable {
+    let section: SidebarStatusSection
+    let sessions: [SessionSummary]
+    var id: String { section.rawValue }
+
+    /// Files every non-archived conversation exactly once — running, else unread, else targeted by
+    /// an automation, else done — then sorts each bucket newest-first on the supplied (live, not
+    /// stale summary) date and drops the empty ones. Pure: the caller hands in the store's
+    /// predicates, so the partition is testable without a runtime.
+    static func groups(
+        _ sessions: [SessionSummary],
+        isRunning: (SessionSummary) -> Bool,
+        isUnread: (SessionSummary) -> Bool,
+        isAutomated: (SessionSummary) -> Bool,
+        modifiedAt: (SessionSummary) -> Date
+    ) -> [SidebarStatusGroup] {
+        var buckets: [SidebarStatusSection: [SessionSummary]] = [:]
+        for session in sessions where !session.isArchived {
+            let section: SidebarStatusSection = isRunning(session) ? .running
+                : isUnread(session) ? .unread
+                : isAutomated(session) ? .automated : .done
+            buckets[section, default: []].append(session)
+        }
+        return SidebarStatusSection.allCases.compactMap { section in
+            guard let bucket = buckets[section], !bucket.isEmpty else { return nil }
+            // The file path breaks a tie, so equal timestamps still order deterministically
+            // instead of letting an unstable sort reshuffle rows between renders.
+            let sorted = bucket.sorted {
+                modifiedAt($0) == modifiedAt($1)
+                    ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
+                    : modifiedAt($0) > modifiedAt($1)
+            }
+            return SidebarStatusGroup(section: section, sessions: sorted)
+        }
+    }
+}
+
+private struct StatusListView: View {
+    @EnvironmentObject private var store: AppStore
+    let sessions: [SessionSummary]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
+                ForEach(groups) { group in
+                    Text(group.section.rawValue)
+                        .font(SidebarTypography.folderHeader)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, PiTheme.space8)
+                        .padding(.top, PiTheme.space6)
+                        .frame(height: PiTheme.folderHeaderHeight, alignment: .leading)
+                        .accessibilityLabel("\(group.section.rawValue), \(group.sessions.count) conversations")
+                    ForEach(group.sessions) { SessionRow(session: $0, archived: false, hint: hint(for: $0)) }
+                }
+            }
+            .padding(.horizontal, PiTheme.space6)
+            .padding(.bottom, PiTheme.space12)
+        }
+        .scrollIndicators(.automatic)
+    }
+
+    private var groups: [SidebarStatusGroup] {
+        SidebarStatusGroup.groups(
+            sessions,
+            isRunning: { store.isRunning($0) },
+            isUnread: { store.isUnread($0) },
+            isAutomated: { store.scheduledThreadIDs.contains($0.id) },
+            modifiedAt: { store.liveModifiedAt($0) }
+        )
+    }
+
+    /// Everything above the conversation itself, so a row torn out of its folder still says where
+    /// it lives. Same helper the toolbar breadcrumb uses, so the two can never disagree.
+    private func hint(for session: SessionSummary) -> String? {
+        let ancestors = store.categorization(of: session).dropLast()
+        return ancestors.isEmpty ? nil : ancestors.joined(separator: " > ")
+    }
+}
+
 /// Caps the pinned, expanded archive so a long archive grows in place instead of crowding out
 /// the active list above it or pushing the footer out of the sidebar.
 private let archiveExpandedMaxHeight: CGFloat = 220
@@ -543,6 +656,9 @@ private struct SessionRow: View {
     let session: SessionSummary
     let archived: Bool
     var depth = 0
+    /// Quiet location line for cross-project lists (Status), where a row has no folder above it.
+    /// Same single line and row height as everywhere else; only the tree passes nothing.
+    var hint: String?
     @State private var hovering = false
     @State private var renaming = false
     @State private var renameValue = ""
@@ -568,6 +684,14 @@ private struct SessionRow: View {
                 Text(session.displayName)
                     .font(SidebarTypography.conversationTitle(selected: selected))
                     .lineLimit(1).truncationMode(.tail)
+                    // The title claims its width first, so the hint truncates before the name does.
+                    .layoutPriority(1)
+                if let hint {
+                    Text(hint)
+                        .font(SidebarTypography.metadata)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.head)
+                }
                 Spacer(minLength: PiTheme.space4)
                 trailingAccessory
             }
@@ -602,8 +726,8 @@ private struct SessionRow: View {
             Button("Cancel", role: .cancel) {}
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
-        .help(session.cwd.path)
-        .accessibilityLabel("\(session.displayName), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
+        .help(hint ?? session.cwd.path)
+        .accessibilityLabel("\(session.displayName)\(hint.map { ", in \($0)" } ?? ""), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
     /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
