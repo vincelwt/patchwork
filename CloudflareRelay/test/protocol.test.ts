@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { freshMutableAsset } from "../src/assets.js";
 import {
   broadcastHostPresence,
   challengeData,
@@ -77,4 +78,30 @@ test("public JWK and cipher payload helpers reject extra or malformed data", () 
   assert.deepEqual(cipherPayload(payload), payload);
   assert.equal(cipherPayload({ ...payload, extra: true }), null);
   assert.equal(cipherPayload({ ...payload, nonce: encodeBase64url(bytes(11)) }), null);
+});
+
+test("mutable assets bypass bodyless Safari 304 responses", async () => {
+  let forwarded: Request | undefined;
+  const assets = {
+    async fetch(request: Request) {
+      forwarded = request;
+      return new Response("asset body", { headers: { etag: '"current"' } });
+    },
+  };
+  const stale = new Request("https://remote.ai.gloom.sh/js/app.js", {
+    headers: { "if-none-match": '"current"', "if-modified-since": "yesterday" },
+  });
+
+  const response = await freshMutableAsset(stale, assets);
+
+  assert.equal(forwarded?.headers.has("if-none-match"), false);
+  assert.equal(forwarded?.headers.has("if-modified-since"), false);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("etag"), '"current"');
+  assert.equal(await response.text(), "asset body");
+
+  const icon = new Request("https://remote.ai.gloom.sh/favicon.svg", { headers: { "if-none-match": '"icon"' } });
+  await freshMutableAsset(icon, assets);
+  assert.equal(forwarded, icon);
 });

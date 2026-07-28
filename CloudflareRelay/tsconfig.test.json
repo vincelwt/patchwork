@@ -8,5 +8,5 @@
     "outDir": ".test-dist",
     "rootDir": "."
   },
-  "include": ["src/protocol.ts", "test/**/*.ts"]
+  "include": ["src/assets.ts", "src/protocol.ts", "test/**/*.ts"]
 }

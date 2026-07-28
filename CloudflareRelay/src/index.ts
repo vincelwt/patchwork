@@ -1,3 +1,4 @@
+import { freshMutableAsset } from "./assets";
 import {
   MAX_DEVICES,
   MAX_FRAME_BYTES,
@@ -89,7 +90,7 @@ export default {
 
     if (!route) {
       if (url.pathname.startsWith("/relay/")) return response(404, "Not found");
-      return env.ASSETS ? env.ASSETS.fetch(request) : response(404, "Not found");
+      return env.ASSETS ? freshMutableAsset(request, env.ASSETS) : response(404, "Not found");
     }
     if (request.method !== "GET") return response(400, "WebSocket relay requires GET");
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return response(426, "WebSocket upgrade required");
