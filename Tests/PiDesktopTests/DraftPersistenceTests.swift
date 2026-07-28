@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import PiDesktop
@@ -142,6 +143,20 @@ final class DraftPersistenceIntegrationTests: XCTestCase {
         )
         value.prepareSearchKey()
         return value
+    }
+
+    func testComposerTypingDoesNotInvalidateTheWholeAppStore() {
+        let store = makeStore(persistence: AppPersistence(baseURL: directory))
+        var appInvalidations = 0
+        var composerInvalidations = 0
+        let appObservation = store.objectWillChange.sink { appInvalidations += 1 }
+        let composerObservation = store.composer.objectWillChange.sink { composerInvalidations += 1 }
+
+        store.draft = "native key repeat"
+
+        XCTAssertEqual(appInvalidations, 0)
+        XCTAssertEqual(composerInvalidations, 1)
+        withExtendedLifetime((appObservation, composerObservation)) {}
     }
 
     func testSwitchingAwayAndBackKeepsTheDraftText() {

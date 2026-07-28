@@ -171,8 +171,27 @@ final class AppStore: ObservableObject {
     @Published private(set) var initialScrollTargetMessageID: String?
     @Published var conversationError: String?
 
-    @Published var draft = ""
-    @Published var attachments: [ImageAttachment] = []
+    /// Composer edits have their own observation scope so a key-repeat burst does not invalidate
+    /// the transcript, sidebar, inspector, and menu-bar trees.
+    let composer = ComposerModel()
+    var draft: String {
+        get { composer.content.text }
+        set {
+            var value = composer.content
+            value.text = newValue
+            guard value != composer.content else { return }
+            composer.content = value
+        }
+    }
+    var attachments: [ImageAttachment] {
+        get { composer.content.attachments }
+        set {
+            var value = composer.content
+            value.attachments = newValue
+            guard value != composer.content else { return }
+            composer.content = value
+        }
+    }
     @Published var selectedFolder: URL?
     @Published var runtimeState = RuntimeState()
     @Published private(set) var isOffline = false
@@ -368,10 +387,10 @@ final class AppStore: ObservableObject {
             }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
-            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
-            .sink { [weak self] _ in self?.flushDraftPersistence() }
+            .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
             .store(in: &appCancellables)
         self.activityMonitor.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -380,11 +399,14 @@ final class AppStore: ObservableObject {
             .sink { [weak self] activities in self?.handleActivitySnapshot(activities) }
             .store(in: &appCancellables)
         self.notificationService.onSelectSession = { [weak self] path in self?.focusSession(atPath: path) }
-        $draft
+        composer.$content
+            .map(\.text)
             .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] text in
                 guard let self else { return }
-                persistDraftText(text, for: currentDraftKey)
+                persistIdleComposerDraft(text, for: currentDraftKey)
             }
             .store(in: &appCancellables)
         self.connectivityMonitor?.start { [weak self] isOnline in
@@ -1651,6 +1673,19 @@ final class AppStore: ObservableObject {
         scheduleDraftPersistence()
     }
 
+    private func persistIdleComposerDraft(_ text: String, for key: String) {
+        persistDraftText(text, for: key)
+        if runtimeMatchesCurrentRoute {
+            let slot = activeRuntimeSlot
+            resetRuntimeRetirementLease(for: slot)
+        }
+    }
+
+    private func flushCurrentDraftPersistence() {
+        persistDraftText(draft, for: currentDraftKey)
+        flushDraftPersistence()
+    }
+
     /// Idle typing debounce: writing `state.json` on every keystroke is unacceptable, so a burst
     /// of edits collapses into one write after typing pauses.
     private func scheduleDraftPersistence() {
@@ -2164,8 +2199,15 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Actual editor mutations prewarm Pi; merely rendering or navigating to a composer does not.
-    func composerContentDidChange() { prepareComposerOptions() }
+    /// The first editor mutation prewarms Pi. Later keys stay on AppKit's input path instead of
+    /// cancelling and rebuilding the same runtime lease; the idle draft publisher touches it once.
+    func composerContentDidChange() {
+        if runtimeMatchesCurrentRoute {
+            let slot = activeRuntimeSlot
+            guard !slot.isStarting, !slot.optionsLoading, !slot.optionsPrepared else { return }
+        }
+        prepareComposerOptions()
+    }
 
     /// Starts or attaches the route's RPC runtime and loads picker choices. These are query-only
     /// commands and never send a provider prompt.

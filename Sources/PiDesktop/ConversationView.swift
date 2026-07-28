@@ -122,8 +122,7 @@ struct ConversationView: View {
                     }
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
-                        text: $store.draft,
-                        attachments: $store.attachments,
+                        model: store.composer,
                         isStreaming: store.isSelectedRuntime && store.runtimeState.isStreaming,
                         autofocus: true,
                         focusSignal: composerFocusTick,
