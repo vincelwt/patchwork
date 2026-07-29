@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 16
+// pi-desktop-activity-version: 17
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -90,14 +90,29 @@ function pullRequestReviewWatchKey(sessionId: string, pullRequest: GitHubPullReq
   return `pr_review_${digest}`;
 }
 
-function toolText(content: unknown): string {
-  if (typeof content === "string") return content;
+const TOOL_TEXT_TAIL_LIMIT = 16 * 1024;
+
+function toolTextTail(content: unknown): string {
+  if (typeof content === "string") return content.slice(-TOOL_TEXT_TAIL_LIMIT);
   if (!Array.isArray(content)) return "";
-  return content.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
+  const chunks: string[] = [];
+  let remaining = TOOL_TEXT_TAIL_LIMIT;
+  for (let index = content.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const item = content[index];
+    if (!item || typeof item !== "object") continue;
     const text = (item as { text?: unknown }).text;
-    return typeof text === "string" ? [text] : [];
-  }).join("\n");
+    if (typeof text !== "string") continue;
+    if (chunks.length > 0) {
+      chunks.push("\n");
+      remaining -= 1;
+    }
+    if (remaining > 0) {
+      const tail = text.slice(-remaining);
+      chunks.push(tail);
+      remaining -= tail.length;
+    }
+  }
+  return chunks.reverse().join("");
 }
 
 function hasQueuedReviewFollowUp(entries: readonly unknown[], url: string): boolean {
@@ -376,6 +391,10 @@ function runAutomationSelfTest(): void {
   const pullRequest = githubPullRequest(
     "created https://github.com/acme/widgets/pull/42 after https://github.com/acme/widgets/issues/1"
   );
+  const boundedText = toolTextTail([
+    { type: "text", text: "x".repeat(TOOL_TEXT_TAIL_LIMIT * 2) },
+    { type: "text", text: "https://github.com/acme/widgets/pull/42" },
+  ]);
   const watchKey = pullRequest ? pullRequestReviewWatchKey("session", pullRequest) : "";
   const queued = [{
     type: "custom_message",
@@ -383,6 +402,8 @@ function runAutomationSelfTest(): void {
     details: { url: pullRequest?.url },
   }];
   if (pullRequest?.url !== "https://github.com/acme/widgets/pull/42"
+      || boundedText.length > TOOL_TEXT_TAIL_LIMIT
+      || githubPullRequest(boundedText)?.url !== "https://github.com/acme/widgets/pull/42"
       || watchKey.length < 16
       || !hasQueuedReviewFollowUp(queued, "https://github.com/acme/widgets/pull/42")) {
     throw new Error("Pi Desktop pull-request watcher self-test failed.");
@@ -672,7 +693,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     if (event.toolName.toLowerCase() !== "bash" || event.isError) return;
     const command = (event.input as { command?: unknown }).command;
     if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
-    const pullRequest = githubPullRequest(toolText(event.content));
+    const pullRequest = githubPullRequest(toolTextTail(event.content));
     if (!pullRequest) return;
     try {
       await createPullRequestReviewWatch(pullRequest, ctx.sessionManager.getSessionId());
