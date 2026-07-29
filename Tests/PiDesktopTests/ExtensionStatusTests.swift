@@ -176,7 +176,7 @@ final class ExtensionStatusModelTests: XCTestCase {
         ], isLive: true)
 
         XCTAssertEqual(model.mode, PiMode.ultra)
-        XCTAssertEqual(model.fastPriority?.isActive, true)
+        XCTAssertTrue(model.fastPriority.isActive)
         XCTAssertEqual(model.codexAccount?.account, "a@b.co")
         XCTAssertEqual(model.genericChips.map(\.key), ["brand-new-extension", "chrome"])
         XCTAssertEqual(model.genericChips.map(\.value), ["Something happened", "Chrome ready"])
@@ -201,6 +201,10 @@ final class ExtensionStatusModelTests: XCTestCase {
         XCTAssertEqual(model.genericChips.map(\.key), ["b"])
         XCTAssertFalse(model.isEmpty)
         XCTAssertTrue(ExtensionStatusModel().isEmpty)
+    }
+
+    func testMissingFastPriorityStatusFallsBackToInactive() {
+        XCTAssertFalse(ExtensionStatusModel().fastPriority.isActive)
     }
 }
 

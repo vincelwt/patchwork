@@ -19,9 +19,7 @@ struct StatusBarView: View {
                 CodexAccountControl(account: statuses.codexAccount, isLive: statuses.isLive, isStale: statuses.codexAccountIsStale)
                 StatusSeparator()
             }
-            if let fast = statuses.fastPriority {
-                FastPriorityControl(status: fast, isLive: statuses.isLive)
-            }
+            FastPriorityControl(status: statuses.fastPriority, isLive: statuses.isLive)
 
             StatusSeparator()
 
