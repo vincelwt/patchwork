@@ -144,7 +144,7 @@ private struct SidebarFooter: View {
     let archiveForcedOpen: Bool
     @State private var remoteAccessPresented = false
     private var runningCount: Int { store.runningSessions.count }
-    private var resourceUsage: ThreadResourceUsage? { store.runningResourceUsage }
+    private var resourceUsage: ThreadResourceUsage? { store.aggregateResourceUsage }
     private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
     var body: some View {
@@ -203,7 +203,7 @@ private struct SidebarFooter: View {
         .frame(height: PiTheme.statusBarHeight)
     }
 
-    /// `nil` when idle: there is deliberately no "ready"/"idle" copy, only real activity.
+    /// Resource totals remain useful while an idle thread's managed process is still working.
     private var label: String? {
         if let resourceUsage { return NumberFormatting.resources(resourceUsage) }
         if runningCount == 1 { return "1 session running" }
@@ -212,7 +212,8 @@ private struct SidebarFooter: View {
     }
 
     private var activityDescription: String {
-        let sessions = runningCount == 1 ? "1 session running" : "\(runningCount) sessions running"
+        let sessions = runningCount == 0 ? "No sessions running"
+            : runningCount == 1 ? "1 session running" : "\(runningCount) sessions running"
         guard let resourceUsage else { return sessions }
         return "\(sessions), \(NumberFormatting.cpuPercent(resourceUsage.cpuPercent)) CPU, \(NumberFormatting.memoryBytes(resourceUsage.memoryBytes)) memory"
     }

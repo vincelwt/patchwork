@@ -4,15 +4,6 @@ import Foundation
 struct ThreadResourceUsage: Equatable, Sendable {
     var cpuPercent: Double
     var memoryBytes: UInt64
-
-    static func sum(_ values: [Self]) -> Self? {
-        guard !values.isEmpty else { return nil }
-        return values.reduce(into: Self(cpuPercent: 0, memoryBytes: 0)) { total, value in
-            total.cpuPercent += value.cpuPercent
-            let bytes = total.memoryBytes.addingReportingOverflow(value.memoryBytes)
-            total.memoryBytes = bytes.overflow ? .max : bytes.partialValue
-        }
-    }
 }
 
 struct ProcessResourceSample: Equatable, Sendable {
@@ -21,33 +12,32 @@ struct ProcessResourceSample: Equatable, Sendable {
     var sampledAt: Date
 }
 
-/// Samples a live Pi process and its descendants with libproc. CPU is the change in cumulative
-/// process time since the previous poll; memory is the current physical footprint.
+/// Samples live process trees with libproc. CPU is the change in cumulative process time since
+/// the previous poll; memory is the current physical footprint.
 enum ProcessResourceSampler {
-    static let maxProcessesPerThread = 1_024
+    static let maxProcessesPerTree = 1_024
 
     static func sample(
         rootsByPath: [String: Set<Int32>],
         previous: [Int32: ProcessResourceSample],
+        aggregateRoots: Set<Int32> = [],
         now: Date = Date()
-    ) -> (usageByPath: [String: ThreadResourceUsage], samples: [Int32: ProcessResourceSample]) {
-        var processIDsByPath: [String: Set<Int32>] = [:]
-        for (path, roots) in rootsByPath {
-            var ids: Set<Int32> = []
-            for root in roots.sorted() {
-                for pid in descendants(including: root) where ids.count < maxProcessesPerThread {
-                    ids.insert(pid)
-                }
-                if ids.count == maxProcessesPerThread { break }
-            }
-            processIDsByPath[path] = ids
-        }
-
-        let allProcessIDs = Set(processIDsByPath.values.flatMap { $0 })
+    ) -> (
+        usageByPath: [String: ThreadResourceUsage],
+        aggregateUsage: ThreadResourceUsage?,
+        samples: [Int32: ProcessResourceSample]
+    ) {
+        let processIDsByPath = rootsByPath.mapValues { processIDs(for: $0) }
+        let aggregateProcessIDs = processIDs(for: aggregateRoots)
+        let allProcessIDs = Set(processIDsByPath.values.flatMap { $0 }).union(aggregateProcessIDs)
         let samples = Dictionary(uniqueKeysWithValues: allProcessIDs.compactMap { pid in
             taskSample(pid: pid, at: now).map { (pid, $0) }
         })
-        return (usage(processIDsByPath: processIDsByPath, current: samples, previous: previous), samples)
+        return (
+            usage(processIDsByPath: processIDsByPath, current: samples, previous: previous),
+            usage(processIDsByPath: ["aggregate": aggregateProcessIDs], current: samples, previous: previous)["aggregate"],
+            samples
+        )
     }
 
     static func usage(
@@ -75,13 +65,24 @@ enum ProcessResourceSampler {
         }
     }
 
+    private static func processIDs(for roots: Set<Int32>) -> Set<Int32> {
+        var ids: Set<Int32> = []
+        for root in roots.sorted() {
+            for pid in descendants(including: root) where ids.count < maxProcessesPerTree {
+                ids.insert(pid)
+            }
+            if ids.count == maxProcessesPerTree { break }
+        }
+        return ids
+    }
+
     private static func descendants(including root: Int32) -> [Int32] {
         guard root > 0 else { return [] }
         var seen: Set<Int32> = [root]
         var queue: [Int32] = [root]
         var cursor = 0
-        var children = [pid_t](repeating: 0, count: maxProcessesPerThread)
-        while cursor < queue.count, queue.count < maxProcessesPerThread {
+        var children = [pid_t](repeating: 0, count: maxProcessesPerTree)
+        while cursor < queue.count, queue.count < maxProcessesPerTree {
             let parent = queue[cursor]
             cursor += 1
             let count = children.withUnsafeMutableBytes {
@@ -90,7 +91,7 @@ enum ProcessResourceSampler {
             guard count > 0 else { continue }
             for child in children.prefix(min(Int(count), children.count)) where child > 0 {
                 if seen.insert(child).inserted { queue.append(child) }
-                if queue.count == maxProcessesPerThread { break }
+                if queue.count == maxProcessesPerTree { break }
             }
         }
         return queue

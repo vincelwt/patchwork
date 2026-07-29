@@ -151,6 +151,8 @@ enum SessionActivityClassifier {
 @MainActor
 final class SessionActivityMonitor: ObservableObject {
     @Published private(set) var activities: [String: SessionActivity] = [:]
+    /// The whole app process tree plus heartbeat-backed external conversations currently running.
+    @Published private(set) var aggregateResources: ThreadResourceUsage?
 
     static let pollInterval: TimeInterval = 2
     static let backgroundPollInterval: TimeInterval = 15
@@ -204,6 +206,10 @@ final class SessionActivityMonitor: ObservableObject {
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
         heartbeatSnapshots = heartbeatSnapshots.filter { live.contains($0.key) }
+        if live.isEmpty {
+            aggregateResources = nil
+            resourceSamples.removeAll(keepingCapacity: false)
+        }
         tickNow()
     }
 
@@ -276,9 +282,13 @@ final class SessionActivityMonitor: ObservableObject {
         let cursor = fallbackCursor
         let knownHeartbeats = heartbeatSnapshots
         let knownResourceSamples = resourceSamples
+        let appProcessID = ProcessInfo.processInfo.processIdentifier
 
         let result = await Task.detached(priority: .utility) {
-            () -> ([String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int, [Int32: ProcessResourceSample]) in
+            () -> (
+                [String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int,
+                [Int32: ProcessResourceSample], ThreadResourceUsage?
+            ) in
             let now = Date()
             var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
             for path in Array(heartbeats.keys) {
@@ -295,9 +305,11 @@ final class SessionActivityMonitor: ObservableObject {
                 }.map(\.pid)
                 if !roots.isEmpty { result[entry.key] = Set(roots) }
             }
+            let aggregateRoots = Set(rootsByPath.values.flatMap { $0 }).union([appProcessID])
             let resourceSnapshot = ProcessResourceSampler.sample(
                 rootsByPath: rootsByPath,
                 previous: knownResourceSamples,
+                aggregateRoots: aggregateRoots,
                 now: now
             )
             let heartbeatPathsToPoll = Self.heartbeatPathsRequiringPoll(
@@ -440,13 +452,17 @@ final class SessionActivityMonitor: ObservableObject {
             for path in deferredHeartbeatPaths {
                 if let previous = knownHeartbeats[path] { nextHeartbeats[path] = previous }
             }
-            return (states, stamps, nextHeartbeats, selection.nextCursor, resourceSnapshot.samples)
+            return (
+                states, stamps, nextHeartbeats, selection.nextCursor,
+                resourceSnapshot.samples, resourceSnapshot.aggregateUsage
+            )
         }.value
 
         fingerprints = result.1
         heartbeatSnapshots = result.2
         fallbackCursor = result.3
         resourceSamples = result.4
+        aggregateResources = result.5
         if activities != result.0 { activities = result.0 }
     }
 

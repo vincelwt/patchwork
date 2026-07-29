@@ -1039,11 +1039,8 @@ final class AppStore: ObservableObject {
             }
     }
 
-    var runningResourceUsage: ThreadResourceUsage? {
-        let running = runningSessions
-        let values = running.compactMap(resourceUsage)
-        guard values.count == running.count else { return nil }
-        return ThreadResourceUsage.sum(values)
+    var aggregateResourceUsage: ThreadResourceUsage? {
+        activityMonitor.aggregateResources
     }
 
     private func managedTurnPath(for slot: RuntimeSlot) -> String? {
