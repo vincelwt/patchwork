@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 14
+// pi-desktop-activity-version: 15
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -574,7 +574,12 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         `${endpoint}/pulls/${pullRequest.number}/reviews?per_page=100`,
         `any(.[]; (${codexLogin}) and .submitted_at != null)`
       );
-      if (reviewed === undefined) return;
+      if (reviewed === undefined) {
+        if (Date.now() >= deadline) {
+          await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+        }
+        return;
+      }
       if (reviewed === true) {
         pi.sendMessage({
           customType: PULL_REQUEST_REVIEW_CUSTOM_TYPE,
