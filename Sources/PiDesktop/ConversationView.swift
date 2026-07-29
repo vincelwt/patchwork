@@ -293,6 +293,9 @@ struct MessageScrollView: View {
     /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
     var onEditLastMessage: (() -> Void)?
     @State private var isPinnedToBottom = true
+    /// Bumped by the coordinator's paint heal; reading it in the tree below guarantees one
+    /// SwiftUI render pass against the viewport actually on screen after an open settles.
+    @State private var healTick = 0
     @State private var scrollBridge = ConversationScrollBridge()
     @State private var underfillPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
@@ -378,10 +381,13 @@ struct MessageScrollView: View {
             .padding(.horizontal, PiTheme.space20)
             .frame(maxWidth: .infinity)
             .background(
-                ConversationScrollObserver(bridge: scrollBridge) { metrics in
-                    handleScrollMetrics(metrics)
-                }
+                ConversationScrollObserver(
+                    bridge: scrollBridge,
+                    onChange: { metrics in handleScrollMetrics(metrics) },
+                    onHeal: { healTick &+= 1 }
+                )
             )
+            .overlay(alignment: .topLeading) { Color.clear.frame(width: 0, height: 0).id(healTick) }
         }
         // The native anchor positions the first frame at the bottom; from then on the AppKit
         // coordinator keeps the viewport pinned through streaming growth, image decodes, and
