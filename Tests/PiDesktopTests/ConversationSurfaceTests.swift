@@ -10,6 +10,22 @@ final class ConversationToolbarTests: XCTestCase {
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
         XCTAssertFalse(source.contains("StatusDot"))
     }
+
+    /// A `withAnimation` around any shared-store mutation (toasts fire constantly with several
+    /// running conversations) animates every batched view diff. If the transcript's structural
+    /// swaps ride such a transaction, an interrupted crossfade leaves the conversation ghosted
+    /// at partial opacity until a scroll forces fresh layers. The strip must stay directly on
+    /// the message area.
+    func testTranscriptSwapsNeverInheritAmbientAnimations() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop/ConversationView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("messageArea\n") && source.contains(".transaction { $0.animation = nil }"),
+            "The message area must strip ambient animations from its structural swaps"
+        )
+    }
 }
 
 final class ConversationImageStripTests: XCTestCase {
