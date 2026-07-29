@@ -113,6 +113,20 @@ final class ActivityExtensionInstallerTests: XCTestCase {
         XCTAssertTrue(bundled.contains("latestCompletedEntryID(ctx.sessionManager.getBranch())"))
     }
 
+    func testBundledExtensionWatchesCodexReviewsWithoutPollingTheProvider() throws {
+        let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 13)
+        XCTAssertTrue(bundled.contains("pi.on(\"tool_result\""))
+        XCTAssertTrue(bundled.contains("gh\\s+pr\\s+create"))
+        XCTAssertTrue(bundled.contains("kind: \"heartbeat\""))
+        XCTAssertTrue(bundled.contains("pi.registerCommand(PULL_REQUEST_REVIEW_COMMAND"))
+        XCTAssertTrue(bundled.contains("chatgpt-codex-connector"))
+        XCTAssertTrue(bundled.contains("--paginate"))
+        XCTAssertTrue(bundled.contains("PULL_REQUEST_REVIEW_CUSTOM_TYPE"))
+        XCTAssertTrue(bundled.contains("never merge a pull request."))
+        XCTAssertTrue(bundled.contains("PULL_REQUEST_REVIEW_MAX_AGE_MS"))
+    }
+
     func testBundledExtensionBranchesEditedMessagesInsideTheCurrentSession() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
         XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 13)

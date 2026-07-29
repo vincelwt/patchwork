@@ -174,7 +174,12 @@ final class AppStore: ObservableObject {
     @Published var isScanning = false
     @Published var scanError: String?
 
-    @Published var messages: [ChatMessage] = [] { didSet { transcriptRevision &+= 1 } }
+    @Published var messages: [ChatMessage] = [] {
+        didSet {
+            transcriptRevision &+= 1
+            pullRequestLinkKey = -1
+        }
+    }
     @Published var streamingMessage: ChatMessage? { didSet { transcriptRevision &+= 1 } }
     /// Plain revision counter for memoizing transcript projection. It deliberately is not
     /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
@@ -182,8 +187,8 @@ final class AppStore: ObservableObject {
     private var pullRequestLinkKey = -1
     private var cachedPullRequestLink: URL?
     /// The pull request this conversation opened, for the header's quick link. Memoized on
-    /// message count rather than `transcriptRevision`: streaming deltas land in
-    /// `streamingMessage`, so a token burst would otherwise rescan the whole transcript.
+    /// message count and explicitly invalidated when `messages` is replaced: streaming deltas
+    /// land in `streamingMessage`, so a token burst never rescans the whole transcript.
     var pullRequestLink: URL? {
         if pullRequestLinkKey != messages.count {
             pullRequestLinkKey = messages.count
