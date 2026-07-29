@@ -19,6 +19,7 @@ struct SidebarView: View {
             query: store.searchText,
             virtualFolders: store.virtualFolders,
             assignments: store.virtualFolderAssignments,
+            managedWorktreeProjects: store.managedWorktreeProjects,
             archivedAt: store.archivedDate
         )
         VStack(spacing: 0) {
@@ -234,6 +235,7 @@ struct SidebarSnapshot {
         query: String,
         virtualFolders: [VirtualFolder] = [],
         assignments: [String: String] = [:],
+        managedWorktreeProjects: [String: String] = [:],
         archivedAt: (SessionSummary) -> Date = { $0.modifiedAt }
     ) {
         let folded = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -241,6 +243,10 @@ struct SidebarSnapshot {
         let validVirtualIDs = Set(virtualFolders.map(\.id))
         all = folded.isEmpty ? sessions : sessions.filter { session in
             if session.searchKey.contains(folded) { return true }
+            if WorkspaceOrganization.projectPath(
+                of: session,
+                managedWorktreeProjects: managedWorktreeProjects
+            ).lowercased().contains(folded) { return true }
             let path = session.fileURL.standardizedFileURL.path
             guard let id = assignments[path],
                   let folder = virtualFolders.first(where: { $0.id == id }) else { return false }
@@ -250,6 +256,7 @@ struct SidebarSnapshot {
             all.filter { !$0.isArchived },
             virtualFolders: virtualFolders,
             assignments: assignments,
+            managedWorktreeProjects: managedWorktreeProjects,
             validVirtualIDs: validVirtualIDs,
             includeEmptyVirtualFolders: !isFiltering
         )
@@ -264,6 +271,7 @@ struct SidebarSnapshot {
         _ sessions: [SessionSummary],
         virtualFolders: [VirtualFolder],
         assignments: [String: String],
+        managedWorktreeProjects: [String: String],
         validVirtualIDs: Set<String>,
         includeEmptyVirtualFolders: Bool
     ) -> [SessionFolderGroup] {
@@ -274,7 +282,11 @@ struct SidebarSnapshot {
             if let id = assignments[sessionPath], validVirtualIDs.contains(id) {
                 virtualSessions[id, default: []].append(session)
             } else {
-                filesystemSessions[session.cwd.standardizedFileURL.path, default: []].append(session)
+                let project = WorkspaceOrganization.projectPath(
+                    of: session,
+                    managedWorktreeProjects: managedWorktreeProjects
+                )
+                filesystemSessions[project, default: []].append(session)
             }
         }
 
@@ -495,12 +507,19 @@ private let archiveExpandedMaxHeight: CGFloat = 220
 /// Deliberately not the folder tree the active list uses: an archive is a history, so it reads
 /// as one flat list, most recently archived first, with each row's folder as its hint.
 private struct ArchiveSection: View {
+    @EnvironmentObject private var store: AppStore
     let sessions: [SessionSummary]
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
-                ForEach(sessions) { SessionRow(session: $0, archived: true, hint: $0.folderName) }
+                ForEach(sessions) {
+                    SessionRow(
+                        session: $0,
+                        archived: true,
+                        hint: SessionFolderGroup.projectName(forPath: store.projectFolder(for: $0).path)
+                    )
+                }
             }
         }
         .frame(maxHeight: archiveExpandedMaxHeight)
@@ -666,7 +685,7 @@ private struct SessionFolderSection: View {
 
     /// Known project paths, from live sessions, as candidate "Move Folder to…" destinations.
     private var projectDestinations: [String] {
-        Set(store.sessions.map { $0.cwd.standardizedFileURL.path })
+        Set(store.sessions.map { store.projectFolder(for: $0).standardizedFileURL.path })
             .filter { !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: $0, isDirectory: true)) }
             .sorted {
                 SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
@@ -678,6 +697,14 @@ private struct SessionFolderSection: View {
     private func availableFolderDestinations(excluding id: String) -> [WorkspaceOrganization.FolderTreeEntry] {
         WorkspaceOrganization.allFolderEntries(store.virtualFolders)
             .filter { $0.folder.id != id && !WorkspaceOrganization.wouldCreateCycle(moving: id, into: $0.folder.id, in: store.virtualFolders) }
+    }
+}
+
+enum SidebarRunningLabel {
+    static func text(since date: Date?, now: Date, usage: ThreadResourceUsage?, hovering: Bool) -> String {
+        if hovering, let usage { return NumberFormatting.resources(usage) }
+        guard let date else { return "working" }
+        return NumberFormatting.elapsed(since: date, now: now)
     }
 }
 
@@ -757,7 +784,7 @@ private struct SessionRow: View {
             Button("Cancel", role: .cancel) {}
             Button("Rename") { store.renameSession(session, to: renameValue) }
         }
-        .help(hint ?? session.cwd.path)
+        .help(hint ?? store.projectFolder(for: session).path)
         .accessibilityLabel("\(session.displayName)\(hint.map { ", in \($0)" } ?? ""), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(resourceUsage.map { ", \(NumberFormatting.cpuPercent($0.cpuPercent)) CPU, \(NumberFormatting.memoryBytes($0.memoryBytes)) memory" } ?? "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
@@ -784,19 +811,25 @@ private struct SessionRow: View {
         }
     }
 
-    /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
-    /// waiting for an answer outranks running, which outranks unread. One explicit stack keeps
-    /// the pair grouped and ordered on the trailing edge.
+    /// Context first (run time with resources on hover, else modification time/branch), then the
+    /// clock, then one status dot. Waiting for an answer outranks running, which outranks unread.
     private var trailingAccessory: some View {
         HStack(spacing: PiTheme.space6) {
-            if hovering {
-                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
-            } else if running, let resourceUsage {
-                Text(NumberFormatting.resources(resourceUsage))
+            if running {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(SidebarRunningLabel.text(
+                        since: store.runningSince(session), now: context.date,
+                        usage: resourceUsage, hovering: hovering
+                    ))
                     .font(SidebarTypography.metadata.monospacedDigit())
                     .foregroundStyle(.tertiary)
-                    .help("\(NumberFormatting.cpuPercent(resourceUsage.cpuPercent)) CPU · \(NumberFormatting.memoryBytes(resourceUsage.memoryBytes)) memory")
-                    .accessibilityHidden(true)
+                }
+                .help(resourceUsage.map {
+                    "\(NumberFormatting.cpuPercent($0.cpuPercent)) CPU · \(NumberFormatting.memoryBytes($0.memoryBytes)) memory"
+                } ?? "Pi is working")
+                .accessibilityHidden(true)
+            } else if hovering {
+                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
             } else if GitIndicatorPolicy.showsBranchIndicator(git) {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)

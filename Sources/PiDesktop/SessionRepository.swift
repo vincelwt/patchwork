@@ -280,6 +280,14 @@ final class AppPersistence {
         save()
     }
 
+    func setManagedWorktreeProject(_ project: URL?, for worktree: URL) {
+        let worktreePath = worktree.standardizedFileURL.path
+        let projectPath = project?.standardizedFileURL.path
+        guard state.managedWorktreeProjects[worktreePath] != projectPath else { return }
+        state.setManagedWorktreeProject(worktreePath: worktreePath, projectPath: projectPath)
+        save()
+    }
+
     func updateState(_ update: (inout PersistedAppState) -> Void) {
         update(&state)
         save()

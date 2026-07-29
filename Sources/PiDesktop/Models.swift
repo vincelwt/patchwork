@@ -491,6 +491,9 @@ struct PersistedAppState: Codable {
     /// App-only organization. Keys are standardized session-file paths, never Pi JSONL IDs.
     var virtualFolders: [VirtualFolder] = []
     var virtualFolderAssignments: [String: String] = [:]
+    /// App-created worktree cwd → project folder shown by the desktop organization. Pi keeps the
+    /// real worktree cwd in its session; this metadata changes presentation only.
+    var managedWorktreeProjects: [String: String] = [:]
     /// Completion/read state is keyed by session-file path so duplicate/migrated session IDs
     /// cannot collide. `lastReadAt` is decode-only migration input from pre-completion-ID builds.
     var latestCompletedEntryIDBySessionPath: [String: String] = [:]
@@ -521,6 +524,10 @@ struct PersistedAppState: Codable {
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
         virtualFolders = try container.decodeIfPresent([VirtualFolder].self, forKey: .virtualFolders) ?? []
         virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
+        let worktreeProjects = try container.decodeIfPresent([String: String].self, forKey: .managedWorktreeProjects) ?? [:]
+        managedWorktreeProjects = Dictionary(uniqueKeysWithValues: worktreeProjects
+            .sorted { $0.key < $1.key }
+            .suffix(Self.maxManagedWorktreeProjects))
         latestCompletedEntryIDBySessionPath = try container.decodeIfPresent(
             [String: String].self, forKey: .latestCompletedEntryIDBySessionPath
         ) ?? [:]
@@ -541,6 +548,17 @@ struct PersistedAppState: Codable {
 
     static let maxRetainedCompletionSessions = 2_000
     static let maxManagedTurnRecoveries = 32
+    static let maxManagedWorktreeProjects = 2_000
+
+    mutating func setManagedWorktreeProject(worktreePath: String, projectPath: String?) {
+        if let projectPath { managedWorktreeProjects[worktreePath] = projectPath }
+        else { managedWorktreeProjects.removeValue(forKey: worktreePath) }
+        let overflow = managedWorktreeProjects.count - Self.maxManagedWorktreeProjects
+        guard overflow > 0 else { return }
+        for key in managedWorktreeProjects.keys.filter({ $0 != worktreePath }).sorted().prefix(overflow) {
+            managedWorktreeProjects.removeValue(forKey: key)
+        }
+    }
 
     /// Keeps completion metadata bounded even for hand-edited state, and optionally drops paths
     /// no longer discovered. `preferredPath` is the just-observed session and is never evicted.

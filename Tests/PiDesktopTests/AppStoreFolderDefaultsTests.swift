@@ -157,6 +157,40 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         XCTAssertEqual(store.sidebarFolders.map(\.standardizedFileURL.path), [project.standardizedFileURL.path])
     }
 
+    func testWorktreeKeepsTheProjectSelectedButStartsPiInsideTheWorktree() async throws {
+        let project = directory.appendingPathComponent("project-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        XCTAssertEqual(GitService.run(["-C", project.path, "init", "-q"]).status, 0)
+        XCTAssertEqual(GitService.run(["-C", project.path, "config", "user.email", "pi-desktop@example.invalid"]).status, 0)
+        XCTAssertEqual(GitService.run(["-C", project.path, "config", "user.name", "Pi Desktop Tests"]).status, 0)
+        try Data("one\n".utf8).write(to: project.appendingPathComponent("sample.txt"))
+        XCTAssertEqual(GitService.run(["-C", project.path, "add", "sample.txt"]).status, 0)
+        XCTAssertEqual(GitService.run(["-C", project.path, "commit", "-q", "-m", "initial"]).status, 0)
+
+        var worktree: URL?
+        defer {
+            if let worktree {
+                _ = GitService.run(["-C", project.path, "worktree", "remove", "--force", worktree.path])
+            }
+        }
+        let runtime = FakeRuntime()
+        let store = makeStore(runtime: runtime)
+        store.chooseFolder(project)
+
+        store.setNewChatWorktree(true)
+        try await waitUntil { store.newChatWorktree != nil }
+        let createdWorktree = try XCTUnwrap(store.newChatWorktree)
+        worktree = createdWorktree
+
+        XCTAssertEqual(store.selectedFolder?.standardizedFileURL.path, project.standardizedFileURL.path)
+        XCTAssertEqual(store.managedWorktreeProjects[createdWorktree.standardizedFileURL.path], project.standardizedFileURL.path)
+
+        store.draft = "hello"
+        store.submitDraft()
+
+        XCTAssertEqual(runtime.startedCwd?.standardizedFileURL.path, createdWorktree.standardizedFileURL.path)
+    }
+
     // MARK: - Git refresh stays lazy until the folder is opted into
 
     func testTheGlobalDesktopFolderNeverTriggersAGitSubprocessOnItsOwn() async throws {

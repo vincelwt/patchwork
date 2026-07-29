@@ -232,6 +232,8 @@ final class AppStore: ObservableObject {
     /// the worktree) or a different new chat starts (the unused worktree is removed).
     @Published private(set) var newChatWorktree: URL?
     private var newChatWorktreeOrigin: URL?
+    /// Once submitted, navigation may hide this selection but must never delete its live cwd.
+    private var newChatWorktreeSubmitted = false
     @Published var runtimeState = RuntimeState()
     @Published private(set) var isOffline = false
     @Published var liveMetrics = TokenMetrics()
@@ -965,12 +967,18 @@ final class AppStore: ObservableObject {
         return sessions.first { $0.fileURL.standardizedFileURL.path == path }
     }
 
+    /// The folder Pi runs in. New-chat organization stays on the selected project while an
+    /// optional worktree replaces only this execution cwd.
+    private var selectedExecutionFolder: URL? {
+        selectedSession?.cwd ?? newChatWorktree ?? selectedFolder
+    }
+
     /// Filesystem projects already known from sidebar conversations. A virtual-folder assignment
     /// must not make its underlying project disappear from the new-chat chooser.
     var sidebarFolders: [URL] {
         var seen: Set<String> = []
         return sessions.compactMap { session in
-            let folder = session.cwd.standardizedFileURL
+            let folder = projectFolder(for: session).standardizedFileURL
             guard !WorkspaceOrganization.isGlobalWorkingDirectory(folder), seen.insert(folder.path).inserted else { return nil }
             return folder
         }
@@ -1015,8 +1023,8 @@ final class AppStore: ObservableObject {
 
     private var currentRouteKey: RuntimeRouteKey? {
         if let selectedSession { return .session(selectedSession.fileURL.standardizedFileURL.path) }
-        guard let selectedFolder else { return nil }
-        return .newChat(selectedFolder.standardizedFileURL.path)
+        guard let selectedExecutionFolder else { return nil }
+        return .newChat(selectedExecutionFolder.standardizedFileURL.path)
     }
 
     var selectedMetrics: TokenMetrics {
@@ -1071,8 +1079,17 @@ final class AppStore: ObservableObject {
         return max(observed ?? .distantPast, session.modifiedAt)
     }
 
+    /// The app knows its prompt start before the shared activity monitor's next poll. Prefer that
+    /// while available so a new turn never inherits an older conversation timestamp.
     func runningSince(_ session: SessionSummary) -> Date? {
-        activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.runningSince
+        let path = session.fileURL.standardizedFileURL.path
+        if activeRuntimePath == path, runtimeState.isBusy, let beganAt = activeRuntimeSlot.promptBeganAt {
+            return beganAt
+        }
+        if let slot = parkedRuntimes[.session(path)], slot.state.isBusy, let beganAt = slot.promptBeganAt {
+            return beganAt
+        }
+        return activityMonitor.activity(forPath: path)?.runningSince
     }
 
     /// The user-turn/run boundary stays fixed while tool and assistant writes keep changing mtime.
@@ -1975,6 +1992,9 @@ final class AppStore: ObservableObject {
 
     func chooseFolder(_ url: URL) {
         let folder = url.standardizedFileURL
+        if case .newChat = route, selectedFolder?.standardizedFileURL.path != folder.path {
+            discardPendingWorktree()
+        }
         if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(folder.path) {
             detachActiveRuntimePresentation()
         }
@@ -1992,8 +2012,8 @@ final class AppStore: ObservableObject {
     // MARK: - Conversation worktrees
 
     /// The new-chat `Worktree` checkbox. Turning it on cuts a fresh worktree off the project's
-    /// main line and selects it, so the Pi agent this chat starts runs there with no extra
-    /// plumbing: the selected folder is already the runtime's cwd.
+    /// main line and uses it only as Pi's execution cwd; the selected project stays unchanged for
+    /// the new-chat row and desktop organization.
     func setNewChatWorktree(_ enabled: Bool) {
         guard enabled else { discardPendingWorktree(restoringFolder: true); return }
         guard newChatWorktree == nil else { return }
@@ -2004,14 +2024,21 @@ final class AppStore: ObservableObject {
         Task {
             switch await WorktreeService.create(from: folder) {
             case let .success(worktree):
-                // The user navigated away while git worked: nothing will ever use this checkout.
-                guard case .newChat = route, newChatWorktree == nil else {
+                // The user navigated away or changed projects while git worked: nothing will use
+                // this checkout.
+                guard case .newChat = route,
+                      newChatWorktree == nil,
+                      selectedFolder?.standardizedFileURL.path == folder.standardizedFileURL.path else {
                     await WorktreeService.remove(at: worktree)
                     return
                 }
+                persistence.setManagedWorktreeProject(folder, for: worktree)
                 newChatWorktreeOrigin = folder
+                newChatWorktreeSubmitted = false
                 newChatWorktree = worktree
-                chooseFolder(worktree)
+                if runtimeKey(for: activeRuntimeSlot) != .newChat(worktree.path) {
+                    detachActiveRuntimePresentation()
+                }
                 showToast("Worktree ready: \(worktree.lastPathComponent)", style: .info)
             case let .failure(error):
                 showToast(error.message, style: .warning)
@@ -2024,10 +2051,13 @@ final class AppStore: ObservableObject {
     private func discardPendingWorktree(restoringFolder: Bool = false) {
         guard let worktree = newChatWorktree else { return }
         let origin = newChatWorktreeOrigin
+        let shouldRemove = !newChatWorktreeSubmitted
         newChatWorktree = nil
         newChatWorktreeOrigin = nil
+        newChatWorktreeSubmitted = false
+        if shouldRemove { persistence.setManagedWorktreeProject(nil, for: worktree) }
         if restoringFolder, let origin { chooseFolder(origin) }
-        Task { await WorktreeService.remove(at: worktree) }
+        if shouldRemove { Task { await WorktreeService.remove(at: worktree) } }
     }
 
     /// Archived conversations (and the worktrees they ran in) are cleared from the sidebar this
@@ -2064,6 +2094,7 @@ final class AppStore: ObservableObject {
             .filter { WorktreeService.isManaged($0) && !stillUsed.contains($0.standardizedFileURL.path) }
             .map { $0.standardizedFileURL })
         for worktree in releasable {
+            persistence.setManagedWorktreeProject(nil, for: worktree)
             Task { await WorktreeService.remove(at: worktree) }
         }
         return surviving
@@ -2190,12 +2221,11 @@ final class AppStore: ObservableObject {
         let cwd: URL
         let sessionPath: URL?
         if let selectedSession { cwd = selectedSession.cwd; sessionPath = selectedSession.fileURL }
-        else if let selectedFolder { cwd = selectedFolder; sessionPath = nil }
+        else if let selectedExecutionFolder { cwd = selectedExecutionFolder; sessionPath = nil }
         else { showToast("Choose a working folder first", style: .warning); return }
-        // The session about to be created owns the pending worktree from here on, so navigating
-        // away later must not delete the checkout it is running in.
-        newChatWorktree = nil
-        newChatWorktreeOrigin = nil
+        // Keep the execution cwd selected until Pi assigns the real session path, but transfer
+        // ownership now so navigation can never delete a submitted worktree.
+        newChatWorktreeSubmitted = newChatWorktree != nil
 
         let sentText = draft
         let sentAttachments = attachments
@@ -2225,6 +2255,10 @@ final class AppStore: ObservableObject {
                                 delivery: delivery, cwd: cwd, optimisticID: optimisticID,
                                 submissionOrigin: origin, slot: slot)
             case let .failure(error):
+                if case .newChat = route,
+                   newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
+                    newChatWorktreeSubmitted = false
+                }
                 if let optimisticID { messages.removeAll { $0.id == optimisticID } }
                 let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
                 showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
@@ -2428,7 +2462,7 @@ final class AppStore: ObservableObject {
         let cwd: URL
         let sessionPath: URL?
         if let selectedSession { cwd = selectedSession.cwd; sessionPath = selectedSession.fileURL }
-        else if let selectedFolder { cwd = selectedFolder; sessionPath = nil }
+        else if let selectedExecutionFolder { cwd = selectedExecutionFolder; sessionPath = nil }
         else { showToast("Choose a working folder first", style: .warning); return }
 
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
@@ -2493,7 +2527,7 @@ final class AppStore: ObservableObject {
         // A real runtime already publishes statuses; probing would duplicate a Pi process.
         guard !runtime.isRunning, probeRuntime == nil else { return }
 
-        let cwd = selectedSession?.cwd ?? selectedFolder ?? FileManager.default.homeDirectoryForCurrentUser
+        let cwd = selectedExecutionFolder ?? FileManager.default.homeDirectoryForCurrentUser
         let probe = probeRuntimeFactory()
         probe.onEvent = { [weak self] event in self?.handleProbeEvent(event) }
         probe.onExit = { [weak self] _ in self?.finishProbe() }
@@ -2697,8 +2731,7 @@ final class AppStore: ObservableObject {
     /// Starts or attaches the route's RPC runtime and loads picker choices. These are query-only
     /// commands and never send a provider prompt.
     func prepareComposerOptions() {
-        let cwd = selectedSession?.cwd ?? selectedFolder
-        guard let cwd else { return }
+        guard let cwd = selectedExecutionFolder else { return }
         let sessionPath = selectedSession?.fileURL
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             guard let self else { return }
@@ -2774,9 +2807,9 @@ final class AppStore: ObservableObject {
         if let selectedSession {
             return activeRuntimePath == selectedSession.fileURL.standardizedFileURL.path
         }
-        guard let selectedFolder else { return false }
+        guard let selectedExecutionFolder else { return false }
         return activeRuntimeStartedForNewChat
-            && activeRuntimeCwd == selectedFolder.standardizedFileURL.path
+            && activeRuntimeCwd == selectedExecutionFolder.standardizedFileURL.path
     }
 
     private func requestComposerOptions(slot: RuntimeSlot? = nil) {
@@ -3609,6 +3642,11 @@ final class AppStore: ObservableObject {
         slot.startedForNewChat = false
         if slot !== activeRuntimeSlot { parkedRuntimes[.session(path)] = slot }
 
+        if newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
+            newChatWorktree = nil
+            newChatWorktreeOrigin = nil
+            newChatWorktreeSubmitted = false
+        }
         if slot === activeRuntimeSlot, case .newChat = route {
             route = .session(path)
             activities = []

@@ -73,6 +73,31 @@ final class SidebarPresentationTests: XCTestCase {
         XCTAssertEqual(snapshot.activeGroups.first?.sessions.map(\.id), ["global"])
     }
 
+    func testRunningLabelShowsElapsedTimeUntilTheRowIsHovered() {
+        let now = Date()
+        let startedAt = now.addingTimeInterval(-125)
+        let usage = ThreadResourceUsage(cpuPercent: 12.5, memoryBytes: 1_048_576)
+
+        XCTAssertEqual(
+            SidebarRunningLabel.text(since: startedAt, now: now, usage: usage, hovering: false),
+            "2m"
+        )
+        XCTAssertEqual(
+            SidebarRunningLabel.text(since: startedAt, now: now, usage: usage, hovering: true),
+            NumberFormatting.resources(usage)
+        )
+        XCTAssertEqual(
+            SidebarRunningLabel.text(since: startedAt, now: now, usage: nil, hovering: true),
+            "2m",
+            "A running thread without heartbeat resource data must keep its elapsed time"
+        )
+        XCTAssertEqual(
+            SidebarRunningLabel.text(since: nil, now: now, usage: nil, hovering: false),
+            "working",
+            "Never substitute an old conversation timestamp before the current run is observed"
+        )
+    }
+
     func testNewFolderActionLivesInTheSidebarContextMenu() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

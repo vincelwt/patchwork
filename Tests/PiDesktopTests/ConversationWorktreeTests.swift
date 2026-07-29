@@ -62,6 +62,45 @@ final class ConversationWorktreeTests: XCTestCase {
         XCTAssertEqual(WorktreeService.baseRef(candidates: ["origin/main", "main"]) { _ in false }, "HEAD")
     }
 
+    func testManagedWorktreeSessionStaysOrganizedUnderItsProject() throws {
+        let project = "/Users/test/code/pi-desktop"
+        let worktree = WorktreeService.root.appendingPathComponent("pi-desktop-20260729-120000").path
+        let session = summary(id: "work", cwd: worktree, archived: false)
+        let projects = [worktree: project]
+        let snapshot = SidebarSnapshot(
+            sessions: [session],
+            query: "",
+            managedWorktreeProjects: projects
+        )
+
+        XCTAssertEqual(snapshot.activeGroups.count, 1)
+        let group = try XCTUnwrap(snapshot.activeGroups.first)
+        XCTAssertEqual(group.path, project)
+        XCTAssertEqual(group.sessions.map(\.id), [session.id])
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(
+                of: session,
+                folders: [],
+                assignments: [:],
+                managedWorktreeProjects: projects
+            ),
+            ["pi-desktop", "work"]
+        )
+
+        let folder = VirtualFolder(id: "focus", name: "Focus")
+        XCTAssertEqual(
+            WorkspaceOrganization.defaultWorkingDirectory(
+                forVirtualFolder: folder.id,
+                sessions: [session],
+                assignments: [session.fileURL.standardizedFileURL.path: folder.id],
+                folders: [folder],
+                fallback: URL(fileURLWithPath: "/tmp/fallback"),
+                managedWorktreeProjects: projects
+            ).path,
+            project
+        )
+    }
+
     // MARK: - Archive retention
 
     @MainActor
@@ -130,15 +169,17 @@ final class ConversationWorktreeTests: XCTestCase {
 
     // MARK: - Persisted state
 
-    func testArchiveDatesAndLastFolderSurviveAStateRoundTrip() throws {
+    func testArchiveDatesLastFolderAndWorktreeProjectsSurviveAStateRoundTrip() throws {
         var state = PersistedAppState()
         state.archivedAt = ["a": Date(timeIntervalSince1970: 1_700_000_000)]
         state.lastFolder = "/tmp/project"
+        state.managedWorktreeProjects = ["/tmp/worktree": "/tmp/project"]
 
         let decoded = try JSONDecoder().decode(PersistedAppState.self, from: JSONEncoder().encode(state))
 
         XCTAssertEqual(decoded.archivedAt["a"], state.archivedAt["a"])
         XCTAssertEqual(decoded.lastFolder, "/tmp/project")
+        XCTAssertEqual(decoded.managedWorktreeProjects, state.managedWorktreeProjects)
     }
 
     /// A `state.json` written before this feature must still decode, archive flags intact.
