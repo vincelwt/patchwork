@@ -694,7 +694,7 @@ struct MarkdownTableView: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            Grid(alignment: .topLeading, horizontalSpacing: PiTheme.space16, verticalSpacing: PiTheme.space6) {
+            Grid(alignment: .topLeading, horizontalSpacing: PiTheme.space16, verticalSpacing: PiTheme.space10) {
                 GridRow {
                     ForEach(Array(header.enumerated()), id: \.offset) { index, cell in
                         cellText(cell, column: index, emphasis: true)
@@ -703,6 +703,7 @@ struct MarkdownTableView: View {
                 Divider()
                     .gridCellColumns(max(1, header.count))
                     .overlay(Color.piHairline)
+                    .padding(.vertical, PiTheme.space2)
                 ForEach(Array(normalizedRows.enumerated()), id: \.offset) { _, row in
                     GridRow {
                         ForEach(Array(row.enumerated()), id: \.offset) { index, cell in

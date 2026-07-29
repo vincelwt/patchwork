@@ -12,60 +12,10 @@ import SwiftUI
 // so the fix is to lay the answer's paragraphs/headings/lists/quotes/code out as one attributed
 // string in one text view instead of one SwiftUI view per block.
 //
-// Tables are the one block kind deliberately left out of this shared text view (see
-// `MarkdownAnswerPartitioner`) — a real aligned table needs `Grid`, not TextKit line layout, so a
-// table still renders as its own `MarkdownTableView` and is its own selection island. Dragging
-// through a paragraph, a list, and a code block — the case actually described in the report —
-// works as one continuous selection.
-
-/// One contiguous run of an answer's blocks that renders as a single selectable region, or one
-/// table that keeps its own `Grid`-based renderer. Splitting only at table boundaries means the
-/// common case (prose, lists, quotes, code) is one `NSTextView` and therefore one selection.
-enum MarkdownAnswerRun: Identifiable, Equatable {
-    case text([MarkdownBlock], position: Int)
-    case table(MarkdownBlock, position: Int)
-
-    /// Position is part of the identity on purpose: two runs of identical content (the same
-    /// table twice, a repeated paragraph) would otherwise collide in a `ForEach` and render on
-    /// top of each other.
-    var id: String {
-        switch self {
-        case let .text(blocks, position): "run:\(position):" + blocks.map(\.id).joined(separator: "|")
-        case let .table(block, position): "table:\(position):" + block.id
-        }
-    }
-
-    var blocks: [MarkdownBlock] {
-        switch self {
-        case let .text(blocks, _): blocks
-        case let .table(block, _): [block]
-        }
-    }
-
-    static func == (lhs: MarkdownAnswerRun, rhs: MarkdownAnswerRun) -> Bool { lhs.id == rhs.id }
-}
-
-enum MarkdownAnswerPartitioner {
-    static func runs(from blocks: [MarkdownBlock]) -> [MarkdownAnswerRun] {
-        var result: [MarkdownAnswerRun] = []
-        var current: [MarkdownBlock] = []
-        func flush() {
-            guard !current.isEmpty else { return }
-            result.append(.text(current, position: result.count))
-            current.removeAll(keepingCapacity: true)
-        }
-        for block in blocks {
-            if case .table = block {
-                flush()
-                result.append(.table(block, position: result.count))
-            } else {
-                current.append(block)
-            }
-        }
-        flush()
-        return result
-    }
-}
+// Tables used to be split out into their own `Grid` view, which made every table its own
+// selection island (a drag could not cross a row, let alone the table boundary). AppKit lays out
+// real tables in TextKit 1 via `NSTextTable`/`NSTextTableBlock`, so a table is now part of the
+// same attributed string and the same single selection as the prose around it.
 
 /// A settled assistant answer, laid out so a drag can select continuously from the first
 /// paragraph through a list and a code block. Streaming text and every other Markdown use in the
@@ -77,20 +27,8 @@ struct MarkdownAnswerText: View {
     var onHoverChange: ((Bool) -> Void)?
 
     var body: some View {
-        let runs = MarkdownAnswerPartitioner.runs(from: MarkdownBlockParser.blocks(from: text))
-        VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
-            ForEach(runs) { run in
-                switch run {
-                case let .text(blocks, _):
-                    SelectableTextRun(blocks: blocks, onHoverChange: onHoverChange)
-                case let .table(block, _):
-                    if case let .table(header, alignment, rows) = block {
-                        MarkdownTableView(header: header, alignment: alignment, rows: rows)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        SelectableTextRun(blocks: MarkdownBlockParser.blocks(from: text), onHoverChange: onHoverChange)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -465,8 +403,8 @@ enum AnswerAttributedTextBuilder {
                 let start = result.length
                 result.append(codeAttributedString(code, size: size))
                 codeBlocks.append(CodeBlockEntry(id: id, code: code, range: NSRange(location: start, length: result.length - start)))
-            case .table:
-                continue // Tables are partitioned out before reaching this builder.
+            case let .table(header, alignment, rows):
+                result.append(table(header: header, alignment: alignment, rows: rows, size: size))
             case .rule:
                 result.append(NSAttributedString(
                     string: " ",
@@ -532,6 +470,70 @@ enum AnswerAttributedTextBuilder {
             result.append(piece)
         }
         return result
+    }
+
+    /// A GFM pipe table as a native `NSTextTable`: quiet medium-weight header, one hairline under
+    /// it, generous cell padding, per-column alignment, and no per-cell borders. Cells wrap at the
+    /// answer's measure instead of being clipped, and because it is the same text storage as the
+    /// prose, a drag selects straight through it.
+    private static func table(
+        header: [String],
+        alignment: [MarkdownTableAlignment],
+        rows: [[String]],
+        size: CGFloat
+    ) -> NSAttributedString {
+        let columns = max(1, header.count)
+        let textTable = NSTextTable()
+        textTable.numberOfColumns = columns
+        textTable.layoutAlgorithm = .automaticLayoutAlgorithm
+        textTable.collapsesBorders = true
+        textTable.hidesEmptyCells = false
+
+        let result = NSMutableAttributedString()
+        for (rowIndex, row) in ([header] + rows).enumerated() {
+            let isHeader = rowIndex == 0
+            for column in 0..<columns {
+                let block = NSTextTableBlock(
+                    table: textTable,
+                    startingRow: rowIndex,
+                    rowSpan: 1,
+                    startingColumn: column,
+                    columnSpan: 1
+                )
+                // Row rhythm comes from padding, not ruled lines. The first column keeps no
+                // leading padding so the table's text starts on the same left edge as the prose.
+                block.setWidth(PiTheme.space6, type: .absoluteValueType, for: .padding, edge: .minY)
+                block.setWidth(PiTheme.space6, type: .absoluteValueType, for: .padding, edge: .maxY)
+                block.setWidth(column == 0 ? 0 : PiTheme.space16, type: .absoluteValueType, for: .padding, edge: .minX)
+                if isHeader {
+                    block.setBorderColor(AnswerColors.hairline)
+                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                }
+                let style = NSMutableParagraphStyle()
+                style.textBlocks = [block]
+                style.lineSpacing = PiFont.bodyLineSpacing
+                style.alignment = textAlignment(alignment[safe: column])
+                let cell = inline(
+                    column < row.count ? row[column] : "",
+                    size: size,
+                    color: isHeader ? .secondaryLabelColor : .labelColor,
+                    baseFontOverride: isHeader ? NSFont.systemFont(ofSize: size, weight: .medium) : nil
+                )
+                // Every table cell is its own paragraph — that is how TextKit identifies cells.
+                cell.append(NSAttributedString(string: "\n"))
+                cell.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: cell.length))
+                result.append(cell)
+            }
+        }
+        return result
+    }
+
+    private static func textAlignment(_ alignment: MarkdownTableAlignment?) -> NSTextAlignment {
+        switch alignment ?? .none {
+        case .center: .center
+        case .trailing: .right
+        case .leading, .none: .left
+        }
     }
 
     private static func quote(_ text: String, size: CGFloat) -> NSAttributedString {
@@ -614,4 +616,8 @@ enum AnswerAttributedTextBuilder {
         guard !traits.isEmpty else { return base }
         return NSFontManager.shared.convert(base, toHaveTrait: traits)
     }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
