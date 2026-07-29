@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 11
+// pi-desktop-activity-version: 13
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -423,11 +423,11 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("pi-desktop-resume", {
-    description: "Resume an interrupted turn after network connectivity returns",
+    description: "Continue an interrupted turn after a transient failure",
     handler: async () => {
       pi.sendMessage({
-        customType: "pi-desktop-connectivity-resume",
-        content: "Network connectivity interrupted the previous turn. Continue from where it stopped without repeating completed work.",
+        customType: "pi-desktop-retry",
+        content: "A transient failure interrupted the previous turn. Continue from where it stopped without repeating completed work.",
         display: false,
       }, { triggerTurn: true });
     },

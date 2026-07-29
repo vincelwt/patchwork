@@ -120,7 +120,7 @@ struct ConversationView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PiTheme.space6) {
-                    if let error = store.runtimeState.lastError, store.isSelectedRuntime { InlineError(text: error) }
+                    runtimeError
                     if store.isEditingLastMessage {
                         EditingMessageBanner {
                             store.cancelEditingLastMessage()
@@ -151,6 +151,15 @@ struct ConversationView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.piTranscript)
             }
+    }
+
+    @ViewBuilder
+    private var runtimeError: some View {
+        if let error = store.runtimeState.lastError, store.isSelectedRuntime {
+            InlineError(text: error, retryEnabled: store.canRetryLastFailure) {
+                store.retryLastFailedTurn()
+            }
+        }
     }
 
     /// Working, whether this app's runtime drives the turn or a terminal does.
@@ -537,6 +546,9 @@ private struct EditingMessageBanner: View {
 
 private struct InlineError: View {
     let text: String
+    let retryEnabled: Bool
+    let onRetry: () -> Void
+
     var body: some View {
         HStack(spacing: PiTheme.space8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -544,6 +556,13 @@ private struct InlineError: View {
                 .foregroundStyle(Color.piRed)
             Text(text).font(PiFont.caption).lineLimit(2)
             Spacer()
+            Button(action: onRetry) {
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!retryEnabled)
+            .accessibilityHint("Continue the failed turn without repeating completed work")
         }
         .padding(.horizontal, PiTheme.space10)
         .padding(.vertical, PiTheme.space8)
