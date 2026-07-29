@@ -1079,8 +1079,17 @@ final class AppStore: ObservableObject {
         return max(observed ?? .distantPast, session.modifiedAt)
     }
 
+    /// The app knows its prompt start before the shared activity monitor's next poll. Prefer that
+    /// while available so a new turn never inherits an older conversation timestamp.
     func runningSince(_ session: SessionSummary) -> Date? {
-        activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.runningSince
+        let path = session.fileURL.standardizedFileURL.path
+        if activeRuntimePath == path, runtimeState.isBusy, let beganAt = activeRuntimeSlot.promptBeganAt {
+            return beganAt
+        }
+        if let slot = parkedRuntimes[.session(path)], slot.state.isBusy, let beganAt = slot.promptBeganAt {
+            return beganAt
+        }
+        return activityMonitor.activity(forPath: path)?.runningSince
     }
 
     /// The user-turn/run boundary stays fixed while tool and assistant writes keep changing mtime.

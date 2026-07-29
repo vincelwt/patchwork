@@ -137,6 +137,21 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testRunningSinceUsesTheCurrentPromptBeforeTheActivityPoll() throws {
+        let oldModifiedAt = Date(timeIntervalSince1970: 1)
+        let (store, _, _, sessionA, _) = makeStore(sessionAModifiedAt: oldModifiedAt)
+        store.selectSession(sessionA)
+
+        let beforeSubmit = Date()
+        store.draft = "new work"
+        store.submitDraft()
+        let beganAt = try XCTUnwrap(store.runningSince(sessionA))
+
+        XCTAssertGreaterThanOrEqual(beganAt, beforeSubmit)
+        XCTAssertLessThanOrEqual(beganAt, Date())
+        XCTAssertNotEqual(beganAt, oldModifiedAt, "A new turn must not display the conversation's old modification age")
+    }
+
     func testSwitchingBackImmediatelyRestoresQueuedMessages() {
         let (store, runtimeA, _, sessionA, sessionB) = makeStore()
         store.selectSession(sessionA)
@@ -381,8 +396,8 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertTrue(store.sessions.contains { $0.id == "new-session" })
     }
 
-    private func makeStore() -> (AppStore, ParallelFakeRuntime, ParallelFakeRuntime, SessionSummary, SessionSummary) {
-        let sessionA = summary(id: "session-a", file: "a.jsonl")
+    private func makeStore(sessionAModifiedAt: Date = Date()) -> (AppStore, ParallelFakeRuntime, ParallelFakeRuntime, SessionSummary, SessionSummary) {
+        let sessionA = summary(id: "session-a", file: "a.jsonl", modifiedAt: sessionAModifiedAt)
         let sessionB = summary(id: "session-b", file: "b.jsonl")
         let runtimeA = ParallelFakeRuntime(sessionFile: sessionA.fileURL.path, sessionID: sessionA.id)
         let runtimeB = ParallelFakeRuntime(sessionFile: sessionB.fileURL.path, sessionID: sessionB.id)
@@ -400,13 +415,13 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         return (store, runtimeA, runtimeB, sessionA, sessionB)
     }
 
-    private func summary(id: String, file: String) -> SessionSummary {
+    private func summary(id: String, file: String, modifiedAt: Date = Date()) -> SessionSummary {
         var summary = SessionSummary(
             id: id,
             fileURL: directory.appendingPathComponent(file),
             cwd: directory,
-            createdAt: Date(),
-            modifiedAt: Date(),
+            createdAt: modifiedAt,
+            modifiedAt: modifiedAt,
             name: id,
             preview: "preview",
             messageCount: 0,
