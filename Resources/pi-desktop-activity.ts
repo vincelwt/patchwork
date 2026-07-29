@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 13
+// pi-desktop-activity-version: 17
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -17,7 +17,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -31,6 +31,12 @@ const PREVIEW_LIMIT = 160;
 const TERMINAL_STOP_REASONS = new Set(["stop", "length", "error", "aborted"]);
 const DAEMON_TIMEOUT_MS = 3_000;
 const DAEMON_RESPONSE_LIMIT = 1_048_576;
+const PULL_REQUEST_REVIEW_COMMAND = "pi-desktop-pr-review";
+const PULL_REQUEST_REVIEW_COMPLETE_STATUS = "pi-desktop-pr-review-complete";
+const PULL_REQUEST_REVIEW_CUSTOM_TYPE = "pi-desktop-pr-review-follow-up";
+const PULL_REQUEST_REVIEW_INTERVAL_SECONDS = 300;
+const PULL_REQUEST_REVIEW_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const CODEX_REVIEWER = "chatgpt-codex-connector";
 const DAEMON_SOCKET_PATH = process.env.PI_DESKTOP_DAEMON_SOCKET_PATH ?? path.join(
   os.homedir(), "Library", "Application Support", "Pi Desktop", "daemon.sock"
 );
@@ -38,7 +44,15 @@ const DAEMON_SOCKET_PATH = process.env.PI_DESKTOP_DAEMON_SOCKET_PATH ?? path.joi
 type AutomationTrigger =
   | { kind: "once"; at: string }
   | { kind: "interval"; everySeconds: number }
-  | { kind: "cron"; expression: string; timeZone?: string };
+  | { kind: "cron"; expression: string; timeZone?: string }
+  | { kind: "heartbeat"; everySeconds: number };
+
+type GitHubPullRequest = {
+  url: string;
+  owner: string;
+  repository: string;
+  number: number;
+};
 
 type DaemonResponse = { status: number; body: unknown; headers: http.IncomingHttpHeaders };
 type CreatedSchedule = { id: string; name: string; nextRunAt?: string };
@@ -51,6 +65,65 @@ type ScheduleRequest = {
   trigger: AutomationTrigger;
   policy: { skipIfRunning: boolean; timeoutSeconds: number };
 };
+
+function githubPullRequest(inText: string): GitHubPullRequest | undefined {
+  const matches = [...inText.matchAll(
+    /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/g
+  )];
+  const match = matches[matches.length - 1];
+  if (!match) return undefined;
+  const number = Number(match[3]);
+  if (!Number.isSafeInteger(number) || number < 1) return undefined;
+  return {
+    url: `https://github.com/${match[1]}/${match[2]}/pull/${number}`,
+    owner: match[1],
+    repository: match[2],
+    number,
+  };
+}
+
+function pullRequestReviewWatchKey(sessionId: string, pullRequest: GitHubPullRequest): string {
+  const digest = createHash("sha256")
+    .update(`${sessionId}\0${pullRequest.url}`)
+    .digest("hex")
+    .slice(0, 40);
+  return `pr_review_${digest}`;
+}
+
+const TOOL_TEXT_TAIL_LIMIT = 16 * 1024;
+
+function toolTextTail(content: unknown): string {
+  if (typeof content === "string") return content.slice(-TOOL_TEXT_TAIL_LIMIT);
+  if (!Array.isArray(content)) return "";
+  const chunks: string[] = [];
+  let remaining = TOOL_TEXT_TAIL_LIMIT;
+  for (let index = content.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const item = content[index];
+    if (!item || typeof item !== "object") continue;
+    const text = (item as { text?: unknown }).text;
+    if (typeof text !== "string") continue;
+    if (chunks.length > 0) {
+      chunks.push("\n");
+      remaining -= 1;
+    }
+    if (remaining > 0) {
+      const tail = text.slice(-remaining);
+      chunks.push(tail);
+      remaining -= tail.length;
+    }
+  }
+  return chunks.reverse().join("");
+}
+
+function hasQueuedReviewFollowUp(entries: readonly unknown[], url: string): boolean {
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const value = entry as { type?: unknown; customType?: unknown; details?: { url?: unknown } };
+    return value.type === "custom_message"
+      && value.customType === PULL_REQUEST_REVIEW_CUSTOM_TYPE
+      && value.details?.url === url;
+  });
+}
 
 function isDaemonCron(expression: string): boolean {
   const ranges = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
@@ -204,29 +277,10 @@ async function desktopDaemonAvailable(signal?: AbortSignal): Promise<boolean> {
   }
 }
 
-async function createDesktopAutomation(
-  input: { name: string; prompt: string; schedule: string },
-  sessionId: string,
+async function createDesktopSchedule(
+  request: ScheduleRequest,
   signal?: AbortSignal
 ): Promise<CreatedSchedule> {
-  const name = input.name.trim();
-  const prompt = input.prompt.trim();
-  if (!name) throw new Error("Give the automation a name.");
-  if (!prompt) throw new Error("Write the prompt Pi should run.");
-  if (!sessionId) throw new Error("This conversation has no session ID yet.");
-
-  const requestWithoutKey = {
-    name,
-    enabled: true,
-    target: { kind: "existingThread" as const, threadId: sessionId },
-    prompt: input.prompt,
-    trigger: parseAutomationSchedule(input.schedule),
-    policy: { skipIfRunning: true, timeoutSeconds: 3_600 },
-  };
-  const request: ScheduleRequest = {
-    idempotencyKey: randomUUID(),
-    ...requestWithoutKey,
-  };
   if (!await desktopDaemonAvailable(signal)) {
     if (signal?.aborted) throw new Error("Cancelled.");
     throw new Error("Pi Desktop's compatible background service is not running.");
@@ -250,11 +304,69 @@ async function createDesktopAutomation(
   throw new Error("Pi Desktop returned an incompatible response. Check the Automations page before retrying.");
 }
 
+async function createDesktopAutomation(
+  input: { name: string; prompt: string; schedule: string },
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<CreatedSchedule> {
+  const name = input.name.trim();
+  const prompt = input.prompt.trim();
+  if (!name) throw new Error("Give the automation a name.");
+  if (!prompt) throw new Error("Write the prompt Pi should run.");
+  if (!sessionId) throw new Error("This conversation has no session ID yet.");
+
+  return createDesktopSchedule({
+    idempotencyKey: randomUUID(),
+    name,
+    enabled: true,
+    target: { kind: "existingThread", threadId: sessionId },
+    prompt: input.prompt,
+    trigger: parseAutomationSchedule(input.schedule),
+    policy: { skipIfRunning: true, timeoutSeconds: 3_600 },
+  }, signal);
+}
+
+async function createPullRequestReviewWatch(
+  pullRequest: GitHubPullRequest,
+  sessionId: string,
+  signal?: AbortSignal
+): Promise<CreatedSchedule> {
+  if (!sessionId) throw new Error("This conversation has no session ID yet.");
+  const deadline = Date.now() + PULL_REQUEST_REVIEW_MAX_AGE_MS;
+  return createDesktopSchedule({
+    idempotencyKey: pullRequestReviewWatchKey(sessionId, pullRequest),
+    name: `Codex review ${pullRequest.owner}/${pullRequest.repository}#${pullRequest.number}`,
+    enabled: true,
+    target: { kind: "existingThread", threadId: sessionId },
+    prompt: `/${PULL_REQUEST_REVIEW_COMMAND} ${pullRequest.url} ${deadline}`,
+    trigger: { kind: "heartbeat", everySeconds: PULL_REQUEST_REVIEW_INTERVAL_SECONDS },
+    policy: { skipIfRunning: true, timeoutSeconds: 3_600 },
+  }, signal);
+}
+
+async function stopPullRequestReviewWatch(
+  pullRequest: GitHubPullRequest,
+  sessionId: string
+): Promise<void> {
+  const id = `sch_req_${pullRequestReviewWatchKey(sessionId, pullRequest)}`;
+  try {
+    const response = await daemonRequest("DELETE", `/v1/schedules/${id}`);
+    if (response.status !== 404
+        && (response.status !== 200 || !apiCompatible(response))) {
+      throw new Error(`Pi Desktop could not stop pull-request watch ${id}.`);
+    }
+  } catch {
+    // A later heartbeat sees the durable follow-up marker and retries deletion without
+    // waking the model twice.
+  }
+}
+
 function normalizedSchedule(trigger: AutomationTrigger): string {
   switch (trigger.kind) {
     case "once": return trigger.at;
     case "interval": return `${trigger.everySeconds}s`;
     case "cron": return trigger.expression;
+    case "heartbeat": return `${trigger.everySeconds}s`;
   }
 }
 
@@ -274,6 +386,27 @@ function runAutomationSelfTest(): void {
   if (cron.expression !== "0 9 * * 1" || interval.everySeconds !== 900
       || once.at !== "1970-01-01T00:10:00.000Z" || !rejectedUnsupportedCron) {
     throw new Error("Pi Desktop automation schedule parser self-test failed.");
+  }
+
+  const pullRequest = githubPullRequest(
+    "created https://github.com/acme/widgets/pull/42 after https://github.com/acme/widgets/issues/1"
+  );
+  const boundedText = toolTextTail([
+    { type: "text", text: "x".repeat(TOOL_TEXT_TAIL_LIMIT * 2) },
+    { type: "text", text: "https://github.com/acme/widgets/pull/42" },
+  ]);
+  const watchKey = pullRequest ? pullRequestReviewWatchKey("session", pullRequest) : "";
+  const queued = [{
+    type: "custom_message",
+    customType: PULL_REQUEST_REVIEW_CUSTOM_TYPE,
+    details: { url: pullRequest?.url },
+  }];
+  if (pullRequest?.url !== "https://github.com/acme/widgets/pull/42"
+      || boundedText.length > TOOL_TEXT_TAIL_LIMIT
+      || githubPullRequest(boundedText)?.url !== "https://github.com/acme/widgets/pull/42"
+      || watchKey.length < 16
+      || !hasQueuedReviewFollowUp(queued, "https://github.com/acme/widgets/pull/42")) {
+    throw new Error("Pi Desktop pull-request watcher self-test failed.");
   }
 }
 
@@ -385,6 +518,14 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     return trimmed.length > PREVIEW_LIMIT ? `${trimmed.slice(0, PREVIEW_LIMIT)}…` : trimmed;
   }
 
+  async function githubAny(apiPath: string, jq: string): Promise<boolean | undefined> {
+    const result = await pi.exec(
+      "gh", ["api", apiPath, "--paginate", "--jq", jq], { timeout: 10_000 }
+    );
+    if (result.code !== 0) return undefined;
+    return result.stdout.trim().split(/\s+/).includes("true");
+  }
+
   if (process.env.PI_DESKTOP_AUTOMATION_SELF_TEST === "1"
       && process.env.PI_DESKTOP_DAEMON_SOCKET_PATH) {
     pi.registerCommand("pi-desktop-automation-self-test", {
@@ -430,6 +571,58 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         content: "A transient failure interrupted the previous turn. Continue from where it stopped without repeating completed work.",
         display: false,
       }, { triggerTurn: true });
+    },
+  });
+
+  pi.registerCommand(PULL_REQUEST_REVIEW_COMMAND, {
+    description: "Check a watched pull request for its automatic Codex review",
+    handler: async (args, ctx) => {
+      const [url, deadlineText, ...extra] = args.trim().split(/\s+/);
+      const pullRequest = githubPullRequest(url ?? "");
+      const deadline = Number(deadlineText);
+      if (!pullRequest || extra.length > 0 || !Number.isSafeInteger(deadline)) {
+        throw new Error("Pi Desktop supplied an invalid pull-request review watch.");
+      }
+
+      const currentSessionId = ctx.sessionManager.getSessionId();
+      if (hasQueuedReviewFollowUp(ctx.sessionManager.getBranch(), pullRequest.url)) {
+        await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+        ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
+        return;
+      }
+
+      const endpoint = `repos/${pullRequest.owner}/${pullRequest.repository}`;
+      const codexLogin = `.user.login == \"${CODEX_REVIEWER}\" or .user.login == \"${CODEX_REVIEWER}[bot]\"`;
+      const reviewed = await githubAny(
+        `${endpoint}/pulls/${pullRequest.number}/reviews?per_page=100`,
+        `any(.[]; (${codexLogin}) and .submitted_at != null)`
+      );
+      if (reviewed === undefined) {
+        if (Date.now() >= deadline) {
+          await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+        }
+        ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
+        return;
+      }
+      if (reviewed === true) {
+        pi.sendMessage({
+          customType: PULL_REQUEST_REVIEW_CUSTOM_TYPE,
+          content: `Codex's automatic review is ready for ${pullRequest.url}. Inspect that Codex review and its inline comments, address every valid finding that still applies, and run the relevant tests. If the pull request is open, push the fixes to its branch; if it was merged or closed, open a follow-up pull request. Report what changed and never merge a pull request.`,
+          display: false,
+          details: { url: pullRequest.url },
+        }, { triggerTurn: true, deliverAs: "followUp" });
+        await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+        return;
+      }
+
+      const clean = await githubAny(
+        `${endpoint}/issues/${pullRequest.number}/reactions?per_page=100`,
+        `any(.[]; (${codexLogin}) and .content == \"+1\")`
+      );
+      if (clean === true || Date.now() >= deadline) {
+        await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+      }
+      ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
     },
   });
 
@@ -494,6 +687,21 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         details: { scheduleId: schedule.id, name: schedule.name, nextRunAt: schedule.nextRunAt },
       };
     },
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName.toLowerCase() !== "bash" || event.isError) return;
+    const command = (event.input as { command?: unknown }).command;
+    if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
+    const pullRequest = githubPullRequest(toolTextTail(event.content));
+    if (!pullRequest) return;
+    try {
+      await createPullRequestReviewWatch(pullRequest, ctx.sessionManager.getSessionId());
+    } catch {
+      if (ctx.hasUI) {
+        ctx.ui.notify("Pull request linked, but its Codex review watcher could not start.", "warning");
+      }
+    }
   });
 
   pi.on("tool_call", async (event, ctx) => {
