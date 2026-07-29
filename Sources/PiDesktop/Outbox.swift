@@ -165,7 +165,7 @@ extension AppStore {
     func stopFromEscape(fully: Bool) {
         if fully { abortFromEscapeSequence(); return }
         guard activateCurrentRouteRuntimeForEscape(),
-              runtimeState.isStreaming || currentRouteHasPendingStartupPrompt else { return }
+              runtimeState.isBusy || currentRouteHasPendingStartupPrompt else { return }
         for index in outbox.indices { outbox[index].delivery = .followUp }
         abortCurrentTurnPreservingQueues()
     }

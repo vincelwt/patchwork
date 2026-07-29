@@ -120,6 +120,31 @@ private final class RecoveryCapture {
     var calls: [(path: String, instruction: String, clientID: String)] = []
 }
 
+private final class RetryScheduleCapture {
+    private struct Scheduled {
+        let id: UUID
+        let action: @MainActor () -> Void
+    }
+
+    private var scheduled: [Scheduled] = []
+    private var cancelled: Set<UUID> = []
+    private(set) var delays: [TimeInterval] = []
+
+    func schedule(_ delay: TimeInterval, _ action: @escaping @MainActor () -> Void) -> () -> Void {
+        let id = UUID()
+        delays.append(delay)
+        scheduled.append(Scheduled(id: id, action: action))
+        return { [weak self] in self?.cancelled.insert(id) }
+    }
+
+    @MainActor
+    func fireNext() {
+        guard !scheduled.isEmpty else { return }
+        let next = scheduled.removeFirst()
+        if !cancelled.contains(next.id) { next.action() }
+    }
+}
+
 // MARK: - Tests
 
 @MainActor
@@ -506,14 +531,16 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.draft, "", "The settled turn left nothing pending to restore")
     }
 
-    func testExhaustedProviderRetryOffersAHiddenOneClickContinuation() {
-        let (store, runtime, session, _) = makeStore()
+    func testExhaustedProviderRetriesContinueWithBackoffUntilSuccessOrAbort() {
+        let retryScheduler = RetryScheduleCapture()
+        let (store, runtime, session, _) = makeStore(providerRetryScheduler: retryScheduler.schedule)
         store.selectSession(session)
         runtime.sessionFile = session.fileURL.path
         runtime.sessionID = session.id
-        store.draft = "finish this work"
+        store.draft = "finish this despite overloads"
         store.submitDraft()
         runtime.succeed("prompt", data: .object([:]))
+
         runtime.onEvent?(.object([
             "type": .string("auto_retry_end"),
             "success": .bool(false),
@@ -521,15 +548,76 @@ final class AppStoreRollbackTests: XCTestCase {
         ]))
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
 
-        XCTAssertTrue(store.canRetryLastFailure)
-        XCTAssertEqual(store.runtimeState.lastError, "servers overloaded")
-
-        store.retryLastFailedTurn()
-
+        XCTAssertEqual(retryScheduler.delays, [15])
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertTrue(store.runtimeState.isRetrying)
+        XCTAssertFalse(store.canRetryLastFailure)
         XCTAssertNil(store.runtimeState.lastError)
-        XCTAssertTrue(store.runtimeState.isStreaming)
+
+        retryScheduler.fireNext()
         XCTAssertEqual(runtime.commandCount("prompt"), 2)
         XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "/pi-desktop-resume")
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(retryScheduler.delays, [15, 30])
+
+        retryScheduler.fireNext()
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertFalse(store.runtimeState.isRetrying)
+
+        store.draft = "one more task"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(retryScheduler.delays, [15, 30, 15], "A successful turn resets the backoff")
+
+        store.abort()
+        retryScheduler.fireNext()
+        XCTAssertEqual(runtime.commandCount("prompt"), 4, "Stopping cancels a delayed continuation")
+    }
+
+    func testQueuedSteerThatContinuesPiDoesNotAlsoScheduleAHiddenRetry() {
+        let retryScheduler = RetryScheduleCapture()
+        let (store, runtime, session, _) = makeStore(providerRetryScheduler: retryScheduler.schedule)
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "start"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        store.enqueueOutbox(text: "change direction", delivery: .steer)
+
+        runtime.onEvent?(.object(["type": .string("turn_end")]))
+        XCTAssertEqual(runtime.commandCount("steer"), 1)
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        XCTAssertTrue(retryScheduler.delays.isEmpty)
+        XCTAssertEqual(runtime.commandCount("prompt"), 1, "Pi already continued with the queued steer")
+    }
+
+    func testEscapeDuringRetryCountdownRunsThePreservedFollowUpOnce() {
+        let retryScheduler = RetryScheduleCapture()
+        let (store, runtime, session, _) = makeStore(providerRetryScheduler: retryScheduler.schedule)
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "start"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        store.enqueueOutbox(text: "do this next", delivery: .steer)
+
+        store.stopFromEscape(fully: false)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+        XCTAssertTrue(store.runtimeState.isStreaming)
+        retryScheduler.fireNext()
+        XCTAssertEqual(runtime.commandCount("prompt"), 2, "The cancelled recovery must not race the follow-up")
     }
 
     func testOfflineProviderRetryPausesAndResumesOnceAfterReconnect() throws {
@@ -887,6 +975,7 @@ final class AppStoreRollbackTests: XCTestCase {
     }
 
     private func makeStore(
+        providerRetryScheduler: @escaping RuntimeRetirementScheduler = { _, _ in {} },
         managedTurnResumer: @escaping ManagedTurnResumer = { _, _, _ in },
         managedTurnWriterProbe: ManagedTurnWriterProbe? = nil
     ) -> (AppStore, FakeRuntime, SessionSummary, SessionSummary) {
@@ -898,6 +987,7 @@ final class AppStoreRollbackTests: XCTestCase {
             runtimeFactory: { FakeRuntime() },
             persistence: AppPersistence(baseURL: temporaryDirectory),
             activityPresenter: ActivityPresenter(),
+            providerRetryScheduler: providerRetryScheduler,
             managedTurnResumer: managedTurnResumer,
             managedTurnWriterProbe: managedTurnWriterProbe
         )
