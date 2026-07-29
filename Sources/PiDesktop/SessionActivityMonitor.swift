@@ -12,7 +12,7 @@ enum SessionRunState: String, Equatable, Sendable {
 struct SessionActivity: Equatable, Sendable {
     var state: SessionRunState
     var modifiedAt: Date
-    /// When the file last transitioned into `running`, used for the menu bar's elapsed label.
+    /// When the file last transitioned into `running`, used for sidebar and menu bar elapsed labels.
     var runningSince: Date?
     /// The newest completed assistant entry and its stop reason, when known. These are stable
     /// completion semantics; mtime and running/idle transitions never stand in for an answer.

@@ -700,6 +700,14 @@ private struct SessionFolderSection: View {
     }
 }
 
+enum SidebarRunningLabel {
+    static func text(since date: Date?, now: Date, usage: ThreadResourceUsage?, hovering: Bool) -> String {
+        if hovering, let usage { return NumberFormatting.resources(usage) }
+        guard let date else { return "working" }
+        return NumberFormatting.elapsed(since: date, now: now)
+    }
+}
+
 private struct SessionRow: View {
     @EnvironmentObject private var store: AppStore
     let session: SessionSummary
@@ -803,19 +811,25 @@ private struct SessionRow: View {
         }
     }
 
-    /// Context first (time on hover, else the branch hint), then the clock, then one status dot:
-    /// waiting for an answer outranks running, which outranks unread. One explicit stack keeps
-    /// the pair grouped and ordered on the trailing edge.
+    /// Context first (run time with resources on hover, else modification time/branch), then the
+    /// clock, then one status dot. Waiting for an answer outranks running, which outranks unread.
     private var trailingAccessory: some View {
         HStack(spacing: PiTheme.space6) {
-            if hovering {
-                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
-            } else if running, let resourceUsage {
-                Text(NumberFormatting.resources(resourceUsage))
+            if running {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    Text(SidebarRunningLabel.text(
+                        since: store.runningSince(session), now: context.date,
+                        usage: resourceUsage, hovering: hovering
+                    ))
                     .font(SidebarTypography.metadata.monospacedDigit())
                     .foregroundStyle(.tertiary)
-                    .help("\(NumberFormatting.cpuPercent(resourceUsage.cpuPercent)) CPU · \(NumberFormatting.memoryBytes(resourceUsage.memoryBytes)) memory")
-                    .accessibilityHidden(true)
+                }
+                .help(resourceUsage.map {
+                    "\(NumberFormatting.cpuPercent($0.cpuPercent)) CPU · \(NumberFormatting.memoryBytes($0.memoryBytes)) memory"
+                } ?? "Pi is working")
+                .accessibilityHidden(true)
+            } else if hovering {
+                Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)
             } else if GitIndicatorPolicy.showsBranchIndicator(git) {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: PiIcon.micro)).foregroundStyle(.tertiary)
