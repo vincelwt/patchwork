@@ -221,6 +221,21 @@ struct ConversationView: View {
             ToolbarSpacer(.flexible)
         }
 
+        // Only present once the conversation actually opened a pull request.
+        if let link = store.pullRequestLink {
+            ToolbarItem(placement: .primaryAction) {
+                Link(destination: link) {
+                    Label(
+                        PullRequestLink.number(in: link) ?? "Pull request",
+                        systemImage: "arrow.triangle.pull"
+                    )
+                    .font(PiFont.caption)
+                }
+                .help(link.absoluteString)
+                .accessibilityLabel("Open pull request \(PullRequestLink.number(in: link) ?? "") in your browser")
+            }
+        }
+
         ToolbarItem(placement: .primaryAction) {
             Button { withAnimation(.easeOut(duration: 0.16)) { store.inspectorVisible.toggle() } } label: {
                 Image(systemName: "sidebar.right").font(.system(size: PiIcon.small, weight: .regular))

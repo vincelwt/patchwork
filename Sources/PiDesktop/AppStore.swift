@@ -179,6 +179,18 @@ final class AppStore: ObservableObject {
     /// Plain revision counter for memoizing transcript projection. It deliberately is not
     /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
     private(set) var transcriptRevision = 0
+    private var pullRequestLinkKey = -1
+    private var cachedPullRequestLink: URL?
+    /// The pull request this conversation opened, for the header's quick link. Memoized on
+    /// message count rather than `transcriptRevision`: streaming deltas land in
+    /// `streamingMessage`, so a token burst would otherwise rescan the whole transcript.
+    var pullRequestLink: URL? {
+        if pullRequestLinkKey != messages.count {
+            pullRequestLinkKey = messages.count
+            cachedPullRequestLink = PullRequestLink.latest(in: messages)
+        }
+        return cachedPullRequestLink
+    }
     /// Streaming deltas are coalesced to this cadence before publishing: each publish reprojects
     /// the whole loaded transcript, and raw `message_update` bursts arrive far faster than the
     /// user can read. Parsing is deferred with the publish, so skipped deltas cost nothing.
@@ -215,6 +227,11 @@ final class AppStore: ObservableObject {
         }
     }
     @Published var selectedFolder: URL?
+    /// The app-created worktree a pending new chat will run in, plus the folder it was cut from
+    /// so unchecking the box can go back. Both clear once the chat is sent (the session adopts
+    /// the worktree) or a different new chat starts (the unused worktree is removed).
+    @Published private(set) var newChatWorktree: URL?
+    private var newChatWorktreeOrigin: URL?
     @Published var runtimeState = RuntimeState()
     @Published private(set) var isOffline = false
     @Published var liveMetrics = TokenMetrics()
@@ -429,10 +446,12 @@ final class AppStore: ObservableObject {
         self.notificationService = notificationService ?? NotificationService()
         self.isActiveOverride = isActiveOverride
         // Pi requires a cwd even for a global conversation; Desktop is the neutral default and
-        // passive Git inspection explicitly skips it until a real prompt starts Pi.
-        let globalFolder = WorkspaceOrganization.globalWorkingDirectory
-        selectedFolder = globalFolder
-        selectedGitDirectoryPath = globalFolder.standardizedFileURL.path
+        // passive Git inspection explicitly skips it until a real prompt starts Pi. The folder
+        // the last chat used wins over it when it is still on disk.
+        let startFolder = Self.existingFolder(atPath: self.persistence.state.lastFolder)
+            ?? WorkspaceOrganization.globalWorkingDirectory
+        selectedFolder = startFolder
+        selectedGitDirectoryPath = startFolder.standardizedFileURL.path
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
         if cachedStatuses.removeValue(forKey: ExtensionStatusParser.subagentsKey) != nil {
             self.persistence.cacheExtensionStatuses(cachedStatuses)
@@ -1406,7 +1425,9 @@ final class AppStore: ObservableObject {
         scanError = nil
         do {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
-            let discovered = try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+            let discovered = applyArchiveRetention(
+                to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+            )
             sessions = discovered
             persistence.pruneCompletionState(retainingSessionPaths: discovered.map { $0.fileURL.path })
             syncActivityMonitorPaths()
@@ -1452,7 +1473,10 @@ final class AppStore: ObservableObject {
         flushDraftPersistence()
         cancelConversationLoad()
         resetConversationPageState()
-        let newFolder = WorkspaceOrganization.globalWorkingDirectory
+        // Anything still pending here was never sent, so the worktree is unused; drop it instead
+        // of leaving an orphan under ~/.pi/worktrees.
+        discardPendingWorktree()
+        let newFolder = defaultNewChatFolder
         if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
             detachActiveRuntimePresentation()
         }
@@ -1905,15 +1929,115 @@ final class AppStore: ObservableObject {
         selectSession(selectedSession)
     }
 
+    /// A remembered folder path that still exists, standardized. `nil` for anything moved away.
+    static func existingFolder(atPath path: String?) -> URL? {
+        guard let path, FileManager.default.fileExists(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+
+    /// Where ⌘N starts: the folder the last chat used, else Global.
+    private var defaultNewChatFolder: URL {
+        Self.existingFolder(atPath: persistence.state.lastFolder) ?? WorkspaceOrganization.globalWorkingDirectory
+    }
+
     func chooseFolder(_ url: URL) {
         let folder = url.standardizedFileURL
         if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(folder.path) {
             detachActiveRuntimePresentation()
         }
         selectedFolder = folder
-        if !WorkspaceOrganization.isGlobalWorkingDirectory(folder) { persistence.rememberFolder(folder) }
+        // A generated worktree is never "the folder you work in": remembering it would make the
+        // next new chat start in a throwaway checkout and crowd the folder menu.
+        if !WorktreeService.isManaged(folder) { persistence.setLastFolder(folder.path) }
+        if !WorkspaceOrganization.isGlobalWorkingDirectory(folder), !WorktreeService.isManaged(folder) {
+            persistence.rememberFolder(folder)
+        }
         if selectedSession == nil { resetSelectedGitDirectory(to: folder) }
         refreshSelectedGit()
+    }
+
+    // MARK: - Conversation worktrees
+
+    /// The new-chat `Worktree` checkbox. Turning it on cuts a fresh worktree off the project's
+    /// main line and selects it, so the Pi agent this chat starts runs there with no extra
+    /// plumbing: the selected folder is already the runtime's cwd.
+    func setNewChatWorktree(_ enabled: Bool) {
+        guard enabled else { discardPendingWorktree(restoringFolder: true); return }
+        guard newChatWorktree == nil else { return }
+        guard let folder = selectedFolder, !WorkspaceOrganization.isGlobalWorkingDirectory(folder) else {
+            showToast("Choose a project folder before adding a worktree.", style: .warning)
+            return
+        }
+        Task {
+            switch await WorktreeService.create(from: folder) {
+            case let .success(worktree):
+                // The user navigated away while git worked: nothing will ever use this checkout.
+                guard case .newChat = route, newChatWorktree == nil else {
+                    await WorktreeService.remove(at: worktree)
+                    return
+                }
+                newChatWorktreeOrigin = folder
+                newChatWorktree = worktree
+                chooseFolder(worktree)
+                showToast("Worktree ready: \(worktree.lastPathComponent)", style: .info)
+            case let .failure(error):
+                showToast(error.message, style: .warning)
+            }
+        }
+    }
+
+    /// Drops a worktree that was created for a chat that never started. `remove` is non-force, so
+    /// anything already written there survives as a plain directory git still tracks.
+    private func discardPendingWorktree(restoringFolder: Bool = false) {
+        guard let worktree = newChatWorktree else { return }
+        let origin = newChatWorktreeOrigin
+        newChatWorktree = nil
+        newChatWorktreeOrigin = nil
+        if restoringFolder, let origin { chooseFolder(origin) }
+        Task { await WorktreeService.remove(at: worktree) }
+    }
+
+    /// Archived conversations (and the worktrees they ran in) are cleared from the sidebar this
+    /// long after archiving — long enough that an accidental archive can still be restored. Pi's
+    /// own session file is never touched, so a pruned conversation is hidden, not destroyed.
+    static let archiveRetention: TimeInterval = 7 * 24 * 60 * 60
+
+    static func expiredArchiveIDs(
+        _ sessions: [SessionSummary],
+        archivedAt: [String: Date],
+        now: Date
+    ) -> Set<String> {
+        Set(sessions.lazy
+            .filter { $0.isArchived }
+            .filter { now.timeIntervalSince(archivedAt[$0.id] ?? now) >= archiveRetention }
+            .map(\.id))
+    }
+
+    /// Stamps newly seen archives (including ones archived by older builds, whose clock starts
+    /// now) and drops the expired ones, removing any worktree no surviving conversation still uses.
+    private func applyArchiveRetention(to discovered: [SessionSummary], now: Date = Date()) -> [SessionSummary] {
+        persistence.updateState { state in
+            for session in discovered where session.isArchived && state.archivedAt[session.id] == nil {
+                state.archivedAt[session.id] = now
+            }
+        }
+        let expired = Self.expiredArchiveIDs(discovered, archivedAt: persistence.state.archivedAt, now: now)
+        guard !expired.isEmpty else { return discovered }
+        let surviving = discovered.filter { !expired.contains($0.id) }
+        let stillUsed = Set(surviving.map { $0.cwd.standardizedFileURL.path })
+        let releasable = Set(discovered
+            .filter { expired.contains($0.id) }
+            .map(\.cwd)
+            .filter { WorktreeService.isManaged($0) && !stillUsed.contains($0.standardizedFileURL.path) }
+            .map { $0.standardizedFileURL })
+        for worktree in releasable {
+            Task { await WorktreeService.remove(at: worktree) }
+        }
+        return surviving
+    }
+
+    func archivedDate(_ session: SessionSummary) -> Date {
+        persistence.state.archivedAt[session.id] ?? session.modifiedAt
     }
 
     func toggleArchive(_ session: SessionSummary) {
@@ -2035,6 +2159,10 @@ final class AppStore: ObservableObject {
         if let selectedSession { cwd = selectedSession.cwd; sessionPath = selectedSession.fileURL }
         else if let selectedFolder { cwd = selectedFolder; sessionPath = nil }
         else { showToast("Choose a working folder first", style: .warning); return }
+        // The session about to be created owns the pending worktree from here on, so navigating
+        // away later must not delete the checkout it is running in.
+        newChatWorktree = nil
+        newChatWorktreeOrigin = nil
 
         let sentText = draft
         let sentAttachments = attachments
@@ -3020,6 +3148,9 @@ final class AppStore: ObservableObject {
     /// Global Desktop is never a project for Git-refresh purposes.
     private func hasOptedIntoGitRefresh(_ url: URL) -> Bool {
         guard !WorkspaceOrganization.isGlobalWorkingDirectory(url) else { return false }
+        // A worktree this app just cut for the pending chat is opted in by construction: the
+        // user asked for it, even though it is deliberately never a remembered folder.
+        if WorktreeService.isManaged(url) { return true }
         let path = url.standardizedFileURL.path
         if persistence.state.recentFolders.contains(path) { return true }
         return sessions.contains { $0.cwd.standardizedFileURL.path == path }

@@ -472,7 +472,13 @@ struct ManagedTurnRecovery: Codable, Equatable {
 
 struct PersistedAppState: Codable {
     var archivedSessionIDs: Set<String> = []
+    /// When each archive happened, so retention can expire an archived conversation (and the
+    /// worktree it ran in) without ever touching Pi's own session file.
+    var archivedAt: [String: Date] = [:]
     var recentFolders: [String] = []
+    /// The folder the last chat was started in, so a new chat reopens where work happens.
+    /// App-created worktrees are deliberately never recorded here.
+    var lastFolder: String?
     /// One app-wide choice: changing conversations or relaunching never reopens a panel the user closed.
     var inspectorVisible = true
     /// Sidebar folders the user explicitly opened or closed. Anything absent falls back to the
@@ -506,7 +512,9 @@ struct PersistedAppState: Codable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
+        archivedAt = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
+        lastFolder = try container.decodeIfPresent(String.self, forKey: .lastFolder)
         inspectorVisible = try container.decodeIfPresent(Bool.self, forKey: .inspectorVisible) ?? true
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []

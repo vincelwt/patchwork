@@ -237,9 +237,14 @@ final class AppPersistence {
         state.pruneCompletionState()
     }
 
-    func setArchived(_ archived: Bool, sessionID: String) {
-        if archived { state.archivedSessionIDs.insert(sessionID) }
-        else { state.archivedSessionIDs.remove(sessionID) }
+    func setArchived(_ archived: Bool, sessionID: String, now: Date = Date()) {
+        if archived {
+            state.archivedSessionIDs.insert(sessionID)
+            state.archivedAt[sessionID] = now
+        } else {
+            state.archivedSessionIDs.remove(sessionID)
+            state.archivedAt.removeValue(forKey: sessionID)
+        }
         save()
     }
 
@@ -258,6 +263,12 @@ final class AppPersistence {
     func cacheExtensionStatuses(_ values: [String: String]) {
         guard state.cachedExtensionStatuses != values else { return }
         state.cachedExtensionStatuses = values
+        save()
+    }
+
+    func setLastFolder(_ path: String) {
+        guard state.lastFolder != path else { return }
+        state.lastFolder = path
         save()
     }
 

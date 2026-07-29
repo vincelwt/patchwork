@@ -77,6 +77,14 @@ struct NewChatView: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: PiTheme.space8)
+            Toggle("Worktree", isOn: Binding(
+                get: { store.newChatWorktree != nil },
+                set: { store.setNewChatWorktree($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .font(PiFont.caption)
+            .disabled(isGlobal && store.newChatWorktree == nil)
+            .help("Run this chat in a fresh worktree cut off the project's main branch, stored in \(WorktreeService.root.path)")
             if store.selectedGit.isRepository, let branch = store.selectedGit.branch {
                 Label(branch, systemImage: "arrow.triangle.branch")
                     .font(PiFont.caption)

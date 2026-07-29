@@ -303,7 +303,7 @@ struct GitService: GitStatusProviding {
 
     /// stderr goes to the null device so a chatty git invocation can never fill a pipe and
     /// deadlock the worker, and a hard deadline guarantees the call returns.
-    private static func run(_ arguments: [String], timeout: TimeInterval = 15) -> (status: Int32, output: String) {
+    static func run(_ arguments: [String], timeout: TimeInterval = 15) -> (status: Int32, output: String) {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")

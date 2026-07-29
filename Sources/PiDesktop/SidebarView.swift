@@ -18,7 +18,8 @@ struct SidebarView: View {
             sessions: store.sessions,
             query: store.searchText,
             virtualFolders: store.virtualFolders,
-            assignments: store.virtualFolderAssignments
+            assignments: store.virtualFolderAssignments,
+            archivedAt: store.archivedDate
         )
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
@@ -42,19 +43,19 @@ struct SidebarView: View {
             .padding(.bottom, PiTheme.space6)
             .help("Tree groups by project and folder; Status groups every project's conversations by what they need")
 
-            if store.isScanning, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
+            if store.isScanning, snapshot.activeGroups.isEmpty, snapshot.archivedSessions.isEmpty {
                 VStack(spacing: PiTheme.space8) {
                     ProgressView().controlSize(.small)
                     Text("Finding Pi sessions…").font(SidebarTypography.status).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let error = store.scanError, snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
+            } else if let error = store.scanError, snapshot.activeGroups.isEmpty, snapshot.archivedSessions.isEmpty {
                 PiUnavailableView(
                     "Sessions unavailable",
                     systemImage: "exclamationmark.triangle",
                     description: error
                 )
-            } else if snapshot.activeGroups.isEmpty, snapshot.archivedGroups.isEmpty {
+            } else if snapshot.activeGroups.isEmpty, snapshot.archivedSessions.isEmpty {
                 PiUnavailableView(
                     store.searchText.isEmpty ? "No conversations yet" : "No matches",
                     systemImage: store.searchText.isEmpty ? "bubble.left" : "magnifyingglass"
@@ -79,9 +80,9 @@ struct SidebarView: View {
                 // Pinned below the scroller instead of living inside it, so Archived always
                 // sits in the same quiet spot above the footer instead of floating mid-list.
                 // Disclosure now lives in the status bar; the list only exists while open.
-                if !snapshot.archivedGroups.isEmpty, archiveExpanded || snapshot.isFiltering {
+                if !snapshot.archivedSessions.isEmpty, archiveExpanded || snapshot.isFiltering {
                     PiHairline()
-                    ArchiveSection(groups: snapshot.archivedGroups, forceExpanded: snapshot.isFiltering)
+                    ArchiveSection(sessions: snapshot.archivedSessions)
                         .padding(.horizontal, PiTheme.space6)
                 }
             }
@@ -224,14 +225,16 @@ private struct SidebarFooter: View {
 struct SidebarSnapshot {
     let all: [SessionSummary]
     let activeGroups: [SessionFolderGroup]
-    let archivedGroups: [SessionFolderGroup]
+    /// Flat and sorted by archive recency, not grouped: see `ArchiveSection`.
+    let archivedSessions: [SessionSummary]
     let isFiltering: Bool
 
     init(
         sessions: [SessionSummary],
         query: String,
         virtualFolders: [VirtualFolder] = [],
-        assignments: [String: String] = [:]
+        assignments: [String: String] = [:],
+        archivedAt: (SessionSummary) -> Date = { $0.modifiedAt }
     ) {
         let folded = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         isFiltering = !folded.isEmpty
@@ -250,13 +253,7 @@ struct SidebarSnapshot {
             validVirtualIDs: validVirtualIDs,
             includeEmptyVirtualFolders: !isFiltering
         )
-        archivedGroups = Self.groups(
-            all.filter(\.isArchived),
-            virtualFolders: virtualFolders,
-            assignments: assignments,
-            validVirtualIDs: validVirtualIDs,
-            includeEmptyVirtualFolders: false
-        )
+        archivedSessions = all.filter(\.isArchived).sorted { archivedAt($0) > archivedAt($1) }
     }
 
     /// Builds the folder forest: filesystem project roots plus top-level virtual folders, each
@@ -495,16 +492,15 @@ private struct StatusListView: View {
 /// the active list above it or pushing the footer out of the sidebar.
 private let archiveExpandedMaxHeight: CGFloat = 220
 
+/// Deliberately not the folder tree the active list uses: an archive is a history, so it reads
+/// as one flat list, most recently archived first, with each row's folder as its hint.
 private struct ArchiveSection: View {
-    let groups: [SessionFolderGroup]
-    let forceExpanded: Bool
+    let sessions: [SessionSummary]
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: PiTheme.space2) {
-                ForEach(groups) { group in
-                    SessionFolderSection(group: group, archived: true, forceExpanded: forceExpanded)
-                }
+            LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
+                ForEach(sessions) { SessionRow(session: $0, archived: true, hint: $0.folderName) }
             }
         }
         .frame(maxHeight: archiveExpandedMaxHeight)
