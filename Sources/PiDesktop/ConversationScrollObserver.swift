@@ -25,7 +25,8 @@ struct ConversationScrollMetrics: Equatable {
 /// The SwiftUI side's handle into the AppKit coordinator that owns scroll corrections.
 @MainActor
 final class ConversationScrollBridge {
-    fileprivate weak var coordinator: ConversationScrollObserver.Coordinator?
+    /// Internal (not fileprivate) so the coordinator test harness can wire a bridge directly.
+    weak var coordinator: ConversationScrollObserver.Coordinator?
 
     /// Arm before a history page is requested: subsequent document growth is treated as content
     /// inserted above the viewport and compensated in the same layout pass.
@@ -104,6 +105,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
         private(set) var pinned = true
         private var prependArmed = false
         private var isAdjusting = false
+        private var paintHealScheduled = false
         private var pendingMetrics: ConversationScrollMetrics?
         private var metricsCallbackScheduled = false
 
@@ -149,7 +151,10 @@ struct ConversationScrollObserver: NSViewRepresentable {
                 }
                 lastDocumentHeight = document.bounds.height
             }
-            if pinned { scrollToBottom() }
+            // No programmatic scroll here on purpose: attach runs inside SwiftUI's update, and
+            // `defaultScrollAnchor(.bottom)` already positions the first frame through SwiftUI's
+            // own pipeline. Scrolling the clip view mid-update leaves SwiftUI's display list
+            // culled for the stale viewport — the "ghost band + blank transcript" artifact.
             publish(direction: .stationary)
         }
 
@@ -173,7 +178,10 @@ struct ConversationScrollObserver: NSViewRepresentable {
             lastDocumentHeight = newHeight
             guard abs(newHeight - oldHeight) > 0.5 else { return }
             if pinned {
-                scrollToBottom()
+                // `defaultScrollAnchor(.bottom)` usually maintains the pin itself, fully
+                // rendered; only correct when it did not, and then heal the paint (below).
+                let target = max(0, newHeight - scrollView.contentView.bounds.height)
+                if abs(scrollView.contentView.bounds.origin.y - target) > 0.5 { setOrigin(target) }
             } else if prependArmed, let target = ConversationScrollObserver.restoredOriginY(
                 originalY: scrollView.contentView.bounds.origin.y,
                 oldDocumentHeight: oldHeight,
@@ -215,6 +223,31 @@ struct ConversationScrollObserver: NSViewRepresentable {
             scrollView.reflectScrolledClipView(scrollView.contentView)
             isAdjusting = false
             previousOriginY = y
+            schedulePaintHeal()
+        }
+
+        /// A clip-origin move made inside SwiftUI's update or layout pass positions correctly
+        /// but leaves SwiftUI's display list rendered for the old viewport: newly exposed rows
+        /// stay blank and stale pixels linger until the next real scroll. One coalesced pass
+        /// after the current turn re-asserts the origin through the normal notification path
+        /// (with a sub-pixel nudge so the bounds change is real), which makes SwiftUI re-render
+        /// the viewport it is actually showing.
+        private func schedulePaintHeal() {
+            guard !paintHealScheduled else { return }
+            paintHealScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                paintHealScheduled = false
+                guard let scrollView else { return }
+                let clip = scrollView.contentView
+                let origin = clip.bounds.origin
+                isAdjusting = true
+                clip.setBoundsOrigin(NSPoint(x: origin.x, y: origin.y + 0.5))
+                isAdjusting = false
+                clip.scroll(to: origin)
+                scrollView.reflectScrolledClipView(clip)
+                previousOriginY = origin.y
+            }
         }
 
         /// Metrics reach SwiftUI coalesced and asynchronously — state must not mutate inside the
