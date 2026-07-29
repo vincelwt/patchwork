@@ -332,8 +332,10 @@ struct ExtensionStatusModel: Equatable {
         values[ExtensionStatusParser.modeKey].flatMap(ExtensionStatusParser.mode)
     }
 
-    var fastPriority: FastPriorityStatus? {
+    /// The extension removes its status key when fast priority is off, but the toggle must remain.
+    var fastPriority: FastPriorityStatus {
         values[ExtensionStatusParser.fastPriorityKey].flatMap(ExtensionStatusParser.fastPriority)
+            ?? FastPriorityStatus(isActive: false, raw: "fast (inactive)")
     }
 
     /// Everything the status bar renders as a plain chip, in stable key order.
