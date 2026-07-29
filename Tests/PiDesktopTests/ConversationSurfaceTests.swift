@@ -97,6 +97,38 @@ final class ConversationScrollMetricsTests: XCTestCase {
         ).shouldRequestEarlierHistory)
     }
 
+    func testBottomOriginRespectsInsets() {
+        // Long content: the true bottom sits past `doc - viewport` by the composer's inset.
+        XCTAssertEqual(
+            ConversationScrollObserver.bottomOriginY(
+                documentHeight: 5_000, viewportHeight: 818, topInset: 58, bottomInset: 90
+            ),
+            4_272
+        )
+        // Short content: SwiftUI bottom-aligns it by growing a synthetic top inset, and the
+        // correct origin is negative. Clamping to zero here was the "conversation shoved up
+        // behind the toolbar glass" bug.
+        XCTAssertEqual(
+            ConversationScrollObserver.bottomOriginY(
+                documentHeight: 390, viewportHeight: 818, topInset: 338, bottomInset: 90
+            ),
+            -338
+        )
+    }
+
+    func testPrependRestorationWithDynamicInsetsLandsOnTheNewBottom() {
+        // An underfilled page (origin -338 via the synthetic top inset) gains 1,610pt of
+        // earlier history and the inset collapses to 58: the delta math lands exactly on the
+        // new bottom, keeping the rows that were on screen in place.
+        XCTAssertEqual(
+            ConversationScrollObserver.restoredOriginY(
+                originalY: -338, oldDocumentHeight: 390, newDocumentHeight: 2_000,
+                viewportHeight: 818, topInset: 58, bottomInset: 90
+            ),
+            1_272
+        )
+    }
+
     func testPrependRestorationPreservesTheOriginalViewportOffset() {
         XCTAssertEqual(
             ConversationScrollObserver.restoredOriginY(

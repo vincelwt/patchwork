@@ -46,6 +46,15 @@ final class ConversationScrollBridge {
 ///   newest content without a trailing `scrollTo` task racing the layout.
 /// - While a history prepend is armed, document growth shifts the origin by the added height, so
 ///   the rows the user was reading stay exactly where they were.
+/// Temporary stderr diagnostics, active only when PI_SCROLL_DEBUG=1.
+enum ScrollDebug {
+    static let enabled = ProcessInfo.processInfo.environment["PI_SCROLL_DEBUG"] == "1"
+    static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        FileHandle.standardError.write(Data("[scroll] \(message())\n".utf8))
+    }
+}
+
 struct ConversationScrollObserver: NSViewRepresentable {
     let bridge: ConversationScrollBridge
     let onChange: (ConversationScrollMetrics) -> Void
@@ -69,15 +78,37 @@ struct ConversationScrollObserver: NSViewRepresentable {
         coordinator.detach()
     }
 
+    /// Scroll geometry is inset-aware everywhere: SwiftUI bottom-aligns short content by
+    /// growing a synthetic *top* content inset, and the composer/toolbar contribute real
+    /// insets, so "scrolled to top" is `-top` and "scrolled to bottom" is
+    /// `docHeight - viewport + bottom` — both routinely negative. Clamping to zero here is what
+    /// used to shove freshly opened conversations up behind the toolbar glass.
+    static func bottomOriginY(
+        documentHeight: CGFloat,
+        viewportHeight: CGFloat,
+        topInset: CGFloat,
+        bottomInset: CGFloat
+    ) -> CGFloat {
+        max(-topInset, documentHeight - viewportHeight + bottomInset)
+    }
+
     static func restoredOriginY(
         originalY: CGFloat,
         oldDocumentHeight: CGFloat,
         newDocumentHeight: CGFloat,
-        viewportHeight: CGFloat
+        viewportHeight: CGFloat,
+        topInset: CGFloat = 0,
+        bottomInset: CGFloat = 0
     ) -> CGFloat? {
         let addedHeight = newDocumentHeight - oldDocumentHeight
         guard addedHeight > 0.5 else { return nil }
-        return min(max(0, newDocumentHeight - viewportHeight), max(0, originalY + addedHeight))
+        let bottomMost = bottomOriginY(
+            documentHeight: newDocumentHeight,
+            viewportHeight: viewportHeight,
+            topInset: topInset,
+            bottomInset: bottomInset
+        )
+        return min(bottomMost, max(-topInset, originalY + addedHeight))
     }
 
     final class AttachmentView: NSView {
@@ -177,16 +208,25 @@ struct ConversationScrollObserver: NSViewRepresentable {
             let oldHeight = lastDocumentHeight
             lastDocumentHeight = newHeight
             guard abs(newHeight - oldHeight) > 0.5 else { return }
+            ScrollDebug.log("frame \(Int(oldHeight))->\(Int(newHeight)) origin=\(Int(scrollView.contentView.bounds.origin.y)) clipH=\(Int(scrollView.contentView.bounds.height)) pinned=\(pinned) svInsets=\(scrollView.contentInsets) clipInsets=\(scrollView.contentView.contentInsets) safeArea=\(scrollView.safeAreaInsets)")
+            let insets = scrollView.contentView.contentInsets
             if pinned {
                 // `defaultScrollAnchor(.bottom)` usually maintains the pin itself, fully
                 // rendered; only correct when it did not, and then heal the paint (below).
-                let target = max(0, newHeight - scrollView.contentView.bounds.height)
+                let target = ConversationScrollObserver.bottomOriginY(
+                    documentHeight: newHeight,
+                    viewportHeight: scrollView.contentView.bounds.height,
+                    topInset: insets.top,
+                    bottomInset: insets.bottom
+                )
                 if abs(scrollView.contentView.bounds.origin.y - target) > 0.5 { setOrigin(target) }
             } else if prependArmed, let target = ConversationScrollObserver.restoredOriginY(
                 originalY: scrollView.contentView.bounds.origin.y,
                 oldDocumentHeight: oldHeight,
                 newDocumentHeight: newHeight,
-                viewportHeight: scrollView.contentView.bounds.height
+                viewportHeight: scrollView.contentView.bounds.height,
+                topInset: insets.top,
+                bottomInset: insets.bottom
             ) {
                 setOrigin(target)
             }
@@ -213,11 +253,18 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         private func scrollToBottom() {
             guard let scrollView, let document = scrollView.documentView else { return }
-            setOrigin(max(0, document.bounds.height - scrollView.contentView.bounds.height))
+            let insets = scrollView.contentView.contentInsets
+            setOrigin(ConversationScrollObserver.bottomOriginY(
+                documentHeight: document.bounds.height,
+                viewportHeight: scrollView.contentView.bounds.height,
+                topInset: insets.top,
+                bottomInset: insets.bottom
+            ))
         }
 
         private func setOrigin(_ y: CGFloat) {
             guard let scrollView else { return }
+            ScrollDebug.log("setOrigin \(Int(scrollView.contentView.bounds.origin.y)) -> \(Int(y))")
             isAdjusting = true
             scrollView.contentView.scroll(to: NSPoint(x: scrollView.contentView.bounds.origin.x, y: y))
             scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -239,6 +286,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
                 guard let self else { return }
                 paintHealScheduled = false
                 guard let scrollView else { return }
+                ScrollDebug.log("heal fires")
                 let clip = scrollView.contentView
                 let origin = clip.bounds.origin
                 isAdjusting = true
