@@ -563,8 +563,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       }
 
       const currentSessionId = ctx.sessionManager.getSessionId();
-      if (hasQueuedReviewFollowUp(ctx.sessionManager.getBranch(), pullRequest.url)
-          || Date.now() >= deadline) {
+      if (hasQueuedReviewFollowUp(ctx.sessionManager.getBranch(), pullRequest.url)) {
         await stopPullRequestReviewWatch(pullRequest, currentSessionId);
         return;
       }
@@ -591,7 +590,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         `${endpoint}/issues/${pullRequest.number}/reactions?per_page=100`,
         `any(.[]; (${codexLogin}) and .content == \"+1\")`
       );
-      if (clean === true) {
+      if (clean === true || Date.now() >= deadline) {
         await stopPullRequestReviewWatch(pullRequest, currentSessionId);
       }
     },
