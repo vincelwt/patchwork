@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 15
+// pi-desktop-activity-version: 16
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -32,6 +32,7 @@ const TERMINAL_STOP_REASONS = new Set(["stop", "length", "error", "aborted"]);
 const DAEMON_TIMEOUT_MS = 3_000;
 const DAEMON_RESPONSE_LIMIT = 1_048_576;
 const PULL_REQUEST_REVIEW_COMMAND = "pi-desktop-pr-review";
+const PULL_REQUEST_REVIEW_COMPLETE_STATUS = "pi-desktop-pr-review-complete";
 const PULL_REQUEST_REVIEW_CUSTOM_TYPE = "pi-desktop-pr-review-follow-up";
 const PULL_REQUEST_REVIEW_INTERVAL_SECONDS = 300;
 const PULL_REQUEST_REVIEW_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -565,6 +566,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       const currentSessionId = ctx.sessionManager.getSessionId();
       if (hasQueuedReviewFollowUp(ctx.sessionManager.getBranch(), pullRequest.url)) {
         await stopPullRequestReviewWatch(pullRequest, currentSessionId);
+        ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
         return;
       }
 
@@ -578,6 +580,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
         if (Date.now() >= deadline) {
           await stopPullRequestReviewWatch(pullRequest, currentSessionId);
         }
+        ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
         return;
       }
       if (reviewed === true) {
@@ -598,6 +601,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
       if (clean === true || Date.now() >= deadline) {
         await stopPullRequestReviewWatch(pullRequest, currentSessionId);
       }
+      ctx.ui.setStatus(PULL_REQUEST_REVIEW_COMPLETE_STATUS, undefined);
     },
   });
 
