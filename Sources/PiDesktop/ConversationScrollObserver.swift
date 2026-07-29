@@ -143,6 +143,9 @@ struct ConversationScrollObserver: NSViewRepresentable {
         /// its content settles, whether or not any correction fired.
         private var openHealArmed = true
         private var healWork: DispatchWorkItem?
+        /// A real user scroll is itself the strongest paint heal — and the moment one happens,
+        /// the coordinator must never move the viewport on its own again.
+        private var userScrolledSinceAttach = false
         private var pendingMetrics: ConversationScrollMetrics?
         private var metricsCallbackScheduled = false
 
@@ -193,6 +196,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
             // own pipeline. Scrolling the clip view mid-update leaves SwiftUI's display list
             // culled for the stale viewport — the "ghost band + blank transcript" artifact.
             openHealArmed = true
+            userScrolledSinceAttach = false
             scheduleHeal()
             publish(direction: .stationary)
         }
@@ -255,6 +259,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
             } else {
                 direction = originY < previousOriginY! ? .up : .down
             }
+            if let previous = previousOriginY, abs(originY - previous) > 0.5 { userScrolledSinceAttach = true }
             previousOriginY = originY
             pinned = document.bounds.height - (originY + visible.height) <= PiTheme.transcriptScrollEdgeThreshold
             publish(direction: direction)
@@ -296,8 +301,16 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         private func performHeal() {
             guard let scrollView, let document = scrollView.documentView else { return }
+            // Never move anything while the user's hands are on it: a drag (text selection,
+            // scroller grab) defers the heal entirely, and any user scroll since attach already
+            // forced the repaint, so only the always-safe parts run. The heal must be
+            // unobservable: the user may scroll or select the instant a thread opens.
+            if NSEvent.pressedMouseButtons != 0 {
+                ScrollDebug.log("heal deferred: mouse down")
+                scheduleHeal()
+                return
+            }
             openHealArmed = false
-            ScrollDebug.log("heal fires")
             let clip = scrollView.contentView
             let origin = clip.bounds.origin
             let insets = clip.contentInsets
@@ -310,7 +323,8 @@ struct ConversationScrollObserver: NSViewRepresentable {
             // A real one-point move the clip view will accept, then back — two genuine bounds
             // changes across two turns, exactly what a manual scroll does. Underfilled content
             // has no scrollable range, so short conversations rely on the SwiftUI tick below.
-            if bottomMost > -insets.top + 1 {
+            if !userScrolledSinceAttach, bottomMost > -insets.top + 1 {
+                ScrollDebug.log("heal fires (jiggle)")
                 let nudged = origin.y > -insets.top + 1 ? origin.y - 1 : origin.y + 1
                 isAdjusting = true
                 clip.scroll(to: NSPoint(x: origin.x, y: nudged))
@@ -318,10 +332,17 @@ struct ConversationScrollObserver: NSViewRepresentable {
                 isAdjusting = false
                 DispatchQueue.main.async { [weak self] in
                     guard let self, let scrollView = self.scrollView else { return }
+                    let current = scrollView.contentView.bounds.origin
+                    // The user moved in the meantime: their position wins, never teleport back.
+                    guard abs(current.y - nudged) <= 0.5 else { return }
+                    isAdjusting = true
                     scrollView.contentView.scroll(to: origin)
                     scrollView.reflectScrolledClipView(scrollView.contentView)
+                    isAdjusting = false
                     previousOriginY = origin.y
                 }
+            } else {
+                ScrollDebug.log("heal fires (safe parts only)")
             }
             document.needsLayout = true
             parent.onHeal()
