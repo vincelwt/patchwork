@@ -228,23 +228,47 @@ enum MenuBarCircleState: Equatable {
     }
 }
 
+enum ThreadCountBadge {
+    static func label(for count: Int) -> String? {
+        count > 0 ? String(count) : nil
+    }
+
+    @MainActor
+    static func updateDock(doneCount: Int) {
+        NSApplication.shared.dockTile.badgeLabel = label(for: doneCount)
+    }
+}
+
 struct MenuBarLabelView: View {
     @EnvironmentObject private var store: AppStore
+
+    private var runningCount: Int { store.runningSessions.count }
 
     private var unreadCount: Int {
         store.sessions.filter { !$0.isArchived && store.isUnread($0) }.count
     }
 
     private var state: MenuBarCircleState {
-        MenuBarCircleState.resolve(runningCount: store.runningSessions.count, unreadCount: unreadCount)
+        MenuBarCircleState.resolve(runningCount: runningCount, unreadCount: unreadCount)
     }
 
     var body: some View {
-        Image(systemName: state.symbolName)
-            .renderingMode(state.usesOriginalColor ? .original : .template)
-            .font(.system(size: PiIcon.medium, weight: .semibold))
-            .foregroundStyle(state.tint)
-            .accessibilityLabel(state.accessibilityLabel)
+        HStack(spacing: PiTheme.space4) {
+            Image(systemName: state.symbolName)
+                .renderingMode(state.usesOriginalColor ? .original : .template)
+                .font(.system(size: PiIcon.medium, weight: .semibold))
+                .foregroundStyle(state.tint)
+                .accessibilityLabel(state.accessibilityLabel)
+            if let count = ThreadCountBadge.label(for: runningCount) {
+                Text(count)
+                    .font(PiFont.rowEmphasis.monospacedDigit())
+                    .accessibilityLabel(runningCount == 1 ? "1 session running" : "\(runningCount) sessions running")
+            }
+        }
+        .onAppear { ThreadCountBadge.updateDock(doneCount: store.doneSessionCount) }
+        .onChange(of: store.doneSessionCount) { _, count in
+            ThreadCountBadge.updateDock(doneCount: count)
+        }
     }
 }
 

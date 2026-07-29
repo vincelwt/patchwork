@@ -1026,7 +1026,7 @@ final class AppStore: ObservableObject {
         activityMonitor.activity(forPath: session.fileURL.standardizedFileURL.path)?.resources
     }
 
-    /// Menu bar / badge source: every non-archived session currently working, newest run first.
+    /// Menu bar source: every non-archived session currently working, newest run first.
     var runningSessions: [SessionSummary] {
         sessions
             .filter { !$0.isArchived && isRunning($0) }
@@ -1041,6 +1041,18 @@ final class AppStore: ObservableObject {
 
     var aggregateResourceUsage: ThreadResourceUsage? {
         activityMonitor.aggregateResources
+    }
+
+    /// Dock badge source: the same Done bucket shown by the sidebar's Status view.
+    var doneSessionCount: Int {
+        sessions.reduce(0) { count, session in
+            count + (SidebarStatusGroup.section(
+                for: session,
+                isRunning: isRunning(session),
+                isUnread: isUnread(session),
+                isAutomated: scheduledThreadIDs.contains(session.id)
+            ) == .done ? 1 : 0)
+        }
     }
 
     private func managedTurnPath(for slot: RuntimeSlot) -> String? {
