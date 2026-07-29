@@ -152,6 +152,30 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertNotEqual(beganAt, oldModifiedAt, "A new turn must not display the conversation's old modification age")
     }
 
+    func testOneSleepHoldCoversOverlappingRunsUntilTheLastSettles() {
+        var transitions: [Bool] = []
+        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore(sleepPrevention: {
+            transitions.append($0)
+        })
+
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        XCTAssertEqual(transitions, [true])
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        XCTAssertEqual(transitions, [true], "a second thread must reuse the app's existing hold")
+
+        runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(transitions, [true], "the remaining thread keeps the shared hold alive")
+
+        runtimeB.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertFalse(store.isCaffeinated)
+    }
+
     func testSwitchingBackImmediatelyRestoresQueuedMessages() {
         let (store, runtimeA, _, sessionA, sessionB) = makeStore()
         store.selectSession(sessionA)
@@ -396,7 +420,10 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertTrue(store.sessions.contains { $0.id == "new-session" })
     }
 
-    private func makeStore(sessionAModifiedAt: Date = Date()) -> (AppStore, ParallelFakeRuntime, ParallelFakeRuntime, SessionSummary, SessionSummary) {
+    private func makeStore(
+        sessionAModifiedAt: Date = Date(),
+        sleepPrevention: @escaping SleepPreventionHandler = { _ in }
+    ) -> (AppStore, ParallelFakeRuntime, ParallelFakeRuntime, SessionSummary, SessionSummary) {
         let sessionA = summary(id: "session-a", file: "a.jsonl", modifiedAt: sessionAModifiedAt)
         let sessionB = summary(id: "session-b", file: "b.jsonl")
         let runtimeA = ParallelFakeRuntime(sessionFile: sessionA.fileURL.path, sessionID: sessionA.id)
@@ -409,6 +436,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
             runtimeFactory: { spareRuntimes.removeFirst() },
             persistence: AppPersistence(baseURL: directory),
             activityPresenter: ActivityPresenter(),
+            sleepPrevention: sleepPrevention,
             isActiveOverride: true
         )
         store.sessions = [sessionA, sessionB]

@@ -473,6 +473,33 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertNil(monitor.activity(forPath: running.path), "Untracked paths are released immediately")
     }
 
+    func testMonitorSeesARunningHeartbeatBeforeTheSessionIsDiscovered() async throws {
+        let heartbeatDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiHeartbeats-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: heartbeatDirectory) }
+
+        let heartbeat = heartbeatDirectory.appendingPathComponent("new-thread.json")
+        func writeHeartbeat(_ state: String) throws {
+            try Data("""
+            {"sessionId":"new","sessionFile":"/tmp/not-discovered.jsonl","pid":1,"state":"\(state)","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))"}
+            """.utf8).write(to: heartbeat, options: .atomic)
+        }
+
+        try writeHeartbeat("running")
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: false, heartbeatDirectory: heartbeatDirectory, isProcessAlive: { _ in true }
+        )
+        monitor.start()
+        defer { monitor.stop() }
+        try await waitUntil(timeout: 1) { monitor.hasRunningActivity }
+
+        try writeHeartbeat("idle")
+        try await waitUntil(timeout: 1) { !monitor.hasRunningActivity }
+        try writeHeartbeat("running")
+        try await waitUntil(timeout: 1) { monitor.hasRunningActivity }
+    }
+
     func testHeartbeatOverridesAStaleLookingFileToStayRunning() async throws {
         // The file itself looks long-idle (old mtime, terminal stop reason), but a fresh
         // heartbeat with a live pid says otherwise — e.g. Pi is mid-tool-call and has not

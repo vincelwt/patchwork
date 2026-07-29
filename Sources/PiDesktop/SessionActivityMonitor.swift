@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 
 /// How a session file's tail classifies right now.
@@ -145,12 +146,15 @@ enum SessionActivityClassifier {
 /// produce a confident verdict, the previous resolved state is kept rather than guessing
 /// (`.unknown` is sticky), so a momentary gap in the data can never look like a flip.
 ///
-/// Cost control: one shared timer runs every 2s while active and every 15s in the background,
-/// with one heartbeat-directory scan per tick and at most 16 bounded tail reads. Unchanged files
-/// reuse their last completion, and no timer is created per row.
+/// Cost control: heartbeat-directory writes trigger an immediate shared scan; one fallback timer
+/// runs every 2s while active and every 15s in the background. Each tick performs at most 16
+/// bounded tail reads. Unchanged files reuse their last completion, and no timer is created per row.
 @MainActor
 final class SessionActivityMonitor: ObservableObject {
     @Published private(set) var activities: [String: SessionActivity] = [:]
+    /// Includes live heartbeat-backed threads that have not reached the session scan yet, such as
+    /// a newly-created automation run.
+    @Published private(set) var hasRunningActivity = false
     /// The whole app process tree plus heartbeat-backed external conversations currently running.
     @Published private(set) var aggregateResources: ThreadResourceUsage?
 
@@ -171,7 +175,9 @@ final class SessionActivityMonitor: ObservableObject {
     private var heartbeatSnapshots: [String: [ActivityHeartbeat]] = [:]
     private var resourceSamples: [Int32: ProcessResourceSample] = [:]
     private var pollTask: Task<Void, Never>?
+    private var heartbeatWatcher: DispatchSourceFileSystemObject?
     private var tickInFlight = false
+    private var tickPending = false
     private var fallbackCursor = 0
     private var cancellables: Set<AnyCancellable> = []
     private let isActiveOverride: Bool?
@@ -214,6 +220,7 @@ final class SessionActivityMonitor: ObservableObject {
     }
 
     func start() {
+        startHeartbeatWatcher()
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -228,6 +235,34 @@ final class SessionActivityMonitor: ObservableObject {
     func stop() {
         pollTask?.cancel()
         pollTask = nil
+        heartbeatWatcher?.cancel()
+        heartbeatWatcher = nil
+    }
+
+    private func startHeartbeatWatcher() {
+        guard heartbeatWatcher == nil else { return }
+        try? FileManager.default.createDirectory(at: heartbeatDirectory, withIntermediateDirectories: true)
+        let descriptor = open(heartbeatDirectory.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .delete, .rename],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let directoryMoved = self.heartbeatWatcher?.data.contains(.delete) == true
+                || self.heartbeatWatcher?.data.contains(.rename) == true
+            self.tickNow()
+            if directoryMoved {
+                self.heartbeatWatcher?.cancel()
+                self.heartbeatWatcher = nil
+                self.startHeartbeatWatcher()
+            }
+        }
+        source.setCancelHandler { close(descriptor) }
+        heartbeatWatcher = source
+        source.resume()
     }
 
     func tickNow() {
@@ -269,9 +304,18 @@ final class SessionActivityMonitor: ObservableObject {
     }
 
     private func tick() async {
-        guard !trackedPaths.isEmpty, !tickInFlight else { return }
+        guard !tickInFlight else {
+            tickPending = true
+            return
+        }
         tickInFlight = true
-        defer { tickInFlight = false }
+        defer {
+            tickInFlight = false
+            if tickPending {
+                tickPending = false
+                tickNow()
+            }
+        }
 
         let paths = trackedPaths
         let known = fingerprints
@@ -287,7 +331,7 @@ final class SessionActivityMonitor: ObservableObject {
         let result = await Task.detached(priority: .utility) {
             () -> (
                 [String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int,
-                [Int32: ProcessResourceSample], ThreadResourceUsage?
+                [Int32: ProcessResourceSample], ThreadResourceUsage?, Bool
             ) in
             let now = Date()
             var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
@@ -295,6 +339,12 @@ final class SessionActivityMonitor: ObservableObject {
                 heartbeats[path]?.sort { lhs, rhs in
                     lhs.pid == rhs.pid ? lhs.updatedAt < rhs.updatedAt : lhs.pid < rhs.pid
                 }
+            }
+            let hasRunningActivity = heartbeats.values.joined().contains {
+                ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
+            }
+            guard !paths.isEmpty else {
+                return ([:], [:], [:], 0, [:], nil, hasRunningActivity)
             }
             let heartbeatPaths = Set(heartbeats.keys)
             let trackedPathSet = Set(paths)
@@ -454,7 +504,7 @@ final class SessionActivityMonitor: ObservableObject {
             }
             return (
                 states, stamps, nextHeartbeats, selection.nextCursor,
-                resourceSnapshot.samples, resourceSnapshot.aggregateUsage
+                resourceSnapshot.samples, resourceSnapshot.aggregateUsage, hasRunningActivity
             )
         }.value
 
@@ -463,8 +513,12 @@ final class SessionActivityMonitor: ObservableObject {
         fallbackCursor = result.3
         resourceSamples = result.4
         aggregateResources = result.5
+        if hasRunningActivity != result.6 { hasRunningActivity = result.6 }
         if activities != result.0 { activities = result.0 }
     }
 
-    deinit { pollTask?.cancel() }
+    deinit {
+        pollTask?.cancel()
+        heartbeatWatcher?.cancel()
+    }
 }
