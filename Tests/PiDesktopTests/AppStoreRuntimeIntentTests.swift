@@ -175,8 +175,18 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         runtime.finishState()
         XCTAssertEqual(runtime.count("prompt"), 1, "thinking/stats requests must not gate dispatch")
         XCTAssertEqual(store.currentRouteRuntimePhase, .waitingForModel)
+        XCTAssertEqual(RuntimePhase.waitingForModel.label, "Waiting for first response…")
         runtime.onEvent?(.object(["type": .string("agent_start")]))
-        XCTAssertEqual(store.currentRouteRuntimePhase, .waitingForModel)
+        runtime.onEvent?(.object([
+            "type": .string("message_start"),
+            "message": .object(["role": .string("user")])
+        ]))
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object(["role": .string("user"), "content": .string("hello")])
+        ]))
+        runtime.onEvent?(.object(["type": .string("turn_start")]))
+        XCTAssertEqual(store.currentRouteRuntimePhase, .waitingForModel, "local user events are not provider output")
         runtime.onEvent?(.object([
             "type": .string("message_update"),
             "message": .object(["role": .string("assistant"), "content": .string("Hi")])

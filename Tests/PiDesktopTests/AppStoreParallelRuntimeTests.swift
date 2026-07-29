@@ -137,6 +137,44 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testCodexQueueStatusIsEphemeralAndRuntimeScoped() {
+        let (store, runtimeA, _, sessionA, sessionB) = makeStore()
+        let queueEvent: JSONValue = .object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.providerQueueKey),
+            "statusText": .string("Waiting for Codex slot…")
+        ])
+
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(queueEvent)
+        XCTAssertEqual(store.statusModel.values[ExtensionStatusParser.providerQueueKey], "Waiting for Codex slot…")
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.providerQueueKey])
+
+        store.selectSession(sessionA)
+        store.prepareComposerOptions()
+        XCTAssertEqual(store.statusModel.values[ExtensionStatusParser.providerQueueKey], "Waiting for Codex slot…")
+
+        store.selectSession(sessionB)
+        store.prepareComposerOptions()
+        runtimeA.onEvent?(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.providerQueueKey)
+        ]))
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.providerQueueKey])
+
+        store.selectSession(sessionA)
+        store.prepareComposerOptions()
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.providerQueueKey])
+    }
+
     func testRunningSinceUsesTheCurrentPromptBeforeTheActivityPoll() throws {
         let oldModifiedAt = Date(timeIntervalSince1970: 1)
         let (store, _, _, sessionA, _) = makeStore(sessionAModifiedAt: oldModifiedAt)

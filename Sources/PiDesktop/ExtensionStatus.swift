@@ -151,9 +151,13 @@ enum ExtensionStatusParser {
     static let modeKey = "mode"
     static let fastPriorityKey = "fast-priority"
     static let subagentsKey = "subagents"
+    static let providerQueueKey = "codex-provider-queue"
+
+    /// Runtime-local statuses must never leak into another conversation through the cache.
+    static let ephemeralKeys: Set<String> = [subagentsKey, providerQueueKey]
 
     /// Keys rendered by dedicated status-bar controls rather than the generic chip list.
-    static let specialKeys: Set<String> = [codexAccountKey, modeKey, fastPriorityKey]
+    static let specialKeys: Set<String> = [codexAccountKey, modeKey, fastPriorityKey, providerQueueKey]
 
     /// `"<email> 5h:78% 7d:57% reset×2:12h"`. The leading token is the account name/email;
     /// `label:NN%` tokens are remaining windows; `reset×N[:time]` is optional.

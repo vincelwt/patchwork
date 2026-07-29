@@ -171,6 +171,7 @@ final class ExtensionStatusModelTests: XCTestCase {
             "codex-account": "a@b.co 5h:78%",
             "mode": "mode:ultra",
             "fast-priority": "fast",
+            "codex-provider-queue": "Waiting for Codex slot…",
             "chrome": "Chrome ready",
             "brand-new-extension": "Something happened"
         ], isLive: true)
@@ -180,6 +181,7 @@ final class ExtensionStatusModelTests: XCTestCase {
         XCTAssertEqual(model.codexAccount?.account, "a@b.co")
         XCTAssertEqual(model.genericChips.map(\.key), ["brand-new-extension", "chrome"])
         XCTAssertEqual(model.genericChips.map(\.value), ["Something happened", "Chrome ready"])
+        XCTAssertTrue(ExtensionStatusParser.ephemeralKeys.contains(ExtensionStatusParser.providerQueueKey))
     }
 
     /// `ponytail` is a real, named extension — not just an arbitrary unknown key — but it has
