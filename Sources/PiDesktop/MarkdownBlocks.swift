@@ -51,8 +51,7 @@ enum MarkdownBlockParser {
 
     /// SwiftUI re-evaluates message bodies on hover and row realization; parsing the same
     /// settled markdown again each time is pure waste. NSCache is thread-safe and evicts on
-    /// its own; streaming text naturally misses (it changes every delta) and short-lived
-    /// entries age out under the count limit.
+    /// its own; streaming bodies bypass it because every update has a new full-text key.
     private final class ParsedBlocks {
         let blocks: [MarkdownBlock]
         init(_ blocks: [MarkdownBlock]) { self.blocks = blocks }
@@ -65,7 +64,8 @@ enum MarkdownBlockParser {
 
     /// Splits source Markdown into blocks. Blank lines separate blocks; newlines inside a
     /// paragraph are preserved so hard breaks survive to the renderer.
-    static func blocks(from source: String) -> [MarkdownBlock] {
+    static func blocks(from source: String, cacheResult: Bool = true) -> [MarkdownBlock] {
+        guard cacheResult else { return parse(source) }
         let key = source as NSString
         if let cached = cache.object(forKey: key) { return cached.blocks }
         let parsed = parse(source)
@@ -511,13 +511,6 @@ enum MarkdownInline {
         return result
     }
 
-    /// Plain fallback used while a message is still streaming (no per-token reparse).
-    static func plain(_ text: String) -> AttributedString {
-        var value = AttributedString(text)
-        value.font = PiFont.body
-        return value
-    }
-
     private static func styleCodeSpans(
         in string: inout AttributedString,
         weight: Font.Weight
@@ -561,27 +554,23 @@ enum MarkdownInline {
 
 struct MarkdownBlockView: View {
     let text: String
-    /// Growing streaming text renders as plain preserved-whitespace text; block Markdown is
-    /// parsed once the message is final so every token does not re-parse the whole body.
+    /// Live text is reparsed on each coalesced publish, but its one-use full-body keys must not
+    /// evict settled transcript entries from the bounded parser cache.
     var streaming = false
     /// User bubbles shrink-wrap their content; the transcript column fills its width.
     var fillWidth = true
 
+    var parsedBlocks: [MarkdownBlock] {
+        MarkdownBlockParser.blocks(from: text, cacheResult: !streaming)
+    }
+
     var body: some View {
-        if streaming {
-            Text(MarkdownInline.plain(text))
-                .lineSpacing(PiFont.bodyLineSpacing)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
-        } else {
-            VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
-                ForEach(Array(MarkdownBlockParser.blocks(from: text).enumerated()), id: \.offset) { _, block in
-                    MarkdownBlockRow(block: block, fillWidth: fillWidth)
-                }
+        VStack(alignment: .leading, spacing: PiTheme.transcriptBlockSpacing) {
+            ForEach(Array(parsedBlocks.enumerated()), id: \.offset) { _, block in
+                MarkdownBlockRow(block: block, fillWidth: fillWidth)
             }
-            .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
         }
+        .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
     }
 }
 

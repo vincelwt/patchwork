@@ -74,6 +74,18 @@ final class MarkdownBlockTests: XCTestCase {
         XCTAssertEqual(blocks, [.code(language: nil, code: "streaming code\nnot closed yet")])
     }
 
+    func testStreamingViewParsesPartialMarkdownBeforeCompletion() {
+        let source = "## Notes\n\n- one\n- two\n\n```swift\nlet x = 1"
+        XCTAssertEqual(MarkdownBlockView(text: source, streaming: true).parsedBlocks, [
+            .heading(level: 2, text: "Notes"),
+            .list(items: [
+                MarkdownListItem(marker: "•", text: "one", depth: 0),
+                MarkdownListItem(marker: "•", text: "two", depth: 0)
+            ], ordered: false, start: 1),
+            .code(language: "swift", code: "let x = 1")
+        ])
+    }
+
     func testTildeFenceAndBacktickFenceBothWork() {
         XCTAssertEqual(
             MarkdownBlockParser.blocks(from: "~~~sh\necho hi\n~~~"),
