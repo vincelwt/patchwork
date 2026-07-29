@@ -853,10 +853,18 @@ final class AppStore: ObservableObject {
         let capability = slot === activeRuntimeSlot && !activePresentationDetached ? activeCapability : slot.capability
         let questionnaire = slot === activeRuntimeSlot && !activePresentationDetached ? pendingQuestionnaire : slot.questionnaire
         let stream = slot === activeRuntimeSlot && !activePresentationDetached ? streamingMessage : slot.streamingMessage
+        let statuses = slot === activeRuntimeSlot && !activePresentationDetached ? extensionStatuses : slot.statuses
+        // Background subagents run inside this runtime's process: stopping it kills them
+        // silently mid-work. The subagents extension only publishes this key while agents are
+        // running or queued and clears it when the last one finishes, so its presence is a
+        // keep-alive. A blank value counts as "no work" so a degenerate status cannot pin a
+        // process open forever.
+        let subagents = statuses[ExtensionStatusParser.subagentsKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return !slot.isStarting && !slot.optionsLoading && presentation.phase == .idle && !presentation.isBusy
             && slot.pendingTurn == nil && dialogs.isEmpty && queued.isEmpty
             && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
-            && capability == nil && questionnaire == nil && stream == nil
+            && capability == nil && questionnaire == nil && stream == nil && subagents.isEmpty
     }
 
     private func cancelRuntimeRetirementLease() {
@@ -3849,6 +3857,12 @@ final class AppStore: ObservableObject {
             }
             persistence.cacheExtensionStatuses(cachedStatuses)
             if slot === activeRuntimeSlot, !activePresentationDetached { extensionStatuses = slot.statuses }
+            // The turn already settled, so nothing else re-evaluates retirement once the last
+            // subagent clears this key; without this the kept-alive process would never retire.
+            if key == ExtensionStatusParser.subagentsKey {
+                if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
+            }
         case "setWidget":
             guard let key = event["widgetKey"]?.stringValue else { return }
             let lines = (event["widgetLines"]?.arrayValue?.compactMap(\.stringValue) ?? [])
@@ -4240,6 +4254,9 @@ final class AppStore: ObservableObject {
                 cachedStatuses.removeValue(forKey: key)
             }
             persistence.cacheExtensionStatuses(cachedStatuses)
+            // Subagent activity gates retirement (see `isIdleAndClean`), and a settled turn has
+            // no other trigger left, so the lease is re-evaluated whenever that key changes.
+            if key == ExtensionStatusParser.subagentsKey { resetRuntimeRetirementLease(for: activeRuntimeSlot) }
         case "setWidget":
             guard let key = event["widgetKey"]?.stringValue else { return }
             let lines = (event["widgetLines"]?.arrayValue?.compactMap(\.stringValue) ?? []).prefix(100).map { $0.suffixString(2_000) }

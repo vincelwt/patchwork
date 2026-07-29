@@ -399,6 +399,67 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.stopCount, 1)
     }
 
+    func testRunningSubagentsHoldTheRuntimeOpenUntilTheStatusClears() {
+        let runtime = IntentRuntime()
+        let lease = ManualRuntimeLease()
+        let store = makeStore(runtime: runtime, lease: lease)
+        let session = summary("a", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.composerContentDidChange()
+        XCTAssertEqual(lease.entries.last?.delay, 120)
+
+        runtime.onEvent?(Self.subagentStatus("5 running agents"))
+        XCTAssertTrue(lease.entries[lease.entries.count - 1].cancelled, "live subagents must drop the idle lease")
+        for index in lease.entries.indices { lease.fire(index) }
+        XCTAssertEqual(runtime.stopCount, 0, "a runtime hosting background agents must never be stopped")
+
+        // A blank value is the degenerate case: it must not pin the process open.
+        runtime.onEvent?(Self.subagentStatus("   "))
+        let blankLease = lease.entries.count - 1
+        XCTAssertEqual(lease.entries[blankLease].delay, 120)
+        XCTAssertFalse(lease.entries[blankLease].cancelled)
+
+        runtime.onEvent?(Self.subagentStatus("2 running, 3 queued agents"))
+        XCTAssertTrue(lease.entries[blankLease].cancelled)
+        runtime.onEvent?(Self.subagentStatus(nil))
+        let finalLease = lease.entries.count - 1
+        XCTAssertGreaterThan(finalLease, blankLease, "clearing the last agent must re-arm retirement")
+        lease.fire(finalLease)
+        XCTAssertEqual(runtime.stopCount, 1)
+    }
+
+    func testSwitchingAwayParksARuntimeWithSubagentsAndRetiresItWhenTheyFinish() {
+        let runtime = IntentRuntime()
+        let replacement = IntentRuntime()
+        let store = makeStore(runtime: runtime, factory: { replacement })
+        let a = summary("a", cwd: root)
+        let b = summary("b", cwd: root)
+        store.sessions = [a, b]
+        store.selectSession(a)
+        store.composerContentDidChange()
+        runtime.onEvent?(Self.subagentStatus("2 running, 3 queued agents"))
+
+        store.selectSession(b)
+        store.composerContentDidChange()
+        XCTAssertEqual(runtime.stopCount, 0, "the hosting process must be parked, not stopped")
+        XCTAssertEqual(runtime.count("switch_session"), 0, "reusing the process would abandon its agents")
+        XCTAssertEqual(replacement.starts.count, 1)
+
+        runtime.onEvent?(Self.subagentStatus(nil))
+        XCTAssertEqual(runtime.stopCount, 1, "the parked runtime retires once its agents finish")
+    }
+
+    private static func subagentStatus(_ text: String?) -> JSONValue {
+        var event: [String: JSONValue] = [
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string("subagents")
+        ]
+        if let text { event["statusText"] = .string(text) }
+        return .object(event)
+    }
+
     private func makeStore(
         runtime: IntentRuntime,
         factory: @escaping () -> PiRuntimeProtocol = { IntentRuntime() },
