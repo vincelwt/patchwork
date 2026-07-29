@@ -6,7 +6,8 @@ struct PiDesktopApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
     @StateObject private var store = AppStore(
         connectivityMonitor: ConnectivityMonitor(),
-        probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) }
+        probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) },
+        sleepPrevention: SleepPreventionController.liveHandler()
     )
     // Owns the in-process control service lifecycle. Kept on the app delegate (not a second
     // @StateObject) so launch/quit and the Settings scene share the exact same instance.

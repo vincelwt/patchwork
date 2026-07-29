@@ -245,6 +245,7 @@ final class AppStore: ObservableObject {
     private var newChatWorktreeSubmitted = false
     @Published var runtimeState = RuntimeState()
     @Published private(set) var isOffline = false
+    @Published private(set) var isCaffeinated = false
     @Published var liveMetrics = TokenMetrics()
     @Published private(set) var availableModels: [AvailableModel] = []
     @Published private(set) var availableThinkingLevels: [String] = ["off"]
@@ -351,6 +352,7 @@ final class AppStore: ObservableObject {
     private var probeStatuses: [String: String] = [:]
     private var appCancellables: Set<AnyCancellable> = []
     private let notificationService: NotificationPresenting
+    private let sleepPreventionHandler: SleepPreventionHandler
     private let isActiveOverride: Bool?
     /// Sentinel draft key for the new-chat route; every session route keys off its own
     /// standardized file path instead.
@@ -408,6 +410,7 @@ final class AppStore: ObservableObject {
         connectivityMonitor: ConnectivityMonitor? = nil,
         probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil,
         notificationService: NotificationPresenting? = nil,
+        sleepPrevention: @escaping SleepPreventionHandler = { _ in },
         isActiveOverride: Bool? = nil,
         runtimeRetirementDelay: TimeInterval = 120,
         runtimeRetirementScheduler: @escaping RuntimeRetirementScheduler = { delay, action in
@@ -466,6 +469,7 @@ final class AppStore: ObservableObject {
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
         self.probeRuntimeFactory = probeRuntimeFactory
         self.notificationService = notificationService ?? NotificationService()
+        self.sleepPreventionHandler = sleepPrevention
         self.isActiveOverride = isActiveOverride
         // Pi requires a cwd even for a global conversation; Desktop is the neutral default and
         // passive Git inspection explicitly skips it until a real prompt starts Pi. The folder
@@ -493,13 +497,20 @@ final class AppStore: ObservableObject {
             .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
             .store(in: &appCancellables)
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
-            .sink { [weak self] _ in self?.flushCurrentDraftPersistence() }
+            .sink { [weak self] _ in
+                self?.flushCurrentDraftPersistence()
+                self?.setSleepPrevention(false)
+            }
             .store(in: &appCancellables)
         self.activityMonitor.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &appCancellables)
         self.activityMonitor.$activities
             .sink { [weak self] activities in self?.handleActivitySnapshot(activities) }
+            .store(in: &appCancellables)
+        self.activityMonitor.$hasRunningActivity
+            .removeDuplicates()
+            .sink { [weak self] running in self?.updateSleepPrevention(hasRunningActivity: running) }
             .store(in: &appCancellables)
         self.notificationService.onSelectSession = { [weak self] path in self?.focusSession(atPath: path) }
         composer.$content
@@ -548,6 +559,7 @@ final class AppStore: ObservableObject {
     }
 
     private func updateState(for slot: RuntimeSlot, _ update: (inout RuntimeState) -> Void) {
+        defer { updateSleepPrevention() }
         if slot === activeRuntimeSlot {
             update(&runtimeState)
             slot.state = runtimeState
@@ -1104,6 +1116,23 @@ final class AppStore: ObservableObject {
         return paths
     }
 
+    private func updateSleepPrevention(
+        activities: [String: SessionActivity]? = nil,
+        hasRunningActivity: Bool? = nil
+    ) {
+        let observedActivities = activities ?? activityMonitor.activities
+        let shouldPreventSleep = runtimeSlots().contains { state(for: $0).isBusy }
+            || (hasRunningActivity ?? activityMonitor.hasRunningActivity)
+            || observedActivities.values.contains { $0.state == .running }
+        setSleepPrevention(shouldPreventSleep)
+    }
+
+    private func setSleepPrevention(_ active: Bool) {
+        guard active != isCaffeinated else { return }
+        isCaffeinated = active
+        sleepPreventionHandler(active)
+    }
+
     private func isWaitingForProviderRecovery(at path: String) -> Bool {
         runtimeSlots().contains { slot in
             let waiting = state(for: slot).isWaitingForNetwork || slot.connectivityResumeInFlight
@@ -1370,6 +1399,7 @@ final class AppStore: ObservableObject {
     /// The first snapshot establishes a quiet baseline; every later distinct ID is persisted
     /// before notification gating so duplicate observations and relaunches stay silent.
     private func handleActivitySnapshot(_ activities: [String: SessionActivity]) {
+        defer { updateSleepPrevention(activities: activities) }
         if let selectedPath = selectedSession?.fileURL.standardizedFileURL.path,
            activities[selectedPath] != nil {
             refreshSelectedConversationIfNeeded()
@@ -3913,6 +3943,7 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        defer { updateSleepPrevention() }
         switch event["type"]?.stringValue {
         case "tool_execution_start": updateManagedTool(event, running: true, slot: slot)
         case "tool_execution_end": updateManagedTool(event, running: false, slot: slot)

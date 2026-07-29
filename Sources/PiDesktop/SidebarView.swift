@@ -159,6 +159,15 @@ private struct SidebarFooter: View {
                     .accessibilityValue(activityDescription)
             }
             Spacer(minLength: PiTheme.space4)
+            Image(systemName: store.isCaffeinated ? "cup.and.saucer.fill" : "cup.and.saucer")
+                .font(.system(size: PiIcon.small, weight: .medium))
+                .foregroundStyle(store.isCaffeinated ? Color.piGreen : .secondary)
+                .frame(width: 22, height: 22)
+                .help(store.isCaffeinated
+                    ? "Keeping this Mac awake while a thread runs"
+                    : "Sleep prevention turns on automatically when a thread runs")
+                .accessibilityLabel("Automatic sleep prevention")
+                .accessibilityValue(store.isCaffeinated ? "on" : "off")
             Button { remoteAccessPresented = true } label: {
                 Image(systemName: "iphone")
                     .font(.system(size: PiIcon.small, weight: .medium))
