@@ -378,9 +378,9 @@ final class AppStore: ObservableObject {
     /// finish the current turn; older pages stay on demand without retaining history forever.
     private static let loadedMessageLimit = 1_000
     private static let connectivityResumeCommand = "/pi-desktop-resume"
-    private static let connectivityResumeDescription = "Resume an interrupted turn after network connectivity returns"
+    private static let connectivityResumeDescription = "Continue an interrupted turn after a transient failure"
     private static let connectivityResumeInstruction =
-        "Network connectivity interrupted the previous turn. Continue from where it stopped without repeating completed work."
+        "A transient failure interrupted the previous turn. Continue from where it stopped without repeating completed work."
     private static let relaunchRecoveryInstruction =
         "Pi Desktop restarted during the previous turn. Inspect the durable conversation and continue from where it stopped. Do not repeat completed actions; if an outcome is uncertain, explain that and ask before repeating it."
 
@@ -574,9 +574,15 @@ final class AppStore: ObservableObject {
 
     private func resumeAfterConnectivityIfPossible(_ slot: RuntimeSlot) {
         let current = state(for: slot)
-        guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying,
+        guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying else { return }
+        prepareInterruptedTurnContinuation(for: slot)
+    }
+
+    private func prepareInterruptedTurnContinuation(for slot: RuntimeSlot) {
+        let current = state(for: slot)
+        guard !isOffline, !current.isStreaming, !current.isRetrying,
               !slot.connectivityResumeCancelled, !slot.connectivityResumePreparing,
-              slot.runtime.isRunning, slot.isReady, !slot.isStarting else { return }
+              slot.runtime.isRunning, slot.isReady, !slot.isStarting, !slot.isSuperseded else { return }
 
         // Verify the helper command on this already-running Pi process. The extension may have
         // been disabled or upgraded after launch; in that case a plain visible continuation is
@@ -586,18 +592,18 @@ final class AppStore: ObservableObject {
             guard let self, let slot else { return }
             slot.connectivityResumePreparing = false
             let current = state(for: slot)
-            guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying,
+            guard !isOffline, !current.isStreaming, !current.isRetrying,
                   !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
 
             let response: JSONValue
             switch result {
             case let .success(value): response = value
             case .failure:
-                sendConnectivityResume(to: slot, hidden: false)
+                sendInterruptedTurnContinuation(to: slot, hidden: false)
                 return
             }
             guard responseError(response) == nil else {
-                sendConnectivityResume(to: slot, hidden: false)
+                sendInterruptedTurnContinuation(to: slot, hidden: false)
                 return
             }
             let helperPath = ActivityExtensionInstaller.installedFileURL().standardizedFileURL.path
@@ -609,12 +615,14 @@ final class AppStore: ObservableObject {
                         URL(fileURLWithPath: $0).standardizedFileURL.path == helperPath
                     } == true
             }
-            sendConnectivityResume(to: slot, hidden: hasHelper)
+            sendInterruptedTurnContinuation(to: slot, hidden: hasHelper)
         }
     }
 
-    private func sendConnectivityResume(to slot: RuntimeSlot, hidden: Bool) {
-        guard state(for: slot).isWaitingForNetwork, !slot.connectivityResumeCancelled else { return }
+    private func sendInterruptedTurnContinuation(to slot: RuntimeSlot, hidden: Bool) {
+        let current = state(for: slot)
+        guard !isOffline, !current.isStreaming, !current.isRetrying,
+              !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
         clearConnectivityWait(for: slot)
         slot.connectivityResumeInFlight = true
         slot.promptBeganAt = Date()
@@ -644,14 +652,14 @@ final class AppStore: ObservableObject {
                 }
                 return
             }
-            failConnectivityResume(slot, error: errorText)
+            failInterruptedTurnContinuation(slot, error: errorText)
         }
     }
 
-    private func failConnectivityResume(_ slot: RuntimeSlot, error: String) {
+    private func failInterruptedTurnContinuation(_ slot: RuntimeSlot, error: String) {
         clearConnectivityWait(for: slot)
         slot.connectivityResumeInFlight = false
-        let message = "Could not resume after reconnecting: \(error)"
+        let message = "Could not retry the interrupted turn: \(error)"
         updateState(for: slot) { state in
             state.isStreaming = false
             state.phase = .idle
@@ -663,6 +671,27 @@ final class AppStore: ObservableObject {
             resetRuntimeRetirementLease(for: slot)
         } else if isIdleAndClean(slot) {
             retireBackgroundRuntime(slot)
+        }
+    }
+
+    func retryLastFailedTurn() {
+        guard let session = selectedSession, canRetryLastFailure else { return }
+        guard !isOffline else {
+            showToast("Reconnect before retrying this turn.", style: .warning)
+            return
+        }
+        let path = session.fileURL.standardizedFileURL.path
+        runtimeState.lastError = nil
+        ensureRuntime(cwd: session.cwd, sessionPath: session.fileURL) { [weak self] result in
+            guard let self, selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+            switch result {
+            case let .success(slot):
+                slot.connectivityResumeCancelled = false
+                prepareInterruptedTurnContinuation(for: slot)
+            case let .failure(error):
+                runtimeState.lastError = error.localizedDescription
+                showToast(error.localizedDescription, style: .error)
+            }
         }
     }
 
@@ -973,6 +1002,10 @@ final class AppStore: ObservableObject {
         let queued = slot === activeRuntimeSlot && !activePresentationDetached ? outbox : slot.outbox
         return slot.isStarting || current.isBusy || !queued.isEmpty || current.queueCount > 0
             || !slot.outboxDispatches.isEmpty
+    }
+
+    var canRetryLastFailure: Bool {
+        isSelectedRuntime && runtimeState.lastError != nil && !runtimeState.isBusy
     }
 
     var currentRouteRuntimePhase: RuntimePhase? {
