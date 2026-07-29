@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 10
+// pi-desktop-activity-version: 11
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -469,10 +469,11 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     promptSnippet: "Create durable scheduled prompts managed by Pi Desktop",
     promptGuidelines: [
       "Use schedule_automation instead of Agent's schedule parameter whenever the user explicitly asks for scheduled, recurring, or delayed work in the current conversation.",
+      "For current-conversation automations, rely on durable thread history. Keep the scheduled prompt concise: state the recurring action and critical safety constraints, but do not restate the schedule or turn prior discussion into a self-contained runbook.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Short name shown on the Automations page." }),
-      prompt: Type.String({ description: "The complete prompt Pi should execute when the automation fires." }),
+      prompt: Type.String({ description: "The message appended to this conversation when the automation fires. It inherits durable thread context; repeat only critical facts and safety constraints." }),
       schedule: Type.String({
         description: "5-field cron, 6-field cron with zero seconds, interval (15m/1h), or one-shot (+10m/ISO timestamp).",
       }),

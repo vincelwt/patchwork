@@ -112,8 +112,10 @@ and resuming is the switch on each row, and the clock button opens **Run History
 recent 50 runs for that automation with their status, start time, duration, and stored error or
 summary; full output remains in the target conversation. When the background service is reachable,
 compatible scheduling requests from a thread use this same durable store, so they appear on the
-page and survive that Pi process exiting. The Agent extension's session-local scheduler remains the
-fallback for specialized subagent jobs or when the service is off.
+page and survive that Pi process exiting. Existing-thread runs reopen that conversation, so Pi keeps
+the scheduled message concise and relies on its durable history instead of repeating the full
+runbook. The Agent extension's session-local scheduler remains the fallback for specialized
+subagent jobs or when the service is off.
 
 The default app-hosted service runs only while Pi Desktop is open. On quit it stops its own Pi
 workers; direct terminal `pi` processes remain external and untouched. Missed one-shot, cron, and
