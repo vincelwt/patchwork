@@ -2,6 +2,8 @@ import SwiftUI
 
 struct DaemonSettingsView: View {
     @EnvironmentObject private var supervisor: DaemonSupervisor
+    @State private var toolState = CommandLineToolInstaller.state()
+    @State private var toolError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space16) {
@@ -22,6 +24,10 @@ struct DaemonSettingsView: View {
 
             Divider()
 
+            commandLineTool
+
+            Divider()
+
             Text("Pi Desktop hosts threads, automations, CLI access, and remote access inside the app process. "
                 + "They stop when the app quits. An explicitly installed `pi-deskd` login item remains independent.")
                 .font(PiFont.caption)
@@ -29,6 +35,48 @@ struct DaemonSettingsView: View {
         }
         .padding(PiTheme.space24)
         .frame(width: 420)
+    }
+
+    /// The CLI lives inside the bundle, so it needs a link on `PATH` to be usable at all.
+    @ViewBuilder
+    private var commandLineTool: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space6) {
+            Text("Command Line Tool").font(PiFont.bodyEmphasis)
+            switch toolState {
+            case let .installed(path):
+                Text("`pidesk` is installed at \(path).")
+                    .font(PiFont.caption)
+                    .foregroundStyle(.secondary)
+            case .notInstalled:
+                HStack(spacing: PiTheme.space8) {
+                    Button("Install “pidesk”") { install() }
+                    Text("Links it into ~/.local/bin, next to Pi itself.")
+                        .font(PiFont.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            case let .conflicting(path):
+                Text("Something else already exists at \(path); leaving it alone.")
+                    .font(PiFont.caption)
+                    .foregroundStyle(Color.piOrange)
+            case .unavailable:
+                Text("Available from the packaged app.")
+                    .font(PiFont.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            if let toolError {
+                Text(toolError).font(PiFont.caption).foregroundStyle(Color.piRed)
+            }
+        }
+    }
+
+    private func install() {
+        do {
+            _ = try CommandLineToolInstaller.install()
+            toolError = nil
+        } catch {
+            toolError = error.localizedDescription
+        }
+        toolState = CommandLineToolInstaller.state()
     }
 
     private var statusColor: Color {
