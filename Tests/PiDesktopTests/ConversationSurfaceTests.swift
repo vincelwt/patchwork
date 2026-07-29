@@ -11,6 +11,20 @@ final class ConversationToolbarTests: XCTestCase {
         XCTAssertFalse(source.contains("StatusDot"))
     }
 
+    /// The soft macOS 26 scroll edge effect computes its backdrop from scroll state that
+    /// programmatic positioning leaves stale, ballooning a ghost blur over the top of freshly
+    /// opened conversations until a real scroll refreshes it. The transcript must keep a hard
+    /// top edge.
+    func testTranscriptUsesAHardTopScrollEdge() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop")
+        let conversation = try String(contentsOf: root.appendingPathComponent("ConversationView.swift"), encoding: .utf8)
+        let theme = try String(contentsOf: root.appendingPathComponent("Theme.swift"), encoding: .utf8)
+        XCTAssertTrue(conversation.contains(".piHardTopScrollEdge()"))
+        XCTAssertTrue(theme.contains("scrollEdgeEffectStyle(.hard, for: .top)"))
+    }
+
     /// A `withAnimation` around any shared-store mutation (toasts fire constantly with several
     /// running conversations) animates every batched view diff. If the transcript's structural
     /// swaps ride such a transaction, an interrupted crossfade leaves the conversation ghosted
