@@ -531,6 +531,43 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(store.draft, "", "The settled turn left nothing pending to restore")
     }
 
+    func testProviderRetryTracksCountdownAndClearsMetadata() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "retry this"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_start"),
+            "attempt": .number(2),
+            "delayMs": .number(30_000),
+            "errorMessage": .string("servers overloaded")
+        ]))
+
+        XCTAssertTrue(store.runtimeState.isRetrying)
+        XCTAssertEqual(store.runtimeState.retryAttempt, 2)
+        XCTAssertEqual(store.runtimeState.retryDelayMs, 30_000)
+        XCTAssertEqual(store.runtimeState.retryErrorMessage, "servers overloaded")
+        XCTAssertTrue((29 ... 30).contains(store.runtimeState.retrySecondsRemaining(at: Date()) ?? -1))
+
+        runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(true)]))
+        XCTAssertFalse(store.runtimeState.isRetrying)
+        XCTAssertNil(store.runtimeState.retryAttempt)
+        XCTAssertNil(store.runtimeState.retryDelayMs)
+        XCTAssertNil(store.runtimeState.retryStartedAt)
+        XCTAssertNil(store.runtimeState.retryErrorMessage)
+
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_start"), "attempt": .number(1), "delayMs": .number(1_000)
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertNil(store.runtimeState.retryStartedAt)
+        XCTAssertNil(store.runtimeState.retryDelayMs)
+    }
+
     func testExhaustedProviderRetriesContinueWithBackoffUntilSuccessOrAbort() {
         let retryScheduler = RetryScheduleCapture()
         let (store, runtime, session, _) = makeStore(providerRetryScheduler: retryScheduler.schedule)
@@ -551,12 +588,18 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(retryScheduler.delays, [15])
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
         XCTAssertTrue(store.runtimeState.isRetrying)
+        XCTAssertEqual(store.runtimeState.retryAttempt, 1)
+        XCTAssertEqual(store.runtimeState.retryDelayMs, 15_000)
+        XCTAssertEqual(store.runtimeState.retryErrorMessage, "servers overloaded")
+        XCTAssertTrue((14 ... 15).contains(store.runtimeState.retrySecondsRemaining(at: Date()) ?? -1))
         XCTAssertFalse(store.canRetryLastFailure)
         XCTAssertNil(store.runtimeState.lastError)
 
         retryScheduler.fireNext()
         XCTAssertEqual(runtime.commandCount("prompt"), 2)
         XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "/pi-desktop-resume")
+        XCTAssertNil(store.runtimeState.retryStartedAt)
+        XCTAssertNil(store.runtimeState.retryErrorMessage)
         runtime.succeed("prompt", data: .object([:]))
         runtime.onEvent?(.object(["type": .string("auto_retry_end"), "success": .bool(false)]))
         runtime.onEvent?(.object(["type": .string("agent_settled")]))
@@ -1016,14 +1059,17 @@ final class AppStoreRollbackTests: XCTestCase {
 
 @MainActor
 final class StatusCacheMergeTests: XCTestCase {
-    func testTransientSubagentStatusIsLiveOnlyAndOldCacheIsPurged() throws {
+    func testTransientRuntimeStatusesAreLiveOnlyAndOldCacheIsPurged() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let persistence = AppPersistence(baseURL: directory)
-        persistence.cacheExtensionStatuses([ExtensionStatusParser.subagentsKey: "1 running agent"])
+        persistence.cacheExtensionStatuses([
+            ExtensionStatusParser.subagentsKey: "1 running agent",
+            ExtensionStatusParser.providerQueueKey: "Waiting for Codex slot…"
+        ])
         let store = AppStore(
             repository: FakeRepository(),
             gitService: FakeGitService(),
@@ -1033,7 +1079,9 @@ final class StatusCacheMergeTests: XCTestCase {
         )
 
         XCTAssertNil(store.statusModel.values[ExtensionStatusParser.subagentsKey])
+        XCTAssertNil(store.statusModel.values[ExtensionStatusParser.providerQueueKey])
         XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.subagentsKey])
+        XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.providerQueueKey])
 
         store.handleRPCEventForTesting(.object([
             "type": .string("extension_ui_request"),
@@ -1050,6 +1098,15 @@ final class StatusCacheMergeTests: XCTestCase {
             "statusKey": .string(ExtensionStatusParser.subagentsKey)
         ]))
         XCTAssertNil(store.statusModel.values[ExtensionStatusParser.subagentsKey])
+
+        store.handleRPCEventForTesting(.object([
+            "type": .string("extension_ui_request"),
+            "method": .string("setStatus"),
+            "statusKey": .string(ExtensionStatusParser.providerQueueKey),
+            "statusText": .string("Waiting for Codex slot…")
+        ]))
+        XCTAssertEqual(store.statusModel.values[ExtensionStatusParser.providerQueueKey], "Waiting for Codex slot…")
+        XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.providerQueueKey])
     }
 
     func testAPartialLiveUpdateNeverErasesTheKnownAccount() throws {

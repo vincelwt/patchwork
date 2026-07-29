@@ -296,9 +296,18 @@ private struct ComposerRuntimeLabel: View {
                     .foregroundStyle(Color.piOrange)
             } else if store.isSelectedRuntime, store.runtimeState.isCompacting {
                 Label("Compacting", systemImage: "arrow.triangle.2.circlepath").foregroundStyle(Color.piPurple)
-            } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
-                Label("Retry \(store.runtimeState.retryAttempt ?? 1)", systemImage: "arrow.clockwise")
+            } else if store.isSelectedRuntime,
+                      let queue = store.statusModel.values[ExtensionStatusParser.providerQueueKey], !queue.isEmpty {
+                Label(queue, systemImage: "hourglass")
                     .foregroundStyle(Color.piOrange)
+            } else if store.isSelectedRuntime, store.runtimeState.isRetrying {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = store.runtimeState.retrySecondsRemaining(at: context.date)
+                    Label(remaining.map { $0 > 0 ? "Retry in \($0)s" : "Retrying" }
+                        ?? "Retry \(store.runtimeState.retryAttempt ?? 1)", systemImage: "arrow.clockwise")
+                }
+                .foregroundStyle(Color.piOrange)
+                .help(store.runtimeState.retryErrorMessage ?? "Retrying the last provider request")
             } else if let label = store.currentRouteRuntimePhase?.label {
                 HStack(spacing: PiTheme.space4) {
                     StatusDot(color: .piGreen, pulsing: true)
