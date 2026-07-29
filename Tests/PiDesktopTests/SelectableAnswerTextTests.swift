@@ -8,40 +8,69 @@ private func descendant<View: NSView>(_ type: View.Type, in root: NSView) -> Vie
     return root.subviews.lazy.compactMap { descendant(type, in: $0) }.first
 }
 
-/// Covers the cross-block answer partitioner, attributed-string builder, and hosted text sizing.
+/// Covers the answer attributed-string builder (including native table layout) and text sizing.
 /// Real AppKit drag/selection interaction is not exercised here, the same way the rest of the
 /// suite never simulates mouse events — see `ComposerInlineImageTests` for the established pattern
 /// of testing AppKit text state programmatically instead.
 final class SelectableAnswerTextTests: XCTestCase {
-    // MARK: - Partitioning
+    // MARK: - Tables (one shared selection, not a separate island)
 
-    func testContiguousNonTableBlocksStayInOneRun() {
-        let blocks: [MarkdownBlock] = [.paragraph("one"), .list(items: [], ordered: false, start: 1), .paragraph("two")]
-        let runs = MarkdownAnswerPartitioner.runs(from: blocks)
-        XCTAssertEqual(runs.count, 1)
-        guard case let .text(grouped, _) = runs[0] else { return XCTFail("Expected one text run") }
-        XCTAssertEqual(grouped.count, 3)
+    func testTableCellsAreLaidOutAsOneNativeTextTableInTheSameString() throws {
+        let blocks = MarkdownBlockParser.blocks(from: """
+        before
+
+        | Feedback | Fix |
+        | --- | ---: |
+        | not clickable | recap passes onWordPress |
+
+        after
+        """)
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
+        let string = built.attributedString.string
+
+        for fragment in ["before", "Feedback", "Fix", "not clickable", "recap passes onWordPress", "after"] {
+            XCTAssertTrue(string.contains(fragment), "\(fragment) must live in the same selectable string")
+        }
+
+        // Every cell belongs to one and the same NSTextTable, which is what lets a drag cross rows.
+        var tables: [NSTextTable] = []
+        for fragment in ["Feedback", "Fix", "not clickable", "recap passes onWordPress"] {
+            let range = NSRange(try XCTUnwrap(string.range(of: fragment)), in: string)
+            let style = try XCTUnwrap(
+                built.attributedString.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle
+            )
+            let block = try XCTUnwrap(style.textBlocks.first as? NSTextTableBlock, "\(fragment) must be a table cell")
+            tables.append(block.table)
+        }
+        XCTAssertEqual(tables.count, 4)
+        XCTAssertTrue(tables.allSatisfy { $0 === tables[0] })
+        XCTAssertEqual(tables[0].numberOfColumns, 2)
+
+        // Prose around the table is plain text, not a cell.
+        let beforeRange = NSRange(try XCTUnwrap(string.range(of: "before")), in: string)
+        let beforeStyle = built.attributedString.attribute(.paragraphStyle, at: beforeRange.location, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertTrue(beforeStyle?.textBlocks.isEmpty ?? true)
     }
 
-    func testATableSplitsSurroundingProseIntoSeparateRuns() {
-        let table = MarkdownBlock.table(header: ["A"], alignment: [.none], rows: [["1"]])
-        let blocks: [MarkdownBlock] = [.paragraph("before"), table, .paragraph("after")]
-        let runs = MarkdownAnswerPartitioner.runs(from: blocks)
-        XCTAssertEqual(runs.count, 3)
-        guard case .text = runs[0] else { return XCTFail("Expected text before the table") }
-        guard case .table = runs[1] else { return XCTFail("Expected the table itself") }
-        guard case .text = runs[2] else { return XCTFail("Expected text after the table") }
+    func testTableRespectsPerColumnAlignment() throws {
+        let blocks = MarkdownBlockParser.blocks(from: "| L | C | R |\n| :--- | :---: | ---: |\n| a | b | c |")
+        let built = AnswerAttributedTextBuilder.build(blocks: blocks)
+        let string = built.attributedString.string
+        for (fragment, expected) in [("a", NSTextAlignment.left), ("b", .center), ("c", .right)] {
+            let range = NSRange(try XCTUnwrap(string.range(of: fragment)), in: string)
+            let style = try XCTUnwrap(
+                built.attributedString.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle
+            )
+            XCTAssertEqual(style.alignment, expected, fragment)
+        }
     }
 
-    func testConsecutiveTablesEachGetTheirOwnRunWithNoEmptyTextRunBetween() {
-        let table = MarkdownBlock.table(header: ["A"], alignment: [.none], rows: [])
-        let runs = MarkdownAnswerPartitioner.runs(from: [table, table])
-        XCTAssertEqual(runs.count, 2)
-        XCTAssertTrue(runs.allSatisfy { if case .table = $0 { return true } else { return false } })
-    }
-
-    func testEmptyBlockListProducesNoRuns() {
-        XCTAssertTrue(MarkdownAnswerPartitioner.runs(from: []).isEmpty)
+    @MainActor
+    func testAnAnswerWithATableStillMeasuresTallerThanASingleRow() {
+        let blocks = MarkdownBlockParser.blocks(from: "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |")
+        let view = AnswerTextView()
+        view.apply(AnswerAttributedTextBuilder.build(blocks: blocks))
+        XCTAssertGreaterThan(view.height(forWidth: 600), PiFont.size * 3, "Header plus two rows must all be laid out")
     }
 
     // MARK: - Attributed string construction (the ⌘C / continuous-selection model)
@@ -254,16 +283,8 @@ final class MarkdownRunIdentityTests: XCTestCase {
         XCTAssertEqual(paragraph.id, MarkdownBlock.paragraph("hello").id)
     }
 
-    func testRepeatedContentStillGetsDistinctRunIdentities() {
+    func testTableBlockIdentityIsStableAcrossReads() {
         let table = MarkdownBlock.table(header: ["a"], alignment: [.leading], rows: [["1"]])
-        let blocks: [MarkdownBlock] = [
-            .paragraph("same"), table, .paragraph("same"), table, .rule, .rule
-        ]
-        let runs = MarkdownAnswerPartitioner.runs(from: blocks)
-        let ids = runs.map(\.id)
-        XCTAssertEqual(Set(ids).count, ids.count, "identical content must not collide into one view")
-
-        // And the identity has to be stable when the same blocks are partitioned again.
-        XCTAssertEqual(MarkdownAnswerPartitioner.runs(from: blocks).map(\.id), ids)
+        XCTAssertEqual(table.id, table.id)
     }
 }
