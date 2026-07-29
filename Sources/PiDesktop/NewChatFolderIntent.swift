@@ -12,15 +12,22 @@ enum NewChatFolderResolution {
     }
 
     /// `candidate` matches when: nothing has organized it yet (an explicit user move always
-    /// wins over this best-effort guess), it runs in the exact cwd the intent was armed with,
-    /// and it was created no earlier than the intent. That last check is what actually tells
+    /// wins over this best-effort guess), its displayed project matches the cwd the intent was
+    /// armed with (even when Pi runs in a worktree), and it was created no earlier than the
+    /// intent. That last check is what actually tells
     /// apart "the fresh session Pi just assigned" from an unrelated, pre-existing conversation
     /// that happens to share the same folder: `AppStore.ensureProvisionalSession` stamps a new
     /// session's `createdAt` with `Date()` at the moment it learns the session's real id/path,
     /// so a genuine match's timestamp always lands at or after the moment the intent was armed.
-    static func matches(_ candidate: SessionSummary, intent: Intent, existingAssignment: String?) -> Bool {
+    static func matches(
+        _ candidate: SessionSummary,
+        intent: Intent,
+        existingAssignment: String?,
+        projectFolder: URL? = nil
+    ) -> Bool {
         guard existingAssignment == nil else { return false }
-        guard candidate.cwd.standardizedFileURL.path == intent.cwd.standardizedFileURL.path else { return false }
+        let folder = projectFolder ?? candidate.cwd
+        guard folder.standardizedFileURL.path == intent.cwd.standardizedFileURL.path else { return false }
         return candidate.createdAt >= intent.armedAt
     }
 }
@@ -72,7 +79,12 @@ final class NewChatFolderIntent {
         guard case let .session(path) = route,
               let session = store.sessions.first(where: { $0.fileURL.standardizedFileURL.path == path })
         else { return }
-        guard NewChatFolderResolution.matches(session, intent: intent, existingAssignment: store.virtualFolderID(for: session)) else { return }
+        guard NewChatFolderResolution.matches(
+            session,
+            intent: intent,
+            existingAssignment: store.virtualFolderID(for: session),
+            projectFolder: store.projectFolder(for: session)
+        ) else { return }
         store.moveSession(session, toVirtualFolder: intent.folderID)
     }
 }

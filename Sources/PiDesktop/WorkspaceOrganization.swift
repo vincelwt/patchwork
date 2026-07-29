@@ -187,6 +187,17 @@ enum WorkspaceOrganization {
 
     // MARK: - Categorization path
 
+    /// App-created worktrees remain execution details: organization uses the project they were
+    /// cut from while Pi continues to use the session's real cwd.
+    static func projectPath(
+        of session: SessionSummary,
+        managedWorktreeProjects: [String: String] = [:]
+    ) -> String {
+        let cwd = session.cwd.standardizedFileURL.path
+        guard let project = managedWorktreeProjects[cwd] else { return cwd }
+        return URL(fileURLWithPath: project, isDirectory: true).standardizedFileURL.path
+    }
+
     /// Where a conversation actually sits in the sidebar, outermost ancestor first and the
     /// conversation itself last, so a breadcrumb can never disagree with the tree that
     /// `SidebarSnapshot` draws from the same `parentID`/assignment state:
@@ -200,11 +211,12 @@ enum WorkspaceOrganization {
         of session: SessionSummary,
         folders: [VirtualFolder],
         assignments: [String: String],
+        managedWorktreeProjects: [String: String] = [:],
         maxDepth: Int = 48
     ) -> [String] {
         let assigned = assignments[session.fileURL.standardizedFileURL.path]
         guard let assigned, var folder = folders.first(where: { $0.id == assigned }) else {
-            return [label(forProjectPath: session.cwd.standardizedFileURL.path), session.displayName]
+            return [label(forProjectPath: projectPath(of: session, managedWorktreeProjects: managedWorktreeProjects)), session.displayName]
         }
         var chain = [folder.name]
         var visited: Set<String> = [folder.id]
@@ -244,9 +256,15 @@ enum WorkspaceOrganization {
         sessions: [SessionSummary],
         assignments: [String: String],
         folders: [VirtualFolder],
-        fallback: URL
+        fallback: URL,
+        managedWorktreeProjects: [String: String] = [:]
     ) -> URL {
-        if let shared = mostCommonCwd(inVirtualFolder: folderID, sessions: sessions, assignments: assignments) {
+        if let shared = mostCommonCwd(
+            inVirtualFolder: folderID,
+            sessions: sessions,
+            assignments: assignments,
+            managedWorktreeProjects: managedWorktreeProjects
+        ) {
             return shared
         }
         if let project = enclosingProjectPath(ofVirtualFolder: folderID, folders: folders) {
@@ -256,18 +274,25 @@ enum WorkspaceOrganization {
     }
 
     private static func mostCommonCwd(
-        inVirtualFolder folderID: String, sessions: [SessionSummary], assignments: [String: String]
+        inVirtualFolder folderID: String,
+        sessions: [SessionSummary],
+        assignments: [String: String],
+        managedWorktreeProjects: [String: String]
     ) -> URL? {
         let own = sessions.filter { assignments[$0.fileURL.standardizedFileURL.path] == folderID }
         guard !own.isEmpty else { return nil }
         var counts: [String: Int] = [:]
-        for session in own { counts[session.cwd.standardizedFileURL.path, default: 0] += 1 }
+        for session in own {
+            counts[projectPath(of: session, managedWorktreeProjects: managedWorktreeProjects), default: 0] += 1
+        }
         let topCount = counts.values.max() ?? 0
         let tiedPaths = Set(counts.filter { $0.value == topCount }.map(\.key))
         let winner = own
-            .filter { tiedPaths.contains($0.cwd.standardizedFileURL.path) }
+            .filter { tiedPaths.contains(projectPath(of: $0, managedWorktreeProjects: managedWorktreeProjects)) }
             .max { $0.modifiedAt < $1.modifiedAt }
-        return winner.map { URL(fileURLWithPath: $0.cwd.standardizedFileURL.path, isDirectory: true) }
+        return winner.map {
+            URL(fileURLWithPath: projectPath(of: $0, managedWorktreeProjects: managedWorktreeProjects), isDirectory: true)
+        }
     }
 
     /// Walks up through parent virtual folders — cycle-safe like `effectiveParentID`, which this
@@ -386,6 +411,17 @@ extension AppPersistence {
 extension AppStore {
     var virtualFolders: [VirtualFolder] { persistence.state.virtualFolders }
     var virtualFolderAssignments: [String: String] { persistence.state.virtualFolderAssignments }
+    var managedWorktreeProjects: [String: String] { persistence.state.managedWorktreeProjects }
+
+    func projectFolder(for session: SessionSummary) -> URL {
+        URL(
+            fileURLWithPath: WorkspaceOrganization.projectPath(
+                of: session,
+                managedWorktreeProjects: managedWorktreeProjects
+            ),
+            isDirectory: true
+        )
+    }
 
     func virtualFolderID(for session: SessionSummary) -> String? {
         let path = session.fileURL.standardizedFileURL.path
@@ -395,12 +431,20 @@ extension AppStore {
 
     /// Sidebar categorization path for a conversation; see `WorkspaceOrganization.categorization`.
     func categorization(of session: SessionSummary) -> [String] {
-        WorkspaceOrganization.categorization(of: session, folders: virtualFolders, assignments: virtualFolderAssignments)
+        WorkspaceOrganization.categorization(
+            of: session,
+            folders: virtualFolders,
+            assignments: virtualFolderAssignments,
+            managedWorktreeProjects: managedWorktreeProjects
+        )
     }
 
     func displayFolderName(for session: SessionSummary) -> String {
         guard let id = virtualFolderID(for: session), let folder = virtualFolders.first(where: { $0.id == id }) else {
-            return WorkspaceOrganization.isGlobalWorkingDirectory(session.cwd) ? "Global" : session.folderName
+            let project = projectFolder(for: session)
+            return WorkspaceOrganization.isGlobalWorkingDirectory(project)
+                ? "Global"
+                : SessionFolderGroup.projectName(forPath: project.path)
         }
         return folder.name
     }
@@ -442,7 +486,8 @@ extension AppStore {
             sessions: sessions,
             assignments: virtualFolderAssignments,
             folders: virtualFolders,
-            fallback: selectedFolder ?? WorkspaceOrganization.globalWorkingDirectory
+            fallback: selectedFolder ?? WorkspaceOrganization.globalWorkingDirectory,
+            managedWorktreeProjects: managedWorktreeProjects
         )
     }
 

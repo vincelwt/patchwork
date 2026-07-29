@@ -30,6 +30,22 @@ final class NewChatFolderResolutionTests: XCTestCase {
         XCTAssertFalse(NewChatFolderResolution.matches(elsewhere, intent: intent, existingAssignment: nil))
     }
 
+    func testMatchesAWorktreeSessionThroughItsProjectFolder() {
+        let armedAt = Date(timeIntervalSince1970: 1_000)
+        let project = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
+        let intent = NewChatFolderResolution.Intent(folderID: "focus", cwd: project, armedAt: armedAt)
+        let worktree = session(cwd: "/tmp/worktree", createdAt: armedAt.addingTimeInterval(5))
+
+        XCTAssertTrue(
+            NewChatFolderResolution.matches(
+                worktree,
+                intent: intent,
+                existingAssignment: nil,
+                projectFolder: project
+            )
+        )
+    }
+
     func testRejectsAPreExistingSessionCreatedBeforeTheIntentWasArmed() {
         let armedAt = Date(timeIntervalSince1970: 1_000)
         let intent = NewChatFolderResolution.Intent(folderID: "focus", cwd: URL(fileURLWithPath: "/tmp/project"), armedAt: armedAt)
