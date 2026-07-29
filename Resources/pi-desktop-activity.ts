@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 13
+// pi-desktop-activity-version: 14
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
