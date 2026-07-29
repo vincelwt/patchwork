@@ -206,6 +206,26 @@ final class ConversationWorktreeTests: XCTestCase {
         XCTAssertEqual(link.flatMap(PullRequestLink.number(in:)), "#482")
     }
 
+    @MainActor
+    func testPullRequestLinkCacheInvalidatesWhenATranscriptWithTheSameCountReplacesIt() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("PiPRLink-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = AppStore(
+            persistence: AppPersistence(baseURL: base),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+
+        store.messages = [message("https://github.com/acme/widgets/pull/11")]
+        XCTAssertEqual(store.pullRequestLink?.absoluteString, "https://github.com/acme/widgets/pull/11")
+
+        store.messages = [message("https://github.com/acme/widgets/pull/482")]
+        XCTAssertEqual(
+            store.pullRequestLink?.absoluteString,
+            "https://github.com/acme/widgets/pull/482",
+            "Switching between equal-length transcripts must not retain the previous thread's link"
+        )
+    }
+
     func testGitLabMergeRequestsCountAndUnrelatedGitHubLinksDoNot() {
         XCTAssertEqual(
             PullRequestLink.firstLink(in: "see https://gitlab.com/acme/widgets/-/merge_requests/7")?.absoluteString,

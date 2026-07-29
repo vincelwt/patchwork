@@ -3,7 +3,8 @@ import PiDeskKit
 
 /// The real `RunExecuting`: spawns `pi --mode rpc`, attaches to the target session (or creates
 /// one in a cwd), applies `mode` if requested, sends the prompt, streams events until
-/// `agent_settled`, then stops the runtime. This is the only type in the daemon that actually
+/// `agent_settled` (or Pi Desktop's command-only completion marker), then stops the runtime.
+/// This is the only type in the daemon that actually
 /// launches Pi; every test uses a fake `RunExecuting` instead.
 struct PiProcessRunExecutor: RunExecuting {
     let logger: DaemonLogger
@@ -164,6 +165,17 @@ struct PiProcessRunExecutor: RunExecuting {
     /// Polls in short slices (rather than one long wait) so both the run's own timeout and
     /// cooperative cancellation from `RunManager`'s timeout race are noticed within a few
     /// seconds instead of only after the next Pi event arrives.
+    private static let commandOnlyReviewPrompt = "/pi-desktop-pr-review "
+    private static let commandOnlyReviewStatus = "pi-desktop-pr-review-complete"
+
+    private static func isCommandOnlyCompletion(_ event: PiJSONValue, prompt: String) -> Bool {
+        prompt.hasPrefix(commandOnlyReviewPrompt)
+            && event["type"]?.stringValue == "extension_ui_request"
+            && event["method"]?.stringValue == "setStatus"
+            && event["statusKey"]?.stringValue == commandOnlyReviewStatus
+            && event["statusText"] == nil
+    }
+
     private func consumeUntilSettled(
         _ session: PiRPCSession, job: RunJob, liveThreadID: String?,
         resolvedThreadId: String?, resolvedThreadPath: String?,
@@ -226,8 +238,8 @@ struct PiProcessRunExecutor: RunExecuting {
                 lastAssistantText = Self.firstLine(from: message["content"]) ?? lastAssistantText
                 lastAssistantIsError = message["isError"]?.boolValue ?? (message["stopReason"]?.stringValue == "error")
             }
-            if type == "agent_settled" {
-                // The settle boundary is the only place this run may stop accepting live messages,
+            if type == "agent_settled" || Self.isCommandOnlyCompletion(event, prompt: job.prompt) {
+                // A settle boundary is the only place this run may stop accepting live messages,
                 // and closing admission is what makes that safe: a steer accepted moments ago owns
                 // the turn now starting, and stopping the session here would discard it.
                 guard let liveThreadID, let liveSessions else {
