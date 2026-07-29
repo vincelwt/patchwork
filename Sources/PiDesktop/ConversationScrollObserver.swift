@@ -58,6 +58,9 @@ enum ScrollDebug {
 struct ConversationScrollObserver: NSViewRepresentable {
     let bridge: ConversationScrollBridge
     let onChange: (ConversationScrollMetrics) -> Void
+    /// Invoked (coalesced) after an open settles or a forced origin move, so the SwiftUI side
+    /// can bump a state tick that guarantees one render pass against the actual viewport.
+    var onHeal: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -136,7 +139,10 @@ struct ConversationScrollObserver: NSViewRepresentable {
         private(set) var pinned = true
         private var prependArmed = false
         private var isAdjusting = false
-        private var paintHealScheduled = false
+        /// True from attach until the first heal runs: every open gets exactly one heal after
+        /// its content settles, whether or not any correction fired.
+        private var openHealArmed = true
+        private var healWork: DispatchWorkItem?
         private var pendingMetrics: ConversationScrollMetrics?
         private var metricsCallbackScheduled = false
 
@@ -186,6 +192,8 @@ struct ConversationScrollObserver: NSViewRepresentable {
             // `defaultScrollAnchor(.bottom)` already positions the first frame through SwiftUI's
             // own pipeline. Scrolling the clip view mid-update leaves SwiftUI's display list
             // culled for the stale viewport — the "ghost band + blank transcript" artifact.
+            openHealArmed = true
+            scheduleHeal()
             publish(direction: .stationary)
         }
 
@@ -209,6 +217,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
             lastDocumentHeight = newHeight
             guard abs(newHeight - oldHeight) > 0.5 else { return }
             ScrollDebug.log("frame \(Int(oldHeight))->\(Int(newHeight)) origin=\(Int(scrollView.contentView.bounds.origin.y)) clipH=\(Int(scrollView.contentView.bounds.height)) pinned=\(pinned) svInsets=\(scrollView.contentInsets) clipInsets=\(scrollView.contentView.contentInsets) safeArea=\(scrollView.safeAreaInsets)")
+            if openHealArmed { scheduleHeal() }
             let insets = scrollView.contentView.contentInsets
             if pinned {
                 // `defaultScrollAnchor(.bottom)` usually maintains the pin itself, fully
@@ -270,32 +279,52 @@ struct ConversationScrollObserver: NSViewRepresentable {
             scrollView.reflectScrolledClipView(scrollView.contentView)
             isAdjusting = false
             previousOriginY = y
-            schedulePaintHeal()
+            scheduleHeal()
         }
 
-        /// A clip-origin move made inside SwiftUI's update or layout pass positions correctly
-        /// but leaves SwiftUI's display list rendered for the old viewport: newly exposed rows
-        /// stay blank and stale pixels linger until the next real scroll. One coalesced pass
-        /// after the current turn re-asserts the origin through the normal notification path
-        /// (with a sub-pixel nudge so the bounds change is real), which makes SwiftUI re-render
-        /// the viewport it is actually showing.
-        private func schedulePaintHeal() {
-            guard !paintHealScheduled else { return }
-            paintHealScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                paintHealScheduled = false
-                guard let scrollView else { return }
-                ScrollDebug.log("heal fires")
-                let clip = scrollView.contentView
-                let origin = clip.bounds.origin
+        /// SwiftUI can render a conversation's first display list for the pre-anchor viewport
+        /// (or, after a forced origin move made inside layout, for the pre-move viewport) and
+        /// never repaint: the thread opens white or ghosted until the user scrolls. This heal is
+        /// that manual scroll, made automatic and invisible. Debounced past the open's settle
+        /// churn; every open runs it at least once, and every forced move re-runs it.
+        private func scheduleHeal() {
+            healWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.performHeal() }
+            healWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        }
+
+        private func performHeal() {
+            guard let scrollView, let document = scrollView.documentView else { return }
+            openHealArmed = false
+            ScrollDebug.log("heal fires")
+            let clip = scrollView.contentView
+            let origin = clip.bounds.origin
+            let insets = clip.contentInsets
+            let bottomMost = ConversationScrollObserver.bottomOriginY(
+                documentHeight: document.bounds.height,
+                viewportHeight: clip.bounds.height,
+                topInset: insets.top,
+                bottomInset: insets.bottom
+            )
+            // A real one-point move the clip view will accept, then back — two genuine bounds
+            // changes across two turns, exactly what a manual scroll does. Underfilled content
+            // has no scrollable range, so short conversations rely on the SwiftUI tick below.
+            if bottomMost > -insets.top + 1 {
+                let nudged = origin.y > -insets.top + 1 ? origin.y - 1 : origin.y + 1
                 isAdjusting = true
-                clip.setBoundsOrigin(NSPoint(x: origin.x, y: origin.y + 0.5))
-                isAdjusting = false
-                clip.scroll(to: origin)
+                clip.scroll(to: NSPoint(x: origin.x, y: nudged))
                 scrollView.reflectScrolledClipView(clip)
-                previousOriginY = origin.y
+                isAdjusting = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let scrollView = self.scrollView else { return }
+                    scrollView.contentView.scroll(to: origin)
+                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                    previousOriginY = origin.y
+                }
             }
+            document.needsLayout = true
+            parent.onHeal()
         }
 
         /// Metrics reach SwiftUI coalesced and asynchronously — state must not mutate inside the
