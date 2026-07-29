@@ -78,6 +78,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Pi Desktop uses Apple Events to control Mac apps on your behalf.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>
@@ -91,12 +93,26 @@ PLIST
 # Ad-hoc signing avoids a damaged-app warning for local builds. Distribution
 # signing/notarization can replace this identity later.
 if command -v codesign >/dev/null 2>&1; then
+    cat > "$ICON_OUT/PiDesktop.entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+
     # The optional standalone host and CLI are separate executables, so sign them before the
     # whole-bundle pass reseals the outer resource envelope.
     codesign --force --sign - "$APP/Contents/Helpers/pi-deskd" >/dev/null
     codesign --force --sign - "$APP/Contents/Helpers/pidesk" >/dev/null
-    codesign --force --deep --sign - "$APP" >/dev/null
+    codesign --force --deep --sign - --entitlements "$ICON_OUT/PiDesktop.entitlements" "$APP" >/dev/null
     codesign --verify --deep --strict "$APP"
+    plutil -extract NSAppleEventsUsageDescription raw -o - "$APP/Contents/Info.plist" | grep -q .
+    codesign -d --entitlements :- "$APP" 2>/dev/null > "$ICON_OUT/SignedEntitlements.plist"
+    test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.automation.apple-events' "$ICON_OUT/SignedEntitlements.plist")" = true
 fi
 
 rm -rf "$INSTALLED_APP"
