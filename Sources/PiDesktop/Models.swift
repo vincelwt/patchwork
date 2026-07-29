@@ -314,7 +314,7 @@ enum RuntimePhase: Hashable, Sendable {
         case .idle: nil
         case .startingPi: "Starting Pi…"
         case .openingConversation: "Opening conversation…"
-        case .waitingForModel: "Waiting for model…"
+        case .waitingForModel: "Waiting for first response…"
         case .working: "Working"
         }
     }
@@ -328,6 +328,9 @@ struct RuntimeState: Hashable, Sendable {
     var isRetrying = false
     var isWaitingForNetwork = false
     var retryAttempt: Int?
+    var retryDelayMs: Int?
+    var retryStartedAt: Date?
+    var retryErrorMessage: String?
     var steeringQueue: [String] = []
     var followUpQueue: [String] = []
     var steeringMode = "one-at-a-time"
@@ -345,6 +348,20 @@ struct RuntimeState: Hashable, Sendable {
     var queuedFollowUp: Int { followUpQueue.count }
     var queueCount: Int { steeringQueue.count + followUpQueue.count }
     var isBusy: Bool { isStreaming || isCompacting || isRetrying || isWaitingForNetwork }
+
+    func retrySecondsRemaining(at date: Date) -> Int? {
+        guard isRetrying, let retryDelayMs, let retryStartedAt else { return nil }
+        let elapsed = date.timeIntervalSince(retryStartedAt)
+        return max(0, Int(ceil(Double(retryDelayMs) / 1_000 - elapsed)))
+    }
+
+    mutating func clearRetryState() {
+        isRetrying = false
+        retryAttempt = nil
+        retryDelayMs = nil
+        retryStartedAt = nil
+        retryErrorMessage = nil
+    }
 }
 
 struct GitFileChange: Identifiable, Hashable, Sendable {

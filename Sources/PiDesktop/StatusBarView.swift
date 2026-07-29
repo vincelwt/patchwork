@@ -56,7 +56,7 @@ private struct RuntimeStateLabel: View {
     @EnvironmentObject private var store: AppStore
 
     /// Idle is the normal state and needs no words: the bar only speaks while Pi is busy.
-    private var activity: (text: String, help: String, symbol: String?)? {
+    private func activity(at date: Date) -> (text: String, help: String, symbol: String?)? {
         if store.isOffline {
             let paused = store.runtimeState.isWaitingForNetwork
             return (paused ? "Offline · paused" : "Offline", paused ? "This turn will resume when the network returns" : "No network connection", "wifi.slash")
@@ -67,10 +67,21 @@ private struct RuntimeStateLabel: View {
         if store.isSelectedRuntime, store.runtimeState.isCompacting {
             return ("Compacting", "Compacting the context window", nil)
         }
+        if store.isSelectedRuntime,
+           let queue = store.statusModel.values[ExtensionStatusParser.providerQueueKey], !queue.isEmpty {
+            return (queue, "This request is waiting for an available Codex account slot", nil)
+        }
         if store.isSelectedRuntime, store.runtimeState.isRetrying {
-            return ("Retry \(store.runtimeState.retryAttempt ?? 1)", "Retrying the last provider request", nil)
+            let remaining = store.runtimeState.retrySecondsRemaining(at: date)
+            let text = remaining.map { $0 > 0 ? "Retry in \($0)s" : "Retrying" }
+                ?? "Retry \(store.runtimeState.retryAttempt ?? 1)"
+            let error = store.runtimeState.retryErrorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (text, (error?.isEmpty == false ? error : nil) ?? "Retrying the last provider request", nil)
         }
         if store.isSelectedRuntime, store.runtimeState.isStreaming {
+            if store.runtimeState.phase == .waitingForModel {
+                return ("Waiting for first response…", "Pi is preparing the provider request or waiting for its first response", nil)
+            }
             return ("Working", "Pi is working on this turn", nil)
         }
         if let session = store.selectedSession, store.isRunning(session) {
@@ -80,24 +91,35 @@ private struct RuntimeStateLabel: View {
     }
 
     var body: some View {
-        if let activity {
-            HStack(spacing: PiTheme.space4) {
-                if let symbol = activity.symbol {
-                    Image(systemName: symbol).font(PiFont.micro)
-                } else {
-                    StatusDot(color: .piGreen, pulsing: true)
+        Group {
+            if store.isSelectedRuntime, store.runtimeState.isRetrying {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    if let activity = activity(at: context.date) { label(activity) }
                 }
-                Text(activity.text)
-                    .font(PiFont.micro)
-                    .foregroundStyle(.secondary)
+            } else if let activity = activity(at: Date()) {
+                label(activity)
             }
-            .help(activity.help)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Session state")
-            .accessibilityValue(activity.help)
-
-            StatusSeparator()
         }
+    }
+
+    @ViewBuilder
+    private func label(_ activity: (text: String, help: String, symbol: String?)) -> some View {
+        HStack(spacing: PiTheme.space4) {
+            if let symbol = activity.symbol {
+                Image(systemName: symbol).font(PiFont.micro)
+            } else {
+                StatusDot(color: .piGreen, pulsing: true)
+            }
+            Text(activity.text)
+                .font(PiFont.micro)
+                .foregroundStyle(.secondary)
+        }
+        .help(activity.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Session state")
+        .accessibilityValue(activity.help)
+
+        StatusSeparator()
     }
 }
 

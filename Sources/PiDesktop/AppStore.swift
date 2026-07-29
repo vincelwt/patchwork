@@ -479,9 +479,11 @@ final class AppStore: ObservableObject {
         selectedFolder = startFolder
         selectedGitDirectoryPath = startFolder.standardizedFileURL.path
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
-        if cachedStatuses.removeValue(forKey: ExtensionStatusParser.subagentsKey) != nil {
-            self.persistence.cacheExtensionStatuses(cachedStatuses)
+        var hadEphemeralStatuses = false
+        for key in ExtensionStatusParser.ephemeralKeys where cachedStatuses.removeValue(forKey: key) != nil {
+            hadEphemeralStatuses = true
         }
+        if hadEphemeralStatuses { self.persistence.cacheExtensionStatuses(cachedStatuses) }
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
 
@@ -597,7 +599,7 @@ final class AppStore: ObservableObject {
         markWaitingForConnectivity(slot)
         if slot.providerRetryID != nil {
             cancelProviderRetry(for: slot, resetAttempt: false)
-            updateState(for: slot) { $0.isRetrying = false }
+            updateState(for: slot) { $0.clearRetryState() }
             return
         }
         guard !slot.connectivityRetryAbortRequested else { return }
@@ -636,6 +638,8 @@ final class AppStore: ObservableObject {
         updateState(for: slot) { state in
             state.isRetrying = true
             state.retryAttempt = slot.providerRetryAttempt
+            state.retryDelayMs = Int(delay * 1_000)
+            state.retryStartedAt = Date()
             state.lastError = nil
         }
         if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
@@ -698,7 +702,7 @@ final class AppStore: ObservableObject {
               !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
         slot.cancelProviderRetry = nil
         slot.providerRetryID = nil
-        updateState(for: slot) { $0.isRetrying = false }
+        updateState(for: slot) { $0.clearRetryState() }
         clearConnectivityWait(for: slot)
         slot.connectivityResumeInFlight = true
         slot.promptBeganAt = Date()
@@ -2669,7 +2673,9 @@ final class AppStore: ObservableObject {
         probe.stop()
         isProbingStatuses = false
         if !probeStatuses.isEmpty {
-            cachedStatuses.merge(probeStatuses.filter { $0.key != ExtensionStatusParser.subagentsKey }) { _, fresh in fresh }
+            cachedStatuses.merge(
+                probeStatuses.filter { !ExtensionStatusParser.ephemeralKeys.contains($0.key) }
+            ) { _, fresh in fresh }
             persistence.cacheExtensionStatuses(cachedStatuses)
         }
     }
@@ -2693,7 +2699,7 @@ final class AppStore: ObservableObject {
         slot.connectivityResumeCancelled = true
         cancelProviderRetry(for: slot, resetAttempt: true)
         if wasWaitingToRetry {
-            runtimeState.isRetrying = false
+            runtimeState.clearRetryState()
             if !runtimeState.isStreaming {
                 if dispatchNextActiveFollowUp() { slot.connectivityResumeCancelled = false }
                 else { resetRuntimeRetirementLease(for: slot) }
@@ -2781,7 +2787,7 @@ final class AppStore: ObservableObject {
             state.isConnected = false
             state.isStreaming = false
             state.isCompacting = false
-            state.isRetrying = false
+            state.clearRetryState()
             state.isWaitingForNetwork = false
             state.phase = .idle
             state.steeringQueue.removeAll()
@@ -3622,6 +3628,7 @@ final class AppStore: ObservableObject {
             slot.promptBeganAt = Date()
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
+                state.clearRetryState()
                 state.isStreaming = true
                 state.phase = .waitingForModel
             }
@@ -4040,16 +4047,19 @@ final class AppStore: ObservableObject {
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
                 state.isStreaming = true
-                state.isRetrying = false
+                state.clearRetryState()
                 if state.phase != .waitingForModel { state.phase = .working }
             }
             if abortPreflight { sendSoftAbort(to: slot) }
         case "agent_settled":
-            let waitingForNetwork = state(for: slot).isWaitingForNetwork
+            let current = state(for: slot)
+            let waitingForNetwork = current.isWaitingForNetwork
             let shouldRetryProvider = slot.providerRetryPending
+            let retryErrorMessage = current.retryErrorMessage
             updateState(for: slot) { state in
                 state.isStreaming = false
-                state.isRetrying = false
+                state.clearRetryState()
+                if shouldRetryProvider { state.retryErrorMessage = retryErrorMessage }
                 state.phase = .idle
             }
             slot.connectivityResumeCancelled = false
@@ -4078,7 +4088,7 @@ final class AppStore: ObservableObject {
                 slot.streamingMessage = parsed
             }
         case "message_end":
-            recordRuntimeOutput(for: slot)
+            if event["message"]?["role"]?.stringValue == "assistant" { recordRuntimeOutput(for: slot) }
             slot.streamingMessage = nil
             if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) {
                 if let path = slot.sessionPath ?? state(for: slot).sessionFile {
@@ -4122,14 +4132,20 @@ final class AppStore: ObservableObject {
             updateState(for: slot) { state in
                 state.isRetrying = true
                 state.retryAttempt = event["attempt"]?.intValue
+                state.retryDelayMs = event["delayMs"]?.intValue.map { max(0, $0) }
+                state.retryStartedAt = Date()
+                state.retryErrorMessage = event["errorMessage"]?.stringValue?.suffixString(1_000)
             }
             pauseRetryForConnectivity(slot)
         case "auto_retry_end":
             let waitingForNetwork = state(for: slot).isWaitingForNetwork
             let succeeded = event["success"]?.boolValue == true
             updateState(for: slot) { state in
-                state.isRetrying = false
+                state.clearRetryState()
                 state.lastError = nil
+                if !succeeded, !slot.connectivityResumeCancelled, !waitingForNetwork {
+                    state.retryErrorMessage = event["finalError"]?.stringValue?.suffixString(1_000)
+                }
             }
             if succeeded {
                 cancelProviderRetry(for: slot, resetAttempt: true)
@@ -4150,9 +4166,15 @@ final class AppStore: ObservableObject {
             slot.capability = nil
             discardQuestionnaire(from: slot)
             if !state(for: slot).isWaitingForNetwork { _ = flushBackgroundOutbox(.steer, slot: slot) }
-        case "message_start", "tool_execution_update", "bash_execution_update":
+        case "message_start":
+            if event["message"]?["role"]?.stringValue == "assistant" { recordRuntimeOutput(for: slot) }
+        case "tool_execution_update", "bash_execution_update":
             recordRuntimeOutput(for: slot)
-        case "agent_end", "turn_start", "summarization_retry_scheduled", "summarization_retry_attempt_start",
+        case "turn_start":
+            updateState(for: slot) { state in
+                if state.isStreaming { state.phase = .waitingForModel }
+            }
+        case "agent_end", "summarization_retry_scheduled", "summarization_retry_attempt_start",
              "summarization_retry_finished":
             break
         default:
@@ -4173,10 +4195,10 @@ final class AppStore: ObservableObject {
             if let value = event["statusText"]?.stringValue, !ANSI.strip(value).isEmpty {
                 let clean = ANSI.strip(value).suffixString(500)
                 slot.statuses[key] = clean
-                if key != ExtensionStatusParser.subagentsKey { cachedStatuses[key] = clean }
+                if !ExtensionStatusParser.ephemeralKeys.contains(key) { cachedStatuses[key] = clean }
             } else {
                 slot.statuses.removeValue(forKey: key)
-                cachedStatuses.removeValue(forKey: key)
+                if !ExtensionStatusParser.ephemeralKeys.contains(key) { cachedStatuses.removeValue(forKey: key) }
             }
             persistence.cacheExtensionStatuses(cachedStatuses)
             if slot === activeRuntimeSlot, !activePresentationDetached { extensionStatuses = slot.statuses }
@@ -4308,15 +4330,17 @@ final class AppStore: ObservableObject {
             }
             cancelRuntimeRetirementLease()
             runtimeState.isStreaming = true
-            runtimeState.isRetrying = false
+            runtimeState.clearRetryState()
             if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
             if abortPreflight { sendSoftAbort(to: activeRuntimeSlot) }
         case "agent_settled":
             cancelPendingStreamingPublish()
             let waitingForNetwork = runtimeState.isWaitingForNetwork
             let shouldRetryProvider = activeRuntimeSlot.providerRetryPending
+            let retryErrorMessage = runtimeState.retryErrorMessage
             runtimeState.isStreaming = false
-            runtimeState.isRetrying = false
+            runtimeState.clearRetryState()
+            if shouldRetryProvider { runtimeState.retryErrorMessage = retryErrorMessage }
             runtimeState.phase = .idle
             activeRuntimeSlot.connectivityResumeCancelled = false
             activeRuntimeSlot.connectivityResumeInFlight = false
@@ -4349,7 +4373,9 @@ final class AppStore: ObservableObject {
             guard selected, let partial = event["message"] else { return }
             publishStreamingUpdate(partial)
         case "message_end":
-            recordRuntimeOutput(for: activeRuntimeSlot)
+            if event["message"]?["role"]?.stringValue == "assistant" {
+                recordRuntimeOutput(for: activeRuntimeSlot)
+            }
             cancelPendingStreamingPublish()
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
@@ -4424,12 +4450,18 @@ final class AppStore: ObservableObject {
         case "auto_retry_start":
             runtimeState.isRetrying = true
             runtimeState.retryAttempt = event["attempt"]?.intValue
+            runtimeState.retryDelayMs = event["delayMs"]?.intValue.map { max(0, $0) }
+            runtimeState.retryStartedAt = Date()
+            runtimeState.retryErrorMessage = event["errorMessage"]?.stringValue?.suffixString(1_000)
             pauseRetryForConnectivity(activeRuntimeSlot)
         case "auto_retry_end":
             let waitingForNetwork = runtimeState.isWaitingForNetwork
             let succeeded = event["success"]?.boolValue == true
-            runtimeState.isRetrying = false
+            runtimeState.clearRetryState()
             runtimeState.lastError = nil
+            if !succeeded, !activeRuntimeSlot.connectivityResumeCancelled, !waitingForNetwork {
+                runtimeState.retryErrorMessage = event["finalError"]?.stringValue?.suffixString(1_000)
+            }
             if succeeded {
                 cancelProviderRetry(for: activeRuntimeSlot, resetAttempt: true)
                 clearConnectivityWait(for: activeRuntimeSlot)
@@ -4446,8 +4478,15 @@ final class AppStore: ObservableObject {
             // Pi delivers steering at exactly this boundary, so holding it until now costs
             // nothing and keeps it editable for as long as possible.
             if !runtimeState.isWaitingForNetwork { flushOutbox(.steer) }
-        case "message_start", "bash_execution_update": recordRuntimeOutput(for: activeRuntimeSlot)
-        case "agent_end", "turn_start", "summarization_retry_scheduled",
+        case "message_start":
+            if event["message"]?["role"]?.stringValue == "assistant" {
+                recordRuntimeOutput(for: activeRuntimeSlot)
+            }
+        case "bash_execution_update":
+            recordRuntimeOutput(for: activeRuntimeSlot)
+        case "turn_start":
+            if runtimeState.isStreaming { runtimeState.phase = .waitingForModel }
+        case "agent_end", "summarization_retry_scheduled",
              "summarization_retry_attempt_start", "summarization_retry_finished": break
         default:
             unknownRPCEvents.append(event.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
@@ -4576,12 +4615,12 @@ final class AppStore: ObservableObject {
                 extensionStatuses[key] = ANSI.strip(value).suffixString(500)
                 // Merge, never replace: a runtime that has only reported `mode` so far must not
                 // erase the last known `codex-account`, which is what made the status bar fall
-                // back to a bare “Codex account” placeholder mid-session. Subagent activity is
-                // runtime-local and must never survive the process that reported it.
-                if key != ExtensionStatusParser.subagentsKey { cachedStatuses[key] = extensionStatuses[key] }
+                // back to a bare “Codex account” placeholder mid-session. Transient activity
+                // is runtime-local and must never survive the process that reported it.
+                if !ExtensionStatusParser.ephemeralKeys.contains(key) { cachedStatuses[key] = extensionStatuses[key] }
             } else {
                 extensionStatuses.removeValue(forKey: key)
-                cachedStatuses.removeValue(forKey: key)
+                if !ExtensionStatusParser.ephemeralKeys.contains(key) { cachedStatuses.removeValue(forKey: key) }
             }
             persistence.cacheExtensionStatuses(cachedStatuses)
             // Subagent activity gates retirement (see `isIdleAndClean`), and a settled turn has
@@ -4626,7 +4665,7 @@ final class AppStore: ObservableObject {
                 state.isConnected = false
                 state.isStreaming = false
                 state.isCompacting = false
-                state.isRetrying = false
+                state.clearRetryState()
                 state.isWaitingForNetwork = false
                 state.phase = .idle
             }
@@ -4638,7 +4677,7 @@ final class AppStore: ObservableObject {
                 state.isConnected = false
                 state.isStreaming = false
                 state.isCompacting = false
-                state.isRetrying = false
+                state.clearRetryState()
                 state.isWaitingForNetwork = false
                 state.phase = .idle
             }
