@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import PiDesktop
 
@@ -33,13 +34,26 @@ final class ProcessResourceSamplerTests: XCTestCase {
         XCTAssertEqual(usage.memoryBytes, 350)
     }
 
-    func testThreadUsageAggregationFeedsTheFooter() throws {
-        let total = try XCTUnwrap(ThreadResourceUsage.sum([
-            ThreadResourceUsage(cpuPercent: 12.5, memoryBytes: 100),
-            ThreadResourceUsage(cpuPercent: 25, memoryBytes: 200)
-        ]))
+    func testAggregateSamplerIncludesAppAndDescendantProcessesWithoutRunningThreads() throws {
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        defer {
+            if child.isRunning { child.terminate() }
+            child.waitUntilExit()
+        }
 
-        XCTAssertEqual(total, ThreadResourceUsage(cpuPercent: 37.5, memoryBytes: 300))
-        XCTAssertNil(ThreadResourceUsage.sum([]))
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let snapshot = ProcessResourceSampler.sample(
+            rootsByPath: [:],
+            previous: [:],
+            aggregateRoots: [pid]
+        )
+
+        XCTAssertTrue(snapshot.usageByPath.isEmpty)
+        XCTAssertNotNil(snapshot.samples[pid])
+        XCTAssertNotNil(snapshot.samples[child.processIdentifier])
+        XCTAssertGreaterThan(try XCTUnwrap(snapshot.aggregateUsage).memoryBytes, 0)
     }
 }

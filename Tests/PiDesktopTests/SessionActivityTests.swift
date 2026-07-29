@@ -429,6 +429,23 @@ final class SessionActivityMonitorTests: XCTestCase {
         FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-empty-\(UUID().uuidString)")
     }
 
+    func testMonitorSamplesTheAppTreeWithoutARunningSession() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("PiMonitor-\(UUID().uuidString).jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: emptyHeartbeatDirectory())
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.aggregateResources != nil }
+
+        XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .idle)
+        XCTAssertGreaterThan(try XCTUnwrap(monitor.aggregateResources).memoryBytes, 0)
+
+        monitor.setTrackedPaths([])
+        XCTAssertNil(monitor.aggregateResources)
+    }
+
     func testMonitorClassifiesTrackedPathsAndDropsRemovedOnes() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
