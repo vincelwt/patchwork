@@ -222,6 +222,7 @@ struct ThinkingBlockView: View {
 struct TranscriptWorkView: View, Equatable {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.transcriptRowLayoutInvalidation) private var invalidateTranscriptRowLayout
 
     let block: TranscriptWorkBlock
     let onImage: (ImagePayload, [ImagePayload]) -> Void
@@ -241,7 +242,10 @@ struct TranscriptWorkView: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-            Button { userExpanded = !isOpen } label: {
+            Button {
+                userExpanded = !isOpen
+                invalidateTranscriptRowLayout()
+            } label: {
                 HStack(spacing: PiTheme.gridGutter) {
                     // The icon column is always reserved while live or settled, so the headline
                     // starts at the same origin as every row inside the log below it.
@@ -388,13 +392,17 @@ private struct WorkNoteView: View {
 /// Compaction stays recognizable inside the turn's collapsed work log and reveals its summary
 /// only on demand.
 struct CompactionRowView: View {
+    @Environment(\.transcriptRowLayoutInvalidation) private var invalidateTranscriptRowLayout
     let note: TranscriptCompaction
     @State private var expanded = false
     @State private var hovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
-            Button { expanded.toggle() } label: {
+            Button {
+                expanded.toggle()
+                invalidateTranscriptRowLayout()
+            } label: {
                 HStack(spacing: PiTheme.space8) {
                     PiHairline()
                     HStack(spacing: PiTheme.space4) {
@@ -496,6 +504,7 @@ private struct MessageActionRow: View {
 /// The single collapsed-row treatment for thinking, tool calls, tool results, custom, system, and
 /// unknown entries. One icon column, one text origin, one chevron: every transcript row lines up.
 private struct DisclosureRow<Detail: View>: View {
+    @Environment(\.transcriptRowLayoutInvalidation) private var invalidateTranscriptRowLayout
     let symbol: String
     let title: String
     var titleTint: Color = .secondary
@@ -545,7 +554,10 @@ private struct DisclosureRow<Detail: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.transcriptRowSpacing) {
-            Button { expanded = !isOpen } label: {
+            Button {
+                expanded = !isOpen
+                invalidateTranscriptRowLayout()
+            } label: {
                 HStack(alignment: .firstTextBaseline, spacing: PiTheme.gridGutter) {
                     Group {
                         if showsProgress { StatusDot(color: .piGreen, pulsing: true) }
@@ -586,7 +598,10 @@ private struct DisclosureRow<Detail: View>: View {
             }
         }
         .onChange(of: collapseSignal) { _, shouldCollapse in
-            if shouldCollapse { expanded = false }
+            if shouldCollapse {
+                expanded = false
+                invalidateTranscriptRowLayout()
+            }
         }
     }
 }

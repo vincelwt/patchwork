@@ -10,18 +10,22 @@ extension PiTheme {
 
 @MainActor
 final class TranscriptProjectionCache {
+    private var route: AppRoute?
     private var revision = -1
     private var isRunning = false
     private var cached: [TranscriptItem] = []
     private(set) var buildCount = 0
 
     func items(
+        route: AppRoute = .newChat,
         revision: Int,
         messages: [ChatMessage],
         streaming: ChatMessage?,
         isRunning: Bool
     ) -> [TranscriptItem] {
-        guard self.revision != revision || self.isRunning != isRunning else { return cached }
+        guard self.route != route || self.revision != revision || self.isRunning != isRunning else { return cached }
+        if self.route != route { cached.removeAll(keepingCapacity: true) }
+        self.route = route
         self.revision = revision
         self.isRunning = isRunning
         let projected = TranscriptPresenter.items(messages: messages, streaming: streaming, isRunning: isRunning)
@@ -286,7 +290,6 @@ struct ConversationView: View {
                     composerFocusTick += 1
                 }
             )
-            .id(store.route)
         }
     }
 }
@@ -298,25 +301,29 @@ struct MessageScrollView: View {
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
     let transcriptRevision: Int
-    /// Wired only to the conversation's single most recent user message; every earlier turn's
-    /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
+    /// Wired only to the conversation's single most recent user message.
     var onEditLastMessage: (() -> Void)?
     @State private var isPinnedToBottom = true
-    /// Bumped by the coordinator's paint heal; reading it in the tree below guarantees one
-    /// SwiftUI render pass against the viewport actually on screen after an open settles.
-    @State private var healTick = 0
-    @State private var scrollBridge = ConversationScrollBridge()
+    @State private var pinRequest = 0
     @State private var underfillPageAttempts = 0
     @State private var didMarkFirstTextPaint = false
     @State private var projectionCache = TranscriptProjectionCache()
 
     private var transcriptItems: [TranscriptItem] {
         projectionCache.items(
+            route: store.route,
             revision: transcriptRevision,
             messages: messages,
             streaming: streaming,
             isRunning: isRunning
         )
+    }
+
+    private var history: NativeTranscriptHistory? {
+        if store.isLoadingEarlierMessages { return .loading }
+        if store.hasEarlierMessages { return .loadEarlier }
+        if store.conversationHistoryLimitReached { return .limitReached }
+        return nil
     }
 
     private var lastUserMessageID: String? { messages.last(where: { $0.role == .user })?.id }
@@ -326,104 +333,49 @@ struct MessageScrollView: View {
         store.activeQuestionnaireSession.map { "\($0.toolCallID):\($0.currentIndex)" }
     }
 
+    private var questionnaireToolCallID: String? { store.activeQuestionnaireSession?.toolCallID }
+
     var body: some View {
         let items = transcriptItems
-        ScrollView {
-            // A single small gap between entries keeps consecutive tool rows on an even
-            // rhythm; paragraphs get their breathing room from the block renderer.
-            LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                if store.isLoadingEarlierMessages {
-                    ProgressView().controlSize(.small)
-                        .frame(maxWidth: .infinity)
-                        .accessibilityLabel("Loading earlier messages")
-                } else if store.hasEarlierMessages {
-                    Button("Load earlier messages") { requestEarlierMessages() }
-                        .buttonStyle(.plain)
-                        .font(PiFont.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
-                } else if store.conversationHistoryLimitReached {
-                    Text("Earlier history is outside this bounded window.")
-                        .font(PiFont.caption)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity)
-                }
-
-                ForEach(items) { item in
-                    Group {
-                        switch item {
-                        case let .message(message, isStreaming):
-                            MessageView(
-                                message: message,
-                                isStreaming: isStreaming,
-                                onImage: store.showImage,
-                                showsActions: true,
-                                onEdit: message.role == .user && message.id == lastUserMessageID ? onEditLastMessage : nil
-                            )
-                            .equatable()
-                            .padding(.top, message.role == .user ? PiTheme.transcriptTurnSpacing : 0)
-                        case let .work(block):
-                            TranscriptWorkView(
-                                block: block,
-                                onImage: store.showImage,
-                                questionnaireKey: questionnaireKey
-                            )
-                            .equatable()
-                            .padding(.top, PiTheme.space6)
-                        }
-                    }
-                    .id(item.id)
-                    .onAppear {
-                        guard !didMarkFirstTextPaint else { return }
-                        didMarkFirstTextPaint = true
-                        ConversationPerformance.mark(
-                            "Conversation first text paint",
-                            path: store.selectedSession?.fileURL.path ?? "new-chat",
-                            count: items.count
-                        )
-                    }
-                }
-            }
-            .padding(.top, PiTheme.space24)
-            .padding(.bottom, PiTheme.space8)
-            .frame(maxWidth: PiTheme.transcriptMaxWidth, alignment: .leading)
-            .padding(.horizontal, PiTheme.space20)
-            .frame(maxWidth: .infinity)
-            .background(
-                ConversationScrollObserver(
-                    bridge: scrollBridge,
-                    onChange: { metrics in handleScrollMetrics(metrics) },
-                    onHeal: { healTick &+= 1 }
+        let rows = NativeTranscriptRow.rows(
+            items: items,
+            history: history,
+            lastUserMessageID: lastUserMessageID,
+            questionnaireToolCallID: questionnaireToolCallID,
+            questionnaireKey: questionnaireKey
+        )
+        NativeTranscriptView(
+            route: store.route,
+            rows: rows,
+            isLoadingEarlier: store.isLoadingEarlierMessages,
+            pinRequest: pinRequest,
+            performancePath: store.selectedSession?.fileURL.path ?? "new-chat",
+            onLoadEarlier: { _ = requestEarlierMessages() },
+            onEditLastMessage: onEditLastMessage,
+            onMetrics: handleScrollMetrics,
+            onFirstPaint: {
+                guard !didMarkFirstTextPaint else { return }
+                didMarkFirstTextPaint = true
+                ConversationPerformance.mark(
+                    "Conversation first text paint",
+                    path: store.selectedSession?.fileURL.path ?? "new-chat",
+                    count: items.count
                 )
-            )
-            .overlay(alignment: .topLeading) { Color.clear.frame(width: 0, height: 0).id(healTick) }
-        }
-        // The native anchor positions the first frame at the bottom; from then on the AppKit
-        // coordinator keeps the viewport pinned through streaming growth, image decodes, and
-        // lazily settling rows — synchronously, inside each layout pass.
-        .defaultScrollAnchor(.bottom)
-        // A hard top edge on purpose: the soft (progressive-blur) scroll edge effect computes
-        // its extent from scroll state that programmatic positioning (bottom anchor plus the
-        // coordinator's clip-origin corrections) leaves stale, ballooning a ghost "blur
-        // overlay" over the top of freshly opened conversations until a real scroll recomputes
-        // it. The toolbar background is opaque here anyway, so the soft fade bought nothing.
+            }
+        )
         .piHardTopScrollEdge()
         .scrollDismissesKeyboard(.interactively)
         .onAppear { store.consumeInitialScrollTarget() }
-        .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
-            guard wasLoading, !isLoading else { return }
-            // The prepended rows land over the next few layout passes; keep the origin
-            // compensation armed briefly so each pass is corrected, then release it.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                if !store.isLoadingEarlierMessages { scrollBridge.disarmPrepend() }
-            }
+        .onChange(of: store.route) { _, _ in
+            isPinnedToBottom = true
+            underfillPageAttempts = 0
+            didMarkFirstTextPaint = false
         }
         .overlay(alignment: .bottom) {
             if !isPinnedToBottom {
                 Button {
                     isPinnedToBottom = true
-                    scrollBridge.pinToBottom()
+                    pinRequest &+= 1
                 } label: {
                     Label("Jump to latest", systemImage: "arrow.down")
                         .font(PiFont.caption)
@@ -454,7 +406,6 @@ struct MessageScrollView: View {
     @discardableResult
     private func requestEarlierMessages() -> Bool {
         guard store.hasEarlierMessages, !store.isLoadingEarlierMessages else { return false }
-        scrollBridge.armPrepend()
         store.loadEarlierMessages()
         return true
     }

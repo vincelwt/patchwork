@@ -73,7 +73,11 @@ final class ConversationScrollMetricsTests: XCTestCase {
             originY: 0, viewportHeight: 500, documentHeight: 500, direction: .stationary
         )
         XCTAssertTrue(underfilled.isUnderfilled)
-        XCTAssertTrue(underfilled.shouldRequestEarlierHistory)
+        XCTAssertFalse(underfilled.shouldRequestEarlierHistory, "Layout-only metrics never page history")
+        XCTAssertTrue(ConversationScrollMetrics(
+            originY: 0, viewportHeight: 500, documentHeight: 500,
+            direction: .stationary, allowsUnderfillPaging: true
+        ).shouldRequestEarlierHistory)
         XCTAssertFalse(ConversationScrollMetrics(
             originY: 0, viewportHeight: 500, documentHeight: 700, direction: .stationary
         ).shouldRequestEarlierHistory)
@@ -97,58 +101,74 @@ final class ConversationScrollMetricsTests: XCTestCase {
         ).shouldRequestEarlierHistory)
     }
 
-    func testBottomOriginRespectsInsets() {
-        // Long content: the true bottom sits past `doc - viewport` by the composer's inset.
+    func testNativeBottomOriginRespectsInsets() {
         XCTAssertEqual(
-            ConversationScrollObserver.bottomOriginY(
-                documentHeight: 5_000, viewportHeight: 818, topInset: 58, bottomInset: 90
+            NativeTranscriptGeometry.bottomOriginY(
+                documentHeight: 5_000, viewportHeight: 818, topInset: 24, bottomInset: 8
             ),
-            4_272
+            4_190
         )
-        // Short content: SwiftUI bottom-aligns it by growing a synthetic top inset, and the
-        // correct origin is negative. Clamping to zero here was the "conversation shoved up
-        // behind the toolbar glass" bug.
+        let top = NativeTranscriptGeometry.topInset(documentHeight: 390, viewportHeight: 818)
+        XCTAssertEqual(top, 420)
         XCTAssertEqual(
-            ConversationScrollObserver.bottomOriginY(
-                documentHeight: 390, viewportHeight: 818, topInset: 338, bottomInset: 90
+            NativeTranscriptGeometry.bottomOriginY(
+                documentHeight: 390, viewportHeight: 818, topInset: top, bottomInset: 8
             ),
-            -338
-        )
-    }
-
-    func testPrependRestorationWithDynamicInsetsLandsOnTheNewBottom() {
-        // An underfilled page (origin -338 via the synthetic top inset) gains 1,610pt of
-        // earlier history and the inset collapses to 58: the delta math lands exactly on the
-        // new bottom, keeping the rows that were on screen in place.
-        XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: -338, oldDocumentHeight: 390, newDocumentHeight: 2_000,
-                viewportHeight: 818, topInset: 58, bottomInset: 90
-            ),
-            1_272
+            -420,
+            "Short threads are bottom-aligned before their first frame"
         )
     }
 
-    func testPrependRestorationPreservesTheOriginalViewportOffset() {
+    func testTailPinReleasesAfterOneBackingPixel() {
+        XCTAssertTrue(NativeTranscriptGeometry.isPinned(originY: 999.5, bottomOriginY: 1_000, backingScale: 2))
+        XCTAssertFalse(NativeTranscriptGeometry.isPinned(originY: 999.0, bottomOriginY: 1_000, backingScale: 2))
+        XCTAssertTrue(NativeTranscriptGeometry.isPinned(
+            originY: 1_004, bottomOriginY: 1_000, backingScale: 2
+        ), "Elastic overscroll at the bottom remains pinned")
+    }
+
+    func testPagingControlIsNeverTheViewportAnchor() {
+        let message = ChatMessage(
+            id: "message", role: .user,
+            blocks: [MessageBlock(id: "text", kind: .text("Keep me still"))],
+            timestamp: nil, raw: .null
+        )
+        let rows = NativeTranscriptRow.rows(
+            items: [.message(message, streaming: false)],
+            history: .loadEarlier,
+            lastUserMessageID: nil,
+            questionnaireToolCallID: nil,
+            questionnaireKey: nil
+        )
+        XCTAssertEqual(NativeTranscriptGeometry.anchorIndex(startingAt: 0, rows: rows), 1)
+        XCTAssertEqual(NativeTranscriptGeometry.anchorIndex(startingAt: 1, rows: rows), 1)
+    }
+
+    func testNativeStructuralChangesUseStableRowIdentity() {
         XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: 500, oldDocumentHeight: 2_000,
-                newDocumentHeight: 2_600, viewportHeight: 600
-            ),
-            1_100
+            NativeTranscriptStructuralChange.classify(old: ["b", "c"], new: ["a", "b", "c"]),
+            .prepend(0..<1)
         )
         XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: 1_900, oldDocumentHeight: 2_000,
-                newDocumentHeight: 2_600, viewportHeight: 600
+            NativeTranscriptStructuralChange.classify(
+                old: ["transcript:history", "b", "c"],
+                new: ["transcript:history", "a", "b", "c"]
             ),
-            2_000,
-            "Restoration clamps to the new scrollable maximum"
+            .prepend(1..<2),
+            "The stable paging control stays put while transcript rows insert below it"
         )
-        XCTAssertNil(ConversationScrollObserver.restoredOriginY(
-            originalY: 500, oldDocumentHeight: 2_000,
-            newDocumentHeight: 2_000, viewportHeight: 600
-        ))
+        XCTAssertEqual(
+            NativeTranscriptStructuralChange.classify(old: ["a", "b"], new: ["a", "b", "c"]),
+            .append(2..<3)
+        )
+        XCTAssertEqual(
+            NativeTranscriptStructuralChange.classify(old: ["a", "b", "c"], new: ["a", "b"]),
+            .removeSuffix(2..<3)
+        )
+        XCTAssertEqual(
+            NativeTranscriptStructuralChange.classify(old: ["a", "b"], new: ["a", "c"]),
+            .replace
+        )
     }
 }
 
@@ -166,6 +186,24 @@ final class ConversationScrollCacheTests: XCTestCase {
         XCTAssertEqual(cache.buildCount, 1)
 
         _ = cache.items(revision: 2, messages: [message], streaming: nil, isRunning: false)
+        XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testProjectionCacheNeverCarriesRowsAcrossRoutes() {
+        let message = ChatMessage(
+            id: "same-local-id", role: .assistant,
+            blocks: [MessageBlock(id: "text", kind: .text("Answer"))],
+            timestamp: nil, raw: .null
+        )
+        let cache = TranscriptProjectionCache()
+        _ = cache.items(
+            route: .session("/a.jsonl"), revision: 1,
+            messages: [message], streaming: nil, isRunning: false
+        )
+        _ = cache.items(
+            route: .session("/b.jsonl"), revision: 1,
+            messages: [message], streaming: nil, isRunning: false
+        )
         XCTAssertEqual(cache.buildCount, 2)
     }
 
@@ -917,45 +955,17 @@ final class StatusDotAnimationTests: XCTestCase {
     }
 }
 
-@MainActor
-final class ConversationScrollCoordinatorTests: XCTestCase {
-    private func makeHarness() -> (NSScrollView, NSView, ConversationScrollObserver.Coordinator, ConversationScrollBridge) {
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 500))
-        let document = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 1_000))
-        scrollView.documentView = document
-        let bridge = ConversationScrollBridge()
-        let observer = ConversationScrollObserver(bridge: bridge, onChange: { _ in })
-        let coordinator = ConversationScrollObserver.Coordinator(parent: observer)
-        let attachment = NSView(frame: .zero)
-        document.addSubview(attachment)
-        coordinator.attach(from: attachment)
-        bridge.coordinator = coordinator
-        return (scrollView, document, coordinator, bridge)
-    }
-
-    func testPinnedViewportFollowsDocumentGrowth() {
-        let (scrollView, document, coordinator, _) = makeHarness()
-        XCTAssertTrue(coordinator.pinned, "A conversation opens pinned")
-        // Without SwiftUI's bottom anchor in play, the coordinator's fallback must catch up.
-        document.setFrameSize(NSSize(width: 400, height: 1_400))
-        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 900, accuracy: 1,
-                       "Growth while pinned lands at the new bottom")
-    }
-
-    func testUnpinnedPrependCompensationKeepsTheReadingPosition() {
-        let (scrollView, document, coordinator, bridge) = makeHarness()
-        // A real user scroll away from the bottom unpins.
-        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: 100))
-        XCTAssertFalse(coordinator.pinned)
-
-        bridge.armPrepend()
-        document.setFrameSize(NSSize(width: 400, height: 1_600))
-        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
-                       "Prepended height shifts the origin so visible rows do not move")
-
-        bridge.disarmPrepend()
-        document.setFrameSize(NSSize(width: 400, height: 1_800))
-        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
-                       "Disarmed growth below the viewport leaves the reading position alone")
+final class NativeTranscriptOwnershipTests: XCTestCase {
+    func testTranscriptHasNoSwiftUIScrollOrDelayedPaintHeal() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/PiDesktop")
+        let conversation = try String(contentsOf: root.appendingPathComponent("ConversationView.swift"), encoding: .utf8)
+        let native = try String(contentsOf: root.appendingPathComponent("NativeTranscriptView.swift"), encoding: .utf8)
+        XCTAssertFalse(conversation.contains("defaultScrollAnchor"))
+        XCTAssertFalse(conversation.contains("ConversationScrollObserver"))
+        XCTAssertFalse(conversation.contains("LazyVStack"))
+        XCTAssertFalse(native.contains("asyncAfter"), "Native viewport corrections are synchronous")
+        XCTAssertTrue(native.contains("NSTableView"))
     }
 }

@@ -101,6 +101,7 @@ struct ExtensionDialogView: View {
 /// sits beside the options when the transcript is wide enough and stacks below when it is not.
 struct QuestionnaireCardView: View {
     @EnvironmentObject private var store: AppStore
+    @Environment(\.transcriptRowLayoutInvalidation) private var invalidateTranscriptRowLayout
     let question: QuestionnaireQuestion
     let questionCount: Int
     let currentIndex: Int
@@ -274,6 +275,7 @@ struct QuestionnaireCardView: View {
             usesCustom = true
             selected.removeAll()
             focusedOption = question.options.count
+            invalidateTranscriptRowLayout()
         }
     }
 
@@ -282,6 +284,7 @@ struct QuestionnaireCardView: View {
         selected.removeAll()
         focusedOption = question.options.count
         customFocused = true
+        invalidateTranscriptRowLayout()
     }
 
     private func optionCard(_ option: QuestionnaireOption) -> some View {
@@ -375,6 +378,7 @@ struct QuestionnaireCardView: View {
         } else {
             selected = [index]
         }
+        invalidateTranscriptRowLayout()
     }
 
     private func moveFocus(_ direction: MoveCommandDirection) {
@@ -384,6 +388,7 @@ struct QuestionnaireCardView: View {
         case .down, .right: focusedOption = (focusedOption + 1) % count
         default: break
         }
+        invalidateTranscriptRowLayout()
     }
 
     private func submitOrAdvance() {
