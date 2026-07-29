@@ -884,3 +884,46 @@ final class StatusDotAnimationTests: XCTestCase {
         XCTAssertTrue(source.contains("CABasicAnimation"), "The pulse is a Core Animation layer animation")
     }
 }
+
+@MainActor
+final class ConversationScrollCoordinatorTests: XCTestCase {
+    private func makeHarness() -> (NSScrollView, NSView, ConversationScrollObserver.Coordinator, ConversationScrollBridge) {
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 500))
+        let document = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 1_000))
+        scrollView.documentView = document
+        let bridge = ConversationScrollBridge()
+        let observer = ConversationScrollObserver(bridge: bridge, onChange: { _ in })
+        let coordinator = ConversationScrollObserver.Coordinator(parent: observer)
+        let attachment = NSView(frame: .zero)
+        document.addSubview(attachment)
+        coordinator.attach(from: attachment)
+        bridge.coordinator = coordinator
+        return (scrollView, document, coordinator, bridge)
+    }
+
+    func testPinnedViewportFollowsDocumentGrowth() {
+        let (scrollView, document, coordinator, _) = makeHarness()
+        XCTAssertTrue(coordinator.pinned, "A conversation opens pinned")
+        // Without SwiftUI's bottom anchor in play, the coordinator's fallback must catch up.
+        document.setFrameSize(NSSize(width: 400, height: 1_400))
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 900, accuracy: 1,
+                       "Growth while pinned lands at the new bottom")
+    }
+
+    func testUnpinnedPrependCompensationKeepsTheReadingPosition() {
+        let (scrollView, document, coordinator, bridge) = makeHarness()
+        // A real user scroll away from the bottom unpins.
+        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: 100))
+        XCTAssertFalse(coordinator.pinned)
+
+        bridge.armPrepend()
+        document.setFrameSize(NSSize(width: 400, height: 1_600))
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
+                       "Prepended height shifts the origin so visible rows do not move")
+
+        bridge.disarmPrepend()
+        document.setFrameSize(NSSize(width: 400, height: 1_800))
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
+                       "Disarmed growth below the viewport leaves the reading position alone")
+    }
+}
