@@ -488,6 +488,20 @@ struct PulsingDotView: NSViewRepresentable {
     }
 }
 
+extension View {
+    /// Replaces the macOS 26 soft scroll edge effect with a hard edge under the toolbar. The
+    /// soft effect's backdrop region goes stale when scroll position is set programmatically,
+    /// painting a large ghost blur over the top of the content until a user scroll refreshes it.
+    @ViewBuilder
+    func piHardTopScrollEdge() -> some View {
+        if #available(macOS 26.0, *) {
+            scrollEdgeEffectStyle(.hard, for: .top)
+        } else {
+            self
+        }
+    }
+}
+
 /// A quiet section header used by the inspector: uppercase, tertiary, no card.
 struct PiSectionHeader: View {
     let title: String

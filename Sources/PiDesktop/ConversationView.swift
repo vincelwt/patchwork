@@ -372,6 +372,12 @@ struct MessageScrollView: View {
         // coordinator keeps the viewport pinned through streaming growth, image decodes, and
         // lazily settling rows — synchronously, inside each layout pass.
         .defaultScrollAnchor(.bottom)
+        // A hard top edge on purpose: the soft (progressive-blur) scroll edge effect computes
+        // its extent from scroll state that programmatic positioning (bottom anchor plus the
+        // coordinator's clip-origin corrections) leaves stale, ballooning a ghost "blur
+        // overlay" over the top of freshly opened conversations until a real scroll recomputes
+        // it. The toolbar background is opaque here anyway, so the soft fade bought nothing.
+        .piHardTopScrollEdge()
         .scrollDismissesKeyboard(.interactively)
         .onAppear { store.consumeInitialScrollTarget() }
         .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
