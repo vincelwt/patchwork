@@ -92,6 +92,10 @@ private final class RuntimeSlot {
     var connectivityResumeCancelled = false
     var connectivityResumePreparing = false
     var connectivityResumeInFlight = false
+    var providerRetryPending = false
+    var providerRetryAttempt = 0
+    var providerRetryID: UUID?
+    var cancelProviderRetry: (() -> Void)?
     var isReady = false
     var isStarting = false
     var startupBeganAt: Date?
@@ -294,6 +298,7 @@ final class AppStore: ObservableObject {
     private let connectivityMonitor: ConnectivityMonitor?
     private let runtimeRetirementDelay: TimeInterval
     private let runtimeRetirementScheduler: RuntimeRetirementScheduler
+    private let providerRetryScheduler: RuntimeRetirementScheduler
     private let managedTurnResumer: ManagedTurnResumer
     private let managedTurnWriterProbe: ManagedTurnWriterProbe?
     private var cancelRuntimeRetirement: (() -> Void)?
@@ -383,6 +388,7 @@ final class AppStore: ObservableObject {
     private static let connectivityResumeDescription = "Continue an interrupted turn after a transient failure"
     private static let connectivityResumeInstruction =
         "A transient failure interrupted the previous turn. Continue from where it stopped without repeating completed work."
+    private static let providerRetryDelays: [TimeInterval] = [15, 30, 60, 120, 300, 600, 1_200, 3_600]
     private static let relaunchRecoveryInstruction =
         "Pi Desktop restarted during the previous turn. Inspect the durable conversation and continue from where it stopped. Do not repeat completed actions; if an outcome is uncertain, explain that and ask before repeating it."
 
@@ -400,6 +406,14 @@ final class AppStore: ObservableObject {
         isActiveOverride: Bool? = nil,
         runtimeRetirementDelay: TimeInterval = 120,
         runtimeRetirementScheduler: @escaping RuntimeRetirementScheduler = { delay, action in
+            let task = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                action()
+            }
+            return { task.cancel() }
+        },
+        providerRetryScheduler: @escaping RuntimeRetirementScheduler = { delay, action in
             let task = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 guard !Task.isCancelled else { return }
@@ -436,6 +450,7 @@ final class AppStore: ObservableObject {
         self.runtimeFactory = runtimeFactory
         self.runtimeRetirementDelay = runtimeRetirementDelay
         self.runtimeRetirementScheduler = runtimeRetirementScheduler
+        self.providerRetryScheduler = providerRetryScheduler
         self.managedTurnResumer = managedTurnResumer
         self.managedTurnWriterProbe = managedTurnWriterProbe
         self.connectivityMonitor = connectivityMonitor
@@ -563,6 +578,11 @@ final class AppStore: ObservableObject {
     private func pauseRetryForConnectivity(_ slot: RuntimeSlot) {
         guard isOffline, state(for: slot).isRetrying, !slot.connectivityResumeCancelled else { return }
         markWaitingForConnectivity(slot)
+        if slot.providerRetryID != nil {
+            cancelProviderRetry(for: slot, resetAttempt: false)
+            updateState(for: slot) { $0.isRetrying = false }
+            return
+        }
         guard !slot.connectivityRetryAbortRequested else { return }
         slot.connectivityRetryAbortRequested = true
         slot.runtime.send(type: "abort_retry", payload: [:]) { _ in }
@@ -574,6 +594,40 @@ final class AppStore: ObservableObject {
         updateState(for: slot) { $0.isWaitingForNetwork = false }
     }
 
+    private func cancelProviderRetry(for slot: RuntimeSlot, resetAttempt: Bool) {
+        slot.cancelProviderRetry?()
+        slot.cancelProviderRetry = nil
+        slot.providerRetryID = nil
+        slot.providerRetryPending = false
+        if resetAttempt { slot.providerRetryAttempt = 0 }
+    }
+
+    private func scheduleProviderRetry(for slot: RuntimeSlot) {
+        guard slot.providerRetryPending, !slot.connectivityResumeCancelled,
+              slot.runtime.isRunning, slot.isReady, !slot.isStarting, !slot.isSuperseded else { return }
+        slot.providerRetryPending = false
+        if isOffline {
+            markWaitingForConnectivity(slot)
+            return
+        }
+
+        let index = min(slot.providerRetryAttempt, Self.providerRetryDelays.count - 1)
+        let delay = Self.providerRetryDelays[index]
+        slot.providerRetryAttempt = min(index + 1, Self.providerRetryDelays.count)
+        let retryID = UUID()
+        slot.providerRetryID = retryID
+        updateState(for: slot) { state in
+            state.isRetrying = true
+            state.retryAttempt = slot.providerRetryAttempt
+            state.lastError = nil
+        }
+        if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
+        slot.cancelProviderRetry = providerRetryScheduler(delay) { [weak self, weak slot] in
+            guard let self, let slot, slot.providerRetryID == retryID, !slot.isSuperseded else { return }
+            prepareInterruptedTurnContinuation(for: slot)
+        }
+    }
+
     private func resumeAfterConnectivityIfPossible(_ slot: RuntimeSlot) {
         let current = state(for: slot)
         guard !isOffline, current.isWaitingForNetwork, !current.isStreaming, !current.isRetrying else { return }
@@ -582,7 +636,7 @@ final class AppStore: ObservableObject {
 
     private func prepareInterruptedTurnContinuation(for slot: RuntimeSlot) {
         let current = state(for: slot)
-        guard !isOffline, !current.isStreaming, !current.isRetrying,
+        guard !isOffline, !current.isStreaming, (!current.isRetrying || slot.providerRetryID != nil),
               !slot.connectivityResumeCancelled, !slot.connectivityResumePreparing,
               slot.runtime.isRunning, slot.isReady, !slot.isStarting, !slot.isSuperseded else { return }
 
@@ -594,7 +648,7 @@ final class AppStore: ObservableObject {
             guard let self, let slot else { return }
             slot.connectivityResumePreparing = false
             let current = state(for: slot)
-            guard !isOffline, !current.isStreaming, !current.isRetrying,
+            guard !isOffline, !current.isStreaming, (!current.isRetrying || slot.providerRetryID != nil),
                   !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
 
             let response: JSONValue
@@ -623,8 +677,11 @@ final class AppStore: ObservableObject {
 
     private func sendInterruptedTurnContinuation(to slot: RuntimeSlot, hidden: Bool) {
         let current = state(for: slot)
-        guard !isOffline, !current.isStreaming, !current.isRetrying,
+        guard !isOffline, !current.isStreaming, (!current.isRetrying || slot.providerRetryID != nil),
               !slot.connectivityResumeCancelled, slot.runtime.isRunning, !slot.isSuperseded else { return }
+        slot.cancelProviderRetry = nil
+        slot.providerRetryID = nil
+        updateState(for: slot) { $0.isRetrying = false }
         clearConnectivityWait(for: slot)
         slot.connectivityResumeInFlight = true
         slot.promptBeganAt = Date()
@@ -660,6 +717,7 @@ final class AppStore: ObservableObject {
 
     private func failInterruptedTurnContinuation(_ slot: RuntimeSlot, error: String) {
         clearConnectivityWait(for: slot)
+        cancelProviderRetry(for: slot, resetAttempt: true)
         slot.connectivityResumeInFlight = false
         let message = "Could not retry the interrupted turn: \(error)"
         updateState(for: slot) { state in
@@ -913,6 +971,7 @@ final class AppStore: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return !slot.isStarting && !slot.optionsLoading && presentation.phase == .idle && !presentation.isBusy
             && slot.pendingTurn == nil && dialogs.isEmpty && queued.isEmpty
+            && !slot.providerRetryPending && slot.providerRetryID == nil
             && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
             && capability == nil && questionnaire == nil && stream == nil && subagents.isEmpty
     }
@@ -1040,9 +1099,11 @@ final class AppStore: ObservableObject {
         return paths
     }
 
-    private func isWaitingForConnectivity(at path: String) -> Bool {
+    private func isWaitingForProviderRecovery(at path: String) -> Bool {
         runtimeSlots().contains { slot in
-            guard (state(for: slot).isWaitingForNetwork || slot.connectivityResumeInFlight),
+            let waiting = state(for: slot).isWaitingForNetwork || slot.connectivityResumeInFlight
+                || slot.providerRetryPending || slot.providerRetryID != nil
+            guard waiting,
                   let candidate = slot.sessionPath ?? state(for: slot).sessionFile else { return false }
             return URL(fileURLWithPath: candidate).standardizedFileURL.path == path
         }
@@ -1323,7 +1384,7 @@ final class AppStore: ObservableObject {
             if activity.lastStopReason == "error", activity.state == .running { continue }
             // A transport error is intermediate while Desktop owns a pending continuation.
             // Deferring it avoids an error notification immediately followed by a success one.
-            if isWaitingForConnectivity(at: path) { continue }
+            if isWaitingForProviderRecovery(at: path) { continue }
 
             let previousID = persistence.state.latestCompletedEntryIDBySessionPath[path]
             let focused = isApplicationActive
@@ -2593,7 +2654,17 @@ final class AppStore: ObservableObject {
     func abortCurrentTurnPreservingQueues() {
         guard runtimeMatchesCurrentRoute else { return }
         let slot = activeRuntimeSlot
+        let wasWaitingToRetry = slot.providerRetryPending || slot.providerRetryID != nil
         slot.connectivityResumeCancelled = true
+        cancelProviderRetry(for: slot, resetAttempt: true)
+        if wasWaitingToRetry {
+            runtimeState.isRetrying = false
+            if !runtimeState.isStreaming {
+                if dispatchNextActiveFollowUp() { slot.connectivityResumeCancelled = false }
+                else { resetRuntimeRetirementLease(for: slot) }
+                return
+            }
+        }
         if slot.pendingStartupPrompts > 0 {
             slot.outboxPromptAbortRequested = true
             return
@@ -2663,6 +2734,7 @@ final class AppStore: ObservableObject {
         slot.connectivityResumeCancelled = true
         slot.connectivityResumePreparing = false
         slot.connectivityResumeInFlight = false
+        cancelProviderRetry(for: slot, resetAttempt: true)
         if ownsLivePresentation {
             outbox.removeAll()
             streamingMessage = nil
@@ -3338,6 +3410,7 @@ final class AppStore: ObservableObject {
         slot.connectivityResumeCancelled = false
         slot.connectivityResumePreparing = false
         slot.connectivityResumeInFlight = false
+        cancelProviderRetry(for: slot, resetAttempt: true)
         slot.isReady = false
         slot.isStarting = true
         slot.isSuperseded = false
@@ -3498,6 +3571,7 @@ final class AppStore: ObservableObject {
         if command == "prompt" {
             slot.connectivityResumeCancelled = false
             slot.connectivityResumeInFlight = false
+            cancelProviderRetry(for: slot, resetAttempt: true)
             clearConnectivityWait(for: slot)
             slot.pendingTurn = PendingUserTurn(origin: origin, text: originalDraft, attachments: sentAttachments)
         }
@@ -3924,14 +3998,19 @@ final class AppStore: ObservableObject {
             slot.outboxPromptPreflighting = false
             slot.outboxPromptAbortRequested = false
             slot.promptPreflightID = nil
+            if slot.providerRetryPending || slot.providerRetryID != nil {
+                cancelProviderRetry(for: slot, resetAttempt: false)
+            }
             if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
             updateState(for: slot) { state in
                 state.isStreaming = true
+                state.isRetrying = false
                 if state.phase != .waitingForModel { state.phase = .working }
             }
             if abortPreflight { sendSoftAbort(to: slot) }
         case "agent_settled":
             let waitingForNetwork = state(for: slot).isWaitingForNetwork
+            let shouldRetryProvider = slot.providerRetryPending
             updateState(for: slot) { state in
                 state.isStreaming = false
                 state.isRetrying = false
@@ -3944,12 +4023,17 @@ final class AppStore: ObservableObject {
             slot.streamingMessage = nil
             slot.pendingTurn = nil
             slot.promptBeganAt = nil
-            let startedFollowUp = waitingForNetwork ? false : flushBackgroundOutbox(.followUp, slot: slot)
+            let startedFollowUp = waitingForNetwork || shouldRetryProvider
+                ? false : flushBackgroundOutbox(.followUp, slot: slot)
             let session = session(for: slot)
             if let session { Task { await self.refreshSummary(for: session) } }
             if !startedFollowUp {
                 if waitingForNetwork { resumeAfterConnectivityIfPossible(slot) }
-                else if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                else if shouldRetryProvider { scheduleProviderRetry(for: slot) }
+                else {
+                    cancelProviderRetry(for: slot, resetAttempt: true)
+                    if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+                }
                 scheduleFinalDurabilityCheck(for: slot, retireWhenDone: slot !== activeRuntimeSlot)
             }
         case "message_update":
@@ -4009,13 +4093,14 @@ final class AppStore: ObservableObject {
             let succeeded = event["success"]?.boolValue == true
             updateState(for: slot) { state in
                 state.isRetrying = false
-                if slot.connectivityResumeCancelled {
-                    state.lastError = nil
-                } else if !succeeded, !waitingForNetwork {
-                    state.lastError = event["finalError"]?.stringValue
-                }
+                state.lastError = nil
             }
-            if succeeded { clearConnectivityWait(for: slot) }
+            if succeeded {
+                cancelProviderRetry(for: slot, resetAttempt: true)
+                clearConnectivityWait(for: slot)
+            } else if !slot.connectivityResumeCancelled, !waitingForNetwork {
+                slot.providerRetryPending = true
+            }
         case "extension_ui_request":
             handleBackgroundExtensionUI(event, slot: slot)
         case "extension_error":
@@ -4182,13 +4267,18 @@ final class AppStore: ObservableObject {
             activeRuntimeSlot.outboxPromptPreflighting = false
             activeRuntimeSlot.outboxPromptAbortRequested = false
             activeRuntimeSlot.promptPreflightID = nil
+            if activeRuntimeSlot.providerRetryPending || activeRuntimeSlot.providerRetryID != nil {
+                cancelProviderRetry(for: activeRuntimeSlot, resetAttempt: false)
+            }
             cancelRuntimeRetirementLease()
             runtimeState.isStreaming = true
+            runtimeState.isRetrying = false
             if runtimeState.phase != .waitingForModel { runtimeState.phase = .working }
             if abortPreflight { sendSoftAbort(to: activeRuntimeSlot) }
         case "agent_settled":
             cancelPendingStreamingPublish()
             let waitingForNetwork = runtimeState.isWaitingForNetwork
+            let shouldRetryProvider = activeRuntimeSlot.providerRetryPending
             runtimeState.isStreaming = false
             runtimeState.isRetrying = false
             runtimeState.phase = .idle
@@ -4197,7 +4287,7 @@ final class AppStore: ObservableObject {
             activeCapability = nil
             discardQuestionnaire()
             streamingMessage = nil
-            if !waitingForNetwork { flushOutbox(.followUp) }
+            if !waitingForNetwork, !shouldRetryProvider { flushOutbox(.followUp) }
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
             // left: nothing about this dispatch is "pending" any more.
             activeRuntimeSlot.promptBeganAt = nil
@@ -4212,7 +4302,11 @@ final class AppStore: ObservableObject {
                 }
             }
             if waitingForNetwork { resumeAfterConnectivityIfPossible(activeRuntimeSlot) }
-            else { resetRuntimeRetirementLease(for: activeRuntimeSlot) }
+            else if shouldRetryProvider { scheduleProviderRetry(for: activeRuntimeSlot) }
+            else {
+                cancelProviderRetry(for: activeRuntimeSlot, resetAttempt: true)
+                resetRuntimeRetirementLease(for: activeRuntimeSlot)
+            }
             scheduleFinalDurabilityCheck(for: activeRuntimeSlot, retireWhenDone: false)
         case "message_update":
             recordRuntimeOutput(for: activeRuntimeSlot)
@@ -4299,14 +4393,12 @@ final class AppStore: ObservableObject {
             let waitingForNetwork = runtimeState.isWaitingForNetwork
             let succeeded = event["success"]?.boolValue == true
             runtimeState.isRetrying = false
+            runtimeState.lastError = nil
             if succeeded {
+                cancelProviderRetry(for: activeRuntimeSlot, resetAttempt: true)
                 clearConnectivityWait(for: activeRuntimeSlot)
-            } else if activeRuntimeSlot.connectivityResumeCancelled {
-                runtimeState.lastError = nil
-            } else if !waitingForNetwork, let error = event["finalError"]?.stringValue {
-                // Pi's own automatic retries were exhausted while the network path was live.
-                runtimeState.lastError = error
-                showToast(error, style: .error)
+            } else if !activeRuntimeSlot.connectivityResumeCancelled, !waitingForNetwork {
+                activeRuntimeSlot.providerRetryPending = true
             }
         case "extension_ui_request":
             if selected { handleExtensionUI(event) }
@@ -4490,6 +4582,7 @@ final class AppStore: ObservableObject {
         slot.connectivityResumeCancelled = false
         slot.connectivityResumePreparing = false
         slot.connectivityResumeInFlight = false
+        cancelProviderRetry(for: slot, resetAttempt: true)
         if slot === activeRuntimeSlot {
             cancelRuntimeRetirementLease()
             clearExtensionDialogs()

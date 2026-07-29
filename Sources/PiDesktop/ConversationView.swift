@@ -131,7 +131,7 @@ struct ConversationView: View {
                     ExtensionWidgetStrip(placement: .aboveEditor)
                     ComposerView(
                         model: store.composer,
-                        isStreaming: store.isSelectedRuntime && store.runtimeState.isStreaming,
+                        isStreaming: store.isSelectedRuntime && store.runtimeState.isBusy,
                         autofocus: true,
                         focusSignal: composerFocusTick,
                         onSend: {
@@ -164,7 +164,7 @@ struct ConversationView: View {
 
     /// Working, whether this app's runtime drives the turn or a terminal does.
     private var conversationIsRunning: Bool {
-        if store.isSelectedRuntime, store.runtimeState.isStreaming { return true }
+        if store.isSelectedRuntime, store.runtimeState.isBusy { return true }
         guard let session = store.selectedSession else { return false }
         return store.isRunning(session)
     }
