@@ -37,7 +37,7 @@ final class SidebarPresentationTests: XCTestCase {
         let snapshot = SidebarSnapshot(sessions: sessions, query: "")
 
         let active = snapshot.activeGroups.flatMap(\.sessions)
-        let archived = snapshot.archivedGroups.flatMap(\.sessions)
+        let archived = snapshot.archivedSessions
 
         XCTAssertEqual(Set(active.map(\.id)), ["a", "d"])
         XCTAssertEqual(Set(archived.map(\.id)), ["b", "c"])
@@ -58,7 +58,7 @@ final class SidebarPresentationTests: XCTestCase {
         let snapshot = SidebarSnapshot(sessions: sessions, query: "", virtualFolders: [folder], assignments: assignments)
 
         XCTAssertEqual(snapshot.activeGroups.flatMap(\.sessions).map(\.id), ["kept"])
-        XCTAssertEqual(snapshot.archivedGroups.flatMap(\.sessions).map(\.id), ["shelved"])
+        XCTAssertEqual(snapshot.archivedSessions.map(\.id), ["shelved"])
     }
 
     func testGlobalDesktopConversationsAppearFirstUnderRecents() {

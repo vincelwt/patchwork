@@ -1,0 +1,188 @@
+import Foundation
+import XCTest
+@testable import PiDesktop
+
+/// Covers the pure logic behind conversation worktrees, archive retention, the flat archive
+/// list, and the header's pull-request link. No git process, no runtime, no provider call.
+final class ConversationWorktreeTests: XCTestCase {
+    private func summary(id: String, cwd: String, archived: Bool, modifiedAt: Date = Date()) -> SessionSummary {
+        SessionSummary(
+            id: id,
+            fileURL: URL(fileURLWithPath: "/tmp/\(id).jsonl"),
+            cwd: URL(fileURLWithPath: cwd, isDirectory: true),
+            createdAt: modifiedAt,
+            modifiedAt: modifiedAt,
+            name: id,
+            preview: "",
+            messageCount: 0,
+            metrics: TokenMetrics(),
+            isArchived: archived
+        )
+    }
+
+    private func message(_ text: String) -> ChatMessage {
+        ChatMessage(
+            id: UUID().uuidString,
+            role: .assistant,
+            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))],
+            timestamp: Date(),
+            raw: .null
+        )
+    }
+
+    // MARK: - Worktree location
+
+    /// The single guard standing between automatic retention and a real project checkout.
+    func testOnlyPathsInsideTheWorktreeRootAreEverConsideredManaged() {
+        XCTAssertTrue(WorktreeService.isManaged(WorktreeService.root.appendingPathComponent("pi-desktop-20260729-120000")))
+        XCTAssertFalse(WorktreeService.isManaged(URL(fileURLWithPath: "/Users/someone/code/pi-desktop")))
+        XCTAssertFalse(WorktreeService.isManaged(WorktreeService.root), "The root itself is not a worktree")
+        XCTAssertFalse(
+            WorktreeService.isManaged(URL(fileURLWithPath: WorktreeService.root.path + "-elsewhere/repo")),
+            "A sibling directory sharing the root's prefix must not be treated as managed"
+        )
+    }
+
+    func testWorktreesLiveUnderThePiHomeDirectoryRatherThanTheProject() {
+        XCTAssertTrue(WorktreeService.root.path.hasSuffix("/.pi/worktrees"))
+    }
+
+    func testSlugCombinesRepositoryNameAndTimestampSoRepeatedWorktreesNeverCollide() {
+        let first = WorktreeService.slug(forRepositoryNamed: "pi-desktop", now: Date(timeIntervalSince1970: 0))
+        let second = WorktreeService.slug(forRepositoryNamed: "pi-desktop", now: Date(timeIntervalSince1970: 3_600))
+        XCTAssertTrue(first.hasPrefix("pi-desktop-"))
+        XCTAssertNotEqual(first, second)
+    }
+
+    /// A worktree must branch off the project's main line, never off whatever another task left
+    /// checked out; `HEAD` is only the last resort for a repo with no main branch at all.
+    func testBaseRefPrefersTheMainLineAndFallsBackToHead() {
+        XCTAssertEqual(WorktreeService.baseRef(candidates: ["origin/main", "main"]) { $0 == "main" }, "main")
+        XCTAssertEqual(WorktreeService.baseRef(candidates: ["origin/main", "main"]) { _ in true }, "origin/main")
+        XCTAssertEqual(WorktreeService.baseRef(candidates: ["origin/main", "main"]) { _ in false }, "HEAD")
+    }
+
+    // MARK: - Archive retention
+
+    @MainActor
+    func testArchivesExpireOnlyAfterTheRetentionWindow() {
+        let now = Date()
+        let sessions = [
+            summary(id: "fresh", cwd: "/tmp/a", archived: true),
+            summary(id: "stale", cwd: "/tmp/b", archived: true),
+            summary(id: "active", cwd: "/tmp/c", archived: false)
+        ]
+        let archivedAt: [String: Date] = [
+            "fresh": now.addingTimeInterval(-AppStore.archiveRetention + 60),
+            "stale": now.addingTimeInterval(-AppStore.archiveRetention - 60),
+            "active": now.addingTimeInterval(-AppStore.archiveRetention * 10)
+        ]
+
+        let expired = AppStore.expiredArchiveIDs(sessions, archivedAt: archivedAt, now: now)
+
+        XCTAssertEqual(expired, ["stale"], "Only archived conversations past the window are pruned")
+    }
+
+    /// Sessions archived by an older build carry no timestamp; their clock starts when this build
+    /// first sees them rather than expiring them instantly.
+    @MainActor
+    func testUnstampedArchivesAreNotExpiredImmediately() {
+        let expired = AppStore.expiredArchiveIDs(
+            [summary(id: "legacy", cwd: "/tmp/a", archived: true)],
+            archivedAt: [:],
+            now: Date()
+        )
+        XCTAssertTrue(expired.isEmpty)
+    }
+
+    func testRetentionIsSevenDays() {
+        XCTAssertEqual(AppStore.archiveRetention, 7 * 24 * 60 * 60)
+    }
+
+    // MARK: - Flat archive list
+
+    func testArchiveIsAFlatListOrderedByArchiveRecency() {
+        let now = Date()
+        let sessions = [
+            summary(id: "old", cwd: "/tmp/a", archived: true),
+            summary(id: "newest", cwd: "/tmp/b", archived: true),
+            summary(id: "middle", cwd: "/tmp/a", archived: true),
+            summary(id: "active", cwd: "/tmp/a", archived: false)
+        ]
+        let stamps: [String: Date] = [
+            "old": now.addingTimeInterval(-300),
+            "newest": now,
+            "middle": now.addingTimeInterval(-100)
+        ]
+
+        let snapshot = SidebarSnapshot(
+            sessions: sessions,
+            query: "",
+            archivedAt: { stamps[$0.id] ?? $0.modifiedAt }
+        )
+
+        XCTAssertEqual(
+            snapshot.archivedSessions.map(\.id),
+            ["newest", "middle", "old"],
+            "Archived rows are sorted by archive date, not grouped by folder"
+        )
+    }
+
+    // MARK: - Persisted state
+
+    func testArchiveDatesAndLastFolderSurviveAStateRoundTrip() throws {
+        var state = PersistedAppState()
+        state.archivedAt = ["a": Date(timeIntervalSince1970: 1_700_000_000)]
+        state.lastFolder = "/tmp/project"
+
+        let decoded = try JSONDecoder().decode(PersistedAppState.self, from: JSONEncoder().encode(state))
+
+        XCTAssertEqual(decoded.archivedAt["a"], state.archivedAt["a"])
+        XCTAssertEqual(decoded.lastFolder, "/tmp/project")
+    }
+
+    /// A `state.json` written before this feature must still decode, archive flags intact.
+    func testLegacyStateWithoutTheNewFieldsStillDecodes() throws {
+        let legacy = Data(#"{"archivedSessionIDs":["kept"],"recentFolders":["/tmp/x"]}"#.utf8)
+        let decoded = try JSONDecoder().decode(PersistedAppState.self, from: legacy)
+
+        XCTAssertEqual(decoded.archivedSessionIDs, ["kept"])
+        XCTAssertTrue(decoded.archivedAt.isEmpty)
+        XCTAssertNil(decoded.lastFolder)
+    }
+
+    // MARK: - Pull request link
+
+    func testTheMostRecentPullRequestInTheTranscriptWins() {
+        let messages = [
+            message("Opened https://github.com/acme/widgets/pull/11 earlier."),
+            message("Now shipped as https://github.com/acme/widgets/pull/482 instead.")
+        ]
+
+        let link = PullRequestLink.latest(in: messages)
+
+        XCTAssertEqual(link?.absoluteString, "https://github.com/acme/widgets/pull/482")
+        XCTAssertEqual(link.flatMap(PullRequestLink.number(in:)), "#482")
+    }
+
+    func testGitLabMergeRequestsCountAndUnrelatedGitHubLinksDoNot() {
+        XCTAssertEqual(
+            PullRequestLink.firstLink(in: "see https://gitlab.com/acme/widgets/-/merge_requests/7")?.absoluteString,
+            "https://gitlab.com/acme/widgets/-/merge_requests/7"
+        )
+        XCTAssertNil(PullRequestLink.firstLink(in: "https://github.com/acme/widgets/issues/12"))
+        XCTAssertNil(PullRequestLink.firstLink(in: "https://github.com/acme/widgets"))
+        XCTAssertNil(PullRequestLink.latest(in: [message("no links at all here")]))
+    }
+
+    /// `gh pr create` prints the URL last, after any progress chatter that may itself name an
+    /// older PR; the tail of the blob is the one that just got created.
+    func testTheLastLinkInsideOneMessageWins() {
+        let output = """
+        remote: resolving deltas
+        Superseding https://github.com/acme/widgets/pull/3
+        https://github.com/acme/widgets/pull/4
+        """
+        XCTAssertEqual(PullRequestLink.firstLink(in: output)?.absoluteString, "https://github.com/acme/widgets/pull/4")
+    }
+}
