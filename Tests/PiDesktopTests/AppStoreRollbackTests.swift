@@ -55,7 +55,7 @@ private final class FakeRuntime: PiRuntimeProtocol {
             let commands: [JSONValue] = hasConnectivityResumeCommand ? [.object([
                 "name": .string("pi-desktop-resume"),
                 "source": .string("extension"),
-                "description": .string("Resume an interrupted turn after network connectivity returns"),
+                "description": .string("Continue an interrupted turn after a transient failure"),
                 "sourceInfo": .object(["path": .string(connectivityResumeCommandPath)])
             ])] : []
             completion?(.success(.object([
@@ -504,6 +504,32 @@ final class AppStoreRollbackTests: XCTestCase {
         // A later, unrelated crash (nothing pending any more) must not resurrect the first turn.
         runtime.crash("Pi exited with status 1.")
         XCTAssertEqual(store.draft, "", "The settled turn left nothing pending to restore")
+    }
+
+    func testExhaustedProviderRetryOffersAHiddenOneClickContinuation() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        store.draft = "finish this work"
+        store.submitDraft()
+        runtime.succeed("prompt", data: .object([:]))
+        runtime.onEvent?(.object([
+            "type": .string("auto_retry_end"),
+            "success": .bool(false),
+            "finalError": .string("servers overloaded")
+        ]))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        XCTAssertTrue(store.canRetryLastFailure)
+        XCTAssertEqual(store.runtimeState.lastError, "servers overloaded")
+
+        store.retryLastFailedTurn()
+
+        XCTAssertNil(store.runtimeState.lastError)
+        XCTAssertTrue(store.runtimeState.isStreaming)
+        XCTAssertEqual(runtime.commandCount("prompt"), 2)
+        XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "/pi-desktop-resume")
     }
 
     func testOfflineProviderRetryPausesAndResumesOnceAfterReconnect() throws {
