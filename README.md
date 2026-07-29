@@ -88,6 +88,10 @@ host so the explicit LaunchAgent mode below remains available. If a LaunchAgent 
 started host already owns the socket, the app defers to it rather than starting a competing
 service.
 
+The packaged app ships `pidesk` inside its bundle, so it is not on `PATH` until you link it.
+Settings → Daemon has an **Install “pidesk”** button that symlinks it into `~/.local/bin`
+(next to the Pi CLI); it never overwrites an existing file it does not own.
+
 For a daemon that runs without the app at all — a headless machine, or automations that must
 survive the app never being opened — install it as a LaunchAgent instead:
 
