@@ -109,6 +109,14 @@ struct ConversationView: View {
 
     private var conversationColumn: some View {
         messageArea
+            // The transcript's structural swaps (loading → content, `.id(route)` remounts) must
+            // never inherit an ambient animation. `withAnimation` around any shared-store
+            // mutation (a toast appearing, for example) animates every view diff batched into
+            // that update, which turned those swaps into opacity crossfades; an interrupted
+            // crossfade left the whole conversation ghosted at partial opacity until a scroll
+            // forced fresh layers. Row-level `.animation(_, value:)` modifiers set their own
+            // animation downstream of this strip, so in-row micro-animations still play.
+            .transaction { $0.animation = nil }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PiTheme.space6) {
