@@ -43,7 +43,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
     func testBundledVersionUpgradesThePreviousDevelopmentInstall() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
         XCTAssertEqual(
-            ActivityExtensionInstaller.decide(installed: source(version: 17), bundled: bundled),
+            ActivityExtensionInstaller.decide(installed: source(version: 19), bundled: bundled),
             .upgraded
         )
     }
@@ -92,17 +92,20 @@ final class ActivityExtensionInstallerTests: XCTestCase {
     }
 
     func testBundledSourcePreservesExternalRunState() throws {
-        // An idle RPC attachment or a background subagent must not make its parent look idle.
+        // An idle RPC attachment, background subagent, or managed process must not make its parent look idle.
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertGreaterThanOrEqual(try XCTUnwrap(ActivityExtensionInstaller.version(of: bundled)), 3)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("${sessionId}-${process.pid}.json"))
         XCTAssertTrue(bundled.contains("subagents:created"))
         XCTAssertTrue(bundled.contains("subagents:completed"))
+        XCTAssertTrue(bundled.contains("pi.on(\"tool_execution_end\""))
+        XCTAssertTrue(bundled.contains("ad-process:update"))
+        XCTAssertTrue(bundled.contains("backgroundProcesses.size > 0"))
     }
 
     func testBundledExtensionLetsPiNameANewConversation() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("name: \"set_conversation_name\""))
         XCTAssertTrue(bundled.contains("After understanding the first user message"))
         XCTAssertTrue(bundled.contains("const current = pi.getSessionName()"))
@@ -111,7 +114,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
         XCTAssertTrue(bundled.contains("rely on durable thread history"))
         XCTAssertTrue(bundled.contains("appended to this conversation"))
@@ -123,7 +126,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionDeliversAppManagedCodexReviewsWithoutCreatingAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("pi.registerCommand(PULL_REQUEST_REVIEW_COMMAND"))
         XCTAssertTrue(bundled.contains("chatgpt-codex-connector"))
         XCTAssertTrue(bundled.contains("--paginate"))
@@ -136,7 +139,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionBranchesEditedMessagesInsideTheCurrentSession() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-edit-message\""))
         XCTAssertTrue(bundled.contains("ctx.navigateTree(entryId, { summarize: false })"))
         XCTAssertTrue(bundled.contains("pi.appendEntry(\"pi-desktop-edit-ready\""))
@@ -145,7 +148,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionCanRetryWithoutAVisibleUserMessage() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-resume\""))
         XCTAssertTrue(bundled.contains("customType: \"pi-desktop-retry\""))
         XCTAssertTrue(bundled.contains("Continue from where it stopped without repeating completed work"))
@@ -155,7 +158,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionCouplesPreviewToTheCompletedAnswer() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 19)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 20)
         XCTAssertTrue(bundled.contains("preview = extractPreview(message.content);"))
         XCTAssertTrue(bundled.contains("previewCompletionId: preview ? completionId : undefined"))
         XCTAssertTrue(bundled.contains("completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());"))
