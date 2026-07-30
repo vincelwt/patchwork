@@ -1270,6 +1270,20 @@ final class AppStore: ObservableObject {
         activityMonitor.aggregateResources
     }
 
+    /// The sidebar's Status buckets, also used by the menu bar panel, so both file and sort
+    /// every conversation identically instead of each repeating the store's predicates.
+    func statusGroups(_ sessions: [SessionSummary]) -> [SidebarStatusGroup] {
+        SidebarStatusGroup.groups(
+            sessions,
+            isRunning: { self.isRunning($0) },
+            isUnread: { self.isUnread($0) },
+            hasOpenPullRequest: { self.openPullRequestSessionIDs.contains($0.id) },
+            isAutomated: { self.scheduledThreadIDs.contains($0.id) },
+            runningAt: { self.runningSortDate($0) },
+            modifiedAt: { self.liveModifiedAt($0) }
+        )
+    }
+
     /// Dock badge source: the same Done bucket shown by the sidebar's Status view.
     var doneSessionCount: Int {
         sessions.reduce(0) { count, session in

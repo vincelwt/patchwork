@@ -19,11 +19,33 @@ enum MenuBarPanelLayout {
         return (sessions, limits)
     }
 
-    static func sessionHeight(count: Int, maxHeight: CGFloat) -> CGFloat {
-        guard count > 0 else { return 0 }
-        let rows = min(count, sessionDisplayLimit)
+    /// The buckets worth a glance from the menu bar, in display order. Open PRs and Automated
+    /// stay in the sidebar; because `SidebarStatusGroup.groups` files each conversation exactly
+    /// once, dropping them here cannot leak them into Done.
+    static let sections: [SidebarStatusSection] = [.running, .unread, .done]
+
+    /// Fills Running, then Unread, then Done up to the one shared row bound and reports what did
+    /// not fit, so a long tail becomes a single line instead of an unbounded list.
+    static func boundedSections(_ groups: [SidebarStatusGroup]) -> (sections: [SidebarStatusGroup], hidden: Int) {
+        var remaining = sessionDisplayLimit
+        var visible: [SidebarStatusGroup] = []
+        var hidden = 0
+        for group in groups where sections.contains(group.section) {
+            let shown = min(remaining, group.sessions.count)
+            hidden += group.sessions.count - shown
+            remaining -= shown
+            guard shown > 0 else { continue }
+            visible.append(SidebarStatusGroup(section: group.section, sessions: Array(group.sessions.prefix(shown))))
+        }
+        return (visible, hidden)
+    }
+
+    static func sessionHeight(rows: Int, headers: Int, maxHeight: CGFloat) -> CGFloat {
+        guard rows > 0 else { return 0 }
+        let rows = min(rows, sessionDisplayLimit)
         let contentHeight = CGFloat(rows) * PiTheme.menuBarSessionRowHeight
-            + CGFloat(rows - 1) * PiTheme.space2
+            + CGFloat(headers) * PiTheme.folderHeaderHeight
+            + CGFloat(rows + headers - 1) * PiTheme.space2
             + 2 * PiTheme.space4
         return min(contentHeight, maxHeight)
     }
@@ -64,11 +86,9 @@ struct MenuBarContentView: View {
     private var heights: (sessions: CGFloat, limits: CGFloat) {
         MenuBarPanelLayout.heights(availableHeight: MenuBarPanelLayout.availableScreenHeight)
     }
-    private var sessionHeight: CGFloat {
-        MenuBarPanelLayout.sessionHeight(count: running.count, maxHeight: heights.sessions)
-    }
 
     var body: some View {
+        let visible = MenuBarPanelLayout.boundedSections(store.statusGroups(store.sessions))
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: PiTheme.space8) {
                 if !running.isEmpty { StatusDot(color: .piGreen, pulsing: true) }
@@ -81,25 +101,37 @@ struct MenuBarContentView: View {
 
             PiHairline()
 
-            if running.isEmpty {
-                Text("No sessions running")
+            if visible.sections.isEmpty {
+                Text("Nothing to show")
                     .font(PiFont.caption).foregroundStyle(.secondary)
                     .padding(.horizontal, PiTheme.space12)
                     .frame(height: PiTheme.menuBarEmptyStateHeight)
             } else {
                 ScrollView {
-                    VStack(spacing: PiTheme.space2) {
-                        ForEach(running.prefix(MenuBarPanelLayout.sessionDisplayLimit)) { session in
-                            RunningSessionRow(session: session)
+                    VStack(alignment: .leading, spacing: PiTheme.space2) {
+                        ForEach(visible.sections) { group in
+                            Text(group.section.rawValue)
+                                .font(SidebarTypography.folderHeader)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, PiTheme.space8)
+                                .frame(height: PiTheme.folderHeaderHeight, alignment: .leading)
+                                .accessibilityLabel("\(group.section.rawValue), \(group.sessions.count) conversations")
+                            ForEach(group.sessions) { MenuBarSessionRow(session: $0, section: group.section) }
                         }
-                        if running.count > MenuBarPanelLayout.sessionDisplayLimit {
-                            Text("\(running.count - MenuBarPanelLayout.sessionDisplayLimit) more running")
+                        if visible.hidden > 0 {
+                            Text("\(visible.hidden) more")
                                 .font(PiFont.micro).foregroundStyle(.tertiary)
+                                .padding(.horizontal, PiTheme.space8)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(PiTheme.space4)
                 }
-                .frame(height: sessionHeight)
+                .frame(height: MenuBarPanelLayout.sessionHeight(
+                    rows: visible.sections.reduce(0) { $0 + $1.sessions.count },
+                    headers: visible.sections.count,
+                    maxHeight: heights.sessions
+                ))
             }
 
             PiHairline()
@@ -127,17 +159,18 @@ struct MenuBarContentView: View {
     }
 }
 
-/// One running-session row with real hover feedback (previously none) and a click that brings
-/// the conversation on screen, matching every other row list in the app.
-private struct RunningSessionRow: View {
+/// One session row with real hover feedback and a click that brings the conversation on screen,
+/// matching every other row list in the app.
+private struct MenuBarSessionRow: View {
     @EnvironmentObject private var store: AppStore
     let session: SessionSummary
+    let section: SidebarStatusSection
     @State private var hovering = false
 
     var body: some View {
         Button { activate() } label: {
             HStack(spacing: PiTheme.space8) {
-                StatusDot(color: .piGreen, pulsing: true)
+                dot
                 VStack(alignment: .leading, spacing: 1) {
                     Text(session.displayName)
                         .font(PiFont.row).lineLimit(1).truncationMode(.tail)
@@ -155,8 +188,19 @@ private struct RunningSessionRow: View {
         .onHover { hovering = $0 }
     }
 
+    /// Done keeps the column without a mark of its own: a clear dot reuses the shared dot size
+    /// rather than introducing a spacer constant.
+    private var dot: some View {
+        switch section {
+        case .running: return StatusDot(color: .piGreen, pulsing: true)
+        case .unread: return StatusDot(color: .piBlue)
+        default: return StatusDot(color: .clear)
+        }
+    }
+
     private var state: String {
-        store.runningSince(session).map { "working \(NumberFormatting.elapsed(since: $0))" } ?? "working"
+        guard section == .running else { return store.liveModifiedAt(session).relativeShort }
+        return store.runningSince(session).map { "working \(NumberFormatting.elapsed(since: $0))" } ?? "working"
     }
 
     private func activate() {

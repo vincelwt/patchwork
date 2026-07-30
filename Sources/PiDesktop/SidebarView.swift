@@ -494,19 +494,21 @@ struct SidebarStatusGroup: Identifiable {
 private struct StatusListView: View {
     @EnvironmentObject private var store: AppStore
     let sessions: [SessionSummary]
+    /// Which buckets are folded away is a way of looking at the same list, like `SidebarMode`:
+    /// local state, everything open until this session says otherwise.
+    @State private var collapsed: Set<SidebarStatusSection> = []
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: PiTheme.space2) {
                 ForEach(groups) { group in
-                    Text(group.section.rawValue)
-                        .font(SidebarTypography.folderHeader)
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, PiTheme.space8)
-                        .padding(.top, PiTheme.space6)
-                        .frame(height: PiTheme.folderHeaderHeight, alignment: .leading)
-                        .accessibilityLabel("\(group.section.rawValue), \(group.sessions.count) conversations")
-                    ForEach(group.sessions) { SessionRow(session: $0, archived: false, hint: hint(for: $0)) }
+                    let expanded = !collapsed.contains(group.section)
+                    StatusSectionHeader(section: group.section, count: group.sessions.count, expanded: expanded) {
+                        if expanded { collapsed.insert(group.section) } else { collapsed.remove(group.section) }
+                    }
+                    if expanded {
+                        ForEach(group.sessions) { SessionRow(session: $0, archived: false, hint: hint(for: $0)) }
+                    }
                 }
             }
             .padding(.horizontal, PiTheme.space6)
@@ -515,23 +517,49 @@ private struct StatusListView: View {
         .scrollIndicators(.automatic)
     }
 
-    private var groups: [SidebarStatusGroup] {
-        SidebarStatusGroup.groups(
-            sessions,
-            isRunning: { store.isRunning($0) },
-            isUnread: { store.isUnread($0) },
-            hasOpenPullRequest: { store.openPullRequestSessionIDs.contains($0.id) },
-            isAutomated: { store.scheduledThreadIDs.contains($0.id) },
-            runningAt: { store.runningSortDate($0) },
-            modifiedAt: { store.liveModifiedAt($0) }
-        )
-    }
+    private var groups: [SidebarStatusGroup] { store.statusGroups(sessions) }
 
     /// Everything above the conversation itself, so a row torn out of its folder still says where
     /// it lives. Same helper the toolbar breadcrumb uses, so the two can never disagree.
     private func hint(for session: SessionSummary) -> String? {
         let ancestors = store.categorization(of: session).dropLast()
         return ancestors.isEmpty ? nil : ancestors.joined(separator: " > ")
+    }
+}
+
+/// Every Status bucket is a real disclosure, Automated included: a chevron, the whole header row
+/// as the click target, and the same header type, height, and hover treatment as the folder tree.
+private struct StatusSectionHeader: View {
+    let section: SidebarStatusSection
+    let count: Int
+    let expanded: Bool
+    let toggle: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: PiTheme.space6) {
+                // The chevron takes the shared icon column, so a section title starts on the
+                // same text origin as folder headers and conversation rows.
+                PiChevron(expanded: expanded)
+                    .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
+                Text(section.rawValue)
+                    .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
+                Text("\(count)")
+                    .font(SidebarTypography.metadata.monospacedDigit()).foregroundStyle(.tertiary)
+                Spacer(minLength: PiTheme.space4)
+            }
+            .padding(.horizontal, PiTheme.space8)
+            .frame(height: PiTheme.folderHeaderHeight)
+            .contentShape(Rectangle())
+            .piRowBackground(selected: false, hovering: hovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .padding(.top, PiTheme.space6)
+        .help(expanded ? "Hide \(section.rawValue)" : "Show \(section.rawValue)")
+        .accessibilityLabel("\(section.rawValue), \(count) conversations")
+        .accessibilityValue(expanded ? "expanded" : "collapsed")
     }
 }
 
