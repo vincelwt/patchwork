@@ -71,8 +71,8 @@ The phone UI covers the daily loop, not just reading:
   the session, so the browser never routes to a `pending:` placeholder; the web client also
   resolves placeholders from older daemons through their run id instead of showing “thread not found.”
 - **A thread can start in an existing checkout.** When the chosen folder is a repository with more
-  than one checkout, a Checkout menu lists the main one and every existing worktree. Selection
-  only: worktrees are still created and removed in the app.
+  than one checkout, a Checkout menu lists the main one and every existing worktree. The web remote
+  only selects existing checkouts; it never creates or removes them.
 - **Archiving has somewhere to go.** The list has explicit Active and Archived modes and a worded
   Archive/Unarchive button. A thread archived in the Mac app still shows under Archived, but
   restoring it answers `409` and has to be done in the app: the daemon never writes `state.json`.
@@ -115,16 +115,19 @@ survive the app never being opened — install it as a LaunchAgent instead:
 swift build -c release --product pi-deskd
 swift build -c release --product pidesk
 scripts/install-daemon.sh              # LaunchAgent, starts at login, restarts on crash
-pidesk threads list
-pidesk schedule add --name "Morning triage" --thread <id> \
+pidesk                              # active threads plus help in one call
+pidesk threads new --cwd . --worktree --name "CLI task"
+pidesk threads show <short-id>       # 8 dialogue messages; add --all for tool results
+pidesk schedule add --name "Morning triage" --thread <short-id> \
     --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
 pidesk remote enable --port 7717      # optional legacy loopback/tunnel listener
 ```
 
 If both are present, the app defers to the LaunchAgent rather than running a second daemon;
-`pidesk daemon status` reports which one (or neither) is actually in play. See docs/daemon-api.md's
-"Lifecycle" section for the full contract, including what happens to a scheduled run in progress
-when the app quits.
+`pidesk daemon status` reports which one (or neither) is actually in play. Human thread lists use
+compact UUID tails, omit archived threads by default, mark automated and managed-worktree threads,
+and include longer previews. See `docs/cli.md` for dialogue-only history paging and raw tool-result
+controls, and docs/daemon-api.md's "Lifecycle" section for the full host contract.
 
 Automations also have their own page in the window: pick **Automations** in the sidebar or press
 `⌥⌘S`. It opens in the detail area, so the selected conversation and its draft stay put; pausing
@@ -272,4 +275,4 @@ Tests cover JSONL framing, bounded active-branch pages, compaction traversal, to
 
 Pi Desktop keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed detailed transcript page retains at most 1,000 messages, but dialogue-focused page replacement can navigate through the entire active branch; a page scan reports an explicit unreadable-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
 
-On the web remote: the transcript is polled while a thread runs (SSE carries no message bodies), so a long turn advances in ~2.5s steps rather than token by token, and unlike the Mac app there is no streaming answer. Work-row disclosures are open per screen and are not restored after a reload. Steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited because Pi's dialog bridge is sequential, so there is no Back. Unconfirmed messages live with the open screen and are not restored after a reload. Replay protection for a send is in-memory and bounded to 256 submissions for 30 minutes, so a retry that spans a daemon restart can still duplicate; while all 256 are still running, a new send is refused with `503 submissions_busy` rather than losing one submission's protection. Message attachments are rejected rather than forwarded. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone. Worktrees can be selected but not created or removed. Archiving from the web is the daemon's own flag: a thread archived in the Mac app still shows under Archived, but restoring it answers `409 archived_in_app` and has to be done in the app, because the daemon never writes the app's `state.json`.
+On the web remote: the transcript is polled while a thread runs (SSE carries no message bodies), so a long turn advances in ~2.5s steps rather than token by token, and unlike the Mac app there is no streaming answer. Work-row disclosures are open per screen and are not restored after a reload. Steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited because Pi's dialog bridge is sequential, so there is no Back. Unconfirmed messages live with the open screen and are not restored after a reload. Replay protection for a send is in-memory and bounded to 256 submissions for 30 minutes, so a retry that spans a daemon restart can still duplicate; while all 256 are still running, a new send is refused with `503 submissions_busy` rather than losing one submission's protection. Message attachments are rejected rather than forwarded. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone. The web remote can select worktrees but not create or remove them. Archiving from the web is the daemon's own flag: a thread archived in the Mac app still shows under Archived, but restoring it answers `409 archived_in_app` and has to be done in the app, because the daemon never writes the app's `state.json`.

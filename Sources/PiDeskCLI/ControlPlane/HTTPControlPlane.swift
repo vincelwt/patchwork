@@ -53,17 +53,24 @@ final class HTTPControlPlane: ControlPlane {
         try await requestNoBody("GET", "/v1/health")
     }
 
-    func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?) async throws -> WireThreadListResponse {
+    func listThreads(
+        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?
+    ) async throws -> WireThreadListResponse {
         var items = [URLQueryItem(name: "limit", value: "\(limit)")]
         if let query, !query.isEmpty { items.append(URLQueryItem(name: "query", value: query)) }
         if let cursor { items.append(URLQueryItem(name: "cursor", value: cursor)) }
         if let archived { items.append(URLQueryItem(name: "archived", value: archived ? "true" : "false")) }
         if let running { items.append(URLQueryItem(name: "running", value: running ? "true" : "false")) }
+        if let automated { items.append(URLQueryItem(name: "automated", value: automated ? "true" : "false")) }
         return try await requestNoBody("GET", "/v1/threads" + queryString(items))
     }
 
-    func showThread(id: String, messages: Int) async throws -> WireThreadDetailResponse {
-        try await requestNoBody("GET", "/v1/threads/\(encodePathComponent(id))" + queryString([URLQueryItem(name: "messages", value: "\(messages)")]))
+    func showThread(id: String, messages: Int, offset: Int, includeTools: Bool) async throws -> WireThreadDetailResponse {
+        try await requestNoBody("GET", "/v1/threads/\(encodePathComponent(id))" + queryString([
+            URLQueryItem(name: "messages", value: "\(messages)"),
+            URLQueryItem(name: "offset", value: "\(offset)"),
+            URLQueryItem(name: "all", value: includeTools ? "true" : "false")
+        ]))
     }
 
     func createThread(_ request: WireCreateThreadRequest) async throws -> WireCreateThreadResponse {

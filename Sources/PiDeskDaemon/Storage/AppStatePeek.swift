@@ -24,11 +24,13 @@ enum AppStatePeek {
         var virtualFolders: [StoredVirtualFolder] = []
         var virtualFolderAssignments: [String: String] = [:]
         var projectFolderAssignments: [String: String] = [:]
+        var managedWorktreeProjects: [String: String] = [:]
 
         private enum CodingKeys: String, CodingKey {
             case archivedSessionIDs, manuallyUnreadSessionPaths
             case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
             case virtualFolders, virtualFolderAssignments, projectFolderAssignments
+            case managedWorktreeProjects
         }
 
         init() {}
@@ -48,7 +50,16 @@ enum AppStatePeek {
             // decoded independently of everything above and default to empty on any failure.
             virtualFolders = (try? container.decodeIfPresent([StoredVirtualFolder].self, forKey: .virtualFolders)) ?? []
             virtualFolderAssignments = (try? container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments)) ?? [:]
-            projectFolderAssignments = (try? container.decodeIfPresent([String: String].self, forKey: .projectFolderAssignments)) ?? [:]
+            projectFolderAssignments = (try? container.decodeIfPresent(
+                [String: String].self, forKey: .projectFolderAssignments
+            )) ?? [:]
+            let worktrees = (try? container.decodeIfPresent(
+                [String: String].self, forKey: .managedWorktreeProjects
+            )) ?? [:]
+            for (worktree, project) in worktrees.sorted(by: { $0.key < $1.key }).suffix(2_000) {
+                managedWorktreeProjects[URL(fileURLWithPath: worktree).standardizedFileURL.path] =
+                    URL(fileURLWithPath: project).standardizedFileURL.path
+            }
         }
 
         /// The cycle-safe, depth-capped projection `GET /v1/folders` returns. Assignment keys are

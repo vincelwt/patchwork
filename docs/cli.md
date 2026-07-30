@@ -14,7 +14,8 @@ pidesk limits
 ```
 
 Every level answers `--help`/`-h` with real examples: `pidesk --help`, `pidesk threads --help`,
-`pidesk threads send --help`.
+`pidesk threads send --help`. Running bare `pidesk` lists the 20 newest active threads, then
+prints top-level help, so an agent gets both discovery and usage in one call.
 
 ## Global flags
 
@@ -88,9 +89,10 @@ start it with `pidesk daemon start` (or `pidesk daemon install` to run at login)
 ## `threads`
 
 ```
-pidesk threads list [--query TEXT] [--running] [--archived] [--limit N] [--cursor C] [--json]
-pidesk threads show <id> [--messages N] [--json]
-pidesk threads new --cwd DIR [--name NAME] [--message TEXT] [--mode MODE] [--json]
+pidesk threads list [--query TEXT] [--running] [--automated] [--archived | --all]
+                    [--limit N] [--cursor C] [--json]
+pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
+pidesk threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]
 pidesk threads send <id> <text|-> [--steer | --follow-up] [--wait] [--json]
 pidesk threads abort <id> [--json]
 pidesk threads archive <id> [--json]
@@ -101,11 +103,18 @@ pidesk threads watch [<id>] [--json]
 
 Notes:
 
-- `--limit`/`--cursor` aren't in the contract's one-line CLI surface but exist in the API
-  (`GET /v1/threads?...&limit=&cursor=`); they're exposed so a huge thread list is never fetched
-  unbounded. `--limit` defaults to 50.
-- `--running`/`--archived` are strict filters when given (only running / only archived), not
-  toggles that add to the default view.
+- Lists default to 20 non-archived threads. `--archived` shows only archived threads; list
+  `--all` includes both. `--running` and `--automated` are strict filters. `--cursor` continues a
+  bounded list page.
+- Human lists print a UUID's random final segment instead of all 36 characters. Every thread
+  endpoint, `watch`, and `schedule add --thread` accepts an unambiguous prefix or suffix. An
+  ambiguous abbreviation fails instead of selecting a thread.
+- `show` defaults to the latest 8 user/assistant messages and omits tool/system results. Use
+  `--all` for the raw message stream and `--offset N` to page older messages. When another page
+  exists, human output prints the next command on stderr and JSON includes `nextOffset`.
+- `new --worktree` uses the Desktop app's managed worktree flow: main-line base selection,
+  `~/.pi/worktrees`, `pi/` branch naming, non-force cleanup on failed creation, and source-project
+  organization in the app. The session `cwd` remains the real worktree path.
 - `<text>` (in `send`) and `--message` (in `new`) accept `-` to read the message from stdin:
   `echo "continue" | pidesk threads send <id> -`.
 - Delivery: no flag is `"auto"`; `--steer` interrupts the current turn; `--follow-up` queues

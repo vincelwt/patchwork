@@ -39,6 +39,19 @@ final class RemoteParityEndpointTests: XCTestCase {
         try PiDeskJSON.decoder.decode(type, from: response.body)
     }
 
+    @discardableResult
+    private func git(_ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
     private static let tinyPNG =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
@@ -164,6 +177,48 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(cwd, directory.path)
         XCTAssertEqual(job.prompt, "hello")
         XCTAssertEqual(job.mode, "smart")
+    }
+
+    func testCreateWithWorktreeUsesDesktopFlowAndPersistsTheSourceProject() async throws {
+        let project = directory.appendingPathComponent("project", isDirectory: true)
+        let source = project.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        XCTAssertEqual(git(["-C", project.path, "init", "-q"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "config", "user.email", "test@example.invalid"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "config", "user.name", "Test"]), 0)
+        try Data("one\n".utf8).write(to: project.appendingPathComponent("sample.txt"))
+        XCTAssertEqual(git(["-C", project.path, "add", "sample.txt"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "commit", "-q", "-m", "initial"]), 0)
+
+        let file = TestSupport.writeSessionFile(in: directory, id: "created-worktree", cwd: source.path)
+        let created = PiThread(
+            id: "created-worktree", path: file.path, name: "Worktree", cwd: source.path,
+            folder: source.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let threadRPC = FakeThreadRPCService(thread: created)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(source.path)","name":"Worktree","worktree":true}"#
+        )
+        XCTAssertEqual(response.status, 201)
+        let decoded = try decode(CreateThreadResponse.self, response)
+        let worktree = try XCTUnwrap(threadRPC.createdCwds.first)
+        XCTAssertTrue(WorktreeService.isManaged(worktree, root: core.worktreeRootURL))
+        XCTAssertEqual(decoded.thread.cwd, worktree.path)
+        XCTAssertEqual(decoded.thread.project, source.standardizedFileURL.path)
+        XCTAssertEqual(decoded.thread.worktree, worktree.standardizedFileURL.path)
+        XCTAssertEqual(
+            DaemonWorktreeProjects.load(
+                from: directory.appendingPathComponent("overlay.json")
+            )[worktree.standardizedFileURL.path],
+            source.standardizedFileURL.path
+        )
     }
 
     func testRuntimeControlsUseTheAlreadyLivePiSession() async throws {

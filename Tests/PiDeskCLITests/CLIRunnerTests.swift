@@ -2,10 +2,24 @@ import XCTest
 @testable import PiDeskCLI
 
 final class CLIRunnerTests: XCTestCase {
-    func testNoArgumentsPrintsUsageAndExitsBadUsage() async {
-        let result = await runCLI([])
-        XCTAssertEqual(result.exitCode, 2)
-        XCTAssertTrue(result.stderr.contains("Usage:"))
+    func testNoArgumentsListsActiveThreadsThenPrintsHelp() async {
+        let plane = FakeControlPlane()
+        plane.threadListResult = WireThreadListResponse(
+            threads: [WireThread(
+                id: "019f9dea-1234-4567-89ab-a1b2c3d4e5f6", name: "Current",
+                shortId: "a1b2c3d4e5f6"
+            )],
+            nextCursor: nil
+        )
+        let result = await runCLI([], controlPlane: plane)
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("Current"))
+        XCTAssertTrue(result.stdout.contains("a1b2c3d4e5f6"))
+        XCTAssertTrue(result.stdout.contains("Usage:"))
+        XCTAssertEqual(
+            plane.calls.first?.detail,
+            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil"
+        )
     }
 
     func testTopLevelHelpExitsOk() async {

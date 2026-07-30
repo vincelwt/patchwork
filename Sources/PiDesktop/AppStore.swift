@@ -335,6 +335,7 @@ final class AppStore: ObservableObject {
     private let providerRetryScheduler: RuntimeRetirementScheduler
     private let managedTurnResumer: ManagedTurnResumer
     private let managedTurnWriterProbe: ManagedTurnWriterProbe?
+    private let daemonWorktreeProjectsURL: URL
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -491,7 +492,8 @@ final class AppStore: ObservableObject {
                 PiDeskKit.SendMessageRequest(text: instruction, clientId: clientID)
             )
         },
-        managedTurnWriterProbe: ManagedTurnWriterProbe? = nil
+        managedTurnWriterProbe: ManagedTurnWriterProbe? = nil,
+        daemonWorktreeProjectsURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json")
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -502,6 +504,7 @@ final class AppStore: ObservableObject {
         self.providerRetryScheduler = providerRetryScheduler
         self.managedTurnResumer = managedTurnResumer
         self.managedTurnWriterProbe = managedTurnWriterProbe
+        self.daemonWorktreeProjectsURL = daemonWorktreeProjectsURL
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
@@ -1648,8 +1651,16 @@ final class AppStore: ObservableObject {
         scanError = nil
         do {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
+            let overlayURL = daemonWorktreeProjectsURL
+            let daemonWorktrees = await Task.detached(priority: .utility) {
+                DaemonWorktreeProjects.load(from: overlayURL)
+            }.value
             let discovered = applyArchiveRetention(
                 to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+            )
+            let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
+            persistence.mergeManagedWorktreeProjects(
+                daemonWorktrees.filter { discoveredCwds.contains($0.key) }
             )
             sessions = discovered
             refreshPullRequestStates(for: discovered)

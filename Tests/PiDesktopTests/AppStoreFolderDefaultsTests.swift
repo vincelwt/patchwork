@@ -20,7 +20,8 @@ private final class FakeRuntime: PiRuntimeProtocol {
 
 private struct FakeRepository: SessionRepositoryProtocol {
     var rootURL = URL(fileURLWithPath: "/tmp/pi-desktop-folder-default-tests")
-    func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] { [] }
+    var sessions: [SessionSummary] = []
+    func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] { sessions }
     func loadConversation(from fileURL: URL) async throws -> SessionConversation {
         SessionConversation(messages: [], leafID: nil, rawEntryCount: 0)
     }
@@ -156,6 +157,32 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         store.moveSession(filedProjectSession, toVirtualFolder: virtualFolder.id)
 
         XCTAssertEqual(store.sidebarFolders.map(\.standardizedFileURL.path), [project.standardizedFileURL.path])
+    }
+
+    func testDaemonWorktreeMappingKeepsCLIThreadUnderItsSourceProject() async throws {
+        let project = directory.appendingPathComponent("project", isDirectory: true)
+        let worktree = directory.appendingPathComponent("worktrees/task", isDirectory: true)
+        let file = directory.appendingPathComponent("cli.jsonl")
+        var session = SessionSummary(
+            id: "cli", fileURL: file, cwd: worktree,
+            createdAt: Date(), modifiedAt: Date(), name: "CLI", preview: "",
+            messageCount: 0, metrics: TokenMetrics()
+        )
+        session.prepareSearchKey()
+        let overlay = directory.appendingPathComponent("daemon-overlay.json")
+        let payload = ["managedWorktreeProjects": [worktree.path: project.path]]
+        try JSONSerialization.data(withJSONObject: payload).write(to: overlay)
+        let store = AppStore(
+            repository: FakeRepository(sessions: [session]),
+            gitService: FakeGitService(counter: CallCounter()), runtime: FakeRuntime(),
+            persistence: AppPersistence(baseURL: directory),
+            daemonWorktreeProjectsURL: overlay
+        )
+
+        await store.refreshSessions()
+
+        XCTAssertEqual(store.managedWorktreeProjects[worktree.path], project.path)
+        XCTAssertEqual(store.sidebarFolders.map(\.path), [project.path])
     }
 
     func testWorktreeKeepsTheProjectSelectedButStartsPiInsideTheWorktree() async throws {

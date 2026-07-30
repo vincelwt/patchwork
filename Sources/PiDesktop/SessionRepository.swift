@@ -299,6 +299,15 @@ final class AppPersistence {
         save()
     }
 
+    func mergeManagedWorktreeProjects(_ projects: [String: String]) {
+        var changed = false
+        for (worktree, project) in projects where state.managedWorktreeProjects[worktree] == nil {
+            state.setManagedWorktreeProject(worktreePath: worktree, projectPath: project)
+            changed = true
+        }
+        if changed { save() }
+    }
+
     func updateState(_ update: (inout PersistedAppState) -> Void) {
         update(&state)
         save()

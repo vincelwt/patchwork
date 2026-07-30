@@ -23,6 +23,10 @@ struct WireThread: Codable, Equatable {
     var preview: String?
     var cost: Double?
     var contextPercent: Double?
+    var shortId: String? = nil
+    var automated: Bool? = nil
+    var project: String? = nil
+    var worktree: String? = nil
 }
 
 struct WireMessage: Codable, Equatable {
@@ -41,6 +45,7 @@ struct WireThreadListResponse: Codable, Equatable {
 struct WireThreadDetailResponse: Codable, Equatable {
     var thread: WireThread
     var messages: [WireMessage]
+    var nextOffset: Int? = nil
 }
 
 struct WireCreateThreadRequest: Codable {
@@ -48,6 +53,7 @@ struct WireCreateThreadRequest: Codable {
     var name: String?
     var message: String?
     var mode: String?
+    var worktree: Bool? = nil
 }
 
 struct WireCreateThreadResponse: Codable, Equatable {
@@ -173,6 +179,7 @@ struct WireHealth: Codable, Equatable {
     var piVersion: String?
     var schedulesEnabled: Bool?
     var scheduleIdempotency: Bool? = nil
+    var threadWorktrees: Bool? = nil
 }
 
 struct WireLimits: Codable, Equatable {

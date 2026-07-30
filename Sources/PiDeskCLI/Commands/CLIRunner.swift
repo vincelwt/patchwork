@@ -39,8 +39,10 @@ enum CLIRunner {
         )
 
         if rawArgs.isEmpty {
-            out.errorLine(topLevelHelp())
-            return ExitCode.badUsage.rawValue
+            let status = await ThreadsCommand.run(["list"], context: context)
+            out.line("")
+            out.line(topLevelHelp())
+            return status
         }
         if rawArgs[0] == "--version" {
             out.line("pidesk (Pi Desktop control API v\(1))")
@@ -87,7 +89,8 @@ enum CLIRunner {
         lines.append("Run `pidesk <command> --help` or `pidesk <command> <subcommand> --help` for details.")
         lines.append("")
         lines.append("Examples:")
-        lines.append("  pidesk threads new --cwd ~/code/myapp --message \"survey the repo\"")
+        lines.append("  pidesk  # list active threads, then show this help")
+        lines.append("  pidesk threads new --cwd ~/code/myapp --worktree --message \"survey the repo\"")
         lines.append("  pidesk threads list --json | jq '.threads[].name'")
         lines.append("  pidesk schedule add --name \"Morning triage\" --cwd ~/code/myapp \\")
         lines.append("      --prompt \"Check overnight CI failures\" --cron \"0 9 * * 1-5\"")

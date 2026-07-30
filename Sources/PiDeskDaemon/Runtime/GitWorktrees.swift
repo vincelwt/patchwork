@@ -2,9 +2,9 @@ import Foundation
 import PiDeskKit
 
 /// Read-only git worktree discovery for `GET /v1/worktrees`, so the web remote can start a thread
-/// in a checkout that already exists on the Mac. It never creates, moves, or removes anything:
-/// `git worktree list` is the only subcommand used, and the app's own `WorktreeService` stays the
-/// only thing that writes worktrees.
+/// in a checkout that already exists on the Mac. This endpoint never creates, moves, or removes
+/// anything: `git worktree list` is its only subcommand. Managed creation is a separate
+/// `POST /v1/threads` option.
 ///
 /// Not shared with `Sources/PiDesktop/GitService.swift`: that lives in an executable target this
 /// one cannot import, and porting the whole status snapshot for one `list` call would be far more

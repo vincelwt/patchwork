@@ -3,22 +3,36 @@ import Foundation
 /// Shared human-table rendering for wire models, used by both `threads` and `schedule`. Every
 /// free-text column is truncated so one huge name/prompt/preview can't blow up terminal output.
 enum Rendering {
-    static let previewWidth = 60
+    static let previewWidth = 120
     static let nameWidth = 32
+    static let locationWidth = 48
+
+    /// Older daemons do not accept abbreviations, so only use the compact id they advertise.
+    static func threadID(_ thread: WireThread) -> String {
+        thread.shortId ?? thread.id
+    }
 
     static func threadStatus(_ thread: WireThread, colorEnabled: Bool) -> String {
         var parts: [String] = []
         if thread.running == true { parts.append(colorize("running", ANSI.green, enabled: colorEnabled)) }
         if thread.archived == true { parts.append(colorize("archived", ANSI.dim, enabled: colorEnabled)) }
         if thread.unread == true { parts.append(colorize("unread", ANSI.yellow, enabled: colorEnabled)) }
+        if thread.automated == true { parts.append("automated") }
         return parts.isEmpty ? "-" : parts.joined(separator: ",")
     }
 
     static func threadRow(_ thread: WireThread, colorEnabled: Bool) -> [String] {
-        [
-            thread.id,
+        let location: String
+        if let worktree = thread.worktree {
+            let project = thread.project.map { URL(fileURLWithPath: $0).lastPathComponent } ?? thread.folder ?? "-"
+            location = "\(project) [wt:\(URL(fileURLWithPath: worktree).lastPathComponent)]"
+        } else {
+            location = thread.folder ?? "-"
+        }
+        return [
+            threadID(thread),
             truncated(thread.name ?? "(unnamed)", max: nameWidth),
-            thread.folder ?? "-",
+            truncated(location, max: locationWidth),
             threadStatus(thread, colorEnabled: colorEnabled),
             FlexibleDate.displayLocal(thread.updatedAt),
             truncated(thread.preview ?? "", max: previewWidth)
