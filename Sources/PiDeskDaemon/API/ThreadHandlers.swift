@@ -163,6 +163,15 @@ enum ThreadHandlers {
                 }
 
                 do {
+                    if thread.archived {
+                        let restored = try await core.threadStore.setArchived(false, idOrPath: thread.id)
+                        if restored.archived {
+                            throw DaemonHTTPError.conflict(
+                                code: "archived_in_app",
+                                message: "This thread was archived in the Mac app; restore it there."
+                            )
+                        }
+                    }
                     let response = try await deliverOrEnqueue(core, thread: thread, text: text, delivery: body.delivery)
                     if let clientID {
                         await core.submissions.complete(threadID: thread.id, clientID: clientID, response: response)

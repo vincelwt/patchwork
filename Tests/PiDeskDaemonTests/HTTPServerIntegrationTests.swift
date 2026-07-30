@@ -112,6 +112,16 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertTrue(readResult.thread.unread)
     }
 
+    func testSendingToAnArchivedThreadRestoresIt() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-archived", cwd: "/tmp/project")
+        _ = try await client.archiveThread(id: "sess-archived", archived: true)
+
+        _ = try await client.sendMessage(threadId: "sess-archived", SendMessageRequest(text: "resume this"))
+
+        let restored = try await client.getThread(id: "sess-archived")
+        XCTAssertFalse(restored.thread.archived)
+    }
+
     func testRunningThreadBecomesUnreadOnlyAfterItFinishes() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-running", cwd: "/tmp/project")
         let heartbeatURL = directory.appendingPathComponent("activity/sess-running.json")

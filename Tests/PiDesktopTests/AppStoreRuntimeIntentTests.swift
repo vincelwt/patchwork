@@ -218,6 +218,22 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertFalse(store.messages.contains { $0.textContent == "never send this" })
     }
 
+    func testSendingAnArchivedConversationRestoresIt() {
+        let runtime = IntentRuntime()
+        let store = makeStore(runtime: runtime)
+        var session = summary("archived", cwd: root)
+        session.isArchived = true
+        store.sessions = [session]
+        store.selectSession(session)
+        store.draft = "resume this"
+
+        store.submitDraft()
+
+        XCTAssertFalse(store.sessions[0].isArchived)
+        XCTAssertFalse(store.selectedSession?.isArchived ?? true)
+        XCTAssertEqual(runtime.count("prompt"), 1)
+    }
+
     func testPendingModelOptionsDoNotGatePromptDispatch() {
         let runtime = IntentRuntime()
         runtime.delayModels = true
