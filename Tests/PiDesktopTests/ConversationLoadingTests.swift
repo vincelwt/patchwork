@@ -388,6 +388,36 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.textContent), ["a-0", "a-1", "a-2", "a-3"])
     }
 
+    func testOptimisticMessageStaysInOwningSessionAcrossCachedNavigation() async throws {
+        let fileA = temporaryDirectory.appendingPathComponent("a.jsonl")
+        let fileB = temporaryDirectory.appendingPathComponent("b.jsonl")
+        try writeLinearConversation(prefix: "a", messageCount: 2, to: fileA)
+        try writeLinearConversation(prefix: "b", messageCount: 2, to: fileB)
+        let runtime = FakeRuntime()
+        runtime.sessionFile = fileA.path
+        runtime.sessionID = "a"
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory), runtime: runtime)
+        let a = try makeSummary(id: "a", fileURL: fileA)
+        let b = try makeSummary(id: "b", fileURL: fileB)
+        store.sessions = [a, b]
+
+        store.selectSession(b)
+        try await waitUntil { store.messages.first?.textContent == "b-0" }
+        store.selectSession(a)
+        try await waitUntil { store.messages.first?.textContent == "a-0" }
+        store.draft = "only A"
+        store.submitDraft()
+        XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") && $0.textContent == "only A" })
+
+        store.selectSession(b)
+        XCTAssertFalse(store.isConversationLoading, "B should use its warm transcript cache")
+        XCTAssertEqual(store.messages.map(\.textContent), ["b-0", "b-1"])
+
+        store.selectSession(a)
+        XCTAssertFalse(store.isConversationLoading, "A should use its warm transcript cache")
+        XCTAssertEqual(store.messages.map(\.textContent), ["a-0", "a-1", "only A"])
+    }
+
     func testSelectingAnotherSessionMidLoadDiscardsTheStaleLoad() async throws {
         let fileA = temporaryDirectory.appendingPathComponent("a.jsonl")
         let fileB = temporaryDirectory.appendingPathComponent("b.jsonl")
