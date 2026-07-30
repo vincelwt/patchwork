@@ -479,11 +479,13 @@ final class AppStore: ObservableObject {
         selectedFolder = startFolder
         selectedGitDirectoryPath = startFolder.standardizedFileURL.path
         cachedStatuses = self.persistence.state.cachedExtensionStatuses
-        var hadEphemeralStatuses = false
-        for key in ExtensionStatusParser.ephemeralKeys where cachedStatuses.removeValue(forKey: key) != nil {
-            hadEphemeralStatuses = true
+        var prunedCachedStatuses = false
+        // A retired extension can no longer send setStatus(nil); migrate its last cached key here.
+        let startupPurgeKeys = ExtensionStatusParser.ephemeralKeys.union(["pi-caffeinate"])
+        for key in startupPurgeKeys where cachedStatuses.removeValue(forKey: key) != nil {
+            prunedCachedStatuses = true
         }
-        if hadEphemeralStatuses { self.persistence.cacheExtensionStatuses(cachedStatuses) }
+        if prunedCachedStatuses { self.persistence.cacheExtensionStatuses(cachedStatuses) }
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
 
@@ -1502,9 +1504,8 @@ final class AppStore: ObservableObject {
     // MARK: - Extension statuses
 
     var statusModel: ExtensionStatusModel {
-        // Live values win per key, but a key the current runtime has not reported yet keeps its
-        // last known value instead of vanishing, so no chip ever flips to a placeholder while a
-        // session is attached.
+        // Live values win per key while a runtime starts. Once get_state succeeds, that runtime's
+        // complete status snapshot replaces the cache, pruning keys from removed extensions.
         if !extensionStatuses.isEmpty {
             return ExtensionStatusModel(
                 values: cachedStatuses.merging(extensionStatuses) { _, live in live },
@@ -1518,6 +1519,13 @@ final class AppStore: ObservableObject {
             )
         }
         return ExtensionStatusModel(values: cachedStatuses, isLive: false)
+    }
+
+    private func replaceCachedStatuses(with snapshot: [String: String]) {
+        let durable = snapshot.filter { !ExtensionStatusParser.ephemeralKeys.contains($0.key) }
+        guard durable != cachedStatuses else { return }
+        cachedStatuses = durable
+        persistence.cacheExtensionStatuses(durable)
     }
 
     // MARK: - Sidebar folder expansion
@@ -2672,12 +2680,7 @@ final class AppStore: ObservableObject {
         probe.onExit = nil
         probe.stop()
         isProbingStatuses = false
-        if !probeStatuses.isEmpty {
-            cachedStatuses.merge(
-                probeStatuses.filter { !ExtensionStatusParser.ephemeralKeys.contains($0.key) }
-            ) { _, fresh in fresh }
-            persistence.cacheExtensionStatuses(cachedStatuses)
-        }
+        if !probeStatuses.isEmpty { replaceCachedStatuses(with: probeStatuses) }
     }
 
     func activateCurrentRouteRuntimeForEscape() -> Bool {
@@ -3539,6 +3542,9 @@ final class AppStore: ObservableObject {
                 return
             }
             if bindOnSuccess { bindRuntime(slot) }
+            let statusSnapshot = slot === activeRuntimeSlot && !activePresentationDetached
+                ? extensionStatuses : slot.statuses
+            replaceCachedStatuses(with: statusSnapshot)
             finishRuntimeStart(slot, result: .success(slot))
             if slot === activeRuntimeSlot { requestStats() }
         }
@@ -4613,9 +4619,9 @@ final class AppStore: ObservableObject {
             // Extension footers are ANSI-coloured for the TUI; the desktop stores plain text.
             if let value = event["statusText"]?.stringValue, !ANSI.strip(value).isEmpty {
                 extensionStatuses[key] = ANSI.strip(value).suffixString(500)
-                // Merge, never replace: a runtime that has only reported `mode` so far must not
-                // erase the last known `codex-account`, which is what made the status bar fall
-                // back to a bare “Codex account” placeholder mid-session. Transient activity
+                // Individual events merge so a partially-started runtime cannot blank unrelated
+                // values. A successful get_state later replaces the complete cache snapshot,
+                // pruning statuses from extensions that are no longer loaded. Transient activity
                 // is runtime-local and must never survive the process that reported it.
                 if !ExtensionStatusParser.ephemeralKeys.contains(key) { cachedStatuses[key] = extensionStatuses[key] }
             } else {
