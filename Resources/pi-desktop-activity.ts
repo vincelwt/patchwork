@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 17
+// pi-desktop-activity-version: 18
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -80,6 +80,12 @@ function githubPullRequest(inText: string): GitHubPullRequest | undefined {
     repository: match[2],
     number,
   };
+}
+
+function invokesPullRequestCreation(command: string): boolean {
+  // Match an executable shell segment, not source code, grep patterns, or quoted prose that
+  // merely contains "gh pr create".
+  return /(?:^|[;&|(\n])\s*gh\s+pr\s+create(?:\s|$)/.test(command);
 }
 
 function pullRequestReviewWatchKey(sessionId: string, pullRequest: GitHubPullRequest): string {
@@ -404,6 +410,11 @@ function runAutomationSelfTest(): void {
   if (pullRequest?.url !== "https://github.com/acme/widgets/pull/42"
       || boundedText.length > TOOL_TEXT_TAIL_LIMIT
       || githubPullRequest(boundedText)?.url !== "https://github.com/acme/widgets/pull/42"
+      || !invokesPullRequestCreation("gh pr create --fill")
+      || !invokesPullRequestCreation("git push && gh pr create --fill")
+      || !invokesPullRequestCreation("url=$(gh pr create --fill)")
+      || invokesPullRequestCreation("python3 -c \"print('gh pr create')\"")
+      || invokesPullRequestCreation("rg 'gh pr create' Sources")
       || watchKey.length < 16
       || !hasQueuedReviewFollowUp(queued, "https://github.com/acme/widgets/pull/42")) {
     throw new Error("Pi Desktop pull-request watcher self-test failed.");
@@ -692,7 +703,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     if (event.toolName.toLowerCase() !== "bash" || event.isError) return;
     const command = (event.input as { command?: unknown }).command;
-    if (typeof command !== "string" || !/\bgh\s+pr\s+create\b/.test(command)) return;
+    if (typeof command !== "string" || !invokesPullRequestCreation(command)) return;
     const pullRequest = githubPullRequest(toolTextTail(event.content));
     if (!pullRequest) return;
     try {

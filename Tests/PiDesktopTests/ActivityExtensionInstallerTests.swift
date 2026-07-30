@@ -43,7 +43,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
     func testBundledVersionUpgradesThePreviousDevelopmentInstall() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
         XCTAssertEqual(
-            ActivityExtensionInstaller.decide(installed: source(version: 16), bundled: bundled),
+            ActivityExtensionInstaller.decide(installed: source(version: 17), bundled: bundled),
             .upgraded
         )
     }
@@ -102,7 +102,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionLetsPiNameANewConversation() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("name: \"set_conversation_name\""))
         XCTAssertTrue(bundled.contains("After understanding the first user message"))
         XCTAssertTrue(bundled.contains("const current = pi.getSessionName()"))
@@ -111,7 +111,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionRoutesThreadSchedulesToDesktopAutomations() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("name: \"schedule_automation\""))
         XCTAssertTrue(bundled.contains("rely on durable thread history"))
         XCTAssertTrue(bundled.contains("appended to this conversation"))
@@ -123,9 +123,10 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionWatchesCodexReviewsWithoutPollingTheProvider() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("pi.on(\"tool_result\""))
         XCTAssertTrue(bundled.contains("gh\\s+pr\\s+create"))
+        XCTAssertTrue(bundled.contains("invokesPullRequestCreation"))
         XCTAssertTrue(bundled.contains("kind: \"heartbeat\""))
         XCTAssertTrue(bundled.contains("pi.registerCommand(PULL_REQUEST_REVIEW_COMMAND"))
         XCTAssertTrue(bundled.contains("chatgpt-codex-connector"))
@@ -138,7 +139,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionBranchesEditedMessagesInsideTheCurrentSession() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-edit-message\""))
         XCTAssertTrue(bundled.contains("ctx.navigateTree(entryId, { summarize: false })"))
         XCTAssertTrue(bundled.contains("pi.appendEntry(\"pi-desktop-edit-ready\""))
@@ -147,7 +148,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionCanRetryWithoutAVisibleUserMessage() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("pi.registerCommand(\"pi-desktop-resume\""))
         XCTAssertTrue(bundled.contains("customType: \"pi-desktop-retry\""))
         XCTAssertTrue(bundled.contains("Continue from where it stopped without repeating completed work"))
@@ -157,7 +158,7 @@ final class ActivityExtensionInstallerTests: XCTestCase {
 
     func testBundledExtensionCouplesPreviewToTheCompletedAnswer() throws {
         let bundled = try XCTUnwrap(ActivityExtensionInstaller.bundledSource())
-        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 17)
+        XCTAssertEqual(ActivityExtensionInstaller.version(of: bundled), 18)
         XCTAssertTrue(bundled.contains("preview = extractPreview(message.content);"))
         XCTAssertTrue(bundled.contains("previewCompletionId: preview ? completionId : undefined"))
         XCTAssertTrue(bundled.contains("completionId = latestCompletedEntryID(ctx.sessionManager.getBranch());"))

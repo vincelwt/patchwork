@@ -53,6 +53,8 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     var provider: String?
     var thinkingLevel: String?
     var metrics: TokenMetrics
+    /// The newest pull request created by this conversation's active branch.
+    var pullRequestURL: URL? = nil
     var isArchived = false
     var searchKey = ""
 

@@ -226,6 +226,30 @@ final class ConversationWorktreeTests: XCTestCase {
         )
     }
 
+    func testPullRequestCreationDetectionIgnoresQuotedSourceText() {
+        XCTAssertTrue(PullRequestLink.invokesCreation("gh pr create --fill"))
+        XCTAssertTrue(PullRequestLink.invokesCreation("git push && gh pr create --fill"))
+        XCTAssertTrue(PullRequestLink.invokesCreation("url=$(gh pr create --fill)"))
+        XCTAssertFalse(PullRequestLink.invokesCreation("python3 -c \"print('gh pr create')\""))
+        XCTAssertFalse(PullRequestLink.invokesCreation("rg 'gh pr create' Sources"))
+    }
+
+    func testGitHubPullRequestStateBatchKeepsUnsupportedHostsUnknown() {
+        let open = URL(string: "https://github.com/acme/widgets/pull/11")!
+        let merged = URL(string: "https://github.com/acme/widgets/pull/12")!
+        let gitLab = URL(string: "https://gitlab.com/acme/widgets/-/merge_requests/7")!
+        let states = GitHubPullRequestStateService.decodedStates(from: .object([
+            "data": .object([
+                "pr0": .object(["pullRequest": .object(["state": .string("OPEN")])]),
+                "pr1": .object(["pullRequest": .object(["state": .string("MERGED")])])
+            ])
+        ]), for: [open, merged, gitLab])
+
+        XCTAssertEqual(states[open], .open)
+        XCTAssertEqual(states[merged], .closed)
+        XCTAssertEqual(states[gitLab], .unknown)
+    }
+
     func testGitLabMergeRequestsCountAndUnrelatedGitHubLinksDoNot() {
         XCTAssertEqual(
             PullRequestLink.firstLink(in: "see https://gitlab.com/acme/widgets/-/merge_requests/7")?.absoluteString,

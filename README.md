@@ -11,7 +11,7 @@ A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit
 - New conversations reopen in the folder the last chat used (Global, with Pi's neutral `~/Desktop` cwd, until you pick one); **Choose…** lists only projects already known from sidebar conversations
 - A **Worktree** checkbox on the new-chat row runs the conversation in a fresh git worktree cut off the project's main line (`origin/main` → `origin/master` → `main` → `master` → `HEAD`) and stored under `~/.pi/worktrees`, never inside the project. The worktree is execution-only: the new-chat row, sidebar, breadcrumbs, search, and folder defaults keep treating the conversation as part of its original project. Unchecking it before sending removes the worktree again; the branch always survives
 - App-owned folders created from the sidebar context menu, nesting at any depth inside a project group or another folder, with drag-and-drop and “Move to…” across the whole tree. Folders never touch the filesystem.
-- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations under **Running**, **Unread**, **Done**, and **Automated** — each in exactly one section, with a quiet location hint. Running order follows the stable turn start in both the sidebar and menu bar, so tool writes never reshuffle it; other sections remain newest-first. The menu bar dot carries the Running count, and the Dock icon badge carries the Done count. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
+- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations under **Running**, **Unread**, **Open PRs**, **Done**, and **Automated**, in that priority so each appears exactly once, with a quiet location hint. Pi Desktop recognizes the latest GitHub PR created by each active conversation branch and checks its current state through the authenticated `gh` CLI whenever sessions refresh. Running order follows the stable turn start in both the sidebar and menu bar, so tool writes never reshuffle it; other sections remain newest-first. The menu bar dot carries the Running count, and the Dock icon badge carries the Done count. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
 - Codex-style turns: running work stays collapsed to a live latest-reasoning/error/compaction line with elapsed time and a pulsing green dot, expands into borderless details on demand, and settles into one “Worked for 4m 1s” line as the answer starts. Retried errors, compaction, and branch summaries stay inside that same work log.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - One app-owned macOS sleep hold covers every running thread and releases when the last one settles. The coffee icon in the sidebar footer shows the live state; one silent app lease also drives the installed closed-lid companion, with no per-Pi-process sleep workers or failure notifications.
@@ -221,7 +221,7 @@ App-owned archive and recent-folder metadata lives at:
 The summary index lives under:
 
 ```text
-~/Library/Caches/Pi Desktop/session-summaries-v3.json
+~/Library/Caches/Pi Desktop/session-summaries-v4.json
 ```
 
 Activity heartbeats (app/extension-owned, never Pi session data) live under:

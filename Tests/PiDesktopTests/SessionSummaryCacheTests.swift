@@ -45,6 +45,48 @@ final class SessionSummaryCacheTests: XCTestCase {
         XCTAssertEqual(remaining, 0)
     }
 
+    func testV3CachePaintsImmediatelyThenReparsesForPullRequestMetadata() async throws {
+        struct LegacyEntry: Encodable {
+            let fingerprint: SessionFileFingerprint
+            let summary: SessionSummary
+        }
+        struct LegacyEnvelope: Encodable {
+            let version: Int
+            let entries: [String: LegacyEntry]
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiDesktopCacheMigration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("session.jsonl")
+        try fixture().write(to: file)
+        let values = try file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let fingerprint = SessionFileFingerprint(url: file, values: values)
+        var summary = try SessionParser.summary(at: file)
+        let legacy = LegacyEnvelope(
+            version: 3,
+            entries: [file.standardizedFileURL.path: LegacyEntry(fingerprint: fingerprint, summary: summary)]
+        )
+        try JSONEncoder().encode(legacy).write(
+            to: root.appendingPathComponent("session-summaries-v3.json"), options: .atomic
+        )
+
+        let v4URL = root.appendingPathComponent("session-summaries-v4.json")
+        let cache = SessionSummaryCache(fileURL: v4URL)
+        let hydrated = await cache.liveSummaries(archivedIDs: [])
+        let staleLookup = await cache.summary(for: fingerprint, archivedIDs: [])
+        XCTAssertEqual(hydrated.map(\.id), ["cache-session"])
+        XCTAssertNil(staleLookup, "Legacy entries must reparse in the background")
+
+        summary.pullRequestURL = URL(string: "https://github.com/acme/widgets/pull/4")
+        await cache.store(summary, fingerprint: fingerprint)
+        try await cache.persist()
+        let reloaded = SessionSummaryCache(fileURL: v4URL)
+        let upgraded = await reloaded.summary(for: fingerprint, archivedIDs: [])
+        XCTAssertEqual(upgraded?.pullRequestURL, summary.pullRequestURL)
+    }
+
     func testRefreshSummarySeesAnAppendThroughADiscoveredURL() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PiDesktopCacheRefresh-\(UUID().uuidString)", isDirectory: true)

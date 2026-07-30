@@ -405,6 +405,7 @@ struct SessionFolderGroup: Identifiable {
 enum SidebarStatusSection: String, CaseIterable {
     case running = "Running"
     case unread = "Unread"
+    case pullRequest = "Open PRs"
     case done = "Done"
     case automated = "Automated"
 }
@@ -419,23 +420,26 @@ struct SidebarStatusGroup: Identifiable {
         for session: SessionSummary,
         isRunning: Bool,
         isUnread: Bool,
+        hasOpenPullRequest: Bool,
         isAutomated: Bool
     ) -> SidebarStatusSection? {
         guard !session.isArchived else { return nil }
         if isRunning { return .running }
         if isUnread { return .unread }
+        if hasOpenPullRequest { return .pullRequest }
         if isAutomated { return .automated }
         return .done
     }
 
-    /// Files every non-archived conversation exactly once — running, else unread, else targeted by
-    /// an automation, else done — then sorts running by its stable turn start and everything
-    /// else by live modification date. Pure: the caller hands in the store's predicates and
-    /// dates, so the partition is testable without a runtime.
+    /// Files every non-archived conversation exactly once: running, else unread, else open PR,
+    /// else targeted by an automation, else done. It sorts running by its stable turn start and
+    /// everything else by live modification date. Pure: the caller hands in the store's
+    /// predicates and dates, so the partition is testable without a runtime.
     static func groups(
         _ sessions: [SessionSummary],
         isRunning: (SessionSummary) -> Bool,
         isUnread: (SessionSummary) -> Bool,
+        hasOpenPullRequest: (SessionSummary) -> Bool,
         isAutomated: (SessionSummary) -> Bool,
         runningAt: (SessionSummary) -> Date,
         modifiedAt: (SessionSummary) -> Date
@@ -446,6 +450,7 @@ struct SidebarStatusGroup: Identifiable {
                 for: session,
                 isRunning: isRunning(session),
                 isUnread: isUnread(session),
+                hasOpenPullRequest: hasOpenPullRequest(session),
                 isAutomated: isAutomated(session)
             ) else { continue }
             buckets[section, default: []].append(session)
@@ -495,6 +500,7 @@ private struct StatusListView: View {
             sessions,
             isRunning: { store.isRunning($0) },
             isUnread: { store.isUnread($0) },
+            hasOpenPullRequest: { store.openPullRequestSessionIDs.contains($0.id) },
             isAutomated: { store.scheduledThreadIDs.contains($0.id) },
             runningAt: { store.runningSortDate($0) },
             modifiedAt: { store.liveModifiedAt($0) }

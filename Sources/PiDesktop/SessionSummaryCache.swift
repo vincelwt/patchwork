@@ -23,10 +23,13 @@ actor SessionSummaryCache {
         var entries: [String: Entry]
     }
 
-    /// v3 shortened the retained preview, so v2 payloads are intentionally discarded.
-    static let version = 3
+    /// v4 adds the pull request created by each active branch, so older summaries are reparsed.
+    static let version = 4
     private let fileURL: URL
     private var entries: [String: Entry]
+    /// Legacy entries can paint immediately, but miss normal lookups once so v4 metadata is filled
+    /// during the ordinary background discovery pass.
+    private var stalePaths: Set<String>
     private(set) var hitCount = 0
     private(set) var missCount = 0
 
@@ -34,19 +37,31 @@ actor SessionSummaryCache {
         let manager = FileManager.default
         let defaultDirectory = manager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Pi Desktop", isDirectory: true)
-        self.fileURL = fileURL ?? defaultDirectory.appendingPathComponent("session-summaries-v3.json")
+        self.fileURL = fileURL ?? defaultDirectory.appendingPathComponent("session-summaries-v4.json")
 
         if let data = try? Data(contentsOf: self.fileURL),
            let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
            envelope.version == Self.version {
             entries = envelope.entries
+            stalePaths = []
         } else {
-            entries = [:]
+            let legacyURL = self.fileURL.deletingLastPathComponent()
+                .appendingPathComponent("session-summaries-v3.json")
+            if let data = try? Data(contentsOf: legacyURL),
+               let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+               envelope.version == 3 {
+                entries = envelope.entries
+                stalePaths = Set(envelope.entries.keys)
+            } else {
+                entries = [:]
+                stalePaths = []
+            }
         }
     }
 
     func summary(for fingerprint: SessionFileFingerprint, archivedIDs: Set<String>) -> SessionSummary? {
-        guard var summary = entries[fingerprint.path]?.summary,
+        guard !stalePaths.contains(fingerprint.path),
+              var summary = entries[fingerprint.path]?.summary,
               entries[fingerprint.path]?.fingerprint == fingerprint else {
             missCount += 1
             return nil
@@ -62,6 +77,7 @@ actor SessionSummaryCache {
         cached.isArchived = false
         if cached.searchKey.isEmpty { cached.prepareSearchKey() }
         entries[fingerprint.path] = Entry(fingerprint: fingerprint, summary: cached)
+        stalePaths.remove(fingerprint.path)
     }
 
     /// Every cached summary whose file still exists, for immediate sidebar hydration at launch.
@@ -81,6 +97,7 @@ actor SessionSummaryCache {
     func pruneMissingFiles() -> Int {
         let previous = entries.count
         entries = entries.filter { FileManager.default.fileExists(atPath: $0.key) }
+        stalePaths.formIntersection(entries.keys)
         return previous - entries.count
     }
 

@@ -320,38 +320,48 @@ final class SidebarFolderDefaultTests: XCTestCase {
     func testStatusSectionsRenderInFixedOrderAndHideEmptyOnes() {
         let now = Date()
         var running = summary(modifiedAt: now); running.name = "running"
+        var pullRequest = summary(modifiedAt: now); pullRequest.name = "pull request"
         var automated = summary(modifiedAt: now); automated.name = "automated"
         let groups = SidebarStatusGroup.groups(
-            [automated, running],
+            [automated, pullRequest, running],
             isRunning: { $0.name == "running" },
             isUnread: { _ in false },
+            hasOpenPullRequest: { $0.name == "pull request" },
             isAutomated: { $0.name == "automated" },
             runningAt: \.modifiedAt,
             modifiedAt: \.modifiedAt
         )
-        XCTAssertEqual(groups.map(\.section), [.running, .automated], "Unread and Done are empty, so they do not render")
-        XCTAssertEqual(SidebarStatusSection.allCases, [.running, .unread, .done, .automated], "Done is shown before Automated")
+        XCTAssertEqual(groups.map(\.section), [.running, .pullRequest, .automated], "Unread and Done are empty, so they do not render")
+        XCTAssertEqual(
+            SidebarStatusSection.allCases, [.running, .unread, .pullRequest, .done, .automated],
+            "Open PRs are actionable before Done; Automated remains last"
+        )
     }
 
     func testEveryConversationIsFiledExactlyOnceByPriority() {
         let now = Date()
-        var all = summary(modifiedAt: now); all.name = "all"          // running + unread + automated
-        var unread = summary(modifiedAt: now); unread.name = "unread" // unread + automated
+        var all = summary(modifiedAt: now); all.name = "all"          // running + unread + PR + automated
+        var unread = summary(modifiedAt: now); unread.name = "unread" // unread + PR + automated
+        var pullRequest = summary(modifiedAt: now); pullRequest.name = "pull request" // PR + automated
         var automated = summary(modifiedAt: now); automated.name = "automated"
         var done = summary(modifiedAt: now); done.name = "done"
         var archived = summary(modifiedAt: now); archived.name = "archived"; archived.isArchived = true
 
         let groups = SidebarStatusGroup.groups(
-            [all, unread, automated, done, archived],
+            [all, unread, pullRequest, automated, done, archived],
             isRunning: { $0.name == "all" },
             isUnread: { ["all", "unread"].contains($0.name) },
-            isAutomated: { ["all", "unread", "automated"].contains($0.name) },
+            hasOpenPullRequest: { ["all", "unread", "pull request"].contains($0.name) },
+            isAutomated: { ["all", "unread", "pull request", "automated"].contains($0.name) },
             runningAt: \.modifiedAt,
             modifiedAt: \.modifiedAt
         )
-        XCTAssertEqual(groups.map(\.section), [.running, .unread, .done, .automated])
-        XCTAssertEqual(groups.map { $0.sessions.map(\.name) }, [["all"], ["unread"], ["done"], ["automated"]])
-        XCTAssertEqual(groups.flatMap(\.sessions).count, 4, "Archived stays out and nothing is filed twice")
+        XCTAssertEqual(groups.map(\.section), [.running, .unread, .pullRequest, .done, .automated])
+        XCTAssertEqual(
+            groups.map { $0.sessions.map(\.name) },
+            [["all"], ["unread"], ["pull request"], ["done"], ["automated"]]
+        )
+        XCTAssertEqual(groups.flatMap(\.sessions).count, 5, "Archived stays out and nothing is filed twice")
     }
 
     func testRunningSortStaysOnTurnStartWhileOtherSectionsFollowLiveUpdates() {
@@ -370,6 +380,7 @@ final class SidebarFolderDefaultTests: XCTestCase {
             [early, late, old, fresh],
             isRunning: { ["early", "late"].contains($0.name) },
             isUnread: { _ in false },
+            hasOpenPullRequest: { _ in false },
             isAutomated: { _ in false },
             runningAt: { running[$0.name] ?? $0.modifiedAt },
             modifiedAt: { live[$0.name] ?? $0.modifiedAt }
