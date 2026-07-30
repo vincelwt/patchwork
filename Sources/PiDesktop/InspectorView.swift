@@ -4,6 +4,7 @@ import SwiftUI
 /// conversation layout), quiet uppercase section headers, and no nested surfaces.
 struct InspectorView: View {
     @EnvironmentObject private var store: AppStore
+    @ObservedObject var activities: RuntimeActivityModel
 
     var body: some View {
         ScrollView {
@@ -16,12 +17,12 @@ struct InspectorView: View {
                     CapabilitySection(capability: capability)
                 }
 
-                let agents = store.activities.filter { $0.kind == .subagent }
+                let agents = activities.items.filter { $0.kind == .subagent }
                 if !agents.isEmpty {
                     ActivitySection(title: "Subagents", items: agents)
                 }
 
-                let processes = store.activities.filter { $0.kind == .process }
+                let processes = activities.items.filter { $0.kind == .process }
                 if !processes.isEmpty {
                     ActivitySection(title: "Background processes", items: processes)
                 }

@@ -164,6 +164,58 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(store.streamingMessage?.textContent, "update 99")
     }
 
+    func testVisibleStreamingUpdatesInvalidateOnlyTheTranscriptScope() async throws {
+        let (store, runtimeA, _, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": assistantMessage("first output")
+        ]))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        let revisionBeforeBurst = store.transcriptRevision
+        var storeInvalidations = 0
+        var transcriptInvalidations = 0
+        let storeCancellable = store.objectWillChange.sink { storeInvalidations += 1 }
+        let transcriptCancellable = store.transcriptStream.objectWillChange.sink { transcriptInvalidations += 1 }
+        for index in 0..<100 {
+            runtimeA.onEvent?(.object([
+                "type": .string("message_update"),
+                "message": assistantMessage("update \(index)")
+            ]))
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(storeInvalidations, 0, "visible tokens must not redraw the sidebar, composer, or window shell")
+        XCTAssertGreaterThan(transcriptInvalidations, 0)
+        XCTAssertGreaterThan(store.transcriptRevision, revisionBeforeBurst)
+        XCTAssertEqual(store.streamingMessage?.textContent, "update 99")
+        withExtendedLifetime((storeCancellable, transcriptCancellable)) {}
+    }
+
+    func testLiveActivityUpdatesInvalidateOnlyTheInspectorScope() {
+        let (store, _, _, _, _) = makeStore()
+        store.activities = [ActivityItem(
+            id: "process-1", sourceID: "tool-1", kind: .process,
+            title: "Build", subtitle: nil, detail: nil, status: .running,
+            startedAt: Date(), endedAt: nil, raw: .null,
+            agentID: nil, agentType: nil, modelName: nil, toolCallCount: nil, duration: nil
+        )]
+        var storeInvalidations = 0
+        var activityInvalidations = 0
+        let storeCancellable = store.objectWillChange.sink { storeInvalidations += 1 }
+        let activityCancellable = store.runtimeActivities.objectWillChange.sink { activityInvalidations += 1 }
+
+        for index in 0..<100 { store.activities[0].detail = "update \(index)" }
+
+        XCTAssertEqual(storeInvalidations, 0, "tool progress must not redraw the transcript, composer, or window shell")
+        XCTAssertEqual(activityInvalidations, 100)
+        XCTAssertEqual(store.activities.first?.detail, "update 99")
+        withExtendedLifetime((storeCancellable, activityCancellable)) {}
+    }
+
     func testCodexQueueStatusIsEphemeralAndRuntimeScoped() {
         let (store, runtimeA, _, sessionA, sessionB) = makeStore()
         let queueEvent: JSONValue = .object([

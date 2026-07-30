@@ -189,6 +189,18 @@ struct DraftStore {
     }
 }
 
+/// High-frequency partial answers observed only by the transcript leaf.
+@MainActor
+final class TranscriptStreamModel: ObservableObject {
+    @Published fileprivate(set) var message: ChatMessage?
+}
+
+/// High-frequency process and subagent progress observed only by the inspector.
+@MainActor
+final class RuntimeActivityModel: ObservableObject {
+    @Published fileprivate(set) var items: [ActivityItem] = []
+}
+
 @MainActor
 final class AppStore: ObservableObject {
     @Published var sessions: [SessionSummary] = []
@@ -203,9 +215,17 @@ final class AppStore: ObservableObject {
             pullRequestLinkKey = -1
         }
     }
-    @Published var streamingMessage: ChatMessage? { didSet { transcriptRevision &+= 1 } }
-    /// Plain revision counter for memoizing transcript projection. It deliberately is not
-    /// published: `messages`/`streamingMessage` already invalidate the view exactly once.
+    let transcriptStream = TranscriptStreamModel()
+    var streamingMessage: ChatMessage? {
+        get { transcriptStream.message }
+        set {
+            guard transcriptStream.message != newValue else { return }
+            transcriptRevision &+= 1
+            transcriptStream.message = newValue
+        }
+    }
+    /// Plain revision counter for memoizing transcript projection. Stream changes publish only
+    /// through `transcriptStream`, while settled `messages` still invalidate the shared store.
     private(set) var transcriptRevision = 0
     private var pullRequestLinkKey = -1
     private var cachedPullRequestLink: URL?
@@ -282,7 +302,11 @@ final class AppStore: ObservableObject {
     /// follow an explicit tool cwd/edit path away from the session's original cwd.
     @Published var folderWorktrees: [String: GitWorktreeInfo] = [:]
     @Published var selectedWorktree: GitWorktreeInfo?
-    @Published var activities: [ActivityItem] = []
+    let runtimeActivities = RuntimeActivityModel()
+    var activities: [ActivityItem] {
+        get { runtimeActivities.items }
+        set { runtimeActivities.items = newValue }
+    }
     @Published var extensionStatuses: [String: String] = [:]
     @Published var extensionWidgets: [String: ExtensionWidget] = [:]
     @Published var activeDialog: ExtensionDialogRequest?
