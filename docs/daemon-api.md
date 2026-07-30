@@ -159,7 +159,9 @@ associated with any automation, including paused ones.
 `Thread.archived` is the union of that flag with the app's `state.json`, which the daemon reads
 and never writes. So `{"archived":true}` always takes, but `{"archived":false}` on a thread the
 *app* archived cannot clear it: that answers `409 archived_in_app` rather than a success the caller
-did not get. Restore it in the Mac app.
+did not get. Restore it in the Mac app. Accepting a message automatically clears the daemon's
+archive flag first; it returns the same `409` when the app's flag would still keep the thread
+archived.
 
 **Runtime controls use Pi, never the JSONL file.** The runtime endpoints issue Pi's own query and
 `set_model` / `set_thinking_level` RPCs. During a daemon-owned turn they share that live process;

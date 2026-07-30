@@ -198,8 +198,9 @@ matches the visible list removes the row instead of merging it back in.
 
 Inside a thread, the top bar carries a worded **Archive** / **Unarchive** button rather than a
 glyph. Archiving keeps the thread open and readable; only the list it appears in changes. An
-archived thread can be opened from the Archived list, read, and replied to. Pi's session file is
-never touched; archive state is metadata.
+archived thread can be opened from the Archived list, read, and replied to. Sending automatically
+restores a thread archived from the web. Pi's session file is never touched; archive state is
+metadata.
 
 Restoring works for threads archived **from the web**, which is what this button writes. A thread
 archived in the **Mac app** cannot be restored from here: that flag lives in the app's own

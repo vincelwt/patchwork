@@ -301,7 +301,12 @@ const actions = {
     return thread;
   },
 
-  sendMessage: (id, body) => api.sendMessage(id, body),
+  sendMessage(id, body) {
+    return api.sendMessage(id, body).then((response) => {
+      setState((s) => ({ threads: applyThreadUpdate(s.threads, { id, archived: false }, s.showArchived) }));
+      return response;
+    });
+  },
   abortThread: (id) => api.abortThread(id),
   respondInteraction: (id, body) => api.respondInteraction(id, body),
 

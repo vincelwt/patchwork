@@ -2633,9 +2633,17 @@ final class AppStore: ObservableObject {
         guard !text.isEmpty || !attachments.isEmpty else { return }
         let cwd: URL
         let sessionPath: URL?
-        if let selectedSession { cwd = selectedSession.cwd; sessionPath = selectedSession.fileURL }
-        else if let selectedExecutionFolder { cwd = selectedExecutionFolder; sessionPath = nil }
-        else { showToast("Choose a working folder first", style: .warning); return }
+        if let selectedSession {
+            cwd = selectedSession.cwd
+            sessionPath = selectedSession.fileURL
+            if selectedSession.isArchived { setArchived(false, session: selectedSession) }
+        } else if let selectedExecutionFolder {
+            cwd = selectedExecutionFolder
+            sessionPath = nil
+        } else {
+            showToast("Choose a working folder first", style: .warning)
+            return
+        }
         // Keep the execution cwd selected until Pi assigns the real session path, but transfer
         // ownership now so navigation can never delete a submitted worktree.
         newChatWorktreeSubmitted = newChatWorktree != nil
