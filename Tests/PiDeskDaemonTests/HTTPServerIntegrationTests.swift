@@ -35,6 +35,7 @@ final class HTTPServerIntegrationTests: XCTestCase {
         let health = try await client.health()
         XCTAssertTrue(health.ok)
         XCTAssertEqual(health.api, PiDeskAPI.apiVersion)
+        XCTAssertTrue(health.threadWorktrees)
         XCTAssertEqual(health.runningRuns, 0)
         XCTAssertEqual(health.queuedRuns, 0)
     }
@@ -95,6 +96,78 @@ final class HTTPServerIntegrationTests: XCTestCase {
         } catch PiDeskClientError.notFound {
             // expected
         }
+    }
+
+    func testCompactThreadSuffixResolvesAndAmbiguousPrefixIsRejected() async throws {
+        let id = "019f9dea-1234-4567-89ab-a1b2c3d4e5f6"
+        _ = TestSupport.writeSessionFile(in: directory, id: id, cwd: "/tmp/project")
+        let resolved = try await client.getThread(id: "a1b2c3d4e5f6")
+        XCTAssertEqual(resolved.thread.id, id)
+        XCTAssertEqual(resolved.thread.shortId, "a1b2c3d4e5f6")
+        let schedule = try await client.createSchedule(ScheduleCreateRequest(
+            name: "Compact target", target: .existingThread(threadId: "a1b2c3d4e5f6"),
+            prompt: "p", trigger: .heartbeat(everySeconds: 900)
+        )).schedule
+        XCTAssertEqual(schedule.target.existingThreadID, id)
+
+        _ = TestSupport.writeSessionFile(in: directory, id: "shared-one", cwd: "/tmp/project")
+        _ = TestSupport.writeSessionFile(in: directory, id: "shared-two", cwd: "/tmp/project")
+        do {
+            _ = try await client.getThread(id: "shared")
+            XCTFail("expected an ambiguous id error")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "ambiguous_thread_id")
+        }
+    }
+
+    func testDialoguePagingExcludesToolResultsAndFindsOlderMessages() async throws {
+        _ = TestSupport.writeSessionFile(
+            in: directory, id: "dialogue", cwd: "/tmp/project",
+            lines: [
+                #"{"type":"message","id":"u1","message":{"role":"user","content":"u1","timestamp":1}}"#,
+                #"{"type":"message","id":"a1","message":{"role":"assistant","content":"a1","timestamp":2}}"#,
+                #"{"type":"message","id":"t1","message":{"role":"toolResult","content":"tool","timestamp":3}}"#,
+                #"{"type":"message","id":"u2","message":{"role":"user","content":"u2","timestamp":4}}"#,
+                #"{"type":"message","id":"a2","message":{"role":"assistant","content":"a2","timestamp":5}}"#
+            ]
+        )
+        let newest = try await client.getThread(
+            id: "dialogue", messages: 2, offset: 0, includeTools: false
+        )
+        XCTAssertEqual(newest.messages.map(\.text), ["u2", "a2"])
+        XCTAssertEqual(newest.nextOffset, 2)
+        let older = try await client.getThread(
+            id: "dialogue", messages: 2, offset: 2, includeTools: false
+        )
+        XCTAssertEqual(older.messages.map(\.text), ["u1", "a1"])
+        XCTAssertNil(older.nextOffset)
+    }
+
+    func testThreadListProjectsDesktopManagedWorktreeMetadata() async throws {
+        let worktree = "/tmp/pi-managed-worktree"
+        let project = "/tmp/source-project"
+        try JSONSerialization.data(withJSONObject: [
+            "managedWorktreeProjects": [worktree: project]
+        ]).write(to: directory.appendingPathComponent("state.json"))
+        _ = TestSupport.writeSessionFile(in: directory, id: "desktop-worktree", cwd: worktree)
+
+        let listed = try await client.listThreads()
+        let thread = try XCTUnwrap(listed.threads.first)
+        XCTAssertEqual(thread.cwd, worktree)
+        XCTAssertEqual(thread.project, project)
+        XCTAssertEqual(thread.worktree, worktree)
+    }
+
+    func testAutomatedFilterAndFlagIncludePausedSchedules() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "automated-thread", cwd: "/tmp/project")
+        _ = try await client.createSchedule(ScheduleCreateRequest(
+            name: "Paused automation", enabled: false,
+            target: .existingThread(threadId: "automated-thread"), prompt: "p",
+            trigger: .heartbeat(everySeconds: 900)
+        ))
+        let threads = try await client.listThreads(automated: true).threads
+        XCTAssertEqual(threads.map(\.id), ["automated-thread"])
+        XCTAssertEqual(try XCTUnwrap(threads.first).automated, true)
     }
 
     func testArchiveAndReadRoundTripThroughTheOverlay() async throws {

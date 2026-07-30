@@ -156,6 +156,27 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(try SessionThreadParser.messages(at: url, limit: 0), [])
     }
 
+    func testDialoguePagesExcludeToolsAndOffsetAfterFiltering() throws {
+        let url = write([
+            messageLine(role: "user", text: "u1", id: "e1"),
+            messageLine(role: "assistant", text: "a1", id: "e2"),
+            messageLine(role: "toolResult", text: "large tool result", id: "e3"),
+            messageLine(role: "user", text: "u2", id: "e4"),
+            messageLine(role: "assistant", text: "a2", id: "e5")
+        ])
+        let newest = try SessionThreadParser.messagePage(
+            at: url, limit: 2, offset: 0, conversationOnly: true
+        )
+        XCTAssertEqual(newest.messages.map(\.text), ["u2", "a2"])
+        XCTAssertEqual(newest.nextOffset, 2)
+
+        let older = try SessionThreadParser.messagePage(
+            at: url, limit: 2, offset: 2, conversationOnly: true
+        )
+        XCTAssertEqual(older.messages.map(\.text), ["u1", "a1"])
+        XCTAssertNil(older.nextOffset)
+    }
+
     func testMessagesReadOnlyTheTailOfALargeSession() throws {
         let hugeIgnoredRecord = String(repeating: "x", count: SessionThreadParser.initialTailBytes + 1_024)
         let url = write([

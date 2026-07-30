@@ -14,7 +14,8 @@ enum ScheduleHandlers {
                 guard !name.isEmpty else { throw DaemonHTTPError.badRequest(code: "invalid_name", message: "name must not be empty.") }
                 let prompt = body.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !prompt.isEmpty else { throw DaemonHTTPError.badRequest(code: "invalid_prompt", message: "prompt must not be empty.") }
-                try validate(body.target)
+                let target = try await canonicalTarget(body.target, core: core)
+                try validate(target)
                 try validate(body.trigger)
                 if let quietHours = body.policy?.quietHours { try validate(quietHours) }
 
@@ -34,7 +35,7 @@ enum ScheduleHandlers {
                     id = "sch_req_\(key)"
                     if let existing = await core.scheduleStore.get(id: id) {
                         guard existing.name == name, existing.enabled == enabled,
-                              existing.target == body.target, existing.prompt == prompt,
+                              existing.target == target, existing.prompt == prompt,
                               existing.mode == body.mode, existing.trigger == body.trigger,
                               existing.policy == policy else {
                             throw DaemonHTTPError.badRequest(
@@ -52,7 +53,7 @@ enum ScheduleHandlers {
                 let nextRunAt = await core.scheduler.computeInitialNextRunAt(for: body.trigger)
                 let schedule = Schedule(
                     id: id, name: name, enabled: enabled,
-                    target: body.target, prompt: prompt, mode: body.mode, trigger: body.trigger,
+                    target: target, prompt: prompt, mode: body.mode, trigger: body.trigger,
                     policy: policy, createdAt: now, updatedAt: now, nextRunAt: nextRunAt
                 )
                 let saved = try await core.scheduleStore.upsert(schedule)
@@ -79,7 +80,13 @@ enum ScheduleHandlers {
                 if let cleanPrompt, cleanPrompt.isEmpty {
                     throw DaemonHTTPError.badRequest(code: "invalid_prompt", message: "prompt must not be empty.")
                 }
-                if let target = body.target { try validate(target) }
+                let target: ScheduleTarget?
+                if let requestedTarget = body.target {
+                    target = try await canonicalTarget(requestedTarget, core: core)
+                } else {
+                    target = nil
+                }
+                if let target { try validate(target) }
                 if let trigger = body.trigger { try validate(trigger) }
                 if let quietHours = body.policy?.quietHours { try validate(quietHours) }
                 let nextRunAt = if let trigger = body.trigger {
@@ -92,7 +99,7 @@ enum ScheduleHandlers {
                 guard let saved = try await core.scheduleStore.update(id: id, { updated in
                     if let cleanName { updated.name = cleanName }
                     if let enabled = body.enabled { updated.enabled = enabled }
-                    if let target = body.target { updated.target = target }
+                    if let target { updated.target = target }
                     if let cleanPrompt { updated.prompt = cleanPrompt }
                     if let mode = body.mode { updated.mode = mode }
                     if let trigger = body.trigger {
@@ -146,8 +153,17 @@ enum ScheduleHandlers {
         return schedule
     }
 
-    /// Anything unparseable/unrecognised is rejected here, at creation/update time, with a
-    /// clear error \u2014 never silently stored as a schedule that can never fire.
+    private static func canonicalTarget(_ target: ScheduleTarget, core: DaemonCore) async throws -> ScheduleTarget {
+        guard case let .existingThread(threadID) = target else { return target }
+        return if let thread = try await core.threadStore.resolve(idOrPath: threadID) {
+            .existingThread(threadId: thread.id)
+        } else {
+            target
+        }
+    }
+
+    /// Anything unparseable or unrecognised is rejected here at creation/update time, never
+    /// silently stored as a schedule that can never fire.
     private static func validate(_ target: ScheduleTarget) throws {
         switch target {
         case let .existingThread(threadId):

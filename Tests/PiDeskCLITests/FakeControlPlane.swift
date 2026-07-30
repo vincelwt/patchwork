@@ -13,7 +13,11 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
     var calls: [Call] = []
     var error: Error?
 
-    var healthResult = WireHealth(ok: true, version: "1.0.0", api: 1, startedAt: "2026-01-01T00:00:00Z", runningRuns: 0, queuedRuns: 0, piVersion: "0.82.1", schedulesEnabled: true)
+    var healthResult = WireHealth(
+        ok: true, version: "1.0.0", api: 1, startedAt: "2026-01-01T00:00:00Z",
+        runningRuns: 0, queuedRuns: 0, piVersion: "0.82.1", schedulesEnabled: true,
+        threadWorktrees: true
+    )
     var threadListResult = WireThreadListResponse(threads: [], nextCursor: nil)
     var threadDetailResult = WireThreadDetailResponse(thread: WireThread(id: "t1"), messages: [])
     var createThreadResult = WireCreateThreadResponse(thread: WireThread(id: "t1"), runId: nil)
@@ -41,14 +45,19 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
         return healthResult
     }
 
-    func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?) async throws -> WireThreadListResponse {
-        calls.append(Call(method: "listThreads", detail: "query=\(query ?? "") limit=\(limit) cursor=\(cursor ?? "") archived=\(String(describing: archived)) running=\(String(describing: running))"))
+    func listThreads(
+        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?
+    ) async throws -> WireThreadListResponse {
+        calls.append(Call(
+            method: "listThreads",
+            detail: "query=\(query ?? "") limit=\(limit) cursor=\(cursor ?? "") archived=\(String(describing: archived)) running=\(String(describing: running)) automated=\(String(describing: automated))"
+        ))
         if let error { throw error }
         return threadListResult
     }
 
-    func showThread(id: String, messages: Int) async throws -> WireThreadDetailResponse {
-        calls.append(Call(method: "showThread", detail: "id=\(id) messages=\(messages)"))
+    func showThread(id: String, messages: Int, offset: Int, includeTools: Bool) async throws -> WireThreadDetailResponse {
+        calls.append(Call(method: "showThread", detail: "id=\(id) messages=\(messages) offset=\(offset) includeTools=\(includeTools)"))
         if let error { throw error }
         return threadDetailResult
     }

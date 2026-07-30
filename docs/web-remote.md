@@ -185,9 +185,9 @@ instead of inviting a duplicate first prompt.
 The working directory is picked from the `cwd` of threads already known, or typed. When that folder
 is a git repository with more than one checkout, a **Checkout** menu appears listing the main
 checkout and every existing worktree (`GET /v1/worktrees`), and the selected one becomes the
-thread's working directory. Selection only: worktrees are created and removed in the Mac app, and a
-folder that is not a repository, or a daemon without the endpoint, simply hides the menu instead
-of blocking thread creation.
+thread's working directory. The web remote only selects existing checkouts; it never creates or
+removes them. A folder that is not a repository, or a daemon without the endpoint, simply hides the
+menu instead of blocking thread creation.
 
 ## Archiving
 

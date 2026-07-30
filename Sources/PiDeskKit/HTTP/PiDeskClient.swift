@@ -60,18 +60,26 @@ public final class PiDeskClient: Sendable {
 
     // MARK: - Threads
 
-    public func listThreads(query: String? = nil, limit: Int? = nil, cursor: String? = nil, archived: Bool? = nil, running: Bool? = nil) async throws -> ThreadListResponse {
+    public func listThreads(
+        query: String? = nil, limit: Int? = nil, cursor: String? = nil,
+        archived: Bool? = nil, running: Bool? = nil, automated: Bool? = nil
+    ) async throws -> ThreadListResponse {
         try await get("/v1/threads", query: [
             "query": query,
             "limit": limit.map(String.init),
             "cursor": cursor,
             "archived": archived.map(String.init),
-            "running": running.map(String.init)
+            "running": running.map(String.init),
+            "automated": automated.map(String.init)
         ])
     }
 
-    public func getThread(id: String, messages: Int = 20) async throws -> ThreadDetailResponse {
-        try await get("/v1/threads/\(pathComponent: id)", query: ["messages": String(messages)])
+    public func getThread(
+        id: String, messages: Int = 20, offset: Int = 0, includeTools: Bool = true
+    ) async throws -> ThreadDetailResponse {
+        try await get("/v1/threads/\(pathComponent: id)", query: [
+            "messages": String(messages), "offset": String(offset), "all": String(includeTools)
+        ])
     }
 
     public func createThread(_ request: CreateThreadRequest) async throws -> CreateThreadResponse {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// One checkout of a git repository: the main one, or a linked worktree already created on the
-/// Mac. Discovery only: the control API never creates or deletes a worktree.
+/// Mac. This model is the read-only projection returned by `GET /v1/worktrees`.
 public struct GitWorktreeEntry: Codable, Hashable, Sendable, Identifiable {
     public var id: String { path }
     public var path: String

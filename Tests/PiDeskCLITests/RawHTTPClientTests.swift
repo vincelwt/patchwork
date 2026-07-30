@@ -75,7 +75,7 @@ final class RawHTTPClientTests: XCTestCase {
 
         let plane = HTTPControlPlane(target: .unixSocket(path: server.socketPath), token: nil, timeout: 5)
         do {
-            _ = try await plane.showThread(id: "missing", messages: 20)
+            _ = try await plane.showThread(id: "missing", messages: 20, offset: 0, includeTools: false)
             XCTFail("expected apiError")
         } catch ControlPlaneError.apiError(let status, let code, let message) {
             XCTAssertEqual(status, 404)

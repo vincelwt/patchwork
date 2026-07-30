@@ -29,13 +29,15 @@ enum ThreadsCommand {
     // MARK: - list
 
     private static let listHelp = CommandHelp(
-        usage: "pidesk threads list [--query TEXT] [--running] [--archived] [--limit N] [--cursor C] [--json]",
-        summary: "List threads, newest first.",
+        usage: "pidesk threads list [--query TEXT] [--running] [--automated] [--archived | --all] [--limit N] [--cursor C] [--json]",
+        summary: "List active threads newest first. UUIDs use their compact final segment.",
         flags: [
             FlagSpec("--query", takesValue: true, placeholder: "TEXT", help: "filter by name/preview text"),
             FlagSpec("--running", takesValue: false, help: "only threads with a run in progress"),
-            FlagSpec("--archived", takesValue: false, help: "only archived threads (default: non-archived)"),
-            FlagSpec("--limit", takesValue: true, placeholder: "N", help: "max threads to fetch (default 50)"),
+            FlagSpec("--automated", takesValue: false, help: "only threads targeted by an automation"),
+            FlagSpec("--archived", takesValue: false, help: "only archived threads"),
+            FlagSpec("--all", takesValue: false, help: "include active and archived threads"),
+            FlagSpec("--limit", takesValue: true, placeholder: "N", help: "max threads to fetch (default 20)"),
             FlagSpec("--cursor", takesValue: true, placeholder: "C", help: "resume from a previous --json nextCursor")
         ],
         examples: [
@@ -47,14 +49,18 @@ enum ThreadsCommand {
 
     private static func list(_ args: [String], context: CommandContext) async -> Int32 {
         await runLeaf(args, context: context, help: listHelp) { parsed, global in
-            let limit = try positiveInt(parsed.value("--limit"), flag: "--limit", default: 50)
+            let limit = try positiveInt(parsed.value("--limit"), flag: "--limit", default: 20)
+            if parsed.flag("--archived"), parsed.flag("--all") {
+                throw UsageError.conflictingFlags(["--archived", "--all"])
+            }
             let plane = context.makeControlPlane(global)
             let response = try await plane.listThreads(
                 query: parsed.value("--query"),
                 limit: limit,
                 cursor: parsed.value("--cursor"),
-                archived: parsed.flag("--archived") ? true : nil,
-                running: parsed.flag("--running") ? true : nil
+                archived: parsed.flag("--all") ? nil : parsed.flag("--archived"),
+                running: parsed.flag("--running") ? true : nil,
+                automated: parsed.flag("--automated") ? true : nil
             )
             if global.jsonOutput {
                 context.out.json(response)
@@ -65,7 +71,7 @@ enum ThreadsCommand {
                 return
             }
             let rows = response.threads.map { Rendering.threadRow($0, colorEnabled: context.out.colorEnabled) }
-            for line in Table.render(headers: ["ID", "NAME", "FOLDER", "STATUS", "UPDATED", "PREVIEW"], rows: rows) {
+            for line in Table.render(headers: ["ID", "NAME", "LOCATION", "STATUS", "UPDATED", "PREVIEW"], rows: rows) {
                 context.out.line(line)
             }
             if let cursor = response.nextCursor {
@@ -77,24 +83,40 @@ enum ThreadsCommand {
     // MARK: - show
 
     private static let showHelp = CommandHelp(
-        usage: "pidesk threads show <id> [--messages N] [--json]",
-        summary: "Show one thread's details and its most recent messages.",
-        flags: [FlagSpec("--messages", takesValue: true, placeholder: "N", help: "how many recent messages to include (default 20)")],
-        examples: ["pidesk threads show 019f9dea-...", "pidesk threads show 019f9dea-... --messages 5 --json"]
+        usage: "pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]",
+        summary: "Show recent user/assistant messages. Use --all for tool and system results.",
+        flags: [
+            FlagSpec("--messages", takesValue: true, placeholder: "N", help: "messages per page (default 8)"),
+            FlagSpec("--offset", takesValue: true, placeholder: "N", help: "skip N newer matching messages"),
+            FlagSpec("--all", takesValue: false, help: "include tool results and system messages")
+        ],
+        examples: [
+            "pidesk threads show a1b2c3d4e5f6",
+            "pidesk threads show a1b2c3d4e5f6 --offset 8",
+            "pidesk threads show a1b2c3d4e5f6 --all --messages 20 --json"
+        ]
     )
 
     private static func show(_ args: [String], context: CommandContext) async -> Int32 {
         await runLeaf(args, context: context, help: showHelp) { parsed, global in
             let id = try requirePositionals(parsed, names: ["id"])[0]
-            let messages = try positiveInt(parsed.value("--messages"), flag: "--messages", default: 20)
-            let response = try await context.makeControlPlane(global).showThread(id: id, messages: messages)
+            let messages = try positiveInt(parsed.value("--messages"), flag: "--messages", default: 8)
+            let offset = try nonNegativeInt(parsed.value("--offset"), flag: "--offset", default: 0)
+            let response = try await context.makeControlPlane(global).showThread(
+                id: id, messages: messages, offset: offset, includeTools: parsed.flag("--all")
+            )
             if global.jsonOutput {
                 context.out.json(response)
                 return
             }
             let thread = response.thread
-            context.out.line("\(thread.name ?? "(unnamed)")  [\(thread.id)]")
-            context.out.line("cwd: \(thread.cwd ?? "-")   folder: \(thread.folder ?? "-")")
+            context.out.line("\(thread.name ?? "(unnamed)")  [\(Rendering.threadID(thread))]")
+            if let worktree = thread.worktree {
+                context.out.line("project: \(thread.project ?? "-")")
+                context.out.line("worktree: \(worktree)")
+            } else {
+                context.out.line("cwd: \(thread.cwd ?? "-")")
+            }
             context.out.line("status: \(Rendering.threadStatus(thread, colorEnabled: context.out.colorEnabled))   updated: \(FlexibleDate.displayLocal(thread.updatedAt))")
             if let cost = thread.cost { context.out.line("cost: $\(String(format: "%.2f", cost))") }
             context.out.line("")
@@ -105,22 +127,26 @@ enum ThreadsCommand {
                 context.out.line(truncated(message.text ?? "", max: 2000))
                 context.out.line("")
             }
+            if let next = response.nextOffset {
+                context.out.info("Older messages: pidesk threads show \(Rendering.threadID(thread)) --offset \(next)\(parsed.flag("--all") ? " --all" : "")")
+            }
         }
     }
 
     // MARK: - new
 
     private static let newHelp = CommandHelp(
-        usage: "pidesk threads new --cwd DIR [--name NAME] [--message TEXT] [--mode MODE] [--json]",
+        usage: "pidesk threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]",
         summary: "Create a thread. Without --message the session is created idle (no run starts).",
         flags: [
-            FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "working directory for the new thread (required)"),
+            FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "working directory or source project (required)"),
+            FlagSpec("--worktree", takesValue: false, help: "run in a fresh managed git worktree"),
             FlagSpec("--name", takesValue: true, placeholder: "NAME", help: "thread name (default: chosen by the daemon)"),
             FlagSpec("--message", takesValue: true, placeholder: "TEXT", help: "first message to send; \"-\" reads it from stdin"),
             FlagSpec("--mode", takesValue: true, placeholder: "MODE", help: "applies /mode before the message, e.g. ultra")
         ],
         examples: [
-            "pidesk threads new --cwd ~/code/myapp --name \"Nightly triage\"",
+            "pidesk threads new --cwd ~/code/myapp --worktree --name \"Nightly triage\"",
             "pidesk threads new --cwd ~/code/myapp --message \"survey the repo\" --mode ultra --json"
         ]
     )
@@ -129,14 +155,25 @@ enum ThreadsCommand {
         await runLeaf(args, context: context, help: newHelp) { parsed, global in
             guard let cwd = parsed.value("--cwd") else { throw UsageError.missingRequiredFlag("--cwd") }
             let message = try resolveMessageText(parsed.value("--message"), context: context)
-            let response = try await context.makeControlPlane(global).createThread(
-                WireCreateThreadRequest(cwd: cwd, name: parsed.value("--name"), message: message, mode: parsed.value("--mode"))
+            let plane = context.makeControlPlane(global)
+            if parsed.flag("--worktree"), try await plane.health().threadWorktrees != true {
+                throw CLIFailure(
+                    exitCode: .requestFailed,
+                    message: "the running daemon does not support thread worktrees",
+                    hint: "update Pi Desktop and restart the active host"
+                )
+            }
+            let response = try await plane.createThread(
+                WireCreateThreadRequest(
+                    cwd: cwd, name: parsed.value("--name"), message: message,
+                    mode: parsed.value("--mode"), worktree: parsed.flag("--worktree") ? true : nil
+                )
             )
             if global.jsonOutput {
                 context.out.json(response)
                 return
             }
-            context.out.line("Created thread \(response.thread.id)\(response.thread.name.map { " (\($0))" } ?? "")")
+            context.out.line("Created thread \(Rendering.threadID(response.thread))\(response.thread.name.map { " (\($0))" } ?? "")")
             if let runId = response.runId { context.out.info("Run started: \(runId)") }
         }
     }
@@ -281,9 +318,9 @@ enum ThreadsCommand {
 
     private static func eventMatches(_ event: ControlPlaneEvent, threadId: String) -> Bool {
         if event.name == "activity" { return true } // global snapshot; not tied to one thread
-        if event.data["id"]?.stringValue == threadId { return true }
-        if event.data["threadId"]?.stringValue == threadId { return true }
-        return false
+        return [event.data["id"]?.stringValue, event.data["threadId"]?.stringValue]
+            .compactMap { $0 }
+            .contains { $0 == threadId || $0.hasPrefix(threadId) || $0.hasSuffix(threadId) }
     }
 
     private static func emit(_ event: ControlPlaneEvent, out: OutputSink, jsonOutput: Bool, now: () -> Date) {
@@ -324,6 +361,14 @@ enum ThreadsCommand {
         guard let raw else { return value }
         guard let parsed = Int(raw), parsed > 0 else {
             throw UsageError.invalidValue(flag: flag, value: raw, reason: "expected a positive integer")
+        }
+        return parsed
+    }
+
+    private static func nonNegativeInt(_ raw: String?, flag: String, default value: Int) throws -> Int {
+        guard let raw else { return value }
+        guard let parsed = Int(raw), parsed >= 0 else {
+            throw UsageError.invalidValue(flag: flag, value: raw, reason: "expected zero or a positive integer")
         }
         return parsed
     }

@@ -66,7 +66,8 @@ final class ResilientSchedulerTests: XCTestCase {
         XCTAssertEqual(fired, 2)
         let firstStarted = await poll { executor.executedJobs.count == 1 }
         XCTAssertTrue(firstStarted)
-        XCTAssertTrue(persistenceObserved.value)
+        let persistedBeforeExecution = await poll { persistenceObserved.value }
+        XCTAssertTrue(persistedBeforeExecution)
         let duplicate = await core.scheduler.tick(now: now.addingTimeInterval(1))
         XCTAssertEqual(duplicate, 0, "one pending occurrence prevents a duplicate")
 

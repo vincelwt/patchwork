@@ -47,9 +47,11 @@ final class FakeRunExecutor: RunExecuting, @unchecked Sendable {
 final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
     private let lock = NSLock()
     private var _created = 0
+    private var _createdCwds: [URL] = []
     private var _modelSets: [(String, String)] = []
     private var _thinkingSets: [String] = []
     var created: Int { lock.lock(); defer { lock.unlock() }; return _created }
+    var createdCwds: [URL] { lock.lock(); defer { lock.unlock() }; return _createdCwds }
     var modelSets: [(String, String)] { lock.lock(); defer { lock.unlock() }; return _modelSets }
     var thinkingSets: [String] { lock.lock(); defer { lock.unlock() }; return _thinkingSets }
 
@@ -62,8 +64,11 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
     }
 
     func createIdle(cwd: URL, name: String?) async throws -> PiThread {
-        recordCreate()
-        return thread
+        recordCreate(cwd: cwd)
+        var created = thread
+        created.cwd = cwd.standardizedFileURL.path
+        created.folder = cwd.lastPathComponent
+        return created
     }
 
     func rename(cwd: URL, sessionPath: URL, name: String) async throws {}
@@ -83,7 +88,9 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
         return runtime
     }
 
-    private func recordCreate() { lock.lock(); _created += 1; lock.unlock() }
+    private func recordCreate(cwd: URL) {
+        lock.lock(); _created += 1; _createdCwds.append(cwd); lock.unlock()
+    }
     private func recordModel(_ provider: String, _ modelId: String) {
         lock.lock(); _modelSets.append((provider, modelId)); lock.unlock()
     }
@@ -144,10 +151,10 @@ enum TestSupport {
             interactions: interactions,
             liveSessions: liveSessions,
             threadRPC: threadRPC,
-            // Never the real app's `state.json`: the folder endpoint must read a fixture, and
-            // nothing here may depend on how the machine running the tests organises its own
-            // conversations.
-            appStateURL: directory.appendingPathComponent("state.json")
+            // Never the real app's `state.json` or worktree root: fixtures must stay inside the
+            // throwaway directory and no test may alter the user's managed worktrees.
+            appStateURL: directory.appendingPathComponent("state.json"),
+            worktreeRootURL: directory.appendingPathComponent("worktrees", isDirectory: true)
         )
     }
 

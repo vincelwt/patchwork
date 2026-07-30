@@ -125,16 +125,35 @@ public enum SessionThreadParser {
     /// The last `limit` messages in file order. Reads backward from EOF so opening a 120 MB
     /// conversation costs roughly the size of its visible tail, not the size of its history.
     public static func messages(at url: URL, limit: Int) throws -> [Message] {
-        guard limit > 0 else { return [] }
-        if let tail = try tailMessages(at: url, limit: limit) {
-            return applyImageBudget(to: tail)
-        }
-        return applyImageBudget(to: try forwardMessages(at: url, limit: limit))
+        try messagePage(at: url, limit: limit, offset: 0, conversationOnly: false).messages
+    }
+
+    /// A bounded page from newest toward oldest. `offset` counts messages after applying the role
+    /// filter, so an agent can page through dialogue without tool results shifting every page.
+    public static func messagePage(
+        at url: URL, limit: Int, offset: Int, conversationOnly: Bool
+    ) throws -> (messages: [Message], nextOffset: Int?) {
+        guard limit > 0, offset >= 0 else { return ([], nil) }
+        let pageLimit = min(limit, 500)
+        let pageOffset = min(offset, 5_000)
+        let target = pageLimit + pageOffset + 1
+        let retained = try tailMessages(at: url, limit: target, conversationOnly: conversationOnly)
+            ?? forwardMessages(at: url, limit: target, conversationOnly: conversationOnly)
+        let hasMore = retained.count == target
+        let withoutNewer = retained.dropLast(min(pageOffset, retained.count))
+        let page = applyImageBudget(to: Array(withoutNewer.suffix(pageLimit)))
+        return (page, hasMore ? pageOffset + page.count : nil)
     }
 
     /// `nil` means the bounded reverse window did not contain enough complete records, so the
     /// caller must use the slower full scan rather than silently return incomplete history.
     static func tailMessages(at url: URL, limit: Int) throws -> [Message]? {
+        try tailMessages(at: url, limit: limit, conversationOnly: false)
+    }
+
+    private static func tailMessages(
+        at url: URL, limit: Int, conversationOnly: Bool
+    ) throws -> [Message]? {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let end = try handle.seekToEnd()
@@ -155,7 +174,8 @@ public enum SessionThreadParser {
                 if record.last == 0x0D { record.removeLast() }
                 let offset = start + UInt64(line.startIndex)
                 guard let value = try? PiJSONValue.decode(record), let object = value.objectValue,
-                      let message = wireMessage(from: object, locator: .offset(offset)) else { continue }
+                      let message = wireMessage(from: object, locator: .offset(offset)),
+                      !conversationOnly || message.role == .user || message.role == .assistant else { continue }
                 messages.append(message)
                 if messages.count == limit { return Array(messages.reversed()) }
             }
@@ -167,7 +187,9 @@ public enum SessionThreadParser {
         }
     }
 
-    private static func forwardMessages(at url: URL, limit: Int) throws -> [Message] {
+    private static func forwardMessages(
+        at url: URL, limit: Int, conversationOnly: Bool
+    ) throws -> [Message] {
         var buffer: [Message] = []
         buffer.reserveCapacity(min(limit, 512))
         var ordinal = 0
@@ -176,7 +198,8 @@ public enum SessionThreadParser {
             let entryOrdinal = ordinal
             ordinal += 1
             guard let value = try? PiJSONValue.decode(data), let object = value.objectValue,
-                  let message = wireMessage(from: object, locator: .ordinal(entryOrdinal)) else { return }
+                  let message = wireMessage(from: object, locator: .ordinal(entryOrdinal)),
+                  !conversationOnly || message.role == .user || message.role == .assistant else { return }
             buffer.append(message)
             if buffer.count > limit * 2 { buffer.removeFirst(buffer.count - limit) }
         }

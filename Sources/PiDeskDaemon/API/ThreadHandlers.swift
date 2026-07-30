@@ -6,12 +6,15 @@ enum ThreadHandlers {
         [
             Route("GET", "/v1/threads") { request, _ in
                 let limit = clamp(request.query["limit"].flatMap(Int.init) ?? 50, 1, 200)
+                let automatedIDs = Set(await core.scheduleStore.all().compactMap(\.target.existingThreadID))
                 let (threads, next) = await core.threadStore.listThreads(
                     query: request.query["query"],
                     limit: limit,
                     cursor: request.query["cursor"],
                     archived: request.query["archived"].flatMap(parseBool),
-                    running: request.query["running"].flatMap(parseBool)
+                    running: request.query["running"].flatMap(parseBool),
+                    automated: request.query["automated"].flatMap(parseBool),
+                    automatedThreadIDs: automatedIDs
                 )
                 return .json(ThreadListResponse(threads: threads, nextCursor: next))
             },
@@ -19,8 +22,15 @@ enum ThreadHandlers {
             Route("GET", "/v1/threads/:id") { request, params in
                 let thread = try await requireThread(core, params)
                 let limit = clamp(request.query["messages"].flatMap(Int.init) ?? 20, 0, 500)
-                let messages = (try? SessionThreadParser.messages(at: URL(fileURLWithPath: thread.path), limit: limit)) ?? []
-                return .json(ThreadDetailResponse(thread: thread, messages: messages))
+                let offset = clamp(request.query["offset"].flatMap(Int.init) ?? 0, 0, 5_000)
+                let includeTools = request.query["all"].flatMap(parseBool) ?? true
+                let page = (try? SessionThreadParser.messagePage(
+                    at: URL(fileURLWithPath: thread.path), limit: limit, offset: offset,
+                    conversationOnly: !includeTools
+                )) ?? (messages: [], nextOffset: nil)
+                return .json(ThreadDetailResponse(
+                    thread: thread, messages: page.messages, nextOffset: page.nextOffset
+                ))
             },
 
             // Image bytes never travel inside a thread detail: one screenshot-heavy transcript
@@ -55,14 +65,41 @@ enum ThreadHandlers {
 
             Route("POST", "/v1/threads") { request, _ in
                 let body = try request.decodeJSON(CreateThreadRequest.self)
-                let cwdURL = try existingDirectory(body.cwd)
-                let thread: PiThread
+                let projectURL = try existingDirectory(body.cwd)
+                let worktreeURL: URL?
+                if body.worktree == true {
+                    switch await WorktreeService.create(from: projectURL, root: core.worktreeRootURL) {
+                    case let .success(url): worktreeURL = url
+                    case let .failure(error):
+                        throw DaemonHTTPError.badRequest(code: "worktree_failed", message: error.message)
+                    }
+                } else {
+                    worktreeURL = nil
+                }
+                let executionURL = worktreeURL ?? projectURL
+                var thread: PiThread
                 do {
                     // Resolve the real Pi session before responding. A `pending:<run>` id is not
                     // a thread and made the web client navigate straight into a guaranteed 404.
-                    thread = try await core.threadRPC.createIdle(cwd: cwdURL, name: body.name)
-                } catch let error as RunnerError {
-                    throw DaemonHTTPError.conflict(code: "create_failed", message: error.localizedDescription)
+                    thread = try await core.threadRPC.createIdle(cwd: executionURL, name: body.name)
+                } catch {
+                    if let worktreeURL {
+                        _ = await WorktreeService.remove(at: worktreeURL, root: core.worktreeRootURL)
+                    }
+                    if let error = error as? RunnerError {
+                        throw DaemonHTTPError.conflict(code: "create_failed", message: error.localizedDescription)
+                    }
+                    throw error
+                }
+                thread.shortId = PiThread.abbreviatedID(for: thread.id)
+                if let worktreeURL {
+                    thread.project = projectURL.path
+                    thread.worktree = worktreeURL.path
+                    do {
+                        try await core.threadStore.setManagedWorktreeProject(projectURL, for: worktreeURL)
+                    } catch {
+                        core.logger.warn("Created thread \(thread.id), but could not save its worktree project mapping: \(error)")
+                    }
                 }
 
                 guard let message = body.message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
@@ -336,9 +373,13 @@ enum ThreadHandlers {
         guard let id = params["id"], !id.isEmpty else {
             throw DaemonHTTPError.badRequest(code: "missing_id", message: "Missing thread id.")
         }
-        guard let thread = await core.threadStore.thread(idOrPath: id) else {
+        guard var thread = try await core.threadStore.resolve(idOrPath: id) else {
             throw DaemonHTTPError.notFound("Thread \(id)")
         }
+        thread.shortId = PiThread.abbreviatedID(for: thread.id)
+        thread.automated = await core.scheduleStore.all().contains(where: {
+            $0.target.existingThreadID == thread.id
+        }) ? true : nil
         return thread
     }
 

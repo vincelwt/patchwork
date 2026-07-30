@@ -33,6 +33,8 @@ final class DaemonCore: @unchecked Sendable {
     /// The app's `state.json`, read-only, for the folder tree `GET /v1/folders` exposes. A
     /// parameter purely so tests point at a throwaway file instead of the real one.
     let appStateURL: URL
+    /// Injectable so worktree creation tests never touch the user's `~/.pi/worktrees`.
+    let worktreeRootURL: URL
 
     init(
         settings: DaemonSettings,
@@ -52,7 +54,8 @@ final class DaemonCore: @unchecked Sendable {
         interactions: InteractionRegistry = InteractionRegistry(),
         liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
         threadRPC: ThreadRPCServing? = nil,
-        appStateURL: URL = AppStatePeek.defaultURL()
+        appStateURL: URL = AppStatePeek.defaultURL(),
+        worktreeRootURL: URL = WorktreeService.root
     ) {
         self.settings = settings
         self.logger = logger
@@ -61,6 +64,7 @@ final class DaemonCore: @unchecked Sendable {
         self.liveSessions = liveSessions
         self.threadRPC = threadRPC ?? ThreadCreationService(logger: logger)
         self.appStateURL = appStateURL
+        self.worktreeRootURL = worktreeRootURL.standardizedFileURL
 
         let bus = EventBus(logger: logger)
         self.bus = bus
@@ -77,7 +81,7 @@ final class DaemonCore: @unchecked Sendable {
         let overlay = DaemonOverlayStore(fileURL: overlayFileURL)
         threadStore = ThreadStore(
             rootURL: sessionRootURL, activityDirectoryURL: activityDirectoryURL,
-            logger: logger, overlay: overlay, appStateURL: appStateURL
+            appStateURL: appStateURL, logger: logger, overlay: overlay
         )
         limitsCache = LimitsCache()
 

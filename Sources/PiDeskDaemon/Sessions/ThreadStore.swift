@@ -16,11 +16,11 @@ actor ThreadStore {
 
     private let rootURL: URL
     private let activityDirectoryURL: URL
-    private let logger: DaemonLogger
-    private let overlay: DaemonOverlayStore
     /// Read-only, and a parameter only so tests read a fixture instead of the machine's own
     /// `state.json`. The daemon never writes it; see `AppStatePeek`.
     private let appStateURL: URL
+    private let logger: DaemonLogger
+    private let overlay: DaemonOverlayStore
     private var cache: [String: CacheEntry] = [:]
     /// Last fully overlaid, sorted list. The web view loads this before opening a detail, so a
     /// point lookup stays O(thread count) instead of refreshing every session on disk.
@@ -29,19 +29,26 @@ actor ThreadStore {
     init(
         rootURL: URL = SessionScanner.defaultRootURL(),
         activityDirectoryURL: URL = PiDeskPaths.activityDirectory,
+        appStateURL: URL = AppStatePeek.defaultURL(),
         logger: DaemonLogger,
-        overlay: DaemonOverlayStore = DaemonOverlayStore(),
-        appStateURL: URL = AppStatePeek.defaultURL()
+        overlay: DaemonOverlayStore = DaemonOverlayStore()
     ) {
         self.rootURL = rootURL
         self.activityDirectoryURL = activityDirectoryURL
+        self.appStateURL = appStateURL
         self.logger = logger
         self.overlay = overlay
-        self.appStateURL = appStateURL
     }
 
-    func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?) async -> (threads: [PiThread], nextCursor: String?) {
+    func listThreads(
+        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?,
+        automated: Bool? = nil, automatedThreadIDs: Set<String> = []
+    ) async -> (threads: [PiThread], nextCursor: String?) {
         var filtered = await allThreadsSorted()
+        for index in filtered.indices {
+            filtered[index].shortId = PiThread.abbreviatedID(for: filtered[index].id)
+            if automatedThreadIDs.contains(filtered[index].id) { filtered[index].automated = true }
+        }
         if let query, !query.trimmingCharacters(in: .whitespaces).isEmpty {
             let needle = query.lowercased()
             filtered = filtered.filter {
@@ -50,6 +57,7 @@ actor ThreadStore {
         }
         if let archived { filtered = filtered.filter { $0.archived == archived } }
         if let running { filtered = filtered.filter { $0.running == running } }
+        if let automated { filtered = filtered.filter { ($0.automated == true) == automated } }
 
         let start = cursor.flatMap(Int.init) ?? 0
         guard start >= 0, start < filtered.count else { return ([], nil) }
@@ -70,6 +78,23 @@ actor ThreadStore {
             return await applyingOverlays(to: [cached], sessionIDCounts: counts).first
         }
         return await refreshedThread(idOrPath: idOrPath)
+    }
+
+    /// Exact ids/paths stay fast. Otherwise a unique prefix or suffix is accepted, which lets
+    /// callers use the compact UUID tail printed by `pidesk` without risking the wrong thread.
+    func resolve(idOrPath: String) async throws -> PiThread? {
+        if let exact = await thread(idOrPath: idOrPath) { return exact }
+        guard !idOrPath.contains("/") else { return nil }
+        let matches = await allThreadsSorted().filter {
+            $0.id.hasPrefix(idOrPath) || $0.id.hasSuffix(idOrPath)
+        }
+        guard matches.count <= 1 else {
+            throw DaemonHTTPError.badRequest(
+                code: "ambiguous_thread_id",
+                message: "Thread id \(idOrPath) matches \(matches.count) threads; use more characters."
+            )
+        }
+        return matches.first
     }
 
     /// Mutations that need freshly overlaid fields may pay for a list refresh; ordinary detail,
@@ -93,6 +118,10 @@ actor ThreadStore {
 
     func unreadCount() async -> Int {
         await allThreadsSorted().filter(\.unread).count
+    }
+
+    func setManagedWorktreeProject(_ project: URL, for worktree: URL) async throws {
+        try await overlay.setManagedWorktreeProject(project, for: worktree)
     }
 
     /// Threads the heartbeat extension has never reported on — sessions that started before it
@@ -125,6 +154,9 @@ actor ThreadStore {
     ) async -> [PiThread] {
         let appState = AppStatePeek.load(from: appStateURL)
         let overlayState = await overlay.snapshot()
+        let worktreeProjects = appState.managedWorktreeProjects.merging(
+            overlayState.managedWorktreeProjects
+        ) { _, daemon in daemon }
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
         let heartbeatIDs = Set(heartbeats.map(\.sessionId))
         let heartbeatPaths = Set(heartbeats.compactMap { $0.sessionFile.map { URL(fileURLWithPath: $0).standardizedFileURL.path } })
@@ -145,6 +177,11 @@ actor ThreadStore {
             let path = URL(fileURLWithPath: results[index].path).standardizedFileURL.path
             results[index].archived = appState.isArchived(sessionID: results[index].id)
                 || overlayState.isArchived(results[index].id)
+            let cwd = URL(fileURLWithPath: results[index].cwd).standardizedFileURL.path
+            if let project = worktreeProjects[cwd] {
+                results[index].project = project
+                results[index].worktree = cwd
+            }
             let completion = latestHeartbeatCompletionByPath[path]
                 ?? (sessionIDCounts[results[index].id] == 1 ? latestHeartbeatCompletionBySessionID[results[index].id] : nil)
             results[index].unread = overlayState.unreadOverride(

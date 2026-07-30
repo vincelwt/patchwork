@@ -100,23 +100,25 @@ carries `X-Pi-Desktop-Api: 1`.
 ```
 GET /v1/health
 → {"ok":true,"version":"1.0.0","api":1,"startedAt":"…","runningRuns":1,"queuedRuns":0,
-   "piVersion":"0.82.1","schedulesEnabled":true,"scheduleIdempotency":true}
+   "piVersion":"0.82.1","schedulesEnabled":true,"scheduleIdempotency":true,
+   "threadWorktrees":true}
 ```
 
 ### Threads
 
 A *thread* is a Pi session. `id` is the session's stable id; `path` is its JSONL path. Both are
-accepted wherever `{id}` appears, so a caller can use whichever it has.
+accepted wherever `{id}` appears. A unique id prefix or suffix is also accepted; ambiguous
+abbreviations return `400 ambiguous_thread_id` rather than choosing one.
 
 ```
-GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=
+GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=&automated=
 → {"threads":[Thread],"nextCursor":null}
 
-GET  /v1/threads/{id}?messages=20
-→ {"thread":Thread,"messages":[Message]}
+GET  /v1/threads/{id}?messages=20&offset=0&all=true
+→ {"thread":Thread,"messages":[Message],"nextOffset":20}
 
 POST /v1/threads
-     {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra"}
+     {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra","worktree":true}
 → {"thread":Thread,"runId":"…"}          // message is optional; `thread.id` is always a real session id
 
 GET  /v1/threads/{id}/runtime
@@ -142,7 +144,16 @@ GET  /v1/threads/{id}/images/{imageId}
 
 A message-bearing create resolves an idle Pi session first, then queues the first prompt against
 that session. The response therefore never invents a `pending:<run>` thread id that cannot be
-opened. Older clients may still use `runId` to follow the prompt itself.
+opened. Older clients may still use `runId` to follow the prompt itself. With `worktree:true`,
+the daemon uses the same managed worktree algorithm as the Mac app and records the exact source
+`cwd` in its own overlay so the app groups the thread under the source project. If idle-session
+creation fails, the unused worktree is removed non-force. The thread and run keep the real
+worktree as their execution `cwd`.
+
+Thread detail defaults to the existing raw projection (`all=true`) for API compatibility. Set
+`all=false` to retain only user and assistant roles. `offset` is applied after that filter and
+`nextOffset` is present only when an older page exists. List `automated=true` keeps threads
+associated with any automation, including paused ones.
 
 **Archive is the daemon's own flag, not the app's.** It is written to the daemon overlay file, and
 `Thread.archived` is the union of that flag with the app's `state.json`, which the daemon reads
@@ -168,15 +179,15 @@ GET /v1/worktrees?cwd=/Users/x/code
 ```
 
 Every existing checkout of the repository containing `cwd`, main first, so a client can start a
-thread in a worktree that already exists. **Discovery only:** `git worktree list` is the one
-subcommand used, run through a fixed `/usr/bin/git` path with no shell, and nothing here creates,
-moves, or removes a checkout; the Mac app remains the only thing that does. A directory that is not
-a repository (or a machine without git) answers with an empty list rather than an error. Bounds: 64
-entries, 256 KB of git output, 5-second timeout. A missing or non-directory `cwd` is
-`400 invalid_cwd`.
+thread in a worktree that already exists. This GET endpoint is discovery only: `git worktree list`
+is run through a fixed `/usr/bin/git` path with no shell, and the request never mutates a checkout.
+A directory that is not a repository (or a machine without git) answers with an empty list rather
+than an error. Bounds: 64 entries, 256 KB of git output, 5-second timeout. A missing or
+non-directory `cwd` is `400 invalid_cwd`.
 
 Starting a thread in a chosen checkout needs no extra field: pass its `path` as `POST /v1/threads`'s
-`cwd`.
+`cwd`. To create a fresh managed worktree instead, pass the source project as `cwd` with
+`worktree:true`.
 
 **Delivery is reported, not assumed.** `delivery` in the *response* says what actually happened,
 which is not always what was asked:
@@ -264,10 +275,12 @@ because their bounded identity is what makes results attachable.
 ```jsonc
 // Thread
 {
-  "id": "019f9dea-…", "path": "/Users/x/.pi/agent/sessions/--Users-x-code--/….jsonl",
+  "id": "019f9dea-…-a1b2c3d4e5f6", "shortId": "a1b2c3d4e5f6",
+  "path": "/Users/x/.pi/agent/sessions/--Users-x-code--/….jsonl",
   "name": "Desktop app", "cwd": "/Users/x/code", "folder": "code",
   "createdAt": "…", "updatedAt": "…",
-  "running": true, "unread": false, "archived": false,
+  "running": true, "unread": false, "archived": false, "automated": true,
+  "project": "/Users/x/code", "worktree": "/Users/x/.pi/worktrees/code-20260730-120000",
   "preview": "first line of the last assistant message",
   "cost": 12.34, "contextPercent": 61.0
 }
@@ -551,9 +564,10 @@ the API, never by touching the files, so there is exactly one writer.
 ## CLI surface
 
 ```
-pidesk threads list [--json] [--query q] [--running] [--archived]
-pidesk threads show <id> [--messages N] [--json]
-pidesk threads new --cwd DIR [--name N] [--message M] [--mode ultra]
+pidesk                                      # active thread list, then help
+pidesk threads list [--query q] [--running] [--automated] [--archived|--all] [--json]
+pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
+pidesk threads new --cwd DIR [--worktree] [--name N] [--message M] [--mode ultra]
 pidesk threads send <id> "text" [--steer|--follow-up] [--wait]
 pidesk threads abort|archive|unarchive|rename <id> [args]
 pidesk threads watch [<id>]                     # streams /v1/events

@@ -20,6 +20,13 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
     public var preview: String
     public var cost: Double?
     public var contextPercent: Double?
+    /// Compact random UUID tail advertised only by daemons that accept abbreviated ids.
+    public var shortId: String?
+    /// True when at least one automation targets this existing thread, including paused ones.
+    public var automated: Bool?
+    /// Original project folder for an app-managed worktree; `cwd` remains the execution path.
+    public var project: String?
+    public var worktree: String?
 
     public init(
         id: String,
@@ -34,7 +41,11 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         archived: Bool = false,
         preview: String = "",
         cost: Double? = nil,
-        contextPercent: Double? = nil
+        contextPercent: Double? = nil,
+        shortId: String? = nil,
+        automated: Bool? = nil,
+        project: String? = nil,
+        worktree: String? = nil
     ) {
         self.id = id
         self.path = path
@@ -49,6 +60,10 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         self.preview = preview
         self.cost = cost
         self.contextPercent = contextPercent
+        self.shortId = shortId
+        self.automated = automated
+        self.project = project
+        self.worktree = worktree
     }
 
     public init(from decoder: Decoder) throws {
@@ -66,6 +81,15 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         preview = try container.decodeIfPresent(String.self, forKey: .preview) ?? ""
         cost = try container.decodeIfPresent(Double.self, forKey: .cost)
         contextPercent = try container.decodeIfPresent(Double.self, forKey: .contextPercent)
+        shortId = try container.decodeIfPresent(String.self, forKey: .shortId)
+        automated = try container.decodeIfPresent(Bool.self, forKey: .automated)
+        project = try container.decodeIfPresent(String.self, forKey: .project)
+        worktree = try container.decodeIfPresent(String.self, forKey: .worktree)
+    }
+
+    public static func abbreviatedID(for id: String) -> String? {
+        guard UUID(uuidString: id) != nil else { return nil }
+        return id.split(separator: "-").last.map(String.init)
     }
 }
 
@@ -297,9 +321,12 @@ public struct ThreadListResponse: Codable, Sendable {
 public struct ThreadDetailResponse: Codable, Sendable {
     public var thread: PiThread
     public var messages: [Message]
-    public init(thread: PiThread, messages: [Message]) {
+    /// Offset for the next older page using the same role filter, or nil at the beginning.
+    public var nextOffset: Int?
+    public init(thread: PiThread, messages: [Message], nextOffset: Int? = nil) {
         self.thread = thread
         self.messages = messages
+        self.nextOffset = nextOffset
     }
 }
 
@@ -372,11 +399,16 @@ public struct CreateThreadRequest: Codable, Sendable {
     public var name: String?
     public var message: String?
     public var mode: String?
-    public init(cwd: String, name: String? = nil, message: String? = nil, mode: String? = nil) {
+    public var worktree: Bool?
+    public init(
+        cwd: String, name: String? = nil, message: String? = nil, mode: String? = nil,
+        worktree: Bool? = nil
+    ) {
         self.cwd = cwd
         self.name = name
         self.message = message
         self.mode = mode
+        self.worktree = worktree
     }
 }
 

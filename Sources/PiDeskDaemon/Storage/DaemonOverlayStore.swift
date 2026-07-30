@@ -25,6 +25,23 @@ actor DaemonOverlayStore {
         /// Keyed by the thread's standardized file path, matching the app's own key choice for
         /// `lastReadAt` in `state.json`.
         var readOverrides: [String: ReadOverride] = [:]
+        /// Worktree execution cwd → the exact source cwd supplied by the caller. Kept outside
+        /// app-owned state.json so daemon and app writes cannot clobber each other.
+        var managedWorktreeProjects: [String: String] = [:]
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            archivedThreadIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedThreadIDs) ?? []
+            readOverrides = try container.decodeIfPresent([String: ReadOverride].self, forKey: .readOverrides) ?? [:]
+            let worktrees = try container.decodeIfPresent(
+                [String: String].self, forKey: .managedWorktreeProjects
+            ) ?? [:]
+            managedWorktreeProjects = Dictionary(uniqueKeysWithValues: worktrees
+                .sorted { $0.key < $1.key }
+                .suffix(2_000))
+        }
     }
 
     private let fileURL: URL
@@ -40,6 +57,7 @@ actor DaemonOverlayStore {
     struct Snapshot: Sendable {
         var archivedThreadIDs: Set<String>
         var readOverrides: [String: (unread: Bool, markedAt: Date)]
+        var managedWorktreeProjects: [String: String]
 
         func isArchived(_ threadID: String) -> Bool { archivedThreadIDs.contains(threadID) }
 
@@ -50,7 +68,11 @@ actor DaemonOverlayStore {
     }
 
     func snapshot() -> Snapshot {
-        Snapshot(archivedThreadIDs: state.archivedThreadIDs, readOverrides: state.readOverrides.mapValues { ($0.unread, $0.markedAt) })
+        Snapshot(
+            archivedThreadIDs: state.archivedThreadIDs,
+            readOverrides: state.readOverrides.mapValues { ($0.unread, $0.markedAt) },
+            managedWorktreeProjects: state.managedWorktreeProjects
+        )
     }
 
     func isArchived(_ threadID: String) -> Bool { state.archivedThreadIDs.contains(threadID) }
@@ -70,6 +92,18 @@ actor DaemonOverlayStore {
 
     func setUnread(_ unread: Bool, path: String) throws {
         state.readOverrides[path] = ReadOverride(unread: unread, markedAt: Date())
+        try persist()
+    }
+
+    func setManagedWorktreeProject(_ project: URL, for worktree: URL) throws {
+        let worktreePath = worktree.standardizedFileURL.path
+        state.managedWorktreeProjects[worktreePath] = project.standardizedFileURL.path
+        let overflow = state.managedWorktreeProjects.count - 2_000
+        if overflow > 0 {
+            for key in state.managedWorktreeProjects.keys.filter({ $0 != worktreePath }).sorted().prefix(overflow) {
+                state.managedWorktreeProjects.removeValue(forKey: key)
+            }
+        }
         try persist()
     }
 

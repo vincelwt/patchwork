@@ -2,18 +2,38 @@ import XCTest
 @testable import PiDeskCLI
 
 final class ThreadsListShowTests: XCTestCase {
-    func testListDefaultsToLimitFiftyAndNoFilters() async {
+    func testListDefaultsToTwentyActiveThreads() async {
         let plane = FakeControlPlane()
         let result = await runCLI(["threads", "list"], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(plane.calls.first?.detail, "query= limit=50 cursor= archived=nil running=nil")
+        XCTAssertEqual(
+            plane.calls.first?.detail,
+            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil"
+        )
     }
 
     func testListPassesThroughFilters() async {
         let plane = FakeControlPlane()
         let result = await runCLI(["threads", "list", "--query", "triage", "--running", "--archived", "--limit", "5", "--cursor", "abc"], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(plane.calls.first?.detail, "query=triage limit=5 cursor=abc archived=Optional(true) running=Optional(true)")
+        XCTAssertEqual(
+            plane.calls.first?.detail,
+            "query=triage limit=5 cursor=abc archived=Optional(true) running=Optional(true) automated=nil"
+        )
+    }
+
+    func testListAllAndAutomatedPassThrough() async {
+        let plane = FakeControlPlane()
+        _ = await runCLI(["threads", "list", "--all", "--automated"], controlPlane: plane)
+        XCTAssertEqual(
+            plane.calls.first?.detail,
+            "query= limit=20 cursor= archived=nil running=nil automated=Optional(true)"
+        )
+    }
+
+    func testListRejectsArchivedWithAll() async {
+        let result = await runCLI(["threads", "list", "--archived", "--all"])
+        XCTAssertEqual(result.exitCode, 2)
     }
 
     func testListRejectsInvalidLimit() async {
@@ -44,6 +64,35 @@ final class ThreadsListShowTests: XCTestCase {
         XCTAssertTrue(result.stdout.contains("\"threads\""))
     }
 
+    func testListKeepsFullUUIDWhenOlderDaemonDoesNotAdvertiseShortIDs() async {
+        let plane = FakeControlPlane()
+        let id = "019f9dea-1234-4567-89ab-a1b2c3d4e5f6"
+        plane.threadListResult = WireThreadListResponse(
+            threads: [WireThread(id: id, name: "Old daemon")], nextCursor: nil
+        )
+        let result = await runCLI(["threads", "list"], controlPlane: plane)
+        XCTAssertTrue(result.stdout.contains(id))
+    }
+
+    func testListHumanShowsAutomatedWorktreeAndLongerPreview() async {
+        let plane = FakeControlPlane()
+        let preview = String(repeating: "x", count: 80) + "TAIL"
+        plane.threadListResult = WireThreadListResponse(
+            threads: [WireThread(
+                id: "019f9dea-1234-4567-89ab-a1b2c3d4e5f6", name: "Task",
+                cwd: "/tmp/worktrees/task", folder: "task", preview: preview,
+                shortId: "a1b2c3d4e5f6", automated: true,
+                project: "/code/project", worktree: "/tmp/worktrees/task"
+            )],
+            nextCursor: nil
+        )
+        let result = await runCLI(["threads", "list"], controlPlane: plane)
+        XCTAssertTrue(result.stdout.contains("a1b2c3d4e5f6"))
+        XCTAssertTrue(result.stdout.contains("project [wt:task]"))
+        XCTAssertTrue(result.stdout.contains("automated"))
+        XCTAssertTrue(result.stdout.contains("TAIL"), "the preview is no longer cut at 60 characters")
+    }
+
     func testListHumanTableShowsCursorHint() async {
         // Progress/hint text is incidental, not data — it goes to stderr so stdout stays clean
         // for piping, and disappears entirely under --quiet.
@@ -67,17 +116,36 @@ final class ThreadsListShowTests: XCTestCase {
         XCTAssertTrue(result.stderr.contains("<id>"))
     }
 
-    func testShowDefaultsToTwentyMessages() async {
+    func testShowDefaultsToEightDialogueMessages() async {
         let plane = FakeControlPlane()
         let result = await runCLI(["threads", "show", "t1"], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(plane.calls.first?.detail, "id=t1 messages=20")
+        XCTAssertEqual(plane.calls.first?.detail, "id=t1 messages=8 offset=0 includeTools=false")
     }
 
     func testShowRespectsMessagesFlag() async {
         let plane = FakeControlPlane()
         _ = await runCLI(["threads", "show", "t1", "--messages", "3"], controlPlane: plane)
-        XCTAssertEqual(plane.calls.first?.detail, "id=t1 messages=3")
+        XCTAssertEqual(plane.calls.first?.detail, "id=t1 messages=3 offset=0 includeTools=false")
+    }
+
+    func testShowSupportsOlderRawPages() async {
+        let plane = FakeControlPlane()
+        _ = await runCLI(["threads", "show", "abc", "--offset", "8", "--all"], controlPlane: plane)
+        XCTAssertEqual(plane.calls.first?.detail, "id=abc messages=8 offset=8 includeTools=true")
+    }
+
+    func testShowPrintsOlderPageHintWithCompactID() async {
+        let plane = FakeControlPlane()
+        plane.threadDetailResult = WireThreadDetailResponse(
+            thread: WireThread(
+                id: "019f9dea-1234-4567-89ab-a1b2c3d4e5f6", shortId: "a1b2c3d4e5f6"
+            ),
+            messages: [], nextOffset: 8
+        )
+        let result = await runCLI(["threads", "show", "a1b2c3d4e5f6"], controlPlane: plane)
+        XCTAssertTrue(result.stderr.contains("--offset 8"))
+        XCTAssertFalse(result.stdout.contains("019f9dea-1234"))
     }
 
     func testShowJSONMatchesFakeResponse() async {
@@ -126,14 +194,29 @@ final class ThreadsNewTests: XCTestCase {
         XCTAssertFalse(result.stdout.contains("Run started"))
     }
 
-    func testCreatesWithMessageAndMode() async {
+    func testCreatesWithMessageModeAndWorktree() async {
         let plane = FakeControlPlane()
         plane.createThreadResult = WireCreateThreadResponse(thread: WireThread(id: "t1"), runId: "run_1")
-        let result = await runCLI(["threads", "new", "--cwd", "/code", "--message", "survey", "--mode", "ultra"], controlPlane: plane)
+        let result = await runCLI([
+            "threads", "new", "--cwd", "/code", "--worktree",
+            "--message", "survey", "--mode", "ultra"
+        ], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(plane.lastCreateThreadRequest?.message, "survey")
         XCTAssertEqual(plane.lastCreateThreadRequest?.mode, "ultra")
+        XCTAssertEqual(plane.lastCreateThreadRequest?.worktree, true)
         XCTAssertTrue(result.stderr.contains("run_1")) // "Run started: ..." is incidental, not the primary result line
+    }
+
+    func testWorktreeRefusesAnOlderDaemonBeforeCreatingAnything() async {
+        let plane = FakeControlPlane()
+        plane.healthResult.threadWorktrees = nil
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--worktree"], controlPlane: plane
+        )
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertNil(plane.lastCreateThreadRequest)
+        XCTAssertTrue(result.stderr.contains("does not support thread worktrees"))
     }
 
     func testMessageDashReadsStdin() async {
