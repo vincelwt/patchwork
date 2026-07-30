@@ -118,6 +118,8 @@ private final class RuntimeSlot {
     var startupBeganAt: Date?
     var promptBeganAt: Date?
     var readyWaiters: [(Result<RuntimeSlot, Error>) -> Void] = []
+    var managedProcessIDs: Set<String> = []
+    var managedProcessStartedAt: Date?
     var isSuperseded = false
 
     init(runtime: PiRuntimeProtocol) { self.runtime = runtime }
@@ -1036,6 +1038,7 @@ final class AppStore: ObservableObject {
             && !slot.providerRetryPending && slot.providerRetryID == nil
             && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
             && capability == nil && questionnaire == nil && stream == nil && subagents.isEmpty
+            && slot.managedProcessIDs.isEmpty
     }
 
     private func cancelRuntimeRetirementLease() {
@@ -1153,12 +1156,10 @@ final class AppStore: ObservableObject {
     }
 
     private var runningRuntimePaths: Set<String> {
-        var paths: Set<String> = []
-        if runtimeState.isBusy, let activeRuntimePath { paths.insert(activeRuntimePath) }
-        for slot in parkedRuntimes.values where slot.state.isBusy {
-            if let path = slot.sessionPath { paths.insert(path) }
-        }
-        return paths
+        Set(runtimeSlots().compactMap { slot in
+            guard state(for: slot).isBusy || !slot.managedProcessIDs.isEmpty else { return nil }
+            return slot.sessionPath
+        })
     }
 
     private func updateSleepPrevention(
@@ -1166,8 +1167,9 @@ final class AppStore: ObservableObject {
         hasRunningActivity: Bool? = nil
     ) {
         let observedActivities = activities ?? activityMonitor.activities
-        let shouldPreventSleep = runtimeSlots().contains { state(for: $0).isBusy }
-            || (hasRunningActivity ?? activityMonitor.hasRunningActivity)
+        let shouldPreventSleep = runtimeSlots().contains {
+            state(for: $0).isBusy || !$0.managedProcessIDs.isEmpty
+        } || (hasRunningActivity ?? activityMonitor.hasRunningActivity)
             || observedActivities.values.contains { $0.state == .running }
         setSleepPrevention(shouldPreventSleep)
     }
@@ -1229,7 +1231,14 @@ final class AppStore: ObservableObject {
         if let slot = parkedRuntimes[.session(path)], slot.state.isBusy, let beganAt = slot.promptBeganAt {
             return beganAt
         }
-        return activityMonitor.activity(forPath: path)?.runningSince
+        if let observed = activityMonitor.activity(forPath: path)?.runningSince { return observed }
+        if activeRuntimePath == path, !activeRuntimeSlot.managedProcessIDs.isEmpty {
+            return activeRuntimeSlot.managedProcessStartedAt
+        }
+        if let slot = parkedRuntimes[.session(path)], !slot.managedProcessIDs.isEmpty {
+            return slot.managedProcessStartedAt
+        }
+        return nil
     }
 
     /// The user-turn/run boundary stays fixed while tool and assistant writes keep changing mtime.
@@ -3040,6 +3049,8 @@ final class AppStore: ObservableObject {
         slot.deferredEvents.removeAll()
         slot.pendingTurn = nil
         slot.streamingMessage = nil
+        slot.managedProcessIDs.removeAll()
+        slot.managedProcessStartedAt = nil
         slot.capability = nil
         slot.questionnaire = nil
         slot.dialogs.removeAll()
@@ -4403,6 +4414,9 @@ final class AppStore: ObservableObject {
         case "message_end":
             if event["message"]?["role"]?.stringValue == "assistant" { recordRuntimeOutput(for: slot) }
             slot.streamingMessage = nil
+            if let raw = event["message"] {
+                updateManagedProcesses(fromMessage: raw, slot: slot)
+            }
             if let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) {
                 if let path = slot.sessionPath ?? state(for: slot).sessionFile {
                     retainLiveMessage(parsed, path: URL(fileURLWithPath: path).standardizedFileURL.path)
@@ -4471,6 +4485,7 @@ final class AppStore: ObservableObject {
         case "extension_error":
             updateState(for: slot) { $0.lastError = event["error"]?.stringValue ?? "A Pi extension failed." }
         case "tool_execution_end":
+            updateManagedProcesses(fromToolEvent: event, slot: slot)
             if let id = event["toolCallId"]?.stringValue {
                 if slot.capability?.sourceID == id { slot.capability = nil }
                 if slot.questionnaire?.toolCallID == id { discardQuestionnaire(from: slot) }
@@ -4589,6 +4604,49 @@ final class AppStore: ObservableObject {
         return sessions.first { $0.fileURL.standardizedFileURL.path == path }
     }
 
+    private static let liveManagedProcessStatuses: Set<String> = [
+        "running", "terminating", "terminate_timeout"
+    ]
+
+    private func updateManagedProcesses(fromToolEvent event: JSONValue, slot: RuntimeSlot) {
+        guard event["toolName"]?.stringValue?.lowercased() == "process",
+              let details = event["result"]?["details"], details["success"]?.boolValue == true else { return }
+
+        guard details["action"]?.stringValue == "start",
+              let process = details["process"],
+              let id = process["id"]?.stringValue,
+              Self.liveManagedProcessStatuses.contains(process["status"]?.stringValue ?? "") else { return }
+        let startedAt = process["startTime"]?.doubleValue.map { Date(timeIntervalSince1970: $0 / 1_000) }
+        setManagedProcesses(slot.managedProcessIDs.union([id]), startedAt: startedAt, slot: slot)
+    }
+
+    private func updateManagedProcesses(fromMessage message: JSONValue, slot: RuntimeSlot) {
+        guard message["role"]?.stringValue == "custom",
+              message["customType"]?.stringValue == "ad-process:update",
+              let details = message["details"], details["kind"]?.stringValue == "lifecycle",
+              let id = details["processId"]?.stringValue,
+              ["exited", "killed"].contains(details["status"]?.stringValue ?? "") else { return }
+        setManagedProcesses(slot.managedProcessIDs.subtracting([id]), slot: slot)
+    }
+
+    private func setManagedProcesses(_ ids: Set<String>, startedAt: Date? = nil, slot: RuntimeSlot) {
+        guard ids != slot.managedProcessIDs else { return }
+        let wasEmpty = slot.managedProcessIDs.isEmpty
+        slot.managedProcessIDs = ids
+        if ids.isEmpty { slot.managedProcessStartedAt = nil }
+        else if wasEmpty { slot.managedProcessStartedAt = startedAt ?? Date() }
+        else if let startedAt { slot.managedProcessStartedAt = min(slot.managedProcessStartedAt ?? startedAt, startedAt) }
+
+        objectWillChange.send()
+        updateSleepPrevention()
+        if ids.isEmpty {
+            if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+            else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
+        } else if slot === activeRuntimeSlot {
+            cancelRuntimeRetirementLease()
+        }
+    }
+
     private func retireBackgroundRuntime(_ slot: RuntimeSlot) {
         guard !slot.isSuperseded, slot !== activeRuntimeSlot, isIdleAndClean(slot) else { return }
         removeParkedReference(to: slot)
@@ -4691,6 +4749,9 @@ final class AppStore: ObservableObject {
             }
             cancelPendingStreamingPublish()
             activeRuntimeSlot.streamingMessage = nil
+            if let raw = event["message"] {
+                updateManagedProcesses(fromMessage: raw, slot: activeRuntimeSlot)
+            }
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
             if SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? "") {
@@ -4734,6 +4795,7 @@ final class AppStore: ObservableObject {
                   let index = activities.firstIndex(where: { $0.id == id || $0.sourceID == id }) else { return }
             ActivityPresenter.applyResult(event["partialResult"], finished: false, to: &activities[index])
         case "tool_execution_end":
+            updateManagedProcesses(fromToolEvent: event, slot: activeRuntimeSlot)
             guard let id = event["toolCallId"]?.stringValue else { return }
             // The question belongs to the attached runtime, not to whatever is on screen, so it
             // is retired here even while the user browses another conversation.
@@ -4968,6 +5030,8 @@ final class AppStore: ObservableObject {
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
         clearManagedTurnRecovery(for: slot)
+        slot.managedProcessIDs.removeAll()
+        slot.managedProcessStartedAt = nil
         slot.outboxDispatches.removeAll()
         slot.outboxPromptPreflighting = false
         slot.outboxPromptAbortRequested = false

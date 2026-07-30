@@ -444,6 +444,31 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.stopCount, 1)
     }
 
+    func testManagedProcessKeepsBackgroundConversationRunningUntilItsLifecycleUpdate() {
+        let runtime = IntentRuntime()
+        let replacement = IntentRuntime()
+        let store = makeStore(runtime: runtime, factory: { replacement })
+        let a = summary("a", cwd: root)
+        let b = summary("b", cwd: root)
+        store.sessions = [a, b]
+        store.selectSession(a)
+        store.composerContentDidChange()
+
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
+        runtime.onEvent?(Self.processStarted("proc-1"))
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+        XCTAssertTrue(store.isRunning(a), "a settled model turn must stay running while its managed process works")
+
+        store.selectSession(b)
+        store.composerContentDidChange()
+        XCTAssertEqual(runtime.stopCount, 0, "switching conversations must not kill the managed process")
+        XCTAssertEqual(replacement.starts.count, 1)
+
+        runtime.onEvent?(Self.processEnded("proc-1"))
+        XCTAssertEqual(runtime.stopCount, 1, "the parked runtime can retire after the process posts its lifecycle update")
+        XCTAssertFalse(store.isRunning(a))
+    }
+
     func testSwitchingAwayParksARuntimeWithSubagentsAndRetiresItWhenTheyFinish() {
         let runtime = IntentRuntime()
         let replacement = IntentRuntime()
@@ -463,6 +488,44 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
 
         runtime.onEvent?(Self.subagentStatus(nil))
         XCTAssertEqual(runtime.stopCount, 1, "the parked runtime retires once its agents finish")
+    }
+
+    private static func processStarted(_ id: String) -> JSONValue {
+        .object([
+            "type": .string("tool_execution_end"),
+            "toolCallId": .string("start-process"),
+            "toolName": .string("process"),
+            "result": .object([
+                "details": .object([
+                    "action": .string("start"),
+                    "success": .bool(true),
+                    "process": .object([
+                        "id": .string(id),
+                        "status": .string("running"),
+                        "startTime": .number(Date().timeIntervalSince1970 * 1_000)
+                    ])
+                ])
+            ])
+        ])
+    }
+
+    private static func processEnded(_ id: String) -> JSONValue {
+        .object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("custom"),
+                "customType": .string("ad-process:update"),
+                "content": .string("Process completed"),
+                "display": .bool(true),
+                "timestamp": .number(Date().timeIntervalSince1970 * 1_000),
+                "details": .object([
+                    "kind": .string("lifecycle"),
+                    "processId": .string(id),
+                    "status": .string("exited"),
+                    "success": .bool(true)
+                ])
+            ])
+        ])
     }
 
     private static func subagentStatus(_ text: String?) -> JSONValue {
