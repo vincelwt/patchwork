@@ -184,6 +184,24 @@ struct RootView: View {
         }
         }
         .frame(minWidth: PiTheme.windowMinimumWidth, minHeight: PiTheme.windowMinimumHeight)
+        // Kept on the outer container so it does not compete with the virtual-folder alert.
+        .alert(item: archiveConfirmationBinding) { confirmation in
+            Alert(
+                title: Text("Archive conversation?"),
+                message: Text(confirmation.message),
+                primaryButton: .destructive(Text(confirmation.actionTitle)) {
+                    Task { await store.confirmArchive(confirmation) }
+                },
+                secondaryButton: .cancel { store.cancelArchiveConfirmation() }
+            )
+        }
+    }
+
+    private var archiveConfirmationBinding: Binding<ArchiveConfirmation?> {
+        Binding(
+            get: { store.archiveConfirmation },
+            set: { if $0 == nil { store.cancelArchiveConfirmation() } }
+        )
     }
 
     /// Scoped to the sidebar column so it renders at that column's trailing edge.

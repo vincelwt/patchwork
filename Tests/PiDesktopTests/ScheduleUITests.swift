@@ -248,6 +248,16 @@ final class ScheduledThreadStoreTests: XCTestCase {
         ScheduleEntry(name: name, enabled: enabled, target: target, prompt: "p", trigger: .interval(everySeconds: 3_600))
     }
 
+    private func session(_ id: String) -> SessionSummary {
+        var session = SessionSummary(
+            id: id, fileURL: directory.appendingPathComponent("\(id).jsonl"), cwd: directory,
+            createdAt: Date(), modifiedAt: Date(), name: id, preview: "",
+            messageCount: 0, metrics: TokenMetrics()
+        )
+        session.prepareSearchKey()
+        return session
+    }
+
     func testOnlyExistingThreadTargetsMarkAConversationAndPausedStillCounts() {
         store.updateScheduledThreads(from: [
             entry("live", target: .existingThread(threadID: "t1")),
@@ -277,6 +287,49 @@ final class ScheduledThreadStoreTests: XCTestCase {
         let retried = await store.refreshScheduledThreads()
         XCTAssertFalse(retried, "A failed load reports itself, so launch can try once more")
         XCTAssertEqual(store.scheduledThreadIDs, ["t1"], "A transient outage must not erase the clocks already on screen")
+    }
+
+    func testArchivingAThreadConfirmsThenDeletesAllLinkedAutomations() async throws {
+        let service = InMemoryScheduleService(entries: [
+            entry("Morning", target: .existingThread(threadID: "t1")),
+            entry("Evening", target: .existingThread(threadID: "t1")),
+            entry("Other", target: .existingThread(threadID: "t2"))
+        ])
+        store.cachedScheduleService = service
+        store.sessions = [session("t1"), session("t2")]
+
+        await store.requestArchive(store.sessions[0])
+        let cancelled = try XCTUnwrap(store.archiveConfirmation)
+        XCTAssertEqual(cancelled.automationCount, 2)
+        XCTAssertFalse(store.sessions[0].isArchived)
+
+        store.cancelArchiveConfirmation()
+        XCTAssertEqual(service.entries.count, 3)
+        XCTAssertFalse(store.sessions[0].isArchived)
+
+        await store.requestArchive(store.sessions[0])
+        let confirmed = try XCTUnwrap(store.archiveConfirmation)
+        await store.confirmArchive(confirmed)
+
+        XCTAssertTrue(store.sessions[0].isArchived)
+        XCTAssertEqual(service.entries.map(\.name), ["Other"])
+        XCTAssertEqual(store.scheduledThreadIDs, ["t2"])
+    }
+
+    func testArchiveStaysActiveWhenLinkedAutomationsCannotBeDeleted() async throws {
+        let service = InMemoryScheduleService(entries: [
+            entry("Morning", target: .existingThread(threadID: "t1"))
+        ])
+        store.cachedScheduleService = service
+        store.sessions = [session("t1")]
+
+        await store.requestArchive(store.sessions[0])
+        let confirmation = try XCTUnwrap(store.archiveConfirmation)
+        service.failure = ScheduleServiceError.daemonUnavailable
+        await store.confirmArchive(confirmation)
+
+        XCTAssertFalse(store.sessions[0].isArchived)
+        XCTAssertEqual(service.entries.count, 1)
     }
 }
 

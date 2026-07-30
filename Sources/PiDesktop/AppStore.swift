@@ -4,6 +4,23 @@ import Foundation
 import PiDeskKit
 import SwiftUI
 
+/// The destructive archive the user is deciding on, with the fresh linked-automation count.
+struct ArchiveConfirmation: Identifiable, Equatable {
+    let sessionID: String
+    let automationCount: Int
+    var id: String { sessionID }
+
+    var message: String {
+        automationCount == 1
+            ? "This conversation has an automation tied to it. Archiving will also delete the automation."
+            : "This conversation has \(automationCount) automations tied to it. Archiving will also delete them."
+    }
+
+    var actionTitle: String {
+        automationCount == 1 ? "Archive and Delete Automation" : "Archive and Delete Automations"
+    }
+}
+
 /// Where a submission came from. A late failure may only touch the draft when the user is
 /// still on the same route, so conversation A's error can never inject text or images into
 /// conversation B's composer.
@@ -289,6 +306,7 @@ final class AppStore: ObservableObject {
     /// automations panel still owns the schedules themselves. See `ScheduleService.swift`.
     @Published private(set) var scheduledThreadIDs: Set<String> = []
     private static let scheduledThreadIDLimit = 500
+    @Published private(set) var archiveConfirmation: ArchiveConfirmation?
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
     /// True only while the ephemeral status probe runtime is attached.
@@ -2332,7 +2350,59 @@ final class AppStore: ObservableObject {
     }
 
     func toggleArchive(_ session: SessionSummary) {
-        let archived = !session.isArchived
+        if session.isArchived {
+            setArchived(false, session: session)
+        } else {
+            Task { await requestArchive(session) }
+        }
+    }
+
+    /// Re-reads the durable schedule store before deciding whether confirmation is needed, so an
+    /// automation created from the CLI or web cannot be missed by an older sidebar clock.
+    func requestArchive(_ session: SessionSummary) async {
+        do {
+            let entries = try await scheduleService.loadSchedules()
+            updateScheduledThreads(from: entries)
+            guard let current = sessions.first(where: { $0.id == session.id }), !current.isArchived else { return }
+            let linked = linkedSchedules(in: entries, threadID: session.id)
+            if linked.isEmpty {
+                setArchived(true, session: current)
+            } else {
+                archiveConfirmation = ArchiveConfirmation(sessionID: session.id, automationCount: linked.count)
+            }
+        } catch {
+            showToast("Couldn’t check linked automations: \(error.localizedDescription)", style: .error)
+        }
+    }
+
+    func cancelArchiveConfirmation() {
+        archiveConfirmation = nil
+    }
+
+    func confirmArchive(_ confirmation: ArchiveConfirmation) async {
+        archiveConfirmation = nil
+        guard sessions.contains(where: { $0.id == confirmation.sessionID && !$0.isArchived }) else { return }
+        do {
+            let entries = try await scheduleService.loadSchedules()
+            let linked = linkedSchedules(in: entries, threadID: confirmation.sessionID)
+            for entry in linked { try await scheduleService.delete(id: entry.id) }
+            updateScheduledThreads(from: entries.filter { !linked.contains($0) })
+            guard let session = sessions.first(where: { $0.id == confirmation.sessionID }), !session.isArchived else { return }
+            setArchived(true, session: session)
+        } catch {
+            await refreshScheduledThreads()
+            showToast("Couldn’t archive because linked automations couldn’t be deleted: \(error.localizedDescription)", style: .error)
+        }
+    }
+
+    private func linkedSchedules(in entries: [ScheduleEntry], threadID: String) -> [ScheduleEntry] {
+        entries.filter {
+            if case let .existingThread(targetID) = $0.target { return targetID == threadID }
+            return false
+        }
+    }
+
+    private func setArchived(_ archived: Bool, session: SessionSummary) {
         let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
         persistence.setArchived(archived, sessionID: session.id)
         if let index = sessions.firstIndex(where: { $0.id == session.id }) {
