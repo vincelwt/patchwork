@@ -139,6 +139,10 @@ export const api = {
   // Read-only projection of the Mac app's own folder tree; never written from here.
   folders: () => request("/v1/folders"),
 
+  // Existing git checkouts of the repository a folder belongs to, for the new-thread picker.
+  // Read-only: nothing here creates or removes a worktree.
+  worktrees: (cwd) => request(`/v1/worktrees${toQuery({ cwd })}`),
+
   // The authoritative list of dialogs a daemon run is blocked on. The `interaction` SSE event is
   // only a hint that something changed — this is what a reconnecting client rehydrates from.
   interactions: (threadId) => request(`/v1/interactions${toQuery({ threadId })}`),

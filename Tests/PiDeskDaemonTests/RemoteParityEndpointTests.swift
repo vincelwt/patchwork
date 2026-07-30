@@ -460,6 +460,99 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertTrue(try decode(FolderTreeResponse.self, response).folders.isEmpty)
     }
 
+    // MARK: - Worktrees
+
+    func testPorcelainParsingKeepsTheMainCheckoutFirstAndSkipsBareEntries() {
+        let porcelain = """
+        worktree /repo/main
+        HEAD abc123
+        branch refs/heads/main
+
+        worktree /repo/bare
+        bare
+
+        worktree /repo/feature
+        HEAD def456
+        branch refs/heads/feat/thing
+
+        worktree /repo/detached
+        HEAD 99ff00
+        detached
+
+        """
+        let entries = GitWorktrees.parse(porcelain, mainPath: "/repo/main")
+        XCTAssertEqual(entries.map(\.path), ["/repo/main", "/repo/detached", "/repo/feature"])
+        XCTAssertEqual(entries.map(\.isMain), [true, false, false])
+        XCTAssertEqual(entries[0].branch, "main")
+        XCTAssertEqual(entries[0].name, "main")
+        XCTAssertNil(entries[1].branch, "a detached checkout has no branch to show")
+        XCTAssertEqual(entries[2].branch, "feat/thing")
+    }
+
+    func testPorcelainParsingIsBounded() {
+        let porcelain = (0..<(GitWorktrees.maxEntries + 20))
+            .map { "worktree /repo/w\($0)\nHEAD abc\n" }
+            .joined(separator: "\n")
+        XCTAssertEqual(GitWorktrees.parse(porcelain, mainPath: "/repo/w0").count, GitWorktrees.maxEntries)
+    }
+
+    func testGitOutputIsBoundedWhileTheChildIsStillWriting() throws {
+        let pipe = Pipe()
+        // Written from another queue so this stays a "still being written to" stream rather than
+        // a file that is already complete. 32 KiB fits a pipe buffer, so the writer finishes even
+        // though the reader deliberately stops early.
+        let payload = Data(repeating: UInt8(ascii: "x"), count: 32 * 1_024)
+        DispatchQueue.global(qos: .utility).async {
+            try? pipe.fileHandleForWriting.write(contentsOf: payload)
+            try? pipe.fileHandleForWriting.close()
+        }
+
+        let data = GitWorktrees.drain(pipe.fileHandleForReading, limit: 4_096)
+        try? pipe.fileHandleForReading.close()
+        XCTAssertEqual(data.count, 4_096, "the cap must bound what is read, not what is kept after reading it all")
+    }
+
+    func testWorktreesEndpointAnswersAnEmptyListForADirectoryThatIsNotARepository() async throws {
+        let plain = directory.appendingPathComponent("not-a-repo", isDirectory: true)
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+
+        let response = await send("GET", "/v1/worktrees", query: ["cwd": plain.path])
+        XCTAssertEqual(response.status, 200)
+        XCTAssertTrue(try decode(WorktreeListResponse.self, response).worktrees.isEmpty)
+    }
+
+    func testWorktreesEndpointRejectsAMissingOrNonDirectoryCwd() async {
+        let missing = await send("GET", "/v1/worktrees")
+        XCTAssertEqual(missing.status, 400)
+        let file = directory.appendingPathComponent("file.txt")
+        try? "x".write(to: file, atomically: true, encoding: .utf8)
+        let notADirectory = await send("GET", "/v1/worktrees", query: ["cwd": file.path])
+        XCTAssertEqual(notADirectory.status, 400)
+    }
+
+    // MARK: - Archive
+
+    /// `Thread.archived` is the union of the daemon's overlay with the app's own `state.json`,
+    /// which the daemon never writes. Restoring what the app archived therefore cannot work, and
+    /// must not be reported as if it had.
+    func testUnarchivingAThreadTheAppArchivedIsAConflictRatherThanAFakeSuccess() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-app-archived", cwd: directory.path)
+        TestSupport.writeAppState(in: directory, archivedSessionIDs: ["sess-app-archived"])
+
+        let restore = await send("POST", "/v1/threads/sess-app-archived/archive", body: #"{"archived":false}"#)
+        XCTAssertEqual(restore.status, 409)
+        XCTAssertTrue(String(decoding: restore.body, as: UTF8.self).contains("archived_in_app"))
+
+        // A web-archived thread still restores here, so the conflict is specific rather than a
+        // blanket refusal to unarchive anything.
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-web-archived", cwd: directory.path)
+        let archived = await send("POST", "/v1/threads/sess-web-archived/archive", body: #"{"archived":true}"#)
+        XCTAssertEqual(archived.status, 200)
+        let restored = await send("POST", "/v1/threads/sess-web-archived/archive", body: #"{"archived":false}"#)
+        XCTAssertEqual(restored.status, 200)
+        XCTAssertFalse(try decode(ThreadResponse.self, restored).thread.archived)
+    }
+
     // MARK: - Interactions
 
     private func registerDialog(id: String = "d1", method: InteractionMethod = .select, options: [String] = ["Alpha", "Beta"]) -> ResponseRecorder {

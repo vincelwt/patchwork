@@ -18,6 +18,9 @@ actor ThreadStore {
     private let activityDirectoryURL: URL
     private let logger: DaemonLogger
     private let overlay: DaemonOverlayStore
+    /// Read-only, and a parameter only so tests read a fixture instead of the machine's own
+    /// `state.json`. The daemon never writes it; see `AppStatePeek`.
+    private let appStateURL: URL
     private var cache: [String: CacheEntry] = [:]
     /// Last fully overlaid, sorted list. The web view loads this before opening a detail, so a
     /// point lookup stays O(thread count) instead of refreshing every session on disk.
@@ -27,12 +30,14 @@ actor ThreadStore {
         rootURL: URL = SessionScanner.defaultRootURL(),
         activityDirectoryURL: URL = PiDeskPaths.activityDirectory,
         logger: DaemonLogger,
-        overlay: DaemonOverlayStore = DaemonOverlayStore()
+        overlay: DaemonOverlayStore = DaemonOverlayStore(),
+        appStateURL: URL = AppStatePeek.defaultURL()
     ) {
         self.rootURL = rootURL
         self.activityDirectoryURL = activityDirectoryURL
         self.logger = logger
         self.overlay = overlay
+        self.appStateURL = appStateURL
     }
 
     func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?) async -> (threads: [PiThread], nextCursor: String?) {
@@ -118,7 +123,7 @@ actor ThreadStore {
         to source: [PiThread],
         sessionIDCounts suppliedCounts: [String: Int]? = nil
     ) async -> [PiThread] {
-        let appState = AppStatePeek.load()
+        let appState = AppStatePeek.load(from: appStateURL)
         let overlayState = await overlay.snapshot()
         let heartbeats = ActivityReader.readHeartbeats(directory: activityDirectoryURL, logger: logger)
         let heartbeatIDs = Set(heartbeats.map(\.sessionId))

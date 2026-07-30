@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  applyThreadUpdate,
   buildThreadTree,
   flattenTree,
   folderIdFromGroupId,
@@ -222,4 +223,30 @@ test("a project group is created to host a folder even with no threads of its ow
   });
   assert.deepEqual(groups.map((g) => g.name), ["code"]);
   assert.deepEqual(groups[0].children.map((g) => g.name), ["Docs"]);
+});
+
+test("an update whose archived flag no longer matches the visible list removes the row", () => {
+  const list = [thread("a", "/Users/x/code"), thread("b", "/Users/x/code")];
+  const archived = applyThreadUpdate(list, { ...list[0], archived: true }, false);
+  assert.deepEqual(archived.map((t) => t.id), ["b"], "archiving must visibly leave the Active list");
+
+  const restored = applyThreadUpdate([thread("a", "/Users/x/code", { archived: true })], { id: "a", archived: false }, true);
+  assert.deepEqual(restored, [], "and unarchiving must leave the Archived list");
+});
+
+test("an update for the list on screen merges in place, and an unknown thread joins it", () => {
+  const list = [thread("a", "/Users/x/code"), thread("b", "/Users/x/code")];
+  const renamed = applyThreadUpdate(list, { id: "b", name: "renamed" }, false);
+  assert.deepEqual(renamed.map((t) => t.id), ["a", "b"], "position is kept");
+  assert.equal(renamed[1].name, "renamed");
+  assert.equal(renamed[1].cwd, "/Users/x/code", "an event carrying only changed fields keeps the rest");
+
+  const added = applyThreadUpdate(list, thread("c", "/Users/x/code"), false);
+  assert.deepEqual(added.map((t) => t.id), ["c", "a", "b"]);
+});
+
+test("an update with no id is ignored rather than added as a blank row", () => {
+  const list = [thread("a", "/Users/x/code")];
+  assert.equal(applyThreadUpdate(list, {}, false), list);
+  assert.equal(applyThreadUpdate(list, null, false), list);
 });

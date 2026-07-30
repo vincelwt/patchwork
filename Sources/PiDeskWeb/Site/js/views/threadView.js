@@ -106,7 +106,9 @@ export function renderThreadView(state, actions, threadId) {
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
   const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
   const cwdEl = h("div", { class: "cwd" });
-  const archiveBtn = h("button", { class: "icon-btn", type: "button", "aria-label": "Archive thread", onclick: onToggleArchive }, "\u2298");
+  // A word, not a glyph: "archive" has no icon a reader can be expected to guess, and the label
+  // has to say which way the toggle goes.
+  const archiveBtn = h("button", { class: "link-btn topbar-action", type: "button", onclick: onToggleArchive }, "Archive");
 
   // A single persistent live region. Announcing from inside the bubbles themselves does not work:
   // they are replaced wholesale on every repaint, and assistive tech only announces changes to a
@@ -474,7 +476,7 @@ export function renderThreadView(state, actions, threadId) {
     cwdEl.textContent = thread?.cwd || "";
     cwdEl.hidden = !thread?.cwd;
     runStatus.hidden = !thread?.running;
-    archiveBtn.setAttribute("aria-pressed", String(!!thread?.archived));
+    archiveBtn.textContent = thread?.archived ? "Unarchive" : "Archive";
     archiveBtn.setAttribute("aria-label", thread?.archived ? "Unarchive thread" : "Archive thread");
     syncLive();
   }

@@ -168,3 +168,15 @@ export function flattenTree(groups, collapsed = new Set(), maxDepth = 24) {
 export function isFlatList(groups) {
   return groups.length <= 1 && groups.every((group) => group.kind === "project" && group.children.length === 0);
 }
+
+/**
+ * Applies one updated thread to the list currently on screen. The Threads tab shows Active or
+ * Archived, never both, so a thread whose `archived` flag no longer matches the visible list
+ * leaves it instead of being merged back in; otherwise archiving would appear to do nothing.
+ */
+export function applyThreadUpdate(threads, thread, showArchived) {
+  if (!thread?.id) return threads;
+  if (!!thread.archived !== !!showArchived) return threads.filter((entry) => entry.id !== thread.id);
+  const index = threads.findIndex((entry) => entry.id === thread.id);
+  return index === -1 ? [thread, ...threads] : threads.map((entry, i) => (i === index ? { ...entry, ...thread } : entry));
+}
