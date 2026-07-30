@@ -112,8 +112,9 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         XCTAssertEqual(runtime.startedCwd?.standardizedFileURL.path, desktopPath)
     }
 
-    func testArchivingTheSelectedConversationOpensTheNextActiveConversation() {
+    func testArchivingTheSelectedConversationOpensTheNextActiveConversation() async {
         let store = makeStore()
+        store.cachedScheduleService = InMemoryScheduleService()
         func session(_ id: String, archived: Bool = false) -> SessionSummary {
             var value = SessionSummary(
                 id: id, fileURL: directory.appendingPathComponent("\(id).jsonl"), cwd: directory,
@@ -127,7 +128,7 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         store.sessions = [current, session("archived", archived: true), session("next")]
         store.selectSession(current)
 
-        store.toggleArchive(current)
+        await store.requestArchive(current)
 
         XCTAssertTrue(store.sessions[0].isArchived)
         XCTAssertEqual(store.selectedSession?.id, "next")
