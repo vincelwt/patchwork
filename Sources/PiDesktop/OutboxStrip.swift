@@ -61,18 +61,21 @@ private struct OutboxRowView: View {
 
     @ViewBuilder private var deliveryControl: some View {
         if let entry = row.entry {
-            Picker("Delivery", selection: Binding(
-                get: { entry.delivery },
-                set: { store.setOutboxDelivery(id: entry.id, delivery: $0) }
-            )) {
-                Text(OutboxEntry.Delivery.steer.label).tag(OutboxEntry.Delivery.steer)
-                Text(OutboxEntry.Delivery.followUp.label).tag(OutboxEntry.Delivery.followUp)
+            Menu {
+                Button(OutboxEntry.Delivery.steer.label) {
+                    store.setOutboxDelivery(id: entry.id, delivery: .steer)
+                }
+                Button(OutboxEntry.Delivery.followUp.label) {
+                    store.setOutboxDelivery(id: entry.id, delivery: .followUp)
+                }
+            } label: {
+                Text(entry.delivery.label)
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
             .controlSize(.small)
             .font(PiFont.micro)
             .fixedSize()
+            .accessibilityLabel("Delivery")
+            .accessibilityValue(entry.delivery.label)
         } else {
             Label(row.delivery.label, systemImage: "lock.fill")
                 .font(PiFont.micro)
