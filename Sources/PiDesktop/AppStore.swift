@@ -372,7 +372,6 @@ final class AppStore: ObservableObject {
     private var conversationLoadGeneration = 0
     private var loadedConversationPage: ConversationPage?
     private var latestConversationPage: ConversationPage?
-    private var latestOptimisticMessages: [ChatMessage] = []
     private var historyDepth = 0
     /// ponytail: Reload cursors make nearby Newer navigation one bounded read. Deep history keeps
     /// only an LRU; a miss replays with constant page memory. Add a disk index only if measured.
@@ -1982,7 +1981,6 @@ final class AppStore: ObservableObject {
         cancelEditingLastMessage()
         let generation = conversationLoadGeneration
         let nextDepth = historyDepth + 1
-        let latestMessages = messages
         isLoadingEarlierMessages = true
         historyNavigationTask = Task { [weak self] in
             guard let self else { return }
@@ -1992,10 +1990,7 @@ final class AppStore: ObservableObject {
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
-                if historyDepth == 0 {
-                    latestConversationPage = current
-                    latestOptimisticMessages = latestMessages.filter { $0.id.hasPrefix("local-") }
-                }
+                if historyDepth == 0 { latestConversationPage = current }
                 rememberHistoryReloadCursor(cursor, depth: nextDepth)
                 publishHistoryPage(older, depth: nextDepth)
                 isLoadingEarlierMessages = false
@@ -2102,14 +2097,12 @@ final class AppStore: ObservableObject {
         isBrowsingEarlierHistory = false
         hasNewerMessages = false
         latestConversationPage = nil
-        let optimistic = latestOptimisticMessages
-        latestOptimisticMessages.removeAll(keepingCapacity: false)
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)
         loadedConversationPage = latest
         conversationHistoryLimitReached = latest.isTruncated && latest.olderCursor == nil
         hasEarlierMessages = latest.olderCursor != nil
-        replaceLoadedMessages(with: latest.messages, optimistic: optimistic)
+        replaceLoadedMessages(with: latest.messages)
         if isSelectedRuntime { streamingMessage = activeRuntimeSlot.streamingMessage }
         refreshSelectedConversationIfNeeded()
     }
@@ -2135,7 +2128,6 @@ final class AppStore: ObservableObject {
     ) {
         loadedConversationPage = page
         latestConversationPage = nil
-        latestOptimisticMessages.removeAll(keepingCapacity: false)
         historyDepth = 0
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)
@@ -2164,7 +2156,6 @@ final class AppStore: ObservableObject {
     private func resetConversationPageState() {
         loadedConversationPage = nil
         latestConversationPage = nil
-        latestOptimisticMessages.removeAll(keepingCapacity: false)
         historyDepth = 0
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)
@@ -2622,6 +2613,7 @@ final class AppStore: ObservableObject {
         if delivery == .automatic, !(isSelectedRuntime && runtimeState.isStreaming) {
             let message = Self.optimisticMessage(text: text, attachments: sentAttachments)
             optimisticID = message.id
+            retainLiveMessage(message, path: origin.sessionPath ?? Self.newChatDraftKey)
             messages = enforcingLoadedImageBudget(messages + [message])
         } else {
             optimisticID = nil
@@ -2646,7 +2638,7 @@ final class AppStore: ObservableObject {
                    newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
                     newChatWorktreeSubmitted = false
                 }
-                if let optimisticID { messages.removeAll { $0.id == optimisticID } }
+                if let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
                 let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
                 showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
             }
@@ -3893,7 +3885,14 @@ final class AppStore: ObservableObject {
         let prompt = ImageAttachment.prompt(text: text, attachments: sentAttachments)
         let promotedOrigin = ensureProvisionalSession(cwd: cwd, prompt: prompt, slot: slot)
         let origin = promotedOrigin ?? submissionOrigin
-        if command != "prompt", let optimisticID { messages.removeAll { $0.id == optimisticID } }
+        if let optimisticID, let promotedPath = promotedOrigin?.sessionPath {
+            moveLiveMessage(
+                id: optimisticID,
+                from: submissionOrigin.sessionPath ?? Self.newChatDraftKey,
+                to: promotedPath
+            )
+        }
+        if command != "prompt", let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
         if command == "prompt" {
             slot.connectivityResumeCancelled = false
             slot.connectivityResumeInFlight = false
@@ -3959,7 +3958,7 @@ final class AppStore: ObservableObject {
                 slot.promptBeganAt = nil
                 slot.pendingTurn = nil
             }
-            if let optimisticID { messages.removeAll { $0.id == optimisticID } }
+            if let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
             let restored = restoreDraft(text: originalDraft, attachments: sentAttachments, origin: origin)
             showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
             if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
@@ -4057,20 +4056,9 @@ final class AppStore: ObservableObject {
 
     /// Disk pages never erase optimistic user content or a terminal RPC answer that has not yet
     /// reached JSONL. Once the durable equivalent appears, the overlay removes itself.
-    private func replaceLoadedMessages(with loaded: [ChatMessage], optimistic suppliedOptimistic: [ChatMessage]? = nil) {
+    private func replaceLoadedMessages(with loaded: [ChatMessage]) {
         guard !isBrowsingEarlierHistory else { return }
-        let optimistic = suppliedOptimistic ?? messages.filter { $0.id.hasPrefix("local-") }
-        var merged = loaded + optimistic.filter { local in
-            !loaded.contains { candidate in
-                guard candidate.role == .user,
-                      candidate.textContent == local.textContent,
-                      candidate.images.count == local.images.count,
-                      let candidateTime = candidate.timestamp,
-                      let localTime = local.timestamp else { return false }
-                return candidateTime >= localTime.addingTimeInterval(-0.01)
-            }
-        }
-
+        var merged = loaded
         if let path = loadedConversationPath {
             removeDurableLiveMessages(in: loaded, path: path)
             for live in liveMessagesByPath[path] ?? [] where !merged.contains(where: { $0.id == live.id }) {
@@ -4123,6 +4111,10 @@ final class AppStore: ObservableObject {
     }
 
     private func durableMessage(_ candidate: ChatMessage, matches live: ChatMessage) -> Bool {
+        if Self.sameOptimisticUserContent(live, candidate) {
+            guard let candidateTime = candidate.timestamp, let liveTime = live.timestamp else { return false }
+            return candidateTime >= liveTime.addingTimeInterval(-0.01)
+        }
         guard candidate.role == live.role, candidate.textContent == live.textContent,
               candidate.toolCallID == live.toolCallID, candidate.isError == live.isError else { return false }
         if let candidateTime = candidate.timestamp, let liveTime = live.timestamp {
@@ -4131,7 +4123,36 @@ final class AppStore: ObservableObject {
         return candidate.id == live.id
     }
 
+    private static func sameOptimisticUserContent(_ local: ChatMessage, _ candidate: ChatMessage) -> Bool {
+        local.id.hasPrefix("local-") && candidate.role == .user
+            && candidate.textContent == local.textContent && candidate.images.count == local.images.count
+    }
+
+    private func removeLiveMessage(id: String, path: String) {
+        liveMessagesByPath[path]?.removeAll { $0.id == id }
+        if liveMessagesByPath[path]?.isEmpty == true { liveMessagesByPath.removeValue(forKey: path) }
+        liveMessageOrder.removeAll { $0.path == path && $0.id == id }
+    }
+
+    private func moveLiveMessage(id: String, from source: String, to destination: String) {
+        guard source != destination,
+              let message = liveMessagesByPath[source]?.first(where: { $0.id == id }) else { return }
+        removeLiveMessage(id: id, path: source)
+        retainLiveMessage(message, path: destination)
+    }
+
+    private func removeOptimisticMessage(_ id: String, origin: DraftOrigin) {
+        removeLiveMessage(id: id, path: origin.sessionPath ?? Self.newChatDraftKey)
+        messages.removeAll { $0.id == id }
+    }
+
     private func retainLiveMessage(_ message: ChatMessage, path: String) {
+        if !message.id.hasPrefix("local-"),
+           let localID = liveMessagesByPath[path]?.last(where: {
+               Self.sameOptimisticUserContent($0, message)
+           })?.id {
+            removeLiveMessage(id: localID, path: path)
+        }
         let key = LiveMessageKey(path: path, id: message.id)
         var live = liveMessagesByPath[path] ?? []
         if let index = live.firstIndex(where: { $0.id == message.id }) { live[index] = message }
@@ -5011,7 +5032,7 @@ final class AppStore: ObservableObject {
         var updated = messages
         if let index = updated.firstIndex(where: { $0.id == message.id }) { updated[index] = message }
         else if message.role == .user,
-                let localIndex = updated.lastIndex(where: { $0.id.hasPrefix("local-") && $0.textContent == message.textContent }) {
+                let localIndex = updated.lastIndex(where: { Self.sameOptimisticUserContent($0, message) }) {
             updated[localIndex] = message
         } else { updated.append(message) }
         messages = enforcingLoadedImageBudget(updated)
