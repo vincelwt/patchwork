@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -438,11 +439,19 @@ enum ImageImportService {
             guard let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image),
                   let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
                   size <= PiTheme.imageByteLimit,
-                  let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  let ready = providerReadyImage(
+                    data: data,
+                    mimeType: type.preferredMIMEType ?? "image/\(url.pathExtension.lowercased())",
+                    fileName: url.lastPathComponent
+                  ) else { return nil }
+            if ready.resized {
+                return temporaryAttachment(data: ready.data, mimeType: ready.mimeType, fileName: ready.fileName)
+            }
             return ImageAttachment(
                 data: data,
-                mimeType: type.preferredMIMEType ?? "image/\(url.pathExtension.lowercased())",
-                fileName: url.lastPathComponent,
+                mimeType: ready.mimeType,
+                fileName: ready.fileName,
                 fileURL: url
             )
         }
@@ -521,20 +530,68 @@ enum ImageImportService {
     }
 
     private static func temporaryAttachment(data: Data, mimeType: String, fileName: String) -> ImageAttachment? {
+        guard let ready = providerReadyImage(data: data, mimeType: mimeType, fileName: fileName) else { return nil }
         let manager = FileManager.default
         let directory = ImageAttachment.temporaryDirectory
         let id = UUID()
         var url = directory.appendingPathComponent(id.uuidString)
-        let pathExtension = URL(fileURLWithPath: fileName).pathExtension
+        let pathExtension = URL(fileURLWithPath: ready.fileName).pathExtension
         if !pathExtension.isEmpty { url.appendPathExtension(pathExtension) }
         do {
             try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-            try data.write(to: url, options: .atomic)
+            try ready.data.write(to: url, options: .atomic)
             pruneTemporaryImages(in: directory, keeping: url)
-            return ImageAttachment(id: id, data: data, mimeType: mimeType, fileName: fileName, fileURL: url)
+            return ImageAttachment(
+                id: id,
+                data: ready.data,
+                mimeType: ready.mimeType,
+                fileName: ready.fileName,
+                fileURL: url
+            )
         } catch {
             return nil
         }
+    }
+
+    /// Claude rejects any edge over 2,000 pixels once the conversation contains many images.
+    /// Resize at import so every send path and the attached local file use the same safe bitmap.
+    private static func providerReadyImage(
+        data: Data,
+        mimeType: String,
+        fileName: String
+    ) -> (data: Data, mimeType: String, fileName: String, resized: Bool)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+              width > 0, height > 0 else { return nil }
+        guard max(width, height) > CGFloat(PiTheme.imagePixelLimit) else {
+            return (data, mimeType, fileName, false)
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: PiTheme.imagePixelLimit
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        let hasAlpha = switch image.alphaInfo {
+        case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly: true
+        default: false
+        }
+        let png = mimeType.lowercased() == "image/png" || hasAlpha
+        let fileType: NSBitmapImageRep.FileType = png ? .png : .jpeg
+        let outputMimeType = png ? "image/png" : "image/jpeg"
+        let outputExtension = png ? "png" : "jpg"
+        let encodingProperties: [NSBitmapImageRep.PropertyKey: Any] = png ? [:] : [.compressionFactor: 0.9]
+        guard let encoded = NSBitmapImageRep(cgImage: image).representation(
+            using: fileType,
+            properties: encodingProperties
+        ),
+              encoded.count <= PiTheme.imageByteLimit else { return nil }
+        let stem = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+        return (encoded, outputMimeType, "\(stem).\(outputExtension)", true)
     }
 
     static func pruneTemporaryImages(

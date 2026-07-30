@@ -92,6 +92,8 @@ enum PiTheme {
     static let imageCountLimit = 8
     static let imageByteLimit = 16 * 1_024 * 1_024
     static let totalImageByteLimit = 64 * 1_024 * 1_024
+    /// Claude applies this per-edge limit once a request contains many images.
+    static let imagePixelLimit = 2_000
     static let unknownPayloadLimit = 8_000
     static let sessionPreviewLimit = 512
     /// Aggregate decoded-bitmap cache ceiling (decoded pixel cost, not encoded bytes).
