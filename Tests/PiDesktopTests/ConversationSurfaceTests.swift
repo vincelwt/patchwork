@@ -482,6 +482,34 @@ final class TranscriptPresenterTests: XCTestCase {
         )
     }
 
+    func testSidebandUpdatesBeforeReasoningStayInsideLiveWorkBlock() throws {
+        let updates = ["process-1", "process-2"].map { id in
+            ChatMessage(
+                id: id,
+                role: .custom,
+                blocks: [text("Background update")],
+                timestamp: nil,
+                customType: "ad-process:update",
+                raw: .null
+            )
+        }
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "u", text: "Merge", at: nil)] + updates + [
+                assistant(id: "thinking", blocks: [thinking("Inspecting git worktrees for merge")])
+            ],
+            streaming: nil,
+            isRunning: true
+        )
+
+        XCTAssertEqual(items.count, 2, "Early sideband updates must not leak out as standalone rows")
+        guard case let .work(block) = items[1] else { return XCTFail("Expected one live work block") }
+        XCTAssertFalse(block.shouldStartExpanded)
+        XCTAssertEqual(
+            block.entries.compactMap { if case let .note(message) = $0 { return message.id }; return nil },
+            ["process-1", "process-2"]
+        )
+    }
+
     func testCustomUpdateAfterPlainTerminalAnswerDoesNotHideIt() throws {
         var answer = assistant(id: "a1", blocks: [text("Done.")])
         answer.stopReason = "stop"
