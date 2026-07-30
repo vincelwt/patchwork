@@ -604,13 +604,14 @@ final class AppStore: ObservableObject {
     }
 
     private func updateState(for slot: RuntimeSlot, _ update: (inout RuntimeState) -> Void) {
-        defer { updateSleepPrevention() }
+        let wasBusy = state(for: slot).isBusy
         if slot === activeRuntimeSlot {
             update(&runtimeState)
             slot.state = runtimeState
         } else {
             update(&slot.state)
         }
+        if state(for: slot).isBusy != wasBusy { updateSleepPrevention() }
     }
 
     private func runtimeSlots() -> [RuntimeSlot] {
@@ -4268,7 +4269,10 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
-        defer { updateSleepPrevention() }
+        let wasBusy = state(for: slot).isBusy
+        defer {
+            if state(for: slot).isBusy != wasBusy { updateSleepPrevention() }
+        }
         switch event["type"]?.stringValue {
         case "tool_execution_start": updateManagedTool(event, running: true, slot: slot)
         case "tool_execution_end": updateManagedTool(event, running: false, slot: slot)
@@ -4347,7 +4351,9 @@ final class AppStore: ObservableObject {
     }
 
     private func recordRuntimeOutput(for slot: RuntimeSlot) {
-        updateState(for: slot) { $0.phase = .working }
+        if state(for: slot).phase != .working {
+            updateState(for: slot) { $0.phase = .working }
+        }
         guard let beganAt = slot.promptBeganAt else { return }
         slot.promptBeganAt = nil
         ConversationPerformance.mark(

@@ -153,11 +153,13 @@ private struct SidebarFooter: View {
     var body: some View {
         HStack(spacing: PiTheme.space6) {
             StatusDot(color: runningCount > 0 ? .piGreen : .secondary, pulsing: runningCount > 0)
-            if let label {
-                Text(label).font(SidebarTypography.status.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
-                    .help(activityDescription)
-                    .accessibilityLabel("Session activity")
-                    .accessibilityValue(activityDescription)
+            TimelineView(.periodic(from: .now, by: SessionActivityMonitor.pollInterval)) { _ in
+                if let label {
+                    Text(label).font(SidebarTypography.status.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                        .help(activityDescription)
+                        .accessibilityLabel("Session activity")
+                        .accessibilityValue(activityDescription)
+                }
             }
             Spacer(minLength: PiTheme.space4)
             Image(systemName: store.isCaffeinated ? "cup.and.saucer.fill" : "cup.and.saucer")
