@@ -65,6 +65,35 @@ final class ActivityPresenterTests: XCTestCase {
         XCTAssertEqual(item.agentSummary(), "UI · Opus 5 · 46 calls / 3m")
     }
 
+    func testUnansweredAgentCallStopsAtTheNextAssistantTurn() throws {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let stoppedAt = startedAt.addingTimeInterval(30)
+        let messages = [
+            assistant(
+                id: "spawn-message",
+                callID: "spawn",
+                name: "Agent",
+                arguments: [
+                    "subagent_type": .string("general-purpose"),
+                    "description": .string("Backfill episodes")
+                ],
+                at: startedAt,
+                model: "gpt-5.6-sol"
+            ),
+            ChatMessage(
+                id: "continued",
+                role: .assistant,
+                blocks: [MessageBlock(id: "continued-text", kind: .text("Continuing after the interrupted tool."))],
+                timestamp: stoppedAt,
+                raw: .null
+            )
+        ]
+
+        let item = try XCTUnwrap(ActivityPresenter().activities(from: messages).first)
+        XCTAssertEqual(item.status, .stopped)
+        XCTAssertEqual(item.endedAt, stoppedAt)
+    }
+
     func testBackgroundAgentResultStaysRunningAndRetainsResolvedModel() throws {
         let event: JSONValue = .object([
             "toolCallId": .string("spawn"),
