@@ -770,6 +770,12 @@ final class RuntimePickerStateTests: XCTestCase {
         XCTAssertEqual(RuntimePickerState.thinkingLevels(from: .array([])), ["off"])
     }
 
+    func testPickerLabelUsesIntrinsicWidthUntilItsCap() throws {
+        XCTAssertNil(RuntimePickerLayout.labelWidth("Claude Opus 5", maximum: nil))
+        XCTAssertLessThan(try XCTUnwrap(RuntimePickerLayout.labelWidth("Claude Opus 5", maximum: 150)), 150)
+        XCTAssertEqual(RuntimePickerLayout.labelWidth(String(repeating: "Long model name ", count: 20), maximum: 150), 150)
+    }
+
     func testPickerPresentationPrefersExactChoicesAndFallsBackToCycle() {
         let models = [AvailableModel(provider: "openai", modelID: "gpt-5", name: "GPT-5")]
 
