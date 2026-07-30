@@ -129,6 +129,64 @@ final class ActivityPresenterTests: XCTestCase {
         XCTAssertNil(item.endedAt)
     }
 
+    func testBackgroundProcessStaysActiveUntilItsLifecycleUpdate() throws {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        var messages = [
+            assistant(
+                id: "start-message", callID: "start", name: "process",
+                arguments: ["action": .string("start"), "name": .string("full-tests")],
+                at: startedAt, model: "gpt-5.6-sol"
+            ),
+            result(
+                id: "start-result", callID: "start", text: "Started full-tests.",
+                at: startedAt.addingTimeInterval(1), details: .object([
+                    "action": .string("start"), "success": .bool(true),
+                    "process": .object([
+                        "id": .string("proc-1"), "name": .string("full-tests"),
+                        "status": .string("running")
+                    ])
+                ])
+            ),
+            assistant(
+                id: "output-message", callID: "output", name: "process",
+                arguments: ["action": .string("output"), "id": .string("proc-1")],
+                at: startedAt.addingTimeInterval(2), model: "gpt-5.6-sol"
+            ),
+            result(
+                id: "output-result", callID: "output", text: "full-tests [running]",
+                at: startedAt.addingTimeInterval(3), details: .object([
+                    "action": .string("output"), "success": .bool(true),
+                    "message": .string("full-tests [running]")
+                ])
+            )
+        ]
+
+        var item = try XCTUnwrap(ActivityPresenter().activities(from: messages).first)
+        XCTAssertEqual(ActivityPresenter().activities(from: messages).count, 1)
+        XCTAssertEqual(item.id, "proc-1")
+        XCTAssertEqual(item.title, "full-tests")
+        XCTAssertEqual(item.status, .running)
+        XCTAssertNil(item.endedAt)
+
+        messages.append(ChatMessage(
+            id: "process-update", role: .custom,
+            blocks: [MessageBlock(id: "process-update-block", kind: .text("full-tests completed"))],
+            timestamp: startedAt.addingTimeInterval(4),
+            customType: "ad-process:update",
+            details: .object([
+                "kind": .string("lifecycle"), "processId": .string("proc-1"),
+                "processName": .string("full-tests"), "status": .string("exited"),
+                "success": .bool(true)
+            ]),
+            raw: .null
+        ))
+
+        item = try XCTUnwrap(ActivityPresenter().activities(from: messages).first)
+        XCTAssertEqual(ActivityPresenter().activities(from: messages).count, 1)
+        XCTAssertEqual(item.status, .succeeded)
+        XCTAssertEqual(item.endedAt, startedAt.addingTimeInterval(4))
+    }
+
     private func assistant(
         id: String,
         callID: String,

@@ -398,7 +398,7 @@ enum ActivityKind: String, Hashable, Sendable { case subagent, process, tool }
 enum ActivityStatus: String, Hashable, Sendable { case queued, running, succeeded, failed, waiting, stopped, unknown }
 
 struct ActivityItem: Identifiable, Hashable, Sendable {
-    let id: String
+    var id: String
     let sourceID: String?
     let kind: ActivityKind
     var title: String
