@@ -271,6 +271,48 @@ final class SelectableAnswerTextTests: XCTestCase {
         let textView = try XCTUnwrap(descendant(AnswerTextView.self, in: host))
         XCTAssertGreaterThan(textView.frame.height, PiFont.size * 3, "The list must not be clipped below the first paragraph")
     }
+
+    @MainActor
+    func testUserMessageUsesOneCompactSelectableRunAcrossParagraphs() throws {
+        let source = "First paragraph.\n\nSecond paragraph."
+        let message = ChatMessage(
+            id: "user", role: .user,
+            blocks: [MessageBlock(id: "text", kind: .text(source))],
+            timestamp: nil, raw: .null
+        )
+        let host = NSHostingView(rootView: MessageView(
+            message: message,
+            isStreaming: false,
+            onImage: { _, _ in }
+        ))
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 300)
+        host.layoutSubtreeIfNeeded()
+
+        let textView = try XCTUnwrap(descendant(AnswerTextView.self, in: host))
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertEqual(textView.string, source)
+        textView.setSelectedRange(NSRange(location: 0, length: (source as NSString).length))
+        XCTAssertEqual(textView.selectedRange().length, (source as NSString).length)
+        XCTAssertLessThan(textView.frame.width, 300, "Short user messages must keep a shrink-wrapped bubble")
+
+        let longSource = String(repeating: "A long user message still has to wrap inside a narrow conversation. ", count: 12)
+        let narrowHost = NSHostingView(rootView: MessageView(
+            message: ChatMessage(
+                id: "long-user", role: .user,
+                blocks: [MessageBlock(id: "text", kind: .text(longSource))],
+                timestamp: nil, raw: .null
+            ),
+            isStreaming: false,
+            onImage: { _, _ in }
+        ))
+        narrowHost.frame = NSRect(x: 0, y: 0, width: 560, height: 600)
+        narrowHost.layoutSubtreeIfNeeded()
+
+        let narrowTextView = try XCTUnwrap(descendant(AnswerTextView.self, in: narrowHost))
+        let availableTextWidth = 560 - PiTheme.space32 * 2 - PiTheme.space16 * 2
+        XCTAssertLessThanOrEqual(narrowTextView.frame.width, availableTextWidth)
+        XCTAssertGreaterThan(narrowTextView.frame.height, PiFont.size * 3, "Long user messages must wrap")
+    }
 }
 
 final class MarkdownRunIdentityTests: XCTestCase {

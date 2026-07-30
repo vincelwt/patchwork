@@ -17,18 +17,24 @@ import SwiftUI
 // real tables in TextKit 1 via `NSTextTable`/`NSTextTableBlock`, so a table is now part of the
 // same attributed string and the same single selection as the prose around it.
 
-/// A settled assistant answer, laid out so a drag can select continuously from the first
-/// paragraph through a list and a code block. Streaming text and every other Markdown use in the
-/// app (user bubbles, thinking, narration, tool detail) keep the existing per-block renderer.
+/// Settled Markdown laid out as one run, so a drag can select continuously from the first
+/// paragraph through a list and a code block. Answers fill the transcript; user bubbles shrink.
 struct MarkdownAnswerText: View {
     let text: String
+    var fillWidth = true
+    var accessibilityLabel = "Answer"
     /// AppKit text views install their own tracking areas, so SwiftUI's `.onHover` never fires
-    /// while the pointer is over the answer body. The view reports it instead.
+    /// while the pointer is over the text body. The view reports it instead.
     var onHoverChange: ((Bool) -> Void)?
 
     var body: some View {
-        SelectableTextRun(blocks: MarkdownBlockParser.blocks(from: text), onHoverChange: onHoverChange)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        SelectableTextRun(
+            blocks: MarkdownBlockParser.blocks(from: text),
+            fillWidth: fillWidth,
+            accessibilityLabel: accessibilityLabel,
+            onHoverChange: onHoverChange
+        )
+        .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
     }
 }
 
@@ -39,16 +45,20 @@ struct MarkdownAnswerText: View {
 /// on the first layout pass instead of growing into it after an async callback.
 private struct SelectableTextRun: View {
     let blocks: [MarkdownBlock]
+    let fillWidth: Bool
+    let accessibilityLabel: String
     var onHoverChange: ((Bool) -> Void)?
     @State private var codeBlocks: [AnswerCodeBlockFrame] = []
 
     var body: some View {
         SelectableTextBlock(
             blocks: blocks,
+            fillWidth: fillWidth,
+            accessibilityLabel: accessibilityLabel,
             onCodeBlocksChange: { codeBlocks = $0 },
             onHoverChange: onHoverChange
         )
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
         .overlay(alignment: .topLeading) {
             ForEach(codeBlocks) { frame in
                 CodeBlockCopyOverlay(frame: frame)
@@ -113,6 +123,8 @@ private struct CodeBlockCopyOverlay: View {
 /// column width and TextKit answers with the height that text really wraps to, in the same pass.
 private struct SelectableTextBlock: NSViewRepresentable {
     let blocks: [MarkdownBlock]
+    let fillWidth: Bool
+    let accessibilityLabel: String
     let onCodeBlocksChange: ([AnswerCodeBlockFrame]) -> Void
     var onHoverChange: ((Bool) -> Void)?
 
@@ -124,7 +136,7 @@ private struct SelectableTextBlock: NSViewRepresentable {
         view.linkTextAttributes = [.foregroundColor: NSColor.linkColor, .underlineStyle: NSUnderlineStyle.single.rawValue]
         view.onCodeBlocksChange = onCodeBlocksChange
         view.onHoverChange = onHoverChange
-        view.setAccessibilityLabel("Answer")
+        view.setAccessibilityLabel(accessibilityLabel)
         applyContent(to: view, context: context)
         return view
     }
@@ -132,6 +144,7 @@ private struct SelectableTextBlock: NSViewRepresentable {
     func updateNSView(_ view: AnswerTextView, context: Context) {
         view.onCodeBlocksChange = onCodeBlocksChange
         view.onHoverChange = onHoverChange
+        view.setAccessibilityLabel(accessibilityLabel)
         applyContent(to: view, context: context)
     }
 
@@ -140,7 +153,9 @@ private struct SelectableTextBlock: NSViewRepresentable {
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: AnswerTextView, context: Context) -> CGSize? {
         // Zero is SwiftUI's minimum-size probe, not a usable wrapping width.
         guard proposal.width != 0 else { return nil }
-        return nsView.fittingSize(for: proposal.width)
+        return fillWidth
+            ? nsView.fittingSize(for: proposal.width)
+            : nsView.shrinkWrappedSize(for: proposal.width)
     }
 
     /// Building the attributed string for a long answer is the expensive part of realizing its
@@ -221,6 +236,25 @@ final class AnswerTextView: NSTextView {
         let proposed = proposedWidth.flatMap { $0 > 0 && $0.isFinite ? $0 : nil }
         let current = bounds.width > 1 && bounds.width.isFinite ? bounds.width : nil
         let width = proposed ?? current ?? lastMeasuredWidth
+        return CGSize(width: width, height: height(forWidth: width))
+    }
+
+    /// Measures at the available width, then uses the longest laid-out line as the bubble width.
+    /// Long text still wraps at the transcript edge; short user messages keep their compact card.
+    func shrinkWrappedSize(for proposedWidth: CGFloat?) -> CGSize {
+        let proposed = proposedWidth.flatMap { $0 > 0 && $0.isFinite ? $0 : nil }
+        let maximumWidth = proposed ?? PiTheme.transcriptMaxWidth
+        guard let container = textContainer, let manager = layoutManager else {
+            return CGSize(width: 1, height: 1)
+        }
+        setContainerWidth(maximumWidth)
+        manager.ensureLayout(for: container)
+        var longestLine: CGFloat = 1
+        let glyphs = manager.glyphRange(for: container)
+        manager.enumerateLineFragments(forGlyphRange: glyphs) { _, usedRect, _, _, _ in
+            longestLine = max(longestLine, usedRect.maxX)
+        }
+        let width = min(maximumWidth, longestLine.rounded(.up))
         return CGSize(width: width, height: height(forWidth: width))
     }
 
