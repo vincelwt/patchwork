@@ -83,7 +83,7 @@ struct MessageView: View, Equatable {
     /// and resubmit" affordance next to the existing copy action on answers.
     var onEdit: (() -> Void)? = nil
     @State private var hovering = false
-    /// Reported by the answer's AppKit text view, which owns the pointer while it is over prose.
+    /// Reported by selectable AppKit text, which owns the pointer while it is over prose.
     @State private var textHovering = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -120,7 +120,7 @@ struct MessageView: View, Equatable {
             }
             if showsActions, let onEdit {
                 UserMessageActionRow(onEdit: onEdit)
-                    .opacity(hovering ? 1 : 0)
+                    .opacity(hovering || textHovering ? 1 : 0)
             }
         }
         .onHover { hovering = $0 }
@@ -155,12 +155,16 @@ struct MessageView: View, Equatable {
             switch block.kind {
             case let .text(text):
                 if !text.isEmpty {
-                    // The settled answer renders as one continuous, AppKit-backed selectable run
-                    // (see SelectableAnswerText.swift) so a drag can cross paragraph/list/code
-                    // boundaries; every other text use (user bubble, narration, streaming) keeps
-                    // the existing per-block SwiftUI renderer.
-                    if isAnswer, !isStreaming {
-                        MarkdownAnswerText(text: text, onHoverChange: { textHovering = $0 })
+                    // Settled answers and user messages use one AppKit-backed selectable run so
+                    // a drag can cross paragraph/list/code boundaries. Streaming and work-log
+                    // text keep the per-block SwiftUI renderer.
+                    if !isStreaming, isAnswer || message.role == .user {
+                        MarkdownAnswerText(
+                            text: text,
+                            fillWidth: fillWidth,
+                            accessibilityLabel: isAnswer ? "Answer" : "Your message",
+                            onHoverChange: { textHovering = $0 }
+                        )
                     } else {
                         MarkdownBlockView(text: text, streaming: isStreaming, fillWidth: fillWidth)
                     }
