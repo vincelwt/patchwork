@@ -420,6 +420,16 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(tree.assignments, ["/tmp/a.jsonl": "f1"], "an assignment to a folder that is gone is dropped")
     }
 
+    func testFoldersEndpointIncludesRealProjectAssignments() async throws {
+        TestSupport.writeAppState(
+            in: directory,
+            folders: #"[{"id":"clients","name":"Clients","createdAt":0}]"#,
+            projectAssignments: ["/tmp/client-a": "clients"]
+        )
+        let tree = try decode(FolderTreeResponse.self, await send("GET", "/v1/folders"))
+        XCTAssertEqual(tree.projectAssignments, ["/tmp/client-a": "clients"])
+    }
+
     func testFoldersEndpointFlattensACycleInsteadOfHangingOrFailing() async throws {
         TestSupport.writeAppState(in: directory, folders: """
         [{"id":"a","name":"A","createdAt":0,"parentID":"virtual:b"},

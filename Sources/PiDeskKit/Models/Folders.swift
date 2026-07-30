@@ -34,10 +34,24 @@ public struct FolderNode: Codable, Hashable, Sendable, Identifiable {
 public struct FolderTreeResponse: Codable, Sendable {
     public var folders: [FolderNode]
     public var assignments: [String: String]
+    /// Standardized real project path → virtual folder id. Absent from older daemons.
+    public var projectAssignments: [String: String]
 
-    public init(folders: [FolderNode], assignments: [String: String]) {
+    public init(
+        folders: [FolderNode],
+        assignments: [String: String],
+        projectAssignments: [String: String] = [:]
+    ) {
         self.folders = folders
         self.assignments = assignments
+        self.projectAssignments = projectAssignments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        folders = try container.decodeIfPresent([FolderNode].self, forKey: .folders) ?? []
+        assignments = try container.decodeIfPresent([String: String].self, forKey: .assignments) ?? [:]
+        projectAssignments = try container.decodeIfPresent([String: String].self, forKey: .projectAssignments) ?? [:]
     }
 }
 
@@ -85,80 +99,150 @@ public enum FolderTree {
         groupID.hasPrefix("virtual:") ? String(groupID.dropFirst("virtual:".count)) : nil
     }
 
-    /// Ancestor folder ids walking up through `parentID`, nearest first. Stops at top level, at a
-    /// filesystem project, or at the first repeated id, so a corrupted cycle terminates.
-    static func ancestorFolderIDs(of startID: String, in folders: [StoredVirtualFolder]) -> [String] {
-        var chain: [String] = []
-        var visited: Set<String> = [startID]
-        var currentID = startID
-        while let node = folders.first(where: { $0.id == currentID }),
-              let parentGroupID = node.parentID,
-              let parentFolderID = folderID(fromGroupID: parentGroupID) {
-            guard visited.insert(parentFolderID).inserted else { break }
-            chain.append(parentFolderID)
-            currentID = parentFolderID
+    private static func normalizedProjectPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+
+    private static func normalizedGroupID(_ groupID: String) -> String {
+        folderID(fromGroupID: groupID) == nil ? normalizedProjectPath(groupID) : groupID
+    }
+
+    private static func rawParentGroupID(
+        of groupID: String,
+        folders: [StoredVirtualFolder],
+        projectAssignments: [String: String]
+    ) -> String? {
+        if let id = folderID(fromGroupID: groupID) {
+            return folders.first(where: { $0.id == id })?.parentID.map(normalizedGroupID)
         }
-        return chain
+        let path = normalizedProjectPath(groupID)
+        guard let id = projectAssignments[path], folders.contains(where: { $0.id == id }) else { return nil }
+        return self.groupID(forFolderID: id)
     }
 
-    static func wouldCreateCycle(moving movedID: String, into newParentFolderID: String, in folders: [StoredVirtualFolder]) -> Bool {
-        newParentFolderID == movedID || ancestorFolderIDs(of: newParentFolderID, in: folders).contains(movedID)
+    private static func wouldCreateGroupCycle(
+        moving groupID: String,
+        into parentGroupID: String,
+        folders: [StoredVirtualFolder],
+        projectAssignments: [String: String]
+    ) -> Bool {
+        let movingID = normalizedGroupID(groupID)
+        var current: String? = normalizedGroupID(parentGroupID)
+        var visited: Set<String> = [movingID]
+        while let node = current {
+            guard visited.insert(node).inserted else { return true }
+            current = rawParentGroupID(of: node, folders: folders, projectAssignments: projectAssignments)
+        }
+        return false
     }
 
-    /// A dangling virtual parent, or an ancestor cycle, both degrade to top level.
-    static func effectiveParentID(of folder: StoredVirtualFolder, in folders: [StoredVirtualFolder]) -> String? {
-        guard let parentGroupID = folder.parentID else { return nil }
-        guard let parentFolderID = folderID(fromGroupID: parentGroupID) else { return parentGroupID }
-        guard folders.contains(where: { $0.id == parentFolderID }),
-              !wouldCreateCycle(moving: folder.id, into: parentFolderID, in: folders) else { return nil }
-        return parentGroupID
+    private static func effectiveParentID(
+        ofGroupID groupID: String,
+        folders: [StoredVirtualFolder],
+        projectAssignments: [String: String]
+    ) -> String? {
+        let groupID = normalizedGroupID(groupID)
+        guard let parent = rawParentGroupID(
+            of: groupID, folders: folders, projectAssignments: projectAssignments
+        ) else { return nil }
+        if let id = folderID(fromGroupID: parent), !folders.contains(where: { $0.id == id }) { return nil }
+        return wouldCreateGroupCycle(
+            moving: groupID, into: parent, folders: folders, projectAssignments: projectAssignments
+        ) ? nil : parent
     }
 
-    /// Every folder exactly once, depth-first: the top-level subtree first, then each filesystem
-    /// project that hosts folders, in first-seen order — the same shape the app's flat folder
-    /// pickers use. Folders unreachable within `maxDepth` are dropped rather than rendered at a
-    /// misleading depth.
-    public static func nodes(from folders: [StoredVirtualFolder]) -> [FolderNode] {
-        // Duplicate ids would make `first(where:)` lookups ambiguous and could double-render a
-        // subtree; the first occurrence wins, exactly like a dictionary insert would.
+    /// Every virtual folder exactly once, depth-first through the alternating virtual/project
+    /// tree. Project wrappers are traversed but do not consume virtual-folder depth.
+    public static func nodes(
+        from folders: [StoredVirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> [FolderNode] {
         var seenIDs: Set<String> = []
         let unique = folders.filter { seenIDs.insert($0.id).inserted }
-
-        var childrenByParent: [String: [StoredVirtualFolder]] = [:]
+        let virtualByGroupID = Dictionary(uniqueKeysWithValues: unique.map { (groupID(forFolderID: $0.id), $0) })
+        var projectPaths = Set(projectAssignments.keys.map(normalizedProjectPath))
         for folder in unique {
-            childrenByParent[effectiveParentID(of: folder, in: unique) ?? "", default: []].append(folder)
+            guard let parent = effectiveParentID(
+                ofGroupID: groupID(forFolderID: folder.id),
+                folders: unique,
+                projectAssignments: projectAssignments
+            ), folderID(fromGroupID: parent) == nil else { continue }
+            projectPaths.insert(parent)
+        }
+
+        var childrenByParent: [String: [String]] = [:]
+        for groupID in virtualByGroupID.keys {
+            let parent = effectiveParentID(
+                ofGroupID: groupID,
+                folders: unique,
+                projectAssignments: projectAssignments
+            ) ?? ""
+            childrenByParent[parent, default: []].append(groupID)
+        }
+        for path in projectPaths {
+            let parent = effectiveParentID(
+                ofGroupID: path,
+                folders: unique,
+                projectAssignments: projectAssignments
+            ) ?? ""
+            childrenByParent[parent, default: []].append(path)
         }
         for key in childrenByParent.keys {
             childrenByParent[key]?.sort { lhs, rhs in
-                let left = lhs.createdAt ?? .distantPast
-                let right = rhs.createdAt ?? .distantPast
-                return left == right ? lhs.id < rhs.id : left < right
+                guard let left = virtualByGroupID[lhs] else { return virtualByGroupID[rhs] == nil && lhs < rhs }
+                guard let right = virtualByGroupID[rhs] else { return true }
+                let leftDate = left.createdAt ?? .distantPast
+                let rightDate = right.createdAt ?? .distantPast
+                return leftDate == rightDate ? left.id < right.id : leftDate < rightDate
             }
         }
 
         func walk(parentGroupID: String, depth: Int) -> [FolderNode] {
-            // `<=`, not `<`: the sidebar draws the folder at `maxDepth` and stops at its children.
             guard depth <= maxDepth else { return [] }
-            return (childrenByParent[parentGroupID] ?? []).flatMap { folder -> [FolderNode] in
-                [FolderNode(id: folder.id, name: folder.name, parentId: parentGroupID.isEmpty ? nil : parentGroupID, depth: depth)]
-                    + walk(parentGroupID: groupID(forFolderID: folder.id), depth: depth + 1)
+            return (childrenByParent[parentGroupID] ?? []).flatMap { groupID -> [FolderNode] in
+                guard let folder = virtualByGroupID[groupID] else {
+                    return walk(parentGroupID: groupID, depth: depth)
+                }
+                let node = FolderNode(
+                    id: folder.id,
+                    name: folder.name,
+                    parentId: parentGroupID.isEmpty ? nil : parentGroupID,
+                    depth: depth
+                )
+                return [node] + (depth == maxDepth ? [] : walk(
+                    parentGroupID: groupID,
+                    depth: depth + 1
+                ))
             }
         }
 
-        var roots = [""]
-        for folder in unique {
-            guard let parent = effectiveParentID(of: folder, in: unique), folderID(fromGroupID: parent) == nil,
-                  !roots.contains(parent) else { continue }
-            roots.append(parent)
-        }
-        return roots.flatMap { walk(parentGroupID: $0, depth: 0) }
+        return walk(parentGroupID: "", depth: 0)
     }
 
-    /// Drops assignments pointing at folders that were never rendered (deleted, duplicated away,
-    /// or beyond `maxDepth`), so a client never files a thread under a folder it cannot show.
-    public static func response(folders: [StoredVirtualFolder], assignments: [String: String]) -> FolderTreeResponse {
-        let nodes = nodes(from: folders)
+    /// Drops assignments pointing at folders that were not rendered and project moves whose
+    /// target is missing or cyclic.
+    public static func response(
+        folders: [StoredVirtualFolder],
+        assignments: [String: String],
+        projectAssignments: [String: String] = [:]
+    ) -> FolderTreeResponse {
+        let standardizedProjects = Dictionary(
+            projectAssignments.map { (normalizedProjectPath($0.key), $0.value) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let nodes = nodes(from: folders, projectAssignments: standardizedProjects)
         let valid = Set(nodes.map(\.id))
-        return FolderTreeResponse(folders: nodes, assignments: assignments.filter { valid.contains($0.value) })
+        let projects = standardizedProjects.filter { path, folderID in
+            valid.contains(folderID) && effectiveParentID(
+                ofGroupID: path,
+                folders: folders,
+                projectAssignments: standardizedProjects
+            ) == groupID(forFolderID: folderID)
+        }
+        return FolderTreeResponse(
+            folders: nodes,
+            assignments: assignments.filter { valid.contains($0.value) },
+            projectAssignments: projects
+        )
     }
 }

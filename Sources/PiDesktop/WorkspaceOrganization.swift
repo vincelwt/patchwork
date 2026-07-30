@@ -56,38 +56,110 @@ enum WorkspaceOrganization {
         groupID.hasPrefix("virtual:") ? String(groupID.dropFirst("virtual:".count)) : nil
     }
 
-    /// Ancestor folder ids walking up from `folderID` through `parentID`, nearest first. Stops
-    /// at top level, a filesystem project, or the first repeated id, so a corrupted cycle can
-    /// never make this loop forever.
-    static func ancestorFolderIDs(of folderID: String, in folders: [VirtualFolder]) -> [String] {
+    static func normalizedProjectPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+
+    private static func normalizedGroupID(_ groupID: String) -> String {
+        virtualFolderID(fromGroupID: groupID) == nil ? normalizedProjectPath(groupID) : groupID
+    }
+
+    /// Raw parent lookup across both node kinds. A virtual folder stores its parent directly;
+    /// a real project stores the virtual folder it was filed under in `projectAssignments`.
+    private static func rawParentGroupID(
+        of groupID: String,
+        folders: [VirtualFolder],
+        projectAssignments: [String: String]
+    ) -> String? {
+        if let folderID = virtualFolderID(fromGroupID: groupID) {
+            return folders.first(where: { $0.id == folderID })?.parentID.map(normalizedGroupID)
+        }
+        let projectPath = normalizedProjectPath(groupID)
+        guard let folderID = projectAssignments[projectPath], folders.contains(where: { $0.id == folderID }) else { return nil }
+        return self.groupID(forVirtualFolderID: folderID)
+    }
+
+    /// One cycle rule for the alternating tree (virtual → project → virtual is valid). Walking
+    /// raw parents keeps this usable while validating an edit; repeated corrupt ancestry also
+    /// refuses the edit instead of making the corruption harder to recover from.
+    static func wouldCreateGroupCycle(
+        moving groupID: String,
+        into parentGroupID: String,
+        folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> Bool {
+        let movingID = normalizedGroupID(groupID)
+        var current: String? = normalizedGroupID(parentGroupID)
+        var visited: Set<String> = [movingID]
+        while let node = current {
+            guard visited.insert(node).inserted else { return true }
+            current = rawParentGroupID(of: node, folders: folders, projectAssignments: projectAssignments)
+        }
+        return false
+    }
+
+    /// Effective parent for either a virtual folder group id or a real project path. Dangling
+    /// virtual targets and hand-edited cycles degrade to top level, so every node remains visible.
+    static func effectiveParentID(
+        ofGroupID groupID: String,
+        folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> String? {
+        let normalizedID = normalizedGroupID(groupID)
+        guard let parent = rawParentGroupID(
+            of: normalizedID, folders: folders, projectAssignments: projectAssignments
+        ) else { return nil }
+        if let parentFolderID = virtualFolderID(fromGroupID: parent),
+           !folders.contains(where: { $0.id == parentFolderID }) { return nil }
+        guard !wouldCreateGroupCycle(
+            moving: normalizedID, into: parent, folders: folders, projectAssignments: projectAssignments
+        ) else { return nil }
+        return parent
+    }
+
+    /// Ancestor virtual-folder ids, nearest first, crossing real project wrappers when needed.
+    static func ancestorFolderIDs(
+        of folderID: String,
+        in folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> [String] {
         var chain: [String] = []
-        var visited: Set<String> = [folderID]
-        var currentID = folderID
-        while let node = folders.first(where: { $0.id == currentID }),
-              let parentGroupID = node.parentID,
-              let parentFolderID = virtualFolderID(fromGroupID: parentGroupID) {
-            guard visited.insert(parentFolderID).inserted else { break }
-            chain.append(parentFolderID)
-            currentID = parentFolderID
+        var visited: Set<String> = [groupID(forVirtualFolderID: folderID)]
+        var current = groupID(forVirtualFolderID: folderID)
+        while let parent = effectiveParentID(
+            ofGroupID: current, folders: folders, projectAssignments: projectAssignments
+        ) {
+            guard visited.insert(parent).inserted else { break }
+            if let parentFolderID = virtualFolderID(fromGroupID: parent) { chain.append(parentFolderID) }
+            current = parent
         }
         return chain
     }
 
-    /// A folder can never become its own ancestor: true if `newParentFolderID` is `folderID`
-    /// itself or already sits underneath it.
-    static func wouldCreateCycle(moving folderID: String, into newParentFolderID: String, in folders: [VirtualFolder]) -> Bool {
-        newParentFolderID == folderID || ancestorFolderIDs(of: newParentFolderID, in: folders).contains(folderID)
+    static func wouldCreateCycle(
+        moving folderID: String,
+        into newParentFolderID: String,
+        in folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> Bool {
+        wouldCreateGroupCycle(
+            moving: groupID(forVirtualFolderID: folderID),
+            into: groupID(forVirtualFolderID: newParentFolderID),
+            folders: folders,
+            projectAssignments: projectAssignments
+        )
     }
 
-    /// Defensive parent resolution for rendering: a dangling virtual parent, or an ancestor
-    /// cycle that `reparent` should have made unreachable, both degrade to top level instead of
-    /// hanging the sidebar tree in infinite recursion over hand-edited state.
-    static func effectiveParentID(of folder: VirtualFolder, in folders: [VirtualFolder]) -> String? {
-        guard let parentGroupID = folder.parentID else { return nil }
-        guard let parentFolderID = virtualFolderID(fromGroupID: parentGroupID) else { return parentGroupID }
-        guard folders.contains(where: { $0.id == parentFolderID }),
-              !wouldCreateCycle(moving: folder.id, into: parentFolderID, in: folders) else { return nil }
-        return parentGroupID
+    static func effectiveParentID(
+        of folder: VirtualFolder,
+        in folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> String? {
+        effectiveParentID(
+            ofGroupID: groupID(forVirtualFolderID: folder.id),
+            folders: folders,
+            projectAssignments: projectAssignments
+        )
     }
 
     /// `parentID` may be top level, a filesystem project path (always accepted \u2014 projects are
@@ -95,6 +167,7 @@ enum WorkspaceOrganization {
     /// (must already exist).
     static func create(named name: String, parentID: String? = nil, in folders: inout [VirtualFolder]) -> VirtualFolder? {
         guard let clean = cleanedName(name) else { return nil }
+        let parentID = parentID.map(normalizedGroupID)
         if let parentID, let parentFolderID = virtualFolderID(fromGroupID: parentID) {
             guard folders.contains(where: { $0.id == parentFolderID }) else { return nil }
         }
@@ -113,13 +186,25 @@ enum WorkspaceOrganization {
     /// Refuses a move that would make `id` its own ancestor or that targets a virtual folder
     /// that does not exist; a filesystem project path or top level (`nil`) is always accepted.
     @discardableResult
-    static func reparent(id: String, to newParentGroupID: String?, in folders: inout [VirtualFolder]) -> Bool {
+    static func reparent(
+        id: String,
+        to newParentGroupID: String?,
+        in folders: inout [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> Bool {
         guard let index = folders.firstIndex(where: { $0.id == id }) else { return false }
-        if let newParentGroupID, let newParentFolderID = virtualFolderID(fromGroupID: newParentGroupID) {
-            guard folders.contains(where: { $0.id == newParentFolderID }),
-                  !wouldCreateCycle(moving: id, into: newParentFolderID, in: folders) else { return false }
+        let parent = newParentGroupID.map(normalizedGroupID)
+        if let parent {
+            if let parentFolderID = virtualFolderID(fromGroupID: parent),
+               !folders.contains(where: { $0.id == parentFolderID }) { return false }
+            guard !wouldCreateGroupCycle(
+                moving: groupID(forVirtualFolderID: id),
+                into: parent,
+                folders: folders,
+                projectAssignments: projectAssignments
+            ) else { return false }
         }
-        folders[index].parentID = newParentGroupID
+        folders[index].parentID = parent
         return true
     }
 
@@ -129,10 +214,31 @@ enum WorkspaceOrganization {
     /// a surviving child or grandchild keep their assignment untouched.
     @discardableResult
     static func delete(id: String, folders: inout [VirtualFolder], assignments: inout [String: String]) -> Bool {
+        var projectAssignments: [String: String] = [:]
+        return delete(
+            id: id,
+            folders: &folders,
+            assignments: &assignments,
+            projectAssignments: &projectAssignments
+        )
+    }
+
+    static func delete(
+        id: String,
+        folders: inout [VirtualFolder],
+        assignments: inout [String: String],
+        projectAssignments: inout [String: String]
+    ) -> Bool {
         guard let target = folders.first(where: { $0.id == id }) else { return false }
         let deletedGroupID = groupID(forVirtualFolderID: id)
         for index in folders.indices where folders[index].parentID == deletedGroupID {
             folders[index].parentID = target.parentID
+        }
+        if let parent = target.parentID, let parentFolderID = virtualFolderID(fromGroupID: parent) {
+            let promotedProjects = projectAssignments.keys.filter { projectAssignments[$0] == id }
+            for path in promotedProjects { projectAssignments[path] = parentFolderID }
+        } else {
+            projectAssignments = projectAssignments.filter { $0.value != id }
         }
         folders.removeAll { $0.id == id }
         assignments = assignments.filter { $0.value != id }
@@ -149,6 +255,30 @@ enum WorkspaceOrganization {
         assignments[path] = folderID
     }
 
+    @discardableResult
+    static func moveProject(
+        path: String,
+        to folderID: String?,
+        folders: [VirtualFolder],
+        assignments: inout [String: String]
+    ) -> Bool {
+        let path = normalizedProjectPath(path)
+        guard !isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true)) else { return false }
+        guard let folderID else {
+            assignments.removeValue(forKey: path)
+            return true
+        }
+        guard folders.contains(where: { $0.id == folderID }),
+              !wouldCreateGroupCycle(
+                moving: path,
+                into: groupID(forVirtualFolderID: folderID),
+                folders: folders,
+                projectAssignments: assignments
+              ) else { return false }
+        assignments[path] = folderID
+        return true
+    }
+
     struct FolderTreeEntry: Identifiable {
         let folder: VirtualFolder
         let depth: Int
@@ -159,30 +289,47 @@ enum WorkspaceOrganization {
     /// (`nil` for top level), for pickers like "Move to\u2026". Uses the same cycle-safe parent
     /// resolution as rendering, and `maxDepth` is a second, independent recursion guard.
     static func orderedChildren(
-        of parentGroupID: String?, in folders: [VirtualFolder], depth: Int = 0, maxDepth: Int = 48
+        of parentGroupID: String?,
+        in folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:],
+        depth: Int = 0,
+        maxDepth: Int = 48
     ) -> [FolderTreeEntry] {
         guard depth < maxDepth else { return [] }
         let direct = folders
-            .filter { effectiveParentID(of: $0, in: folders) == parentGroupID }
+            .filter { effectiveParentID(of: $0, in: folders, projectAssignments: projectAssignments) == parentGroupID }
             .sorted { $0.createdAt < $1.createdAt }
         return direct.flatMap { folder in
             [FolderTreeEntry(folder: folder, depth: depth)]
-                + orderedChildren(of: groupID(forVirtualFolderID: folder.id), in: folders, depth: depth + 1, maxDepth: maxDepth)
+                + orderedChildren(
+                    of: groupID(forVirtualFolderID: folder.id),
+                    in: folders,
+                    projectAssignments: projectAssignments,
+                    depth: depth + 1,
+                    maxDepth: maxDepth
+                )
         }
     }
 
     /// Every folder exactly once: the top-level subtree first, then each filesystem project
     /// that hosts folders (first-seen order), so a flat picker can show the whole tree with
     /// simple per-depth indentation.
-    static func allFolderEntries(_ folders: [VirtualFolder]) -> [FolderTreeEntry] {
+    static func allFolderEntries(
+        _ folders: [VirtualFolder],
+        projectAssignments: [String: String] = [:]
+    ) -> [FolderTreeEntry] {
         var roots: [String?] = [nil]
         var seenProjectPaths: Set<String> = []
         for folder in folders {
-            guard let parent = effectiveParentID(of: folder, in: folders), virtualFolderID(fromGroupID: parent) == nil,
+            guard let parent = effectiveParentID(
+                of: folder, in: folders, projectAssignments: projectAssignments
+            ), virtualFolderID(fromGroupID: parent) == nil,
                   seenProjectPaths.insert(parent).inserted else { continue }
             roots.append(parent)
         }
-        return roots.flatMap { orderedChildren(of: $0, in: folders) }
+        return roots.flatMap {
+            orderedChildren(of: $0, in: folders, projectAssignments: projectAssignments)
+        }
     }
 
     // MARK: - Categorization path
@@ -200,10 +347,9 @@ enum WorkspaceOrganization {
 
     /// Where a conversation actually sits in the sidebar, outermost ancestor first and the
     /// conversation itself last, so a breadcrumb can never disagree with the tree that
-    /// `SidebarSnapshot` draws from the same `parentID`/assignment state:
-    /// unassigned filesystem session → `[project, conversation]`, unassigned global session →
-    /// `["Recents", conversation]`, assigned session → its folder chain from the top, prefixed by
-    /// a project only when that chain really ends in one.
+    /// `SidebarSnapshot` draws from the same folder and project assignment state. It walks the
+    /// alternating project/virtual ancestry for either a directly filed session or its real
+    /// project, then appends the conversation.
     ///
     /// Cycle- and dangling-safe: it walks with `effectiveParentID`, keeps a visited set, and stops
     /// at `maxDepth`, so hand-edited state yields a bounded, visible path instead of looping.
@@ -211,32 +357,34 @@ enum WorkspaceOrganization {
         of session: SessionSummary,
         folders: [VirtualFolder],
         assignments: [String: String],
+        projectAssignments: [String: String] = [:],
         managedWorktreeProjects: [String: String] = [:],
         maxDepth: Int = 48
     ) -> [String] {
         let assigned = assignments[session.fileURL.standardizedFileURL.path]
-        guard let assigned, var folder = folders.first(where: { $0.id == assigned }) else {
-            return [label(forProjectPath: projectPath(of: session, managedWorktreeProjects: managedWorktreeProjects)), session.displayName]
+        var current = assigned.flatMap { id in
+            folders.contains(where: { $0.id == id }) ? groupID(forVirtualFolderID: id) : nil
+        } ?? projectPath(of: session, managedWorktreeProjects: managedWorktreeProjects)
+        var chain: [String] = []
+        var visited: Set<String> = []
+        while chain.count < maxDepth, visited.insert(current).inserted {
+            chain.append(label(forGroupID: current, folders: folders))
+            guard let parent = effectiveParentID(
+                ofGroupID: current,
+                folders: folders,
+                projectAssignments: projectAssignments
+            ) else { break }
+            current = parent
         }
-        var chain = [folder.name]
-        var visited: Set<String> = [folder.id]
-        var projectPath: String?
-        while chain.count < maxDepth {
-            guard let parent = effectiveParentID(of: folder, in: folders) else { break }
-            guard let parentFolderID = virtualFolderID(fromGroupID: parent) else { projectPath = parent; break }
-            guard let next = folders.first(where: { $0.id == parentFolderID }),
-                  visited.insert(parentFolderID).inserted else { break }
-            chain.append(next.name)
-            folder = next
-        }
-        return (projectPath.map { [label(forProjectPath: $0)] } ?? []) + chain.reversed() + [session.displayName]
+        return Array(chain.reversed()) + [session.displayName]
     }
 
-    /// The same name the sidebar's own project group shows for a working directory.
-    private static func label(forProjectPath path: String) -> String {
-        isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
+    private static func label(forGroupID groupID: String, folders: [VirtualFolder]) -> String {
+        if let folderID = virtualFolderID(fromGroupID: groupID),
+           let folder = folders.first(where: { $0.id == folderID }) { return folder.name }
+        return isGlobalWorkingDirectory(URL(fileURLWithPath: groupID, isDirectory: true))
             ? "Recents"
-            : SessionFolderGroup.projectName(forPath: path)
+            : SessionFolderGroup.projectName(forPath: groupID)
     }
 
     // MARK: - Default working directory for a folder-scoped new chat
@@ -257,7 +405,8 @@ enum WorkspaceOrganization {
         assignments: [String: String],
         folders: [VirtualFolder],
         fallback: URL,
-        managedWorktreeProjects: [String: String] = [:]
+        managedWorktreeProjects: [String: String] = [:],
+        projectAssignments: [String: String] = [:]
     ) -> URL {
         if let shared = mostCommonCwd(
             inVirtualFolder: folderID,
@@ -267,7 +416,11 @@ enum WorkspaceOrganization {
         ) {
             return shared
         }
-        if let project = enclosingProjectPath(ofVirtualFolder: folderID, folders: folders) {
+        if let project = enclosingProjectPath(
+            ofVirtualFolder: folderID,
+            folders: folders,
+            projectAssignments: projectAssignments
+        ) {
             return URL(fileURLWithPath: project, isDirectory: true)
         }
         return fallback
@@ -297,14 +450,21 @@ enum WorkspaceOrganization {
 
     /// Walks up through parent virtual folders — cycle-safe like `effectiveParentID`, which this
     /// reuses at every step — until it finds a filesystem project parent or runs out of ancestors.
-    private static func enclosingProjectPath(ofVirtualFolder folderID: String, folders: [VirtualFolder]) -> String? {
-        var visited: Set<String> = [folderID]
-        var currentID = folderID
-        while let folder = folders.first(where: { $0.id == currentID }) {
-            guard let parent = effectiveParentID(of: folder, in: folders) else { return nil }
-            guard let parentFolderID = virtualFolderID(fromGroupID: parent) else { return parent }
-            guard visited.insert(parentFolderID).inserted else { return nil }
-            currentID = parentFolderID
+    private static func enclosingProjectPath(
+        ofVirtualFolder folderID: String,
+        folders: [VirtualFolder],
+        projectAssignments: [String: String]
+    ) -> String? {
+        var visited: Set<String> = [groupID(forVirtualFolderID: folderID)]
+        var current = groupID(forVirtualFolderID: folderID)
+        while let parent = effectiveParentID(
+            ofGroupID: current,
+            folders: folders,
+            projectAssignments: projectAssignments
+        ) {
+            guard visited.insert(parent).inserted else { return nil }
+            if virtualFolderID(fromGroupID: parent) == nil { return parent }
+            current = parent
         }
         return nil
     }
@@ -327,7 +487,14 @@ extension AppPersistence {
     @discardableResult
     func reparentVirtualFolder(id: String, to parentID: String?) -> Bool {
         var changed = false
-        updateState { changed = WorkspaceOrganization.reparent(id: id, to: parentID, in: &$0.virtualFolders) }
+        updateState { state in
+            changed = WorkspaceOrganization.reparent(
+                id: id,
+                to: parentID,
+                in: &state.virtualFolders,
+                projectAssignments: state.projectFolderAssignments
+            )
+        }
         return changed
     }
 
@@ -336,10 +503,17 @@ extension AppPersistence {
         updateState { state in
             var folders = state.virtualFolders
             var assignments = state.virtualFolderAssignments
-            changed = WorkspaceOrganization.delete(id: id, folders: &folders, assignments: &assignments)
+            var projectAssignments = state.projectFolderAssignments
+            changed = WorkspaceOrganization.delete(
+                id: id,
+                folders: &folders,
+                assignments: &assignments,
+                projectAssignments: &projectAssignments
+            )
             if changed {
                 state.virtualFolders = folders
                 state.virtualFolderAssignments = assignments
+                state.projectFolderAssignments = projectAssignments
             }
         }
         return changed
@@ -356,6 +530,24 @@ extension AppPersistence {
             )
             state.virtualFolderAssignments = assignments
         }
+    }
+
+    func moveProject(path: String, toVirtualFolder folderID: String?) -> Bool {
+        var changed = false
+        updateState { state in
+            var assignments = state.projectFolderAssignments
+            changed = WorkspaceOrganization.moveProject(
+                path: path,
+                to: folderID,
+                folders: state.virtualFolders,
+                assignments: &assignments
+            )
+            if changed {
+                let path = WorkspaceOrganization.normalizedProjectPath(path)
+                state.setProjectFolderAssignment(projectPath: path, folderID: assignments[path])
+            }
+        }
+        return changed
     }
 
     /// Returns true only when this is a different completion from the last one persisted.
@@ -411,6 +603,7 @@ extension AppPersistence {
 extension AppStore {
     var virtualFolders: [VirtualFolder] { persistence.state.virtualFolders }
     var virtualFolderAssignments: [String: String] { persistence.state.virtualFolderAssignments }
+    var projectFolderAssignments: [String: String] { persistence.state.projectFolderAssignments }
     var managedWorktreeProjects: [String: String] { persistence.state.managedWorktreeProjects }
 
     func projectFolder(for session: SessionSummary) -> URL {
@@ -435,6 +628,7 @@ extension AppStore {
             of: session,
             folders: virtualFolders,
             assignments: virtualFolderAssignments,
+            projectAssignments: projectFolderAssignments,
             managedWorktreeProjects: managedWorktreeProjects
         )
     }
@@ -476,6 +670,11 @@ extension AppStore {
         objectWillChange.send()
     }
 
+    func moveProjectFolder(path: String, toVirtualFolder folderID: String?) {
+        guard persistence.moveProject(path: path, toVirtualFolder: folderID) else { return }
+        objectWillChange.send()
+    }
+
     /// Working directory for a chat started via a virtual folder's `+`/"New Chat Here"; see
     /// `WorkspaceOrganization.defaultWorkingDirectory` for the exact preference order.
     /// `selectedFolder` stands in for the current default (its last tier). `openNewChat()` sets
@@ -487,7 +686,8 @@ extension AppStore {
             assignments: virtualFolderAssignments,
             folders: virtualFolders,
             fallback: selectedFolder ?? WorkspaceOrganization.globalWorkingDirectory,
-            managedWorktreeProjects: managedWorktreeProjects
+            managedWorktreeProjects: managedWorktreeProjects,
+            projectAssignments: projectFolderAssignments
         )
     }
 

@@ -278,8 +278,9 @@ availability.
 ## Folders
 
 The thread list mirrors the Mac app's sidebar: threads filed into a virtual folder appear there,
-everything else groups under its project directory, and folders nest inside projects or other
-folders. Group headers are disclosure buttons with subtree counts and unread/running markers;
+everything else groups under its project directory, and virtual folders and real projects can
+contain each other. Group headers are disclosure buttons with subtree counts and unread/running
+markers;
 indentation is capped so a deep tree still leaves room for a title on a phone. Folders are
 read-only here — they are created, renamed, and rearranged in the Mac app. A machine with a single
 project and no folders keeps the flat list, and a daemon that predates `GET /v1/folders` falls

@@ -23,11 +23,12 @@ enum AppStatePeek {
         /// state written before folders existed, which decodes as "no folders", not as a failure.
         var virtualFolders: [StoredVirtualFolder] = []
         var virtualFolderAssignments: [String: String] = [:]
+        var projectFolderAssignments: [String: String] = [:]
 
         private enum CodingKeys: String, CodingKey {
             case archivedSessionIDs, manuallyUnreadSessionPaths
             case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
-            case virtualFolders, virtualFolderAssignments
+            case virtualFolders, virtualFolderAssignments, projectFolderAssignments
         }
 
         init() {}
@@ -47,6 +48,7 @@ enum AppStatePeek {
             // decoded independently of everything above and default to empty on any failure.
             virtualFolders = (try? container.decodeIfPresent([StoredVirtualFolder].self, forKey: .virtualFolders)) ?? []
             virtualFolderAssignments = (try? container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments)) ?? [:]
+            projectFolderAssignments = (try? container.decodeIfPresent([String: String].self, forKey: .projectFolderAssignments)) ?? [:]
         }
 
         /// The cycle-safe, depth-capped projection `GET /v1/folders` returns. Assignment keys are
@@ -57,7 +59,11 @@ enum AppStatePeek {
                 virtualFolderAssignments.map { (URL(fileURLWithPath: $0.key).standardizedFileURL.path, $0.value) },
                 uniquingKeysWith: { first, _ in first }
             )
-            return FolderTree.response(folders: virtualFolders, assignments: standardized)
+            return FolderTree.response(
+                folders: virtualFolders,
+                assignments: standardized,
+                projectAssignments: projectFolderAssignments
+            )
         }
 
         func isArchived(sessionID: String) -> Bool { archivedSessionIDs.contains(sessionID) }

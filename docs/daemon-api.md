@@ -261,7 +261,8 @@ because their bounded identity is what makes results attachable.
 ```
 GET /v1/folders
 → {"folders":[{"id":"…","name":"Review","parentId":null,"depth":0}],
-   "assignments":{"/Users/x/.pi/agent/sessions/…/….jsonl":"<folderId>"}}
+   "assignments":{"/Users/x/.pi/agent/sessions/…/….jsonl":"<folderId>"},
+   "projectAssignments":{"/Users/x/code/repo":"<folderId>"}}
 ```
 
 Read-only projection of the app's own virtual folders from `state.json`. The daemon never writes
@@ -270,9 +271,11 @@ path, or `"virtual:<uuid>"` — and is always the *effective* parent: a cycle or
 already resolved to top level, and folders *past* depth 24 are dropped — the same boundary the Mac
 sidebar draws, which renders the folder at depth 24 and stops at its children — so a client renders
 the list without any cycle logic of its own. A project path in `parentId` hosts folders without
-being a level of nesting: its folders start at depth 0, exactly like top-level ones. Assignments naming a folder that did not survive are
-dropped for the same reason. Missing, legacy (pre-nesting), or malformed state yields an empty
-tree, never an error.
+being a level of nesting: its folders start at depth 0, exactly like top-level ones.
+`projectAssignments` performs the inverse grouping, mapping a real project path into a virtual
+folder. Invalid and cyclic project assignments are dropped. Conversation assignments naming a
+folder that did not survive are dropped for the same reason. Missing, legacy (pre-nesting), or
+malformed state yields an empty tree, never an error.
 
 ### Activity
 
