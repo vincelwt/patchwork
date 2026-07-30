@@ -137,6 +137,33 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(runtimeB.commandCount("abort"), 0)
     }
 
+    func testDetachedStreamingBurstDoesNotInvalidateVisibleConversation() {
+        let (store, runtimeA, _, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": assistantMessage("first output")
+        ]))
+        XCTAssertEqual(store.runtimeState.phase, .working)
+        store.selectSession(sessionB)
+
+        var invalidations = 0
+        let cancellable = store.objectWillChange.sink { invalidations += 1 }
+        for index in 0..<100 {
+            runtimeA.onEvent?(.object([
+                "type": .string("message_update"),
+                "message": assistantMessage("update \(index)")
+            ]))
+        }
+
+        XCTAssertEqual(invalidations, 0, "A hidden token burst must not redraw B's whole window")
+        withExtendedLifetime(cancellable) {}
+        store.selectSession(sessionA)
+        XCTAssertEqual(store.streamingMessage?.textContent, "update 99")
+    }
+
     func testCodexQueueStatusIsEphemeralAndRuntimeScoped() {
         let (store, runtimeA, _, sessionA, sessionB) = makeStore()
         let queueEvent: JSONValue = .object([

@@ -156,7 +156,8 @@ final class SessionActivityMonitor: ObservableObject {
     /// a newly-created automation run.
     @Published private(set) var hasRunningActivity = false
     /// The whole app process tree plus heartbeat-backed external conversations currently running.
-    @Published private(set) var aggregateResources: ThreadResourceUsage?
+    /// Resource samples are polled by the tiny sidebar labels instead of invalidating the whole window.
+    private(set) var aggregateResources: ThreadResourceUsage?
 
     static let pollInterval: TimeInterval = 2
     static let backgroundPollInterval: TimeInterval = 15
@@ -174,6 +175,7 @@ final class SessionActivityMonitor: ObservableObject {
     private var fingerprints: [String: Fingerprint] = [:]
     private var heartbeatSnapshots: [String: [ActivityHeartbeat]] = [:]
     private var resourceSamples: [Int32: ProcessResourceSample] = [:]
+    private var resourceUsageByPath: [String: ThreadResourceUsage] = [:]
     private var pollTask: Task<Void, Never>?
     private var heartbeatWatcher: DispatchSourceFileSystemObject?
     private var tickInFlight = false
@@ -212,6 +214,7 @@ final class SessionActivityMonitor: ObservableObject {
         activities = activities.filter { live.contains($0.key) }
         fingerprints = fingerprints.filter { live.contains($0.key) }
         heartbeatSnapshots = heartbeatSnapshots.filter { live.contains($0.key) }
+        resourceUsageByPath = resourceUsageByPath.filter { live.contains($0.key) }
         if live.isEmpty {
             aggregateResources = nil
             resourceSamples.removeAll(keepingCapacity: false)
@@ -269,7 +272,11 @@ final class SessionActivityMonitor: ObservableObject {
         Task { [weak self] in await self?.tick() }
     }
 
-    func activity(forPath path: String) -> SessionActivity? { activities[path] }
+    func activity(forPath path: String) -> SessionActivity? {
+        guard var activity = activities[path] else { return nil }
+        activity.resources = resourceUsageByPath[path]
+        return activity
+    }
 
     nonisolated static func heartbeatPathsRequiringPoll(
         paths: [String],
@@ -331,7 +338,7 @@ final class SessionActivityMonitor: ObservableObject {
         let result = await Task.detached(priority: .utility) {
             () -> (
                 [String: SessionActivity], [String: Fingerprint], [String: [ActivityHeartbeat]], Int,
-                [Int32: ProcessResourceSample], ThreadResourceUsage?, Bool
+                [Int32: ProcessResourceSample], [String: ThreadResourceUsage], ThreadResourceUsage?, Bool
             ) in
             let now = Date()
             var heartbeats = ActivityHeartbeatStore.scan(directory: heartbeatDirectory)
@@ -344,7 +351,7 @@ final class SessionActivityMonitor: ObservableObject {
                 ActivityHeartbeatClassifier.isRunning($0, now: now, isProcessAlive: isProcessAlive)
             }
             guard !paths.isEmpty else {
-                return ([:], [:], [:], 0, [:], nil, hasRunningActivity)
+                return ([:], [:], [:], 0, [:], [:], nil, hasRunningActivity)
             }
             let heartbeatPaths = Set(heartbeats.keys)
             let trackedPathSet = Set(paths)
@@ -469,8 +476,7 @@ final class SessionActivityMonitor: ObservableObject {
                         latestCompletedEntryID: completionID,
                         lastStopReason: completionStopReason ?? newest?.stopReason,
                         preview: completionPreview
-                            ?? (completionID == old?.latestCompletedEntryID ? old?.preview : nil),
-                        resources: resolved == .running ? resourceSnapshot.usageByPath[path] : nil
+                            ?? (completionID == old?.latestCompletedEntryID ? old?.preview : nil)
                     )
                     continue
                 }
@@ -504,7 +510,8 @@ final class SessionActivityMonitor: ObservableObject {
             }
             return (
                 states, stamps, nextHeartbeats, selection.nextCursor,
-                resourceSnapshot.samples, resourceSnapshot.aggregateUsage, hasRunningActivity
+                resourceSnapshot.samples, resourceSnapshot.usageByPath,
+                resourceSnapshot.aggregateUsage, hasRunningActivity
             )
         }.value
 
@@ -512,8 +519,9 @@ final class SessionActivityMonitor: ObservableObject {
         heartbeatSnapshots = result.2
         fallbackCursor = result.3
         resourceSamples = result.4
-        aggregateResources = result.5
-        if hasRunningActivity != result.6 { hasRunningActivity = result.6 }
+        resourceUsageByPath = result.5
+        aggregateResources = result.6
+        if hasRunningActivity != result.7 { hasRunningActivity = result.7 }
         if activities != result.0 { activities = result.0 }
     }
 

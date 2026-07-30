@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import PiDesktop
@@ -524,7 +525,27 @@ final class SessionActivityMonitorTests: XCTestCase {
         let monitor = SessionActivityMonitor(isActiveOverride: true, heartbeatDirectory: heartbeatDirectory)
         monitor.setTrackedPaths([file.path])
         try await waitUntil { monitor.activity(forPath: file.path)?.resources != nil }
-        XCTAssertGreaterThan(try XCTUnwrap(monitor.activity(forPath: file.path)?.resources).memoryBytes, 0)
+        let firstUsage = try XCTUnwrap(monitor.activity(forPath: file.path)?.resources)
+        let firstAggregate = try XCTUnwrap(monitor.aggregateResources)
+        XCTAssertGreaterThan(firstUsage.memoryBytes, 0)
+
+        do {
+            var invalidations = 0
+            let cancellable = monitor.objectWillChange.sink { invalidations += 1 }
+            var checksum = 0
+            for value in 0..<1_000_000 { checksum &+= value }
+            XCTAssertNotEqual(checksum, 0)
+            try Data("""
+            {"sessionId":"s","sessionFile":"\(file.path)","pid":\(pid),"state":"running","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","completionId":"old"}
+            """.utf8).write(to: heartbeat, options: .atomic)
+            monitor.tickNow()
+            try await waitUntil {
+                monitor.activity(forPath: file.path)?.resources != firstUsage
+                    && monitor.aggregateResources != firstAggregate
+            }
+            XCTAssertEqual(invalidations, 0, "Resource-only samples must not invalidate observing views")
+            withExtendedLifetime(cancellable) {}
+        }
 
         try FileManager.default.removeItem(at: heartbeat)
         monitor.tickNow()
