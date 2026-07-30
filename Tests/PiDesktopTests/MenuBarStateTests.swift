@@ -92,9 +92,70 @@ final class MenuBarPanelLayoutTests: XCTestCase {
         XCTAssertEqual(MenuBarPanelLayout.anchoredX(clickX: 100, panelWidth: 400, visibleFrame: CGRect(x: 0, y: 0, width: 300, height: 300)), 0)
     }
 
-    func testSessionHeightFitsRowsThenCapsForScrolling() {
-        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 0, maxHeight: 480), 0)
-        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 3, maxHeight: 480), 126)
-        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(count: 50, maxHeight: 300), 300)
+    func testSessionHeightFitsRowsAndSectionHeadersThenCapsForScrolling() {
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(rows: 0, headers: 0, maxHeight: 480), 0)
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(rows: 3, headers: 0, maxHeight: 480), 126)
+        // Three rows under one Running header: the header's own height and gap are counted too.
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(rows: 3, headers: 1, maxHeight: 480), 152)
+        XCTAssertEqual(MenuBarPanelLayout.sessionHeight(rows: 50, headers: 3, maxHeight: 300), 300)
+    }
+}
+
+/// The panel lists the same buckets the sidebar files conversations into, so only its own
+/// selection and row bound are worth testing directly.
+final class MenuBarSectionTests: XCTestCase {
+    private func summary(_ name: String) -> SessionSummary {
+        SessionSummary(
+            id: name,
+            fileURL: URL(fileURLWithPath: "/tmp/\(name).jsonl"),
+            cwd: URL(fileURLWithPath: "/Users/vince/code", isDirectory: true),
+            createdAt: Date(),
+            modifiedAt: Date(),
+            name: name,
+            preview: "p",
+            messageCount: 0,
+            metrics: TokenMetrics()
+        )
+    }
+
+    private func groups(_ sessions: [SessionSummary], automated: Set<String> = [], pullRequest: Set<String> = []) -> [SidebarStatusGroup] {
+        SidebarStatusGroup.groups(
+            sessions,
+            isRunning: { $0.name.hasPrefix("running") },
+            isUnread: { $0.name.hasPrefix("unread") },
+            hasOpenPullRequest: { pullRequest.contains($0.name) },
+            isAutomated: { automated.contains($0.name) },
+            runningAt: \.modifiedAt,
+            modifiedAt: \.modifiedAt
+        )
+    }
+
+    func testOnlyRunningUnreadAndDoneAppearInThatOrder() {
+        let sessions = [summary("done"), summary("unread 1"), summary("running 1"), summary("pr"), summary("scheduled")]
+        let visible = MenuBarPanelLayout.boundedSections(
+            groups(sessions, automated: ["scheduled"], pullRequest: ["pr"])
+        )
+        XCTAssertEqual(visible.sections.map(\.section), [.running, .unread, .done])
+        XCTAssertEqual(visible.sections.flatMap { $0.sessions.map(\.name) }, ["running 1", "unread 1", "done"])
+        XCTAssertEqual(visible.hidden, 0, "Open PRs and Automated are not shown here and are not an overflow either")
+    }
+
+    func testTheGlobalRowBoundIsSharedAcrossSectionsInPriorityOrder() {
+        let limit = MenuBarPanelLayout.sessionDisplayLimit
+        let sessions = (0..<40).map { summary("running \($0)") }
+            + (0..<20).map { summary("unread \($0)") }
+            + (0..<5).map { summary("done \($0)") }
+        let visible = MenuBarPanelLayout.boundedSections(groups(sessions))
+
+        XCTAssertEqual(visible.sections.reduce(0) { $0 + $1.sessions.count }, limit)
+        XCTAssertEqual(visible.sections.map(\.section), [.running, .unread], "Done does not fit, so it does not render an empty header")
+        XCTAssertEqual(visible.sections.map(\.sessions.count), [40, limit - 40])
+        XCTAssertEqual(visible.hidden, 65 - limit)
+    }
+
+    func testEmptyInputProducesNoSectionsAndNoOverflow() {
+        let visible = MenuBarPanelLayout.boundedSections([])
+        XCTAssertTrue(visible.sections.isEmpty)
+        XCTAssertEqual(visible.hidden, 0)
     }
 }
