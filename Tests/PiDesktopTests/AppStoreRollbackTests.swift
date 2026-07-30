@@ -1109,7 +1109,7 @@ final class StatusCacheMergeTests: XCTestCase {
         XCTAssertNil(persistence.state.cachedExtensionStatuses[ExtensionStatusParser.providerQueueKey])
     }
 
-    func testAPartialLiveUpdateNeverErasesTheKnownAccount() throws {
+    func testReadyRuntimeReplacesStaleExtensionStatusCache() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("pi-status-cache-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1117,10 +1117,13 @@ final class StatusCacheMergeTests: XCTestCase {
 
         let persistence = AppPersistence(baseURL: directory)
         persistence.cacheExtensionStatuses([
-            "codex-account": "vince@example.com 7d:22% reset\u{d7}3:5h",
+            "pi-caffeinate": "☕ awake · lid-safe",
+            "removed-extension": "old",
+            "codex-account": "vince@example.com 7d:22% reset×3:5h",
             "fast-priority": "fast"
         ])
         let runtime = FakeRuntime()
+        runtime.delaysStateResponse = true
         let store = AppStore(
             repository: FakeRepository(),
             gitService: FakeGitService(),
@@ -1128,20 +1131,30 @@ final class StatusCacheMergeTests: XCTestCase {
             persistence: persistence,
             activityPresenter: ActivityPresenter()
         )
+        XCTAssertNil(persistence.state.cachedExtensionStatuses["pi-caffeinate"])
 
-        // A runtime that has only reported `mode` so far must not blank the rest of the bar.
-        let event: JSONValue = .object([
+        store.selectedFolder = directory
+        store.prepareComposerOptions()
+        runtime.onEvent?(.object([
             "type": .string("extension_ui_request"),
             "method": .string("setStatus"),
             "statusKey": .string("mode"),
             "statusText": .string("mode:ultra")
-        ])
-        store.handleRPCEventForTesting(event)
+        ]))
 
-        let model = store.statusModel
-        XCTAssertEqual(model.mode, PiMode.ultra)
-        XCTAssertEqual(model.codexAccount?.account, "vince@example.com", "the known account must survive")
-        XCTAssertNotNil(model.fastPriority)
+        // Partial startup events still merge until get_state confirms the complete snapshot.
+        XCTAssertEqual(store.statusModel.codexAccount?.account, "vince@example.com")
+        XCTAssertEqual(persistence.state.cachedExtensionStatuses["removed-extension"], "old")
+
+        runtime.succeed("get_state", data: .object([
+            "isStreaming": .bool(false),
+            "sessionFile": .string(directory.appendingPathComponent("new.jsonl").path),
+            "sessionId": .string("new"),
+            "model": .object(["id": .string("m"), "name": .string("M"), "provider": .string("p")])
+        ]))
+
+        XCTAssertEqual(persistence.state.cachedExtensionStatuses, ["mode": "mode:ultra"])
+        XCTAssertNil(store.statusModel.values["removed-extension"])
     }
 
     func testClearedModeStatusIsNotRetainedByTheComposer() throws {

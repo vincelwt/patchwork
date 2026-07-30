@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The model and thinking controls are the same two views everywhere they appear, so the
@@ -164,6 +165,15 @@ struct ModelPickerControl: View {
     }
 }
 
+enum RuntimePickerLayout {
+    static func labelWidth(_ text: String, maximum: CGFloat?) -> CGFloat? {
+        guard let maximum else { return nil }
+        let font = NSFont.systemFont(ofSize: PiFont.size)
+        let intrinsic = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        return min(intrinsic, maximum)
+    }
+}
+
 /// One label treatment for both pickers so the two controls stay on the same baseline grid.
 private struct PickerLabel: View {
     let text: String
@@ -176,6 +186,9 @@ private struct PickerLabel: View {
             .foregroundStyle(.secondary)
             .lineLimit(1)
             .truncationMode(.middle)
-            .frame(maxWidth: maxWidth, alignment: .trailing)
+            // A flexible max-width frame expands to its cap when the status bar gets tight,
+            // putting the unused width before this trailing label. Use its bounded intrinsic
+            // width instead so thinking and model stay adjacent while long names still truncate.
+            .frame(width: RuntimePickerLayout.labelWidth(text, maximum: maxWidth), alignment: .trailing)
     }
 }
