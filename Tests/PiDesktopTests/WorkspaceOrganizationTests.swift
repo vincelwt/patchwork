@@ -167,6 +167,24 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertEqual(assignments["/tmp/leaf-session.jsonl"], leaf.id, "A session's assignment survives its folder's parent being deleted")
     }
 
+    func testDeleteFolderPromotesNestedProjectsToItsVirtualParent() throws {
+        var folders: [VirtualFolder] = []
+        var assignments: [String: String] = [:]
+        let parent = try XCTUnwrap(WorkspaceOrganization.create(named: "Parent", in: &folders))
+        let child = try XCTUnwrap(WorkspaceOrganization.create(
+            named: "Child", parentID: WorkspaceOrganization.groupID(forVirtualFolderID: parent.id), in: &folders
+        ))
+        var projectAssignments = ["/tmp/client": child.id]
+
+        XCTAssertTrue(WorkspaceOrganization.delete(
+            id: child.id,
+            folders: &folders,
+            assignments: &assignments,
+            projectAssignments: &projectAssignments
+        ))
+        XCTAssertEqual(projectAssignments["/tmp/client"], parent.id)
+    }
+
     func testDeleteFolderInsideProjectPromotesChildToProject() throws {
         var folders: [VirtualFolder] = []
         var assignments: [String: String] = [:]
@@ -342,6 +360,73 @@ final class WorkspaceOrganizationTests: XCTestCase {
 
         let topGroup = try XCTUnwrap(snapshot.activeGroups.first { $0.virtualFolderID == topLevel.id })
         XCTAssertEqual(topGroup.sessions.map(\.id), ["top"])
+    }
+
+    func testRealProjectsNestInsideAVirtualFolderAndKeepTheirIdentity() throws {
+        let collection = VirtualFolder(id: "clients", name: "Clients")
+        let sessions = [
+            summary(id: "thread-alpha", cwd: "/tmp/alpha"),
+            summary(id: "thread-beta", cwd: "/tmp/beta")
+        ]
+        let snapshot = SidebarSnapshot(
+            sessions: sessions,
+            query: "",
+            virtualFolders: [collection],
+            projectAssignments: ["/tmp/alpha": collection.id, "/tmp/beta": collection.id]
+        )
+
+        let root = try XCTUnwrap(snapshot.activeGroups.first)
+        XCTAssertEqual(root.virtualFolderID, collection.id)
+        XCTAssertEqual(Set(root.children.map(\.path)), ["/tmp/alpha", "/tmp/beta"])
+        XCTAssertEqual(Set(root.children.flatMap(\.sessions).map(\.id)), ["thread-alpha", "thread-beta"])
+        XCTAssertEqual(
+            WorkspaceOrganization.categorization(
+                of: sessions[0],
+                folders: [collection],
+                assignments: [:],
+                projectAssignments: ["/tmp/alpha": collection.id]
+            ),
+            ["Clients", "alpha", "thread-alpha"]
+        )
+    }
+
+    func testProjectAndVirtualFolderMovesRejectAlternatingCycles() throws {
+        let project = "/tmp/project-a"
+        var folders = [VirtualFolder(id: "inside", name: "Inside", parentID: project)]
+        var projectAssignments: [String: String] = [:]
+
+        XCTAssertFalse(WorkspaceOrganization.moveProject(
+            path: project,
+            to: "inside",
+            folders: folders,
+            assignments: &projectAssignments
+        ))
+        XCTAssertTrue(projectAssignments.isEmpty)
+
+        folders[0].parentID = nil
+        XCTAssertTrue(WorkspaceOrganization.moveProject(
+            path: project,
+            to: "inside",
+            folders: folders,
+            assignments: &projectAssignments
+        ))
+        XCTAssertFalse(WorkspaceOrganization.reparent(
+            id: "inside",
+            to: project,
+            in: &folders,
+            projectAssignments: projectAssignments
+        ))
+    }
+
+    @MainActor
+    func testProjectFolderAssignmentPersistsAcrossReload() throws {
+        let base = temporaryDirectory("ProjectFolderPersistence")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let persistence = AppPersistence(baseURL: base)
+        let folder = try XCTUnwrap(persistence.createVirtualFolder(named: "Clients"))
+
+        XCTAssertTrue(persistence.moveProject(path: "/tmp/client-a", toVirtualFolder: folder.id))
+        XCTAssertEqual(AppPersistence(baseURL: base).state.projectFolderAssignments["/tmp/client-a"], folder.id)
     }
 
     @MainActor

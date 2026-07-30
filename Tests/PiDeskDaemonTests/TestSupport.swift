@@ -152,9 +152,15 @@ enum TestSupport {
     }
 
     /// Writes the app-owned parts of `state.json` this daemon reads (never writes).
-    static func writeAppState(in directory: URL, folders: String = "[]", assignments: [String: String] = [:]) {
+    static func writeAppState(
+        in directory: URL,
+        folders: String = "[]",
+        assignments: [String: String] = [:],
+        projectAssignments: [String: String] = [:]
+    ) {
         let pairs = assignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
-        let json = "{\"virtualFolders\":\(folders),\"virtualFolderAssignments\":{\(pairs)}}"
+        let projectPairs = projectAssignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
+        let json = "{\"virtualFolders\":\(folders),\"virtualFolderAssignments\":{\(pairs)},\"projectFolderAssignments\":{\(projectPairs)}}"
         try? json.write(to: directory.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
     }
 

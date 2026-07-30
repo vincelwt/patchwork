@@ -95,6 +95,31 @@ test("folders nest inside folders and inside project groups, with subtree counts
   assert.deepEqual(project.threads.map((t) => t.id), ["c"]);
 });
 
+test("real projects nest inside virtual folders and can host virtual children", () => {
+  const groups = buildThreadTree([
+    thread("a", "/Users/x/client-a"),
+    thread("b", "/Users/x/client-b")
+  ], {
+    folders: [
+      { id: "clients", name: "Clients", parentId: null, depth: 0 },
+      { id: "docs", name: "Docs", parentId: "/Users/x/client-a", depth: 1 }
+    ],
+    assignments: {},
+    projectAssignments: {
+      "/Users/x/client-a": "clients",
+      "/Users/x/client-b": "clients"
+    }
+  });
+
+  assert.deepEqual(groups.map((group) => group.name), ["Clients"]);
+  assert.deepEqual(groups[0].children.map((group) => group.name), ["client-a", "client-b"]);
+  assert.deepEqual(groups[0].children[0].children.map((group) => group.name), ["Docs"]);
+  assert.deepEqual(
+    flattenTree(groups).filter((row) => row.kind === "thread").map((row) => row.thread.id).sort(),
+    ["a", "b"]
+  );
+});
+
 test("flattening respects collapse state and its own depth guard", () => {
   const groups = buildThreadTree([thread("a", "/Users/x/code")], {
     folders: [{ id: "f1", name: "Review", parentId: null, depth: 0 }],

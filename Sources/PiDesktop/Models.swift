@@ -508,9 +508,11 @@ struct PersistedAppState: Codable {
     /// Last known extension statuses (already ANSI-stripped) so the footer is populated before
     /// any runtime attaches.
     var cachedExtensionStatuses: [String: String] = [:]
-    /// App-only organization. Keys are standardized session-file paths, never Pi JSONL IDs.
+    /// App-only organization. Conversation keys are standardized session-file paths; project
+    /// keys are standardized real-directory paths. Values are virtual folder IDs.
     var virtualFolders: [VirtualFolder] = []
     var virtualFolderAssignments: [String: String] = [:]
+    var projectFolderAssignments: [String: String] = [:]
     /// App-created worktree cwd → project folder shown by the desktop organization. Pi keeps the
     /// real worktree cwd in its session; this metadata changes presentation only.
     var managedWorktreeProjects: [String: String] = [:]
@@ -544,6 +546,10 @@ struct PersistedAppState: Codable {
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
         virtualFolders = try container.decodeIfPresent([VirtualFolder].self, forKey: .virtualFolders) ?? []
         virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
+        let projectAssignments = try container.decodeIfPresent([String: String].self, forKey: .projectFolderAssignments) ?? [:]
+        projectFolderAssignments = Dictionary(uniqueKeysWithValues: projectAssignments
+            .sorted { $0.key < $1.key }
+            .suffix(Self.maxProjectFolderAssignments))
         let worktreeProjects = try container.decodeIfPresent([String: String].self, forKey: .managedWorktreeProjects) ?? [:]
         managedWorktreeProjects = Dictionary(uniqueKeysWithValues: worktreeProjects
             .sorted { $0.key < $1.key }
@@ -568,7 +574,18 @@ struct PersistedAppState: Codable {
 
     static let maxRetainedCompletionSessions = 2_000
     static let maxManagedTurnRecoveries = 32
+    static let maxProjectFolderAssignments = 2_000
     static let maxManagedWorktreeProjects = 2_000
+
+    mutating func setProjectFolderAssignment(projectPath: String, folderID: String?) {
+        if let folderID { projectFolderAssignments[projectPath] = folderID }
+        else { projectFolderAssignments.removeValue(forKey: projectPath) }
+        let overflow = projectFolderAssignments.count - Self.maxProjectFolderAssignments
+        guard overflow > 0 else { return }
+        for key in projectFolderAssignments.keys.filter({ $0 != projectPath }).sorted().prefix(overflow) {
+            projectFolderAssignments.removeValue(forKey: key)
+        }
+    }
 
     mutating func setManagedWorktreeProject(worktreePath: String, projectPath: String?) {
         if let projectPath { managedWorktreeProjects[worktreePath] = projectPath }
