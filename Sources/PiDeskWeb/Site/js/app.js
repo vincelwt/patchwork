@@ -126,6 +126,29 @@ function sortByUpdatedAt(list) {
   return [...list].sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
 }
 
+const terminalRunStatuses = new Set(["ok", "failed", "skipped", "timeout", "interrupted"]);
+const pollDelay = () => new Promise((resolve) => setTimeout(resolve, 750));
+
+// Older daemons return `pending:<run>` for a message-bearing create. That value is deliberately
+// not a thread id; resolve it through the documented run endpoint before routing to a detail.
+async function waitForCreatedThread(runId) {
+  while (true) {
+    let run;
+    try {
+      ({ run } = await api.run(runId));
+      if (run?.threadId) return (await api.thread(run.threadId, 0)).thread;
+      if (terminalRunStatuses.has(run?.status)) {
+        throw new ApiError(409, "create_failed", run.error || "Pi could not create this thread.");
+      }
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.code === "create_failed")) throw err;
+      // A dropped phone connection after creation must not invite a second first prompt. Keep
+      // resolving the accepted run; the global banner already explains that the Mac is offline.
+    }
+    await pollDelay();
+  }
+}
+
 // ---------- data loading ----------
 
 function loadThreads() {
@@ -238,12 +261,14 @@ const actions = {
     setState({ collapsedGroups: collapsed });
   },
 
-  createThread(body) {
-    return api.createThread(body).then(({ thread }) => {
-      setState((s) => ({ threads: sortByUpdatedAt(upsertBy(s.threads, thread, "id")) }));
-      go(`/thread/${encodeURIComponent(thread.id)}`, { replace: true });
-      return thread;
-    });
+  async createThread(body) {
+    const response = await api.createThread(body);
+    const thread = response.thread?.id?.startsWith("pending:") && response.runId
+      ? await waitForCreatedThread(response.runId)
+      : response.thread;
+    setState((s) => ({ threads: sortByUpdatedAt(upsertBy(s.threads, thread, "id")) }));
+    if (location.pathname === "/new") go(`/thread/${encodeURIComponent(thread.id)}`, { replace: true });
+    return thread;
   },
 
   sendMessage: (id, body) => api.sendMessage(id, body),

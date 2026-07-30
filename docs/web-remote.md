@@ -174,6 +174,23 @@ nothing is running. A refresh that returns an identical transcript does not touc
 so nothing re-animates, disclosures stay open, and a reader who has scrolled up is not dragged back
 to the bottom. The elapsed clock updates as text, without repainting the turn.
 
+## Creating a thread
+
+A first message never becomes a fake thread route. Current daemons resolve the real Pi session
+before returning and then queue the prompt against it. When paired with an older daemon that still
+returns `pending:<run>`, the browser follows `GET /v1/runs/{runId}` and opens the conversation only
+once that run reports the real session id; a dropped connection keeps resolving the accepted run
+instead of inviting a duplicate first prompt.
+
+## Model and thinking controls
+
+The row above the composer shows native select menus for the current model and thinking level,
+populated from Pi's exact available choices. Changes use Pi's own `set_model` and
+`set_thinking_level` RPCs and apply to later provider work in the same conversation. A daemon-owned
+live turn shares its existing Pi process; an idle thread gets one short-lived reserved attachment.
+If the Mac app owns the runtime, the row reports that conflict and offers Retry rather than racing
+two processes against one session. Older daemons without these endpoints simply hide the row.
+
 ## Sending a message
 
 A send is optimistic. `POST /v1/threads/{id}/messages` only *accepts* the text; Pi appends the

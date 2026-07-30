@@ -949,6 +949,44 @@ details.advanced[open] summary { color: var(--text); }
 /* The keyboard already covers the home indicator, so its inset would double the gap. */
 #app[data-keyboard="open"] .composer-dock { padding-bottom: 0; }
 
+.runtime-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--pad-r) var(--space-2) var(--pad-l);
+  border-bottom: 1px solid var(--hairline);
+  min-width: 0;
+}
+.runtime-control {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.runtime-control > span {
+  font-size: var(--fs-caption);
+  color: var(--text-tertiary);
+}
+.runtime-control select {
+  min-height: 34px;
+  padding: 5px var(--space-5) 5px var(--space-2);
+  border-radius: var(--radius-s);
+  font-size: var(--fs-small);
+}
+.runtime-model { flex: 1; }
+.runtime-thinking { width: 106px; flex: none; }
+.runtime-status {
+  align-self: center;
+  min-width: 0;
+  font-size: var(--fs-caption);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.runtime-status.runtime-failed { color: var(--red); }
+.runtime-controls > .link-btn { align-self: center; min-height: 34px; }
+
 .run-status {
   display: flex;
   align-items: center;

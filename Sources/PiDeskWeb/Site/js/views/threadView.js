@@ -81,6 +81,10 @@ export function renderThreadView(state, actions, threadId) {
   const recentRuns = new Map();
   let renderedInteractionCards = new Map();
   let renderedInteractionSignature = null;
+  let runtime = null;
+  let runtimeLoading = false;
+  let runtimeError = null;
+  let runtimeUnavailable = false;
   let disposed = false;
   let closeLightbox = null;
   // One observer for every thumbnail on screen: images load when they scroll into view, not all
@@ -152,6 +156,19 @@ export function renderThreadView(state, actions, threadId) {
     h("button", { class: "link-btn", type: "button", onclick: () => onSend(null, "steer") }, "Send as steer (interrupt)")
   );
 
+  const modelSelect = h("select", { "aria-label": "Model", onchange: onModelChange, disabled: true });
+  const thinkingSelect = h("select", { "aria-label": "Thinking level", onchange: onThinkingChange, disabled: true });
+  const runtimeStatus = h("span", { class: "runtime-status", role: "status", "aria-live": "polite" }, "Loading\u2026");
+  const runtimeRetry = h("button", { class: "link-btn", type: "button", hidden: true, onclick: loadRuntime }, "Retry");
+  const runtimeControls = h(
+    "div",
+    { class: "runtime-controls", "aria-label": "Runtime controls" },
+    h("label", { class: "runtime-control runtime-model" }, h("span", null, "Model"), modelSelect),
+    h("label", { class: "runtime-control runtime-thinking" }, h("span", null, "Thinking"), thinkingSelect),
+    runtimeStatus,
+    runtimeRetry
+  );
+
   const runStatus = h(
     "div",
     { class: "run-status", role: "status", hidden: true },
@@ -172,7 +189,7 @@ export function renderThreadView(state, actions, threadId) {
       archiveBtn
     ),
     scroll,
-    h("div", { class: "composer-dock" }, runStatus, composerError, composerMenu, composerForm)
+    h("div", { class: "composer-dock" }, runtimeControls, runStatus, composerError, composerMenu, composerForm)
   );
 
   // The bridge images use to reach this screen's lifetime: an observer that stops with the view,
@@ -196,6 +213,7 @@ export function renderThreadView(state, actions, threadId) {
   paintSkeleton();
   loadMessages();
   loadInteractions();
+  loadRuntime();
   actions.markRead(threadId);
 
   function onInput() {
@@ -204,6 +222,91 @@ export function renderThreadView(state, actions, threadId) {
     textarea.style.height = "auto";
     textarea.style.height = `${textarea.scrollHeight}px`;
     sendBtn.disabled = textarea.value.trim().length === 0;
+  }
+
+  function loadRuntime() {
+    if (disposed || runtimeLoading || runtimeUnavailable) return Promise.resolve();
+    runtimeLoading = true;
+    runtimeError = null;
+    paintRuntime();
+    return api
+      .threadRuntime(threadId)
+      .then(({ runtime: fresh }) => {
+        if (!disposed) runtime = fresh;
+      })
+      .catch((err) => {
+        if (err?.status === 404) runtimeUnavailable = true; // older daemon: keep the thread usable
+        else runtimeError = describeError(err);
+      })
+      .finally(() => {
+        runtimeLoading = false;
+        paintRuntime();
+      });
+  }
+
+  function onModelChange() {
+    let selected;
+    try {
+      selected = JSON.parse(modelSelect.value);
+    } catch {
+      return paintRuntime();
+    }
+    updateRuntime(api.setThreadModel(threadId, { provider: selected[0], modelId: selected[1] }));
+  }
+
+  function onThinkingChange() {
+    updateRuntime(api.setThreadThinking(threadId, { level: thinkingSelect.value }));
+  }
+
+  function updateRuntime(request) {
+    if (runtimeLoading) return;
+    runtimeLoading = true;
+    runtimeError = null;
+    paintRuntime();
+    request
+      .then(({ runtime: fresh }) => {
+        runtime = fresh;
+      })
+      .catch((err) => {
+        runtimeError = describeError(err);
+      })
+      .finally(() => {
+        runtimeLoading = false;
+        paintRuntime();
+      });
+  }
+
+  function paintRuntime() {
+    runtimeControls.hidden = runtimeUnavailable;
+    if (runtimeUnavailable) return;
+
+    const models = [...(runtime?.availableModels || [])];
+    if (runtime?.provider && runtime?.modelId && !models.some((model) => model.provider === runtime.provider && model.modelId === runtime.modelId)) {
+      models.unshift({ provider: runtime.provider, modelId: runtime.modelId, name: runtime.modelName || runtime.modelId });
+    }
+    modelSelect.replaceChildren(
+      ...models.map((model) =>
+        h(
+          "option",
+          { value: JSON.stringify([model.provider, model.modelId]), title: `${model.provider} / ${model.modelId}` },
+          `${model.name || model.modelId} \u00b7 ${model.provider}/${model.modelId}`
+        )
+      )
+    );
+    if (runtime?.provider && runtime?.modelId) modelSelect.value = JSON.stringify([runtime.provider, runtime.modelId]);
+
+    const levels = [...(runtime?.availableThinkingLevels || [])];
+    if (runtime?.thinkingLevel && !levels.includes(runtime.thinkingLevel)) levels.unshift(runtime.thinkingLevel);
+    thinkingSelect.replaceChildren(...levels.map((level) => h("option", { value: level }, level.charAt(0).toUpperCase() + level.slice(1))));
+    if (runtime?.thinkingLevel) thinkingSelect.value = runtime.thinkingLevel;
+
+    modelSelect.disabled = runtimeLoading || models.length === 0;
+    thinkingSelect.disabled = runtimeLoading || levels.length === 0;
+    runtimeStatus.textContent = runtimeError || (runtimeLoading ? (runtime ? "Updating\u2026" : "Loading\u2026") : "");
+    runtimeStatus.classList.toggle("runtime-failed", !!runtimeError);
+    runtimeStatus.title = runtimeError || "";
+    runtimeStatus.hidden = !runtimeStatus.textContent;
+    runtimeRetry.hidden = !runtimeError;
   }
 
   function onComposerKeydown(event) {
@@ -690,6 +793,9 @@ export function renderThreadView(state, actions, threadId) {
           scheduleRefetch();
         } else if (run.threadId === threadId) {
           scheduleRefetch();
+        }
+        if (run.threadId === threadId && ["ok", "failed", "skipped", "timeout", "interrupted"].includes(run.status)) {
+          loadRuntime();
         }
       }
 

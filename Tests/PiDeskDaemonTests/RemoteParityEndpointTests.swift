@@ -128,6 +128,120 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertTrue(runtime.delivered.isEmpty, "an ordinary prompt still queues, exactly as before")
     }
 
+    // MARK: - Thread creation and runtime controls
+
+    func testCreateWithAFirstMessageReturnsARealThreadBeforeQueueingThePrompt() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "created-1", cwd: directory.path)
+        let created = PiThread(
+            id: "created-1", path: file.path, name: "Web thread", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let threadRPC = FakeThreadRPCService(thread: created)
+        executor = FakeRunExecutor()
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","name":"Web thread","message":"hello","mode":"smart"}"#
+        )
+        XCTAssertEqual(response.status, 202)
+        let decoded = try decode(CreateThreadResponse.self, response)
+        XCTAssertEqual(decoded.thread.id, "created-1")
+        XCTAssertFalse(decoded.thread.id.hasPrefix("pending:"))
+        XCTAssertEqual(threadRPC.created, 1)
+
+        try await settle()
+        let job = try XCTUnwrap(executor.executedJobs.first)
+        guard case let .existingThread(threadId, path, cwd) = job.target else {
+            return XCTFail("the first prompt must target the resolved session")
+        }
+        XCTAssertEqual(threadId, "created-1")
+        XCTAssertEqual(path, file.path)
+        XCTAssertEqual(cwd, directory.path)
+        XCTAssertEqual(job.prompt, "hello")
+        XCTAssertEqual(job.mode, "smart")
+    }
+
+    func testRuntimeControlsUseTheAlreadyLivePiSession() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let runtime = FakeLiveRuntime()
+        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+
+        let loaded = try decode(
+            ThreadRuntimeResponse.self,
+            await send("GET", "/v1/threads/sess-1/runtime")
+        ).runtime
+        XCTAssertEqual(loaded.modelId, "gpt-5")
+        XCTAssertEqual(loaded.thinkingLevel, "high")
+        XCTAssertEqual(loaded.availableModels.map(\.name), ["GPT-5", "Sonnet"])
+        XCTAssertTrue(loaded.running)
+
+        let changed = await send(
+            "POST", "/v1/threads/sess-1/runtime/model",
+            body: #"{"provider":"anthropic","modelId":"sonnet"}"#
+        )
+        XCTAssertEqual(changed.status, 200)
+        let set = try XCTUnwrap(runtime.requests.first { $0.type == "set_model" })
+        XCTAssertEqual(set.payload["provider"]?.stringValue, "anthropic")
+        XCTAssertEqual(set.payload["modelId"]?.stringValue, "sonnet")
+    }
+
+    func testIdleRuntimeControlsUseOneReservedThreadSession() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "sess-idle", cwd: directory.path)
+        let thread = PiThread(
+            id: "sess-idle", path: file.path, name: "Idle", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let threadRPC = FakeThreadRPCService(
+            thread: thread,
+            runtime: ThreadRuntimeState(
+                provider: "openai", modelId: "gpt-5", modelName: "GPT-5", thinkingLevel: "off",
+                availableModels: [ThreadRuntimeModel(provider: "openai", modelId: "gpt-5", name: "GPT-5")],
+                availableThinkingLevels: ["off", "high"]
+            )
+        )
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let loaded = await send("GET", "/v1/threads/sess-idle/runtime")
+        XCTAssertEqual(loaded.status, 200)
+        let changed = await send(
+            "POST", "/v1/threads/sess-idle/runtime/thinking", body: #"{"level":"high"}"#
+        )
+        XCTAssertEqual(changed.status, 200)
+        XCTAssertEqual(threadRPC.thinkingSets, ["high"])
+        let stillBusy = await core.runQueue.isThreadBusy("sess-idle")
+        XCTAssertFalse(stillBusy, "the short-lived reservation is always released")
+    }
+
+    func testRuntimeControlsRespectTheNativeAppsLease() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        _ = await core.leaseStore.acquire(threadId: "sess-1", owner: "app", ttlSeconds: 60)
+        let response = await send("GET", "/v1/threads/sess-1/runtime")
+        XCTAssertEqual(response.status, 409)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("thread_leased"))
+    }
+
+    func testNativeLeaseCannotStealAWebRuntimeLease() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        _ = await core.leaseStore.acquire(threadId: "sess-1", owner: "web-runtime", ttlSeconds: 60)
+
+        let response = await send(
+            "POST", "/v1/threads/sess-1/lease",
+            body: #"{"owner":"app","ttlSeconds":60}"#
+        )
+        XCTAssertEqual(response.status, 409)
+        let current = await core.leaseStore.current(threadId: "sess-1")
+        XCTAssertEqual(current?.owner, "web-runtime")
+    }
+
     // MARK: - Replay protection
 
     func testRepeatingASubmissionReplaysTheAnswerInsteadOfPromptingPiTwice() async throws {

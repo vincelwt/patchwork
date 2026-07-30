@@ -15,7 +15,7 @@ enum LiveDelivery: Sendable, Equatable {
 
 /// The narrow slice of a running `PiRPCSession` that steering needs. A protocol purely so tests
 /// can exercise the registry and the send handler with a fake instead of a real `pi` process.
-protocol LiveRuntimeHandle: Sendable {
+protocol LiveRuntimeHandle: RuntimeRequesting {
     /// `command` is Pi's own RPC verb (`steer` or `follow_up`). Throws only when the write itself
     /// failed, which is the one case a caller may safely fall back to the queue from.
     func deliver(command: String, message: String) async throws -> LiveDelivery
@@ -35,6 +35,14 @@ struct PiSessionRuntimeHandle: LiveRuntimeHandle {
         }
         guard response["success"]?.boolValue == false else { return .acknowledged }
         return .rejected(response["error"]?.stringValue ?? "Pi rejected the message.")
+    }
+
+    func request(type: String, payload: [String: PiJSONValue]) async throws -> PiJSONValue {
+        let id = try session.send(type: type, payload: payload)
+        guard let response = await session.awaitCachedResponse(id: id, timeout: 30) else {
+            throw RunnerError.timedOut(afterSeconds: 30)
+        }
+        return response
     }
 }
 
@@ -183,6 +191,23 @@ final class LiveSessionRegistry: @unchecked Sendable {
         }
     }
 
+    /// Holds the live process across a complete runtime query/mutation, so a settle event cannot
+    /// stop Pi between `set_model` and the authoritative state/options refresh that follows it.
+    func withRuntime<T: Sendable>(
+        threadID: String,
+        operation: @Sendable (RuntimeRequesting) async throws -> T
+    ) async throws -> T? {
+        guard let entry = reserveRuntime(threadID: threadID) else { return nil }
+        do {
+            let result = try await operation(entry.handle)
+            releaseRuntime(entry)
+            return result
+        } catch {
+            releaseRuntime(entry)
+            throw error
+        }
+    }
+
     /// How long a run ending on a timeout or an abort may wait for deliveries already mid-write.
     /// A healthy Pi acknowledges in milliseconds and a wedged one will not answer however long
     /// this is, so the bound is kept small: it must stay well inside the shutdown budget the app
@@ -235,6 +260,17 @@ final class LiveSessionRegistry: @unchecked Sendable {
         }
         entry.inFlight += 1
         return Reservation(entry: entry, holdsCredit: needsCredit)
+    }
+
+    private func reserveRuntime(threadID: String) -> Entry? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[threadID], entry.admitting else { return nil }
+        entry.inFlight += 1
+        return entry
+    }
+
+    private func releaseRuntime(_ entry: Entry) {
+        lock.lock(); entry.inFlight -= 1; lock.unlock()
     }
 
     /// Decides, under the lock, whether this delivery owes the run another turn.
