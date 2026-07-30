@@ -50,6 +50,19 @@ final class LeaseStoreTests: XCTestCase {
         XCTAssertEqual(ids, ["still-leased"])
     }
 
+    func testAcquireIfAvailableRenewsTheOwnerButNeverStealsAnotherRuntime() async {
+        let store = LeaseStore()
+        let first = await store.acquireIfAvailable(threadId: "t1", owner: "app", ttlSeconds: 60)
+        let renewed = await store.acquireIfAvailable(threadId: "t1", owner: "app", ttlSeconds: 120)
+        let stolen = await store.acquireIfAvailable(threadId: "t1", owner: "web", ttlSeconds: 60)
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(renewed)
+        XCTAssertNil(stolen)
+        let current = await store.current(threadId: "t1")
+        XCTAssertEqual(current?.owner, "app")
+    }
+
     func testReacquiringOverwritesTheOwnerAndExpiry() async {
         let store = LeaseStore()
         _ = await store.acquire(threadId: "t1", owner: "first", ttlSeconds: 60)

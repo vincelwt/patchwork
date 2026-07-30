@@ -50,34 +50,63 @@ enum ThreadHandlers {
                     throw DaemonHTTPError.badRequest(code: "invalid_cwd", message: "cwd must be an existing directory.")
                 }
                 let cwdURL = URL(fileURLWithPath: cwd, isDirectory: true)
-
-                guard let message = body.message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
-                    // No message: created idle, resolved synchronously, nothing queued.
-                    let service = ThreadCreationService(logger: core.logger)
-                    do {
-                        let thread = try await service.createIdle(cwd: cwdURL, name: body.name)
-                        return .json(CreateThreadResponse(thread: thread, runId: nil), status: 201)
-                    } catch let error as RunnerError {
-                        throw DaemonHTTPError.conflict(code: "create_failed", message: error.localizedDescription)
-                    }
+                let thread: PiThread
+                do {
+                    // Resolve the real Pi session before responding. A `pending:<run>` id is not
+                    // a thread and made the web client navigate straight into a guaranteed 404.
+                    thread = try await core.threadRPC.createIdle(cwd: cwdURL, name: body.name)
+                } catch let error as RunnerError {
+                    throw DaemonHTTPError.conflict(code: "create_failed", message: error.localizedDescription)
                 }
 
-                // A message is provided: the real thread identity is not known until the run
-                // actually starts, so this responds with a placeholder and a `runId` the caller
-                // polls (`GET /v1/runs/{runId}`, whose `threadId` is filled in once resolved).
+                guard let message = body.message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
+                    return .json(CreateThreadResponse(thread: thread, runId: nil), status: 201)
+                }
+
                 let job = RunJob(
                     id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
-                    target: .newThread(cwd: cwdURL.standardizedFileURL.path, namePattern: body.name),
+                    target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd),
                     prompt: message, mode: body.mode, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
                 )
                 await core.runQueue.enqueue(job)
-                let now = Date()
-                let placeholder = PiThread(
-                    id: "pending:\(job.id)", path: "", name: body.name?.isEmpty == false ? body.name! : "Untitled conversation",
-                    cwd: cwdURL.standardizedFileURL.path, folder: cwdURL.standardizedFileURL.lastPathComponent,
-                    createdAt: now, updatedAt: now, preview: message
-                )
-                return .json(CreateThreadResponse(thread: placeholder, runId: job.id), status: 202)
+                return .json(CreateThreadResponse(thread: thread, runId: job.id), status: 202)
+            },
+
+            Route("GET", "/v1/threads/:id/runtime") { _, params in
+                let thread = try await requireThread(core, params)
+                return .json(ThreadRuntimeResponse(runtime: try await runtimeState(core, thread: thread)))
+            },
+
+            Route("POST", "/v1/threads/:id/runtime/model") { request, params in
+                let thread = try await requireThread(core, params)
+                let body = try request.decodeJSON(SetThreadModelRequest.self)
+                let provider = try boundedRuntimeValue(body.provider, field: "provider")
+                let modelId = try boundedRuntimeValue(body.modelId, field: "modelId")
+                let runtime = try await mutateRuntime(core, thread: thread) { target, running in
+                    try await ThreadRuntimeCommands.setModel(
+                        using: target, provider: provider, modelId: modelId, running: running
+                    )
+                } idle: {
+                    try await core.threadRPC.setModel(
+                        cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path),
+                        provider: provider, modelId: modelId
+                    )
+                }
+                return .json(ThreadRuntimeResponse(runtime: runtime))
+            },
+
+            Route("POST", "/v1/threads/:id/runtime/thinking") { request, params in
+                let thread = try await requireThread(core, params)
+                let body = try request.decodeJSON(SetThreadThinkingRequest.self)
+                let level = try boundedRuntimeValue(body.level, field: "level", max: 64)
+                let runtime = try await mutateRuntime(core, thread: thread) { target, running in
+                    try await ThreadRuntimeCommands.setThinkingLevel(using: target, level: level, running: running)
+                } idle: {
+                    try await core.threadRPC.setThinkingLevel(
+                        cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path), level: level
+                    )
+                }
+                return .json(ThreadRuntimeResponse(runtime: runtime))
             },
 
             Route("POST", "/v1/threads/:id/messages") { request, params in
@@ -167,9 +196,8 @@ enum ThreadHandlers {
                 }
                 // Renaming goes through Pi's own `set_session_name` RPC — Pi appends the new
                 // `session_info` entry itself, so this never touches a Pi JSONL file directly.
-                let service = ThreadCreationService(logger: core.logger)
                 do {
-                    try await service.rename(cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path), name: clean)
+                    try await core.threadRPC.rename(cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path), name: clean)
                 } catch let error as RunnerError {
                     throw DaemonHTTPError.conflict(code: "rename_failed", message: error.localizedDescription)
                 }
@@ -191,10 +219,89 @@ enum ThreadHandlers {
                     await core.leaseStore.release(threadId: thread.id, owner: body.owner)
                     return .json(LeaseResponse(leased: false, owner: nil, expiresAt: nil))
                 }
-                let lease = await core.leaseStore.acquire(threadId: thread.id, owner: body.owner, ttlSeconds: body.ttlSeconds)
+                guard let lease = await core.leaseStore.acquireIfAvailable(
+                    threadId: thread.id, owner: body.owner, ttlSeconds: body.ttlSeconds
+                ) else {
+                    throw DaemonHTTPError.conflict(
+                        code: "thread_leased", message: "Another runtime is already attached to this thread."
+                    )
+                }
                 return .json(LeaseResponse(leased: true, owner: lease.owner, expiresAt: lease.expiresAt))
             }
         ]
+    }
+
+    private static func runtimeState(_ core: DaemonCore, thread: PiThread) async throws -> ThreadRuntimeState {
+        try await mutateRuntime(core, thread: thread) { target, running in
+            try await ThreadRuntimeCommands.snapshot(using: target, running: running)
+        } idle: {
+            try await core.threadRPC.runtimeSnapshot(
+                cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path)
+            )
+        }
+    }
+
+    /// Prefer the daemon's already-running Pi process. Otherwise reserve the idle thread in the
+    /// run queue while a short-lived setter/query session is attached.
+    private static func mutateRuntime(
+        _ core: DaemonCore,
+        thread: PiThread,
+        live: @Sendable (RuntimeRequesting, Bool) async throws -> ThreadRuntimeState,
+        idle: @Sendable () async throws -> ThreadRuntimeState
+    ) async throws -> ThreadRuntimeState {
+        if await core.leaseStore.isLeased(threadId: thread.id) {
+            throw DaemonHTTPError.conflict(
+                code: "thread_leased", message: "The app is currently attached to this thread's runtime."
+            )
+        }
+
+        do {
+            if let state = try await core.liveSessions.withRuntime(threadID: thread.id, operation: { target in
+                try await live(target, true)
+            }) {
+                return state
+            }
+        } catch {
+            throw DaemonHTTPError.conflict(code: "runtime_failed", message: runtimeErrorMessage(error))
+        }
+
+        guard !thread.running, await core.runQueue.reserveRuntime(threadID: thread.id) else {
+            throw DaemonHTTPError.conflict(code: "thread_busy", message: "Runtime controls are temporarily busy. Try again in a moment.")
+        }
+        let leaseOwner = "web-runtime-\(UUID().uuidString)"
+        guard await core.leaseStore.acquireIfAvailable(
+            threadId: thread.id, owner: leaseOwner, ttlSeconds: 180
+        ) != nil else {
+            await core.runQueue.releaseRuntime(threadID: thread.id)
+            throw DaemonHTTPError.conflict(
+                code: "thread_leased", message: "The app is currently attached to this thread's runtime."
+            )
+        }
+
+        do {
+            let state = try await idle()
+            await core.leaseStore.release(threadId: thread.id, owner: leaseOwner)
+            await core.runQueue.releaseRuntime(threadID: thread.id)
+            return state
+        } catch {
+            await core.leaseStore.release(threadId: thread.id, owner: leaseOwner)
+            await core.runQueue.releaseRuntime(threadID: thread.id)
+            throw DaemonHTTPError.conflict(code: "runtime_failed", message: runtimeErrorMessage(error))
+        }
+    }
+
+    private static func boundedRuntimeValue(_ raw: String, field: String, max: Int = 256) throws -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= max else {
+            throw DaemonHTTPError.badRequest(
+                code: "invalid_\(field.lowercased())", message: "\(field) must be 1-\(max) characters."
+            )
+        }
+        return value
+    }
+
+    private static func runtimeErrorMessage(_ error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? "Pi could not update this runtime."
     }
 
     private static func requireThread(_ core: DaemonCore, _ params: [String: String]) async throws -> PiThread {

@@ -26,6 +26,12 @@ actor LeaseStore {
         return lease
     }
 
+    /// Acquires or renews without stealing another process's live runtime.
+    func acquireIfAvailable(threadId: String, owner: String, ttlSeconds: Int?, now: Date = Date()) -> Lease? {
+        if let current = leases[threadId], current.expiresAt > now, current.owner != owner { return nil }
+        return acquire(threadId: threadId, owner: owner, ttlSeconds: ttlSeconds, now: now)
+    }
+
     func release(threadId: String, owner: String) {
         // Only the holder can release its own lease, so an unrelated request cannot evict it.
         guard leases[threadId]?.owner == owner else { return }

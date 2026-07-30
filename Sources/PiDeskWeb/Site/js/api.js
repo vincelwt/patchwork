@@ -123,6 +123,9 @@ export const api = {
   threads: (params) => request(`/v1/threads${toQuery(params)}`),
   thread: (id, messages) => request(`/v1/threads/${encodeURIComponent(id)}${toQuery({ messages })}`),
   createThread: (body) => post("/v1/threads", body),
+  threadRuntime: (id) => request(`/v1/threads/${encodeURIComponent(id)}/runtime`),
+  setThreadModel: (id, body) => post(`/v1/threads/${encodeURIComponent(id)}/runtime/model`, body),
+  setThreadThinking: (id, body) => post(`/v1/threads/${encodeURIComponent(id)}/runtime/thinking`, body),
   sendMessage: (id, body) => post(`/v1/threads/${encodeURIComponent(id)}/messages`, body),
   abortThread: (id) => post(`/v1/threads/${encodeURIComponent(id)}/abort`),
   archiveThread: (id, archived) => post(`/v1/threads/${encodeURIComponent(id)}/archive`, { archived }),
@@ -142,6 +145,7 @@ export const api = {
   respondInteraction: (id, body) => post(`/v1/interactions/${encodeURIComponent(id)}/respond`, body),
 
   activity: () => request("/v1/activity"),
+  run: (id) => request(`/v1/runs/${encodeURIComponent(id)}`),
 
   schedules: () => request("/v1/schedules"),
   schedule: (id) => request(`/v1/schedules/${encodeURIComponent(id)}`),

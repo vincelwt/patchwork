@@ -108,6 +108,20 @@ final class RunQueueTests: XCTestCase {
         XCTAssertTrue(bothRan)
     }
 
+    func testRuntimeReservationMakesAPromptWaitForTheIdleAttachment() async {
+        let (queue, _, _, executor) = makeQueue()
+        let reserved = await queue.reserveRuntime(threadID: "t1")
+        XCTAssertTrue(reserved)
+
+        await queue.enqueue(job(id: "waiting", thread: "t1"))
+        let startedWhileReserved = await poll(timeout: 0.2) { !executor.executedJobs.isEmpty }
+        XCTAssertFalse(startedWhileReserved)
+
+        await queue.releaseRuntime(threadID: "t1")
+        let startedAfterRelease = await poll { executor.executedJobs.map(\.id) == ["waiting"] }
+        XCTAssertTrue(startedAfterRelease)
+    }
+
     // MARK: - Status recording
 
     func testSuccessfulRunIsRecordedAsRunningThenOk() async {
