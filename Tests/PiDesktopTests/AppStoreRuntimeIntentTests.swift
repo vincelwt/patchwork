@@ -481,7 +481,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         probe: IntentRuntime? = nil,
         lease: ManualRuntimeLease? = nil
     ) -> AppStore {
-        AppStore(
+        let store = AppStore(
             repository: IntentRepository(rootURL: root),
             gitService: IntentGitService(),
             runtime: runtime,
@@ -494,6 +494,8 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
                 { delay, action in value.schedule(delay: delay, action: action) }
             } ?? { _, _ in {} }
         )
+        store.cachedScheduleService = InMemoryScheduleService()
+        return store
     }
 
     private func summary(_ id: String, cwd: URL) -> SessionSummary {

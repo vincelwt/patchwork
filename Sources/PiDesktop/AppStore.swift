@@ -305,7 +305,10 @@ final class AppStore: ObservableObject {
     /// Thread IDs any automation targets, so the sidebar can mark them. IDs only, capped — the
     /// automations panel still owns the schedules themselves. See `ScheduleService.swift`.
     @Published private(set) var scheduledThreadIDs: Set<String> = []
+    /// Conversations whose latest agent-created GitHub pull request is still open.
+    @Published private(set) var openPullRequestSessionIDs: Set<String> = []
     private static let scheduledThreadIDLimit = 500
+    static let pullRequestReviewMaxAge: TimeInterval = 24 * 60 * 60
     @Published private(set) var archiveConfirmation: ArchiveConfirmation?
     /// Set by the Conversation menu so the rename sheet can live with the transcript.
     @Published var renameRequested = false
@@ -317,6 +320,7 @@ final class AppStore: ObservableObject {
 
     private let repository: SessionRepositoryProtocol
     private let gitService: GitStatusProviding
+    private let pullRequestStateProvider: PullRequestStateProviding
     /// Internal rather than private so focused extensions (the outbox, message editing) can
     /// speak to whichever selected conversation owns the current runtime.
     var runtime: PiRuntimeProtocol { activeRuntimeSlot.runtime }
@@ -355,6 +359,10 @@ final class AppStore: ObservableObject {
     private var selectedGitCandidatePath: String?
     private var selectedGitGeneration = 0
     private var gitRefreshTask: Task<Void, Never>?
+    private var pullRequestRefreshTask: Task<Void, Never>?
+    private var pullRequestRefreshLoopTask: Task<Void, Never>?
+    private var pullRequestRefreshGeneration = 0
+    private var dispatchedPullRequestReviews: Set<String> = []
     private var selectedGitTask: Task<Void, Never>?
     private var selectedWorkspaceTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
@@ -432,6 +440,7 @@ final class AppStore: ObservableObject {
     init(
         repository: SessionRepositoryProtocol = FileSessionRepository(),
         gitService: GitStatusProviding = GitService(),
+        pullRequestStateProvider: PullRequestStateProviding = GitHubPullRequestStateService(),
         runtime: PiRuntimeProtocol = PiRPCClient(),
         runtimeFactory: @escaping () -> PiRuntimeProtocol = { PiRPCClient() },
         persistence: AppPersistence? = nil,
@@ -485,6 +494,7 @@ final class AppStore: ObservableObject {
     ) {
         self.repository = repository
         self.gitService = gitService
+        self.pullRequestStateProvider = pullRequestStateProvider
         self.runtimeFactory = runtimeFactory
         self.runtimeRetirementDelay = runtimeRetirementDelay
         self.runtimeRetirementScheduler = runtimeRetirementScheduler
@@ -1258,6 +1268,7 @@ final class AppStore: ObservableObject {
                 for: session,
                 isRunning: isRunning(session),
                 isUnread: isUnread(session),
+                hasOpenPullRequest: openPullRequestSessionIDs.contains(session.id),
                 isAutomated: scheduledThreadIDs.contains(session.id)
             ) == .done ? 1 : 0)
         }
@@ -1602,6 +1613,7 @@ final class AppStore: ObservableObject {
             await refreshScheduledThreads()
         }
         startGitRefreshLoop()
+        startPullRequestRefreshLoop()
         activityMonitor.start()
         installActivityExtensionIfNeeded()
         LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
@@ -1617,6 +1629,7 @@ final class AppStore: ObservableObject {
                 to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
             )
             sessions = discovered
+            refreshPullRequestStates(for: discovered)
             persistence.pruneCompletionState(retainingSessionPaths: discovered.map { $0.fileURL.path })
             syncActivityMonitorPaths()
             if let selectedPath, sessions.contains(where: { $0.fileURL.standardizedFileURL.path == selectedPath }) {
@@ -1631,12 +1644,85 @@ final class AppStore: ObservableObject {
         isScanning = false
     }
 
+    private func refreshPullRequestStates(for summaries: [SessionSummary]) {
+        pullRequestRefreshTask?.cancel()
+        pullRequestRefreshGeneration &+= 1
+        let generation = pullRequestRefreshGeneration
+        let linked = Array(summaries.lazy.filter {
+            !$0.isArchived && $0.pullRequestURL != nil
+        }.prefix(GitHubPullRequestStateService.maximumURLCount))
+        guard !linked.isEmpty else {
+            openPullRequestSessionIDs = []
+            return
+        }
+
+        let urls = Array(Set(linked.compactMap(\.pullRequestURL)))
+        let previous = openPullRequestSessionIDs
+        let provider = pullRequestStateProvider
+        pullRequestRefreshTask = Task { [weak self] in
+            let states = await provider.states(for: urls)
+            guard !Task.isCancelled, let self,
+                  pullRequestRefreshGeneration == generation else { return }
+            let resolved = Set(linked.compactMap { session -> String? in
+                guard let url = session.pullRequestURL else { return nil }
+                let state = states[url] ?? .unknown
+                if state.isOpen { return session.id }
+                if state == .unknown, previous.contains(session.id) { return session.id }
+                return nil
+            })
+            if openPullRequestSessionIDs != resolved { openPullRequestSessionIDs = resolved }
+
+            // Review polling belongs to Pi Desktop itself. It wakes the thread only after Codex
+            // has actually reviewed the PR, never by creating a user-visible automation.
+            dispatchedPullRequestReviews.formIntersection(linked.compactMap { session in
+                session.pullRequestURL.map { "\(session.id)\u{0}\($0.absoluteString)" }
+            })
+            let ready = Self.pullRequestReviewsReady(
+                in: linked, states: states, now: Date(), isRunning: isRunning
+            )
+            for (session, url, deadline) in ready where !Task.isCancelled {
+                let key = "\(session.id)\u{0}\(url.absoluteString)"
+                guard dispatchedPullRequestReviews.insert(key).inserted else { continue }
+                let deadlineMilliseconds = Int64(deadline.timeIntervalSince1970 * 1_000)
+                do {
+                    try await managedTurnResumer(
+                        session.fileURL.standardizedFileURL.path,
+                        "/pi-desktop-pr-review \(url.absoluteString) \(deadlineMilliseconds)",
+                        "pr-review-\(session.id)-\(url.lastPathComponent)"
+                    )
+                } catch {
+                    dispatchedPullRequestReviews.remove(key)
+                }
+            }
+        }
+    }
+
+    static func pullRequestReviewsReady(
+        in summaries: [SessionSummary],
+        states: [URL: PullRequestState],
+        now: Date,
+        isRunning: (SessionSummary) -> Bool
+    ) -> [(SessionSummary, URL, Date)] {
+        summaries.compactMap { session in
+            guard !session.isArchived, !isRunning(session),
+                  let url = session.pullRequestURL,
+                  states[url] == .openWithCodexReview,
+                  let createdAt = session.pullRequestCreatedAt else { return nil }
+            let age = now.timeIntervalSince(createdAt)
+            guard age >= 0, age <= pullRequestReviewMaxAge else { return nil }
+            return (session, url, createdAt.addingTimeInterval(pullRequestReviewMaxAge))
+        }
+    }
+
     /// Loads the automations only to learn which conversations they target. A failure keeps the
     /// previous set: a daemon that is briefly down must not erase clocks from the sidebar.
     /// Returns whether the load succeeded, so a caller can decide to try once more.
     @discardableResult
     func refreshScheduledThreads() async -> Bool {
         guard let entries = try? await scheduleService.loadSchedules() else { return false }
+        for watch in entries where watch.isInternalPullRequestReviewWatch {
+            try? await scheduleService.delete(id: watch.id)
+        }
         updateScheduledThreads(from: entries)
         return true
     }
@@ -1647,7 +1733,8 @@ final class AppStore: ObservableObject {
     func updateScheduledThreads(from entries: [ScheduleEntry]) {
         var ids: Set<String> = []
         for entry in entries {
-            guard case let .existingThread(threadID) = entry.target, !threadID.isEmpty else { continue }
+            guard !entry.isInternalPullRequestReviewWatch,
+                  case let .existingThread(threadID) = entry.target, !threadID.isEmpty else { continue }
             ids.insert(threadID)
             // A display hint, not a copy of the schedule list.
             if ids.count >= Self.scheduledThreadIDLimit { break }
@@ -4982,7 +5069,10 @@ final class AppStore: ObservableObject {
     private func refreshSummary(for session: SessionSummary) async {
         do {
             let summary = try await repository.refreshSummary(at: session.fileURL, archivedIDs: persistence.state.archivedSessionIDs)
-            if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = summary }
+            if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                sessions[index] = summary
+                refreshPullRequestStates(for: sessions)
+            }
         } catch { /* The live conversation remains authoritative; next manual refresh retries. */ }
     }
 
@@ -5030,6 +5120,17 @@ final class AppStore: ObservableObject {
         return await (path, snapshot, worktree)
     }
 
+    private func startPullRequestRefreshLoop() {
+        pullRequestRefreshLoopTask?.cancel()
+        pullRequestRefreshLoopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                refreshPullRequestStates(for: sessions)
+            }
+        }
+    }
+
     private func startGitRefreshLoop() {
         gitRefreshTask?.cancel()
         gitRefreshTask = Task { [weak self] in
@@ -5071,7 +5172,8 @@ final class AppStore: ObservableObject {
     }
 
     deinit {
-        gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel(); conversationRefreshTask?.cancel()
+        gitRefreshTask?.cancel(); pullRequestRefreshTask?.cancel(); pullRequestRefreshLoopTask?.cancel()
+        selectedGitTask?.cancel(); conversationLoadTask?.cancel(); conversationRefreshTask?.cancel()
         historyNavigationTask?.cancel(); activityProjectionTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel(); cancelRuntimeRetirement?()

@@ -76,6 +76,22 @@ final class SchedulesModelTests: XCTestCase {
         XCTAssertNil(model.error)
     }
 
+    func testInternalPullRequestWatchesNeverAppearAsAutomations() async {
+        let service = InMemoryScheduleService(entries: [
+            ScheduleEntry(
+                id: "sch_req_pr_review_test", name: "Codex review acme/widgets#1",
+                target: .existingThread(threadID: "t1"),
+                prompt: "/pi-desktop-pr-review https://github.com/acme/widgets/pull/1 123",
+                trigger: .heartbeat(everySeconds: 300)
+            )
+        ])
+        let model = SchedulesModel(service: service)
+
+        await model.reload()
+
+        XCTAssertTrue(model.entries.isEmpty)
+    }
+
     func testAMissingBackgroundServiceIsReportedInsteadOfSilentlyEmpty() async {
         let service = InMemoryScheduleService()
         service.failure = ScheduleServiceError.daemonUnavailable
@@ -244,8 +260,14 @@ final class ScheduledThreadStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    private func entry(_ name: String, target: ScheduleEntry.Target, enabled: Bool = true) -> ScheduleEntry {
-        ScheduleEntry(name: name, enabled: enabled, target: target, prompt: "p", trigger: .interval(everySeconds: 3_600))
+    private func entry(
+        _ name: String,
+        id: String = UUID().uuidString,
+        target: ScheduleEntry.Target,
+        enabled: Bool = true,
+        prompt: String = "p"
+    ) -> ScheduleEntry {
+        ScheduleEntry(id: id, name: name, enabled: enabled, target: target, prompt: prompt, trigger: .interval(everySeconds: 3_600))
     }
 
     private func session(_ id: String) -> SessionSummary {
@@ -263,6 +285,11 @@ final class ScheduledThreadStoreTests: XCTestCase {
             entry("live", target: .existingThread(threadID: "t1")),
             entry("paused", target: .existingThread(threadID: "t2"), enabled: false),
             entry("fresh", target: .newThread(cwd: "/tmp/project", namePattern: nil)),
+            // PR-review heartbeats belong to Open PRs or Done, never user-facing Automated.
+            entry(
+                "review", id: "sch_req_pr_review_test", target: .existingThread(threadID: "t3"),
+                prompt: "/pi-desktop-pr-review https://github.com/acme/widgets/pull/1 123"
+            ),
             // The degraded target an unknown daemon kind decodes to must not mark every row.
             entry("unknown", target: .existingThread(threadID: ""))
         ])
@@ -287,6 +314,24 @@ final class ScheduledThreadStoreTests: XCTestCase {
         let retried = await store.refreshScheduledThreads()
         XCTAssertFalse(retried, "A failed load reports itself, so launch can try once more")
         XCTAssertEqual(store.scheduledThreadIDs, ["t1"], "A transient outage must not erase the clocks already on screen")
+    }
+
+    func testRefreshRemovesLegacyPullRequestSchedules() async throws {
+        let review = entry(
+            "review", id: "sch_req_pr_review_legacy", target: .existingThread(threadID: "t1"),
+            prompt: "/pi-desktop-pr-review https://github.com/acme/widgets/pull/1 123"
+        )
+        let service = InMemoryScheduleService(entries: [
+            review,
+            entry("Nightly", target: .existingThread(threadID: "t2"))
+        ])
+        store.cachedScheduleService = service
+
+        let loaded = await store.refreshScheduledThreads()
+
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(service.entries.map(\.name), ["Nightly"])
+        XCTAssertEqual(store.scheduledThreadIDs, ["t2"])
     }
 
     func testArchivingAThreadConfirmsThenDeletesAllLinkedAutomations() async throws {
