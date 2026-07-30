@@ -29,7 +29,11 @@ struct ActivityPresenter: ActivityPresenting {
                 guard case let .toolCall(call) = block.kind,
                       let item = Self.activityForToolCall(call, timestamp: message.timestamp, modelName: message.modelName)
                 else { continue }
-                items[item.id] = item
+                if item.kind == .process, let existing = items[item.id] {
+                    items[item.id] = Self.merged(item, with: existing)
+                } else {
+                    items[item.id] = item
+                }
                 sourceAliases[call.id] = item.id
                 if item.kind == .subagent { unresolvedSubagents[call.id] = item.id }
                 ordering.append(item.id)
@@ -46,7 +50,13 @@ struct ActivityPresenter: ActivityPresenting {
                     isError: message.isError,
                     to: &item
                 )
-                items[itemID] = item
+                if item.kind == .process, item.id != itemID {
+                    items.removeValue(forKey: itemID)
+                    sourceAliases[callID] = item.id
+                    if let existing = items[item.id] { item = Self.merged(item, with: existing) }
+                    ordering.append(item.id)
+                }
+                items[item.id] = item
             }
 
             if let customItem = Self.activityForCustomMessage(message) {
@@ -163,7 +173,7 @@ struct ActivityPresenter: ActivityPresenting {
                 detail: details["runtime"]?.stringValue,
                 status: mapStatus(statusString, success: success),
                 startedAt: message.timestamp,
-                endedAt: ["completed", "failed", "stopped"].contains(statusString) ? message.timestamp : nil,
+                endedAt: ["completed", "failed", "stopped", "exited", "killed"].contains(statusString) ? message.timestamp : nil,
                 raw: details.boundedProjection()
             )
         }
@@ -239,6 +249,15 @@ struct ActivityPresenter: ActivityPresenting {
     ) {
         if !text.isEmpty { item.detail = text.condensedPrefix(600) }
 
+        if item.kind == .process {
+            item.id = details?["process"]?["id"]?.stringValue ?? item.id
+            if let status = processStatus(details: details, text: text, isError: isError) {
+                item.status = status
+                item.endedAt = [.running, .waiting, .queued].contains(status) ? nil : endedAt
+                return
+            }
+        }
+
         if item.kind == .subagent {
             item.agentID = details?["agentId"]?.stringValue
                 ?? field("Agent", in: text)
@@ -276,8 +295,9 @@ struct ActivityPresenter: ActivityPresenting {
 
     static func merged(_ preferred: ActivityItem, with fallback: ActivityItem) -> ActivityItem {
         var item = preferred
-        if ["Ran agents", "Waiting for agents", "Subagent", "Subagent update"].contains(item.title),
-           !["Ran agents", "Waiting for agents", "Subagent", "Subagent update"].contains(fallback.title) {
+        if (["Ran agents", "Waiting for agents", "Subagent", "Subagent update"].contains(item.title)
+            || (item.kind == .process && item.title == ToolActivityKind.processes.rawValue)),
+           !["Ran agents", "Waiting for agents", "Subagent", "Subagent update", ToolActivityKind.processes.rawValue].contains(fallback.title) {
             item.title = fallback.title
         }
         item.subtitle = item.subtitle ?? fallback.subtitle
@@ -311,6 +331,23 @@ struct ActivityPresenter: ActivityPresenting {
             }
         }
         return result
+    }
+
+    private static func processStatus(details: JSONValue?, text: String, isError: Bool) -> ActivityStatus? {
+        if isError { return .failed }
+        if let process = details?["process"], let value = process["status"]?.stringValue {
+            switch value {
+            case "running", "terminating", "terminate_timeout": return .running
+            case "exited": return process["success"]?.boolValue == true ? .succeeded : .failed
+            case "killed": return .stopped
+            default: break
+            }
+        }
+        let summary = details?["message"]?.stringValue ?? text
+        if summary.contains("[running]") { return .running }
+        if summary.contains("[exit(") { return summary.contains("[exit(0)]") ? .succeeded : .failed }
+        if summary.contains("[killed]") || details?["action"]?.stringValue == "kill" { return .stopped }
+        return nil
     }
 
     private static func field(_ name: String, in text: String) -> String? {
