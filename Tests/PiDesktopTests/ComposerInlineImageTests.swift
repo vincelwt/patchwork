@@ -127,6 +127,19 @@ final class ComposerInlineImageTests: XCTestCase {
         XCTAssertNotNil(attachments.first?.image)
     }
 
+    func testOversizedImagesAreDownscaledForClaude() throws {
+        let original = try writePNG(named: "oversized.png", width: 2_400, height: 1_200)
+        let attachment = try XCTUnwrap(ImageImportService.attachments(from: [original]).first)
+        defer { try? FileManager.default.removeItem(at: attachment.fileURL) }
+
+        let representation = try XCTUnwrap(NSBitmapImageRep(data: attachment.data))
+        XCTAssertEqual(representation.pixelsWide, PiTheme.imagePixelLimit)
+        XCTAssertEqual(representation.pixelsHigh, 1_000)
+        XCTAssertEqual(attachment.mimeType, "image/png")
+        XCTAssertNotEqual(attachment.fileURL, original.standardizedFileURL)
+        XCTAssertEqual(try Data(contentsOf: attachment.fileURL), attachment.data)
+    }
+
     func testNonImageFilesAreIgnored() throws {
         let url = directory.appendingPathComponent("notes.txt")
         try Data("hello".utf8).write(to: url)
