@@ -67,6 +67,12 @@ The phone UI covers the daily loop, not just reading:
   outside it. Opening reads the newest messages directly from a bounded file tail instead of
   rescanning the whole session. While a run is in flight the open thread refreshes on its own,
   and an unchanged refresh leaves the transcript, its open disclosures, and scroll position alone.
+- **New threads open on their real session id.** A first message is queued only after Pi creates
+  the session, so the browser never routes to a `pending:` placeholder; the web client also
+  resolves placeholders from older daemons through their run id instead of showing “thread not found.”
+- **Model and thinking stay editable.** Exact choices from Pi appear above the composer and can be
+  changed throughout the conversation. The daemon shares an active run's runtime or reserves one
+  short-lived idle attachment, and refuses rather than racing a runtime leased by the Mac app.
 - **Sending is optimistic and honest.** The composer clears immediately and the message shows as
   queued / working / steering / failed until Pi's own session file confirms it. A failed send
   keeps its text with Retry, and a per-message submission id means a retry after a lost response

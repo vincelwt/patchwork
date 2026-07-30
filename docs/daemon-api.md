@@ -117,7 +117,15 @@ GET  /v1/threads/{id}?messages=20
 
 POST /v1/threads
      {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra"}
-→ {"thread":Thread,"runId":"…"}          // message is optional; without it the session is created idle
+→ {"thread":Thread,"runId":"…"}          // message is optional; `thread.id` is always a real session id
+
+GET  /v1/threads/{id}/runtime
+→ {"runtime":{"provider":"openai-codex","modelId":"gpt-5","modelName":"GPT-5",
+               "thinkingLevel":"high","availableModels":[…],
+               "availableThinkingLevels":["off","high"],"running":false}}
+POST /v1/threads/{id}/runtime/model    {"provider":"openai-codex","modelId":"gpt-5"}
+POST /v1/threads/{id}/runtime/thinking {"level":"high"}
+→ {"runtime":…}
 
 POST /v1/threads/{id}/messages
      {"text":"…","delivery":"auto|steer|followUp","clientId":"web-…"}
@@ -131,6 +139,18 @@ POST /v1/threads/{id}/read            {"unread":false}  → {"thread":Thread}
 GET  /v1/threads/{id}/images/{imageId}
 → {"id":"…","mimeType":"image/png","byteCount":8321,"fileName":"shot.png","data":"<base64>"}
 ```
+
+A message-bearing create resolves an idle Pi session first, then queues the first prompt against
+that session. The response therefore never invents a `pending:<run>` thread id that cannot be
+opened. Older clients may still use `runId` to follow the prompt itself.
+
+**Runtime controls use Pi, never the JSONL file.** The runtime endpoints issue Pi's own query and
+`set_model` / `set_thinking_level` RPCs. During a daemon-owned turn they share that live process;
+while idle they reserve the thread and attach a short-lived process. A native-app lease returns
+`409 thread_leased`, and another queued/running attachment returns `409 thread_busy`, rather than
+starting two writers for one session. Models are bounded to 500 and thinking levels to 32; unknown
+future values remain visible. Lease acquisition is non-stealing: a different live owner gets
+`409 thread_leased`, while the same owner may renew its TTL.
 
 **Delivery is reported, not assumed.** `delivery` in the *response* says what actually happened,
 which is not always what was asked:

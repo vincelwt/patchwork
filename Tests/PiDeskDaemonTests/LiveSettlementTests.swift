@@ -33,6 +33,10 @@ final class GatedLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
         return result
     }
 
+    func request(type: String, payload: [String: PiJSONValue]) async throws -> PiJSONValue {
+        .object(["type": .string("response"), "success": .bool(true), "data": .object([:])])
+    }
+
     /// Blocks until a gated delivery has actually entered `deliver`.
     func waitForDeliveryToStart(timeout: TimeInterval = 5) -> Bool {
         started.wait(timeout: .now() + timeout) == .success

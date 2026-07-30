@@ -44,6 +44,54 @@ final class FakeRunExecutor: RunExecuting, @unchecked Sendable {
     }
 }
 
+final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _created = 0
+    private var _modelSets: [(String, String)] = []
+    private var _thinkingSets: [String] = []
+    var created: Int { lock.lock(); defer { lock.unlock() }; return _created }
+    var modelSets: [(String, String)] { lock.lock(); defer { lock.unlock() }; return _modelSets }
+    var thinkingSets: [String] { lock.lock(); defer { lock.unlock() }; return _thinkingSets }
+
+    let thread: PiThread
+    var runtime: ThreadRuntimeState
+
+    init(thread: PiThread, runtime: ThreadRuntimeState = ThreadRuntimeState()) {
+        self.thread = thread
+        self.runtime = runtime
+    }
+
+    func createIdle(cwd: URL, name: String?) async throws -> PiThread {
+        recordCreate()
+        return thread
+    }
+
+    func rename(cwd: URL, sessionPath: URL, name: String) async throws {}
+
+    func runtimeSnapshot(cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState { runtime }
+
+    func setModel(cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState {
+        recordModel(provider, modelId)
+        runtime.provider = provider
+        runtime.modelId = modelId
+        return runtime
+    }
+
+    func setThinkingLevel(cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState {
+        recordThinking(level)
+        runtime.thinkingLevel = level
+        return runtime
+    }
+
+    private func recordCreate() { lock.lock(); _created += 1; lock.unlock() }
+    private func recordModel(_ provider: String, _ modelId: String) {
+        lock.lock(); _modelSets.append((provider, modelId)); lock.unlock()
+    }
+    private func recordThinking(_ level: String) {
+        lock.lock(); _thinkingSets.append(level); lock.unlock()
+    }
+}
+
 enum TestSupport {
     /// `/tmp` directly, not `FileManager.default.temporaryDirectory` (which resolves under the
     /// much longer `/var/folders/.../T/`): `sockaddr_un.sun_path` is capped at ~104 bytes on
@@ -71,7 +119,8 @@ enum TestSupport {
         schedulerRetryDelays: [TimeInterval] = Scheduler.defaultRetryDelays,
         networkAvailable: @escaping @Sendable () -> Bool = { true },
         interactions: InteractionRegistry = InteractionRegistry(),
-        liveSessions: LiveSessionRegistry = LiveSessionRegistry()
+        liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
+        threadRPC: ThreadRPCServing? = nil
     ) -> DaemonCore {
         let settings = DaemonSettings(remoteEnabled: false, port: 0, concurrency: concurrency)
         let sessionRoot = directory.appendingPathComponent("sessions", isDirectory: true)
@@ -94,6 +143,7 @@ enum TestSupport {
             networkAvailable: networkAvailable,
             interactions: interactions,
             liveSessions: liveSessions,
+            threadRPC: threadRPC,
             // Never the real app's `state.json`: the folder endpoint must read a fixture, and
             // nothing here may depend on how the machine running the tests organises its own
             // conversations.

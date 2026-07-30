@@ -78,6 +78,18 @@ public final class PiDeskClient: Sendable {
         try await post("/v1/threads", body: request)
     }
 
+    public func threadRuntime(id: String) async throws -> ThreadRuntimeResponse {
+        try await get("/v1/threads/\(pathComponent: id)/runtime")
+    }
+
+    public func setThreadModel(id: String, _ request: SetThreadModelRequest) async throws -> ThreadRuntimeResponse {
+        try await post("/v1/threads/\(pathComponent: id)/runtime/model", body: request)
+    }
+
+    public func setThreadThinking(id: String, _ request: SetThreadThinkingRequest) async throws -> ThreadRuntimeResponse {
+        try await post("/v1/threads/\(pathComponent: id)/runtime/thinking", body: request)
+    }
+
     public func sendMessage(threadId: String, _ request: SendMessageRequest) async throws -> SendMessageResponse {
         try await post("/v1/threads/\(pathComponent: threadId)/messages", body: request)
     }

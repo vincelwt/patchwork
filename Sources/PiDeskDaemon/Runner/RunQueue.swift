@@ -18,6 +18,9 @@ actor RunQueue {
 
     private var pending: [RunJob] = []
     private var runningThreadIDs: Set<String> = []
+    /// Idle sessions temporarily attached for model/thinking RPCs. Queued prompts wait until the
+    /// setter has stopped that process, so two Pi runtimes never write one session concurrently.
+    private var reservedThreadIDs: Set<String> = []
     private var runningCount = 0
     private var runningTasks: [String: (threadID: String?, task: Task<Void, Never>)] = [:]
     private var cancelledRunIDs: Set<String> = []
@@ -46,7 +49,19 @@ actor RunQueue {
     /// True if a job for this thread is already running or already waiting its turn \u2014 the
     /// signal `skipIfRunning`/heartbeat-gated triggers consult before enqueueing another one.
     func isThreadBusy(_ threadID: String) -> Bool {
-        runningThreadIDs.contains(threadID) || pending.contains { $0.target.existingThreadID == threadID }
+        runningThreadIDs.contains(threadID) || reservedThreadIDs.contains(threadID)
+            || pending.contains { $0.target.existingThreadID == threadID }
+    }
+
+    func reserveRuntime(threadID: String) -> Bool {
+        guard !isThreadBusy(threadID) else { return false }
+        reservedThreadIDs.insert(threadID)
+        return true
+    }
+
+    func releaseRuntime(threadID: String) {
+        reservedThreadIDs.remove(threadID)
+        pump()
     }
 
     /// `POST /v1/threads/{id}/abort`. Drops queued jobs and cancels the running task; the real
@@ -124,7 +139,8 @@ actor RunQueue {
 
     private func nextRunnableIndex() -> Int? {
         for (index, job) in pending.enumerated() {
-            if let threadID = job.target.existingThreadID, runningThreadIDs.contains(threadID) { continue }
+            if let threadID = job.target.existingThreadID,
+               runningThreadIDs.contains(threadID) || reservedThreadIDs.contains(threadID) { continue }
             return index
         }
         return nil

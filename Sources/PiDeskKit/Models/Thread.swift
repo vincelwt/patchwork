@@ -303,6 +303,70 @@ public struct ThreadDetailResponse: Codable, Sendable {
     }
 }
 
+/// A model Pi reports as selectable for this thread's runtime.
+public struct ThreadRuntimeModel: Codable, Hashable, Sendable, Identifiable {
+    public var id: String { "\(provider)/\(modelId)" }
+    public var provider: String
+    public var modelId: String
+    public var name: String
+    public var reasoning: Bool
+
+    public init(provider: String, modelId: String, name: String, reasoning: Bool = false) {
+        self.provider = provider
+        self.modelId = modelId
+        self.name = name
+        self.reasoning = reasoning
+    }
+}
+
+/// Query-only runtime state plus the exact choices accepted by Pi's setter commands.
+public struct ThreadRuntimeState: Codable, Hashable, Sendable {
+    public var provider: String?
+    public var modelId: String?
+    public var modelName: String?
+    public var thinkingLevel: String
+    public var availableModels: [ThreadRuntimeModel]
+    public var availableThinkingLevels: [String]
+    public var running: Bool
+
+    public init(
+        provider: String? = nil,
+        modelId: String? = nil,
+        modelName: String? = nil,
+        thinkingLevel: String = "off",
+        availableModels: [ThreadRuntimeModel] = [],
+        availableThinkingLevels: [String] = ["off"],
+        running: Bool = false
+    ) {
+        self.provider = provider
+        self.modelId = modelId
+        self.modelName = modelName
+        self.thinkingLevel = thinkingLevel
+        self.availableModels = availableModels
+        self.availableThinkingLevels = availableThinkingLevels
+        self.running = running
+    }
+}
+
+public struct ThreadRuntimeResponse: Codable, Sendable {
+    public var runtime: ThreadRuntimeState
+    public init(runtime: ThreadRuntimeState) { self.runtime = runtime }
+}
+
+public struct SetThreadModelRequest: Codable, Sendable {
+    public var provider: String
+    public var modelId: String
+    public init(provider: String, modelId: String) {
+        self.provider = provider
+        self.modelId = modelId
+    }
+}
+
+public struct SetThreadThinkingRequest: Codable, Sendable {
+    public var level: String
+    public init(level: String) { self.level = level }
+}
+
 public struct CreateThreadRequest: Codable, Sendable {
     public var cwd: String
     public var name: String?

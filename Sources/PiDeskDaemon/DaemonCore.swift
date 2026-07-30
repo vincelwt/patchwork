@@ -25,6 +25,8 @@ final class DaemonCore: @unchecked Sendable {
     let liveSessions: LiveSessionRegistry
     /// Replay protection for `POST /v1/threads/{id}/messages`, keyed by the caller's own id.
     let submissions = SubmissionRegistry()
+    /// Short-lived, query-only or setter-only Pi sessions for idle thread operations.
+    let threadRPC: ThreadRPCServing
     let startedAt = Date()
     let version = "1.0.0"
     let piVersion: String?
@@ -49,6 +51,7 @@ final class DaemonCore: @unchecked Sendable {
         piVersion: String? = nil,
         interactions: InteractionRegistry = InteractionRegistry(),
         liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
+        threadRPC: ThreadRPCServing? = nil,
         appStateURL: URL = AppStatePeek.defaultURL()
     ) {
         self.settings = settings
@@ -56,6 +59,7 @@ final class DaemonCore: @unchecked Sendable {
         self.piVersion = piVersion
         self.interactions = interactions
         self.liveSessions = liveSessions
+        self.threadRPC = threadRPC ?? ThreadCreationService(logger: logger)
         self.appStateURL = appStateURL
 
         let bus = EventBus(logger: logger)

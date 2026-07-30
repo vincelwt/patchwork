@@ -7,7 +7,9 @@ import PiDeskKit
 final class FakeLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
     private let lock = NSLock()
     private var _delivered: [(command: String, message: String)] = []
+    private var _requests: [(type: String, payload: [String: PiJSONValue])] = []
     var delivered: [(command: String, message: String)] { lock.lock(); defer { lock.unlock() }; return _delivered }
+    var requests: [(type: String, payload: [String: PiJSONValue])] { lock.lock(); defer { lock.unlock() }; return _requests }
 
     var result: LiveDelivery = .acknowledged
     var throwsWriteFailure = false
@@ -18,9 +20,37 @@ final class FakeLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
         return result
     }
 
+    func request(type: String, payload: [String: PiJSONValue]) async throws -> PiJSONValue {
+        record(type: type, payload: payload)
+        let data: PiJSONValue
+        switch type {
+        case "get_state":
+            data = .object([
+                "model": .object(["provider": .string("openai"), "id": .string("gpt-5"), "name": .string("GPT-5")]),
+                "thinkingLevel": .string("high")
+            ])
+        case "get_available_models":
+            data = .object(["models": .array([
+                .object(["provider": .string("openai"), "id": .string("gpt-5"), "name": .string("GPT-5")]),
+                .object(["provider": .string("anthropic"), "id": .string("sonnet"), "name": .string("Sonnet")])
+            ])])
+        case "get_available_thinking_levels":
+            data = .object(["levels": .array([.string("off"), .string("high")])])
+        default:
+            data = .object([:])
+        }
+        return .object(["type": .string("response"), "success": .bool(true), "data": data])
+    }
+
     private func record(command: String, message: String) {
         lock.lock()
         _delivered.append((command, message))
+        lock.unlock()
+    }
+
+    private func record(type: String, payload: [String: PiJSONValue]) {
+        lock.lock()
+        _requests.append((type, payload))
         lock.unlock()
     }
 }
