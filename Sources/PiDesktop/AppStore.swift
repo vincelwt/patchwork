@@ -1848,6 +1848,7 @@ final class AppStore: ObservableObject {
             || (merged.isTruncated && merged.olderCursor == nil)
         hasEarlierMessages = merged.olderCursor != nil && !conversationHistoryLimitReached
         cachePage(merged, for: URL(fileURLWithPath: path), fingerprint: fingerprint)
+        mergeHistoryActivities()
     }
 
     func loadEarlierMessages() {
@@ -1988,9 +1989,14 @@ final class AppStore: ObservableObject {
 
     private func projectActivities(from messages: [ChatMessage]) async -> [ActivityItem] {
         let presenter = activityPresenter
-        return await Task.detached(priority: .userInitiated) {
+        var projected = await Task.detached(priority: .userInitiated) {
             presenter.activities(from: messages)
         }.value
+        if isSelectedRuntime, activeRuntimeSlot.isReady,
+           extensionStatuses[ExtensionStatusParser.subagentsKey] == nil {
+            Self.stopInactiveSubagents(in: &projected)
+        }
+        return projected
     }
 
     // MARK: - Prefetch
@@ -4362,8 +4368,7 @@ final class AppStore: ObservableObject {
             let settledSession = activeSession()
             Task {
                 if let settledSession { await refreshSummary(for: settledSession) }
-                if isApplicationActive,
-                   selectedSession?.fileURL.standardizedFileURL.path == settledSession?.fileURL.standardizedFileURL.path {
+                if selectedSession?.fileURL.standardizedFileURL.path == settledSession?.fileURL.standardizedFileURL.path {
                     refreshSelectedGit()
                 }
             }
@@ -4631,7 +4636,13 @@ final class AppStore: ObservableObject {
             persistence.cacheExtensionStatuses(cachedStatuses)
             // Subagent activity gates retirement (see `isIdleAndClean`), and a settled turn has
             // no other trigger left, so the lease is re-evaluated whenever that key changes.
-            if key == ExtensionStatusParser.subagentsKey { resetRuntimeRetirementLease(for: activeRuntimeSlot) }
+            if key == ExtensionStatusParser.subagentsKey {
+                if extensionStatuses[key] == nil {
+                    stopInactiveSubagentActivities()
+                    refreshSelectedGit()
+                }
+                resetRuntimeRetirementLease(for: activeRuntimeSlot)
+            }
         case "setWidget":
             guard let key = event["widgetKey"]?.stringValue else { return }
             let lines = (event["widgetLines"]?.arrayValue?.compactMap(\.stringValue) ?? []).prefix(100).map { $0.suffixString(2_000) }
@@ -4733,7 +4744,7 @@ final class AppStore: ObservableObject {
             let history = await projectActivities(from: snapshot)
             guard !Task.isCancelled, conversationLoadGeneration == generation,
                   selectedSession?.fileURL.standardizedFileURL.path == path else { return }
-            let live = activities.filter { $0.status == .running || $0.status == .waiting }
+            let live = activities.filter { $0.status == .running || $0.status == .waiting || $0.status == .queued }
             var merged = history
             for item in live where !merged.contains(where: {
                 $0.id == item.id || (item.agentID != nil && $0.agentID == item.agentID)
@@ -4749,6 +4760,21 @@ final class AppStore: ObservableObject {
             activities[index] = ActivityPresenter.merged(item, with: activities[index])
         } else {
             activities.insert(item, at: 0)
+        }
+    }
+
+    /// The subagents extension removes its status only after its final live job is gone.
+    private func stopInactiveSubagentActivities() {
+        Self.stopInactiveSubagents(in: &activities)
+    }
+
+    private static func stopInactiveSubagents(in items: inout [ActivityItem]) {
+        let endedAt = Date()
+        for index in items.indices
+        where items[index].kind == .subagent
+            && [.running, .waiting, .queued].contains(items[index].status) {
+            items[index].status = .stopped
+            items[index].endedAt = items[index].endedAt ?? endedAt
         }
     }
 
@@ -4815,7 +4841,7 @@ final class AppStore: ObservableObject {
                 if Task.isCancelled { return }
                 guard let self else { return }
                 // Awaited, not fire-and-forget: a slow repository cannot pile up refreshes.
-                if isApplicationActive { await refreshSelectedGitAndWait() }
+                await refreshSelectedGitAndWait()
             }
         }
     }

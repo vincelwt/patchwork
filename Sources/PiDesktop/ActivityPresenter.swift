@@ -9,20 +9,36 @@ struct ActivityPresenter: ActivityPresenting {
         var items: [String: ActivityItem] = [:]
         var ordering: [String] = []
         var sourceAliases: [String: String] = [:]
+        var unresolvedSubagents: [String: String] = [:]
 
         for message in messages {
+            // A later assistant turn proves an earlier subagent tool call without a result was
+            // interrupted. Background launches are unaffected because their immediate
+            // `status: background` result removes them from this unresolved set.
+            if message.role == .assistant {
+                for itemID in unresolvedSubagents.values {
+                    guard var item = items[itemID], [.running, .waiting, .queued].contains(item.status) else { continue }
+                    item.status = .stopped
+                    item.endedAt = message.timestamp
+                    items[itemID] = item
+                }
+                unresolvedSubagents.removeAll(keepingCapacity: true)
+            }
+
             for block in message.blocks {
                 guard case let .toolCall(call) = block.kind,
                       let item = Self.activityForToolCall(call, timestamp: message.timestamp, modelName: message.modelName)
                 else { continue }
                 items[item.id] = item
                 sourceAliases[call.id] = item.id
+                if item.kind == .subagent { unresolvedSubagents[call.id] = item.id }
                 ordering.append(item.id)
             }
 
             if message.role == .tool, let callID = message.toolCallID,
                let itemID = sourceAliases[callID] ?? (items[callID] != nil ? callID : nil),
                var item = items[itemID] {
+                unresolvedSubagents.removeValue(forKey: callID)
                 Self.applyResult(
                     text: message.textContent,
                     details: message.details,
