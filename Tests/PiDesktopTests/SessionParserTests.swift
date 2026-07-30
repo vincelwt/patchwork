@@ -361,6 +361,41 @@ final class SessionParserTests: XCTestCase {
                              "The bounded scan may inspect abandoned records without projecting them")
     }
 
+    func testFocusedHistoryCarriesAnswerSelectionAcrossScanLimits() throws {
+        let file = temporaryDirectory.appendingPathComponent("focused-split.jsonl")
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "focused"],
+            ["type": "message", "id": "user", "parentId": NSNull(),
+             "message": ["role": "user", "content": "Question"]],
+            ["type": "message", "id": "narration", "parentId": "user",
+             "message": ["role": "assistant", "content": "Let me inspect it."]],
+            ["type": "message", "id": "call", "parentId": "narration",
+             "message": ["role": "assistant", "stopReason": "toolUse", "content": [[
+                "type": "toolCall", "id": "tool", "name": "read", "arguments": [String: Any]()
+             ]]]],
+            ["type": "message", "id": "result", "parentId": "call",
+             "message": ["role": "toolResult", "toolCallId": "tool", "content": "contents"]],
+            ["type": "message", "id": "answer", "parentId": "result",
+             "message": ["role": "assistant", "content": "Final answer", "stopReason": "stop"]]
+        ], to: file)
+        let limits = SessionParser.PageLimits(
+            maxScanBytes: 1_024 * 1_024, maxEntries: 2,
+            maxRecordBytes: 512 * 1_024, chunkBytes: 4 * 1_024
+        )
+
+        var pages = [try SessionParser.conversationPage(
+            at: file, projection: .focusedHistory, limits: limits
+        )]
+        while let cursor = pages.last?.olderCursor {
+            pages.append(try SessionParser.conversationPage(
+                at: file, cursor: cursor, projection: .focusedHistory, limits: limits
+            ))
+        }
+
+        XCTAssertEqual(pages.reversed().flatMap { $0.messages.map(\.id) }, ["user", "answer"])
+        XCTAssertFalse(pages.flatMap(\.messages).contains { $0.id == "narration" })
+    }
+
     func testNewestPageIncludesTheStartOfALongActiveTurn() throws {
         let file = temporaryDirectory.appendingPathComponent("paged-active-turn.jsonl")
         var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "active", "cwd": temporaryDirectory.path]]
