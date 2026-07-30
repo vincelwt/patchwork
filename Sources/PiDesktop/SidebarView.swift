@@ -19,6 +19,7 @@ struct SidebarView: View {
             query: store.searchText,
             virtualFolders: store.virtualFolders,
             assignments: store.virtualFolderAssignments,
+            projectAssignments: store.projectFolderAssignments,
             managedWorktreeProjects: store.managedWorktreeProjects,
             archivedAt: store.archivedDate
         )
@@ -244,6 +245,7 @@ struct SidebarSnapshot {
         query: String,
         virtualFolders: [VirtualFolder] = [],
         assignments: [String: String] = [:],
+        projectAssignments: [String: String] = [:],
         managedWorktreeProjects: [String: String] = [:],
         archivedAt: (SessionSummary) -> Date = { $0.modifiedAt }
     ) {
@@ -265,6 +267,7 @@ struct SidebarSnapshot {
             all.filter { !$0.isArchived },
             virtualFolders: virtualFolders,
             assignments: assignments,
+            projectAssignments: projectAssignments,
             managedWorktreeProjects: managedWorktreeProjects,
             validVirtualIDs: validVirtualIDs,
             includeEmptyVirtualFolders: !isFiltering
@@ -272,14 +275,14 @@ struct SidebarSnapshot {
         archivedSessions = all.filter(\.isArchived).sorted { archivedAt($0) > archivedAt($1) }
     }
 
-    /// Builds the folder forest: filesystem project roots plus top-level virtual folders, each
-    /// carrying its own nested virtual folders (any depth) alongside its directly assigned
-    /// sessions. A folder's own `.sessions` never include a descendant's, so every session in
-    /// `sessions` still appears exactly once across the whole tree.
+    /// Builds one alternating forest: virtual folders can contain projects, and projects can
+    /// still contain virtual folders. Conversation assignments override their real project, so
+    /// every session appears exactly once.
     private static func groups(
         _ sessions: [SessionSummary],
         virtualFolders: [VirtualFolder],
         assignments: [String: String],
+        projectAssignments: [String: String],
         managedWorktreeProjects: [String: String],
         validVirtualIDs: Set<String>,
         includeEmptyVirtualFolders: Bool
@@ -299,40 +302,56 @@ struct SidebarSnapshot {
             }
         }
 
-        // Every folder is bucketed under its cycle/dangling-safe effective parent (see
-        // `WorkspaceOrganization.effectiveParentID`), keyed exactly like `SessionFolderGroup.id`
-        // ("" stands for top level here, since that can never collide with a real path or a
-        // "virtual:" id) \u2014 this is what lets a project or another folder host children at any depth.
-        var childrenByParent: [String: [VirtualFolder]] = [:]
+        var virtualByGroupID: [String: VirtualFolder] = [:]
         for folder in virtualFolders {
-            let key = WorkspaceOrganization.effectiveParentID(of: folder, in: virtualFolders) ?? ""
-            childrenByParent[key, default: []].append(folder)
+            let groupID = WorkspaceOrganization.groupID(forVirtualFolderID: folder.id)
+            if virtualByGroupID[groupID] == nil { virtualByGroupID[groupID] = folder }
+        }
+        var projectPaths = Set(filesystemSessions.keys)
+        for folder in virtualFolders {
+            guard let parent = WorkspaceOrganization.effectiveParentID(
+                of: folder,
+                in: virtualFolders,
+                projectAssignments: projectAssignments
+            ), WorkspaceOrganization.virtualFolderID(fromGroupID: parent) == nil else { continue }
+            projectPaths.insert(parent)
         }
 
-        func keep(_ group: SessionFolderGroup) -> Bool {
-            includeEmptyVirtualFolders || !group.sessions.isEmpty || !group.children.isEmpty
+        var childrenByParent: [String: [String]] = [:]
+        for groupID in virtualByGroupID.keys {
+            let parent = WorkspaceOrganization.effectiveParentID(
+                ofGroupID: groupID,
+                folders: virtualFolders,
+                projectAssignments: projectAssignments
+            ) ?? ""
+            childrenByParent[parent, default: []].append(groupID)
+        }
+        for path in projectPaths {
+            let parent = WorkspaceOrganization.effectiveParentID(
+                ofGroupID: path,
+                folders: virtualFolders,
+                projectAssignments: projectAssignments
+            ) ?? ""
+            childrenByParent[parent, default: []].append(path)
         }
 
-        // `depth` only guards this recursion against a pathologically deep (but already acyclic,
-        // hence never truly infinite) parent chain; real folder trees are nowhere near this deep.
-        func build(_ folder: VirtualFolder, depth: Int) -> SessionFolderGroup {
-            let own = (virtualSessions[folder.id] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
-            let nested = depth >= PiTheme.sidebarMaxFolderDepth ? [] : childrenByParent[WorkspaceOrganization.groupID(forVirtualFolderID: folder.id)] ?? []
-            let children = nested.map { build($0, depth: depth + 1) }.filter(keep).sorted(by: groupSort)
-            return SessionFolderGroup(virtualFolder: folder, sessions: own, children: children)
+        func build(_ groupID: String, depth: Int) -> SessionFolderGroup? {
+            let childIDs = depth >= PiTheme.sidebarMaxFolderDepth ? [] : childrenByParent[groupID] ?? []
+            let children = childIDs.compactMap { build($0, depth: depth + 1) }.sorted(by: groupSort)
+            if let folder = virtualByGroupID[groupID] {
+                let own = (virtualSessions[folder.id] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
+                let group = SessionFolderGroup(virtualFolder: folder, sessions: own, children: children)
+                return includeEmptyVirtualFolders || !own.isEmpty || !children.isEmpty ? group : nil
+            }
+            guard projectPaths.contains(groupID) else { return nil }
+            let own = (filesystemSessions[groupID] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
+            guard !own.isEmpty || !children.isEmpty else { return nil }
+            return SessionFolderGroup(path: groupID, sessions: own, children: children)
         }
 
-        let topVirtual = (childrenByParent[""] ?? []).map { build($0, depth: 0) }.filter(keep)
-
-        let projectPaths = Set(filesystemSessions.keys)
-            .union(childrenByParent.keys.filter { !$0.isEmpty && !$0.hasPrefix("virtual:") })
-        let projectGroups = projectPaths.map { path -> SessionFolderGroup in
-            let own = (filesystemSessions[path] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
-            let children = (childrenByParent[path] ?? []).map { build($0, depth: 0) }.filter(keep).sorted(by: groupSort)
-            return SessionFolderGroup(path: path, sessions: own, children: children)
-        }.filter { !$0.sessions.isEmpty || !$0.children.isEmpty }
-
-        return (topVirtual + projectGroups).sorted(by: groupSort)
+        return (childrenByParent[""] ?? [])
+            .compactMap { build($0, depth: 0) }
+            .sorted(by: groupSort)
     }
 
     private static func groupSort(_ lhs: SessionFolderGroup, _ rhs: SessionFolderGroup) -> Bool {
@@ -351,8 +370,7 @@ struct SessionFolderGroup: Identifiable {
     let virtualFolderID: String?
     let virtualName: String?
     let createdAt: Date?
-    /// Nested virtual folders (any depth) that live inside this group. Filesystem groups can
-    /// have children; virtual folders can have both children and, recursively, grandchildren.
+    /// Nested virtual folders or real projects. Either kind can contain the other.
     let children: [SessionFolderGroup]
 
     init(path: String, sessions: [SessionSummary], children: [SessionFolderGroup] = []) {
@@ -556,6 +574,35 @@ private struct SessionFolderSection: View {
     @State private var childName = ""
 
     private var hasRunning: Bool { group.sessions.contains { store.isRunning($0) } }
+    private var projectGit: GitSnapshot {
+        guard !group.isVirtual, !group.isGlobal else { return .none }
+        let snapshots = store.sessions.compactMap { session -> GitSnapshot? in
+            guard store.projectFolder(for: session).standardizedFileURL.path == group.path else { return nil }
+            return store.folderGit[session.cwd.standardizedFileURL.path]
+        }
+        return snapshots.first(where: { $0.isDirty })
+            ?? snapshots.first(where: { $0.isRepository })
+            ?? store.folderGit[group.path]
+            ?? .none
+    }
+    private var headerSymbol: String {
+        if group.isGlobal { return isOpen ? "clock.fill" : "clock" }
+        if group.isVirtual { return isOpen ? "folder.fill" : "folder" }
+        return projectGit.isRepository ? "arrow.triangle.branch" : "externaldrive"
+    }
+    private var headerHelp: String {
+        if group.isGlobal { return "Global conversations" }
+        if group.isVirtual { return "Virtual folder" }
+        let status = [projectGit.branch, projectGit.statusHint].compactMap { $0 }.joined(separator: " · ")
+        return status.isEmpty ? group.path : "\(group.path) · \(status)"
+    }
+    private var headerAccessibilityLabel: String {
+        if group.isGlobal { return "Recents, global conversations, \(group.sessions.count) conversations" }
+        if group.isVirtual { return "\(group.name), virtual folder, \(group.sessions.count) conversations" }
+        let kind = projectGit.isRepository ? "Git repository" : "real folder"
+        let status = projectGit.statusHint.map { ", \($0)" } ?? ""
+        return "\(group.name), \(kind)\(status), \(group.sessions.count) conversations"
+    }
     /// All active project folders open by default. Explicit user collapse still wins.
     private var defaultExpanded: Bool { true }
     private var isOpen: Bool { forceExpanded || store.isFolderExpanded(path: group.id, defaultExpanded: defaultExpanded) }
@@ -570,8 +617,9 @@ private struct SessionFolderSection: View {
                 HStack(spacing: PiTheme.space6) {
                     // No chevron column: the icon itself carries open/closed state, and the
                     // whole row (not a disclosure glyph) is the click target.
-                    Image(systemName: group.isGlobal ? (isOpen ? "clock.fill" : "clock") : (isOpen ? "folder.fill" : "folder"))
-                        .font(.system(size: PiIcon.small)).foregroundStyle(.tertiary)
+                    Image(systemName: headerSymbol)
+                        .font(.system(size: PiIcon.small))
+                        .foregroundStyle(projectGit.isDirty ? Color.piOrange : Color.secondary)
                         .frame(width: PiTheme.sidebarIconColumn, alignment: .center)
                     Text(group.name)
                         .font(SidebarTypography.folderHeader).foregroundStyle(.secondary).lineLimit(1)
@@ -587,10 +635,8 @@ private struct SessionFolderSection: View {
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
-            .help(group.isGlobal ? "Global conversations" : (group.isVirtual ? "Virtual folder" : group.path))
-            .accessibilityLabel(group.isGlobal
-                ? "Recents, global conversations, \(group.sessions.count) conversations"
-                : "\(group.name) folder, \(group.sessions.count) conversations")
+            .help(headerHelp)
+            .accessibilityLabel(headerAccessibilityLabel)
             .accessibilityValue("\(isOpen ? "expanded" : "collapsed")\(hasRunning ? ", sessions running" : "")")
             .contextMenu {
                 if group.isGlobal {
@@ -601,8 +647,9 @@ private struct SessionFolderSection: View {
                     Button("Rename Folder…") { renameValue = group.name; renaming = true }
                     Menu("Move Folder to…") {
                         Button("Top level") { store.reparentVirtualFolder(id: id, to: nil) }
-                        if !projectDestinations.isEmpty { Divider() }
-                        ForEach(projectDestinations, id: \.self) { path in
+                        let projects = projectDestinations(excluding: id)
+                        if !projects.isEmpty { Divider() }
+                        ForEach(projects, id: \.self) { path in
                             Button(SessionFolderGroup.projectName(forPath: path)) {
                                 store.reparentVirtualFolder(id: id, to: path)
                             }
@@ -619,6 +666,16 @@ private struct SessionFolderSection: View {
                 } else {
                     Button("New Folder Inside…") { childName = ""; creatingChild = true }
                     Button("New Chat Here") { newChatHere() }
+                    Menu("Move Folder to…") {
+                        Button("Top level") { store.moveProjectFolder(path: group.path, toVirtualFolder: nil) }
+                        let destinations = availableProjectDestinations
+                        if !destinations.isEmpty { Divider() }
+                        ForEach(destinations) { entry in
+                            Button(String(repeating: "  ", count: entry.depth) + entry.folder.name) {
+                                store.moveProjectFolder(path: group.path, toVirtualFolder: entry.folder.id)
+                            }
+                        }
+                    }
                 }
             }
             .dropDestination(for: String.self) { paths, _ in
@@ -655,7 +712,7 @@ private struct SessionFolderSection: View {
                 if let id = group.virtualFolderID { store.deleteVirtualFolder(id: id) }
             }
         } message: {
-            Text("Subfolders move up a level and conversations return to their project or Recents group. Session files are not changed.")
+            Text("Subfolders move up a level. Nested projects return to top level or the enclosing virtual folder. Directly filed conversations return to their project or Recents group. Session files are not changed.")
         }
     }
 
@@ -698,20 +755,49 @@ private struct SessionFolderSection: View {
         }
     }
 
-    /// Known project paths, from live sessions, as candidate "Move Folder to…" destinations.
-    private var projectDestinations: [String] {
+    /// Known project paths that would not put this virtual folder under one of its descendants.
+    private func projectDestinations(excluding id: String) -> [String] {
         Set(store.sessions.map { store.projectFolder(for: $0).standardizedFileURL.path })
-            .filter { !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: $0, isDirectory: true)) }
+            .filter { path in
+                !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
+                    && !WorkspaceOrganization.wouldCreateGroupCycle(
+                        moving: WorkspaceOrganization.groupID(forVirtualFolderID: id),
+                        into: path,
+                        folders: store.virtualFolders,
+                        projectAssignments: store.projectFolderAssignments
+                    )
+            }
             .sorted {
                 SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
             }
     }
 
-    /// The whole folder tree minus `id` and its own descendants, so the menu never offers a
-    /// move that `reparent` would refuse as a cycle.
     private func availableFolderDestinations(excluding id: String) -> [WorkspaceOrganization.FolderTreeEntry] {
-        WorkspaceOrganization.allFolderEntries(store.virtualFolders)
-            .filter { $0.folder.id != id && !WorkspaceOrganization.wouldCreateCycle(moving: id, into: $0.folder.id, in: store.virtualFolders) }
+        WorkspaceOrganization.allFolderEntries(
+            store.virtualFolders,
+            projectAssignments: store.projectFolderAssignments
+        ).filter {
+            $0.folder.id != id && !WorkspaceOrganization.wouldCreateCycle(
+                moving: id,
+                into: $0.folder.id,
+                in: store.virtualFolders,
+                projectAssignments: store.projectFolderAssignments
+            )
+        }
+    }
+
+    private var availableProjectDestinations: [WorkspaceOrganization.FolderTreeEntry] {
+        WorkspaceOrganization.allFolderEntries(
+            store.virtualFolders,
+            projectAssignments: store.projectFolderAssignments
+        ).filter {
+            !WorkspaceOrganization.wouldCreateGroupCycle(
+                moving: group.path,
+                into: WorkspaceOrganization.groupID(forVirtualFolderID: $0.folder.id),
+                folders: store.virtualFolders,
+                projectAssignments: store.projectFolderAssignments
+            )
+        }
     }
 }
 
@@ -781,7 +867,10 @@ private struct SessionRow: View {
             Button("Rename…") { renameValue = session.displayName; renaming = true }
             Menu("Move to…") {
                 Button("Project / Recents") { store.moveSession(session, toVirtualFolder: nil) }
-                let entries = WorkspaceOrganization.allFolderEntries(store.virtualFolders)
+                let entries = WorkspaceOrganization.allFolderEntries(
+                    store.virtualFolders,
+                    projectAssignments: store.projectFolderAssignments
+                )
                 if !entries.isEmpty { Divider() }
                 ForEach(entries) { entry in
                     Button(String(repeating: "  ", count: entry.depth) + entry.folder.name) {

@@ -21,6 +21,14 @@ final class FolderTreeTests: XCTestCase {
         XCTAssertTrue(response.assignments.isEmpty, "an assignment naming no surviving folder is dropped")
     }
 
+    func testLegacyResponseWithoutProjectAssignmentsDecodes() throws {
+        let response = try JSONDecoder().decode(
+            FolderTreeResponse.self,
+            from: Data(#"{"folders":[],"assignments":{}}"#.utf8)
+        )
+        XCTAssertTrue(response.projectAssignments.isEmpty)
+    }
+
     func testLegacyFoldersWithNoParentKeyDecodeAsTopLevel() throws {
         // State written before nesting existed has no `parentID` at all.
         let json = Data(#"[{"id":"f1","name":"Review","createdAt":0}]"#.utf8)
@@ -52,6 +60,38 @@ final class FolderTreeTests: XCTestCase {
         ])
         XCTAssertEqual(nodes.map(\.id), ["t", "p"])
         XCTAssertEqual(nodes.last?.parentId, "/Users/x/code")
+    }
+
+    func testARealProjectCanSitInsideAVirtualFolderAndHostAnotherVirtualFolder() {
+        let nodes = FolderTree.nodes(
+            from: [
+                folder("clients", "Clients", createdAt: 1),
+                folder("docs", "Docs", parent: "/Users/x/client-a", createdAt: 2)
+            ],
+            projectAssignments: ["/Users/x/client-a": "clients"]
+        )
+
+        XCTAssertEqual(nodes.map(\.id), ["clients", "docs"])
+        XCTAssertEqual(nodes.map(\.depth), [0, 1])
+        XCTAssertEqual(nodes[1].parentId, "/Users/x/client-a")
+        let response = FolderTree.response(
+            folders: [folder("clients", "Clients")],
+            assignments: [:],
+            projectAssignments: ["/Users/x/client-a": "clients"]
+        )
+        XCTAssertEqual(response.projectAssignments, ["/Users/x/client-a": "clients"])
+    }
+
+    func testAlternatingProjectFolderCycleDegradesBothNodesToTopLevel() {
+        let folders = [folder("clients", "Clients", parent: "/Users/x/client-a")]
+        let response = FolderTree.response(
+            folders: folders,
+            assignments: [:],
+            projectAssignments: ["/Users/x/client-a": "clients"]
+        )
+
+        XCTAssertNil(response.folders.first?.parentId)
+        XCTAssertTrue(response.projectAssignments.isEmpty)
     }
 
     func testATwoFolderCycleDegradesToTopLevelInsteadOfRecursingForever() {

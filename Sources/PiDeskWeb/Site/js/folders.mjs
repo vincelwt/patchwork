@@ -9,7 +9,7 @@
 // The rules mirror `SidebarSnapshot` in the app:
 //   - a thread filed into a virtual folder appears there, and only there
 //   - every other thread groups under its filesystem project (`cwd`)
-//   - a virtual folder can be nested in another folder or hosted by a project group
+//   - virtual folders and real project groups can contain each other
 //   - an empty virtual folder still shows, so a folder made on the Mac is visible before
 //     anything has been filed into it
 //   - a group's own threads never include a descendant's, so each thread appears exactly once
@@ -38,6 +38,7 @@ function time(value) {
 }
 
 function byRecency(a, b) {
+  if (a.kind !== b.kind) return a.kind === "virtual" ? -1 : 1;
   if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
   return a.name.localeCompare(b.name);
 }
@@ -45,7 +46,7 @@ function byRecency(a, b) {
 /**
  * Builds the nested render model.
  *
- * `folderTree` is the `GET /v1/folders` payload (`{folders, assignments}`); passing `null` — an
+ * `folderTree` is the `GET /v1/folders` payload (`{folders, assignments, projectAssignments}`); passing `null`, an
  * older daemon, a machine that never made a folder, or a failed request — yields plain project
  * grouping, which is exactly the pre-folder behaviour.
  */
@@ -54,7 +55,9 @@ export function buildThreadTree(threads, folderTree) {
     (folder) => folder && typeof folder.id === "string"
   );
   const assignments = (folderTree && folderTree.assignments) || {};
+  const projectAssignments = (folderTree && folderTree.projectAssignments) || {};
   const validIds = new Set(folders.map((folder) => folder.id));
+  const folderByGroupId = new Map(folders.map((folder) => [groupIdForFolder(folder.id), folder]));
 
   const threadsByFolder = new Map();
   const threadsByProject = new Map();
@@ -66,44 +69,53 @@ export function buildThreadTree(threads, folderTree) {
     bucket.get(key).push(thread);
   }
 
-  // Same fallback the daemon already applies (`FolderTree.effectiveParentID`), repeated here so
-  // a folder is never bucketed under a parent that will not be rendered: a dangling `virtual:`
-  // parent lands at top level rather than taking its threads out of the list entirely. A
-  // filesystem project parent is always accepted — projects are derived from live threads, so a
-  // project group with no threads of its own is created below to host the folder.
+  const projectPaths = new Set([...threadsByProject.keys(), ...Object.keys(projectAssignments)]);
+  for (const folder of folders) {
+    if (folder.parentId && folderIdFromGroupId(folder.parentId) === null) projectPaths.add(folder.parentId);
+  }
+
+  // Both node kinds share the same parent-id scheme. The daemon has already flattened cycles;
+  // the dangling checks keep this client backward-safe with malformed or older payloads.
   const childrenByParent = new Map();
+  const appendChild = (parent, child) => {
+    if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+    childrenByParent.get(parent).push(child);
+  };
   for (const folder of folders) {
     const virtualParent = folderIdFromGroupId(folder.parentId);
-    const dangling = virtualParent !== null && !validIds.has(virtualParent);
-    const key = dangling ? "" : folder.parentId || "";
-    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
-    childrenByParent.get(key).push(folder);
+    appendChild(virtualParent !== null && !validIds.has(virtualParent) ? "" : folder.parentId || "", groupIdForFolder(folder.id));
+  }
+  for (const path of projectPaths) {
+    const assigned = projectAssignments[path];
+    appendChild(assigned && validIds.has(assigned) ? groupIdForFolder(assigned) : "", path);
   }
 
-  const buildFolder = (folder) => {
-    const own = (threadsByFolder.get(folder.id) || []).slice().sort((a, b) => time(b.updatedAt) - time(a.updatedAt));
-    const children = (childrenByParent.get(groupIdForFolder(folder.id)) || []).map(buildFolder).sort(byRecency);
-    return summarize({ id: groupIdForFolder(folder.id), name: folder.name, kind: "virtual", threads: own, children });
+  const buildGroup = (groupId, ancestors = new Set()) => {
+    if (ancestors.has(groupId)) return null;
+    const nextAncestors = new Set(ancestors).add(groupId);
+    const children = (childrenByParent.get(groupId) || [])
+      .map((child) => buildGroup(child, nextAncestors))
+      .filter(Boolean)
+      .sort(byRecency);
+    const folder = folderByGroupId.get(groupId);
+    const own = folder
+      ? (threadsByFolder.get(folder.id) || []).slice()
+      : (threadsByProject.get(groupId) || []).slice();
+    own.sort((a, b) => time(b.updatedAt) - time(a.updatedAt));
+    const group = summarize({
+      id: groupId,
+      name: folder ? folder.name : lastName(groupId),
+      kind: folder ? "virtual" : "project",
+      threads: own,
+      children
+    });
+    return folder || group.total > 0 || children.length > 0 ? group : null;
   };
 
-  const projectPaths = new Set(threadsByProject.keys());
-  for (const key of childrenByParent.keys()) {
-    if (key && folderIdFromGroupId(key) === null) projectPaths.add(key);
-  }
-
-  const topFolders = (childrenByParent.get("") || []).map(buildFolder).sort(byRecency);
-  const projects = [...projectPaths]
-    .map((path) => {
-      const own = (threadsByProject.get(path) || []).slice().sort((a, b) => time(b.updatedAt) - time(a.updatedAt));
-      const children = (childrenByParent.get(path) || []).map(buildFolder).sort(byRecency);
-      return summarize({ id: path, name: lastName(path), kind: "project", threads: own, children });
-    })
-    // Same rule as the app's sidebar: a project group survives if it holds threads *or* hosts a
-    // folder. An empty one is not something a person made, just a path with nothing left in it.
-    .filter((group) => group.total > 0 || group.children.length > 0)
+  return (childrenByParent.get("") || [])
+    .map((groupId) => buildGroup(groupId))
+    .filter(Boolean)
     .sort(byRecency);
-
-  return [...topFolders, ...projects];
 }
 
 /** Subtree totals, so a collapsed folder can still show what is inside it. */
