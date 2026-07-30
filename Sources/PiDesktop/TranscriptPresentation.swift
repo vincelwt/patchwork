@@ -446,10 +446,13 @@ private struct TurnBuilder {
     }
 
     /// System, custom, and unknown entries join the work log when a turn is in flight and stand
-    /// on their own otherwise, so an extension message is never silently swallowed.
+    /// on their own otherwise, so an extension message is never silently swallowed. Known
+    /// sideband updates always belong to work, even when they arrive before its first thought.
     private mutating func log(_ message: ChatMessage, streaming: Bool) {
-        if trailingIsAnswer,
-           message.customType == "ad-process:update" || message.customType == "web-search-content-ready" {
+        let isSideband = message.customType == "ad-process:update"
+            || message.customType == "web-search-content-ready"
+        if isSideband {
+            if !trailingIsAnswer { demoteTrailing() }
             closeActivity()
             entries.append(.note(message))
             return
