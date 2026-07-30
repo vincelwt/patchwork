@@ -1,4 +1,4 @@
-// pi-desktop-activity-version: 19
+// pi-desktop-activity-version: 20
 //
 // Maintained by Pi Desktop. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Pi Desktop's
@@ -29,6 +29,7 @@ import * as path from "node:path";
 const HEARTBEAT_INTERVAL_MS = 2_000;
 const PREVIEW_LIMIT = 160;
 const TERMINAL_STOP_REASONS = new Set(["stop", "length", "error", "aborted"]);
+const LIVE_MANAGED_PROCESS_STATUSES = new Set(["running", "terminating", "terminate_timeout"]);
 const DAEMON_TIMEOUT_MS = 3_000;
 const DAEMON_RESPONSE_LIMIT = 1_048_576;
 const PULL_REQUEST_REVIEW_COMMAND = "pi-desktop-pr-review";
@@ -359,6 +360,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentRunning = false;
   const backgroundAgents = new Set<string>();
+  const backgroundProcesses = new Set<string>();
 
   function clearTimer(): void {
     if (timer) {
@@ -404,11 +406,15 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     }
   }
 
+  function hasRunningWork(): boolean {
+    return agentRunning || backgroundAgents.size > 0 || backgroundProcesses.size > 0;
+  }
+
   function syncHeartbeat(): void {
-    const running = agentRunning || backgroundAgents.size > 0;
+    const running = hasRunningWork();
     write(running ? "running" : "idle");
     if (running && !timer) {
-      timer = setInterval(() => write(agentRunning || backgroundAgents.size > 0 ? "running" : "idle"), HEARTBEAT_INTERVAL_MS);
+      timer = setInterval(() => write(hasRunningWork() ? "running" : "idle"), HEARTBEAT_INTERVAL_MS);
       timer.unref?.();
     } else if (!running) {
       clearTimer();
@@ -675,6 +681,38 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
     syncHeartbeat();
   });
 
+  pi.on("tool_execution_end", async (event) => {
+    if (event.toolName.toLowerCase() !== "process" || event.isError) return;
+    const details = event.result.details as {
+      action?: unknown;
+      success?: unknown;
+      process?: unknown;
+    } | undefined;
+    if (!details || details.action !== "start" || details.success !== true
+        || !details.process || typeof details.process !== "object") return;
+    const value = details.process as { id?: unknown; status?: unknown };
+    if (typeof value.id !== "string" || typeof value.status !== "string"
+        || !LIVE_MANAGED_PROCESS_STATUSES.has(value.status)) return;
+    backgroundProcesses.add(value.id);
+    syncHeartbeat();
+  });
+
+  pi.on("message_end", async (event) => {
+    const message = event.message as {
+      role?: unknown;
+      customType?: unknown;
+      details?: unknown;
+    };
+    if (message.role !== "custom" || message.customType !== "ad-process:update"
+        || !message.details || typeof message.details !== "object") return;
+    const details = message.details as { processId?: unknown; status?: unknown };
+    if (typeof details.processId === "string"
+        && (details.status === "exited" || details.status === "killed")) {
+      backgroundProcesses.delete(details.processId);
+      syncHeartbeat();
+    }
+  });
+
   pi.on("agent_settled", async () => {
     agentRunning = false;
     syncHeartbeat();
@@ -690,6 +728,7 @@ export default function piDesktopActivity(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     clearTimer();
     backgroundAgents.clear();
+    backgroundProcesses.clear();
     remove();
   });
 
