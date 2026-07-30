@@ -53,7 +53,7 @@ extension AppStore {
     /// regardless, so a stale click can never apply to the wrong turn.
     func beginEditingLastMessage() {
         let state = editState
-        guard !state.isResubmitting, let target = lastUserMessage else { return }
+        guard !isBrowsingEarlierHistory, !state.isResubmitting, let target = lastUserMessage else { return }
         draft = Self.editableText(from: target)
         attachments = target.images.compactMap(ImageImportService.attachment)
         state.targetMessageID = target.id

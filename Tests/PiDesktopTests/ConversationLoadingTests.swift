@@ -69,6 +69,37 @@ private struct DelayedRepository: SessionRepositoryProtocol {
 /// Returns scripted newest pages so the refresh-merge path can be exercised with page flags
 /// (like a scan-budget truncation) that a tiny fixture file can never produce through the real
 /// parser's default limits.
+private struct DelayedPagingRepository: SessionRepositoryProtocol {
+    let base: FileSessionRepository
+    let newestDelay: UInt64
+    let focusedDelay: UInt64
+    var rootURL: URL { base.rootURL }
+
+    func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] {
+        try await base.discoverSessions(archivedIDs: archivedIDs)
+    }
+    func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary {
+        try await base.refreshSummary(at: fileURL, archivedIDs: archivedIDs)
+    }
+    func loadConversation(from fileURL: URL) async throws -> SessionConversation {
+        try await base.loadConversation(from: fileURL)
+    }
+    func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
+        try await base.loadConversationTail(from: fileURL, limit: limit)
+    }
+    func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage {
+        try await Task.sleep(nanoseconds: newestDelay)
+        return try await base.loadNewestConversationPage(from: fileURL)
+    }
+    func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        try await base.loadOlderConversationPage(from: fileURL, cursor: cursor)
+    }
+    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        try await Task.sleep(nanoseconds: focusedDelay)
+        return try await base.loadFocusedHistoryPage(from: fileURL, cursor: cursor)
+    }
+}
+
 private final class ScriptedPagingRepository: SessionRepositoryProtocol, @unchecked Sendable {
     let rootURL = FileManager.default.temporaryDirectory
     private let lock = NSLock()
@@ -116,7 +147,7 @@ final class ConversationLoadingTests: XCTestCase {
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
 
-    func testCacheMissPublishesNewestBoundedPageThenLoadsEarlierOnDemand() async throws {
+    func testHistoryPagesReplaceTheWindowAndNavigateBackToLatest() async throws {
         let file = temporaryDirectory.appendingPathComponent("big.jsonl")
         try writeLinearConversation(prefix: "big", messageCount: 80, to: file)
         let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
@@ -125,20 +156,89 @@ final class ConversationLoadingTests: XCTestCase {
 
         store.selectSession(session)
         try await waitUntil { store.messages.count == ConversationPage.defaultMessageTarget }
-        let firstPaintTailID = store.messages.last?.id
         XCTAssertEqual(store.messages.first?.textContent, "big-30")
         XCTAssertEqual(store.messages.last?.textContent, "big-79")
         XCTAssertTrue(store.hasEarlierMessages)
-        XCTAssertFalse(store.isConversationLoading)
 
         store.loadEarlierMessages()
-        try await waitUntil { store.messages.count == 80 }
+        try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
         XCTAssertEqual(store.messages.first?.textContent, "big-0")
-        XCTAssertEqual(store.messages.last?.id, firstPaintTailID, "A prepend must keep the visible tail's durable identity")
+        XCTAssertEqual(store.messages.last?.textContent, "big-29")
         XCTAssertFalse(store.hasEarlierMessages)
+        XCTAssertTrue(store.hasNewerMessages)
+
+        store.loadNewerMessages()
+        XCTAssertFalse(store.isBrowsingEarlierHistory)
+        XCTAssertEqual(store.messages.first?.textContent, "big-30")
+        XCTAssertEqual(store.messages.last?.textContent, "big-79")
     }
 
-    func testPrependingDiskHistoryKeepsBoundedLiveMessages() async throws {
+    func testConversationFocusedPagingCrossesThousandsOfToolRecords() async throws {
+        let file = temporaryDirectory.appendingPathComponent("tool-heavy.jsonl")
+        var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "tool-heavy"]]
+        var parent: Any = NSNull()
+        for turn in 0..<30 {
+            let userID = "user-\(turn)"
+            lines.append([
+                "type": "message", "id": userID, "parentId": parent,
+                "message": ["role": "user", "content": "prompt \(turn)"]
+            ])
+            parent = userID
+            for step in 0..<40 {
+                let callID = "call-\(turn)-\(step)"
+                let assistantID = "assistant-\(turn)-\(step)"
+                lines.append([
+                    "type": "message", "id": assistantID, "parentId": parent,
+                    "message": [
+                        "role": "assistant", "stopReason": "toolUse",
+                        "content": [["type": "toolCall", "id": callID, "name": "read", "arguments": [String: Any]()]]
+                    ]
+                ])
+                lines.append([
+                    "type": "message", "id": "result-\(turn)-\(step)", "parentId": assistantID,
+                    "message": ["role": "toolResult", "toolCallId": callID, "content": "large tool output"]
+                ])
+                parent = "result-\(turn)-\(step)"
+            }
+            let answerID = "answer-\(turn)"
+            lines.append([
+                "type": "message", "id": answerID, "parentId": parent,
+                "message": ["role": "assistant", "content": "answer \(turn)", "stopReason": "stop"]
+            ])
+            parent = answerID
+        }
+        try writeJSONL(lines, to: file)
+
+        let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
+        let session = try makeSummary(id: "tool-heavy", fileURL: file)
+        store.sessions = [session]
+        store.selectSession(session)
+        try await waitUntil { !store.isConversationLoading && store.messages.last?.id == "answer-29" }
+        XCTAssertGreaterThan(store.messages.count, ConversationPage.defaultMessageTarget,
+                             "The detailed newest page finishes its active turn")
+
+        while store.hasEarlierMessages {
+            store.loadEarlierMessages()
+            try await waitUntil { !store.isLoadingEarlierMessages }
+            XCTAssertLessThanOrEqual(store.messages.count, ConversationPage.defaultMessageTarget + 1)
+            XCTAssertTrue(store.messages.allSatisfy { $0.role == .user || $0.role == .assistant })
+            XCTAssertFalse(store.messages.flatMap(\.blocks).contains { block in
+                if case .toolCall = block.kind { return true }
+                if case .thinking = block.kind { return true }
+                return false
+            })
+        }
+
+        XCTAssertEqual(store.messages.first?.textContent, "prompt 0")
+        XCTAssertTrue(store.hasNewerMessages)
+        store.loadNewerMessages()
+        try await waitUntil { !store.isLoadingNewerMessages }
+        XCTAssertTrue(store.isBrowsingEarlierHistory)
+        store.jumpToLatestMessages()
+        XCTAssertEqual(store.messages.last?.textContent, "answer 29")
+    }
+
+    func testLiveMessagesStayOnLatestWhileBrowsingOlderHistory() async throws {
         let file = temporaryDirectory.appendingPathComponent("live.jsonl")
         try writeLinearConversation(prefix: "disk", messageCount: 60, to: file)
         let runtime = FakeRuntime()
@@ -161,9 +261,26 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.textContent, "Live narration")
 
         store.loadEarlierMessages()
-        try await waitUntil { store.messages.count == 61 }
-        XCTAssertEqual(store.messages.last?.textContent, "Live narration")
+        try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
+        XCTAssertFalse(store.messages.contains { $0.textContent == "Live narration" })
+
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "role": .string("assistant"), "content": .string("Buffered answer"),
+                "stopReason": .string("stop"), "timestamp": .number(3_000)
+            ])
+        ]))
+        XCTAssertFalse(store.messages.contains { $0.textContent == "Buffered answer" })
+
+        store.jumpToLatestMessages()
+        XCTAssertEqual(store.messages.last?.textContent, "Buffered answer")
         XCTAssertEqual(store.messages.filter { $0.textContent == "Live narration" }.count, 1)
+        XCTAssertEqual(store.messages.filter { $0.textContent == "Buffered answer" }.count, 1)
+
+        store.selectSession(session)
+        XCTAssertEqual(store.messages.last?.textContent, "Buffered answer",
+                       "Returning from history must not misclassify an RPC answer as durable")
     }
 
     func testASmallConversationsTailScanIsAlreadyCompleteSoNoBackfillIsNeeded() async throws {
@@ -181,7 +298,7 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.map(\.textContent), ["small-0", "small-1", "small-2"])
     }
 
-    func testLoadingMultiplePagesKeepsOneAggregateImageBudget() async throws {
+    func testEachHistoryPageKeepsABoundedImageBudget() async throws {
         let file = temporaryDirectory.appendingPathComponent("paged-images.jsonl")
         let encoded = Data("pixel".utf8).base64EncodedString()
         var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "images"]]
@@ -211,9 +328,13 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
 
         store.loadEarlierMessages()
-        try await waitUntil { store.messages.count == 60 }
+        try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
+        XCTAssertLessThanOrEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
+        XCTAssertLessThanOrEqual(store.messages.count, ConversationPage.defaultMessageTarget)
+
+        store.jumpToLatestMessages()
         XCTAssertEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
-        XCTAssertEqual(store.messages.last?.images.count, 1, "Newest images have priority")
+        XCTAssertEqual(store.messages.last?.images.count, 1, "Returning restores the newest page")
     }
 
     func testUnreadConversationTargetsTheFirstLoadedCompletionAfterLastSeen() async throws {
@@ -355,7 +476,7 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.filter { $0.textContent == "Durable answer" }.count, 2)
     }
 
-    func testOpenConversationRefreshesItsChangedDiskTailWithoutReselection() async throws {
+    func testDiskRefreshWaitsUntilOlderHistoryReturnsToLatest() async throws {
         let file = temporaryDirectory.appendingPathComponent("live-tail.jsonl")
         try writeLinearConversation(prefix: "live", messageCount: 60, to: file)
         let monitor = SessionActivityMonitor(
@@ -374,8 +495,8 @@ final class ConversationLoadingTests: XCTestCase {
         store.selectSession(session)
         try await waitUntil { store.messages.count == 50 }
         store.loadEarlierMessages()
-        try await waitUntil { store.messages.count == 60 }
-        let firstID = store.messages.first?.id
+        try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
+        let historicalIDs = store.messages.map(\.id)
 
         let entry: [String: Any] = [
             "type": "message", "id": "live-thinking", "parentId": "live-entry-59",
@@ -389,11 +510,52 @@ final class ConversationLoadingTests: XCTestCase {
         try handle.write(contentsOf: JSONSerialization.data(withJSONObject: entry) + Data([0x0A]))
         try handle.close()
         monitor.tickNow()
+        try await Task.sleep(nanoseconds: 150_000_000)
 
+        XCTAssertEqual(store.messages.map(\.id), historicalIDs, "Live disk changes must not replace the page being read")
+        store.jumpToLatestMessages()
         try await waitUntil { store.messages.last?.id == "live-thinking" }
-        XCTAssertEqual(store.messages.first?.id, firstID, "Refreshing the tail must preserve loaded earlier rows")
         XCTAssertEqual(store.messages.last?.textContent, "Fresh live thought")
-        XCTAssertNil(store.initialScrollTargetMessageID, "A passive refresh must not re-arm initial scrolling")
+        XCTAssertNil(store.initialScrollTargetMessageID)
+    }
+
+    func testStartingHistoryCancelsAnInFlightLatestRefresh() async throws {
+        let file = temporaryDirectory.appendingPathComponent("refresh-race.jsonl")
+        try writeLinearConversation(prefix: "race", messageCount: 80, to: file)
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: temporaryDirectory.appendingPathComponent("heartbeats-race", isDirectory: true)
+        )
+        let repository = DelayedPagingRepository(
+            base: FileSessionRepository(rootURL: temporaryDirectory),
+            newestDelay: 150_000_000,
+            focusedDelay: 300_000_000
+        )
+        let store = makeStore(repository: repository, activityMonitor: monitor)
+        let session = try makeSummary(id: "race", fileURL: file)
+        store.sessions = [session]
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path) != nil }
+        store.selectSession(session)
+        try await waitUntil { store.messages.last?.id == "race-entry-79" }
+
+        let fresh: [String: Any] = [
+            "type": "message", "id": "fresh-tail", "parentId": "race-entry-79",
+            "message": ["role": "assistant", "content": "Fresh tail"]
+        ]
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: JSONSerialization.data(withJSONObject: fresh) + Data([0x0A]))
+        try handle.close()
+        monitor.tickNow()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        store.loadEarlierMessages()
+        try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
+        XCTAssertFalse(store.messages.contains { $0.id == "fresh-tail" })
+
+        store.jumpToLatestMessages()
+        try await waitUntil { store.messages.last?.id == "fresh-tail" }
     }
 
     func testLiveTailRefreshReprojectsFinishedSubagents() async throws {

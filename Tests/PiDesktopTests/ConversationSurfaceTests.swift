@@ -60,41 +60,11 @@ final class ConversationImageStripTests: XCTestCase {
 final class ConversationScrollMetricsTests: XCTestCase {
     func testPinningUsesViewportGeometry() {
         XCTAssertTrue(ConversationScrollMetrics(
-            originY: 920, viewportHeight: 500, documentHeight: 1_500, direction: .down
+            originY: 920, viewportHeight: 500, documentHeight: 1_500
         ).isNearBottom)
         XCTAssertFalse(ConversationScrollMetrics(
-            originY: 700, viewportHeight: 500, documentHeight: 1_500, direction: .up
+            originY: 700, viewportHeight: 500, documentHeight: 1_500
         ).isNearBottom)
-        XCTAssertTrue(ConversationScrollMetrics(
-            originY: PiTheme.transcriptScrollEdgeThreshold, viewportHeight: 500,
-            documentHeight: 1_500, direction: .up
-        ).isNearTop)
-        let underfilled = ConversationScrollMetrics(
-            originY: 0, viewportHeight: 500, documentHeight: 500, direction: .stationary
-        )
-        XCTAssertTrue(underfilled.isUnderfilled)
-        XCTAssertTrue(underfilled.shouldRequestEarlierHistory)
-        XCTAssertFalse(ConversationScrollMetrics(
-            originY: 0, viewportHeight: 500, documentHeight: 700, direction: .stationary
-        ).shouldRequestEarlierHistory)
-        XCTAssertFalse(ConversationScrollMetrics(
-            originY: 0, viewportHeight: 0, documentHeight: 0, direction: .stationary
-        ).shouldRequestEarlierHistory)
-    }
-
-    func testHistoryPrefetchStartsBeforeTheViewportReachesTheTop() {
-        XCTAssertTrue(ConversationScrollMetrics(
-            originY: PiTheme.transcriptHistoryPrefetchDistance - 1, viewportHeight: 500,
-            documentHeight: 5_000, direction: .up
-        ).shouldRequestEarlierHistory, "Scrolling up inside the prefetch distance requests the next page")
-        XCTAssertFalse(ConversationScrollMetrics(
-            originY: PiTheme.transcriptHistoryPrefetchDistance - 1, viewportHeight: 500,
-            documentHeight: 5_000, direction: .down
-        ).shouldRequestEarlierHistory, "Scrolling back down never requests history")
-        XCTAssertFalse(ConversationScrollMetrics(
-            originY: PiTheme.transcriptHistoryPrefetchDistance + 200, viewportHeight: 500,
-            documentHeight: 5_000, direction: .up
-        ).shouldRequestEarlierHistory)
     }
 
     func testBottomOriginRespectsInsets() {
@@ -115,41 +85,6 @@ final class ConversationScrollMetricsTests: XCTestCase {
             -338
         )
     }
-
-    func testPrependRestorationWithDynamicInsetsLandsOnTheNewBottom() {
-        // An underfilled page (origin -338 via the synthetic top inset) gains 1,610pt of
-        // earlier history and the inset collapses to 58: the delta math lands exactly on the
-        // new bottom, keeping the rows that were on screen in place.
-        XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: -338, oldDocumentHeight: 390, newDocumentHeight: 2_000,
-                viewportHeight: 818, topInset: 58, bottomInset: 90
-            ),
-            1_272
-        )
-    }
-
-    func testPrependRestorationPreservesTheOriginalViewportOffset() {
-        XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: 500, oldDocumentHeight: 2_000,
-                newDocumentHeight: 2_600, viewportHeight: 600
-            ),
-            1_100
-        )
-        XCTAssertEqual(
-            ConversationScrollObserver.restoredOriginY(
-                originalY: 1_900, oldDocumentHeight: 2_000,
-                newDocumentHeight: 2_600, viewportHeight: 600
-            ),
-            2_000,
-            "Restoration clamps to the new scrollable maximum"
-        )
-        XCTAssertNil(ConversationScrollObserver.restoredOriginY(
-            originalY: 500, oldDocumentHeight: 2_000,
-            newDocumentHeight: 2_000, viewportHeight: 600
-        ))
-    }
 }
 
 @MainActor
@@ -167,6 +102,12 @@ final class ConversationScrollCacheTests: XCTestCase {
 
         _ = cache.items(revision: 2, messages: [message], streaming: nil, isRunning: false)
         XCTAssertEqual(cache.buildCount, 2)
+
+        _ = cache.items(
+            revision: 2, messages: [message], streaming: nil,
+            isRunning: false, mode: .focusedHistory
+        )
+        XCTAssertEqual(cache.buildCount, 3, "Changing history detail must invalidate the projection")
     }
 
     func testProjectionCachePreservesAWorkRowAcrossAPrependSeam() {
@@ -240,6 +181,52 @@ final class TranscriptPresenterTests: XCTestCase {
 
         guard case let .message(answer, _) = items[2] else { return XCTFail("Expected the answer") }
         XCTAssertEqual(answer.textContent, "Here is the answer.")
+    }
+
+    func testFocusedHistoryKeepsDialogueAndForwardCompatibleNotesOnly() throws {
+        let unknown = ChatMessage(
+            id: "future", role: .unknown,
+            blocks: [MessageBlock(id: "future-block", kind: .unknown(type: "future", raw: .string("payload")))],
+            timestamp: nil, raw: .string("payload")
+        )
+        var answer = assistant(id: "answer", blocks: [text("Done.")])
+        answer.stopReason = "stop"
+        let items = TranscriptPresenter.items(
+            messages: [
+                user(id: "user", text: "Inspect it", at: nil),
+                assistant(id: "narration", blocks: [text("Looking now.")]),
+                assistant(id: "tool", blocks: [thinking("plan"), call("call", "read", [:])]),
+                result(id: "result", callID: "call", text: "contents"),
+                answer,
+                unknown
+            ],
+            streaming: nil,
+            mode: .focusedHistory
+        )
+
+        let messageIDs = items.compactMap { item -> String? in
+            if case let .message(message, _) = item { return message.id }
+            return nil
+        }
+        XCTAssertEqual(messageIDs, ["user", "answer", "future"])
+        XCTAssertFalse(items.contains { if case .work = $0 { return true }; return false })
+    }
+
+    func testFocusedHistoryKeepsATerminalAssistantError() throws {
+        var failed = assistant(id: "failed", blocks: [text("Provider failed.")])
+        failed.isError = true
+
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "user", text: "Try it", at: nil), failed],
+            streaming: nil,
+            mode: .focusedHistory
+        )
+        let messages = items.compactMap { item -> ChatMessage? in
+            if case let .message(message, _) = item { return message }
+            return nil
+        }
+        XCTAssertEqual(messages.map(\.id), ["user", "failed"])
+        XCTAssertEqual(messages.last?.textContent, "Provider failed.")
     }
 
     func testReasoningSplitsTheLogAndStaysInOrder() throws {
@@ -948,20 +935,23 @@ final class ConversationScrollCoordinatorTests: XCTestCase {
                        "Growth while pinned lands at the new bottom")
     }
 
-    func testUnpinnedPrependCompensationKeepsTheReadingPosition() {
+    func testHistoryPageReplacementLandsAtTheRequestedEdge() {
         let (scrollView, document, coordinator, bridge) = makeHarness()
-        // A real user scroll away from the bottom unpins.
-        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: 100))
-        XCTAssertFalse(coordinator.pinned)
 
-        bridge.armPrepend()
+        bridge.armPageReplacement(.bottom)
+        bridge.applyPageReplacement()
         document.setFrameSize(NSSize(width: 400, height: 1_600))
-        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
-                       "Prepended height shifts the origin so visible rows do not move")
+        XCTAssertFalse(coordinator.pinned)
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 1_100, accuracy: 1)
 
-        bridge.disarmPrepend()
+        bridge.armPageReplacement(.top)
+        bridge.applyPageReplacement()
         document.setFrameSize(NSSize(width: 400, height: 1_800))
-        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 700, accuracy: 1,
-                       "Disarmed growth below the viewport leaves the reading position alone")
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 0, accuracy: 1)
+
+        bridge.disarmPageReplacement()
+        document.setFrameSize(NSSize(width: 400, height: 2_000))
+        XCTAssertEqual(scrollView.contentView.bounds.origin.y, 0, accuracy: 1,
+                       "Disarmed history pages stop forcing an edge")
     }
 }

@@ -2,25 +2,16 @@ import AppKit
 import SwiftUI
 
 struct ConversationScrollMetrics: Equatable {
-    enum Direction: Equatable { case up, down, stationary }
-
     let originY: CGFloat
     let viewportHeight: CGFloat
     let documentHeight: CGFloat
-    let direction: Direction
 
-    var isNearTop: Bool { originY <= PiTheme.transcriptScrollEdgeThreshold }
     var isNearBottom: Bool {
         documentHeight - (originY + viewportHeight) <= PiTheme.transcriptScrollEdgeThreshold
     }
-    var isUnderfilled: Bool {
-        documentHeight > 1 && viewportHeight > 1 && documentHeight <= viewportHeight + 1
-    }
-    var shouldRequestEarlierHistory: Bool {
-        (direction == .up && originY <= PiTheme.transcriptHistoryPrefetchDistance)
-            || (isNearTop && isUnderfilled)
-    }
 }
+
+enum ConversationPageEdge { case top, bottom }
 
 /// The SwiftUI side's handle into the AppKit coordinator that owns scroll corrections.
 @MainActor
@@ -28,24 +19,18 @@ final class ConversationScrollBridge {
     /// Internal (not fileprivate) so the coordinator test harness can wire a bridge directly.
     weak var coordinator: ConversationScrollObserver.Coordinator?
 
-    /// Arm before a history page is requested: subsequent document growth is treated as content
-    /// inserted above the viewport and compensated in the same layout pass.
-    func armPrepend() { coordinator?.armPrepend() }
-    func disarmPrepend() { coordinator?.disarmPrepend() }
+    func armPageReplacement(_ edge: ConversationPageEdge) { coordinator?.armPageReplacement(edge) }
+    func applyPageReplacement() { coordinator?.applyPageReplacement() }
+    func disarmPageReplacement() { coordinator?.disarmPageReplacement() }
     /// Pin to the newest content and keep following it as the document grows.
     func pinToBottom() { coordinator?.pinToBottom() }
 }
 
 /// Observes and *corrects* the real AppKit scroll view beneath SwiftUI's `ScrollView`.
 ///
-/// Two behaviors live here, both applied synchronously inside the document's own layout pass
-/// (notifications are delivered on the posting thread, not queued), so the user never sees an
-/// intermediate frame at the wrong offset:
-/// - While pinned to the bottom, any document height change re-pins the viewport to the bottom.
-///   This is what keeps streaming turns, image decodes, and lazily settling rows glued to the
-///   newest content without a trailing `scrollTo` task racing the layout.
-/// - While a history prepend is armed, document growth shifts the origin by the added height, so
-///   the rows the user was reading stay exactly where they were.
+/// Corrections are applied synchronously inside the document's own layout pass: the live page
+/// stays pinned through growth, while disjoint history-page replacements land at their requested
+/// edge without ever retaining all intervening rows.
 /// Temporary stderr diagnostics, active only when PI_SCROLL_DEBUG=1.
 enum ScrollDebug {
     static let enabled = ProcessInfo.processInfo.environment["PI_SCROLL_DEBUG"] == "1"
@@ -81,11 +66,8 @@ struct ConversationScrollObserver: NSViewRepresentable {
         coordinator.detach()
     }
 
-    /// Scroll geometry is inset-aware everywhere: SwiftUI bottom-aligns short content by
-    /// growing a synthetic *top* content inset, and the composer/toolbar contribute real
-    /// insets, so "scrolled to top" is `-top` and "scrolled to bottom" is
-    /// `docHeight - viewport + bottom` — both routinely negative. Clamping to zero here is what
-    /// used to shove freshly opened conversations up behind the toolbar glass.
+    /// SwiftUI bottom-aligns short content with a synthetic top inset, while the composer and
+    /// toolbar contribute real insets. Both edges therefore need inset-aware origins.
     static func bottomOriginY(
         documentHeight: CGFloat,
         viewportHeight: CGFloat,
@@ -93,25 +75,6 @@ struct ConversationScrollObserver: NSViewRepresentable {
         bottomInset: CGFloat
     ) -> CGFloat {
         max(-topInset, documentHeight - viewportHeight + bottomInset)
-    }
-
-    static func restoredOriginY(
-        originalY: CGFloat,
-        oldDocumentHeight: CGFloat,
-        newDocumentHeight: CGFloat,
-        viewportHeight: CGFloat,
-        topInset: CGFloat = 0,
-        bottomInset: CGFloat = 0
-    ) -> CGFloat? {
-        let addedHeight = newDocumentHeight - oldDocumentHeight
-        guard addedHeight > 0.5 else { return nil }
-        let bottomMost = bottomOriginY(
-            documentHeight: newDocumentHeight,
-            viewportHeight: viewportHeight,
-            topInset: topInset,
-            bottomInset: bottomInset
-        )
-        return min(bottomMost, max(-topInset, originalY + addedHeight))
     }
 
     final class AttachmentView: NSView {
@@ -135,9 +98,10 @@ struct ConversationScrollObserver: NSViewRepresentable {
         private var frameObserver: NSObjectProtocol?
         private var lastDocumentHeight: CGFloat = 0
         private var previousOriginY: CGFloat?
-        /// A conversation opens pinned; only a real user scroll can unpin it.
+        /// A conversation opens pinned; only a real user scroll or history replacement can unpin it.
         private(set) var pinned = true
-        private var prependArmed = false
+        private var replacementEdge: ConversationPageEdge?
+        private var replacementReady = false
         private var isAdjusting = false
         /// True from attach until the first heal runs: every open gets exactly one heal after
         /// its content settles, whether or not any correction fired.
@@ -151,20 +115,44 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         init(parent: ConversationScrollObserver) { self.parent = parent }
 
-        func armPrepend() { prependArmed = true }
-        func disarmPrepend() { prependArmed = false }
+        func armPageReplacement(_ edge: ConversationPageEdge) {
+            replacementEdge = edge
+            replacementReady = false
+            pinned = false
+            userScrolledSinceAttach = false
+        }
+
+        func applyPageReplacement() {
+            guard let replacementEdge, let scrollView else { return }
+            switch replacementEdge {
+            case .top:
+                // The inset-aware top remains stable as rows below settle; do not fight a scroll.
+                replacementReady = false
+                setOrigin(-scrollView.contentView.contentInsets.top)
+            case .bottom:
+                replacementReady = true
+                scrollToBottom()
+            }
+            publish()
+        }
+
+        func disarmPageReplacement() {
+            replacementEdge = nil
+            replacementReady = false
+        }
 
         func pinToBottom() {
-            prependArmed = false
+            replacementEdge = nil
+            replacementReady = false
             pinned = true
             scrollToBottom()
-            publish(direction: .stationary)
+            publish()
         }
 
         func attach(from view: NSView) {
             guard let candidate = view.enclosingScrollView else { return }
             if candidate === scrollView, candidate.documentView === documentView {
-                publish(direction: .stationary)
+                publish()
                 return
             }
             detach()
@@ -198,7 +186,7 @@ struct ConversationScrollObserver: NSViewRepresentable {
             openHealArmed = true
             userScrolledSinceAttach = false
             scheduleHeal()
-            publish(direction: .stationary)
+            publish()
         }
 
         func detach() {
@@ -222,10 +210,12 @@ struct ConversationScrollObserver: NSViewRepresentable {
             guard abs(newHeight - oldHeight) > 0.5 else { return }
             ScrollDebug.log("frame \(Int(oldHeight))->\(Int(newHeight)) origin=\(Int(scrollView.contentView.bounds.origin.y)) clipH=\(Int(scrollView.contentView.bounds.height)) pinned=\(pinned) svInsets=\(scrollView.contentInsets) clipInsets=\(scrollView.contentView.contentInsets) safeArea=\(scrollView.safeAreaInsets)")
             if openHealArmed { scheduleHeal() }
-            let insets = scrollView.contentView.contentInsets
-            if pinned {
+            if replacementReady {
+                applyPageReplacement()
+            } else if pinned {
                 // `defaultScrollAnchor(.bottom)` usually maintains the pin itself, fully
                 // rendered; only correct when it did not, and then heal the paint (below).
+                let insets = scrollView.contentView.contentInsets
                 let target = ConversationScrollObserver.bottomOriginY(
                     documentHeight: newHeight,
                     viewportHeight: scrollView.contentView.bounds.height,
@@ -233,17 +223,8 @@ struct ConversationScrollObserver: NSViewRepresentable {
                     bottomInset: insets.bottom
                 )
                 if abs(scrollView.contentView.bounds.origin.y - target) > 0.5 { setOrigin(target) }
-            } else if prependArmed, let target = ConversationScrollObserver.restoredOriginY(
-                originalY: scrollView.contentView.bounds.origin.y,
-                oldDocumentHeight: oldHeight,
-                newDocumentHeight: newHeight,
-                viewportHeight: scrollView.contentView.bounds.height,
-                topInset: insets.top,
-                bottomInset: insets.bottom
-            ) {
-                setOrigin(target)
             }
-            publish(direction: .stationary)
+            publish()
         }
 
         /// Clip bounds changed at constant document height: the user scrolled. This is the only
@@ -253,16 +234,12 @@ struct ConversationScrollObserver: NSViewRepresentable {
             guard abs(document.bounds.height - lastDocumentHeight) <= 0.5 else { return }
             let visible = scrollView.contentView.bounds
             let originY = visible.origin.y
-            let direction: ConversationScrollMetrics.Direction
-            if previousOriginY == nil || abs(originY - previousOriginY!) < 0.5 {
-                direction = .stationary
-            } else {
-                direction = originY < previousOriginY! ? .up : .down
+            if let previous = previousOriginY, abs(originY - previous) > 0.5 {
+                userScrolledSinceAttach = true
             }
-            if let previous = previousOriginY, abs(originY - previous) > 0.5 { userScrolledSinceAttach = true }
             previousOriginY = originY
             pinned = document.bounds.height - (originY + visible.height) <= PiTheme.transcriptScrollEdgeThreshold
-            publish(direction: direction)
+            publish()
         }
 
         private func scrollToBottom() {
@@ -350,14 +327,13 @@ struct ConversationScrollObserver: NSViewRepresentable {
 
         /// Metrics reach SwiftUI coalesced and asynchronously — state must not mutate inside the
         /// layout pass the notifications arrive in. Corrections above stay synchronous.
-        private func publish(direction: ConversationScrollMetrics.Direction) {
+        private func publish() {
             guard let scrollView, let document = scrollView.documentView else { return }
             let visible = scrollView.contentView.bounds
             pendingMetrics = ConversationScrollMetrics(
                 originY: visible.origin.y,
                 viewportHeight: visible.height,
-                documentHeight: document.bounds.height,
-                direction: direction
+                documentHeight: document.bounds.height
             )
             guard !metricsCallbackScheduled else { return }
             metricsCallbackScheduled = true

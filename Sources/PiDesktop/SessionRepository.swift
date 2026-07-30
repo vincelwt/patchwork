@@ -6,6 +6,7 @@ protocol SessionRepositoryProtocol {
     func loadConversation(from fileURL: URL) async throws -> SessionConversation
     func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage
+    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage
     func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary
     /// Sidebar hydration: everything the persisted summary cache already knows, with no disk
     /// scan and no JSONL parsing, so the first paint is immediate.
@@ -43,6 +44,10 @@ extension SessionRepositoryProtocol {
 
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
         throw ConversationPagingError.unsupported
+    }
+
+    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        try await loadOlderConversationPage(from: fileURL, cursor: cursor)
     }
 }
 
@@ -160,6 +165,12 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
         try await Self.detached(priority: .userInitiated) {
             try SessionParser.conversationPage(at: fileURL, cursor: cursor)
+        }
+    }
+
+    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
+        try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(at: fileURL, cursor: cursor, projection: .focusedHistory)
         }
     }
 

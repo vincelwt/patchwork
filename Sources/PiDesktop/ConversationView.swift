@@ -12,6 +12,7 @@ extension PiTheme {
 final class TranscriptProjectionCache {
     private var revision = -1
     private var isRunning = false
+    private var mode: TranscriptPresentationMode = .detailed
     private var cached: [TranscriptItem] = []
     private(set) var buildCount = 0
 
@@ -19,12 +20,19 @@ final class TranscriptProjectionCache {
         revision: Int,
         messages: [ChatMessage],
         streaming: ChatMessage?,
-        isRunning: Bool
+        isRunning: Bool,
+        mode: TranscriptPresentationMode = .detailed
     ) -> [TranscriptItem] {
-        guard self.revision != revision || self.isRunning != isRunning else { return cached }
+        guard self.revision != revision || self.isRunning != isRunning || self.mode != mode else { return cached }
         self.revision = revision
         self.isRunning = isRunning
-        let projected = TranscriptPresenter.items(messages: messages, streaming: streaming, isRunning: isRunning)
+        self.mode = mode
+        let projected = TranscriptPresenter.items(
+            messages: messages,
+            streaming: streaming,
+            isRunning: isRunning,
+            mode: mode
+        )
         cached = preservingWorkIDs(in: projected)
         buildCount += 1
         return cached
@@ -266,7 +274,7 @@ struct ConversationView: View {
             ) {
                 Button("Try Again", action: store.retryConversationLoad)
             }
-        } else if store.messages.isEmpty && store.streamingMessage == nil {
+        } else if store.messages.isEmpty && store.streamingMessage == nil && !store.isBrowsingEarlierHistory {
             VStack(spacing: PiTheme.space6) {
                 Text("Ready for a new turn")
                     .font(PiFont.title)
@@ -281,7 +289,7 @@ struct ConversationView: View {
                 streaming: store.streamingMessage,
                 isRunning: conversationIsRunning,
                 transcriptRevision: store.transcriptRevision,
-                onEditLastMessage: {
+                onEditLastMessage: store.isBrowsingEarlierHistory ? nil : {
                     store.beginEditingLastMessage()
                     composerFocusTick += 1
                 }
@@ -306,7 +314,8 @@ struct MessageScrollView: View {
     /// SwiftUI render pass against the viewport actually on screen after an open settles.
     @State private var healTick = 0
     @State private var scrollBridge = ConversationScrollBridge()
-    @State private var underfillPageAttempts = 0
+    @State private var pageReplacementArmed = false
+    @State private var pageReplacementGeneration = 0
     @State private var didMarkFirstTextPaint = false
     @State private var projectionCache = TranscriptProjectionCache()
 
@@ -315,7 +324,8 @@ struct MessageScrollView: View {
             revision: transcriptRevision,
             messages: messages,
             streaming: streaming,
-            isRunning: isRunning
+            isRunning: isRunning,
+            mode: store.isBrowsingEarlierHistory ? .focusedHistory : .detailed
         )
     }
 
@@ -332,21 +342,41 @@ struct MessageScrollView: View {
             // A single small gap between entries keeps consecutive tool rows on an even
             // rhythm; paragraphs get their breathing room from the block renderer.
             LazyVStack(alignment: .leading, spacing: PiTheme.transcriptEntrySpacing) {
-                if store.isLoadingEarlierMessages {
-                    ProgressView().controlSize(.small)
-                        .frame(maxWidth: .infinity)
-                        .accessibilityLabel("Loading earlier messages")
-                } else if store.hasEarlierMessages {
-                    Button("Load earlier messages") { requestEarlierMessages() }
-                        .buttonStyle(.plain)
-                        .font(PiFont.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity)
+                if !store.isBrowsingEarlierHistory {
+                    if store.isLoadingEarlierMessages {
+                        ProgressView().controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel("Loading older conversation")
+                    } else if store.hasEarlierMessages {
+                        Button("Load older conversation") { requestEarlierMessages() }
+                            .buttonStyle(.plain)
+                            .font(PiFont.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                    } else if store.conversationHistoryLimitReached {
+                        Text("Earlier history could not be read safely.")
+                            .font(PiFont.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                    }
                 } else if store.conversationHistoryLimitReached {
-                    Text("Earlier history is outside this bounded window.")
+                    Text("Earlier history could not be read safely.")
                         .font(PiFont.caption)
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity)
+                } else if !store.hasEarlierMessages {
+                    Text("Beginning of conversation")
+                        .font(PiFont.caption)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                }
+
+                if items.isEmpty, store.isBrowsingEarlierHistory {
+                    Text("No user or assistant messages in this section.")
+                        .font(PiFont.caption)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, PiTheme.space20)
                 }
 
                 ForEach(items) { item in
@@ -410,17 +440,29 @@ struct MessageScrollView: View {
         .piHardTopScrollEdge()
         .scrollDismissesKeyboard(.interactively)
         .onAppear { store.consumeInitialScrollTarget() }
+        .onChange(of: transcriptRevision) { _, _ in
+            guard pageReplacementArmed else { return }
+            scrollBridge.applyPageReplacement()
+            releasePageReplacementSoon()
+        }
         .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
-            guard wasLoading, !isLoading else { return }
-            // The prepended rows land over the next few layout passes; keep the origin
-            // compensation armed briefly so each pass is corrected, then release it.
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                if !store.isLoadingEarlierMessages { scrollBridge.disarmPrepend() }
-            }
+            if pageReplacementArmed, wasLoading, !isLoading { releasePageReplacementSoon() }
+        }
+        .onChange(of: store.isLoadingNewerMessages) { wasLoading, isLoading in
+            if pageReplacementArmed, wasLoading, !isLoading { releasePageReplacementSoon() }
+        }
+        .onChange(of: store.latestScrollRequest) { _, _ in
+            pageReplacementArmed = false
+            pageReplacementGeneration &+= 1
+            scrollBridge.disarmPageReplacement()
+            isPinnedToBottom = true
+            scrollBridge.pinToBottom()
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.isBrowsingEarlierHistory { historyNavigationBar }
         }
         .overlay(alignment: .bottom) {
-            if !isPinnedToBottom {
+            if !store.isBrowsingEarlierHistory, !isPinnedToBottom {
                 Button {
                     isPinnedToBottom = true
                     scrollBridge.pinToBottom()
@@ -442,21 +484,105 @@ struct MessageScrollView: View {
 
     private func handleScrollMetrics(_ metrics: ConversationScrollMetrics) {
         if isPinnedToBottom != metrics.isNearBottom { isPinnedToBottom = metrics.isNearBottom }
-        guard metrics.shouldRequestEarlierHistory else { return }
-        if metrics.isUnderfilled {
-            guard underfillPageAttempts < 2 else { return }
-            if requestEarlierMessages() { underfillPageAttempts += 1 }
-        } else {
-            requestEarlierMessages()
-        }
     }
 
-    @discardableResult
-    private func requestEarlierMessages() -> Bool {
-        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages else { return false }
-        scrollBridge.armPrepend()
-        store.loadEarlierMessages()
-        return true
+    private var historyNavigationBar: some View {
+        HStack(spacing: PiTheme.space8) {
+            Text("History · work omitted")
+                .foregroundStyle(.tertiary)
+                .accessibilityLabel("Conversation history. Work details are omitted.")
+            Divider()
+                .frame(height: PiTheme.space16)
+                .accessibilityHidden(true)
+            historyButton(
+                "Older", systemImage: "chevron.up",
+                isLoading: store.isLoadingEarlierMessages,
+                disabled: !store.hasEarlierMessages || store.isLoadingEarlierMessages || store.isLoadingNewerMessages,
+                hint: "Show the preceding conversation page",
+                action: requestEarlierMessages
+            )
+            historyButton(
+                "Newer", systemImage: "chevron.down",
+                isLoading: store.isLoadingNewerMessages,
+                disabled: !store.hasNewerMessages || store.isLoadingEarlierMessages || store.isLoadingNewerMessages,
+                hint: "Show the following conversation page",
+                action: requestNewerMessages
+            )
+            Button {
+                store.jumpToLatestMessages()
+            } label: {
+                Label("Latest", systemImage: "arrow.down.to.line")
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Return to the live conversation and its newest message")
+            .help("Return to the live conversation")
+        }
+        .font(PiFont.caption)
+        .padding(.horizontal, PiTheme.space10)
+        .padding(.vertical, PiTheme.space6)
+        .background(Color.piTranscript, in: Capsule())
+        .overlay { Capsule().stroke(Color.piHairline, lineWidth: PiTheme.hairline) }
+        .padding(.bottom, PiTheme.space10)
+    }
+
+    private func historyButton(
+        _ title: String,
+        systemImage: String,
+        isLoading: Bool,
+        disabled: Bool,
+        hint: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .opacity(isLoading ? 0 : 1)
+                .overlay {
+                    if isLoading {
+                        ProgressView().controlSize(.small).accessibilityHidden(true)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel(title)
+        .accessibilityValue(isLoading ? "Loading" : "")
+        .accessibilityHint(hint)
+        .help(hint)
+    }
+
+    private func requestEarlierMessages() {
+        guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !store.isLoadingNewerMessages else { return }
+        armPageReplacement(.bottom)
+        if !store.loadEarlierMessages() { cancelPageReplacement() }
+    }
+
+    private func requestNewerMessages() {
+        guard store.hasNewerMessages, !store.isLoadingEarlierMessages, !store.isLoadingNewerMessages else { return }
+        armPageReplacement(.top)
+        if !store.loadNewerMessages() { cancelPageReplacement() }
+    }
+
+    private func armPageReplacement(_ edge: ConversationPageEdge) {
+        pageReplacementGeneration &+= 1
+        pageReplacementArmed = true
+        scrollBridge.armPageReplacement(edge)
+    }
+
+    private func cancelPageReplacement() {
+        pageReplacementGeneration &+= 1
+        pageReplacementArmed = false
+        scrollBridge.disarmPageReplacement()
+    }
+
+    private func releasePageReplacementSoon() {
+        guard pageReplacementArmed else { return }
+        let generation = pageReplacementGeneration
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard pageReplacementArmed, pageReplacementGeneration == generation,
+                  !store.isLoadingEarlierMessages, !store.isLoadingNewerMessages else { return }
+            cancelPageReplacement()
+        }
     }
 }
 

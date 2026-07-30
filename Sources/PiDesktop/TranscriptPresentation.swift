@@ -271,11 +271,21 @@ enum TranscriptItem: Identifiable, Hashable, Sendable {
     }
 }
 
+enum TranscriptPresentationMode: Hashable, Sendable {
+    case detailed
+    case focusedHistory
+}
+
 /// Projects raw Pi messages into Codex-style turns: one user message, one collapsible work log
 /// (reasoning, tool activity, mid-turn narration), then the answer. Nothing in the retained
 /// session data is changed; this is presentation only.
 enum TranscriptPresenter {
-    static func items(messages: [ChatMessage], streaming: ChatMessage?, isRunning: Bool = false) -> [TranscriptItem] {
+    static func items(
+        messages: [ChatMessage],
+        streaming: ChatMessage?,
+        isRunning: Bool = false,
+        mode: TranscriptPresentationMode = .detailed
+    ) -> [TranscriptItem] {
         var builder = TurnBuilder(isLive: isRunning || streaming != nil)
         for message in messages { builder.consume(message, streaming: false) }
         // A settled message and its still-held streaming copy now share one identity, so the
@@ -283,7 +293,28 @@ enum TranscriptPresenter {
         if let streaming, !messages.contains(where: { $0.id == streaming.id }) {
             builder.consume(streaming, streaming: true)
         }
-        return builder.finish()
+        let items = builder.finish()
+        guard mode == .focusedHistory else { return items }
+        return items.flatMap { item -> [TranscriptItem] in
+            switch item {
+            case .message:
+                return [item]
+            case let .work(block):
+                // Unknown and extension/system notes stay visible for forward compatibility;
+                // assistant narration, thinking, calls, and results are historical work detail.
+                return block.entries.compactMap { entry in
+                    guard case let .note(message) = entry,
+                          message.role != .tool, message.role != .bash else { return nil }
+                    if message.role == .assistant {
+                        guard message.isError
+                            || SessionParser.terminalAssistantStopReasons.contains(message.stopReason ?? "") else {
+                            return nil
+                        }
+                    }
+                    return .message(message, streaming: false)
+                }
+            }
+        }
     }
 }
 
