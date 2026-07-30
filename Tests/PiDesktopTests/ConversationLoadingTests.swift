@@ -147,7 +147,7 @@ final class ConversationLoadingTests: XCTestCase {
         try? FileManager.default.removeItem(at: temporaryDirectory)
     }
 
-    func testHistoryPagesReplaceTheWindowAndNavigateBackToLatest() async throws {
+    func testHistoryStaysConnectedToLatestAndNavigatesBackToLive() async throws {
         let file = temporaryDirectory.appendingPathComponent("big.jsonl")
         try writeLinearConversation(prefix: "big", messageCount: 80, to: file)
         let store = makeStore(repository: FileSessionRepository(rootURL: temporaryDirectory))
@@ -163,7 +163,9 @@ final class ConversationLoadingTests: XCTestCase {
         store.loadEarlierMessages()
         try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
         XCTAssertEqual(store.messages.first?.textContent, "big-0")
-        XCTAssertEqual(store.messages.last?.textContent, "big-29")
+        XCTAssertEqual(store.messages.last?.textContent, "big-79",
+                       "The latest page must remain visibly connected below history")
+        XCTAssertEqual(store.messages.count, 80)
         XCTAssertFalse(store.hasEarlierMessages)
         XCTAssertTrue(store.hasNewerMessages)
 
@@ -220,13 +222,16 @@ final class ConversationLoadingTests: XCTestCase {
         while store.hasEarlierMessages {
             store.loadEarlierMessages()
             try await waitUntil { !store.isLoadingEarlierMessages }
-            XCTAssertLessThanOrEqual(store.messages.count, ConversationPage.defaultMessageTarget + 1)
-            XCTAssertTrue(store.messages.allSatisfy { $0.role == .user || $0.role == .assistant })
+            XCTAssertEqual(store.messages.last?.textContent, "answer 29",
+                           "The detailed latest turn stays below every focused history page")
             XCTAssertFalse(store.messages.flatMap(\.blocks).contains { block in
-                if case .toolCall = block.kind { return true }
-                if case .thinking = block.kind { return true }
-                return false
-            })
+                guard case let .toolCall(call) = block.kind else { return false }
+                return call.id.hasPrefix("call-28-")
+            }, "Historical tool work stays omitted")
+            XCTAssertTrue(store.messages.flatMap(\.blocks).contains { block in
+                guard case let .toolCall(call) = block.kind else { return false }
+                return call.id.hasPrefix("call-29-")
+            }, "The connected latest turn keeps its detailed work")
         }
 
         XCTAssertEqual(store.messages.first?.textContent, "prompt 0")
@@ -262,7 +267,8 @@ final class ConversationLoadingTests: XCTestCase {
 
         store.loadEarlierMessages()
         try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
-        XCTAssertFalse(store.messages.contains { $0.textContent == "Live narration" })
+        XCTAssertTrue(store.messages.contains { $0.textContent == "Live narration" },
+                      "The frozen latest window stays visible below history")
 
         runtime.onEvent?(.object([
             "type": .string("message_end"),
@@ -330,7 +336,8 @@ final class ConversationLoadingTests: XCTestCase {
         store.loadEarlierMessages()
         try await waitUntil { store.isBrowsingEarlierHistory && !store.isLoadingEarlierMessages }
         XCTAssertLessThanOrEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)
-        XCTAssertLessThanOrEqual(store.messages.count, ConversationPage.defaultMessageTarget)
+        XCTAssertEqual(store.messages.count, 60)
+        XCTAssertEqual(store.messages.last?.id, "image-59")
 
         store.jumpToLatestMessages()
         XCTAssertEqual(store.messages.flatMap(\.images).count, PiTheme.imageCountLimit)

@@ -85,6 +85,28 @@ final class ConversationScrollMetricsTests: XCTestCase {
             -338
         )
     }
+
+    func testHistoryPrependKeepsTheVisibleRowsStationary() throws {
+        XCTAssertEqual(
+            try XCTUnwrap(ConversationScrollObserver.restoredOriginY(
+                originalY: 300,
+                oldDocumentHeight: 1_200,
+                newDocumentHeight: 2_000,
+                viewportHeight: 600,
+                topInset: 0,
+                bottomInset: 90
+            )),
+            1_100
+        )
+        XCTAssertNil(ConversationScrollObserver.restoredOriginY(
+            originalY: 300,
+            oldDocumentHeight: 1_200,
+            newDocumentHeight: 1_200,
+            viewportHeight: 600,
+            topInset: 0,
+            bottomInset: 90
+        ))
+    }
 }
 
 @MainActor
