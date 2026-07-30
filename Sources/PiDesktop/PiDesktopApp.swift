@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import SwiftUI
 
 @main
@@ -7,7 +8,8 @@ struct PiDesktopApp: App {
     @StateObject private var store = AppStore(
         connectivityMonitor: ConnectivityMonitor(),
         probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) },
-        sleepPrevention: SleepPreventionController.liveHandler()
+        sleepPrevention: SleepPreventionController.liveHandler(),
+        daemonClient: .unixSocket()
     )
     // Owns the in-process control service lifecycle. Kept on the app delegate (not a second
     // @StateObject) so launch/quit and the Settings scene share the exact same instance.

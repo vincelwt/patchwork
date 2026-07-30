@@ -475,6 +475,23 @@ final class HTTPServerIntegrationTests: XCTestCase {
         XCTAssertEqual(schedule.name, "Event test")
     }
 
+    func testThreadMutationPublishesAThreadEvent() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "live-archive", cwd: "/tmp/project")
+        let stream = client.events()
+        var iterator = stream.makeAsyncIterator()
+        let received = Task<PiDeskEvent?, Never> { try? await iterator.next() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        _ = try await client.archiveThread(id: "live-archive", archived: true)
+
+        let event = await received.value
+        guard case let .thread(thread) = event else {
+            return XCTFail("expected a .thread event, got \(String(describing: event))")
+        }
+        XCTAssertEqual(thread.id, "live-archive")
+        XCTAssertTrue(thread.archived)
+    }
+
     // MARK: - Resilience
 
     func testMalformedRequestGetsA400AndTheServerKeepsServingAfterward() async throws {

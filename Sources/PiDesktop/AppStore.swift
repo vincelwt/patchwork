@@ -360,6 +360,9 @@ final class AppStore: ObservableObject {
     private let managedTurnResumer: ManagedTurnResumer
     private let managedTurnWriterProbe: ManagedTurnWriterProbe?
     private let daemonWorktreeProjectsURL: URL
+    private let daemonClient: PiDeskClient?
+    private var daemonEventTask: Task<Void, Never>?
+    private var daemonThreadRevision = 0
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -517,7 +520,8 @@ final class AppStore: ObservableObject {
             )
         },
         managedTurnWriterProbe: ManagedTurnWriterProbe? = nil,
-        daemonWorktreeProjectsURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json")
+        daemonWorktreeProjectsURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json"),
+        daemonClient: PiDeskClient? = nil
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -529,6 +533,7 @@ final class AppStore: ObservableObject {
         self.managedTurnResumer = managedTurnResumer
         self.managedTurnWriterProbe = managedTurnWriterProbe
         self.daemonWorktreeProjectsURL = daemonWorktreeProjectsURL
+        self.daemonClient = daemonClient
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
@@ -571,6 +576,7 @@ final class AppStore: ObservableObject {
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
             .sink { [weak self] _ in
                 self?.flushCurrentDraftPersistence()
+                self?.daemonEventTask?.cancel()
                 self?.setSleepPrevention(false)
             }
             .store(in: &appCancellables)
@@ -1646,6 +1652,7 @@ final class AppStore: ObservableObject {
                 syncActivityMonitorPaths()
             }
             await refreshSessions()
+            startDaemonEventLoop()
             if selectedFolder == nil {
                 selectedFolder = WorkspaceOrganization.globalWorkingDirectory
             }
@@ -1669,22 +1676,76 @@ final class AppStore: ObservableObject {
         LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
     }
 
+    private func startDaemonEventLoop() {
+        guard daemonEventTask == nil, let daemonClient else { return }
+        daemonEventTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    _ = try await daemonClient.health()
+                    guard self != nil, !Task.isCancelled else { return }
+                    // SSE has no replay, so reconcile durable changes before every connection.
+                    await self?.refreshSessions()
+                    for try await event in daemonClient.events() {
+                        guard let self, !Task.isCancelled else { return }
+                        if case let .thread(thread) = event { applyDaemonThreadUpdate(thread) }
+                    }
+                } catch { /* The daemon may still be starting; reconnect below. */ }
+                guard self != nil, !Task.isCancelled else { return }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    /// Applies a daemon mutation without waiting for the next disk scan. Paths, not session IDs,
+    /// identify the row because imported/copied Pi sessions can legitimately share an ID.
+    func applyDaemonThreadUpdate(_ thread: PiThread) {
+        daemonThreadRevision &+= 1
+        let path = URL(fileURLWithPath: thread.path).standardizedFileURL.path
+        guard let index = sessions.firstIndex(where: { $0.fileURL.standardizedFileURL.path == path }) else {
+            Task { [weak self] in await self?.refreshSessions() }
+            return
+        }
+        let archived = thread.archived || persistence.state.archivedSessionIDs.contains(sessions[index].id)
+        let nameChanged = sessions[index].name != thread.name
+        let archiveChanged = sessions[index].isArchived != archived
+        guard nameChanged || archiveChanged else { return }
+        if nameChanged {
+            sessions[index].name = thread.name
+            sessions[index].prepareSearchKey()
+        }
+        if archiveChanged {
+            persistence.updateState { state in
+                if archived { state.archivedAt[sessions[index].id] = Date() }
+                else { state.archivedAt.removeValue(forKey: sessions[index].id) }
+            }
+            setArchivedPresentation(archived, path: path)
+        }
+    }
+
     func refreshSessions() async {
         guard !isScanning else { return }
         isScanning = true
         scanError = nil
+        let daemonRevision = daemonThreadRevision
         do {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
             let overlayURL = daemonWorktreeProjectsURL
-            let daemonWorktrees = await Task.detached(priority: .utility) {
-                DaemonWorktreeProjects.load(from: overlayURL)
+            var discovered = try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+            let daemonOverlay = await Task.detached(priority: .utility) {
+                DaemonWorktreeProjects.loadSnapshot(from: overlayURL)
             }.value
-            let discovered = applyArchiveRetention(
-                to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
-            )
+            for index in discovered.indices where daemonOverlay.archivedThreadIDs.contains(discovered[index].id) {
+                discovered[index].isArchived = true
+            }
+            discovered = applyArchiveRetention(to: discovered)
+            guard daemonRevision == daemonThreadRevision else {
+                isScanning = false
+                await refreshSessions()
+                return
+            }
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(
-                daemonWorktrees.filter { discoveredCwds.contains($0.key) }
+                daemonOverlay.managedWorktreeProjects.filter { discoveredCwds.contains($0.key) }
             )
             sessions = discovered
             refreshPullRequestStates(for: discovered)
@@ -2459,11 +2520,15 @@ final class AppStore: ObservableObject {
     }
 
     /// Stamps newly seen archives (including ones archived by older builds, whose clock starts
-    /// now) and drops the expired ones, removing any worktree no surviving conversation still uses.
+    /// now), clears restored timestamps, and drops expired ones and their unused worktrees.
     private func applyArchiveRetention(to discovered: [SessionSummary], now: Date = Date()) -> [SessionSummary] {
         persistence.updateState { state in
-            for session in discovered where session.isArchived && state.archivedAt[session.id] == nil {
-                state.archivedAt[session.id] = now
+            for session in discovered {
+                if session.isArchived, state.archivedAt[session.id] == nil {
+                    state.archivedAt[session.id] = now
+                } else if !session.isArchived {
+                    state.archivedAt.removeValue(forKey: session.id)
+                }
             }
         }
         let expired = Self.expiredArchiveIDs(discovered, archivedAt: persistence.state.archivedAt, now: now)
@@ -2540,20 +2605,23 @@ final class AppStore: ObservableObject {
     }
 
     private func setArchived(_ archived: Bool, session: SessionSummary) {
-        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
         persistence.setArchived(archived, sessionID: session.id)
-        if let index = sessions.firstIndex(where: { $0.id == session.id }) {
-            sessions[index].isArchived = archived
-            if archived, selectedPath == session.fileURL.standardizedFileURL.path {
-                if let next = sessions[(index + 1)...].first(where: { !$0.isArchived })
-                    ?? sessions[..<index].last(where: { !$0.isArchived }) {
-                    selectSession(next)
-                } else {
-                    openNewChat()
-                }
+        setArchivedPresentation(archived, path: session.fileURL.standardizedFileURL.path)
+        showToast(archived ? "Conversation archived" : "Conversation restored", style: .info)
+    }
+
+    private func setArchivedPresentation(_ archived: Bool, path: String) {
+        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
+        guard let index = sessions.firstIndex(where: { $0.fileURL.standardizedFileURL.path == path }) else { return }
+        sessions[index].isArchived = archived
+        if archived, selectedPath == path {
+            if let next = sessions[(index + 1)...].first(where: { !$0.isArchived })
+                ?? sessions[..<index].last(where: { !$0.isArchived }) {
+                selectSession(next)
+            } else {
+                openNewChat()
             }
         }
-        showToast(archived ? "Conversation archived" : "Conversation restored", style: .info)
     }
 
     /// ⌘⇧A. Enabled only when a conversation is selected.

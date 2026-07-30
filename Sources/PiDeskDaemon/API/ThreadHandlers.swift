@@ -101,6 +101,7 @@ enum ThreadHandlers {
                         core.logger.warn("Created thread \(thread.id), but could not save its worktree project mapping: \(error)")
                     }
                 }
+                core.bus.publish(.thread(thread))
 
                 guard let message = body.message?.trimmingCharacters(in: .whitespacesAndNewlines), !message.isEmpty else {
                     return .json(CreateThreadResponse(thread: thread, runId: nil), status: 201)
@@ -201,13 +202,14 @@ enum ThreadHandlers {
 
                 do {
                     if thread.archived {
-                        let restored = try await core.threadStore.setArchived(false, idOrPath: thread.id)
+                        let restored = try await core.threadStore.setArchived(false, idOrPath: thread.path)
                         if restored.archived {
                             throw DaemonHTTPError.conflict(
                                 code: "archived_in_app",
                                 message: "This thread was archived in the Mac app; restore it there."
                             )
                         }
+                        core.bus.publish(.thread(restored))
                     }
                     let response = try await deliverOrEnqueue(core, thread: thread, text: text, delivery: body.delivery)
                     if let clientID {
@@ -231,7 +233,7 @@ enum ThreadHandlers {
             Route("POST", "/v1/threads/:id/archive") { request, params in
                 let thread = try await requireThread(core, params)
                 let body = try request.decodeJSON(ArchiveRequest.self)
-                let updated = try await core.threadStore.setArchived(body.archived, idOrPath: thread.id)
+                let updated = try await core.threadStore.setArchived(body.archived, idOrPath: thread.path)
                 // The daemon owns its overlay, never the app's `state.json`, so the merge is a
                 // union: a thread the app archived stays archived whatever is written here.
                 // Reporting that as a restore would be a success the caller never got.
@@ -241,6 +243,7 @@ enum ThreadHandlers {
                         message: "This thread was archived in the Mac app; restore it there."
                     )
                 }
+                core.bus.publish(.thread(updated))
                 return .json(ThreadResponse(thread: updated))
             },
 
@@ -262,14 +265,16 @@ enum ThreadHandlers {
                 } catch let error as RunnerError {
                     throw DaemonHTTPError.conflict(code: "rename_failed", message: error.localizedDescription)
                 }
-                guard let refreshed = await core.threadStore.refreshedThread(idOrPath: thread.id) else { throw DaemonHTTPError.notFound("Thread \(thread.id)") }
+                guard let refreshed = await core.threadStore.refreshedThread(idOrPath: thread.path) else { throw DaemonHTTPError.notFound("Thread \(thread.id)") }
+                core.bus.publish(.thread(refreshed))
                 return .json(ThreadResponse(thread: refreshed))
             },
 
             Route("POST", "/v1/threads/:id/read") { request, params in
                 let thread = try await requireThread(core, params)
                 let body = try request.decodeJSON(ReadRequest.self)
-                let updated = try await core.threadStore.setUnread(body.unread, idOrPath: thread.id)
+                let updated = try await core.threadStore.setUnread(body.unread, idOrPath: thread.path)
+                core.bus.publish(.thread(updated))
                 return .json(ThreadResponse(thread: updated))
             },
 

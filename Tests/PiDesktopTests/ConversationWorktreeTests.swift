@@ -1,14 +1,17 @@
 import Foundation
+import PiDeskKit
 import XCTest
 @testable import PiDesktop
 
 /// Covers the pure logic behind conversation worktrees, archive retention, the flat archive
 /// list, and the header's pull-request link. No git process, no runtime, no provider call.
 final class ConversationWorktreeTests: XCTestCase {
-    private func summary(id: String, cwd: String, archived: Bool, modifiedAt: Date = Date()) -> SessionSummary {
+    private func summary(
+        id: String, cwd: String, archived: Bool, modifiedAt: Date = Date(), filePath: String? = nil
+    ) -> SessionSummary {
         SessionSummary(
             id: id,
-            fileURL: URL(fileURLWithPath: "/tmp/\(id).jsonl"),
+            fileURL: URL(fileURLWithPath: filePath ?? "/tmp/\(id).jsonl"),
             cwd: URL(fileURLWithPath: cwd, isDirectory: true),
             createdAt: modifiedAt,
             modifiedAt: modifiedAt,
@@ -102,6 +105,32 @@ final class ConversationWorktreeTests: XCTestCase {
     }
 
     // MARK: - Archive retention
+
+    @MainActor
+    func testDaemonMutationUpdatesOnlyTheMatchingSidebarPath() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("PiDaemonSync-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = AppStore(
+            persistence: AppPersistence(baseURL: base),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+        let first = summary(id: "duplicate", cwd: "/tmp/a", archived: false, filePath: "/tmp/first.jsonl")
+        let second = summary(id: "duplicate", cwd: "/tmp/b", archived: false, filePath: "/tmp/second.jsonl")
+        store.sessions = [first, second]
+
+        store.applyDaemonThreadUpdate(PiThread(
+            id: "duplicate", path: "/tmp/second.jsonl", name: "Renamed externally",
+            cwd: "/tmp/b", folder: "b", createdAt: Date(), updatedAt: Date(), archived: true
+        ))
+
+        XCTAssertEqual(store.sessions[0].name, "duplicate")
+        XCTAssertFalse(store.sessions[0].isArchived)
+        XCTAssertEqual(store.sessions[1].name, "Renamed externally")
+        XCTAssertTrue(store.sessions[1].isArchived)
+        XCTAssertTrue(store.sessions[1].searchKey.contains("renamed externally"))
+        XCTAssertTrue(store.persistence.state.archivedSessionIDs.isEmpty, "daemon state must not become app-owned")
+        XCTAssertNotNil(store.persistence.state.archivedAt["duplicate"], "external archives still sort by archive time")
+    }
 
     @MainActor
     func testArchivesExpireOnlyAfterTheRetentionWindow() {

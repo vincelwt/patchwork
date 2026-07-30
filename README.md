@@ -57,6 +57,8 @@ Click the phone button in the sidebar footer only to pair or manage a browser. A
 hosted relay starts automatically with Pi Desktop and the phone reconnects whenever the app is
 open; no VPN, inbound port, or tunnel is needed. A browser stays paired until its site data is
 cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
+Thread creates, renames, and archive changes made through `pidesk`, the web remote, or another
+control client propagate live to the Mac sidebar and every connected browser.
 
 The phone UI covers the daily loop, not just reading:
 

@@ -159,7 +159,7 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         XCTAssertEqual(store.sidebarFolders.map(\.standardizedFileURL.path), [project.standardizedFileURL.path])
     }
 
-    func testDaemonWorktreeMappingKeepsCLIThreadUnderItsSourceProject() async throws {
+    func testDaemonOverlayKeepsCLIThreadUnderItsSourceProjectAndSyncsArchive() async throws {
         let project = directory.appendingPathComponent("project", isDirectory: true)
         let worktree = directory.appendingPathComponent("worktrees/task", isDirectory: true)
         let file = directory.appendingPathComponent("cli.jsonl")
@@ -170,7 +170,10 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         )
         session.prepareSearchKey()
         let overlay = directory.appendingPathComponent("daemon-overlay.json")
-        let payload = ["managedWorktreeProjects": [worktree.path: project.path]]
+        let payload: [String: Any] = [
+            "archivedThreadIDs": ["cli"],
+            "managedWorktreeProjects": [worktree.path: project.path]
+        ]
         try JSONSerialization.data(withJSONObject: payload).write(to: overlay)
         let store = AppStore(
             repository: FakeRepository(sessions: [session]),
@@ -183,6 +186,13 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
 
         XCTAssertEqual(store.managedWorktreeProjects[worktree.path], project.path)
         XCTAssertEqual(store.sidebarFolders.map(\.path), [project.path])
+        XCTAssertTrue(store.sessions[0].isArchived)
+        XCTAssertTrue(store.persistence.state.archivedSessionIDs.isEmpty, "daemon archives stay independently restorable")
+
+        try JSONSerialization.data(withJSONObject: ["managedWorktreeProjects": [worktree.path: project.path]]).write(to: overlay)
+        await store.refreshSessions()
+        XCTAssertFalse(store.sessions[0].isArchived)
+        XCTAssertNil(store.persistence.state.archivedAt["cli"], "a CLI restore must clear its archive timestamp")
     }
 
     func testWorktreeKeepsTheProjectSelectedButStartsPiInsideTheWorktree() async throws {
