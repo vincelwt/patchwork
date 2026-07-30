@@ -40,6 +40,10 @@ struct ScheduleEntry: Identifiable, Hashable, Sendable, Codable {
         case newThread(cwd: String, namePattern: String?)
     }
 
+    var isInternalPullRequestReviewWatch: Bool {
+        id.hasPrefix("sch_req_pr_review_") && prompt.hasPrefix("/pi-desktop-pr-review ")
+    }
+
     /// The four trigger kinds the contract defines. Anything Pi Desktop cannot express is
     /// rejected before it reaches the daemon, never silently dropped.
     enum Trigger: Hashable, Sendable, Codable {

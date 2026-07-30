@@ -50,6 +50,8 @@ struct SessionParser {
         let parentID: String?
         let type: String
         let userText: String?
+        let createdPullRequestURL: URL?
+        let createdPullRequestAt: Date?
     }
 
     /// A transient view of one active entry. It is projected and released inside the pass-two
@@ -72,6 +74,7 @@ struct SessionParser {
         var provider: String?
         var thinkingLevel: String?
         var metrics = TokenMetrics()
+        var pullRequestCreationCallIDs: Set<String> = []
 
         try JSONLFileReader.read(url: url) { data in
             try Task.checkCancellation()
@@ -89,6 +92,8 @@ struct SessionParser {
             let parentID = object["parentId"]?.stringValue
             lastEntryID = id
             var userText: String?
+            var createdPullRequestURL: URL?
+            var createdPullRequestAt: Date?
 
             switch type {
             case "session_info":
@@ -106,6 +111,19 @@ struct SessionParser {
                     if role == "assistant" {
                         model = message["model"]?.stringValue ?? model
                         provider = message["provider"]?.stringValue ?? provider
+                        let available = max(0, 1_000 - pullRequestCreationCallIDs.count)
+                        pullRequestCreationCallIDs.formUnion(
+                            pullRequestCreateCallIDs(in: message["content"]).prefix(available)
+                        )
+                    } else if role == "toolResult",
+                              let callID = message["toolCallId"]?.stringValue,
+                              pullRequestCreationCallIDs.contains(callID),
+                              message["isError"]?.boolValue != true,
+                              let text = extractText(from: message["content"]) {
+                        createdPullRequestURL = PullRequestLink.firstLink(in: String(text.suffix(20_000)))
+                        if createdPullRequestURL != nil {
+                            createdPullRequestAt = Date.piDate(object["timestamp"]?.stringValue)
+                        }
                     }
                     metrics.addUsage(message["usage"])
                 }
@@ -115,7 +133,14 @@ struct SessionParser {
                 break
             }
 
-            entries[id] = MinimalEntry(id: id, parentID: parentID, type: type, userText: userText)
+            entries[id] = MinimalEntry(
+                id: id,
+                parentID: parentID,
+                type: type,
+                userText: userText,
+                createdPullRequestURL: createdPullRequestURL,
+                createdPullRequestAt: createdPullRequestAt
+            )
         }
 
         var activePath: [MinimalEntry] = []
@@ -137,6 +162,7 @@ struct SessionParser {
         let modifiedAt = values?.contentModificationDate ?? createdAt ?? .distantPast
         let creation = createdAt ?? values?.creationDate ?? modifiedAt
 
+        let createdPullRequest = activePath.last { $0.createdPullRequestURL != nil }
         var summary = SessionSummary(
             id: sessionID,
             fileURL: url.standardizedFileURL,
@@ -150,6 +176,8 @@ struct SessionParser {
             provider: provider,
             thinkingLevel: thinkingLevel,
             metrics: metrics,
+            pullRequestURL: createdPullRequest?.createdPullRequestURL,
+            pullRequestCreatedAt: createdPullRequest?.createdPullRequestAt,
             isArchived: archivedIDs.contains(sessionID)
         )
         summary.prepareSearchKey()
@@ -798,6 +826,18 @@ struct SessionParser {
         return MessageBlock(id: id, kind: .image(ImagePayload(
             id: id, data: data, mimeType: mimeType, fileName: fileName
         )))
+    }
+
+    private static func pullRequestCreateCallIDs(in content: JSONValue?) -> Set<String> {
+        Set((content?.arrayValue ?? []).prefix(32).compactMap { block in
+            guard block["type"]?.stringValue == "toolCall",
+                  block["name"]?.stringValue?.lowercased() == "bash",
+                  let id = block["id"]?.stringValue,
+                  let command = block["arguments"]?["command"]?.stringValue,
+                  PullRequestLink.invokesCreation(command)
+            else { return nil }
+            return id
+        })
     }
 
     private static func extractText(from content: JSONValue?) -> String? {

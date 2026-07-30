@@ -38,6 +38,56 @@ final class SessionParserTests: XCTestCase {
         XCTAssertEqual(conversation.messages.last?.role, .unknown)
     }
 
+    func testSummaryTracksOnlyPullRequestsCreatedOnTheActiveBranch() throws {
+        let file = temporaryDirectory.appendingPathComponent("pull-request.jsonl")
+        try write(lines: [
+            ["type": "session", "version": 3, "id": "pr-session", "cwd": temporaryDirectory.path],
+            ["type": "message", "id": "root", "parentId": NSNull(),
+             "message": ["role": "user", "content": "open a pull request"]],
+            ["type": "message", "id": "abandoned-call", "parentId": "root", "message": [
+                "role": "assistant", "content": [[
+                    "type": "toolCall", "id": "old", "name": "bash",
+                    "arguments": ["command": "gh pr create --title old"]
+                ]]
+            ]],
+            ["type": "message", "id": "abandoned-result", "parentId": "abandoned-call", "message": [
+                "role": "toolResult", "toolCallId": "old", "toolName": "bash",
+                "content": [["type": "text", "text": "https://github.com/acme/widgets/pull/1"]]
+            ]],
+            ["type": "message", "id": "active-call", "parentId": "root", "message": [
+                "role": "assistant", "content": [
+                    ["type": "toolCall", "id": "noop", "name": "read", "arguments": ["path": "/tmp/x"]],
+                    ["type": "toolCall", "id": "new", "name": "bash",
+                     "arguments": ["command": "gh pr create --title new"]]
+                ]
+            ]],
+            ["type": "message", "id": "noop-result", "parentId": "active-call", "message": [
+                "role": "toolResult", "toolCallId": "noop", "toolName": "read", "content": "ok"
+            ]],
+            ["type": "message", "id": "active-result", "parentId": "noop-result",
+             "timestamp": "2026-07-30T12:00:00.000Z", "message": [
+                "role": "toolResult", "toolCallId": "new", "toolName": "bash",
+                "content": [["type": "text", "text": "https://github.com/acme/widgets/pull/2"]]
+            ]],
+            ["type": "message", "id": "view-call", "parentId": "active-result", "message": [
+                "role": "assistant", "content": [[
+                    "type": "toolCall", "id": "view", "name": "bash",
+                    "arguments": ["command": "python3 -c \"print('gh pr create')\""]
+                ]]
+            ]],
+            ["type": "message", "id": "view-result", "parentId": "view-call", "message": [
+                "role": "toolResult", "toolCallId": "view", "toolName": "bash",
+                "content": [["type": "text", "text": "https://github.com/acme/widgets/pull/999"]]
+            ]],
+            ["type": "message", "id": "done", "parentId": "view-result",
+             "message": ["role": "assistant", "content": "done"]]
+        ], to: file)
+
+        let summary = try SessionParser.summary(at: file)
+        XCTAssertEqual(summary.pullRequestURL?.absoluteString, "https://github.com/acme/widgets/pull/2")
+        XCTAssertEqual(summary.pullRequestCreatedAt, Date.piDate("2026-07-30T12:00:00.000Z"))
+    }
+
     func testUserImagePromptHidesThePathFooter() throws {
         let imageData = Data("pixels".utf8)
         let message = SessionParser.chatMessage(fromAgentMessage: .object([

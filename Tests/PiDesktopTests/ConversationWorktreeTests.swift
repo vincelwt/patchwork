@@ -226,6 +226,75 @@ final class ConversationWorktreeTests: XCTestCase {
         )
     }
 
+    func testPullRequestCreationDetectionIgnoresQuotedSourceText() {
+        XCTAssertTrue(PullRequestLink.invokesCreation("gh pr create --fill"))
+        XCTAssertTrue(PullRequestLink.invokesCreation("git push && gh pr create --fill"))
+        XCTAssertTrue(PullRequestLink.invokesCreation("url=$(gh pr create --fill)"))
+        XCTAssertFalse(PullRequestLink.invokesCreation("python3 -c \"print('gh pr create')\""))
+        XCTAssertFalse(PullRequestLink.invokesCreation("rg 'gh pr create' Sources"))
+        XCTAssertFalse(PullRequestLink.invokesCreation("rg -n 'text|gh pr create --base' session.jsonl"))
+        XCTAssertFalse(PullRequestLink.invokesCreation("echo xgh pr create"))
+    }
+
+    func testGitHubPullRequestStateQueryUsesGraphQLStringLiterals() {
+        let query = GitHubPullRequestStateService.graphqlQuery(for: [
+            URL(string: "https://github.com/acme/widgets/pull/11")!
+        ])
+
+        XCTAssertTrue(query.contains(#"repository(owner: "acme", name: "widgets")"#))
+        XCTAssertTrue(query.contains("codexReviews: reviews"))
+        XCTAssertFalse(query.contains(#"\"acme\""#), "GraphQL rejects backslashes before string delimiters")
+    }
+
+    func testGitHubPullRequestStateBatchKeepsUnsupportedHostsUnknown() {
+        let open = URL(string: "https://github.com/acme/widgets/pull/11")!
+        let merged = URL(string: "https://github.com/acme/widgets/pull/12")!
+        let reviewed = URL(string: "https://github.com/acme/widgets/pull/13")!
+        let gitLab = URL(string: "https://gitlab.com/acme/widgets/-/merge_requests/7")!
+        let states = GitHubPullRequestStateService.decodedStates(from: .object([
+            "data": .object([
+                "pr0": .object(["pullRequest": .object(["state": .string("OPEN")])]),
+                "pr1": .object(["pullRequest": .object(["state": .string("MERGED")])]),
+                "pr2": .object(["pullRequest": .object([
+                    "state": .string("OPEN"),
+                    "codexReviews": .object(["nodes": .array([
+                        .object(["submittedAt": .string("2026-07-30T12:00:00Z")])
+                    ])])
+                ])])
+            ])
+        ]), for: [open, merged, reviewed, gitLab])
+
+        XCTAssertEqual(states[open], .open)
+        XCTAssertEqual(states[merged], .closed)
+        XCTAssertEqual(states[reviewed], .openWithCodexReview)
+        XCTAssertEqual(states[gitLab], .unknown)
+    }
+
+    @MainActor
+    func testOnlyFreshIdleCodexReviewsWakeTheirConversation() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        func review(_ id: String, age: TimeInterval, archived: Bool = false) -> SessionSummary {
+            var value = summary(id: id, cwd: "/tmp", archived: archived, modifiedAt: now)
+            value.pullRequestURL = URL(string: "https://github.com/acme/widgets/pull/\(id)")!
+            value.pullRequestCreatedAt = now.addingTimeInterval(-age)
+            return value
+        }
+        let fresh = review("1", age: 60)
+        let running = review("2", age: 60)
+        let stale = review("3", age: AppStore.pullRequestReviewMaxAge + 1)
+        let archived = review("4", age: 60, archived: true)
+        let sessions = [fresh, running, stale, archived]
+        let states = Dictionary(uniqueKeysWithValues: sessions.compactMap {
+            $0.pullRequestURL.map { ($0, PullRequestState.openWithCodexReview) }
+        })
+
+        let ready = AppStore.pullRequestReviewsReady(
+            in: sessions, states: states, now: now, isRunning: { $0.id == running.id }
+        )
+
+        XCTAssertEqual(ready.map { $0.0.id }, [fresh.id])
+    }
+
     func testGitLabMergeRequestsCountAndUnrelatedGitHubLinksDoNot() {
         XCTAssertEqual(
             PullRequestLink.firstLink(in: "see https://gitlab.com/acme/widgets/-/merge_requests/7")?.absoluteString,
