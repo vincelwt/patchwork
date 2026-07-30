@@ -84,10 +84,11 @@ The phone UI covers the daily loop, not just reading:
   queued / working / steering / failed until Pi's own session file confirms it. A failed send
   keeps its text with Retry, and a per-message submission id means a retry after a lost response
   replays the original answer instead of prompting Pi twice.
-- **Steering and follow-ups are real.** Both are delivered into the live Pi turn with Pi's own
-  `steer` / `follow_up` command — a steer joins the turn in progress, a follow-up runs as its own
-  next turn, and the daemon settles each accordingly. With no daemon-owned turn running there is
-  nothing to interrupt, and the UI says the message was queued instead of claiming it steered.
+- **Steering and follow-ups are real.** The primary Send action steers whenever the thread is
+  running. Steers and explicit follow-ups use Pi's own `steer` / `follow_up` command. A steer
+  joins the turn in progress, a follow-up waits and runs as its own next turn, and the daemon
+  settles each accordingly. With no daemon-owned turn running there is nothing to interrupt, and
+  the UI says the message was queued instead of claiming it steered.
 - **Questions can be answered from the phone.** An `ask_user_question` step or permission prompt
   raised by a daemon run appears in the thread with accessible single-select, multi-select, typed,
   and confirm forms. Nothing is ever auto-answered; an unsupported dialog says so and offers
@@ -208,7 +209,7 @@ Node are intentionally not bundled.
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |
 
-While Pi is running, the delivery menu explicitly offers **Steer current run** and **Queue as follow-up**. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). A single Escape preserves every app-held message, aborts the current turn, then sends those follow-ups as soon as that turn settles. Double-Escape, ⌘., and the stop button clear queues and terminate that thread's runtime. Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
+While Pi is running, Send and **Steer current run** hand the message to Pi immediately so it can be applied at the next model/tool boundary. **Queue as follow-up** keeps the message editable until the active turn's final assistant message settles, then sends it as the next prompt. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). A single Escape preserves every app-held message, aborts the current turn, then sends those follow-ups as soon as that turn settles. Double-Escape, ⌘., and the stop button clear queues and terminate that thread's runtime. Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
 
 ## Architecture
 

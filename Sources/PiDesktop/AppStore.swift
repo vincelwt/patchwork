@@ -4002,7 +4002,7 @@ final class AppStore: ObservableObject {
                 if command == "prompt" {
                     updateManagedTurn(for: slot) { $0.phase = ManagedTurnRecovery.accepted }
                 }
-                if command == "steer" { showToast("Steering message queued", style: .info) }
+                if command == "steer" { showToast("Steering message sent", style: .info) }
                 if command == "follow_up" { showToast("Follow-up queued", style: .info) }
                 if let preflightID { reconcilePromptPreflight(preflightID, slot: slot) }
                 return

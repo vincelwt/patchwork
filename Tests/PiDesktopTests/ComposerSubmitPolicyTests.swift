@@ -1,8 +1,7 @@
 import XCTest
 @testable import PiDesktop
 
-/// The routing rule behind "sending while Pi is working must add to the outbox instead of going
-/// straight to Pi": pure so every branch can be pinned without standing up a runtime.
+/// Pure routing coverage for the boundary between immediate steering and settled follow-ups.
 final class ComposerSubmitPolicyTests: XCTestCase {
     func testIdleSendsAlwaysGoDirect() {
         XCTAssertEqual(
@@ -15,10 +14,10 @@ final class ComposerSubmitPolicyTests: XCTestCase {
         )
     }
 
-    func testMidTurnSendsQueueInsteadOfReachingPiDirectly() {
+    func testMidTurnSteeringGoesDirectAndFollowUpsQueue() {
         XCTAssertEqual(
             ComposerSubmitRoute.decide(intent: .steer, isStreaming: true, isEditingLastMessage: false, canSend: true),
-            .queue(.steer)
+            .direct
         )
         XCTAssertEqual(
             ComposerSubmitRoute.decide(intent: .followUp, isStreaming: true, isEditingLastMessage: false, canSend: true),

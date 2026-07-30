@@ -12,6 +12,7 @@ import {
   reconcile,
   rememberRun,
   removePending,
+  resolveDelivery,
   statusLabel
 } from "../pending.mjs";
 import { applyInteractionLoad } from "../interactions.mjs";
@@ -346,7 +347,7 @@ export function renderThreadView(state, actions, threadId) {
     // the pending bubble below, where it stays visible (and retryable) even if the send fails.
     textarea.value = "";
     onInput();
-    submit(text, delivery);
+    submit(text, resolveDelivery(delivery, thread?.running === true));
   }
 
   /**
@@ -476,6 +477,7 @@ export function renderThreadView(state, actions, threadId) {
     cwdEl.textContent = thread?.cwd || "";
     cwdEl.hidden = !thread?.cwd;
     runStatus.hidden = !thread?.running;
+    sendBtn.textContent = thread?.running ? "Steer" : "Send";
     archiveBtn.textContent = thread?.archived ? "Unarchive" : "Archive";
     archiveBtn.setAttribute("aria-label", thread?.archived ? "Unarchive thread" : "Archive thread");
     syncLive();

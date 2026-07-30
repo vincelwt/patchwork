@@ -247,10 +247,12 @@ fast failure is never left spinning on "Sending…".
 Attachments are not supported here. The daemon rejects them outright rather than accepting a
 message and dropping its images.
 
-The composer's overflow menu offers **Send as follow-up** and **Send as steer**. Both are real:
-the daemon delivers them into the live Pi turn. When no daemon-owned turn is running there is
-nothing to interrupt, the daemon reports `delivery: auto`, and the bubble says the message is
-queued rather than pretending it steered anything.
+The primary Send action matches the Mac app: it becomes a steer while the thread is running.
+The overflow menu also offers explicit **Send as follow-up** and **Send as steer**. The daemon
+hands those to Pi's live `follow_up` and `steer` commands, so steering is immediate while a
+follow-up waits for the active turn's final assistant message before running. When no daemon-owned
+turn is running there is nothing to interrupt, the daemon reports `delivery: auto`, and the bubble
+says the message is queued rather than pretending it steered anything.
 
 ## Questions and approvals
 

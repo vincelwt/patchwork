@@ -13,6 +13,7 @@ import {
   reconcile,
   rememberRun,
   removePending,
+  resolveDelivery,
   statusLabel,
   userTextCounts
 } from "../../Sources/PiDeskWeb/Site/js/pending.mjs";
@@ -99,14 +100,25 @@ test("a run that finished ok drops the bubble even if the text never matches", (
   assert.equal(reconcile(list, [user("something else entirely")]).length, 0);
 });
 
-test("steer delivery is labelled as steering, and a downgrade is reported honestly", () => {
+test("primary delivery steers only while the thread is running", () => {
+  assert.equal(resolveDelivery("auto", false), "auto");
+  assert.equal(resolveDelivery("auto", true), "steer");
+  assert.equal(resolveDelivery("followUp", true), "followUp");
+  assert.equal(resolveDelivery("steer", false), "steer");
+});
+
+test("steer and follow-up delivery labels show their distinct timing", () => {
   let list = addPending([], { key: "p1", text: "stop that", messages: [] });
   list = markAccepted(list, "p1", { runId: "run_1", queued: false, delivery: "steer" });
   assert.equal(statusLabel(list[0]), "Steering the current run\u2026");
 
+  let followUp = addPending([], { key: "p2", text: "and then", messages: [] });
+  followUp = markAccepted(followUp, "p2", { runId: "run_1", queued: false, delivery: "followUp" });
+  assert.equal(statusLabel(followUp[0]), "Queued \u2014 waiting for the current run");
+
   // The daemon reports `auto` when there was no live turn to interrupt.
-  let downgraded = addPending([], { key: "p2", text: "stop that", messages: [] });
-  downgraded = markAccepted(downgraded, "p2", { runId: "run_2", queued: true, delivery: "auto" });
+  let downgraded = addPending([], { key: "p3", text: "stop that", messages: [] });
+  downgraded = markAccepted(downgraded, "p3", { runId: "run_2", queued: true, delivery: "auto" });
   assert.equal(statusLabel(downgraded[0]), "Queued \u2014 waiting for the current run");
 });
 
