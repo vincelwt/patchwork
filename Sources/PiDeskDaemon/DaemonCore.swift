@@ -75,7 +75,10 @@ final class DaemonCore: @unchecked Sendable {
         runHistoryStore = RunHistoryStore(fileURL: runHistoryFileURL, logger: logger)
         leaseStore = LeaseStore()
         let overlay = DaemonOverlayStore(fileURL: overlayFileURL)
-        threadStore = ThreadStore(rootURL: sessionRootURL, activityDirectoryURL: activityDirectoryURL, logger: logger, overlay: overlay)
+        threadStore = ThreadStore(
+            rootURL: sessionRootURL, activityDirectoryURL: activityDirectoryURL,
+            logger: logger, overlay: overlay, appStateURL: appStateURL
+        )
         limitsCache = LimitsCache()
 
         let queue = RunQueue(concurrencyLimit: settings.concurrency, executor: executor, historyStore: runHistoryStore, bus: bus, logger: logger)

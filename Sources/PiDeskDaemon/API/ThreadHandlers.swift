@@ -43,13 +43,19 @@ enum ThreadHandlers {
                 .json(AppStatePeek.load(from: core.appStateURL).folderTree)
             },
 
+            // Existing checkouts of the repository a folder belongs to, so a new thread can be
+            // started in one of them. Discovery only: this never creates or removes a worktree.
+            Route("GET", "/v1/worktrees") { request, _ in
+                let directory = try existingDirectory(request.query["cwd"])
+                // `git` is a blocking child process; keeping it off the cooperative pool means a
+                // slow repository cannot stall unrelated requests.
+                let worktrees = await Task.detached(priority: .utility) { GitWorktrees.list(for: directory) }.value
+                return .json(WorktreeListResponse(worktrees: worktrees))
+            },
+
             Route("POST", "/v1/threads") { request, _ in
                 let body = try request.decodeJSON(CreateThreadRequest.self)
-                let cwd = (body.cwd as NSString).expandingTildeInPath
-                guard !cwd.isEmpty, FileManager.default.fileExists(atPath: cwd) else {
-                    throw DaemonHTTPError.badRequest(code: "invalid_cwd", message: "cwd must be an existing directory.")
-                }
-                let cwdURL = URL(fileURLWithPath: cwd, isDirectory: true)
+                let cwdURL = try existingDirectory(body.cwd)
                 let thread: PiThread
                 do {
                     // Resolve the real Pi session before responding. A `pending:<run>` id is not
@@ -180,6 +186,15 @@ enum ThreadHandlers {
                 let thread = try await requireThread(core, params)
                 let body = try request.decodeJSON(ArchiveRequest.self)
                 let updated = try await core.threadStore.setArchived(body.archived, idOrPath: thread.id)
+                // The daemon owns its overlay, never the app's `state.json`, so the merge is a
+                // union: a thread the app archived stays archived whatever is written here.
+                // Reporting that as a restore would be a success the caller never got.
+                if !body.archived, updated.archived {
+                    throw DaemonHTTPError.conflict(
+                        code: "archived_in_app",
+                        message: "This thread was archived in the Mac app; restore it there."
+                    )
+                }
                 return .json(ThreadResponse(thread: updated))
             },
 
@@ -229,6 +244,19 @@ enum ThreadHandlers {
                 return .json(LeaseResponse(leased: true, owner: lease.owner, expiresAt: lease.expiresAt))
             }
         ]
+    }
+
+    /// A caller-supplied directory path: tilde-expanded, required to exist, and required to be a
+    /// directory rather than a file.
+    private static func existingDirectory(_ raw: String?) throws -> URL {
+        // Trim before expanding: `expandingTildeInPath` only fires on a leading `~`, so a padded
+        // " ~/code" would otherwise be taken literally.
+        let path = ((raw ?? "").trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw DaemonHTTPError.badRequest(code: "invalid_cwd", message: "cwd must be an existing directory.")
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 
     private static func runtimeState(_ core: DaemonCore, thread: PiThread) async throws -> ThreadRuntimeState {

@@ -430,6 +430,9 @@ select { appearance: none; padding-right: var(--space-5); }
 .segmented button:first-child { border-left: none; }
 .segmented button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
 
+/* The Active/Archived switch sits under a list's top bar rather than inside a form. */
+.list-filter { flex: none; margin: var(--space-2) var(--pad-r) var(--space-2) var(--pad-l); }
+
 details.advanced { margin-top: var(--space-2); margin-bottom: var(--space-4); }
 details.advanced summary {
   font-size: 13.5px;
@@ -721,6 +724,7 @@ details.advanced[open] summary { color: var(--text); }
   white-space: nowrap;
   cursor: pointer;
 }
+.topbar-action { flex: none; padding-inline: var(--space-2); }
 .thread-header input[type="text"] {
   font-size: 16px;
   font-weight: 600;

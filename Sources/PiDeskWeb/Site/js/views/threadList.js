@@ -24,6 +24,26 @@ export function renderThreadList(state, actions) {
     "\u21bb"
   );
 
+  // Two explicit lists rather than one mixed one: archiving a thread is only meaningful if it
+  // visibly leaves Active, and an archived thread is only recoverable if there is somewhere to
+  // find it again. `aria-pressed` on plain buttons is the same pattern the mode picker uses.
+  const filterButtons = [
+    { label: "Active", archived: false },
+    { label: "Archived", archived: true }
+  ].map(({ label, archived }) =>
+    h(
+      "button",
+      {
+        type: "button",
+        "aria-pressed": String(state.showArchived === archived),
+        "data-archived": String(archived),
+        onclick: () => actions.showArchivedThreads(archived)
+      },
+      label
+    )
+  );
+  const filterRow = h("div", { class: "segmented list-filter", role: "group", "aria-label": "Show threads" }, filterButtons);
+
   const node = h(
     "div",
     { class: "screen" },
@@ -33,10 +53,17 @@ export function renderThreadList(state, actions) {
       h("h1", { tabindex: "-1" }, "Threads"),
       refreshBtn
     ),
+    filterRow,
     indicator,
     scroll,
     h("button", { class: "fab", type: "button", "aria-label": "New thread", onclick: () => actions.navigate("/new") }, "+")
   );
+
+  function paintFilter(next) {
+    for (const button of filterButtons) {
+      button.setAttribute("aria-pressed", String(next.showArchived === (button.dataset.archived === "true")));
+    }
+  }
 
   attachPullToRefresh(scroll, indicator, () => actions.refreshThreads());
   paintList(listBody, state, actions);
@@ -44,7 +71,10 @@ export function renderThreadList(state, actions) {
 
   return {
     node,
-    onStateChange: (next) => paintList(listBody, next, actions)
+    onStateChange: (next) => {
+      paintFilter(next);
+      paintList(listBody, next, actions);
+    }
   };
 }
 
@@ -70,7 +100,7 @@ function paintList(container, state, actions) {
     return;
   }
   if (!state.threads.length) {
-    mount(container, state.threadsLoading ? skeletonList() : emptyState(actions));
+    mount(container, state.threadsLoading ? skeletonList() : emptyState(actions, state.showArchived));
     return;
   }
   // Grouping is worth its own chrome only when there is structure to show. A machine with one
@@ -146,7 +176,20 @@ function skeletonList() {
   );
 }
 
-function emptyState(actions) {
+function emptyState(actions, showArchived) {
+  if (showArchived) {
+    return h(
+      "div",
+      { class: "empty-state" },
+      h("div", { class: "empty-glyph", "aria-hidden": "true" }, "\u25a4"),
+      h("p", { class: "empty-title" }, "No archived threads"),
+      h(
+        "p",
+        { class: "empty-body" },
+        "Archiving a thread here hides it from Active and keeps it in this list, ready to restore. Threads archived in the Mac app appear here too, but are restored there."
+      )
+    );
+  }
   return h(
     "div",
     { class: "empty-state" },

@@ -182,6 +182,30 @@ returns `pending:<run>`, the browser follows `GET /v1/runs/{runId}` and opens th
 once that run reports the real session id; a dropped connection keeps resolving the accepted run
 instead of inviting a duplicate first prompt.
 
+The working directory is picked from the `cwd` of threads already known, or typed. When that folder
+is a git repository with more than one checkout, a **Checkout** menu appears listing the main
+checkout and every existing worktree (`GET /v1/worktrees`), and the selected one becomes the
+thread's working directory. Selection only: worktrees are created and removed in the Mac app, and a
+folder that is not a repository, or a daemon without the endpoint, simply hides the menu instead
+of blocking thread creation.
+
+## Archiving
+
+The Threads tab has two explicit lists, **Active** and **Archived**, because archiving is only
+useful if the thread visibly leaves the list it was in and stays findable in another. Switching
+re-reads `GET /v1/threads?archived=…`, and an SSE `thread` event whose `archived` flag no longer
+matches the visible list removes the row instead of merging it back in.
+
+Inside a thread, the top bar carries a worded **Archive** / **Unarchive** button rather than a
+glyph. Archiving keeps the thread open and readable; only the list it appears in changes. An
+archived thread can be opened from the Archived list, read, and replied to. Pi's session file is
+never touched; archive state is metadata.
+
+Restoring works for threads archived **from the web**, which is what this button writes. A thread
+archived in the **Mac app** cannot be restored from here: that flag lives in the app's own
+`state.json`, which the daemon reads and never writes, so unarchiving answers `409` and the message
+says to restore it in the app. Nothing is silently reported as restored.
+
 ## Model and thinking controls
 
 The row above the composer shows native select menus for the current model and thinking level,

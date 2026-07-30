@@ -1,4 +1,4 @@
-import { h } from "../dom.js";
+import { h, mount } from "../dom.js";
 import { describeError } from "../api.js";
 
 const MODES = ["xfast", "fast", "smart", "ultra"];
@@ -41,6 +41,57 @@ export function renderNewThread(state, actions) {
   // which happens on a direct/deep-link visit to this route before the list view has ever run.
   const chipRow = h("div", { class: "chip-row", role: "group", "aria-label": "Recent folders", hidden: true });
 
+  // Existing git checkouts of whatever `cwd` names, so a thread can run in a worktree that is
+  // already on the Mac. Read-only: nothing here creates or removes one. A folder that is not a
+  // repository, or a daemon without the endpoint, simply hides this field.
+  const worktreeSelect = h("select", { id: "new-worktree", "aria-describedby": "new-worktree-hint" });
+  const worktreeField = h(
+    "div",
+    { class: "field", hidden: true },
+    h("label", { for: "new-worktree" }, "Checkout"),
+    worktreeSelect,
+    h("div", { class: "field-hint", id: "new-worktree-hint" }, "Run in the main checkout or an existing worktree.")
+  );
+  let worktreeRequest = 0;
+
+  function loadWorktrees() {
+    const cwd = cwdInput.value.trim();
+    const request = ++worktreeRequest;
+    // Choices from the previous folder must not remain selectable while this lookup is in
+    // flight. In particular, submitting immediately after editing `cwd` must use the typed path.
+    worktreeField.hidden = true;
+    if (!cwd) return;
+    actions
+      .worktrees(cwd)
+      .then((response) => {
+        // A slower answer for a folder the user has since changed must not repopulate the menu.
+        if (request !== worktreeRequest) return;
+        const worktrees = response?.worktrees || [];
+        // One checkout is not a choice; the plain `cwd` field already covers it.
+        worktreeField.hidden = worktrees.length < 2;
+        // The typed path is always an option and always the preselected one. Without it, typing a
+        // subdirectory of a repository would silently start the thread in the checkout root
+        // instead. This menu picks a checkout; it never overrides what was asked for.
+        const options = worktrees.some((worktree) => worktree.path === cwd)
+          ? worktrees
+          : [{ path: cwd, name: folderName(cwd) }, ...worktrees];
+        mount(
+          worktreeSelect,
+          options.map((worktree) =>
+            h("option", { value: worktree.path }, [worktree.name, worktree.branch, worktree.isMain ? "main checkout" : null]
+              .filter(Boolean)
+              .join(" \u00b7 "))
+          )
+        );
+        worktreeSelect.value = cwd;
+      })
+      // Purely an aid: an older daemon or an unreadable repository leaves the typed path alone
+      // rather than blocking thread creation with an error.
+      .catch(() => {
+        if (request === worktreeRequest) worktreeField.hidden = true;
+      });
+  }
+
   function paintChips(threads) {
     const recents = recentCwds(threads);
     chipRow.hidden = recents.length === 0;
@@ -54,6 +105,7 @@ export function renderNewThread(state, actions) {
           onclick: (event) => {
             cwdInput.value = cwd;
             chipRow.querySelectorAll(".chip").forEach((chip) => chip.setAttribute("aria-pressed", String(chip === event.currentTarget)));
+            loadWorktrees();
           }
         },
         folderName(cwd)
@@ -62,9 +114,18 @@ export function renderNewThread(state, actions) {
     chipRow.replaceChildren(...chips);
     // Only pre-fill the most-recent folder while the field is still untouched, so data arriving
     // late never clobbers something the user already typed.
-    if (!cwdInput.value && recents[0]) cwdInput.value = recents[0];
+    if (!cwdInput.value && recents[0]) {
+      cwdInput.value = recents[0];
+      loadWorktrees();
+    }
   }
   paintChips(state.threads);
+  // Hide stale choices as soon as the path changes, but only run Git once the field is committed.
+  cwdInput.addEventListener("input", () => {
+    worktreeRequest += 1;
+    worktreeField.hidden = true;
+  });
+  cwdInput.addEventListener("change", loadWorktrees);
 
   const modeButtons = MODES.map((mode) =>
     h(
@@ -93,7 +154,9 @@ export function renderNewThread(state, actions) {
       class: "content-pad",
       onsubmit: (event) => {
         event.preventDefault();
-        const cwd = cwdInput.value.trim();
+        // The selected checkout *is* the working directory Pi runs in, so the daemon needs no
+        // separate field: it already validates that `cwd` exists.
+        const cwd = (worktreeField.hidden ? "" : worktreeSelect.value) || cwdInput.value.trim();
         if (!cwd) return;
         const mode = modeButtons.find((btn) => btn.getAttribute("aria-pressed") === "true");
         errorBox.hidden = true;
@@ -124,6 +187,7 @@ export function renderNewThread(state, actions) {
       cwdInput,
       h("div", { class: "field-hint", id: "new-cwd-hint" }, "Pick a recent folder or type any path on the Mac.")
     ),
+    worktreeField,
     h("div", { class: "field" }, h("label", { for: "new-name" }, "Name (optional)"), nameInput),
     h(
       "div",

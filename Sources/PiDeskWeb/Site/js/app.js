@@ -23,6 +23,7 @@ import { renderThreadView } from "./views/threadView.js";
 import { renderNewThread } from "./views/newThread.js";
 import { renderSchedules, renderScheduleDetail } from "./views/schedules.js";
 import { renderScheduleForm } from "./views/scheduleForm.js";
+import { applyThreadUpdate } from "./folders.mjs";
 
 const hosted = isRelayMode();
 const openingPairingLink = hosted && location.pathname.startsWith("/pair/");
@@ -33,6 +34,10 @@ const state = {
   threads: [],
   threadsLoading: false,
   threadsError: null,
+  // Which list the Threads tab is showing. Archiving is only useful if the archived thread
+  // actually leaves the list and stays reachable somewhere, so the list has two explicit modes
+  // rather than one mixed one. Session-scoped: a view preference, not something to persist.
+  showArchived: false,
   schedules: [],
   schedulesLoading: false,
   schedulesError: null,
@@ -151,13 +156,23 @@ async function waitForCreatedThread(runId) {
 
 // ---------- data loading ----------
 
+let threadsRequest = 0;
+
 function loadThreads() {
+  const archived = state.showArchived;
+  const request = ++threadsRequest;
   setState({ threadsLoading: true, threadsError: null });
   return api
-    .threads({ limit: 50 })
-    .then(({ threads }) => setState({ threads: sortByUpdatedAt(threads), threadsLoading: false }))
+    .threads({ limit: 50, archived })
+    .then(({ threads }) => {
+      // A slow response for the list the user has since switched away from must not replace the
+      // one now on screen.
+      if (request !== threadsRequest || archived !== state.showArchived) return;
+      setState({ threads: sortByUpdatedAt(threads), threadsLoading: false });
+    })
     .catch((err) => {
       if (err instanceof ApiError && err.status === 401) return;
+      if (request !== threadsRequest || archived !== state.showArchived) return;
       setState({ threadsLoading: false, threadsError: describeError(err) });
     });
 }
@@ -188,7 +203,12 @@ function loadSchedules() {
 function handleEvent(name, data) {
   if (!data || typeof data !== "object") return;
   if (name === "thread") {
-    setState((s) => ({ threads: sortByUpdatedAt(upsertBy(s.threads, data, "id")), lastThreadEvent: data }));
+    // The event carries the thread's current `archived` flag, so a thread that no longer belongs
+    // in the visible list leaves it instead of being merged back in.
+    setState((s) => ({
+      threads: sortByUpdatedAt(applyThreadUpdate(s.threads, data, s.showArchived)),
+      lastThreadEvent: data
+    }));
   } else if (name === "schedule") {
     setState((s) => ({ schedules: upsertBy(s.schedules, data, "id"), lastScheduleEvent: data }));
   } else if (name === "run") {
@@ -254,6 +274,16 @@ const actions = {
   refreshThreads: () => Promise.all([loadThreads(), loadFolders()]),
   refreshSchedules: () => loadSchedules(),
 
+  showArchivedThreads(showArchived) {
+    if (state.showArchived === showArchived) return;
+    // Clear first: the previous list belongs to the other mode entirely, and leaving it up while
+    // the new one loads would show archived threads under "Active".
+    setState({ showArchived, threads: [] });
+    loadThreads();
+  },
+
+  worktrees: (cwd) => api.worktrees(cwd),
+
   toggleGroup(id) {
     const collapsed = new Set(state.collapsedGroups);
     if (collapsed.has(id)) collapsed.delete(id);
@@ -266,7 +296,7 @@ const actions = {
     const thread = response.thread?.id?.startsWith("pending:") && response.runId
       ? await waitForCreatedThread(response.runId)
       : response.thread;
-    setState((s) => ({ threads: sortByUpdatedAt(upsertBy(s.threads, thread, "id")) }));
+    setState((s) => ({ threads: sortByUpdatedAt(applyThreadUpdate(s.threads, thread, s.showArchived)) }));
     if (location.pathname === "/new") go(`/thread/${encodeURIComponent(thread.id)}`, { replace: true });
     return thread;
   },
@@ -277,14 +307,14 @@ const actions = {
 
   archiveThread(id, archived) {
     return api.archiveThread(id, archived).then(({ thread }) => {
-      setState((s) => ({ threads: upsertBy(s.threads, thread, "id") }));
+      setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
       return thread;
     });
   },
 
   renameThread(id, name) {
     return api.renameThread(id, name).then(({ thread }) => {
-      setState((s) => ({ threads: upsertBy(s.threads, thread, "id") }));
+      setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
       return thread;
     });
   },
@@ -292,7 +322,7 @@ const actions = {
   markRead(id) {
     return api
       .markThreadRead(id, false)
-      .then(({ thread }) => setState((s) => ({ threads: upsertBy(s.threads, thread, "id") })))
+      .then(({ thread }) => setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) })))
       .catch(() => {}); // best-effort; not worth surfacing a failure to mark something read
   },
 

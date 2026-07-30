@@ -144,6 +144,12 @@ A message-bearing create resolves an idle Pi session first, then queues the firs
 that session. The response therefore never invents a `pending:<run>` thread id that cannot be
 opened. Older clients may still use `runId` to follow the prompt itself.
 
+**Archive is the daemon's own flag, not the app's.** It is written to the daemon overlay file, and
+`Thread.archived` is the union of that flag with the app's `state.json`, which the daemon reads
+and never writes. So `{"archived":true}` always takes, but `{"archived":false}` on a thread the
+*app* archived cannot clear it: that answers `409 archived_in_app` rather than a success the caller
+did not get. Restore it in the Mac app.
+
 **Runtime controls use Pi, never the JSONL file.** The runtime endpoints issue Pi's own query and
 `set_model` / `set_thinking_level` RPCs. During a daemon-owned turn they share that live process;
 while idle they reserve the thread and attach a short-lived process. A native-app lease returns
@@ -151,6 +157,26 @@ while idle they reserve the thread and attach a short-lived process. A native-ap
 starting two writers for one session. Models are bounded to 500 and thinking levels to 32; unknown
 future values remain visible. Lease acquisition is non-stealing: a different live owner gets
 `409 thread_leased`, while the same owner may renew its TTL.
+
+### Worktrees
+
+```
+GET /v1/worktrees?cwd=/Users/x/code
+→ {"worktrees":[{"path":"/Users/x/code","name":"code","branch":"main","isMain":true},
+                {"path":"/Users/x/code-worktrees/feature","name":"feature",
+                 "branch":"feat/thing","isMain":false}]}
+```
+
+Every existing checkout of the repository containing `cwd`, main first, so a client can start a
+thread in a worktree that already exists. **Discovery only:** `git worktree list` is the one
+subcommand used, run through a fixed `/usr/bin/git` path with no shell, and nothing here creates,
+moves, or removes a checkout; the Mac app remains the only thing that does. A directory that is not
+a repository (or a machine without git) answers with an empty list rather than an error. Bounds: 64
+entries, 256 KB of git output, 5-second timeout. A missing or non-directory `cwd` is
+`400 invalid_cwd`.
+
+Starting a thread in a chosen checkout needs no extra field: pass its `path` as `POST /v1/threads`'s
+`cwd`.
 
 **Delivery is reported, not assumed.** `delivery` in the *response* says what actually happened,
 which is not always what was asked:
