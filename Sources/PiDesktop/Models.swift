@@ -55,6 +55,7 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     var metrics: TokenMetrics
     /// The newest pull request created by this conversation's active branch.
     var pullRequestURL: URL? = nil
+    var pullRequestCreatedAt: Date? = nil
     var isArchived = false
     var searchKey = ""
 

@@ -23,11 +23,11 @@ actor SessionSummaryCache {
         var entries: [String: Entry]
     }
 
-    /// v4 adds the pull request created by each active branch, so older summaries are reparsed.
-    static let version = 4
+    /// v5 adds PR creation time for the app-owned review window, so older summaries are reparsed.
+    static let version = 5
     private let fileURL: URL
     private var entries: [String: Entry]
-    /// Legacy entries can paint immediately, but miss normal lookups once so v4 metadata is filled
+    /// Legacy entries can paint immediately, but miss normal lookups once so v5 metadata is filled
     /// during the ordinary background discovery pass.
     private var stalePaths: Set<String>
     private(set) var hitCount = 0
@@ -37,7 +37,7 @@ actor SessionSummaryCache {
         let manager = FileManager.default
         let defaultDirectory = manager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Pi Desktop", isDirectory: true)
-        self.fileURL = fileURL ?? defaultDirectory.appendingPathComponent("session-summaries-v4.json")
+        self.fileURL = fileURL ?? defaultDirectory.appendingPathComponent("session-summaries-v5.json")
 
         if let data = try? Data(contentsOf: self.fileURL),
            let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
@@ -46,10 +46,10 @@ actor SessionSummaryCache {
             stalePaths = []
         } else {
             let legacyURL = self.fileURL.deletingLastPathComponent()
-                .appendingPathComponent("session-summaries-v3.json")
+                .appendingPathComponent("session-summaries-v4.json")
             if let data = try? Data(contentsOf: legacyURL),
                let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-               envelope.version == 3 {
+               envelope.version == 4 {
                 entries = envelope.entries
                 stalePaths = Set(envelope.entries.keys)
             } else {

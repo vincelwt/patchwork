@@ -87,9 +87,6 @@ enum PullRequestLink {
     private static let pattern = try! NSRegularExpression(
         pattern: #"https://(?:github\.com|gitlab\.com)/[\w.\-]+/[\w.\-]+/(?:pull|merge_requests|-/merge_requests)/(\d+)"#
     )
-    private static let creationCommandPattern = try! NSRegularExpression(
-        pattern: #"(?:^|[;&|(\n])\s*gh\s+pr\s+create(?:\s|$)"#
-    )
     /// Bounds: a transcript can be enormous, and a PR is announced near the end of the work.
     private static let scannedMessageLimit = 200
     private static let scannedCharacterLimit = 20_000
@@ -105,9 +102,39 @@ enum PullRequestLink {
     }
 
     static func invokesCreation(_ command: String) -> Bool {
-        creationCommandPattern.firstMatch(
-            in: command, range: NSRange(command.startIndex..., in: command)
-        ) != nil
+        let needle = "gh pr create"
+        var quote: Character?
+        var escaped = false
+        var index = command.startIndex
+        while index < command.endIndex {
+            let character = command[index]
+            if escaped {
+                escaped = false
+            } else if character == "\\", quote != "'" {
+                escaped = true
+            } else if let activeQuote = quote {
+                if character == activeQuote { quote = nil }
+            } else if character == "'" || character == "\"" {
+                quote = character
+            } else if command[index...].hasPrefix(needle) {
+                let after = command.index(index, offsetBy: needle.count)
+                let endsToken = after == command.endIndex || command[after].isWhitespace
+                var before = index
+                var startsCommand = true
+                while before > command.startIndex {
+                    let previous = command.index(before: before)
+                    let value = command[previous]
+                    if value == "\n" { break }
+                    if value.isWhitespace { before = previous; continue }
+                    if ";&|(".contains(value), endsToken { return true }
+                    startsCommand = false
+                    break
+                }
+                if startsCommand, endsToken { return true }
+            }
+            index = command.index(after: index)
+        }
+        return false
     }
 
     /// The last match in one blob: `gh pr create` prints the URL after any earlier context.
@@ -125,8 +152,11 @@ enum PullRequestLink {
 
 enum PullRequestState: Equatable, Sendable {
     case open
+    case openWithCodexReview
     case closed
     case unknown
+
+    var isOpen: Bool { self == .open || self == .openWithCodexReview }
 }
 
 protocol PullRequestStateProviding {
@@ -160,8 +190,15 @@ struct GitHubPullRequestStateService: PullRequestStateProviding {
         let candidates = candidates(for: urls)
         var states = urls.reduce(into: [URL: PullRequestState]()) { $0[$1] = .unknown }
         for candidate in candidates {
-            switch response["data"]?[candidate.alias]?["pullRequest"]?["state"]?.stringValue {
-            case "OPEN": states[candidate.url] = .open
+            guard let pullRequest = response["data"]?[candidate.alias]?["pullRequest"] else { continue }
+            switch pullRequest["state"]?.stringValue {
+            case "OPEN":
+                let reviewed = ["codexReviews", "codexBotReviews"].contains { field in
+                    pullRequest[field]?["nodes"]?.arrayValue?.contains {
+                        $0["submittedAt"]?.stringValue != nil
+                    } == true
+                }
+                states[candidate.url] = reviewed ? .openWithCodexReview : .open
             case "CLOSED", "MERGED": states[candidate.url] = .closed
             default: break
             }
@@ -174,14 +211,18 @@ struct GitHubPullRequestStateService: PullRequestStateProviding {
         let candidates = candidates(for: urls)
         guard !Task.isCancelled, !candidates.isEmpty,
               let executable = ghExecutable() else { return states }
-        let fields = candidates.map {
-            #"\#($0.alias): repository(owner: \"\#($0.owner)\", name: \"\#($0.repository)\") { pullRequest(number: \#($0.number)) { state } }"#
-        }.joined(separator: " ")
-        let result = run(executable, arguments: ["api", "graphql", "-f", "query=query { \(fields) }"])
+        let result = run(executable, arguments: ["api", "graphql", "-f", "query=\(graphqlQuery(for: urls))"])
         guard !Task.isCancelled, result.status == 0,
               let response = try? JSONValue.decode(result.data) else { return states }
         states.merge(decodedStates(from: response, for: urls)) { _, resolved in resolved }
         return states
+    }
+
+    static func graphqlQuery(for urls: [URL]) -> String {
+        let fields = candidates(for: urls).map {
+            "\($0.alias): repository(owner: \"\($0.owner)\", name: \"\($0.repository)\") { pullRequest(number: \($0.number)) { state codexReviews: reviews(last: 1, author: \"chatgpt-codex-connector\") { nodes { submittedAt } } codexBotReviews: reviews(last: 1, author: \"chatgpt-codex-connector[bot]\") { nodes { submittedAt } } } }"
+        }.joined(separator: " ")
+        return "query { \(fields) }"
     }
 
     private static func candidates(for urls: [URL]) -> [Candidate] {

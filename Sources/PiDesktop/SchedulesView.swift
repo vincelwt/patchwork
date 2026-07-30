@@ -208,7 +208,9 @@ final class SchedulesModel: ObservableObject {
         isBusy = true
         defer { isBusy = false }
         do {
-            entries = try await service.loadSchedules().sorted { ($0.nextRunAt ?? .distantFuture) < ($1.nextRunAt ?? .distantFuture) }
+            entries = try await service.loadSchedules()
+                .filter { !$0.isInternalPullRequestReviewWatch }
+                .sorted { ($0.nextRunAt ?? .distantFuture) < ($1.nextRunAt ?? .distantFuture) }
             error = nil
         } catch {
             self.error = error.localizedDescription

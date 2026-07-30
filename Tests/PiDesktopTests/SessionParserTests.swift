@@ -64,7 +64,8 @@ final class SessionParserTests: XCTestCase {
             ["type": "message", "id": "noop-result", "parentId": "active-call", "message": [
                 "role": "toolResult", "toolCallId": "noop", "toolName": "read", "content": "ok"
             ]],
-            ["type": "message", "id": "active-result", "parentId": "noop-result", "message": [
+            ["type": "message", "id": "active-result", "parentId": "noop-result",
+             "timestamp": "2026-07-30T12:00:00.000Z", "message": [
                 "role": "toolResult", "toolCallId": "new", "toolName": "bash",
                 "content": [["type": "text", "text": "https://github.com/acme/widgets/pull/2"]]
             ]],
@@ -82,10 +83,9 @@ final class SessionParserTests: XCTestCase {
              "message": ["role": "assistant", "content": "done"]]
         ], to: file)
 
-        XCTAssertEqual(
-            try SessionParser.summary(at: file).pullRequestURL?.absoluteString,
-            "https://github.com/acme/widgets/pull/2"
-        )
+        let summary = try SessionParser.summary(at: file)
+        XCTAssertEqual(summary.pullRequestURL?.absoluteString, "https://github.com/acme/widgets/pull/2")
+        XCTAssertEqual(summary.pullRequestCreatedAt, Date.piDate("2026-07-30T12:00:00.000Z"))
     }
 
     func testUserImagePromptHidesThePathFooter() throws {

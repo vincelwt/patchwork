@@ -45,7 +45,7 @@ final class SessionSummaryCacheTests: XCTestCase {
         XCTAssertEqual(remaining, 0)
     }
 
-    func testV3CachePaintsImmediatelyThenReparsesForPullRequestMetadata() async throws {
+    func testV4CachePaintsImmediatelyThenReparsesForPullRequestReviewMetadata() async throws {
         struct LegacyEntry: Encodable {
             let fingerprint: SessionFileFingerprint
             let summary: SessionSummary
@@ -65,26 +65,28 @@ final class SessionSummaryCacheTests: XCTestCase {
         let fingerprint = SessionFileFingerprint(url: file, values: values)
         var summary = try SessionParser.summary(at: file)
         let legacy = LegacyEnvelope(
-            version: 3,
+            version: 4,
             entries: [file.standardizedFileURL.path: LegacyEntry(fingerprint: fingerprint, summary: summary)]
         )
         try JSONEncoder().encode(legacy).write(
-            to: root.appendingPathComponent("session-summaries-v3.json"), options: .atomic
+            to: root.appendingPathComponent("session-summaries-v4.json"), options: .atomic
         )
 
-        let v4URL = root.appendingPathComponent("session-summaries-v4.json")
-        let cache = SessionSummaryCache(fileURL: v4URL)
+        let v5URL = root.appendingPathComponent("session-summaries-v5.json")
+        let cache = SessionSummaryCache(fileURL: v5URL)
         let hydrated = await cache.liveSummaries(archivedIDs: [])
         let staleLookup = await cache.summary(for: fingerprint, archivedIDs: [])
         XCTAssertEqual(hydrated.map(\.id), ["cache-session"])
         XCTAssertNil(staleLookup, "Legacy entries must reparse in the background")
 
         summary.pullRequestURL = URL(string: "https://github.com/acme/widgets/pull/4")
+        summary.pullRequestCreatedAt = Date(timeIntervalSince1970: 1_700_000_000)
         await cache.store(summary, fingerprint: fingerprint)
         try await cache.persist()
-        let reloaded = SessionSummaryCache(fileURL: v4URL)
+        let reloaded = SessionSummaryCache(fileURL: v5URL)
         let upgraded = await reloaded.summary(for: fingerprint, archivedIDs: [])
         XCTAssertEqual(upgraded?.pullRequestURL, summary.pullRequestURL)
+        XCTAssertEqual(upgraded?.pullRequestCreatedAt, summary.pullRequestCreatedAt)
     }
 
     func testRefreshSummarySeesAnAppendThroughADiscoveredURL() async throws {

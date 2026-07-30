@@ -51,6 +51,7 @@ struct SessionParser {
         let type: String
         let userText: String?
         let createdPullRequestURL: URL?
+        let createdPullRequestAt: Date?
     }
 
     /// A transient view of one active entry. It is projected and released inside the pass-two
@@ -92,6 +93,7 @@ struct SessionParser {
             lastEntryID = id
             var userText: String?
             var createdPullRequestURL: URL?
+            var createdPullRequestAt: Date?
 
             switch type {
             case "session_info":
@@ -119,6 +121,9 @@ struct SessionParser {
                               message["isError"]?.boolValue != true,
                               let text = extractText(from: message["content"]) {
                         createdPullRequestURL = PullRequestLink.firstLink(in: String(text.suffix(20_000)))
+                        if createdPullRequestURL != nil {
+                            createdPullRequestAt = Date.piDate(object["timestamp"]?.stringValue)
+                        }
                     }
                     metrics.addUsage(message["usage"])
                 }
@@ -133,7 +138,8 @@ struct SessionParser {
                 parentID: parentID,
                 type: type,
                 userText: userText,
-                createdPullRequestURL: createdPullRequestURL
+                createdPullRequestURL: createdPullRequestURL,
+                createdPullRequestAt: createdPullRequestAt
             )
         }
 
@@ -156,6 +162,7 @@ struct SessionParser {
         let modifiedAt = values?.contentModificationDate ?? createdAt ?? .distantPast
         let creation = createdAt ?? values?.creationDate ?? modifiedAt
 
+        let createdPullRequest = activePath.last { $0.createdPullRequestURL != nil }
         var summary = SessionSummary(
             id: sessionID,
             fileURL: url.standardizedFileURL,
@@ -169,7 +176,8 @@ struct SessionParser {
             provider: provider,
             thinkingLevel: thinkingLevel,
             metrics: metrics,
-            pullRequestURL: activePath.compactMap(\.createdPullRequestURL).last,
+            pullRequestURL: createdPullRequest?.createdPullRequestURL,
+            pullRequestCreatedAt: createdPullRequest?.createdPullRequestAt,
             isArchived: archivedIDs.contains(sessionID)
         )
         summary.prepareSearchKey()
