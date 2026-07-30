@@ -18,6 +18,11 @@ export const PENDING_LIMIT = 8;
 /** Run statuses that mean the text will never produce a user message. */
 const FAILED_RUN_STATUSES = new Set(["failed", "timeout", "skipped", "interrupted"]);
 
+/** The primary Send action matches Desktop: normal prompt while idle, immediate steer while live. */
+export function resolveDelivery(delivery, isRunning) {
+  return delivery === "auto" && isRunning ? "steer" : delivery;
+}
+
 /**
  * Whitespace-insensitive comparison key. The daemon trims the text it accepts and Pi re-emits it
  * through its own JSON encoding, so an exact string match would miss legitimate reconciliations.
@@ -87,9 +92,9 @@ function patch(list, key, changes) {
 }
 
 /**
- * The daemon accepted the text. `queued` distinguishes "waiting for the current run to finish"
- * from "Pi is on it", and `delivery` reports what actually happened — a `steer` the daemon could
- * not deliver live comes back as `auto`, and saying so is the whole point.
+ * The daemon accepted the text. `queued` reports the daemon's run queue, while `delivery` names
+ * Pi's live queue (`followUp`) or immediate interruption (`steer`). A command the daemon could not
+ * deliver live comes back as `auto`, and saying so is the whole point.
  */
 export function markAccepted(list, key, { runId = null, queued = false, delivery = null } = {}) {
   // `requestedDelivery` is deliberately untouched: it is what Retry must ask for again.
@@ -181,7 +186,9 @@ export function statusLabel(entry) {
     case "queued":
       return "Queued \u2014 waiting for the current run";
     case "working":
-      return entry.delivery === "steer" ? "Steering the current run\u2026" : "Sent \u2014 waiting for Pi";
+      if (entry.delivery === "steer") return "Steering the current run\u2026";
+      if (entry.delivery === "followUp") return "Queued \u2014 waiting for the current run";
+      return "Sent \u2014 waiting for Pi";
     case "failed":
       return entry.error || "Not sent";
     default:

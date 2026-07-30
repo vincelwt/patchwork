@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Whether a composer submission can reach Pi directly, or has to wait in the outbox because Pi
-/// is mid-turn and its RPC has no way to edit or withdraw something already sent. An armed
+/// Steering reaches Pi immediately so it can be applied at the next model/tool boundary. A
+/// follow-up stays editable in the outbox until the active turn settles. An armed
 /// edit-and-resubmit (`isEditingLastMessage`) always goes direct regardless of streaming state:
 /// it replaces the turn in place rather than queuing alongside it.
 enum ComposerSubmitRoute: Equatable {
@@ -16,8 +16,8 @@ enum ComposerSubmitRoute: Equatable {
         isEditingLastMessage: Bool,
         canSend: Bool
     ) -> ComposerSubmitRoute {
-        guard canSend, isStreaming, !isEditingLastMessage else { return .direct }
-        return .queue(intent)
+        guard canSend, isStreaming, !isEditingLastMessage, intent == .followUp else { return .direct }
+        return .queue(.followUp)
     }
 }
 
@@ -124,8 +124,8 @@ struct ComposerView: View {
 
     // MARK: - Outbox routing
 
-    /// The round "send" affordance always means "steer" once a turn is in progress (matching the
-    /// delivery `submitDraft(delivery: .automatic)` already picks), so it queues as steering.
+    /// The round "send" affordance always means "steer" once a turn is in progress, matching the
+    /// delivery `submitDraft(delivery: .automatic)` already picks.
     private func handleSend() { route(intent: .steer, direct: onSend) }
 
     private func handleSteer() {
@@ -138,8 +138,7 @@ struct ComposerView: View {
         route(intent: .followUp, direct: onFollowUp)
     }
 
-    /// Pi's RPC has no command to edit or withdraw a message once it is sent, which is exactly
-    /// why a mid-turn submission is held in the outbox instead — see `Outbox.swift`.
+    /// Follow-ups stay editable until settlement; steering goes straight to Pi. See `Outbox.swift`.
     private func route(intent: OutboxEntry.Delivery, direct: () -> Void) {
         switch ComposerSubmitRoute.decide(
             intent: intent,

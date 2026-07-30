@@ -68,9 +68,7 @@ private struct FakeGitService: GitStatusProviding {
     func snapshot(for directory: URL) async -> GitSnapshot { .none }
 }
 
-/// End-to-end coverage for the outbox against a real `AppStore`: queuing never reaches Pi on its
-/// own, and the two boundaries Pi would have delivered at (`turn_end`, `agent_settled`) are the
-/// only things that ever flush it.
+/// End-to-end coverage for immediate steering and follow-ups held until `agent_settled`.
 @MainActor
 final class AppStoreOutboxTests: XCTestCase {
     private var directory: URL!
@@ -82,6 +80,19 @@ final class AppStoreOutboxTests: XCTestCase {
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    func testActiveComposerSendSteersImmediatelyBeforeTurnEnd() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
+        store.draft = "change direction"
+
+        store.submitDraft()
+
+        XCTAssertEqual(runtime.commandCount("steer"), 1)
+        XCTAssertEqual(runtime.lastPayload("steer")?["message"]?.stringValue, "change direction")
+        XCTAssertTrue(store.outbox.isEmpty)
     }
 
     func testEnqueueingHoldsTheMessageInsteadOfSendingIt() {
@@ -129,15 +140,18 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.lastPayload("steer")?["images"]?.arrayValue?.count, 1)
     }
 
-    func testAgentSettledFlushesOnlyFollowUpEntries() {
+    func testFollowUpWaitsPastTurnEndUntilAgentSettled() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
-        store.enqueueOutbox(text: "steer me", delivery: .steer)
+        store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
         store.enqueueOutbox(text: "later please", delivery: .followUp)
 
-        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        store.handleRPCEventForTesting(.object(["type": .string("turn_end")]))
+        XCTAssertEqual(store.outbox.map(\.text), ["later please"])
+        XCTAssertEqual(runtime.commandCount("prompt"), 0)
 
-        XCTAssertEqual(store.outbox.map(\.text), ["steer me"], "Only the follow-up entry flushes at agent_settled")
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+        XCTAssertTrue(store.outbox.isEmpty)
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
         XCTAssertEqual(runtime.lastPayload("prompt")?["message"]?.stringValue, "later please")
     }
@@ -178,19 +192,17 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertTrue(store.outbox.isEmpty)
     }
 
-    func testChangingDeliveryMovesAnEntryToTheOtherBoundary() {
+    func testChangingAFollowUpToSteeringSendsItImmediately() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
-        store.enqueueOutbox(text: "move me", delivery: .steer)
+        store.enqueueOutbox(text: "move me", delivery: .followUp)
         guard let id = store.outbox.first?.id else { return XCTFail("expected a queued entry") }
 
-        store.setOutboxDelivery(id: id, delivery: .followUp)
-        store.handleRPCEventForTesting(.object(["type": .string("turn_end")]))
-        XCTAssertEqual(runtime.commandCount("steer"), 0, "It no longer flushes as steering")
-        XCTAssertEqual(store.outbox.map(\.text), ["move me"], "Still queued, now waiting for agent_settled")
+        store.setOutboxDelivery(id: id, delivery: .steer)
 
-        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
-        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertTrue(store.outbox.isEmpty)
+        XCTAssertEqual(runtime.commandCount("steer"), 1)
+        XCTAssertEqual(runtime.lastPayload("steer")?["message"]?.stringValue, "move me")
     }
 
     func testSingleEscapeStopsCurrentTurnWithoutAQueuedMessage() {

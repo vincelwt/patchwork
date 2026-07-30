@@ -1,12 +1,8 @@
 import Foundation
 
-/// A message the user queued while Pi was working, held by the app instead of handed straight
-/// to Pi.
-///
-/// Pi's RPC can queue a steering or follow-up message but has no command to edit or withdraw
-/// one, so anything sent immediately is final. Holding it here keeps it editable and removable
-/// right up to the moment it actually matters, and it is flushed at the same boundary Pi would
-/// have delivered it: steering at the end of the current turn, follow-ups once the run settles.
+/// A follow-up the user queued while Pi was working, held by the app so it stays editable and
+/// removable until the active turn settles. Steering normally bypasses this outbox and reaches Pi
+/// immediately; changing a held follow-up to steering flushes it immediately too.
 struct OutboxEntry: Identifiable, Hashable, Sendable {
     enum Delivery: String, Hashable, Sendable {
         case steer
@@ -154,6 +150,7 @@ extension AppStore {
     func setOutboxDelivery(id: UUID, delivery: OutboxEntry.Delivery) {
         guard let index = outbox.firstIndex(where: { $0.id == id }) else { return }
         outbox[index].delivery = delivery
+        if delivery == .steer { flushOutbox(.steer) }
     }
 
     func removeOutbox(id: UUID) {
