@@ -418,6 +418,10 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.selectSession(session)
         store.composerContentDidChange()
         XCTAssertEqual(lease.entries.last?.delay, 120)
+        store.activities = [ActivityItem(
+            id: "agent-call", sourceID: "agent-call", kind: .subagent, title: "Live agent",
+            status: .running, raw: .null
+        )]
 
         runtime.onEvent?(Self.subagentStatus("5 running agents"))
         XCTAssertTrue(lease.entries[lease.entries.count - 1].cancelled, "live subagents must drop the idle lease")
@@ -426,6 +430,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
 
         // A blank value is the degenerate case: it must not pin the process open.
         runtime.onEvent?(Self.subagentStatus("   "))
+        XCTAssertEqual(store.activities.first?.status, .stopped, "the authoritative empty status must clear stale activity")
         let blankLease = lease.entries.count - 1
         XCTAssertEqual(lease.entries[blankLease].delay, 120)
         XCTAssertFalse(lease.entries[blankLease].cancelled)

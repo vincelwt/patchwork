@@ -34,6 +34,14 @@ private struct FakeGitService: GitStatusProviding {
     }
 }
 
+private actor MutableGitService: GitStatusProviding {
+    private var value: GitSnapshot
+
+    init(_ value: GitSnapshot) { self.value = value }
+    func set(_ value: GitSnapshot) { self.value = value }
+    func snapshot(for directory: URL) async -> GitSnapshot { value }
+}
+
 /// Wraps a real `FileSessionRepository` and adds a fixed delay before every load, so a test can
 /// deterministically overlap two selections instead of racing against however fast a tiny
 /// fixture file happens to parse.
@@ -388,6 +396,123 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertNil(store.initialScrollTargetMessageID, "A passive refresh must not re-arm initial scrolling")
     }
 
+    func testLiveTailRefreshReprojectsFinishedSubagents() async throws {
+        let file = temporaryDirectory.appendingPathComponent("live-agent.jsonl")
+        try writeLinearConversation(prefix: "live-agent", messageCount: 2, to: file)
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let launch = ChatMessage(
+            id: "launch-message",
+            role: .assistant,
+            blocks: [MessageBlock(
+                id: "launch-block",
+                kind: .toolCall(ToolCallPayload(
+                    id: "launch",
+                    name: "Agent",
+                    arguments: .object([
+                        "subagent_type": .string("general-purpose"),
+                        "description": .string("Refresh inspector activity")
+                    ])
+                ))
+            )],
+            timestamp: startedAt,
+            modelName: "gpt-5.6-sol",
+            raw: .null
+        )
+        let launched = ChatMessage(
+            id: "launch-result",
+            role: .tool,
+            blocks: [MessageBlock(id: "launch-result-text", kind: .text("Agent started in background."))],
+            timestamp: startedAt.addingTimeInterval(1),
+            toolCallID: "launch",
+            details: .object([
+                "agentId": .string("agent-1"),
+                "status": .string("background")
+            ]),
+            raw: .null
+        )
+        let wait = ChatMessage(
+            id: "wait-message",
+            role: .assistant,
+            blocks: [MessageBlock(
+                id: "wait-block",
+                kind: .toolCall(ToolCallPayload(
+                    id: "wait",
+                    name: "get_subagent_result",
+                    arguments: .object(["agent_id": .string("agent-1"), "wait": .bool(true)])
+                ))
+            )],
+            timestamp: startedAt.addingTimeInterval(2),
+            raw: .null
+        )
+        let stopped = ChatMessage(
+            id: "wait-result",
+            role: .tool,
+            blocks: [MessageBlock(id: "wait-result-text", kind: .text("Agent stopped."))],
+            timestamp: startedAt.addingTimeInterval(3),
+            toolCallID: "wait",
+            details: .object(["status": .string("stopped")]),
+            raw: .null
+        )
+        let initial = ConversationPage(
+            messages: [launch, launched], olderCursor: nil, leafID: "launch-result",
+            rawEntryCount: 2, scannedEntryCount: 2, scannedByteCount: 10, isTruncated: false
+        )
+        let refreshed = ConversationPage(
+            messages: [launch, launched, wait, stopped], olderCursor: nil, leafID: "wait-result",
+            rawEntryCount: 4, scannedEntryCount: 4, scannedByteCount: 20, isTruncated: false
+        )
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: temporaryDirectory.appendingPathComponent("heartbeats", isDirectory: true)
+        )
+        let store = makeStore(
+            repository: ScriptedPagingRepository(newestPages: [initial, refreshed]),
+            activityMonitor: monitor
+        )
+        let session = try makeSummary(id: "live-agent", fileURL: file)
+        store.sessions = [session]
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path) != nil }
+
+        store.selectSession(session)
+        try await waitUntil { store.activities.first?.status == .running }
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"custom\"}\n".utf8))
+        try handle.close()
+        monitor.tickNow()
+
+        try await waitUntil { store.activities.first?.status == .stopped }
+    }
+
+    func testSettledTurnRefreshesGitWhileTheAppIsInactive() async throws {
+        let file = temporaryDirectory.appendingPathComponent("inactive-git.jsonl")
+        try writeLinearConversation(prefix: "inactive-git", messageCount: 2, to: file)
+        var dirty = GitSnapshot(isRepository: true, branch: "main")
+        dirty.files = [GitFileChange(path: "stale.txt", additions: 10, deletions: 0, isBinary: false, isUntracked: false)]
+        let git = MutableGitService(dirty)
+        let runtime = FakeRuntime()
+        runtime.sessionFile = file.path
+        runtime.sessionID = "inactive-git"
+        let store = makeStore(
+            repository: FileSessionRepository(rootURL: temporaryDirectory),
+            gitService: git,
+            runtime: runtime,
+            isActiveOverride: false
+        )
+        let session = try makeSummary(id: "inactive-git", fileURL: file)
+        store.sessions = [session]
+        store.selectSession(session)
+        store.renameSession(session, to: "Attach runtime")
+        try await waitUntil { store.isSelectedRuntime && store.selectedGit.isDirty }
+
+        await git.set(GitSnapshot(isRepository: true, branch: "main"))
+        store.handleRPCEventForTesting(.object(["type": .string("agent_settled")]))
+
+        try await waitUntil { store.selectedGit.isRepository && !store.selectedGit.isDirty }
+    }
+
     func testLiveRefreshScanTruncationDoesNotFlagLoadedHistoryOutsideTheWindow() async throws {
         // Regression: a live refresh whose newest-page scan hit its byte budget used to OR its
         // own `isTruncated` into the merged page. With the loaded history complete (no older
@@ -605,7 +730,8 @@ final class ConversationLoadingTests: XCTestCase {
         gitService: GitStatusProviding = FakeGitService(),
         runtime: PiRuntimeProtocol = FakeRuntime(),
         persistence: AppPersistence? = nil,
-        activityMonitor: SessionActivityMonitor? = nil
+        activityMonitor: SessionActivityMonitor? = nil,
+        isActiveOverride: Bool? = nil
     ) -> AppStore {
         AppStore(
             repository: repository,
@@ -613,7 +739,8 @@ final class ConversationLoadingTests: XCTestCase {
             runtime: runtime,
             persistence: persistence ?? AppPersistence(baseURL: temporaryDirectory),
             activityPresenter: ActivityPresenter(),
-            activityMonitor: activityMonitor
+            activityMonitor: activityMonitor,
+            isActiveOverride: isActiveOverride
         )
     }
 
