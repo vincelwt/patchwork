@@ -5,6 +5,9 @@ struct ConversationPageCursor: Hashable, Sendable {
     fileprivate let beforeOffset: UInt64
     fileprivate let expectedID: String?
     fileprivate let leafID: String?
+    /// Older-history pages walk backward, so this carries whether the next assistant prose is
+    /// the answer for the turn currently being scanned. It only affects focused history reads.
+    fileprivate let focusedAnswerAvailable: Bool
 }
 
 struct ConversationPage: Sendable {
@@ -272,6 +275,11 @@ struct SessionParser {
         )
     }
 
+    enum PageProjection: Sendable {
+        case detailed
+        case focusedHistory
+    }
+
     struct PageLimits: Sendable {
         static let `default` = PageLimits(
             maxScanBytes: 64 * 1_024 * 1_024,
@@ -301,6 +309,7 @@ struct SessionParser {
         cursor: ConversationPageCursor? = nil,
         target: Int = ConversationPage.defaultMessageTarget,
         alignToTurnBoundary: Bool = true,
+        projection: PageProjection = .detailed,
         limits: PageLimits = .default
     ) throws -> ConversationPage {
         let sourcePath = url.standardizedFileURL.path
@@ -321,6 +330,7 @@ struct SessionParser {
         var rawEntryCount = 0
         var scannedEntryCount = 0
         var oldestScannedOffset: UInt64?
+        var focusedAnswerAvailable = cursor?.focusedAnswerAvailable ?? true
 
         func result(olderCursor: ConversationPageCursor?, truncated: Bool) -> ConversationPage {
             ConversationPage(
@@ -340,7 +350,8 @@ struct SessionParser {
                 sourcePath: sourcePath,
                 beforeOffset: offset,
                 expectedID: expectedID,
-                leafID: leafID
+                leafID: leafID,
+                focusedAnswerAvailable: focusedAnswerAvailable
             )
         }
 
@@ -366,7 +377,17 @@ struct SessionParser {
                 autoreleasepool {
                     guard let raw = try? JSONValue.decode(record.data) else { return }
                     let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
-                    if let message = chatMessage(from: entry, budget: &budget) {
+                    let message = switch projection {
+                    case .detailed:
+                        chatMessage(from: entry, budget: &budget)
+                    case .focusedHistory:
+                        focusedHistoryMessage(
+                            from: entry,
+                            answerAvailable: &focusedAnswerAvailable,
+                            budget: &budget
+                        )
+                    }
+                    if let message {
                         collected.append(message)
                         reachedTurnBoundary = message.role == .user
                             || entry.type == "compaction" || entry.type == "branch_summary"
@@ -602,6 +623,46 @@ struct SessionParser {
             stopReason: message["stopReason"]?.stringValue,
             raw: role == .unknown ? message.boundedFallback(maxLength: PiTheme.unknownPayloadLimit) : .null
         )
+    }
+
+    /// Historical pages keep the dialogue useful without retaining tool payloads. Scanning runs
+    /// backward: the first prose-bearing assistant message before each user message is that
+    /// turn's answer, including legacy sessions that did not record a terminal stop reason.
+    private static func focusedHistoryMessage(
+        from entry: RawEntry,
+        answerAvailable: inout Bool,
+        budget: inout ImageBudget
+    ) -> ChatMessage? {
+        guard entry.type == "message", let rawMessage = entry.raw["message"],
+              let roleName = rawMessage["role"]?.stringValue else {
+            if entry.type == "compaction" || entry.type == "branch_summary" {
+                answerAvailable = true
+            }
+            return chatMessage(from: entry, budget: &budget)
+        }
+
+        switch MessageRole(rawValue: roleName) ?? .unknown {
+        case .user:
+            answerAvailable = true
+            return chatMessage(from: entry, budget: &budget)
+        case .assistant:
+            guard answerAvailable else { return nil }
+            let stopReason = rawMessage["stopReason"]?.stringValue
+            guard stopReason != "toolUse",
+                  var message = chatMessage(from: entry, budget: &budget) else { return nil }
+            answerAvailable = false
+            message.blocks.removeAll { block in
+                switch block.kind {
+                case .thinking, .toolCall: true
+                default: false
+                }
+            }
+            return message.blocks.isEmpty ? nil : message
+        case .tool, .bash:
+            return nil
+        case .custom, .system, .unknown:
+            return chatMessage(from: entry, budget: &budget)
+        }
     }
 
     private static func chatMessage(from entry: RawEntry, budget: inout ImageBudget) -> ChatMessage? {

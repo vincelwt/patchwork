@@ -209,7 +209,11 @@ final class AppStore: ObservableObject {
     private var lastStreamingPublish = Date.distantPast
     @Published var isConversationLoading = false
     @Published private(set) var isLoadingEarlierMessages = false
+    @Published private(set) var isLoadingNewerMessages = false
     @Published private(set) var hasEarlierMessages = false
+    @Published private(set) var hasNewerMessages = false
+    @Published private(set) var isBrowsingEarlierHistory = false
+    @Published private(set) var latestScrollRequest = 0
     @Published private(set) var conversationHistoryLimitReached = false
     @Published private(set) var initialScrollTargetMessageID: String?
     @Published var conversationError: String?
@@ -337,10 +341,18 @@ final class AppStore: ObservableObject {
     private var selectedWorkspaceTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
     private var conversationRefreshTask: Task<Void, Never>?
-    private var earlierMessagesTask: Task<Void, Never>?
+    private var historyNavigationTask: Task<Void, Never>?
     private var activityProjectionTask: Task<Void, Never>?
     private var conversationLoadGeneration = 0
     private var loadedConversationPage: ConversationPage?
+    private var latestConversationPage: ConversationPage?
+    private var latestOptimisticMessages: [ChatMessage] = []
+    private var historyDepth = 0
+    /// ponytail: Reload cursors make nearby Newer navigation one bounded read. Deep history keeps
+    /// only an LRU; a miss replays with constant page memory. Add a disk index only if measured.
+    private var historyReloadCursors: [Int: ConversationPageCursor] = [:]
+    private var historyReloadOrder: [Int] = []
+    private static let historyReloadCursorLimit = 256
     private var loadedConversationPath: String?
     private var loadedConversationFingerprint: SessionFileFingerprint?
     private var refreshingConversationFingerprint: SessionFileFingerprint?
@@ -388,9 +400,9 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
-    /// Explicit ceiling for a user-expanded transcript window. Pages target 50 messages and may
-    /// finish the current turn; older pages stay on demand without retaining history forever.
-    private static let loadedMessageLimit = 1_000
+    /// One detailed parser page may finish a pathological turn at this ceiling. History itself
+    /// has no accumulated-message ceiling because navigation replaces this bounded page.
+    private static let displayedMessageLimit = ConversationPage.maximumMessageCount
     private static let connectivityResumeCommand = "/pi-desktop-resume"
     private static let connectivityResumeDescription = "Continue an interrupted turn after a transient failure"
     private static let connectivityResumeInstruction =
@@ -1772,10 +1784,11 @@ final class AppStore: ObservableObject {
         schedulePrefetch(around: session)
     }
 
-    /// Refreshes only the selected page's changed tail. Existing rows and any loaded earlier
-    /// pages keep their identity, so text selection, disclosure state, and scroll state survive.
+    /// Refreshes only the selected latest page's changed tail. Historical pages stay frozen until
+    /// the reader returns to Latest, so live work never replaces what they are reading.
     private func refreshSelectedConversationIfNeeded() {
-        guard !isConversationLoading, !isLoadingEarlierMessages,
+        guard !isConversationLoading, !isLoadingEarlierMessages, !isLoadingNewerMessages,
+              !isBrowsingEarlierHistory,
               let session = selectedSession,
               loadedConversationPage != nil else { return }
         let path = session.fileURL.standardizedFileURL.path
@@ -1794,6 +1807,7 @@ final class AppStore: ObservableObject {
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path,
+                      !isLoadingEarlierMessages, !isBrowsingEarlierHistory,
                       let current = loadedConversationPage else {
                     finishConversationRefresh(fingerprint)
                     return
@@ -1822,7 +1836,6 @@ final class AppStore: ObservableObject {
             current.messages.firstIndex(where: { $0.id == message.id })
         }.first
         let combined = overlap.map { Array(current.messages[..<$0]) + newest.messages } ?? newest.messages
-        let exceededLimit = combined.count > Self.loadedMessageLimit
         let retained = enforcingLoadedImageBudget(combined)
         let preservedHistory = overlap != nil
         let merged = ConversationPage(
@@ -1843,55 +1856,165 @@ final class AppStore: ObservableObject {
         loadedConversationFingerprint = fingerprint
         replaceLoadedMessages(with: retained)
         if let session = selectedSession { updateSelectedWorkspace(from: retained, for: session) }
-        conversationHistoryLimitReached = exceededLimit
-            || (merged.olderCursor != nil && retained.count >= Self.loadedMessageLimit)
-            || (merged.isTruncated && merged.olderCursor == nil)
-        hasEarlierMessages = merged.olderCursor != nil && !conversationHistoryLimitReached
+        conversationHistoryLimitReached = merged.isTruncated && merged.olderCursor == nil
+        hasEarlierMessages = merged.olderCursor != nil
         cachePage(merged, for: URL(fileURLWithPath: path), fingerprint: fingerprint)
         mergeHistoryActivities()
     }
 
-    func loadEarlierMessages() {
-        guard !isConversationLoading, !isLoadingEarlierMessages,
+    @discardableResult
+    func loadEarlierMessages() -> Bool {
+        guard !isConversationLoading, !isLoadingEarlierMessages, !isLoadingNewerMessages,
               !conversationHistoryLimitReached,
               let session = selectedSession,
               let current = loadedConversationPage,
-              let cursor = current.olderCursor else { return }
+              let cursor = current.olderCursor else { return false }
         let path = session.fileURL.standardizedFileURL.path
-        guard loadedConversationPath == path else { return }
+        guard loadedConversationPath == path else { return false }
+        conversationRefreshTask?.cancel()
+        conversationRefreshTask = nil
+        refreshingConversationFingerprint = nil
+        cancelEditingLastMessage()
         let generation = conversationLoadGeneration
+        let nextDepth = historyDepth + 1
+        let latestMessages = messages
         isLoadingEarlierMessages = true
-        earlierMessagesTask = Task { [weak self] in
+        historyNavigationTask = Task { [weak self] in
             guard let self else { return }
             let startedAt = Date()
             do {
-                let older = try await repository.loadOlderConversationPage(from: session.fileURL, cursor: cursor)
+                let older = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cursor)
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
-                let prepended = mergeEarlierPage(older)
-                isLoadingEarlierMessages = false
-                if let merged = loadedConversationPage {
-                    cachePage(merged, for: session.fileURL, fingerprint: loadedConversationFingerprint)
+                if historyDepth == 0 {
+                    latestConversationPage = current
+                    latestOptimisticMessages = latestMessages.filter { $0.id.hasPrefix("local-") }
                 }
-                refreshSelectedConversationIfNeeded()
+                rememberHistoryReloadCursor(cursor, depth: nextDepth)
+                publishHistoryPage(older, depth: nextDepth)
+                isLoadingEarlierMessages = false
+                historyNavigationTask = nil
                 ConversationPerformance.mark(
-                    "Conversation page prepend", path: path, count: prepended,
+                    "Focused history page", path: path, count: older.messages.count,
                     milliseconds: Date().timeIntervalSince(startedAt) * 1_000
                 )
-                let projected = await projectActivities(from: messages)
-                guard conversationLoadGeneration == generation,
-                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
-                activities = projected
             } catch is CancellationError {
-                // Route changed.
+                if conversationLoadGeneration == generation,
+                   selectedSession?.fileURL.standardizedFileURL.path == path {
+                    refreshSelectedConversationIfNeeded()
+                }
             } catch {
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
                 isLoadingEarlierMessages = false
+                historyNavigationTask = nil
                 refreshSelectedConversationIfNeeded()
                 showToast("Couldn’t load earlier history: \(error.localizedDescription)", style: .warning)
             }
+        }
+        return true
+    }
+
+    @discardableResult
+    func loadNewerMessages() -> Bool {
+        guard !isConversationLoading, !isLoadingEarlierMessages, !isLoadingNewerMessages,
+              historyDepth > 0, let session = selectedSession,
+              let latest = latestConversationPage else { return false }
+        let path = session.fileURL.standardizedFileURL.path
+        guard loadedConversationPath == path else { return false }
+        let targetDepth = historyDepth - 1
+        if targetDepth == 0 {
+            restoreLatestConversation(latest)
+            return true
+        }
+
+        let generation = conversationLoadGeneration
+        let cachedCursor = historyReloadCursors[targetDepth]
+        isLoadingNewerMessages = true
+        historyNavigationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                var remembered: [(Int, ConversationPageCursor)] = []
+                let page: ConversationPage
+                if let cachedCursor {
+                    page = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cachedCursor)
+                    remembered.append((targetDepth, cachedCursor))
+                } else {
+                    var replayed = latest
+                    for depth in 1...targetDepth {
+                        try Task.checkCancellation()
+                        guard let cursor = replayed.olderCursor else { throw ConversationPagingError.invalidCursor }
+                        if depth > targetDepth - Self.historyReloadCursorLimit {
+                            remembered.append((depth, cursor))
+                        }
+                        replayed = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cursor)
+                    }
+                    page = replayed
+                }
+                try Task.checkCancellation()
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                for (depth, cursor) in remembered { rememberHistoryReloadCursor(cursor, depth: depth) }
+                publishHistoryPage(page, depth: targetDepth)
+                isLoadingNewerMessages = false
+                historyNavigationTask = nil
+            } catch is CancellationError {
+                // Route changed or the reader jumped back to latest.
+            } catch {
+                guard conversationLoadGeneration == generation,
+                      selectedSession?.fileURL.standardizedFileURL.path == path else { return }
+                isLoadingNewerMessages = false
+                historyNavigationTask = nil
+                showToast("Couldn’t load newer history: \(error.localizedDescription)", style: .warning)
+            }
+        }
+        return true
+    }
+
+    func jumpToLatestMessages() {
+        historyNavigationTask?.cancel()
+        historyNavigationTask = nil
+        isLoadingEarlierMessages = false
+        isLoadingNewerMessages = false
+        if let latest = latestConversationPage { restoreLatestConversation(latest) }
+        latestScrollRequest &+= 1
+    }
+
+    private func publishHistoryPage(_ page: ConversationPage, depth: Int) {
+        loadedConversationPage = page
+        historyDepth = depth
+        isBrowsingEarlierHistory = true
+        hasNewerMessages = true
+        conversationHistoryLimitReached = page.isTruncated && page.olderCursor == nil
+        hasEarlierMessages = page.olderCursor != nil
+        streamingMessage = nil
+        messages = enforcingLoadedImageBudget(page.messages)
+    }
+
+    private func restoreLatestConversation(_ latest: ConversationPage) {
+        historyDepth = 0
+        isBrowsingEarlierHistory = false
+        hasNewerMessages = false
+        latestConversationPage = nil
+        let optimistic = latestOptimisticMessages
+        latestOptimisticMessages.removeAll(keepingCapacity: false)
+        historyReloadCursors.removeAll(keepingCapacity: false)
+        historyReloadOrder.removeAll(keepingCapacity: false)
+        loadedConversationPage = latest
+        conversationHistoryLimitReached = latest.isTruncated && latest.olderCursor == nil
+        hasEarlierMessages = latest.olderCursor != nil
+        replaceLoadedMessages(with: latest.messages, optimistic: optimistic)
+        if isSelectedRuntime { streamingMessage = activeRuntimeSlot.streamingMessage }
+        refreshSelectedConversationIfNeeded()
+    }
+
+    private func rememberHistoryReloadCursor(_ cursor: ConversationPageCursor, depth: Int) {
+        historyReloadCursors[depth] = cursor
+        historyReloadOrder.removeAll { $0 == depth }
+        historyReloadOrder.append(depth)
+        while historyReloadOrder.count > Self.historyReloadCursorLimit {
+            historyReloadCursors.removeValue(forKey: historyReloadOrder.removeFirst())
         }
     }
 
@@ -1900,36 +2023,19 @@ final class AppStore: ObservableObject {
         initialPreviousSeenCompletionID = nil
     }
 
-    @discardableResult
-    private func mergeEarlierPage(_ older: ConversationPage) -> Int {
-        guard let current = loadedConversationPage else { return 0 }
-        let existingIDs = Set(current.messages.map(\.id))
-        let unique = older.messages.filter { !existingIDs.contains($0.id) }
-        let remaining = max(0, Self.loadedMessageLimit - current.messages.count)
-        let accepted = Array(unique.suffix(remaining))
-        let mergedMessages = enforcingLoadedImageBudget(accepted + current.messages)
-        loadedConversationPage = ConversationPage(
-            messages: mergedMessages,
-            olderCursor: older.olderCursor,
-            leafID: current.leafID ?? older.leafID,
-            rawEntryCount: current.rawEntryCount + older.rawEntryCount,
-            scannedEntryCount: current.scannedEntryCount + older.scannedEntryCount,
-            scannedByteCount: current.scannedByteCount + older.scannedByteCount,
-            isTruncated: older.isTruncated
-        )
-        replaceLoadedMessages(with: mergedMessages)
-        conversationHistoryLimitReached = (older.olderCursor != nil && mergedMessages.count >= Self.loadedMessageLimit)
-            || (older.isTruncated && older.olderCursor == nil)
-        hasEarlierMessages = older.olderCursor != nil && !conversationHistoryLimitReached
-        return accepted.count
-    }
-
     private func publishConversationPage(
         _ page: ConversationPage,
         path: String,
         fingerprint: SessionFileFingerprint?
     ) {
         loadedConversationPage = page
+        latestConversationPage = nil
+        latestOptimisticMessages.removeAll(keepingCapacity: false)
+        historyDepth = 0
+        historyReloadCursors.removeAll(keepingCapacity: false)
+        historyReloadOrder.removeAll(keepingCapacity: false)
+        isBrowsingEarlierHistory = false
+        hasNewerMessages = false
         loadedConversationPath = path
         loadedConversationFingerprint = fingerprint
         if initialScrollTargetMessageID != nil {
@@ -1946,18 +2052,25 @@ final class AppStore: ObservableObject {
             }
         }
         replaceLoadedMessages(with: page.messages)
-        conversationHistoryLimitReached = (page.olderCursor != nil && page.messages.count >= Self.loadedMessageLimit)
-            || (page.isTruncated && page.olderCursor == nil)
-        hasEarlierMessages = page.olderCursor != nil && !conversationHistoryLimitReached
+        conversationHistoryLimitReached = page.isTruncated && page.olderCursor == nil
+        hasEarlierMessages = page.olderCursor != nil
     }
 
     private func resetConversationPageState() {
         loadedConversationPage = nil
+        latestConversationPage = nil
+        latestOptimisticMessages.removeAll(keepingCapacity: false)
+        historyDepth = 0
+        historyReloadCursors.removeAll(keepingCapacity: false)
+        historyReloadOrder.removeAll(keepingCapacity: false)
         loadedConversationPath = nil
         loadedConversationFingerprint = nil
         refreshingConversationFingerprint = nil
         hasEarlierMessages = false
+        hasNewerMessages = false
+        isBrowsingEarlierHistory = false
         isLoadingEarlierMessages = false
+        isLoadingNewerMessages = false
         conversationHistoryLimitReached = false
         initialScrollTargetMessageID = nil
         initialPreviousSeenCompletionID = nil
@@ -2330,6 +2443,9 @@ final class AppStore: ObservableObject {
     }
 
     func submitDraft(delivery: DeliveryMode = .automatic) {
+        if isBrowsingEarlierHistory || isLoadingEarlierMessages || isLoadingNewerMessages {
+            jumpToLatestMessages()
+        }
         let text = Self.sanitizedMessage(draft)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         let cwd: URL
@@ -3784,8 +3900,9 @@ final class AppStore: ObservableObject {
 
     /// Disk pages never erase optimistic user content or a terminal RPC answer that has not yet
     /// reached JSONL. Once the durable equivalent appears, the overlay removes itself.
-    private func replaceLoadedMessages(with loaded: [ChatMessage]) {
-        let optimistic = messages.filter { $0.id.hasPrefix("local-") }
+    private func replaceLoadedMessages(with loaded: [ChatMessage], optimistic suppliedOptimistic: [ChatMessage]? = nil) {
+        guard !isBrowsingEarlierHistory else { return }
+        let optimistic = suppliedOptimistic ?? messages.filter { $0.id.hasPrefix("local-") }
         var merged = loaded + optimistic.filter { local in
             !loaded.contains { candidate in
                 guard candidate.role == .user,
@@ -3815,8 +3932,8 @@ final class AppStore: ObservableObject {
     }
 
     private func enforcingLoadedImageBudget(_ source: [ChatMessage]) -> [ChatMessage] {
-        var result = source.count > Self.loadedMessageLimit
-            ? Array(source.suffix(Self.loadedMessageLimit))
+        var result = source.count > Self.displayedMessageLimit
+            ? Array(source.suffix(Self.displayedMessageLimit))
             : source
         var count = 0
         var bytes = 0
@@ -4009,7 +4126,10 @@ final class AppStore: ObservableObject {
         let now = Date()
         if streamingPublishTask == nil, now.timeIntervalSince(lastStreamingPublish) >= Self.streamingPublishInterval {
             lastStreamingPublish = now
-            if let parsed = SessionParser.chatMessage(fromAgentMessage: partial) { streamingMessage = parsed }
+            if let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
+                activeRuntimeSlot.streamingMessage = parsed
+                if !isBrowsingEarlierHistory { streamingMessage = parsed }
+            }
             return
         }
         pendingStreamingUpdate = partial
@@ -4023,7 +4143,10 @@ final class AppStore: ObservableObject {
             guard !Task.isCancelled, self.route == route, let pending = pendingStreamingUpdate else { return }
             pendingStreamingUpdate = nil
             lastStreamingPublish = Date()
-            if let parsed = SessionParser.chatMessage(fromAgentMessage: pending) { streamingMessage = parsed }
+            if let parsed = SessionParser.chatMessage(fromAgentMessage: pending) {
+                activeRuntimeSlot.streamingMessage = parsed
+                if !isBrowsingEarlierHistory { streamingMessage = parsed }
+            }
         }
     }
 
@@ -4358,6 +4481,7 @@ final class AppStore: ObservableObject {
             activeRuntimeSlot.connectivityResumeInFlight = false
             activeCapability = nil
             discardQuestionnaire()
+            activeRuntimeSlot.streamingMessage = nil
             streamingMessage = nil
             if !waitingForNetwork, !shouldRetryProvider { flushOutbox(.followUp) }
             // The turn concluded (cleanly or with an in-band error message) with no ambiguity
@@ -4388,6 +4512,7 @@ final class AppStore: ObservableObject {
                 recordRuntimeOutput(for: activeRuntimeSlot)
             }
             cancelPendingStreamingPublish()
+            activeRuntimeSlot.streamingMessage = nil
             guard selected, let raw = event["message"], let parsed = SessionParser.chatMessage(fromAgentMessage: raw) else { return }
             upsertMessage(parsed)
             if SessionParser.terminalAssistantStopReasons.contains(raw["stopReason"]?.stringValue ?? "") {
@@ -4725,6 +4850,7 @@ final class AppStore: ObservableObject {
         if let path = activeRuntimeSlot.sessionPath ?? state(for: activeRuntimeSlot).sessionFile {
             retainLiveMessage(message, path: URL(fileURLWithPath: path).standardizedFileURL.path)
         }
+        guard !isBrowsingEarlierHistory else { return }
         var updated = messages
         if let index = updated.firstIndex(where: { $0.id == message.id }) { updated[index] = message }
         else if message.role == .user,
@@ -4735,6 +4861,7 @@ final class AppStore: ObservableObject {
     }
 
     private func mergeHistoryActivities() {
+        guard !isBrowsingEarlierHistory else { return }
         activityProjectionTask?.cancel()
         let snapshot = messages
         let generation = conversationLoadGeneration
@@ -4849,15 +4976,16 @@ final class AppStore: ObservableObject {
     private func cancelConversationLoad() {
         conversationLoadTask?.cancel()
         conversationRefreshTask?.cancel()
-        earlierMessagesTask?.cancel()
+        historyNavigationTask?.cancel()
         activityProjectionTask?.cancel()
         conversationLoadTask = nil
         conversationRefreshTask = nil
-        earlierMessagesTask = nil
+        historyNavigationTask = nil
         activityProjectionTask = nil
         refreshingConversationFingerprint = nil
         isConversationLoading = false
         isLoadingEarlierMessages = false
+        isLoadingNewerMessages = false
     }
 
     private func showToast(_ text: String, style: ToastMessage.Style, sessionPath: String? = nil) {
@@ -4874,7 +5002,7 @@ final class AppStore: ObservableObject {
 
     deinit {
         gitRefreshTask?.cancel(); selectedGitTask?.cancel(); conversationLoadTask?.cancel(); conversationRefreshTask?.cancel()
-        earlierMessagesTask?.cancel(); activityProjectionTask?.cancel()
+        historyNavigationTask?.cancel(); activityProjectionTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel(); cancelRuntimeRetirement?()
         for task in finalDurabilityTasks.values { task.cancel() }
