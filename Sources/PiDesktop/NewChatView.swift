@@ -16,9 +16,8 @@ struct NewChatView: View {
             } else {
                 MessageScrollView(
                     messages: store.messages,
-                    streaming: store.streamingMessage,
-                    isRunning: true,
-                    transcriptRevision: store.transcriptRevision
+                    stream: store.transcriptStream,
+                    isRunning: true
                 )
             }
         }

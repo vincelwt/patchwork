@@ -88,7 +88,7 @@ struct ConversationView: View {
                     Rectangle()
                         .fill(Color.piHairline)
                         .frame(width: PiTheme.hairline)
-                    InspectorView()
+                    InspectorView(activities: store.runtimeActivities)
                         .transition(.move(edge: .trailing))
                 }
             }
@@ -286,9 +286,8 @@ struct ConversationView: View {
         } else {
             MessageScrollView(
                 messages: store.messages,
-                streaming: store.streamingMessage,
+                stream: store.transcriptStream,
                 isRunning: conversationIsRunning,
-                transcriptRevision: store.transcriptRevision,
                 onEditLastMessage: store.isBrowsingEarlierHistory ? nil : {
                     store.beginEditingLastMessage()
                     composerFocusTick += 1
@@ -302,10 +301,9 @@ struct ConversationView: View {
 struct MessageScrollView: View {
     @EnvironmentObject private var store: AppStore
     let messages: [ChatMessage]
-    let streaming: ChatMessage?
+    @ObservedObject var stream: TranscriptStreamModel
     /// True for a turn in flight here or in a terminal, so the live turn stays open either way.
     let isRunning: Bool
-    let transcriptRevision: Int
     /// Wired only to the conversation's single most recent user message; every earlier turn's
     /// bubble never receives this at all (see the `message.id == lastUserMessageID` check below).
     var onEditLastMessage: (() -> Void)?
@@ -321,9 +319,9 @@ struct MessageScrollView: View {
 
     private var transcriptItems: [TranscriptItem] {
         projectionCache.items(
-            revision: transcriptRevision,
+            revision: store.transcriptRevision,
             messages: messages,
-            streaming: streaming,
+            streaming: stream.message,
             isRunning: isRunning,
             mode: store.isBrowsingEarlierHistory ? .focusedHistory : .detailed
         )
@@ -440,7 +438,7 @@ struct MessageScrollView: View {
         .piHardTopScrollEdge()
         .scrollDismissesKeyboard(.interactively)
         .onAppear { store.consumeInitialScrollTarget() }
-        .onChange(of: transcriptRevision) { _, _ in
+        .onChange(of: store.transcriptRevision) { _, _ in
             guard pageReplacementArmed else { return }
             scrollBridge.applyPageReplacement()
             releasePageReplacementSoon()
