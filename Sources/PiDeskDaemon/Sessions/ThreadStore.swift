@@ -49,9 +49,18 @@ actor ThreadStore {
 
     func listThreads(
         query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?,
-        automated: Bool? = nil, automatedThreadIDs: Set<String> = [], agent: AgentKind? = nil
+        automated: Bool? = nil, automatedThreadIDs: Set<String> = [], agent: AgentKind? = nil,
+        sidebar: Bool = false
     ) async -> (threads: [PiThread], nextCursor: String?) {
         var filtered = await allThreadsSorted()
+        if sidebar {
+            let appState = AppStatePeek.load(from: appStateURL)
+            let overlayState = await overlay.snapshot()
+            let visibility = appState.sidebarVisibility(
+                desktopStartedThreadPaths: overlayState.desktopStartedThreadPaths
+            )
+            filtered = filtered.filter { visibility.includes(path: $0.path, agent: $0.agent) }
+        }
         for index in filtered.indices {
             filtered[index].shortId = PiThread.abbreviatedID(for: filtered[index].id)
             if automatedThreadIDs.contains(filtered[index].id) { filtered[index].automated = true }
@@ -136,6 +145,10 @@ actor ThreadStore {
 
     func setManagedWorktreeProject(_ project: URL, for worktree: URL) async throws {
         try await overlay.setManagedWorktreeProject(project, for: worktree)
+    }
+
+    func recordDesktopStartedThread(path: String) async throws {
+        try await overlay.recordDesktopStartedThread(path: path)
     }
 
     /// Threads the heartbeat extension has never reported on — sessions that started before it

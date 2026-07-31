@@ -412,9 +412,12 @@ public struct CreateThreadRequest: Codable, Sendable {
     /// Which agent should own the new thread. Absent means Pi, so an older client keeps the
     /// behaviour it has always had.
     public var agent: AgentKind?
+    /// True for a Pi Desktop remote surface. The daemon records the created session in its own
+    /// overlay so the Mac sidebar and remote thread list both keep showing it.
+    public var desktopManaged: Bool?
     public init(
         cwd: String, name: String? = nil, message: String? = nil, mode: String? = nil,
-        worktree: Bool? = nil, agent: AgentKind? = nil
+        worktree: Bool? = nil, agent: AgentKind? = nil, desktopManaged: Bool? = nil
     ) {
         self.cwd = cwd
         self.name = name
@@ -422,6 +425,7 @@ public struct CreateThreadRequest: Codable, Sendable {
         self.mode = mode
         self.worktree = worktree
         self.agent = agent
+        self.desktopManaged = desktopManaged
     }
 }
 

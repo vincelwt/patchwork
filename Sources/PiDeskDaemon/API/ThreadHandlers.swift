@@ -15,7 +15,8 @@ enum ThreadHandlers {
                     running: request.query["running"].flatMap(parseBool),
                     automated: request.query["automated"].flatMap(parseBool),
                     automatedThreadIDs: automatedIDs,
-                    agent: try parseAgentFilter(request.query["agent"])
+                    agent: try parseAgentFilter(request.query["agent"]),
+                    sidebar: request.query["sidebar"].flatMap(parseBool) ?? false
                 )
                 return .json(ThreadListResponse(threads: threads, nextCursor: next))
             },
@@ -105,6 +106,13 @@ enum ThreadHandlers {
                         try await core.threadStore.setManagedWorktreeProject(projectURL, for: worktreeURL)
                     } catch {
                         core.logger.warn("Created thread \(thread.id), but could not save its worktree project mapping: \(error)")
+                    }
+                }
+                if body.desktopManaged == true {
+                    do {
+                        try await core.threadStore.recordDesktopStartedThread(path: thread.path)
+                    } catch {
+                        core.logger.warn("Created thread \(thread.id), but could not save its desktop ownership: \(error)")
                     }
                 }
 

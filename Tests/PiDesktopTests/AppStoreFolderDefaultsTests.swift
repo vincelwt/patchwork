@@ -177,7 +177,7 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
             repository: FakeRepository(sessions: [session]),
             gitService: FakeGitService(counter: CallCounter()), runtime: FakeRuntime(),
             persistence: AppPersistence(baseURL: directory),
-            daemonWorktreeProjectsURL: overlay
+            daemonThreadOverlayURL: overlay
         )
         // This is a thread the CLI started, so it is only listed at all in the mode that shows
         // conversations this app did not start.

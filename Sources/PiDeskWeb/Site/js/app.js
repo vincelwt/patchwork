@@ -19,6 +19,7 @@ import {
 import { renderTokenScreen } from "./views/token.js";
 import { renderPairingScreen } from "./views/pairing.js";
 import { renderThreadList } from "./views/threadList.js";
+import { loadThreadPages } from "./threadPages.mjs";
 import { renderThreadView } from "./views/threadView.js";
 import { renderNewThread } from "./views/newThread.js";
 import { renderSchedules, renderScheduleDetail } from "./views/schedules.js";
@@ -162,9 +163,8 @@ function loadThreads() {
   const archived = state.showArchived;
   const request = ++threadsRequest;
   setState({ threadsLoading: true, threadsError: null });
-  return api
-    .threads({ limit: 50, archived })
-    .then(({ threads }) => {
+  return loadThreadPages(api.threads, { archived, sidebar: true })
+    .then((threads) => {
       // A slow response for the list the user has since switched away from must not replace the
       // one now on screen.
       if (request !== threadsRequest || archived !== state.showArchived) return;

@@ -183,14 +183,21 @@ enum TestSupport {
         folders: String = "[]",
         assignments: [String: String] = [:],
         projectAssignments: [String: String] = [:],
-        archivedSessionIDs: [String] = []
+        archivedSessionIDs: [String] = [],
+        appStartedSessionPaths: [String] = [],
+        showsForeignConversations: Bool = false,
+        disabledAgents: [String] = []
     ) {
         let pairs = assignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
         let projectPairs = projectAssignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
         let archived = archivedSessionIDs.map { "\"\($0)\"" }.joined(separator: ",")
+        let started = appStartedSessionPaths.map { "\"\($0)\"" }.joined(separator: ",")
+        let disabled = disabledAgents.map { "\"\($0)\"" }.joined(separator: ",")
         let json = """
         {"virtualFolders":\(folders),"virtualFolderAssignments":{\(pairs)},\
-        "projectFolderAssignments":{\(projectPairs)},"archivedSessionIDs":[\(archived)]}
+        "projectFolderAssignments":{\(projectPairs)},"archivedSessionIDs":[\(archived)],\
+        "appStartedSessionPaths":[\(started)],"showsForeignConversations":\(showsForeignConversations),\
+        "disabledAgents":[\(disabled)]}
         """
         try? json.write(to: directory.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
     }

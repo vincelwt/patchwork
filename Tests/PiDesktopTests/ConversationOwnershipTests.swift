@@ -82,6 +82,31 @@ final class ConversationOwnershipTests: XCTestCase {
         }
     }
 
+    func testAConversationStartedFromTheRemoteIsOwnedByTheMacSidebar() async throws {
+        let base = tempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let overlay = base.appendingPathComponent("overlay.json")
+        let ownedPath = "/tmp/remote-owned.jsonl"
+        try #"{"desktopStartedThreadPaths":["/tmp/remote-owned.jsonl"]}"#
+            .write(to: overlay, atomically: true, encoding: .utf8)
+
+        let repository = StubRepository()
+        repository.summaries = [summary(ownedPath), summary("/tmp/foreign.jsonl")]
+        let store = await AppStore(
+            repository: repository,
+            gitService: StubGit(),
+            persistence: AppPersistence(baseURL: base),
+            daemonThreadOverlayURL: overlay
+        )
+        await store.refreshSessions()
+
+        await MainActor.run {
+            XCTAssertEqual(store.sessions.map(\.fileURL.path), [ownedPath])
+            XCTAssertEqual(store.hiddenForeignCount, 1)
+        }
+    }
+
     func testThePreferenceSurvivesARelaunch() async throws {
         let base = tempBase()
         defer { try? FileManager.default.removeItem(at: base) }

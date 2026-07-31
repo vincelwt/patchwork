@@ -28,6 +28,9 @@ actor DaemonOverlayStore {
         /// Worktree execution cwd → the exact source cwd supplied by the caller. Kept outside
         /// app-owned state.json so daemon and app writes cannot clobber each other.
         var managedWorktreeProjects: [String: String] = [:]
+        /// Conversations created by a Pi Desktop remote surface. The Mac app reads this bounded
+        /// overlay and treats them exactly like conversations it started in its own window.
+        var desktopStartedThreadPaths: Set<String> = []
 
         init() {}
 
@@ -41,6 +44,11 @@ actor DaemonOverlayStore {
             managedWorktreeProjects = Dictionary(uniqueKeysWithValues: worktrees
                 .sorted { $0.key < $1.key }
                 .suffix(2_000))
+            desktopStartedThreadPaths = Set((try container.decodeIfPresent(
+                Set<String>.self, forKey: .desktopStartedThreadPaths
+            ) ?? []).sorted().suffix(5_000).map {
+                URL(fileURLWithPath: $0).standardizedFileURL.path
+            })
         }
     }
 
@@ -58,6 +66,7 @@ actor DaemonOverlayStore {
         var archivedThreadIDs: Set<String>
         var readOverrides: [String: (unread: Bool, markedAt: Date)]
         var managedWorktreeProjects: [String: String]
+        var desktopStartedThreadPaths: Set<String>
 
         func isArchived(_ threadID: String) -> Bool { archivedThreadIDs.contains(threadID) }
 
@@ -71,7 +80,8 @@ actor DaemonOverlayStore {
         Snapshot(
             archivedThreadIDs: state.archivedThreadIDs,
             readOverrides: state.readOverrides.mapValues { ($0.unread, $0.markedAt) },
-            managedWorktreeProjects: state.managedWorktreeProjects
+            managedWorktreeProjects: state.managedWorktreeProjects,
+            desktopStartedThreadPaths: state.desktopStartedThreadPaths
         )
     }
 
@@ -102,6 +112,19 @@ actor DaemonOverlayStore {
         if overflow > 0 {
             for key in state.managedWorktreeProjects.keys.filter({ $0 != worktreePath }).sorted().prefix(overflow) {
                 state.managedWorktreeProjects.removeValue(forKey: key)
+            }
+        }
+        try persist()
+    }
+
+    func recordDesktopStartedThread(path: String) throws {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard !standardized.isEmpty, !state.desktopStartedThreadPaths.contains(standardized) else { return }
+        state.desktopStartedThreadPaths.insert(standardized)
+        let overflow = state.desktopStartedThreadPaths.count - 5_000
+        if overflow > 0 {
+            for path in state.desktopStartedThreadPaths.filter({ $0 != standardized }).sorted().prefix(overflow) {
+                state.desktopStartedThreadPaths.remove(path)
             }
         }
         try persist()

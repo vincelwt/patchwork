@@ -159,8 +159,10 @@ The phone UI covers the daily loop, not just reading:
 - **Assistant and tool screenshots render inline** as responsive thumbnails with a tap-to-open
   lightbox and download, fetched per image so a screenshot-heavy thread stays inside the relay's
   payload budget.
-- **The thread list mirrors the sidebar's folder tree**, read-only, with collapsible groups and
-  unread/running markers.
+- **The thread list mirrors the sidebar's complete folder tree and conversation visibility**, read-only,
+  with collapsible groups and unread/running markers. It follows every bounded list page rather
+  than stopping at the newest 50 conversations, respects the Mac's external-conversation and
+  disabled-agent settings, and keeps a conversation started remotely in both lists.
 
 By default the control service runs directly inside `Pi Desktop.app`: the Unix-socket API,
 scheduler, remote relay, and their Pi workers start and stop with the app, with no separate
