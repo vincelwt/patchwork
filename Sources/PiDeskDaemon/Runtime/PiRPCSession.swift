@@ -2,12 +2,20 @@ import Darwin
 import Foundation
 import PiDeskKit
 
-/// A minimal, sequential Pi RPC client for the runner: start the process, send one command at a
-/// time, wait for its response, and separately drain events until `agent_settled`. Deliberately
-/// not a port of the app's `PiRPCClient` (`Sources/PiDesktop/PiRPCClient.swift`): that client
-/// supports concurrent in-flight commands and live UI callbacks, neither of which the runner
-/// needs \u2014 it drives exactly one prompt per run, strictly in order.
+/// A minimal, sequential agent session for the runner: start the process, send one command at a
+/// time, wait for its response, and separately drain events until `agent_settled`.
+///
+/// Deliberately not a port of the app's `AgentRuntimeClient`: that client supports concurrent
+/// in-flight commands and live UI callbacks, neither of which the runner needs — it drives
+/// exactly one prompt per run, strictly in order. What the two *do* share is the protocol
+/// translation: both drive an `AgentProtocolAdapter`, so this session speaks Pi, Codex, and
+/// Claude Code without the runner above it knowing which.
 final class PiRPCSession: @unchecked Sendable {
+    private let adapter: AgentProtocolAdapter
+    /// Adapters are documented as "called serially", and this session has two serialization
+    /// domains that can touch one: writes hold `writeLock` from any task, while decoding runs on
+    /// `ioQueue`. This lock is what actually makes the adapter's mutable state safe here.
+    private let adapterLock = NSLock()
     private let process: Process
     private let inputHandle: FileHandle
     private let outputFD: Int32
@@ -39,7 +47,13 @@ final class PiRPCSession: @unchecked Sendable {
     /// test can prove the bound in a fraction of a second instead of the production default.
     private let writeTimeout: TimeInterval
 
-    private init(process: Process, inputHandle: FileHandle, outputFD: Int32, errorHandle: FileHandle, writeTimeout: TimeInterval) {
+    var agent: AgentKind { adapter.agent }
+
+    private init(
+        adapter: AgentProtocolAdapter, process: Process, inputHandle: FileHandle,
+        outputFD: Int32, errorHandle: FileHandle, writeTimeout: TimeInterval
+    ) {
+        self.adapter = adapter
         self.process = process
         self.inputHandle = inputHandle
         self.outputFD = outputFD
@@ -50,16 +64,15 @@ final class PiRPCSession: @unchecked Sendable {
 
     static func start(
         cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String],
-        writeTimeout: TimeInterval = BlockingPipeIO.defaultWriteTimeout
+        writeTimeout: TimeInterval = BlockingPipeIO.defaultWriteTimeout,
+        adapter: AgentProtocolAdapter = PiProtocolAdapter()
     ) throws -> PiRPCSession {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
         let error = Pipe()
         process.executableURL = piExecutable
-        var arguments = ["--mode", "rpc"]
-        if let sessionPath { arguments += ["--session", sessionPath.path] }
-        process.arguments = arguments
+        process.arguments = adapter.launchArguments(sessionPath: sessionPath, cwd: cwd)
         process.currentDirectoryURL = cwd
         process.environment = environment
         process.standardInput = input
@@ -72,11 +85,19 @@ final class PiRPCSession: @unchecked Sendable {
         let inputFD = input.fileHandleForWriting.fileDescriptor
         let flags = fcntl(inputFD, F_GETFL, 0)
         if flags >= 0 { _ = fcntl(inputFD, F_SETFL, flags | O_NONBLOCK) }
-        return PiRPCSession(
-            process: process, inputHandle: input.fileHandleForWriting,
+        let session = PiRPCSession(
+            adapter: adapter, process: process, inputHandle: input.fileHandleForWriting,
             outputFD: output.fileHandleForReading.fileDescriptor, errorHandle: error.fileHandleForReading,
             writeTimeout: writeTimeout
         )
+        // A handshake has to be on the wire before any command, and only the adapter knows
+        // whether this agent needs one.
+        session.writeLock.lock()
+        defer { session.writeLock.unlock() }
+        for line in adapter.startupLines(sessionPath: sessionPath, cwd: cwd) {
+            try session.writeRawLocked(line)
+        }
+        return session
     }
 
     /// Writes a correlated request and returns its id; the caller awaits the matching response
@@ -87,35 +108,55 @@ final class PiRPCSession: @unchecked Sendable {
         defer { writeLock.unlock() }
         requestCounter += 1
         let id = "daemon-\(process.processIdentifier)-\(requestCounter)"
-        var object = payload
-        object["type"] = .string(type)
-        object["id"] = .string(id)
-        try writeLocked(object)
+
+        switch adapterLock.withLock({ adapter.encode(command: type, id: id, payload: payload) }) {
+        case let .write(lines):
+            for line in lines { try writeRawLocked(line) }
+        case .deferred:
+            // The adapter is holding this until its handshake lands and will write it itself.
+            // The caller still waits on `id`, and still times out if that never happens.
+            break
+        case let .immediate(value):
+            // Answered from the adapter's own state; nothing reaches the process. It has to be
+            // published into the *buffer*, which is what `receiveNext`/`receiveMatching` drain —
+            // the response cache alone is only read by `awaitCachedResponse`, so a caller that
+            // waits the ordinary way would have waited out its whole timeout.
+            let response = AdapterEncoding.response(id: id, data: value)
+            bufferLock.lock()
+            buffer.append(response)
+            bufferLock.unlock()
+            cacheResponses([response])
+        case let .unsupported(what):
+            throw RunnerError.unsupportedCommand(agent: adapter.agent, what: what)
+        }
         return id
     }
 
-    /// Writes an object whose `id` the caller owns — an `extension_ui_response` must echo the id
-    /// Pi chose for its request, so it can never use `send`'s generated one.
+    /// Writes a message whose correlation the caller owns — a dialog answer must echo the id the
+    /// agent chose for its request, so it can never use `send`'s generated one.
     func sendRaw(_ object: [String: PiJSONValue]) throws {
         writeLock.lock()
         defer { writeLock.unlock() }
-        try writeLocked(object)
+        for line in adapterLock.withLock({ adapter.encodeUncorrelated(.object(object)) }) {
+            try writeRawLocked(line)
+        }
     }
 
     /// Must only be called with `writeLock` held.
-    private func writeLocked(_ object: [String: PiJSONValue]) throws {
+    private func writeRawLocked(_ line: Data) throws {
         if let writeBroken { throw RunnerError.ioFailure(writeBroken) }
+        guard !line.isEmpty else { return }
         do {
             try BlockingPipeIO.writeAll(
                 fd: inputHandle.fileDescriptor,
-                data: try PiJSONValue.object(object).encodedLine(),
+                data: line,
                 timeoutSeconds: writeTimeout
             )
         } catch let error as RunnerError {
             writeBroken = error.localizedDescription
             throw error
         } catch {
-            let message = "Could not write to Pi: \(error)"
+            let message = "Could not write to \(adapter.agent.displayName): \(error)"
             writeBroken = message
             throw RunnerError.ioFailure(message)
         }
@@ -218,7 +259,28 @@ final class PiRPCSession: @unchecked Sendable {
             case let .data(chunk):
                 let records = framer.append(chunk)
                 guard !records.isEmpty else { continue }
-                let values = records.compactMap { try? PiJSONValue.decode($0) }
+                // Translation happens here, so everything above this line — the run loop, the
+                // settlement bookkeeping, steering, dialogs — only ever sees the one vocabulary.
+                let values: [PiJSONValue] = adapterLock.withLock {
+                    records.flatMap { record in
+                        adapter.decode(line: record).map { message in
+                            switch message {
+                            case let .response(_, value): value
+                            case let .event(value): value
+                            }
+                        }
+                    }
+                }
+                // An adapter may owe the agent a reply as a consequence of decoding (a protocol
+                // acknowledgement, a queued command unblocked by a completed handshake).
+                if let writeback = adapter as? AdapterWriteback {
+                    let pending = adapterLock.withLock { writeback.drainPendingWrites() }
+                    if !pending.isEmpty {
+                        writeLock.lock()
+                        for line in pending { try? writeRawLocked(line) }
+                        writeLock.unlock()
+                    }
+                }
                 cacheResponses(values)
                 guard let first = values.first else { continue }
                 if values.count > 1 {

@@ -30,11 +30,12 @@ struct PiProcessRunExecutor: RunExecuting {
     }
 
     private func runProtocol(_ job: RunJob) async throws -> RunOutcome {
-        // This executor speaks Pi's `--mode rpc` protocol and nothing else. Launching `pi`
-        // against a Codex or Claude transcript would corrupt it, so an unsupported agent fails
-        // loudly and non-retryably instead.
-        guard job.target.agent == .pi else { throw RunnerError.agentNotExecutable(job.target.agent) }
-        guard let piURL = piExecutableOverride ?? PiLocator.resolve() else { throw RunnerError.agentNotFound(.pi) }
+        let agent = job.target.agent
+        // The executable is resolved for the thread's own agent, and the adapter translates this
+        // run's commands into that agent's protocol. Nothing below this line is agent-specific.
+        guard let executable = piExecutableOverride ?? AgentCatalog.executable(for: agent) else {
+            throw RunnerError.agentNotFound(agent)
+        }
 
         let cwd: URL
         let sessionPath: URL?
@@ -46,8 +47,11 @@ struct PiProcessRunExecutor: RunExecuting {
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = nil
         }
-        let environment = PiLocator.augmentedEnvironment(piURL: piURL, cwd: cwd)
-        let session = try PiRPCSession.start(cwd: cwd, sessionPath: sessionPath, piExecutable: piURL, environment: environment)
+        let environment = AgentCatalog.augmentedEnvironment(executable: executable, cwd: cwd)
+        let session = try PiRPCSession.start(
+            cwd: cwd, sessionPath: sessionPath, piExecutable: executable, environment: environment,
+            adapter: AgentAdapterFactory.make(agent)
+        )
         defer { session.stop() }
 
         let stateID = try session.send(type: "get_state")

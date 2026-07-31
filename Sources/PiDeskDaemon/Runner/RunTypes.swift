@@ -6,6 +6,8 @@ enum RunnerError: Error, LocalizedError, Sendable {
     /// The daemon can read this agent's threads but cannot drive its runtime yet. Said out loud
     /// rather than silently launching `pi` against someone else's transcript.
     case agentNotExecutable(AgentKind)
+    /// The agent is driveable, but has no equivalent for this particular command.
+    case unsupportedCommand(agent: AgentKind, what: String)
     case timedOut(afterSeconds: TimeInterval)
     case processExited(String)
     case ioFailure(String)
@@ -19,6 +21,8 @@ enum RunnerError: Error, LocalizedError, Sendable {
             return "\(agent.displayName) was not found. Set \(descriptor.executableOverrideKey) or install \(descriptor.executableNames[0]) in ~/.local/bin."
         case let .agentNotExecutable(agent):
             return "Pi Desktop's background service cannot run \(agent.displayName) threads yet; open this thread in the Mac app."
+        case let .unsupportedCommand(agent, what):
+            return "\(agent.displayName) does not support \(what)."
         case let .timedOut(seconds): return "Pi did not respond within \(Int(seconds))s."
         case let .processExited(detail): return detail.isEmpty ? "Pi exited unexpectedly." : "Pi exited: \(detail)"
         case let .ioFailure(detail): return detail
@@ -31,7 +35,7 @@ enum RunnerError: Error, LocalizedError, Sendable {
     var retryableBeforePrompt: Bool {
         switch self {
         case .timedOut, .processExited, .ioFailure: true
-        case .agentNotFound, .agentNotExecutable: false
+        case .agentNotFound, .agentNotExecutable, .unsupportedCommand: false
         }
     }
 }

@@ -1,9 +1,8 @@
 import Darwin
 import Foundation
-import PiDeskKit
 
-protocol AgentRuntimeProtocol: AnyObject {
-    var onEvent: ((JSONValue) -> Void)? { get set }
+public protocol AgentRuntimeProtocol: AnyObject {
+    var onEvent: ((PiJSONValue) -> Void)? { get set }
     var onExit: ((String?) -> Void)? { get set }
     var isRunning: Bool { get }
     /// Which agent this runtime drives. The store gates affordances on its capabilities.
@@ -11,15 +10,15 @@ protocol AgentRuntimeProtocol: AnyObject {
 
     func start(cwd: URL, sessionPath: URL?) throws
     func stop()
-    func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?)
-    func sendUncorrelated(_ value: JSONValue)
+    func send(type: String, payload: [String: PiJSONValue], completion: ((Result<PiJSONValue, Error>) -> Void)?)
+    func sendUncorrelated(_ value: PiJSONValue)
 }
 
-extension AgentRuntimeProtocol {
-    var agent: AgentKind { .pi }
+public extension AgentRuntimeProtocol {
+    public var agent: AgentKind { .pi }
 }
 
-enum AgentRuntimeError: LocalizedError {
+public enum AgentRuntimeError: LocalizedError {
     case notInstalled(AgentKind)
     case notRunning
     case invalidCommand
@@ -32,7 +31,7 @@ enum AgentRuntimeError: LocalizedError {
     case outcomeUnknown(String)
     case processExited(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case let .notInstalled(agent):
             switch agent {
@@ -56,36 +55,20 @@ enum AgentRuntimeError: LocalizedError {
     }
 }
 
-/// Kept as the app-side name for Pi's executable lookup. The catalog is the single source of
-/// truth; this exists so long-lived call sites and the daemon read identically.
-enum PiLocator {
-    static func resolve(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
-        AgentCatalog.executable(for: .pi, environment: environment)
-    }
-
-    static func augmentedEnvironment(
-        piURL: URL,
-        cwd: URL? = nil,
-        base: [String: String] = ProcessInfo.processInfo.environment
-    ) -> [String: String] {
-        AgentCatalog.augmentedEnvironment(executable: piURL, cwd: cwd, base: base)
-    }
-}
-
 /// One agent subprocess speaking LF-delimited JSON over stdio.
 ///
 /// The transport is agent-agnostic: spawning, pipe reads, request correlation, timeouts,
 /// generation fencing, and reaping are identical for Pi, Codex, and Claude Code. Everything
 /// that differs lives behind `AgentProtocolAdapter`.
-final class AgentRuntimeClient: AgentRuntimeProtocol {
+public final class AgentRuntimeClient: AgentRuntimeProtocol {
     private let callbackLock = NSLock()
-    private var eventHandler: ((JSONValue) -> Void)?
+    private var eventHandler: ((PiJSONValue) -> Void)?
     private var exitHandler: ((String?) -> Void)?
-    var onEvent: ((JSONValue) -> Void)? {
+    public var onEvent: ((PiJSONValue) -> Void)? {
         get { callbackLock.withLock { eventHandler } }
         set { callbackLock.withLock { eventHandler = newValue } }
     }
-    var onExit: ((String?) -> Void)? {
+    public var onExit: ((String?) -> Void)? {
         get { callbackLock.withLock { exitHandler } }
         set { callbackLock.withLock { exitHandler = newValue } }
     }
@@ -112,9 +95,9 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
     private let argumentsOverride: [String]?
     private let adapter: AgentProtocolAdapter
 
-    var agent: AgentKind { adapter.agent }
+    public var agent: AgentKind { adapter.agent }
 
-    init(
+    public init(
         adapter: AgentProtocolAdapter = PiProtocolAdapter(),
         executableOverride: URL? = nil,
         environmentOverrides: [String: String] = [:],
@@ -129,15 +112,15 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
     }
 
     /// Builds the runtime for one agent, with that agent's native protocol adapter.
-    static func make(for agent: AgentKind, additionalArguments: [String] = []) -> AgentRuntimeClient {
+    public static func make(for agent: AgentKind, additionalArguments: [String] = []) -> AgentRuntimeClient {
         AgentRuntimeClient(adapter: AgentAdapterFactory.make(agent), additionalArguments: additionalArguments)
     }
 
-    var isRunning: Bool {
+    public var isRunning: Bool {
         ioQueue.sync { process?.isRunning == true }
     }
 
-    func start(cwd: URL, sessionPath: URL? = nil) throws {
+    public func start(cwd: URL, sessionPath: URL? = nil) throws {
         let baseEnvironment = ProcessInfo.processInfo.environment
             .merging(adapter.environmentOverrides) { _, override in override }
             .merging(environmentOverrides) { _, override in override }
@@ -207,7 +190,7 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
         }
     }
 
-    func stop() {
+    public func stop() {
         ioQueue.async { [weak self] in
             guard let self else { return }
             generation.invalidate()
@@ -241,10 +224,10 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
         }
     }
 
-    func send(
+    public func send(
         type: String,
-        payload: [String: JSONValue] = [:],
-        completion: ((Result<JSONValue, Error>) -> Void)? = nil
+        payload: [String: PiJSONValue] = [:],
+        completion: ((Result<PiJSONValue, Error>) -> Void)? = nil
     ) {
         ioQueue.async { [weak self] in
             guard let self, let inputHandle, process?.isRunning == true else {
@@ -304,7 +287,7 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
         }
     }
 
-    func sendUncorrelated(_ value: JSONValue) {
+    public func sendUncorrelated(_ value: PiJSONValue) {
         ioQueue.async { [weak self] in
             guard let self, let input = inputHandle, process?.isRunning == true else { return }
             for line in adapter.encodeUncorrelated(value) {
@@ -361,7 +344,7 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
     private func consume(
         _ data: Data,
         generation currentGeneration: RuntimeGeneration,
-        eventHandler: ((JSONValue) -> Void)?
+        eventHandler: ((PiJSONValue) -> Void)?
     ) {
         // A retired generation's buffered output is dropped rather than published.
         guard currentGeneration.isValid, generation === currentGeneration else { return }
@@ -428,7 +411,7 @@ final class AgentRuntimeClient: AgentRuntimeProtocol {
 
 /// An adapter that sometimes has to answer the agent (protocol acknowledgements, permission
 /// replies) as a consequence of decoding, rather than because the app asked for something.
-protocol AdapterWriteback: AnyObject {
+public protocol AdapterWriteback: AnyObject {
     /// Lines the adapter accumulated while decoding. Called on the IO queue after each record.
     func drainPendingWrites() -> [Data]
 }

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 final class JSONLFramerTests: XCTestCase {
     func testFramesAcrossArbitraryChunksAndStripsOnlyCRBeforeLF() throws {

@@ -24,7 +24,7 @@ final class ConversationWorktreeTests: XCTestCase {
         ChatMessage(
             id: UUID().uuidString,
             role: .assistant,
-            blocks: [MessageBlock(id: UUID().uuidString, kind: .text(text))],
+            blocks: [PiDesktop.MessageBlock(id: UUID().uuidString, kind: .text(text))],
             timestamp: Date(),
             raw: .null
         )

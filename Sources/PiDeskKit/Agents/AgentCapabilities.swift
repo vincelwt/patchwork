@@ -181,3 +181,19 @@ public extension AgentKind {
         }
     }
 }
+
+/// Every reasoning level any supported agent can report, weakest first.
+///
+/// This lives beside the adapters rather than in the app's picker: an adapter has to emit levels
+/// from this list or they are filtered out of every UI that shows them, so the list and the code
+/// that produces it belong in one place.
+public enum AgentThinkingLevels {
+    public static let all = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+    /// Narrows an agent's reported levels to the ones this build understands, preserving the
+    /// canonical weak-to-strong order. An empty result degrades to "off" rather than to nothing.
+    public static func supported(_ reported: [String]) -> [String] {
+        let known = all.filter { reported.contains($0) }
+        return known.isEmpty ? ["off"] : known
+    }
+}

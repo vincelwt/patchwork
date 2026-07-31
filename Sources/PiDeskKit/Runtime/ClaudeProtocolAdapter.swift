@@ -1,5 +1,4 @@
 import Foundation
-import PiDeskKit
 
 /// Drives Claude Code's own streaming-JSON protocol — `claude -p --input-format stream-json
 /// --output-format stream-json --verbose` — and translates it into the app's Pi-shaped
@@ -16,8 +15,10 @@ import PiDeskKit
 ///
 /// Every method runs serially on the transport's IO queue, so the mutable state here is
 /// unsynchronized on purpose.
-final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
-    let agent: AgentKind = .claude
+public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
+    public init() {}
+
+    public let agent: AgentKind = .claude
 
     /// Everything retained from the wire is bounded; a runaway stream must not become a runaway
     /// heap. These are the only limits in this file, deliberately in one place.
@@ -33,11 +34,11 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     /// Claude's `--effort` ladder, in the app's thinking-level vocabulary.
-    static let effortLevels = ["low", "medium", "high", "xhigh", "max"]
+    public static let effortLevels = ["low", "medium", "high", "xhigh", "max"]
 
     /// Claude has no protocol call that enumerates models in every build, so the picker offers
     /// the documented `--model` aliases plus whatever the running session reports.
-    static let modelAliases: [(id: String, name: String)] = [
+    public static let modelAliases: [(id: String, name: String)] = [
         ("default", "Default"),
         ("fable", "Fable"),
         ("opus", "Opus"),
@@ -84,7 +85,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     // MARK: - Launch
 
-    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
+    public func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
         self.cwd = cwd
         var arguments = [
             "-p",
@@ -120,7 +121,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     /// `~/.claude/projects/<cwd with "/" and "." replaced by "-">/<sessionId>.jsonl`.
-    static func transcriptPath(sessionID: String, cwd: URL) -> String {
+    public static func transcriptPath(sessionID: String, cwd: URL) -> String {
         let slug = cwd.standardizedFileURL.path
             .replacingOccurrences(of: ".", with: "-")
             .replacingOccurrences(of: "/", with: "-")
@@ -130,7 +131,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
             .standardizedFileURL.path
     }
 
-    func reset() {
+    public func reset() {
         sessionID = nil
         sessionPath = nil
         slashCommands = []
@@ -146,14 +147,14 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         writeback = []
     }
 
-    func drainPendingWrites() -> [Data] {
+    public func drainPendingWrites() -> [Data] {
         defer { writeback = [] }
         return writeback
     }
 
     // MARK: - Outbound commands
 
-    func encode(command: String, id: String, payload: [String: JSONValue]) -> AdapterOutbound {
+    public func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
         switch command {
         // Claude queues a user message sent mid-turn itself, so steering and follow-up are the
         // same wire message as a prompt; only the queue readout below differs.
@@ -183,15 +184,15 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
             if let level = payload["level"]?.stringValue, Self.effortLevels.contains(level) { effort = level }
             return .unsupported("changing effort mid-session")
         case "get_state":
-            return .immediate(JSONValue(loose: stateSnapshot()))
+            return .immediate(PiJSONValue(any: stateSnapshot()))
         case "get_available_models":
-            return .immediate(JSONValue(loose: ["models": models()]))
+            return .immediate(PiJSONValue(any: ["models": models()]))
         case "get_available_thinking_levels":
-            return .immediate(JSONValue(loose: ["levels": Self.effortLevels]))
+            return .immediate(PiJSONValue(any: ["levels": Self.effortLevels]))
         case "get_commands":
-            return .immediate(JSONValue(loose: ["commands": commands()]))
+            return .immediate(PiJSONValue(any: ["commands": commands()]))
         case "get_session_stats":
-            return .immediate(JSONValue(loose: [
+            return .immediate(PiJSONValue(any: [
                 "tokens": [
                     "input": stats.input, "output": stats.output,
                     "cacheRead": stats.cacheRead, "cacheWrite": stats.cacheWrite
@@ -211,7 +212,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         }
     }
 
-    func encodeUncorrelated(_ value: JSONValue) -> [Data] {
+    public func encodeUncorrelated(_ value: PiJSONValue) -> [Data] {
         // The only uncorrelated message the app sends is a dialog answer, and the only dialog
         // this adapter raises is a tool-permission request.
         guard value["type"]?.stringValue == "extension_ui_response",
@@ -222,7 +223,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return [permissionReply(requestID: requestID, allow: allowed, input: input)].compactMap { $0 }
     }
 
-    private func userTurn(text: String, images: JSONValue?, id: String) -> AdapterOutbound {
+    private func userTurn(text: String, images: PiJSONValue?, id: String) -> AdapterOutbound {
         var content: [[String: Any]] = text.isEmpty ? [] : [["type": "text", "text": text]]
         for image in images?.arrayValue ?? [] {
             guard let data = image["data"]?.stringValue, !data.isEmpty else { continue }
@@ -320,7 +321,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     // MARK: - Inbound
 
-    func decode(line: Data) -> [AdapterInbound] {
+    public func decode(line: Data) -> [AdapterInbound] {
         guard let record = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
               let type = record["type"] as? String else { return [] }
         switch type {
@@ -569,7 +570,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         default:
             break
         }
-        return [.response(id: requestID, value: AdapterEncoding.response(id: requestID, data: JSONValue(loose: data)))]
+        return [.response(id: requestID, value: AdapterEncoding.response(id: requestID, data: PiJSONValue(any: data)))]
     }
 
     // MARK: - Turn bookkeeping
@@ -590,7 +591,7 @@ final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     private func event(_ type: String, _ fields: [String: Any] = [:]) -> AdapterInbound {
         var object = fields
         object["type"] = type
-        return .event(JSONValue(loose: object))
+        return .event(PiJSONValue(any: object))
     }
 
     // MARK: - Block translation

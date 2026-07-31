@@ -1,3 +1,4 @@
+import PiDeskKit
 import Combine
 import Foundation
 import XCTest

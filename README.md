@@ -24,9 +24,13 @@ vocabulary that each adapter translates into.
 | Mid-turn steering | yes | yes | queued instead |
 | Edit and resend | yes | linear, no branch | no |
 | HTML export | yes | — | — |
+| Background automations | yes | yes | yes |
 
-Every affordance is gated on that table rather than on the agent's name, so a control is either
-live, or visibly disabled with a reason. The Environment inspector names what the current agent
+The same three adapters drive the app *and* the headless background service, so automations, the
+`pidesk` CLI, and the web remote reach every agent rather than Pi alone. A route that has to
+launch an agent reports `agent_not_installed` if its binary is gone; reading history never needs
+it. Every affordance is gated on that table rather than on the agent's name, so a control is
+either live, or visibly disabled with a reason. The Environment inspector names what the current agent
 cannot do instead of leaving greyed-out menu items unexplained. Conversations from all three
 agents share one sidebar, one search, one archive, and one set of automations; a small glyph on
 each row identifies the agent, and appears only once history actually spans more than one.
@@ -310,7 +314,7 @@ Tests cover JSONL framing, bounded active-branch pages, compaction traversal, to
 
 ## Current limitations
 
-The background daemon executes automations for Pi threads only; a scheduled run against a Codex or Claude thread fails with a clear message rather than launching the wrong binary against its transcript. Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch), cannot rename a session, and queues a mid-turn message instead of steering into the turn. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
+Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch), cannot rename a session, and queues a mid-turn message instead of steering into the turn. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
 
 The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 

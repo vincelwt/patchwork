@@ -70,15 +70,7 @@ enum ThreadHandlers {
             Route("POST", "/v1/threads") { request, _ in
                 let body = try request.decodeJSON(CreateThreadRequest.self)
                 let agent = body.agent ?? .pi
-                // Reading another agent's threads works; creating one needs a runtime this
-                // daemon does not drive yet. Refuse rather than hand back a Pi session under a
-                // Codex or Claude label.
-                guard agent == .pi else {
-                    throw DaemonHTTPError.badRequest(
-                        code: "agent_unsupported",
-                        message: RunnerError.agentNotExecutable(agent).localizedDescription
-                    )
-                }
+                try requireInstalled(agent)
                 let projectURL = try existingDirectory(body.cwd)
                 let worktreeURL: URL?
                 if body.worktree == true {
@@ -93,9 +85,9 @@ enum ThreadHandlers {
                 let executionURL = worktreeURL ?? projectURL
                 var thread: PiThread
                 do {
-                    // Resolve the real Pi session before responding. A `pending:<run>` id is not
+                    // Resolve the real session before responding. A `pending:<run>` id is not
                     // a thread and made the web client navigate straight into a guaranteed 404.
-                    thread = try await core.threadRPC.createIdle(cwd: executionURL, name: body.name)
+                    thread = try await core.threadRPC.createIdle(agent: agent, cwd: executionURL, name: body.name)
                 } catch {
                     if let worktreeURL {
                         _ = await WorktreeService.remove(at: worktreeURL, root: core.worktreeRootURL)
@@ -145,6 +137,7 @@ enum ThreadHandlers {
                     )
                 } idle: {
                     try await core.threadRPC.setModel(
+                        agent: thread.agent,
                         cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path),
                         provider: provider, modelId: modelId
                     )
@@ -160,7 +153,9 @@ enum ThreadHandlers {
                     try await ThreadRuntimeCommands.setThinkingLevel(using: target, level: level, running: running)
                 } idle: {
                     try await core.threadRPC.setThinkingLevel(
-                        cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path), level: level
+                        agent: thread.agent,
+                        cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path),
+                        level: level
                     )
                 }
                 return .json(ThreadRuntimeResponse(runtime: runtime))
@@ -269,16 +264,16 @@ enum ThreadHandlers {
                 if await core.runQueue.isThreadBusy(thread.id, agent: thread.agent) {
                     throw DaemonHTTPError.conflict(code: "thread_busy", message: "Rename once the thread is idle.")
                 }
-                guard thread.agent == .pi else {
-                    throw DaemonHTTPError.conflict(
-                        code: "agent_unsupported",
-                        message: RunnerError.agentNotExecutable(thread.agent).localizedDescription
-                    )
-                }
-                // Renaming goes through Pi's own `set_session_name` RPC — Pi appends the new
-                // `session_info` entry itself, so this never touches a Pi JSONL file directly.
+                try requireInstalled(thread.agent)
+                // Renaming goes through the agent's own rename command, so the agent appends the
+                // record itself and this never touches a session file directly. An agent with no
+                // rename command reports that rather than pretending to succeed.
                 do {
-                    try await core.threadRPC.rename(cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path), name: clean)
+                    try await core.threadRPC.rename(
+                        agent: thread.agent,
+                        cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path),
+                        name: clean
+                    )
                 } catch let error as RunnerError {
                     throw DaemonHTTPError.conflict(code: "rename_failed", message: error.localizedDescription)
                 }
@@ -325,11 +320,23 @@ enum ThreadHandlers {
         return URL(fileURLWithPath: path, isDirectory: true)
     }
 
+    /// A thread's transcript outlives its agent's installation, so reading always works while
+    /// driving needs the binary to still be there. Reported as a clear conflict rather than as a
+    /// spawn failure deep inside a run.
+    private static func requireInstalled(_ agent: AgentKind) throws {
+        guard AgentCatalog.executable(for: agent) == nil else { return }
+        throw DaemonHTTPError.conflict(
+            code: "agent_not_installed",
+            message: RunnerError.agentNotFound(agent).localizedDescription
+        )
+    }
+
     private static func runtimeState(_ core: DaemonCore, thread: PiThread) async throws -> ThreadRuntimeState {
         try await mutateRuntime(core, thread: thread) { target, running in
             try await ThreadRuntimeCommands.snapshot(using: target, running: running)
         } idle: {
             try await core.threadRPC.runtimeSnapshot(
+                agent: thread.agent,
                 cwd: URL(fileURLWithPath: thread.cwd), sessionPath: URL(fileURLWithPath: thread.path)
             )
         }
@@ -343,16 +350,10 @@ enum ThreadHandlers {
         live: @Sendable (RuntimeRequesting, Bool) async throws -> ThreadRuntimeState,
         idle: @Sendable () async throws -> ThreadRuntimeState
     ) async throws -> ThreadRuntimeState {
-        // Every runtime route funnels through here, and the idle path attaches
-        // `pi --mode rpc --session <path>`. Pointing that at a Codex rollout or a Claude
-        // transcript would have Pi append its own records to another agent's file, so the
-        // guard belongs here rather than on each route.
-        guard thread.agent == .pi else {
-            throw DaemonHTTPError.conflict(
-                code: "agent_unsupported",
-                message: RunnerError.agentNotExecutable(thread.agent).localizedDescription
-            )
-        }
+        // Every runtime route funnels through here, and the idle path launches the agent
+        // against `thread.path`. The adapter makes that correct per agent; what still has to be
+        // checked is that the agent is actually installed, since a thread's history outlives it.
+        try requireInstalled(thread.agent)
 
         if await core.leaseStore.isLeased(threadId: thread.id) {
             throw DaemonHTTPError.conflict(
@@ -430,6 +431,10 @@ enum ThreadHandlers {
     private static func deliverOrEnqueue(
         _ core: DaemonCore, thread: PiThread, text: String, delivery: DeliveryMode?
     ) async throws -> SendMessageResponse {
+        // Not every agent can fold a message into the turn already running. Asking one that
+        // cannot to `steer` would have it queue the message anyway while this endpoint reported
+        // it as steered, so the request is downgraded here and the response says what happened.
+        let delivery = effectiveDelivery(delivery, for: thread.agent)
         if let command = liveCommand(for: delivery),
            let delivered = await core.liveSessions.deliver(threadID: thread.id, command: command, message: text) {
             switch delivered.result {
@@ -468,7 +473,14 @@ enum ThreadHandlers {
         return raw
     }
 
-    /// Pi's own RPC verb for a delivery mode, or `nil` when the caller did not ask for one (so
+    /// Downgrades a delivery an agent cannot honour, so the response never claims a message was
+    /// steered into a turn that was actually only queued behind it.
+    private static func effectiveDelivery(_ requested: DeliveryMode?, for agent: AgentKind) -> DeliveryMode? {
+        guard requested == .steer, !agent.capabilities.canSteerMidTurn else { return requested }
+        return .followUp
+    }
+
+    /// The agent's own verb for a delivery mode, or `nil` when the caller did not ask for one (so
     /// the message is an ordinary prompt and belongs in the queue).
     private static func liveCommand(for delivery: DeliveryMode?) -> String? {
         switch delivery {

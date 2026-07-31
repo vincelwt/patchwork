@@ -1,5 +1,4 @@
 import Foundation
-import PiDeskKit
 
 /// Speaks Codex's own `codex app-server` JSON-RPC protocol and translates it into the app's
 /// (Pi-shaped) command and event vocabulary.
@@ -11,11 +10,13 @@ import PiDeskKit
 ///
 /// Everything retained per session is bounded: the deferred-command queue, the in-flight request
 /// map, streaming text, the open-item map, and the approval map all have explicit caps.
-final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
-    let agent: AgentKind = .codex
+public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
+    public init() {}
+
+    public let agent: AgentKind = .codex
 
     /// Codex only ever reports OpenAI models over this protocol.
-    static let provider = "openai"
+    public static let provider = "openai"
 
     private enum Limit {
         static let queuedCommands = 32
@@ -42,7 +43,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     private struct QueuedCommand {
         let command: String
         let id: String
-        let payload: [String: JSONValue]
+        let payload: [String: PiJSONValue]
     }
 
     private struct Stream {
@@ -55,7 +56,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         case commandExecution
         case fileChange
         /// `item/permissions/requestApproval`: approving means granting exactly what was asked.
-        case permissions(requested: JSONValue)
+        case permissions(requested: PiJSONValue)
         /// Legacy `execCommandApproval` / `applyPatchApproval`, which use `ReviewDecision`.
         case reviewDecision
         case elicitation
@@ -63,7 +64,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     private struct PendingApproval {
-        let requestID: JSONValue
+        let requestID: PiJSONValue
         let kind: ApprovalKind
     }
 
@@ -83,7 +84,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     private var queued: [QueuedCommand] = []
     private var pendingWrites: [Data] = []
 
-    private var models: [JSONValue] = []
+    private var models: [PiJSONValue] = []
     private var modelID: String?
     private var effort: String?
     private var steeringMode = "all"
@@ -100,8 +101,8 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     private var openTools: [String: String] = [:]
     private var openToolOrder: [String] = []
 
-    private var lastUsage: JSONValue?
-    private var totalUsage: JSONValue?
+    private var lastUsage: PiJSONValue?
+    private var totalUsage: PiJSONValue?
     private var contextWindow: Int?
 
     private var approvals: [String: PendingApproval] = [:]
@@ -110,11 +111,11 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     // MARK: - Launch
 
-    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
+    public func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
         ["app-server", "--stdio"]
     }
 
-    func startupLines(sessionPath: URL?, cwd: URL) -> [Data] {
+    public func startupLines(sessionPath: URL?, cwd: URL) -> [Data] {
         self.cwd = cwd
         resumeThreadID = Self.threadID(fromRolloutPath: sessionPath)
         sessionFile = sessionPath?.standardizedFileURL.path
@@ -128,7 +129,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     /// `rollout-2026-07-31T00-11-22-<threadId>.jsonl`. Resuming by id is what Codex prefers, so
     /// the id is recovered from the filename rather than by handing the path back.
-    static func threadID(fromRolloutPath path: URL?) -> String? {
+    public static func threadID(fromRolloutPath path: URL?) -> String? {
         guard let path else { return nil }
         let name = path.deletingPathExtension().lastPathComponent
         guard name.hasPrefix("rollout-") else { return nil }
@@ -136,7 +137,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return UUID(uuidString: candidate) != nil ? candidate : nil
     }
 
-    func reset() {
+    public func reset() {
         cwd = nil
         resumeThreadID = nil
         threadID = nil
@@ -170,14 +171,19 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         approvalOrder.removeAll()
     }
 
-    func drainPendingWrites() -> [Data] {
+    public func drainPendingWrites() -> [Data] {
         defer { pendingWrites.removeAll() }
         return pendingWrites
     }
 
     // MARK: - Outbound commands
 
-    func encode(command: String, id: String, payload: [String: JSONValue]) -> AdapterOutbound {
+    public func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
+        // A query about the session has no honest answer before the session exists, so it waits
+        // for the handshake rather than reporting an empty state the caller would believe.
+        if threadID == nil, Self.answeredFromAdapterState.contains(command) {
+            return threadScoped(command, id: id, payload: payload)
+        }
         switch command {
         case "get_state":
             return .immediate(stateValue())
@@ -187,7 +193,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
             guard models.isEmpty else { return .immediate(modelsValue()) }
             return threadScoped(command, id: id, payload: payload)
         case "get_available_thinking_levels":
-            return .immediate(.object(["levels": .array(thinkingLevels().map(JSONValue.string))]))
+            return .immediate(.object(["levels": .array(thinkingLevels().map(PiJSONValue.string))]))
         case "set_model":
             guard let requested = payload["modelId"]?.stringValue ?? payload["id"]?.stringValue else {
                 return .unsupported("a model change without a model id")
@@ -242,7 +248,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     /// Commands that need a live thread. Before the handshake finishes they are held, not failed.
-    private func threadScoped(_ command: String, id: String, payload: [String: JSONValue]) -> AdapterOutbound {
+    private func threadScoped(_ command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
         guard let threadID else {
             guard queued.count < Limit.queuedCommands else {
                 return .unsupported("more commands while its session is still starting")
@@ -253,7 +259,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return write(line(for: command, id: id, payload: payload, threadID: threadID))
     }
 
-    private func line(for command: String, id: String, payload: [String: JSONValue], threadID: String) -> Data? {
+    private func line(for command: String, id: String, payload: [String: PiJSONValue], threadID: String) -> Data? {
         switch command {
         case "prompt":
             let input = Self.userInput(from: payload)
@@ -296,7 +302,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     /// Turns a Pi prompt payload into Codex `UserInput` items. Attachments arrive as inline
     /// base64, which Codex accepts as a data URL image input.
-    private static func userInput(from payload: [String: JSONValue]) -> [[String: Any]] {
+    private static func userInput(from payload: [String: PiJSONValue]) -> [[String: Any]] {
         var input: [[String: Any]] = []
         let text = payload["message"]?.stringValue ?? ""
         if !text.isEmpty { input.append(["type": "text", "text": text]) }
@@ -313,7 +319,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return input
     }
 
-    func encodeUncorrelated(_ value: JSONValue) -> [Data] {
+    public func encodeUncorrelated(_ value: PiJSONValue) -> [Data] {
         guard value["type"]?.stringValue == "extension_ui_response",
               let dialogID = value["id"]?.stringValue,
               let approval = takeApproval(dialogID) else { return [] }
@@ -349,28 +355,28 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     /// JSON-RPC ids round-trip verbatim: an integer id must not come back as `3.0`.
-    private static func rpcIdentifier(_ value: JSONValue) -> Any {
+    private static func rpcIdentifier(_ value: PiJSONValue) -> Any {
         if case let .number(number) = value, number == number.rounded() { return Int(number) }
-        return value.looseValue
+        return value.anyValue
     }
 
-    private static func grantedPermissions(from requested: JSONValue) -> [String: Any] {
+    private static func grantedPermissions(from requested: PiJSONValue) -> [String: Any] {
         var granted: [String: Any] = [:]
-        if let fileSystem = requested["fileSystem"] { granted["fileSystem"] = fileSystem.looseValue }
-        if let network = requested["network"] { granted["network"] = network.looseValue }
+        if let fileSystem = requested["fileSystem"] { granted["fileSystem"] = fileSystem.anyValue }
+        if let network = requested["network"] { granted["network"] = network.anyValue }
         return granted
     }
 
     // MARK: - Inbound
 
-    func decode(line: Data) -> [AdapterInbound] {
+    public func decode(line: Data) -> [AdapterInbound] {
         guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return [] }
         let params = object["params"] as? [String: Any] ?? [:]
         if let method = object["method"] as? String {
             guard let id = object["id"], !(id is NSNull) else {
                 return handle(notification: method, params: params)
             }
-            return handle(serverRequest: method, id: JSONValue(loose: id), params: params)
+            return handle(serverRequest: method, id: PiJSONValue(any: id), params: params)
         }
         guard let rpcID = (object["id"] as? NSNumber)?.intValue, let entry = takePending(rpcID) else { return [] }
         if let error = object["error"] as? [String: Any] {
@@ -393,7 +399,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         case let .models(appID):
             models = ((result["data"] as? [Any]) ?? [])
                 .prefix(Limit.listedItems)
-                .map { JSONValue(loose: $0) }
+                .map { PiJSONValue(any: $0) }
                 .filter { $0["hidden"]?.boolValue != true }
             if modelID == nil {
                 modelID = models.first(where: { $0["isDefault"]?.boolValue == true })?["id"]?.stringValue
@@ -464,20 +470,37 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return flushQueuedCommands()
     }
 
+    /// Commands this adapter answers from its own state rather than from the wire. They are held
+    /// until the thread exists, then answered with the state the handshake produced.
+    static let answeredFromAdapterState: Set<String> = [
+        "get_state", "get_session_stats", "get_available_thinking_levels"
+    ]
+
     private func flushQueuedCommands() -> [AdapterInbound] {
-        guard let threadID else { return [] }
+        guard threadID != nil else { return [] }
         let commands = queued
         queued.removeAll()
         var inbound: [AdapterInbound] = []
         for entry in commands {
-            guard let data = line(for: entry.command, id: entry.id, payload: entry.payload, threadID: threadID) else {
-                // Nothing to send (an abort with no live turn); the caller still needs an answer.
+            // Re-encoding now that the thread exists routes each command down whichever path it
+            // would have taken had it arrived after the handshake.
+            switch encode(command: entry.command, id: entry.id, payload: entry.payload) {
+            case let .write(lines):
+                for line in lines { enqueue(line) }
+            case let .immediate(value):
+                inbound.append(.response(id: entry.id, value: AdapterEncoding.response(id: entry.id, data: value)))
+            case let .unsupported(what):
+                inbound.append(.response(
+                    id: entry.id,
+                    value: AdapterEncoding.failure(id: entry.id, message: "\(agent.displayName) does not support \(what).")
+                ))
+            case .deferred:
+                // Cannot happen: the thread now exists, so nothing re-queues. Answer rather than
+                // strand the caller if it ever does.
                 inbound.append(.response(
                     id: entry.id, value: AdapterEncoding.response(id: entry.id, data: .object([:]))
                 ))
-                continue
             }
-            enqueue(data)
         }
         return inbound
     }
@@ -561,7 +584,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         }
         if isRetrying {
             isRetrying = false
-            var fields: [String: JSONValue] = ["success": .bool(status == "completed")]
+            var fields: [String: PiJSONValue] = ["success": .bool(status == "completed")]
             if status != "completed",
                let message = (turn["error"] as? [String: Any])?["message"] as? String {
                 fields["finalError"] = .string(message)
@@ -694,7 +717,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
 
     // MARK: Server requests
 
-    private func handle(serverRequest method: String, id: JSONValue, params: [String: Any]) -> [AdapterInbound] {
+    private func handle(serverRequest method: String, id: PiJSONValue, params: [String: Any]) -> [AdapterInbound] {
         switch method {
         case "item/commandExecution/requestApproval", "execCommandApproval":
             let command = params["command"] as? String ?? "a command"
@@ -718,7 +741,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
                 options: Self.approvalChoices
             )]
         case "item/permissions/requestApproval":
-            let requested = JSONValue(loose: params["permissions"])
+            let requested = PiJSONValue(any: params["permissions"])
             return [dialog(
                 id: id,
                 kind: .permissions(requested: requested),
@@ -761,27 +784,27 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     private static let decliningChoices: Set<String> = [declineChoice]
 
     private func dialog(
-        id: JSONValue, kind: ApprovalKind, title: String, message: String, options: [String]
+        id: PiJSONValue, kind: ApprovalKind, title: String, message: String, options: [String]
     ) -> AdapterInbound {
         approvalCounter += 1
         let dialogID = "codex-approval-\(approvalCounter)"
         remember(approval: PendingApproval(requestID: id, kind: kind), as: dialogID)
-        var fields: [String: JSONValue] = [
+        var fields: [String: PiJSONValue] = [
             "id": .string(dialogID),
             "method": .string(options.isEmpty ? "input" : "select"),
             "title": .string(title),
             "message": .string(Self.bounded(message, limit: 4_000))
         ]
         if !options.isEmpty {
-            fields["options"] = .array(options.prefix(20).map(JSONValue.string))
+            fields["options"] = .array(options.prefix(20).map(PiJSONValue.string))
         }
         return .event(AdapterEncoding.event("extension_ui_request", fields))
     }
 
     // MARK: - Projections the app reads
 
-    private func stateValue() -> JSONValue {
-        var object: [String: JSONValue] = [
+    private func stateValue() -> PiJSONValue {
+        var object: [String: PiJSONValue] = [
             "isStreaming": .bool(turnID != nil),
             "isCompacting": .bool(isCompacting),
             "steeringMode": .string(steeringMode),
@@ -797,8 +820,8 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return .object(object)
     }
 
-    private func statsValue() -> JSONValue {
-        var object: [String: JSONValue] = ["tokens": totalUsage ?? .object([:])]
+    private func statsValue() -> PiJSONValue {
+        var object: [String: PiJSONValue] = ["tokens": totalUsage ?? .object([:])]
         if let window = contextWindow, window > 0 {
             let used = totalUsage?["total"]?.intValue ?? 0
             object["contextUsage"] = .object([
@@ -810,7 +833,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         return .object(object)
     }
 
-    private func modelsValue() -> JSONValue {
+    private func modelsValue() -> PiJSONValue {
         .object(["models": .array(models.compactMap { model in
             guard let id = model["id"]?.stringValue else { return nil }
             return .object([
@@ -822,7 +845,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         })])
     }
 
-    private func selectedModelValue() -> JSONValue {
+    private func selectedModelValue() -> PiJSONValue {
         guard let modelID else { return .object([:]) }
         return .object([
             "id": .string(modelID),
@@ -831,12 +854,12 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         ])
     }
 
-    private func commandsValue(_ result: [String: Any]) -> JSONValue {
-        var commands: [JSONValue] = []
+    private func commandsValue(_ result: [String: Any]) -> PiJSONValue {
+        var commands: [PiJSONValue] = []
         for entry in (result["data"] as? [[String: Any]] ?? []) {
             for skill in (entry["skills"] as? [[String: Any]] ?? []) {
                 guard let name = skill["name"] as? String, skill["enabled"] as? Bool != false else { continue }
-                var command: [String: JSONValue] = [
+                var command: [String: PiJSONValue] = [
                     "name": .string(name),
                     "source": .string("skill"),
                     "description": .string(skill["description"] as? String ?? "")
@@ -871,12 +894,12 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         effort = defaultEffort(for: next) ?? effort
     }
 
-    static func thinkingLevel(forEffort effort: String?) -> String {
+    public static func thinkingLevel(forEffort effort: String?) -> String {
         guard let effort, !effort.isEmpty else { return "off" }
         return effort == "none" ? "off" : effort
     }
 
-    static func codexEffort(forLevel level: String) -> String {
+    public static func codexEffort(forLevel level: String) -> String {
         level == "off" ? "none" : level
     }
 
@@ -887,7 +910,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
     }
 
     /// Codex reports total input including the cached portion; Pi counts them separately.
-    private static func usageValue(_ breakdown: [String: Any]?) -> JSONValue? {
+    private static func usageValue(_ breakdown: [String: Any]?) -> PiJSONValue? {
         guard let breakdown else { return nil }
         let cacheRead = (breakdown["cachedInputTokens"] as? NSNumber)?.intValue ?? 0
         let input = max(0, ((breakdown["inputTokens"] as? NSNumber)?.intValue ?? 0) - cacheRead)
@@ -901,8 +924,8 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         ])
     }
 
-    private func assistantMessage(text: String, thinking: Bool, stopReason: String?) -> JSONValue {
-        var message: [String: JSONValue] = [
+    private func assistantMessage(text: String, thinking: Bool, stopReason: String?) -> PiJSONValue {
+        var message: [String: PiJSONValue] = [
             "role": .string("assistant"),
             "content": .array([thinking
                 ? .object(["type": .string("thinking"), "thinking": .string(text)])
@@ -930,22 +953,22 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         }
     }
 
-    private static func toolArguments(for item: [String: Any]) -> JSONValue {
+    private static func toolArguments(for item: [String: Any]) -> PiJSONValue {
         switch item["type"] as? String {
         case "commandExecution":
-            var args: [String: JSONValue] = ["command": .string(bounded(item["command"] as? String ?? "", limit: 2_000))]
+            var args: [String: PiJSONValue] = ["command": .string(bounded(item["command"] as? String ?? "", limit: 2_000))]
             if let cwd = item["cwd"] as? String { args["cwd"] = .string(cwd) }
             return .object(args)
         case "fileChange":
             let paths = (item["changes"] as? [[String: Any]] ?? []).compactMap { $0["path"] as? String }
-            var args: [String: JSONValue] = ["paths": .array(paths.prefix(50).map(JSONValue.string))]
+            var args: [String: PiJSONValue] = ["paths": .array(paths.prefix(50).map(PiJSONValue.string))]
             if let first = paths.first { args["path"] = .string(first) }
             return .object(args)
         case "webSearch":
             let query = item["query"] as? String ?? ""
             return .object(["query": .string(query), "title": .string(query)])
         default:
-            return JSONValue(loose: item["arguments"]).boundedProjection()
+            return PiJSONValue(any: item["arguments"]).boundedProjection()
         }
     }
 
@@ -1024,7 +1047,7 @@ final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback {
         pendingWrites.append(line)
     }
 
-    private func rejection(id: String, message: String) -> JSONValue {
+    private func rejection(id: String, message: String) -> PiJSONValue {
         .object([
             "type": .string("response"),
             "id": .string(id),

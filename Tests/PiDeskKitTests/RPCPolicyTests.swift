@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 final class RPCTimeoutPolicyTests: XCTestCase {
     func testStateQueriesFailAuthoritativelyAndSideEffectsDoNot() {
@@ -140,7 +140,7 @@ final class AgentRuntimeClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcomes: [Result<JSONValue, Error>] = []
+        var outcomes: [Result<PiJSONValue, Error>] = []
         let completed = expectation(description: "stale request completes once")
         client.send(type: "get_state", payload: [:]) { result in
             outcomes.append(result)
@@ -190,7 +190,7 @@ final class AgentRuntimeClientProcessTests: XCTestCase {
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
         defer { client.stop() }
 
-        var response: JSONValue?
+        var response: PiJSONValue?
         let answered = expectation(description: "replacement answers")
         client.send(type: "get_state", payload: [:]) { result in
             if case let .success(value) = result { response = value }
@@ -215,7 +215,7 @@ final class AgentRuntimeClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcome: Result<JSONValue, Error>?
+        var outcome: Result<PiJSONValue, Error>?
         let completed = expectation(description: "prompt settles")
         client.send(type: "prompt", payload: ["message": .string("hi")]) { result in
             outcome = result
@@ -236,7 +236,7 @@ final class AgentRuntimeClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcome: Result<JSONValue, Error>?
+        var outcome: Result<PiJSONValue, Error>?
         let completed = expectation(description: "get_state settles")
         client.send(type: "get_state", payload: [:]) { result in
             outcome = result

@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 /// Drives `CodexProtocolAdapter` directly with app-server protocol lines. Nothing here spawns a
 /// process or reaches a provider: every byte in and out is a literal.
@@ -563,16 +563,16 @@ final class CodexProtocolAdapterTests: XCTestCase {
         (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
-    private func object(_ data: Data) throws -> JSONValue {
-        try JSONValue.decode(data)
+    private func object(_ data: Data) throws -> PiJSONValue {
+        try PiJSONValue.decode(data)
     }
 
-    private func event(_ inbound: AdapterInbound) -> JSONValue? {
+    private func event(_ inbound: AdapterInbound) -> PiJSONValue? {
         guard case let .event(value) = inbound else { return nil }
         return value
     }
 
-    private func responseValue(_ inbound: AdapterInbound) -> JSONValue? {
+    private func responseValue(_ inbound: AdapterInbound) -> PiJSONValue? {
         guard case let .response(_, value) = inbound else { return nil }
         return value
     }
@@ -598,14 +598,13 @@ final class CodexRealProtocolShapeTests: XCTestCase {
         let efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
         for effort in efforts {
             XCTAssertTrue(
-                RuntimePickerState.allThinkingLevels.contains(
+                AgentThinkingLevels.all.contains(
                     CodexProtocolAdapter.thinkingLevel(forEffort: effort)
                 ),
-                "\(effort) must survive the shared picker vocabulary"
+                "\(effort) must survive the shared level vocabulary"
             )
         }
-        let reported = JSONValue.array(efforts.map { .string($0) })
-        XCTAssertEqual(RuntimePickerState.thinkingLevels(from: reported).count, efforts.count)
+        XCTAssertEqual(AgentThinkingLevels.supported(efforts).count, efforts.count)
     }
 
     func testCodexNoneEffortIsPresentedAsOffAndRoundTrips() {
@@ -622,7 +621,116 @@ final class CodexRealProtocolShapeTests: XCTestCase {
 
     /// Pi's own reported levels must be unaffected by widening the shared vocabulary.
     func testPiLevelsAreUnchangedByTheWiderVocabulary() {
-        let piReported = JSONValue.array(["off", "low", "medium", "high"].map { .string($0) })
-        XCTAssertEqual(RuntimePickerState.thinkingLevels(from: piReported), ["off", "low", "medium", "high"])
+        XCTAssertEqual(
+            AgentThinkingLevels.supported(["off", "low", "medium", "high"]),
+            ["off", "low", "medium", "high"]
+        )
+    }
+}
+
+/// Both of these were found by driving the real `codex app-server`, not by fixtures: the adapter
+/// answered a session query before it had a session, and the answer never reached a caller
+/// waiting the ordinary way.
+final class CodexHandshakeOrderingTests: XCTestCase {
+    private let cwd = URL(fileURLWithPath: "/tmp/project")
+
+    private func responses(_ inbound: [AdapterInbound]) -> [(String, PiJSONValue)] {
+        inbound.compactMap { if case let .response(id, value) = $0 { (id, value) } else { nil } }
+    }
+
+    private func line(_ object: [String: Any]) -> Data {
+        (try? JSONSerialization.data(withJSONObject: object.merging(["jsonrpc": "2.0"]) { a, _ in a })) ?? Data()
+    }
+
+    /// Runs `initialize` -> `initialized` -> `thread/start` using the ids the adapter actually
+    /// generated, read back off the wire rather than guessed.
+    @discardableResult
+    private func completeHandshake(
+        _ adapter: CodexProtocolAdapter, thread: [String: Any] = ["id": "thread-9", "path": "/tmp/r.jsonl"],
+        result extra: [String: Any] = ["model": "gpt-5.6-sol", "reasoningEffort": "high"]
+    ) -> [AdapterInbound] {
+        let initializeID = requestID(in: adapter.startupLines(sessionPath: nil, cwd: cwd).first ?? Data())
+        _ = adapter.decode(line: line(["id": initializeID as Any, "result": [String: Any]()]))
+        let startID = requestID(forMethod: "thread/start", in: adapter.drainPendingWrites())
+        return adapter.decode(line: line([
+            "id": startID as Any, "result": extra.merging(["thread": thread]) { a, _ in a }
+        ]))
+    }
+
+    private func requestID(in data: Data) -> Any? {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["id"]
+    }
+
+    /// The handshake emits `initialized`, `thread/start`, and `model/list` together, so the id
+    /// has to be picked by method rather than by position.
+    private func requestID(forMethod method: String, in lines: [Data]) -> Any? {
+        for line in lines {
+            guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                  object["method"] as? String == method else { continue }
+            return object["id"]
+        }
+        return nil
+    }
+
+    /// `get_state` before the handshake used to answer immediately from empty state, so the
+    /// caller learned the thread had no id and never corrected itself.
+    func testSessionQueriesWaitForTheThreadInsteadOfAnsweringEmpty() throws {
+        let adapter = CodexProtocolAdapter()
+        let initializeID = requestID(in: adapter.startupLines(sessionPath: nil, cwd: cwd).first ?? Data())
+
+        for command in CodexProtocolAdapter.answeredFromAdapterState {
+            guard case .deferred = adapter.encode(command: command, id: "q-\(command)", payload: [:]) else {
+                return XCTFail("\(command) must wait for the thread rather than answer empty")
+            }
+        }
+
+        // Complete the handshake; every held query is answered from the state it produced.
+        _ = adapter.decode(line: line(["id": initializeID as Any, "result": [String: Any]()]))
+        let startID = requestID(forMethod: "thread/start", in: adapter.drainPendingWrites())
+        let inbound = adapter.decode(line: line([
+            "id": startID as Any,
+            "result": [
+                "thread": ["id": "thread-9", "path": "/tmp/r.jsonl"],
+                "model": "gpt-5.6-sol", "reasoningEffort": "high"
+            ]
+        ]))
+
+        let answered = responses(inbound)
+        XCTAssertEqual(
+            Set(answered.map(\.0)),
+            Set(CodexProtocolAdapter.answeredFromAdapterState.map { "q-\($0)" }),
+            "every held query must be answered exactly once"
+        )
+        let state = try XCTUnwrap(answered.first { $0.0 == "q-get_state" }?.1)
+        XCTAssertEqual(state["data"]?["sessionId"]?.stringValue, "thread-9")
+        XCTAssertEqual(state["data"]?["model"]?["id"]?.stringValue, "gpt-5.6-sol")
+        XCTAssertEqual(state["data"]?["thinkingLevel"]?.stringValue, "high")
+    }
+
+    /// Once the thread exists the same query is answered without a round trip.
+    func testSessionQueriesAnswerImmediatelyOnceTheThreadExists() throws {
+        let adapter = CodexProtocolAdapter()
+        completeHandshake(adapter, thread: ["id": "t", "path": "/tmp/r.jsonl"], result: ["model": "m"])
+
+        guard case let .immediate(value) = adapter.encode(command: "get_state", id: "s", payload: [:]) else {
+            return XCTFail("an established session answers without waiting")
+        }
+        XCTAssertEqual(value["sessionId"]?.stringValue, "t")
+    }
+
+    /// A queued command that turns out to be unsupported must still complete its caller.
+    func testAHeldCommandWithNoEquivalentIsAnsweredNotStranded() {
+        let adapter = CodexProtocolAdapter()
+        let initializeID = requestID(in: adapter.startupLines(sessionPath: nil, cwd: cwd).first ?? Data())
+        guard case .deferred = adapter.encode(command: "export_html", id: "x", payload: [:]) else {
+            // `export_html` is refused up front, which is also a complete answer.
+            return
+        }
+        _ = adapter.decode(line: line(["id": initializeID as Any, "result": [String: Any]()]))
+        let startID = requestID(forMethod: "thread/start", in: adapter.drainPendingWrites())
+        let inbound = adapter.decode(line: line([
+            "id": startID as Any, "result": ["thread": ["id": "t"], "model": "m"]
+        ]))
+        XCTAssertTrue(responses(inbound).contains { $0.0 == "x" }, "a held command must always complete")
     }
 }

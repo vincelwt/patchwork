@@ -51,10 +51,18 @@ public enum PiJSONValue: Codable, Hashable, Sendable {
         switch any {
         case is NSNull:
             self = .null
+        case let value as NSNumber:
+            // `NSNumber as? Bool` succeeds for 0 and 1, so testing `Bool` first would turn the
+            // JSON numbers 0 and 1 into booleans — and `doubleValue`/`intValue` only match
+            // `.number`, so an `exitCode: 0` or a one-token usage count would silently read as
+            // nil. CFBoolean identity is the only reliable way to tell a real JSON bool apart.
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                self = .bool(value.boolValue)
+            } else {
+                self = .number(value.doubleValue)
+            }
         case let value as Bool:
             self = .bool(value)
-        case let value as NSNumber:
-            self = .number(value.doubleValue)
         case let value as String:
             self = .string(value)
         case let value as [Any]:
@@ -117,5 +125,65 @@ public enum PiJSONValue: Codable, Hashable, Sendable {
         var data = try PiDeskJSON.encoder.encode(self)
         data.append(0x0A)
         return data
+    }
+}
+
+public extension PiJSONValue {
+    /// Back to a `JSONSerialization` tree, for building payloads out of decoded values without
+    /// hand-writing conversions. The inverse of `init(any:)`.
+    var anyValue: Any {
+        switch self {
+        case .null: NSNull()
+        case let .bool(value): value
+        case let .number(value): value
+        case let .string(value): value
+        case let .array(value): value.map(\.anyValue)
+        case let .object(value): value.mapValues(\.anyValue)
+        }
+    }
+}
+
+public extension Dictionary where Key == String, Value == PiJSONValue {
+    var jsonValue: PiJSONValue { .object(self) }
+}
+
+/// Bounded projections for payloads this package stores or forwards but does not model:
+/// unknown events, extension arguments, tool results. Nothing retained is unbounded.
+public extension PiJSONValue {
+    /// Produces a bounded fallback without retaining the original JSON tree.
+    func boundedFallback(maxLength: Int = 8_000) -> PiJSONValue {
+        .string(prettyPrinted(maxLength: maxLength))
+    }
+
+    func prettyPrinted(maxLength: Int = 12_000) -> String {
+        guard JSONSerialization.isValidJSONObject(anyValue),
+              let data = try? JSONSerialization.data(withJSONObject: anyValue, options: [.prettyPrinted, .sortedKeys]),
+              let value = String(data: data, encoding: .utf8)
+        else {
+            let fallback = String(describing: anyValue)
+            return fallback.count > maxLength ? String(fallback.prefix(maxLength)) + "…" : fallback
+        }
+
+        guard value.count > maxLength else { return value }
+        return String(value.prefix(maxLength)) + "\n…"
+    }
+
+    /// Keeps a shallow projected object while bounding large extension strings/arrays.
+    func boundedProjection(depth: Int = 0, stringLimit: Int = 2_000, itemLimit: Int = 40) -> PiJSONValue {
+        guard depth < 4 else { return boundedFallback(maxLength: stringLimit) }
+        switch self {
+        case let .string(value):
+            return .string(value.count > stringLimit ? String(value.prefix(stringLimit)) + "…" : value)
+        case let .array(values):
+            return .array(values.prefix(itemLimit).map {
+                $0.boundedProjection(depth: depth + 1, stringLimit: stringLimit, itemLimit: itemLimit)
+            })
+        case let .object(values):
+            return .object(values.mapValues {
+                $0.boundedProjection(depth: depth + 1, stringLimit: stringLimit, itemLimit: itemLimit)
+            })
+        default:
+            return self
+        }
     }
 }

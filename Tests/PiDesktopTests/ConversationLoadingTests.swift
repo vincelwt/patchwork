@@ -1,3 +1,4 @@
+import PiDeskKit
 import Foundation
 import XCTest
 @testable import PiDesktop
@@ -602,7 +603,7 @@ final class ConversationLoadingTests: XCTestCase {
         let launch = ChatMessage(
             id: "launch-message",
             role: .assistant,
-            blocks: [MessageBlock(
+            blocks: [PiDesktop.MessageBlock(
                 id: "launch-block",
                 kind: .toolCall(ToolCallPayload(
                     id: "launch",
@@ -620,7 +621,7 @@ final class ConversationLoadingTests: XCTestCase {
         let launched = ChatMessage(
             id: "launch-result",
             role: .tool,
-            blocks: [MessageBlock(id: "launch-result-text", kind: .text("Agent started in background."))],
+            blocks: [PiDesktop.MessageBlock(id: "launch-result-text", kind: .text("Agent started in background."))],
             timestamp: startedAt.addingTimeInterval(1),
             toolCallID: "launch",
             details: .object([
@@ -632,7 +633,7 @@ final class ConversationLoadingTests: XCTestCase {
         let wait = ChatMessage(
             id: "wait-message",
             role: .assistant,
-            blocks: [MessageBlock(
+            blocks: [PiDesktop.MessageBlock(
                 id: "wait-block",
                 kind: .toolCall(ToolCallPayload(
                     id: "wait",
@@ -646,7 +647,7 @@ final class ConversationLoadingTests: XCTestCase {
         let stopped = ChatMessage(
             id: "wait-result",
             role: .tool,
-            blocks: [MessageBlock(id: "wait-result-text", kind: .text("Agent stopped."))],
+            blocks: [PiDesktop.MessageBlock(id: "wait-result-text", kind: .text("Agent stopped."))],
             timestamp: startedAt.addingTimeInterval(3),
             toolCallID: "wait",
             details: .object(["status": .string("stopped")]),
@@ -724,8 +725,8 @@ final class ConversationLoadingTests: XCTestCase {
             heartbeatDirectory: temporaryDirectory.appendingPathComponent("heartbeats", isDirectory: true)
         )
 
-        func message(_ id: String, role: MessageRole, text: String) -> ChatMessage {
-            ChatMessage(id: id, role: role, blocks: [MessageBlock(id: "\(id)-text", kind: .text(text))], timestamp: nil, raw: .null)
+        func message(_ id: String, role: PiDesktop.MessageRole, text: String) -> ChatMessage {
+            ChatMessage(id: id, role: role, blocks: [PiDesktop.MessageBlock(id: "\(id)-text", kind: .text(text))], timestamp: nil, raw: .null)
         }
         let m1 = message("m1", role: .user, text: "question")
         let m2 = message("m2", role: .assistant, text: "answer")

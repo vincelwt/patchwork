@@ -1,3 +1,4 @@
+import PiDeskKit
 import Foundation
 import XCTest
 @testable import PiDesktop
@@ -301,10 +302,10 @@ final class AppStoreMessageEditingTests: XCTestCase {
         store.messages.append(message(id: id, role: .user, text: text))
     }
 
-    private func message(id: String, role: MessageRole, text: String) -> ChatMessage {
+    private func message(id: String, role: PiDesktop.MessageRole, text: String) -> ChatMessage {
         ChatMessage(
             id: id, role: role,
-            blocks: [MessageBlock(id: "\(id)-text", kind: .text(text))],
+            blocks: [PiDesktop.MessageBlock(id: "\(id)-text", kind: .text(text))],
             timestamp: Date(), raw: .null
         )
     }

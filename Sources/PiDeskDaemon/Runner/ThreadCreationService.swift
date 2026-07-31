@@ -2,12 +2,15 @@ import Foundation
 import PiDeskKit
 
 /// The thread-scoped RPC work handlers need without owning or retaining a Pi process.
+/// Short-lived agent sessions for the control-plane's own commands. Every method takes the
+/// thread's agent: the executable and the protocol both follow from it, and defaulting it would
+/// mean a mis-threaded call silently attached Pi to another agent's transcript.
 protocol ThreadRPCServing: Sendable {
-    func createIdle(cwd: URL, name: String?) async throws -> PiThread
-    func rename(cwd: URL, sessionPath: URL, name: String) async throws
-    func runtimeSnapshot(cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState
-    func setModel(cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState
-    func setThinkingLevel(cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState
+    func createIdle(agent: AgentKind, cwd: URL, name: String?) async throws -> PiThread
+    func rename(agent: AgentKind, cwd: URL, sessionPath: URL, name: String) async throws
+    func runtimeSnapshot(agent: AgentKind, cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState
+    func setModel(agent: AgentKind, cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState
+    func setThinkingLevel(agent: AgentKind, cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState
 }
 
 /// A command target whose stdout has exactly one owner. Detached runtimes read their own pipe;
@@ -31,13 +34,13 @@ struct ThreadCreationService: ThreadRPCServing {
     let logger: DaemonLogger
     var piExecutableOverride: URL?
 
-    func createIdle(cwd: URL, name: String?) async throws -> PiThread {
-        let session = try start(cwd: cwd, sessionPath: nil)
+    func createIdle(agent: AgentKind, cwd: URL, name: String?) async throws -> PiThread {
+        let session = try start(agent: agent, cwd: cwd, sessionPath: nil)
         defer { session.stop() }
         let runtime = DetachedRuntimeRequester(session: session)
         let data = try ThreadRuntimeCommands.data(try await runtime.request(type: "get_state", payload: [:]))
         guard let sessionId = data["sessionId"]?.stringValue, let sessionFile = data["sessionFile"]?.stringValue else {
-            throw RunnerError.processExited("Pi did not report a session id/file.")
+            throw RunnerError.processExited("\(agent.displayName) did not report a session id/file.")
         }
 
         let title = name?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,46 +70,49 @@ struct ThreadCreationService: ThreadRPCServing {
         )
     }
 
-    func rename(cwd: URL, sessionPath: URL, name: String) async throws {
-        let session = try start(cwd: cwd, sessionPath: sessionPath)
+    func rename(agent: AgentKind, cwd: URL, sessionPath: URL, name: String) async throws {
+        let session = try start(agent: agent, cwd: cwd, sessionPath: sessionPath)
         defer { session.stop() }
         let id = try session.send(type: "set_session_name", payload: ["name": .string(name)])
         // A timed-out response is ambiguous: Pi may already have appended the name. Only a
         // definite rejection is safe to report as a failed rename.
         if let response = try? await session.receiveMatching(id: id, timeout: 30), response["success"]?.boolValue == false {
-            throw RunnerError.processExited(response["error"]?.stringValue ?? "Pi rejected the rename.")
+            throw RunnerError.processExited(response["error"]?.stringValue ?? "\(agent.displayName) rejected the rename.")
         }
     }
 
-    func runtimeSnapshot(cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState {
-        let session = try start(cwd: cwd, sessionPath: sessionPath)
+    func runtimeSnapshot(agent: AgentKind, cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState {
+        let session = try start(agent: agent, cwd: cwd, sessionPath: sessionPath)
         defer { session.stop() }
         return try await ThreadRuntimeCommands.snapshot(using: DetachedRuntimeRequester(session: session), running: false)
     }
 
-    func setModel(cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState {
-        let session = try start(cwd: cwd, sessionPath: sessionPath)
+    func setModel(agent: AgentKind, cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState {
+        let session = try start(agent: agent, cwd: cwd, sessionPath: sessionPath)
         defer { session.stop() }
         return try await ThreadRuntimeCommands.setModel(
             using: DetachedRuntimeRequester(session: session), provider: provider, modelId: modelId, running: false
         )
     }
 
-    func setThinkingLevel(cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState {
-        let session = try start(cwd: cwd, sessionPath: sessionPath)
+    func setThinkingLevel(agent: AgentKind, cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState {
+        let session = try start(agent: agent, cwd: cwd, sessionPath: sessionPath)
         defer { session.stop() }
         return try await ThreadRuntimeCommands.setThinkingLevel(
             using: DetachedRuntimeRequester(session: session), level: level, running: false
         )
     }
 
-    private func start(cwd: URL, sessionPath: URL?) throws -> PiRPCSession {
-        guard let piURL = piExecutableOverride ?? PiLocator.resolve() else { throw RunnerError.piNotFound }
+    private func start(agent: AgentKind, cwd: URL, sessionPath: URL?) throws -> PiRPCSession {
+        guard let executable = piExecutableOverride ?? AgentCatalog.executable(for: agent) else {
+            throw RunnerError.agentNotFound(agent)
+        }
         return try PiRPCSession.start(
             cwd: cwd,
             sessionPath: sessionPath,
-            piExecutable: piURL,
-            environment: PiLocator.augmentedEnvironment(piURL: piURL, cwd: cwd)
+            piExecutable: executable,
+            environment: AgentCatalog.augmentedEnvironment(executable: executable, cwd: cwd),
+            adapter: AgentAdapterFactory.make(agent)
         )
     }
 }

@@ -1,3 +1,4 @@
+import PiDeskKit
 import Foundation
 import XCTest
 @testable import PiDesktop

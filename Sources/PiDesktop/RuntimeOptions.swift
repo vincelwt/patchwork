@@ -1,3 +1,4 @@
+import PiDeskKit
 import Foundation
 
 struct AvailableModel: Identifiable, Hashable, Sendable {
@@ -37,15 +38,11 @@ struct AvailableModel: Identifiable, Hashable, Sendable {
 
 /// Deterministic selection normalization used by menus while asynchronous RPC options refresh.
 enum RuntimePickerState {
-    /// Every reasoning level any supported agent can report, weakest first. An agent's own list
-    /// is intersected with this, so a level missing here silently disappears from the picker:
-    /// `ultra` is Codex's strongest effort and has to be present even though Pi never reports it.
-    static let allThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+    /// The shared vocabulary, which lives with the adapters that have to produce values in it.
+    static let allThinkingLevels = AgentThinkingLevels.all
 
     static func thinkingLevels(from value: JSONValue?) -> [String] {
-        let received = value?.arrayValue?.compactMap(\.stringValue) ?? []
-        let supported = allThinkingLevels.filter { received.contains($0) }
-        return supported.isEmpty ? ["off"] : supported
+        AgentThinkingLevels.supported(value?.arrayValue?.compactMap(\.stringValue) ?? [])
     }
 
     static func selectedModel(in models: [AvailableModel], provider: String?, modelID: String?) -> AvailableModel? {

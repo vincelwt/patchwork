@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import SwiftUI
 
 @main

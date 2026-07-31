@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 final class AgentRuntimeClientTests: XCTestCase {
     func testChildEnvironmentPinsPWDToTheSelectedWorkingDirectory() {
@@ -39,7 +39,7 @@ final class AgentRuntimeClientTests: XCTestCase {
         defer { client.stop() }
 
         let responseReceived = expectation(description: "available models response")
-        var capturedResponse: JSONValue?
+        var capturedResponse: PiJSONValue?
         var capturedError: Error?
         client.send(type: "get_available_models", payload: [:]) { result in
             switch result {
@@ -82,7 +82,7 @@ final class AgentRuntimeClientTests: XCTestCase {
         defer { client.stop() }
 
         let responseReceived = expectation(description: "get_state response")
-        var capturedResponse: JSONValue?
+        var capturedResponse: PiJSONValue?
         var capturedError: Error?
         client.send(type: "get_state", payload: [:]) { result in
             switch result {

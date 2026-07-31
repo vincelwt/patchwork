@@ -1,7 +1,6 @@
 import Foundation
-import PiDeskKit
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 /// Drives `ClaudeProtocolAdapter` directly with realistic protocol lines. Nothing here launches
 /// `claude` or reaches a provider: every byte is a fixture.
@@ -17,7 +16,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         return adapter.decode(line: data)
     }
 
-    private func events(_ messages: [AdapterInbound]) -> [JSONValue] {
+    private func events(_ messages: [AdapterInbound]) -> [PiJSONValue] {
         messages.compactMap { if case let .event(value) = $0 { return value } else { return nil } }
     }
 
@@ -25,16 +24,16 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         events(messages).compactMap { $0["type"]?.stringValue }
     }
 
-    private func responses(_ messages: [AdapterInbound]) -> [(String, JSONValue)] {
+    private func responses(_ messages: [AdapterInbound]) -> [(String, PiJSONValue)] {
         messages.compactMap { if case let .response(id, value) = $0 { return (id, value) } else { return nil } }
     }
 
-    private func written(_ outbound: AdapterOutbound) -> [JSONValue] {
+    private func written(_ outbound: AdapterOutbound) -> [PiJSONValue] {
         guard case let .write(lines) = outbound else { return [] }
-        return lines.compactMap { try? JSONValue.decode($0) }
+        return lines.compactMap { try? PiJSONValue.decode($0) }
     }
 
-    private func immediate(_ outbound: AdapterOutbound) -> JSONValue? {
+    private func immediate(_ outbound: AdapterOutbound) -> PiJSONValue? {
         guard case let .immediate(value) = outbound else { return nil }
         return value
     }
@@ -499,7 +498,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let allow = adapter.encodeUncorrelated(.object([
             "type": .string("extension_ui_response"), "id": .string("req-7"), "confirmed": .bool(true)
         ]))
-        let reply = try XCTUnwrap(allow.compactMap { try? JSONValue.decode($0) }.first)
+        let reply = try XCTUnwrap(allow.compactMap { try? PiJSONValue.decode($0) }.first)
         XCTAssertEqual(reply["type"]?.stringValue, "control_response")
         XCTAssertEqual(reply["response"]?["request_id"]?.stringValue, "req-7")
         XCTAssertEqual(reply["response"]?["subtype"]?.stringValue, "success")
@@ -521,7 +520,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let deny = adapter.encodeUncorrelated(.object([
             "type": .string("extension_ui_response"), "id": .string("req-8"), "cancelled": .bool(true)
         ]))
-        let reply = try XCTUnwrap(deny.compactMap { try? JSONValue.decode($0) }.first)
+        let reply = try XCTUnwrap(deny.compactMap { try? PiJSONValue.decode($0) }.first)
         XCTAssertEqual(reply["response"]?["response"]?["behavior"]?.stringValue, "deny")
     }
 
@@ -533,7 +532,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
                 "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo \(index)"]]
             ])
         }
-        let drained = adapter.drainPendingWrites().compactMap { try? JSONValue.decode($0) }
+        let drained = adapter.drainPendingWrites().compactMap { try? PiJSONValue.decode($0) }
         XCTAssertEqual(drained.count, 1)
         XCTAssertEqual(drained.first?["response"]?["request_id"]?.stringValue, "req-0")
         XCTAssertEqual(drained.first?["response"]?["response"]?["behavior"]?.stringValue, "deny")
@@ -558,18 +557,21 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let adapter = adapter()
         _ = decode(adapter, initLine())
 
-        let models = AvailableModel.parse(
-            try XCTUnwrap(immediate(adapter.encode(command: "get_available_models", id: "1", payload: [:])))["models"]
-        )
-        XCTAssertTrue(models.allSatisfy { $0.provider == "anthropic" })
-        XCTAssertTrue(models.contains { $0.modelID == "opus" })
+        // Shaped exactly as `AvailableModel.init(json:)` reads it, asserted here without the
+        // app type so the adapter's own package can cover it.
+        let models = try XCTUnwrap(
+            immediate(adapter.encode(command: "get_available_models", id: "1", payload: [:])))["models"]?.arrayValue
+        let listed = try XCTUnwrap(models)
+        XCTAssertTrue(listed.allSatisfy { $0["provider"]?.stringValue == "anthropic" })
+        XCTAssertTrue(listed.allSatisfy { $0["id"]?.stringValue?.isEmpty == false })
+        XCTAssertTrue(listed.contains { $0["id"]?.stringValue == "opus" })
         // The model the session actually reported is offered alongside the aliases.
-        XCTAssertTrue(models.contains { $0.modelID == "claude-sonnet-5" })
+        XCTAssertTrue(listed.contains { $0["id"]?.stringValue == "claude-sonnet-5" })
 
-        let levels = RuntimePickerState.thinkingLevels(
-            from: try XCTUnwrap(immediate(adapter.encode(command: "get_available_thinking_levels", id: "2", payload: [:])))["levels"]
-        )
-        XCTAssertEqual(levels, ["low", "medium", "high", "xhigh", "max"])
+        let reported = try XCTUnwrap(
+            immediate(adapter.encode(command: "get_available_thinking_levels", id: "2", payload: [:])))["levels"]?
+            .arrayValue?.compactMap(\.stringValue)
+        XCTAssertEqual(AgentThinkingLevels.supported(try XCTUnwrap(reported)), ["low", "medium", "high", "xhigh", "max"])
     }
 
     func testCommandsWithNoClaudeEquivalentAreReportedAsUnsupported() {
@@ -615,7 +617,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
     func testStreamingTextIsBoundedRegardlessOfHowMuchArrives() throws {
         let adapter = adapter()
         let chunk = String(repeating: "x", count: 10_000)
-        var last: JSONValue?
+        var last: PiJSONValue?
         for _ in 0..<40 {
             let emitted = decode(adapter, [
                 "type": "stream_event", "session_id": "s", "uuid": "e",
