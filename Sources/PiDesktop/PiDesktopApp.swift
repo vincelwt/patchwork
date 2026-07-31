@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import SwiftUI
 
 @main
@@ -6,7 +7,9 @@ struct PiDesktopApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
     @StateObject private var store = AppStore(
         connectivityMonitor: ConnectivityMonitor(),
-        probeRuntimeFactory: { PiRPCClient(additionalArguments: ["--no-session"]) },
+        // The status probe reads Pi's extension host, which is a Pi-only concept, so it always
+        // attaches to Pi regardless of which agent the current conversation uses.
+        probeRuntimeFactory: { AgentRuntimeClient(adapter: PiProtocolAdapter(), additionalArguments: ["--no-session"]) },
         sleepPrevention: SleepPreventionController.liveHandler()
     )
     // Owns the in-process control service lifecycle. Kept on the app delegate (not a second
@@ -58,24 +61,29 @@ struct PiDesktopApp: App {
                     .keyboardShortcut(".", modifiers: .command)
                     .disabled(!store.canStopCurrentThread)
                 Button("Compact Context", action: store.compact)
-                    .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
+                    .disabled(!store.canCompact)
                 Divider()
                 Button("Automations") { store.schedulesPresented = true }
                     .keyboardShortcut("s", modifiers: [.command, .option])
                 Button("Toggle Environment") { store.inspectorVisible.toggle() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
             }
-            CommandMenu("Pi") {
-                Menu("Mode") {
-                    ForEach(PiMode.allCases) { mode in
-                        Button(mode.label) { store.setMode(mode) }
+            CommandMenu("Agent") {
+                Menu(store.activeCapabilities.modeControlTitle) {
+                    ForEach(store.availableModes) { mode in
+                        Button(mode.title) { store.setAgentMode(mode.id) }
                     }
                 }
-                Button("Toggle Fast Priority") { store.toggleFastPriority() }
-                Button("Show Limits…") { store.showLimits() }
-                Divider()
-                Button("Refresh Extension Statuses") { store.refreshExtensionStatuses() }
-                    .disabled(store.isProbingStatuses)
+                .disabled(store.availableModes.isEmpty)
+                // Fast priority, limits, and extension statuses all come from Pi extensions.
+                Group {
+                    Button("Toggle Fast Priority") { store.toggleFastPriority() }
+                    Button("Show Limits…") { store.showLimits() }
+                    Divider()
+                    Button("Refresh Extension Statuses") { store.refreshExtensionStatuses() }
+                        .disabled(store.isProbingStatuses)
+                }
+                .disabled(!store.activeCapabilities.supportsActivityExtension)
             }
         }
 

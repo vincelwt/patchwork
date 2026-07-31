@@ -111,14 +111,15 @@ accepted wherever `{id}` appears. A unique id prefix or suffix is also accepted;
 abbreviations return `400 ambiguous_thread_id` rather than choosing one.
 
 ```
-GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=&automated=
+GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=&automated=&agent=
 → {"threads":[Thread],"nextCursor":null}
 
 GET  /v1/threads/{id}?messages=20&offset=0&all=true
 → {"thread":Thread,"messages":[Message],"nextOffset":20}
 
 POST /v1/threads
-     {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra","worktree":true}
+     {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra","worktree":true,
+      "agent":"pi"}
 → {"thread":Thread,"runId":"…"}          // message is optional; `thread.id` is always a real session id
 
 GET  /v1/threads/{id}/runtime
@@ -154,6 +155,36 @@ Thread detail defaults to the existing raw projection (`all=true`) for API compa
 `all=false` to retain only user and assistant roles. `offset` is applied after that filter and
 `nextOffset` is present only when an older page exists. List `automated=true` keeps threads
 associated with any automation, including paused ones.
+
+### Agents
+
+Every thread carries `agent` (`pi|codex|claude`), decided by which agent's session root the
+transcript was discovered under. The daemon lists and reads all three; an agent name it does not
+know decodes as `pi` rather than failing the whole list, so a newer daemon never breaks an older
+client.
+
+`GET /v1/threads?agent=` filters by exact agent and returns `400 invalid_agent` for a value
+outside the set — a filter that silently matched everything would look like it worked.
+
+The daemon drives every agent, not just Pi: each thread's commands are translated into its own
+agent's protocol (`pi --mode rpc`, `codex app-server`, `claude -p` stream-json), so a Codex or
+Claude thread can be created, messaged, renamed, and reconfigured through this API exactly like a
+Pi one. Routing follows `thread.agent`, which comes from the session root the transcript was
+discovered under, so a command can never reach the wrong agent's transcript.
+
+A thread's history outlives its agent's installation. Reading always works; a route that has to
+launch the agent returns `409 agent_not_installed` when its executable no longer resolves.
+
+Delivery is capability-aware. `delivery: "steer"` is honoured only by agents that can fold a
+message into the turn already running. All three supported agents can today, so nothing is
+downgraded; for one that could not, the request is downgraded and the response reports
+`delivery: "followUp"` rather than claiming a steer that did not happen — a caller told its
+message was steered will not resend it, so the claim has to be true.
+
+Codex subagent rollouts (`"subsession": true`) are read but never listed as threads.
+
+`Schedule.agent` and `Run.agent` are optional and absent means Pi, so every pre-multi-agent
+`schedules.json` and `runs.jsonl` record keeps its meaning.
 
 **Archive is the daemon's own flag, not the app's.** It is written to the daemon overlay file, and
 `Thread.archived` is the union of that flag with the app's `state.json`, which the daemon reads
@@ -284,6 +315,7 @@ because their bounded identity is what makes results attachable.
   "running": true, "unread": false, "archived": false, "automated": true,
   "project": "/Users/x/code", "worktree": "/Users/x/.pi/worktrees/code-20260730-120000",
   "preview": "first line of the last assistant message",
+  "agent": "pi",                       // pi|codex|claude; absent means pi
   "cost": 12.34, "contextPercent": 61.0
 }
 // Message
@@ -567,9 +599,11 @@ the API, never by touching the files, so there is exactly one writer.
 
 ```
 pidesk                                      # active thread list, then help
-pidesk threads list [--query q] [--running] [--automated] [--archived|--all] [--json]
+pidesk threads list [--query q] [--agent pi|codex|claude] [--running] [--automated]
+                    [--archived|--all] [--json]
 pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
-pidesk threads new --cwd DIR [--worktree] [--name N] [--message M] [--mode ultra]
+pidesk threads new --cwd DIR [--agent pi|codex|claude] [--worktree] [--name N]
+                   [--message M] [--mode ultra]
 pidesk threads send <id> "text" [--steer|--follow-up] [--wait]
 pidesk threads abort|archive|unarchive|rename <id> [args]
 pidesk threads watch [<id>]                     # streams /v1/events

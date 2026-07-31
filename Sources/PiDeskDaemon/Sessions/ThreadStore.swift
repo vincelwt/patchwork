@@ -1,7 +1,7 @@
 import Foundation
 import PiDeskKit
 
-/// The daemon's view of every Pi session as a `Thread`. Wraps `SessionScanner`/
+/// The daemon's view of every agent's sessions as a `Thread`. Wraps `SessionScanner`/
 /// `SessionThreadParser` with a fingerprint cache (path/size/mtime, exactly the app's own
 /// `SessionSummaryCache` strategy) so only files that actually changed since the last call are
 /// re-parsed \u2014 real session files run tens of megabytes, so re-parsing all of them on every
@@ -12,9 +12,14 @@ import PiDeskKit
 /// lookups reuse that presented snapshot so opening one thread never reparses every changed file.
 actor ThreadStore {
     private struct Fingerprint: Equatable { let size: Int64; let modifiedAt: TimeInterval }
-    private struct CacheEntry { let fingerprint: Fingerprint; let thread: PiThread }
+    /// `thread == nil` records a file that parsed as "not a user thread" (a Codex subagent
+    /// rollout) or did not parse at all, so a big tree of subagent transcripts is not re-parsed
+    /// on every single list.
+    private struct CacheEntry { let fingerprint: Fingerprint; let thread: PiThread? }
 
     private let rootURL: URL
+    /// Every agent whose sessions this daemon lists, with the root to scan for it.
+    private let roots: [(agent: AgentKind, url: URL)]
     private let activityDirectoryURL: URL
     /// Read-only, and a parameter only so tests read a fixture instead of the machine's own
     /// `state.json`. The daemon never writes it; see `AppStatePeek`.
@@ -28,12 +33,14 @@ actor ThreadStore {
 
     init(
         rootURL: URL = SessionScanner.defaultRootURL(),
+        roots: [(agent: AgentKind, url: URL)]? = nil,
         activityDirectoryURL: URL = PiDeskPaths.activityDirectory,
         appStateURL: URL = AppStatePeek.defaultURL(),
         logger: DaemonLogger,
         overlay: DaemonOverlayStore = DaemonOverlayStore()
     ) {
         self.rootURL = rootURL
+        self.roots = roots ?? SessionScanner.roots(piRootURL: rootURL)
         self.activityDirectoryURL = activityDirectoryURL
         self.appStateURL = appStateURL
         self.logger = logger
@@ -42,7 +49,7 @@ actor ThreadStore {
 
     func listThreads(
         query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?,
-        automated: Bool? = nil, automatedThreadIDs: Set<String> = []
+        automated: Bool? = nil, automatedThreadIDs: Set<String> = [], agent: AgentKind? = nil
     ) async -> (threads: [PiThread], nextCursor: String?) {
         var filtered = await allThreadsSorted()
         for index in filtered.indices {
@@ -58,6 +65,7 @@ actor ThreadStore {
         if let archived { filtered = filtered.filter { $0.archived == archived } }
         if let running { filtered = filtered.filter { $0.running == running } }
         if let automated { filtered = filtered.filter { ($0.automated == true) == automated } }
+        if let agent { filtered = filtered.filter { $0.agent == agent } }
 
         let start = cursor.flatMap(Int.init) ?? 0
         guard start >= 0, start < filtered.count else { return ([], nil) }
@@ -105,8 +113,14 @@ actor ThreadStore {
     }
 
     func messages(idOrPath: String, limit: Int) async -> [Message]? {
-        guard let url = await resolveURL(idOrPath: idOrPath) else { return nil }
-        return try? SessionThreadParser.messages(at: url, limit: limit)
+        guard let thread = await thread(idOrPath: idOrPath) else {
+            guard let url = await resolveURL(idOrPath: idOrPath) else { return nil }
+            return try? SessionThreadParser.messages(at: url, limit: limit)
+        }
+        return try? SessionThreadParser.messages(
+            at: URL(fileURLWithPath: thread.path), limit: limit,
+            transcoder: .make(for: thread.agent)
+        )
     }
 
     func resolveURL(idOrPath: String) async -> URL? {
@@ -205,31 +219,27 @@ actor ThreadStore {
     }
 
     private func allThreadsSorted() async -> [PiThread] {
-        let files = SessionScanner.discoverSessionFiles(rootURL: rootURL)
+        let files = SessionScanner.discoverSessions(roots: roots)
         var results: [PiThread] = []
         results.reserveCapacity(files.count)
         var stillPresent: Set<String> = []
 
         for file in files {
-            let standardizedURL = file.standardizedFileURL
+            let standardizedURL = file.url.standardizedFileURL
             let path = standardizedURL.path
             stillPresent.insert(path)
             guard let values = try? standardizedURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) else { continue }
             let fingerprint = Fingerprint(size: Int64(values.fileSize ?? 0), modifiedAt: values.contentModificationDate?.timeIntervalSince1970 ?? 0)
 
-            var thread: PiThread
+            let thread: PiThread?
             if let cached = cache[path], cached.fingerprint == fingerprint {
                 thread = cached.thread
             } else {
-                guard let parsed = try? SessionThreadParser.thread(at: standardizedURL) else {
-                    logger.warn("Skipping unparseable session file \(standardizedURL.lastPathComponent)")
-                    continue
-                }
-                thread = parsed
+                thread = Self.parse(standardizedURL, agent: file.agent, logger: logger)
                 cache[path] = CacheEntry(fingerprint: fingerprint, thread: thread)
             }
 
-            results.append(thread)
+            if let thread { results.append(thread) }
         }
 
         results = await applyingOverlays(to: results)
@@ -244,5 +254,20 @@ actor ThreadStore {
         }
         presented = sorted
         return sorted
+    }
+
+    /// `nil` means "do not list this file": a subagent rollout, or something unparseable. Both
+    /// are remembered by fingerprint so the decision is made once per file version.
+    private static func parse(_ url: URL, agent: AgentKind, logger: DaemonLogger) -> PiThread? {
+        do {
+            var thread = try SessionThreadParser.thread(at: url, transcoder: .make(for: agent))
+            thread.agent = agent
+            return thread
+        } catch SessionThreadParser.ParseError.subsession {
+            return nil
+        } catch {
+            logger.warn("Skipping unparseable \(agent.displayName) session file \(url.lastPathComponent)")
+            return nil
+        }
     }
 }

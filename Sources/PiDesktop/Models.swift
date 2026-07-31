@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ImageIO
+import PiDeskKit
 
 struct TokenMetrics: Hashable, Codable, Sendable {
     var input = 0
@@ -44,6 +45,9 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let fileURL: URL
     let cwd: URL
+    /// Which agent wrote this session. Derived from the session root the file lives under, so
+    /// it costs nothing to store and never disagrees with where the transcript came from.
+    var agent: AgentKind = .pi
     let createdAt: Date
     let modifiedAt: Date
     var name: String
@@ -57,7 +61,12 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     var pullRequestURL: URL? = nil
     var pullRequestCreatedAt: Date? = nil
     var isArchived = false
+    /// A subagent transcript that happens to live in the same directory as user threads.
+    /// Parsed like any other session but never promoted into the sidebar.
+    var isSubsession = false
     var searchKey = ""
+
+    var capabilities: AgentCapabilities { agent.capabilities }
 
     var folderName: String {
         let value = cwd.lastPathComponent
@@ -499,6 +508,12 @@ struct PersistedAppState: Codable {
     /// The folder the last chat was started in, so a new chat reopens where work happens.
     /// App-created worktrees are deliberately never recorded here.
     var lastFolder: String?
+    /// The agent the last new chat used, as an `AgentKind` raw value. Stored as a string so an
+    /// agent this build does not know about round-trips instead of failing the whole state file.
+    var lastAgent: String?
+    /// Per-agent operating mode (Pi `/mode`, Codex sandbox, Claude permission mode), keyed by
+    /// agent raw value, so switching agents restores each one's last choice.
+    var agentModes: [String: String] = [:]
     /// One app-wide choice: changing conversations or relaunching never reopens a panel the user closed.
     var inspectorVisible = true
     /// Sidebar folders the user explicitly opened or closed. Anything absent falls back to the

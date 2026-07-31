@@ -54,7 +54,7 @@ final class HTTPControlPlane: ControlPlane {
     }
 
     func listThreads(
-        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?
+        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?, agent: String?
     ) async throws -> WireThreadListResponse {
         var items = [URLQueryItem(name: "limit", value: "\(limit)")]
         if let query, !query.isEmpty { items.append(URLQueryItem(name: "query", value: query)) }
@@ -62,6 +62,7 @@ final class HTTPControlPlane: ControlPlane {
         if let archived { items.append(URLQueryItem(name: "archived", value: archived ? "true" : "false")) }
         if let running { items.append(URLQueryItem(name: "running", value: running ? "true" : "false")) }
         if let automated { items.append(URLQueryItem(name: "automated", value: automated ? "true" : "false")) }
+        if let agent, !agent.isEmpty { items.append(URLQueryItem(name: "agent", value: agent)) }
         return try await requestNoBody("GET", "/v1/threads" + queryString(items))
     }
 

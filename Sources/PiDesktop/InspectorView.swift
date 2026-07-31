@@ -1,7 +1,12 @@
+import PiDeskKit
 import SwiftUI
 
 /// A flat column, not a floating card: one background, one leading hairline (owned by the
 /// conversation layout), quiet uppercase section headers, and no nested surfaces.
+///
+/// Every section is agent-aware: sections only appear when the agent behind the conversation
+/// actually produces the thing they show, so a Claude Code thread never renders an empty
+/// Extensions block and a Codex thread never claims Pi's numbers.
 struct InspectorView: View {
     @EnvironmentObject private var store: AppStore
     @ObservedObject var activities: RuntimeActivityModel
@@ -9,6 +14,8 @@ struct InspectorView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: PiTheme.space16) {
+                AgentSection()
+
                 if store.selectedGit.isRepository || store.selectedWorktree != nil {
                     GitSection(snapshot: store.selectedGit)
                 }
@@ -27,14 +34,23 @@ struct InspectorView: View {
                     ActivitySection(title: "Background processes", items: processes)
                 }
 
-                MetricsSection()
+                if store.activeCapabilities.reportsUsage {
+                    MetricsSection()
+                }
 
-                if !store.statusModel.isEmpty || !store.extensionWidgets.isEmpty {
+                // Only Pi has an extension host, so this is a capability check rather than a
+                // "did anything arrive" check: an empty block would otherwise flicker in.
+                if store.activeCapabilities.supportsActivityExtension,
+                   !store.statusModel.isEmpty || !store.extensionWidgets.isEmpty {
                     ExtensionSection()
                 }
 
                 if let latest = store.unknownRPCEvents.last {
-                    UnknownEventSection(event: latest, count: store.unknownRPCEvents.count)
+                    UnknownEventSection(
+                        agent: store.activeAgent,
+                        event: latest,
+                        count: store.unknownRPCEvents.count
+                    )
                 }
             }
             .padding(.horizontal, PiTheme.space12)
@@ -44,6 +60,70 @@ struct InspectorView: View {
         .background(Color.piTranscript)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Environment inspector")
+    }
+}
+
+// MARK: - Agent
+
+/// Who is running this conversation and how it is configured. This is the one section that is
+/// always present: which agent a transcript belongs to is never obvious from its contents, and
+/// the same three controls mean different things per agent.
+private struct AgentSection: View {
+    @EnvironmentObject private var store: AppStore
+
+    private var agent: AgentKind { store.activeAgent }
+    private var capabilities: AgentCapabilities { store.activeCapabilities }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PiTheme.space6) {
+            PiSectionHeader(title: "Agent", trailing: store.runtimeState.isConnected ? nil : "detached")
+
+            InspectorRow(symbol: agent.symbolName, title: agent.displayName) {
+                Text(store.runtimeState.sessionID?.prefix(8).description ?? "—")
+                    .foregroundStyle(.secondary)
+                    .monospaced()
+            }
+
+            if let model = store.runtimeState.modelName ?? store.runtimeState.modelID {
+                InspectorRow(symbol: "cpu", title: "Model") {
+                    Text(model).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+            }
+
+            if capabilities.thinking != .unsupported, let level = store.runtimeState.thinkingLevel {
+                InspectorRow(symbol: "brain", title: "Thinking") {
+                    Text(level).foregroundStyle(.secondary)
+                }
+            }
+
+            if let mode = store.currentMode {
+                InspectorRow(symbol: "slider.horizontal.3", title: capabilities.modeControlTitle) {
+                    Text(mode.title).foregroundStyle(.secondary)
+                }
+                .help(mode.detail)
+            }
+
+            // Named plainly rather than hidden, so "why is Compact greyed out" answers itself.
+            if !unavailable.isEmpty {
+                InspectorRow(symbol: "minus.circle", title: "Unavailable") {
+                    Text(unavailable.joined(separator: ", "))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                }
+                .help("\(agent.displayName) has no equivalent for these")
+            }
+        }
+    }
+
+    private var unavailable: [String] {
+        var missing: [String] = []
+        if !capabilities.canCompact { missing.append("compact") }
+        if !capabilities.canFork { missing.append("edit history") }
+        if !capabilities.canExportHTML { missing.append("export") }
+        if !capabilities.canRenameSession { missing.append("rename") }
+        if !capabilities.canSteerMidTurn { missing.append("steering") }
+        return missing
     }
 }
 
@@ -379,13 +459,14 @@ private struct ExtensionSection: View {
 }
 
 private struct UnknownEventSection: View {
+    let agent: AgentKind
     let event: String
     let count: Int
     @State private var expanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space6) {
-            PiSectionHeader(title: "Unknown Pi events", trailing: "\(count)")
+            PiSectionHeader(title: "Unknown \(agent.shortName) events", trailing: "\(count)")
             DisclosureButton(title: expanded ? "Hide payload" : "Show latest payload", expanded: expanded) {
                 expanded.toggle()
             }

@@ -1,101 +1,74 @@
 import Darwin
 import Foundation
 
-protocol PiRuntimeProtocol: AnyObject {
-    var onEvent: ((JSONValue) -> Void)? { get set }
+public protocol AgentRuntimeProtocol: AnyObject {
+    var onEvent: ((PiJSONValue) -> Void)? { get set }
     var onExit: ((String?) -> Void)? { get set }
     var isRunning: Bool { get }
+    /// Which agent this runtime drives. The store gates affordances on its capabilities.
+    var agent: AgentKind { get }
 
     func start(cwd: URL, sessionPath: URL?) throws
     func stop()
-    func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?)
-    func sendUncorrelated(_ value: JSONValue)
+    func send(type: String, payload: [String: PiJSONValue], completion: ((Result<PiJSONValue, Error>) -> Void)?)
+    func sendUncorrelated(_ value: PiJSONValue)
 }
 
-enum PiRPCError: LocalizedError {
-    case piNotFound
+public extension AgentRuntimeProtocol {
+    var agent: AgentKind { .pi }
+}
+
+public enum AgentRuntimeError: LocalizedError {
+    case notInstalled(AgentKind)
     case notRunning
     case invalidCommand
-    /// Pi did not answer a side-effect-free query in time; safe to treat as a failure.
+    /// The agent cannot do this at all, and said so without a round trip.
+    case unsupported(AgentKind, String)
+    /// The agent did not answer a side-effect-free query in time; safe to treat as a failure.
     case timedOut(String, seconds: TimeInterval)
-    /// Pi did not confirm a command that may already have been applied. Callers must not
+    /// The agent did not confirm a command that may already have been applied. Callers must not
     /// roll back drafts or resubmit on this error.
     case outcomeUnknown(String)
     case processExited(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
-        case .piNotFound:
-            "Pi CLI was not found. Set PI_DESKTOP_PI_PATH or install pi in ~/.local/bin."
+        case let .notInstalled(agent):
+            switch agent {
+            case .pi: "Pi CLI was not found. Set PI_DESKTOP_PI_PATH or install pi in ~/.local/bin."
+            case .codex: "Codex CLI was not found. Set PI_DESKTOP_CODEX_PATH or install codex."
+            case .claude: "Claude Code was not found. Set PI_DESKTOP_CLAUDE_PATH or install claude."
+            }
         case .notRunning:
-            "Pi is not running."
+            "The agent is not running."
         case .invalidCommand:
-            "Could not encode an RPC command."
+            "Could not encode a runtime command."
+        case let .unsupported(agent, what):
+            "\(agent.displayName) does not support \(what)."
         case let .timedOut(command, seconds):
-            "Pi did not respond to \(command) within \(Int(seconds)) seconds."
+            "The agent did not respond to \(command) within \(Int(seconds)) seconds."
         case let .outcomeUnknown(command):
-            "Pi never confirmed \(command). It may already have been applied, so nothing was undone."
+            "The agent never confirmed \(command). It may already have been applied, so nothing was undone."
         case let .processExited(message):
             message
         }
     }
 }
 
-enum PiLocator {
-    static func resolve(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
-        let manager = FileManager.default
-        var candidates: [String] = []
-        if let override = environment["PI_DESKTOP_PI_PATH"], !override.isEmpty {
-            candidates.append((override as NSString).expandingTildeInPath)
-        }
-        let home = manager.homeDirectoryForCurrentUser.path
-        candidates.append(contentsOf: [
-            "\(home)/.local/bin/pi",
-            "/opt/homebrew/bin/pi",
-            "/usr/local/bin/pi",
-            "/usr/bin/pi"
-        ])
-        return candidates
-            .map { URL(fileURLWithPath: $0).standardizedFileURL }
-            .first { manager.isExecutableFile(atPath: $0.path) }
-    }
-
-    static func augmentedEnvironment(
-        piURL: URL,
-        cwd: URL? = nil,
-        base: [String: String] = ProcessInfo.processInfo.environment
-    ) -> [String: String] {
-        var environment = base
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let additions = [
-            piURL.deletingLastPathComponent().path,
-            "\(home)/.local/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin"
-        ]
-        let existing = environment["PATH"]?.split(separator: ":").map(String.init) ?? []
-        environment["PATH"] = Array(NSOrderedSet(array: additions + existing)).compactMap { $0 as? String }.joined(separator: ":")
-        // LaunchServices normally gives GUI apps PWD="/". Process.currentDirectoryURL changes
-        // the actual cwd but not this environment value, and Pi extensions commonly consult PWD
-        // for project discovery. Keep both views of the working directory identical.
-        if let cwd { environment["PWD"] = cwd.standardizedFileURL.path }
-        return environment
-    }
-}
-
-final class PiRPCClient: PiRuntimeProtocol {
+/// One agent subprocess speaking LF-delimited JSON over stdio.
+///
+/// The transport is agent-agnostic: spawning, pipe reads, request correlation, timeouts,
+/// generation fencing, and reaping are identical for Pi, Codex, and Claude Code. Everything
+/// that differs lives behind `AgentProtocolAdapter`.
+public final class AgentRuntimeClient: AgentRuntimeProtocol {
     private let callbackLock = NSLock()
-    private var eventHandler: ((JSONValue) -> Void)?
+    private var eventHandler: ((PiJSONValue) -> Void)?
     private var exitHandler: ((String?) -> Void)?
-    var onEvent: ((JSONValue) -> Void)? {
+    public var onEvent: ((PiJSONValue) -> Void)? {
         get { callbackLock.withLock { eventHandler } }
         set { callbackLock.withLock { eventHandler = newValue } }
     }
-    var onExit: ((String?) -> Void)? {
+    public var onExit: ((String?) -> Void)? {
         get { callbackLock.withLock { exitHandler } }
         set { callbackLock.withLock { exitHandler = newValue } }
     }
@@ -118,29 +91,42 @@ final class PiRPCClient: PiRuntimeProtocol {
     private let executableOverride: URL?
     private let environmentOverrides: [String: String]
     private let additionalArguments: [String]
-    /// Test seam: replaces the standard `--mode rpc` argument list entirely.
+    /// Test seam: replaces the adapter's argument list entirely.
     private let argumentsOverride: [String]?
+    private let adapter: AgentProtocolAdapter
 
-    init(
+    public var agent: AgentKind { adapter.agent }
+
+    public init(
+        adapter: AgentProtocolAdapter = PiProtocolAdapter(),
         executableOverride: URL? = nil,
         environmentOverrides: [String: String] = [:],
         additionalArguments: [String] = [],
         argumentsOverride: [String]? = nil
     ) {
+        self.adapter = adapter
         self.executableOverride = executableOverride
         self.environmentOverrides = environmentOverrides
         self.additionalArguments = additionalArguments
         self.argumentsOverride = argumentsOverride
     }
 
-    var isRunning: Bool {
+    /// Builds the runtime for one agent, with that agent's native protocol adapter.
+    public static func make(for agent: AgentKind, additionalArguments: [String] = []) -> AgentRuntimeClient {
+        AgentRuntimeClient(adapter: AgentAdapterFactory.make(agent), additionalArguments: additionalArguments)
+    }
+
+    public var isRunning: Bool {
         ioQueue.sync { process?.isRunning == true }
     }
 
-    func start(cwd: URL, sessionPath: URL? = nil) throws {
-        let baseEnvironment = ProcessInfo.processInfo.environment.merging(environmentOverrides) { _, override in override }
-        guard let piURL = executableOverride ?? PiLocator.resolve(environment: baseEnvironment) else {
-            throw PiRPCError.piNotFound
+    public func start(cwd: URL, sessionPath: URL? = nil) throws {
+        let baseEnvironment = ProcessInfo.processInfo.environment
+            .merging(adapter.environmentOverrides) { _, override in override }
+            .merging(environmentOverrides) { _, override in override }
+        guard let executableURL = executableOverride
+            ?? AgentCatalog.executable(for: adapter.agent, environment: baseEnvironment) else {
+            throw AgentRuntimeError.notInstalled(adapter.agent)
         }
 
         try ioQueue.sync {
@@ -157,16 +143,16 @@ final class PiRPCClient: PiRuntimeProtocol {
             requestCounter = 0
             stderr = ""
             framer = JSONLFramer()
+            adapter.reset()
 
-            process.executableURL = piURL
-            var arguments = argumentsOverride ?? ["--mode", "rpc"]
-            if argumentsOverride == nil, let sessionPath {
-                arguments += ["--session", sessionPath.path]
-            }
+            process.executableURL = executableURL
+            var arguments = argumentsOverride ?? adapter.launchArguments(sessionPath: sessionPath, cwd: cwd)
             arguments += additionalArguments
             process.arguments = arguments
             process.currentDirectoryURL = cwd
-            process.environment = PiLocator.augmentedEnvironment(piURL: piURL, cwd: cwd, base: baseEnvironment)
+            process.environment = AgentCatalog.augmentedEnvironment(
+                executable: executableURL, cwd: cwd, base: baseEnvironment
+            )
             process.standardInput = input
             process.standardOutput = output
             process.standardError = error
@@ -180,11 +166,12 @@ final class PiRPCClient: PiRuntimeProtocol {
                 self?.ioQueue.async {
                     guard let self, self.generation === currentGeneration, currentGeneration.isValid else { return }
                     let detail = self.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let name = self.adapter.agent.displayName
                     let message = process.terminationStatus == 0
                         ? nil
-                        : "Pi exited with status \(process.terminationStatus).\(detail.isEmpty ? "" : " \(detail)")"
+                        : "\(name) exited with status \(process.terminationStatus).\(detail.isEmpty ? "" : " \(detail)")"
                     currentGeneration.invalidate()
-                    self.rejectPending(processExitMessage: message ?? "Pi exited.")
+                    self.rejectPending(processExitMessage: message ?? "\(name) exited.")
                     self.cleanupHandles()
                     self.process = nil
                     DispatchQueue.main.async { [weak self] in self?.onExit?(message) }
@@ -194,16 +181,23 @@ final class PiRPCClient: PiRuntimeProtocol {
             try process.run()
             startOutputReader(output.fileHandleForReading, generation: currentGeneration)
             startErrorReader(error.fileHandleForReading, generation: currentGeneration)
+
+            // The handshake has to be on the wire before any user command, and the adapter is
+            // the only thing that knows whether this agent needs one.
+            for line in adapter.startupLines(sessionPath: sessionPath, cwd: cwd) {
+                try? inputHandle?.write(contentsOf: line)
+            }
         }
     }
 
-    func stop() {
+    public func stop() {
         ioQueue.async { [weak self] in
             guard let self else { return }
             generation.invalidate()
             generationSequence += 1
             generation = RuntimeGeneration(sequence: generationSequence)
-            rejectPending(processExitMessage: "Pi was stopped.")
+            rejectPending(processExitMessage: "\(adapter.agent.displayName) was stopped.")
+            adapter.reset()
             // Keep retired read descriptors alive until their process closes them. Closing and
             // immediately spawning can reuse the same descriptor, letting the old blocking read
             // consume the replacement runtime's first response.
@@ -230,33 +224,54 @@ final class PiRPCClient: PiRuntimeProtocol {
         }
     }
 
-    func send(
+    public func send(
         type: String,
-        payload: [String: JSONValue] = [:],
-        completion: ((Result<JSONValue, Error>) -> Void)? = nil
+        payload: [String: PiJSONValue] = [:],
+        completion: ((Result<PiJSONValue, Error>) -> Void)? = nil
     ) {
         ioQueue.async { [weak self] in
             guard let self, let inputHandle, process?.isRunning == true else {
-                DispatchQueue.main.async { completion?(.failure(PiRPCError.notRunning)) }
+                DispatchQueue.main.async { completion?(.failure(AgentRuntimeError.notRunning)) }
                 return
             }
 
             requestCounter += 1
             let currentGeneration = generation
             let id = "desktop-\(currentGeneration.sequence)-\(requestCounter)"
-            var object = payload
-            object["type"] = .string(type)
-            object["id"] = .string(id)
 
-            if let completion {
-                pending.register(id: id, command: type, generation: currentGeneration, callback: completion)
-            }
-            do {
-                try inputHandle.write(contentsOf: try JSONValue.object(object).encodedLine())
-            } catch {
-                let callback = pending.remove(id: id) ?? completion
-                DispatchQueue.main.async { callback?(.failure(error)) }
+            switch adapter.encode(command: type, id: id, payload: payload) {
+            case let .immediate(value):
+                // Answered from the adapter's own state; nothing reaches the process.
+                DispatchQueue.main.async {
+                    guard currentGeneration.isValid else { return }
+                    completion?(.success(AdapterEncoding.response(id: id, data: value)))
+                }
                 return
+            case let .unsupported(what):
+                let error = AgentRuntimeError.unsupported(adapter.agent, what)
+                DispatchQueue.main.async { completion?(.failure(error)) }
+                return
+            case .deferred:
+                // The adapter is holding this until a handshake completes and will write it
+                // itself; only the completion is registered here.
+                if let completion {
+                    pending.register(id: id, command: type, generation: currentGeneration, callback: completion)
+                }
+            case let .write(lines):
+                guard !lines.isEmpty else {
+                    DispatchQueue.main.async { completion?(.failure(AgentRuntimeError.invalidCommand)) }
+                    return
+                }
+                if let completion {
+                    pending.register(id: id, command: type, generation: currentGeneration, callback: completion)
+                }
+                do {
+                    for line in lines { try inputHandle.write(contentsOf: line) }
+                } catch {
+                    let callback = pending.remove(id: id) ?? completion
+                    DispatchQueue.main.async { callback?(.failure(error)) }
+                    return
+                }
             }
 
             guard completion != nil else { return }
@@ -272,10 +287,12 @@ final class PiRPCClient: PiRuntimeProtocol {
         }
     }
 
-    func sendUncorrelated(_ value: JSONValue) {
+    public func sendUncorrelated(_ value: PiJSONValue) {
         ioQueue.async { [weak self] in
-            guard let input = self?.inputHandle, self?.process?.isRunning == true else { return }
-            try? input.write(contentsOf: value.encodedLine())
+            guard let self, let input = inputHandle, process?.isRunning == true else { return }
+            for line in adapter.encodeUncorrelated(value) {
+                try? input.write(contentsOf: line)
+            }
         }
     }
 
@@ -327,29 +344,35 @@ final class PiRPCClient: PiRuntimeProtocol {
     private func consume(
         _ data: Data,
         generation currentGeneration: RuntimeGeneration,
-        eventHandler: ((JSONValue) -> Void)?
+        eventHandler: ((PiJSONValue) -> Void)?
     ) {
         // A retired generation's buffered output is dropped rather than published.
         guard currentGeneration.isValid, generation === currentGeneration else { return }
         for record in framer.append(data) {
-            guard let value = try? JSONValue.decode(record) else { continue }
-            if value["type"]?.stringValue == "response" {
-                // An unmatched or superseded response is dropped, never re-published as an event.
-                guard let id = value["id"]?.stringValue,
-                      let callback = pending.takeForDelivery(id: id, currentGeneration: currentGeneration)
-                else { continue }
-                DispatchQueue.main.async {
-                    // Re-checked on main: a stop between queueing and execution must not publish.
-                    guard currentGeneration.isValid else { return }
-                    callback(.success(value))
+            // An adapter may need to write back while decoding (protocol acknowledgements,
+            // deferred commands unblocked by a handshake completing).
+            for message in adapter.decode(line: record) {
+                switch message {
+                case let .response(id, value):
+                    // An unmatched or superseded response is dropped, never re-published as an event.
+                    guard let callback = pending.takeForDelivery(id: id, currentGeneration: currentGeneration)
+                    else { continue }
+                    DispatchQueue.main.async {
+                        // Re-checked on main: a stop between queueing and execution must not publish.
+                        guard currentGeneration.isValid else { return }
+                        callback(.success(value))
+                    }
+                case let .event(value):
+                    // The reader captured the owner with this byte chunk. Rebinding during a
+                    // same-process session transition cannot redirect buffered bytes to the new route.
+                    DispatchQueue.main.async {
+                        guard currentGeneration.isValid else { return }
+                        eventHandler?(value)
+                    }
                 }
-            } else {
-                // The reader captured the owner with this byte chunk. Rebinding during a
-                // same-process session transition cannot redirect buffered bytes to the new route.
-                DispatchQueue.main.async {
-                    guard currentGeneration.isValid else { return }
-                    eventHandler?(value)
-                }
+            }
+            if let outbound = (adapter as? AdapterWriteback)?.drainPendingWrites(), !outbound.isEmpty {
+                for line in outbound { try? inputHandle?.write(contentsOf: line) }
             }
         }
     }
@@ -357,14 +380,14 @@ final class PiRPCClient: PiRuntimeProtocol {
     /// Terminal rejections are always delivered so every caller completes exactly once, even
     /// when its generation has just been retired. A command that may already have taken effect
     /// is reported as outcome-unknown rather than a definite failure — exactly like its RPC
-    /// timeout counterpart (`RPCTimeoutPolicy`) — because the process is gone but Pi may have
-    /// durably accepted the command before it died. Only the read-only state queries, which
+    /// timeout counterpart (`RPCTimeoutPolicy`) — because the process is gone but the agent may
+    /// have durably accepted the command before it died. Only the read-only state queries, which
     /// have no side effect to protect, are reported as a definite failure.
     private func rejectPending(processExitMessage: String) {
         for (command, callback) in pending.drainAll() {
             let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
-                ? PiRPCError.processExited(processExitMessage)
-                : PiRPCError.outcomeUnknown(command)
+                ? AgentRuntimeError.processExited(processExitMessage)
+                : AgentRuntimeError.outcomeUnknown(command)
             DispatchQueue.main.async { callback(.failure(error)) }
         }
     }
@@ -384,4 +407,11 @@ final class PiRPCClient: PiRuntimeProtocol {
         generation.invalidate()
         if let process, process.isRunning { PiProcessReaper.reap(process) }
     }
+}
+
+/// An adapter that sometimes has to answer the agent (protocol acknowledgements, permission
+/// replies) as a consequence of decoding, rather than because the app asked for something.
+public protocol AdapterWriteback: AnyObject {
+    /// Lines the adapter accumulated while decoding. Called on the IO queue after each record.
+    func drainPendingWrites() -> [Data]
 }

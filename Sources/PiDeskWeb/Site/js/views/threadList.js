@@ -2,6 +2,7 @@ import { h, mount } from "../dom.js";
 import { relativeTime } from "../time.mjs";
 import { attachPullToRefresh } from "../pulltorefresh.js";
 import { buildThreadTree, flattenTree, isFlatList } from "../folders.mjs";
+import { agentLabel, shouldShowAgentBadge } from "../agents.mjs";
 
 const SKELETON_ROWS = 6;
 // Indentation stops growing past this depth so a deeply nested folder still leaves usable room
@@ -202,6 +203,7 @@ function emptyState(actions, showArchived) {
 
 function renderRow(thread, actions, depth = 0) {
   const title = thread.name || "Untitled";
+  const showAgent = shouldShowAgentBadge(thread.agent);
   return h(
     "button",
     {
@@ -210,7 +212,13 @@ function renderRow(thread, actions, depth = 0) {
       style: indentStyle(depth),
       // The row's own children carry punctuation and abbreviations that read badly aloud, so
       // the whole control gets one clean label instead.
-      "aria-label": [title, thread.folder, thread.unread ? "unread" : null, thread.running ? "running" : null]
+      "aria-label": [
+        title,
+        showAgent ? agentLabel(thread.agent) : null,
+        thread.folder,
+        thread.unread ? "unread" : null,
+        thread.running ? "running" : null
+      ]
         .filter(Boolean)
         .join(", "),
       onclick: () => actions.navigate(`/thread/${encodeURIComponent(thread.id)}`)
@@ -225,10 +233,11 @@ function renderRow(thread, actions, depth = 0) {
         h("span", { class: "row-title" }, title),
         h("span", { class: "row-time" }, relativeTime(thread.updatedAt))
       ),
-      thread.folder || thread.preview
+      showAgent || thread.folder || thread.preview
         ? h(
             "div",
             { class: "row-sub" },
+            showAgent ? h("span", { class: "agent-badge" }, agentLabel(thread.agent)) : null,
             thread.folder ? h("span", { class: "row-folder" }, thread.folder) : null,
             thread.folder && thread.preview ? " \u00b7 " : "",
             thread.preview || ""

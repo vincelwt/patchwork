@@ -1,10 +1,11 @@
+import PiDeskKit
 import Foundation
 import XCTest
 @testable import PiDesktop
 
 // MARK: - Fakes (mirrors the pattern in AppStoreRollbackTests.swift, private to this file)
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -301,10 +302,10 @@ final class AppStoreMessageEditingTests: XCTestCase {
         store.messages.append(message(id: id, role: .user, text: text))
     }
 
-    private func message(id: String, role: MessageRole, text: String) -> ChatMessage {
+    private func message(id: String, role: PiDesktop.MessageRole, text: String) -> ChatMessage {
         ChatMessage(
             id: id, role: role,
-            blocks: [MessageBlock(id: "\(id)-text", kind: .text(text))],
+            blocks: [PiDesktop.MessageBlock(id: "\(id)-text", kind: .text(text))],
             timestamp: Date(), raw: .null
         )
     }

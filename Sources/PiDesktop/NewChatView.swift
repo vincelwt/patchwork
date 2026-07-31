@@ -9,9 +9,11 @@ struct NewChatView: View {
                 Spacer()
                 Text("Start a conversation")
                     .font(PiFont.displayTitle)
-                Text("Start globally, or choose a project folder.")
+                Text(emptyStateDetail)
                     .font(PiFont.body)
                     .foregroundStyle(.secondary)
+                AgentPicker()
+                    .padding(.top, PiTheme.space8)
                 Spacer()
             } else {
                 MessageScrollView(
@@ -30,7 +32,7 @@ struct NewChatView: View {
                 ComposerView(
                     model: store.composer,
                     isStreaming: false,
-                    placeholder: "Describe a task for Pi…",
+                    placeholder: "Describe a task for \(store.newChatAgent.displayName)…",
                     autofocus: true,
                     onSend: { store.submitDraft() }
                 )
@@ -57,6 +59,14 @@ struct NewChatView: View {
         store.selectedFolder.map(WorkspaceOrganization.isGlobalWorkingDirectory) ?? true
     }
 
+    /// Says which agent will run when there is a choice to make, and stays out of the way when
+    /// there is only one installed.
+    private var emptyStateDetail: String {
+        store.installedAgents.count > 1
+            ? "Pick an agent, then start globally or choose a project folder."
+            : "Start globally, or choose a project folder."
+    }
+
     private var workingFolders: [URL] { store.sidebarFolders }
 
     private var folderContext: some View {
@@ -69,7 +79,9 @@ struct NewChatView: View {
                 Text(isGlobal ? "Global" : (store.selectedFolder?.lastPathComponent ?? "Choose a working folder"))
                     .font(PiFont.rowEmphasis)
                     .lineLimit(1)
-                Text(isGlobal ? "Not tied to a project folder" : (store.selectedFolder?.path ?? "Pi uses this as its current directory"))
+                Text(isGlobal
+                    ? "Not tied to a project folder"
+                    : (store.selectedFolder?.path ?? "\(store.newChatAgent.displayName) uses this as its current directory"))
                     .font(PiFont.micro)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)

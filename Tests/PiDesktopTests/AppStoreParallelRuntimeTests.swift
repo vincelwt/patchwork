@@ -1,9 +1,10 @@
+import PiDeskKit
 import Combine
 import Foundation
 import XCTest
 @testable import PiDesktop
 
-private final class ParallelFakeRuntime: PiRuntimeProtocol {
+private final class ParallelFakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -433,7 +434,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         store.selectSession(sessionA)
         store.draft = "task A"
         store.submitDraft()
-        runtimeA.followUpError = PiRPCError.notRunning
+        runtimeA.followUpError = AgentRuntimeError.notRunning
         store.enqueueOutbox(text: "keep A", delivery: .followUp)
         store.selectSession(sessionB)
 
@@ -497,7 +498,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         store.selectSession(sessionA)
         store.draft = "task A"
         store.submitDraft()
-        runtimeA.followUpError = PiRPCError.outcomeUnknown("follow_up")
+        runtimeA.followUpError = AgentRuntimeError.outcomeUnknown("follow_up")
         store.enqueueOutbox(text: "maybe accepted", delivery: .followUp)
 
         runtimeA.onEvent?(.object(["type": .string("agent_settled")]))
@@ -516,7 +517,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
             repository: ParallelFakeRepository(rootURL: directory),
             gitService: ParallelFakeGitService(),
             runtime: runtimeA,
-            runtimeFactory: { newRuntime },
+            runtimeFactory: { _ in newRuntime },
             persistence: AppPersistence(baseURL: directory),
             activityPresenter: ActivityPresenter(),
             isActiveOverride: true
@@ -550,7 +551,7 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
             repository: ParallelFakeRepository(rootURL: directory),
             gitService: ParallelFakeGitService(),
             runtime: runtimeA,
-            runtimeFactory: { spareRuntimes.removeFirst() },
+            runtimeFactory: { _ in spareRuntimes.removeFirst() },
             persistence: AppPersistence(baseURL: directory),
             activityPresenter: ActivityPresenter(),
             sleepPrevention: sleepPrevention,

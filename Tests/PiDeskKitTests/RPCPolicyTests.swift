@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
 final class RPCTimeoutPolicyTests: XCTestCase {
     func testStateQueriesFailAuthoritativelyAndSideEffectsDoNot() {
@@ -27,7 +27,7 @@ final class RPCTimeoutPolicyTests: XCTestCase {
         let error = RPCTimeoutPolicy.error(for: "get_state")
         XCTAssertFalse(RPCFailureHandling.isOutcomeUnknown(error))
         XCTAssertTrue(error.localizedDescription.contains("30 seconds"))
-        XCTAssertFalse(RPCFailureHandling.isOutcomeUnknown(PiRPCError.processExited("gone")))
+        XCTAssertFalse(RPCFailureHandling.isOutcomeUnknown(AgentRuntimeError.processExited("gone")))
     }
 }
 
@@ -88,7 +88,7 @@ final class RPCPendingRegistryTests: XCTestCase {
         let drained = registry.drainAll()
         XCTAssertEqual(drained.count, 3)
         XCTAssertEqual(registry.count, 0)
-        for (_, callback) in drained { callback(.failure(PiRPCError.processExited("stopped"))) }
+        for (_, callback) in drained { callback(.failure(AgentRuntimeError.processExited("stopped"))) }
         XCTAssertEqual(count, 3)
         XCTAssertTrue(registry.drainAll().isEmpty, "A second drain must not re-deliver")
     }
@@ -104,7 +104,7 @@ final class RPCPendingRegistryTests: XCTestCase {
     }
 }
 
-final class PiRPCClientProcessTests: XCTestCase {
+final class AgentRuntimeClientProcessTests: XCTestCase {
     /// A fake RPC process: echoes one response per request after a delay, so a stop that races
     /// an in-flight response is deterministic.
     private static let slowEchoScript = """
@@ -129,8 +129,8 @@ final class PiRPCClientProcessTests: XCTestCase {
     done
     """
 
-    private func client(script: String) -> PiRPCClient {
-        PiRPCClient(
+    private func client(script: String) -> AgentRuntimeClient {
+        AgentRuntimeClient(
             executableOverride: URL(fileURLWithPath: "/bin/sh"),
             argumentsOverride: ["-c", script]
         )
@@ -140,7 +140,7 @@ final class PiRPCClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcomes: [Result<JSONValue, Error>] = []
+        var outcomes: [Result<PiJSONValue, Error>] = []
         let completed = expectation(description: "stale request completes once")
         client.send(type: "get_state", payload: [:]) { result in
             outcomes.append(result)
@@ -190,7 +190,7 @@ final class PiRPCClientProcessTests: XCTestCase {
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
         defer { client.stop() }
 
-        var response: JSONValue?
+        var response: PiJSONValue?
         let answered = expectation(description: "replacement answers")
         client.send(type: "get_state", payload: [:]) { result in
             if case let .success(value) = result { response = value }
@@ -215,7 +215,7 @@ final class PiRPCClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcome: Result<JSONValue, Error>?
+        var outcome: Result<PiJSONValue, Error>?
         let completed = expectation(description: "prompt settles")
         client.send(type: "prompt", payload: ["message": .string("hi")]) { result in
             outcome = result
@@ -236,7 +236,7 @@ final class PiRPCClientProcessTests: XCTestCase {
         let client = self.client(script: Self.slowEchoScript)
         try client.start(cwd: FileManager.default.temporaryDirectory, sessionPath: nil)
 
-        var outcome: Result<JSONValue, Error>?
+        var outcome: Result<PiJSONValue, Error>?
         let completed = expectation(description: "get_state settles")
         client.send(type: "get_state", payload: [:]) { result in
             outcome = result

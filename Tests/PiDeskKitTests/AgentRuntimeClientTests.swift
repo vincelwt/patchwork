@@ -1,8 +1,8 @@
 import Foundation
 import XCTest
-@testable import PiDesktop
+@testable import PiDeskKit
 
-final class PiRPCClientTests: XCTestCase {
+final class AgentRuntimeClientTests: XCTestCase {
     func testChildEnvironmentPinsPWDToTheSelectedWorkingDirectory() {
         let cwd = URL(fileURLWithPath: "/tmp/Pi Desktop Project", isDirectory: true)
         let environment = PiLocator.augmentedEnvironment(
@@ -26,7 +26,7 @@ final class PiRPCClientTests: XCTestCase {
         try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let client = PiRPCClient(
+        let client = AgentRuntimeClient(
             executableOverride: piURL,
             environmentOverrides: [
                 "PI_CODING_AGENT_SESSION_DIR": sessions.path,
@@ -39,7 +39,7 @@ final class PiRPCClientTests: XCTestCase {
         defer { client.stop() }
 
         let responseReceived = expectation(description: "available models response")
-        var capturedResponse: JSONValue?
+        var capturedResponse: PiJSONValue?
         var capturedError: Error?
         client.send(type: "get_available_models", payload: [:]) { result in
             switch result {
@@ -69,7 +69,7 @@ final class PiRPCClientTests: XCTestCase {
         try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let client = PiRPCClient(
+        let client = AgentRuntimeClient(
             executableOverride: piURL,
             environmentOverrides: [
                 "PI_CODING_AGENT_SESSION_DIR": sessions.path,
@@ -82,7 +82,7 @@ final class PiRPCClientTests: XCTestCase {
         defer { client.stop() }
 
         let responseReceived = expectation(description: "get_state response")
-        var capturedResponse: JSONValue?
+        var capturedResponse: PiJSONValue?
         var capturedError: Error?
         client.send(type: "get_state", payload: [:]) { result in
             switch result {

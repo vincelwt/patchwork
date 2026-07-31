@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 
 struct ConversationPageCursor: Hashable, Sendable {
     fileprivate let sourcePath: String
@@ -62,12 +63,20 @@ struct SessionParser {
         let raw: JSONValue
     }
 
-    static func summary(at url: URL, archivedIDs: Set<String> = []) throws -> SessionSummary {
+    static func summary(
+        at url: URL,
+        archivedIDs: Set<String> = [],
+        transcoder: AgentSessionTranscoder = .pi
+    ) throws -> SessionSummary {
         var sessionID = url.deletingPathExtension().lastPathComponent
+        var sawSessionRecord = false
         var cwd = url.deletingLastPathComponent()
         var createdAt: Date?
         var explicitName: String?
         var entries: [String: MinimalEntry] = [:]
+        /// File order, used when an agent's transcript is a linear log with no parent pointers.
+        var order: [String] = []
+        var isSubsession = false
         var lastEntryID: String?
         var messageCount = 0
         var model: String?
@@ -76,17 +85,32 @@ struct SessionParser {
         var metrics = TokenMetrics()
         var pullRequestCreationCallIDs: Set<String> = []
 
-        try JSONLFileReader.read(url: url) { data in
+        try JSONLFileReader.read(url: url) { rawRecord in
             try Task.checkCancellation()
+            guard let data = transcoder.transcode(rawRecord) else { return }
             guard let raw = try? JSONValue.decode(data), let object = raw.objectValue else { return }
             let type = object["type"]?.stringValue ?? "unknown"
 
             if type == "session" {
                 sessionID = object["id"]?.stringValue ?? sessionID
+                sawSessionRecord = true
                 if let path = object["cwd"]?.stringValue { cwd = URL(fileURLWithPath: path) }
+                if object["subsession"]?.boolValue == true { isSubsession = true }
                 createdAt = Date.piDate(object["timestamp"]?.stringValue)
                 return
             }
+
+            // Agents without a session header record (Claude) repeat these on every entry, and
+            // agents that name a thread outside the entry chain emit an id-less `session_info`.
+            // Both are read before the id guard so neither is lost.
+            if !sawSessionRecord {
+                if let path = object["cwd"]?.stringValue { cwd = URL(fileURLWithPath: path) }
+                if let session = object["sessionId"]?.stringValue { sessionID = session }
+            }
+            if type == "session_info", let name = object["name"]?.stringValue, !name.isEmpty {
+                explicitName = name
+            }
+            if type == "usage" { metrics.addUsage(raw["usage"]) }
 
             guard let id = object["id"]?.stringValue else { return }
             let parentID = object["parentId"]?.stringValue
@@ -101,6 +125,10 @@ struct SessionParser {
             case "model_change":
                 provider = object["provider"]?.stringValue ?? provider
                 model = object["modelId"]?.stringValue ?? model
+                // Some agents report the reasoning level as part of the same settings record
+                // rather than as its own entry. Pi never sets this field here, so reading it is
+                // free for Pi and correct for the others.
+                thinkingLevel = object["thinkingLevel"]?.stringValue ?? thinkingLevel
             case "thinking_level_change":
                 thinkingLevel = object["thinkingLevel"]?.stringValue ?? thinkingLevel
             case "message":
@@ -133,6 +161,7 @@ struct SessionParser {
                 break
             }
 
+            if entries[id] == nil { order.append(id) }
             entries[id] = MinimalEntry(
                 id: id,
                 parentID: parentID,
@@ -144,14 +173,19 @@ struct SessionParser {
         }
 
         var activePath: [MinimalEntry] = []
-        var cursor = lastEntryID
-        var visited: Set<String> = []
-        while let id = cursor, !visited.contains(id), let entry = entries[id] {
-            visited.insert(id)
-            activePath.append(entry)
-            cursor = entry.parentID
+        switch transcoder.chain {
+        case .linear:
+            activePath = order.compactMap { entries[$0] }
+        case .parentPointer:
+            var cursor = lastEntryID
+            var visited: Set<String> = []
+            while let id = cursor, !visited.contains(id), let entry = entries[id] {
+                visited.insert(id)
+                activePath.append(entry)
+                cursor = entry.parentID
+            }
+            activePath.reverse()
         }
-        activePath.reverse()
 
         let firstPrompt = activePath.compactMap(\.userText).first?.condensed
         let title = explicitName?.condensed.nonEmpty ?? firstPrompt?.headline(max: 74) ?? "Untitled conversation"
@@ -178,7 +212,8 @@ struct SessionParser {
             metrics: metrics,
             pullRequestURL: createdPullRequest?.createdPullRequestURL,
             pullRequestCreatedAt: createdPullRequest?.createdPullRequestAt,
-            isArchived: archivedIDs.contains(sessionID)
+            isArchived: archivedIDs.contains(sessionID),
+            isSubsession: isSubsession
         )
         summary.prepareSearchKey()
         return summary
@@ -186,27 +221,39 @@ struct SessionParser {
 
     /// Two-pass projection: pass one retains only id/parent/type, then pass two decodes
     /// full JSON exclusively for entries on the final active parent chain.
-    static func conversation(at url: URL) throws -> SessionConversation {
+    static func conversation(at url: URL, transcoder: AgentSessionTranscoder = .pi) throws -> SessionConversation {
         var parents: [String: String?] = [:]
         var lastEntryID: String?
         var rawEntryCount = 0
+        var linearIDs: Set<String> = []
         let decoder = JSONDecoder()
 
-        try JSONLFileReader.read(url: url) { data in
+        try JSONLFileReader.read(url: url) { rawRecord in
             try Task.checkCancellation()
-            guard let header = try? decoder.decode(EntryHeader.self, from: data),
+            guard let data = transcoder.transcode(rawRecord),
+                  let header = try? decoder.decode(EntryHeader.self, from: data),
                   header.type != "session", let id = header.id else { return }
-            parents[id] = header.parentId
+            if transcoder.chain == .linear {
+                linearIDs.insert(id)
+            } else {
+                parents[id] = header.parentId
+            }
             lastEntryID = id
             rawEntryCount += 1
         }
 
         var activeIDs: Set<String> = []
-        var cursor = lastEntryID
-        while let id = cursor, activeIDs.insert(id).inserted {
-            cursor = parents[id] ?? nil
+        switch transcoder.chain {
+        case .linear:
+            activeIDs = linearIDs
+        case .parentPointer:
+            var cursor = lastEntryID
+            while let id = cursor, activeIDs.insert(id).inserted {
+                cursor = parents[id] ?? nil
+            }
         }
         parents.removeAll(keepingCapacity: false)
+        linearIDs.removeAll(keepingCapacity: false)
         try Task.checkCancellation()
 
         // Pass two projects each active entry immediately and releases its raw JSON before
@@ -215,9 +262,10 @@ struct SessionParser {
         var messages: [ChatMessage] = []
         messages.reserveCapacity(activeIDs.count)
         var budget = ImageBudget()
-        try JSONLFileReader.read(url: url) { data in
+        try JSONLFileReader.read(url: url) { rawRecord in
             try Task.checkCancellation()
-            guard let header = try? decoder.decode(EntryHeader.self, from: data),
+            guard let data = transcoder.transcode(rawRecord),
+                  let header = try? decoder.decode(EntryHeader.self, from: data),
                   let id = header.id, activeIDs.contains(id), header.type != "session" else { return }
             autoreleasepool {
                 guard let raw = try? JSONValue.decode(data) else { return }
@@ -289,14 +337,21 @@ struct SessionParser {
     /// an accepted, self-correcting tradeoff for painting instantly.
     /// `windowBytes` defaults to `tailScanWindowBytes`; tests inject a tiny window instead of
     /// allocating real megabytes to exercise truncation deterministically.
-    static func conversationTail(at url: URL, limit: Int, windowBytes: Int = SessionParser.tailScanWindowBytes) throws -> TailScan {
+    static func conversationTail(
+        at url: URL,
+        limit: Int,
+        windowBytes: Int = SessionParser.tailScanWindowBytes,
+        transcoder: AgentSessionTranscoder = .pi
+    ) throws -> TailScan {
         let limits = PageLimits(
             maxScanBytes: windowBytes,
             maxEntries: PageLimits.default.maxEntries,
             maxRecordBytes: min(windowBytes, PageLimits.default.maxRecordBytes),
             chunkBytes: min(windowBytes, PageLimits.default.chunkBytes)
         )
-        let page = try conversationPage(at: url, target: limit, alignToTurnBoundary: false, limits: limits)
+        let page = try conversationPage(
+            at: url, target: limit, alignToTurnBoundary: false, limits: limits, transcoder: transcoder
+        )
         return TailScan(
             conversation: SessionConversation(messages: page.messages, leafID: page.leafID, rawEntryCount: page.rawEntryCount),
             isComplete: page.hasNoMoreHistory
@@ -338,7 +393,8 @@ struct SessionParser {
         target: Int = ConversationPage.defaultMessageTarget,
         alignToTurnBoundary: Bool = true,
         projection: PageProjection = .detailed,
-        limits: PageLimits = .default
+        limits: PageLimits = .default,
+        transcoder: AgentSessionTranscoder = .pi
     ) throws -> ConversationPage {
         let sourcePath = url.standardizedFileURL.path
         if let cursor, cursor.sourcePath != sourcePath { throw ConversationPagingError.invalidCursor }
@@ -373,7 +429,10 @@ struct SessionParser {
         }
 
         func continuation(before offset: UInt64) -> ConversationPageCursor? {
-            guard offset > 0, expectedID != nil || leafID == nil else { return nil }
+            // A linear transcript has no parent pointers to follow, so "more history" is simply
+            // "more bytes"; a chained one may only continue while it still knows what to expect.
+            guard offset > 0 else { return nil }
+            guard transcoder.chain == .linear || expectedID != nil || leafID == nil else { return nil }
             return ConversationPageCursor(
                 sourcePath: sourcePath,
                 beforeOffset: offset,
@@ -391,19 +450,20 @@ struct SessionParser {
                 oldestScannedOffset = record.startOffset
                 guard !record.isOversized else { return result(olderCursor: nil, truncated: true) }
                 guard !record.data.isEmpty,
-                      let header = try? decoder.decode(EntryHeader.self, from: record.data),
+                      let data = transcoder.transcode(record.data),
+                      let header = try? decoder.decode(EntryHeader.self, from: data),
                       header.type != "session", let id = header.id else { continue }
 
-                if let expectedID {
+                if transcoder.chain == .parentPointer, let expectedID {
                     guard id == expectedID else { continue }
-                } else {
+                } else if leafID == nil {
                     leafID = id
                 }
 
                 rawEntryCount += 1
                 var reachedTurnBoundary = false
                 autoreleasepool {
-                    guard let raw = try? JSONValue.decode(record.data) else { return }
+                    guard let raw = try? JSONValue.decode(data) else { return }
                     let entry = RawEntry(id: id, type: header.type ?? "unknown", raw: raw)
                     let message = switch projection {
                     case .detailed:
@@ -421,9 +481,10 @@ struct SessionParser {
                             || entry.type == "compaction" || entry.type == "branch_summary"
                     }
                 }
-                expectedID = header.parentId
-
-                if expectedID == nil { return result(olderCursor: nil, truncated: false) }
+                if transcoder.chain == .parentPointer {
+                    expectedID = header.parentId
+                    if expectedID == nil { return result(olderCursor: nil, truncated: false) }
+                }
                 if collected.count >= max(1, target),
                    (!alignToTurnBoundary || reachedTurnBoundary
                     || collected.count >= ConversationPage.maximumMessageCount) {
@@ -713,7 +774,9 @@ struct SessionParser {
             return systemMessage(id: entry.id, title: "Context compacted", text: entry.raw["summary"]?.stringValue ?? "Earlier context was compacted.", raw: entry.raw)
         case "branch_summary":
             return systemMessage(id: entry.id, title: "Branch summary", text: entry.raw["summary"]?.stringValue ?? "Branch context summary", raw: entry.raw)
-        case "model_change", "thinking_level_change", "session_info", "label", "custom":
+        // `usage` carries token accounting for agents that report it out of band; it is read by
+        // the summary pass and has nothing to render.
+        case "model_change", "thinking_level_change", "session_info", "label", "custom", "usage":
             return nil
         default:
             let fallback = entry.raw.boundedFallback(maxLength: PiTheme.unknownPayloadLimit)

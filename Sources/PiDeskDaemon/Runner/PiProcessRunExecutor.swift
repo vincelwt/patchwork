@@ -30,20 +30,28 @@ struct PiProcessRunExecutor: RunExecuting {
     }
 
     private func runProtocol(_ job: RunJob) async throws -> RunOutcome {
-        guard let piURL = piExecutableOverride ?? PiLocator.resolve() else { throw RunnerError.piNotFound }
+        let agent = job.target.agent
+        // The executable is resolved for the thread's own agent, and the adapter translates this
+        // run's commands into that agent's protocol. Nothing below this line is agent-specific.
+        guard let executable = piExecutableOverride ?? AgentCatalog.executable(for: agent) else {
+            throw RunnerError.agentNotFound(agent)
+        }
 
         let cwd: URL
         let sessionPath: URL?
         switch job.target {
-        case let .existingThread(_, path, cwdPath):
+        case let .existingThread(_, path, cwdPath, _):
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = URL(fileURLWithPath: path)
-        case let .newThread(cwdPath, _):
+        case let .newThread(cwdPath, _, _):
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = nil
         }
-        let environment = PiLocator.augmentedEnvironment(piURL: piURL, cwd: cwd)
-        let session = try PiRPCSession.start(cwd: cwd, sessionPath: sessionPath, piExecutable: piURL, environment: environment)
+        let environment = AgentCatalog.augmentedEnvironment(executable: executable, cwd: cwd)
+        let session = try PiRPCSession.start(
+            cwd: cwd, sessionPath: sessionPath, piExecutable: executable, environment: environment,
+            adapter: AgentAdapterFactory.make(agent)
+        )
         defer { session.stop() }
 
         let stateID = try session.send(type: "get_state")

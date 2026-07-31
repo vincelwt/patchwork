@@ -169,7 +169,7 @@ final class RemoteParityEndpointTests: XCTestCase {
 
         try await settle()
         let job = try XCTUnwrap(executor.executedJobs.first)
-        guard case let .existingThread(threadId, path, cwd) = job.target else {
+        guard case let .existingThread(threadId, path, cwd, _) = job.target else {
             return XCTFail("the first prompt must target the resolved session")
         }
         XCTAssertEqual(threadId, "created-1")

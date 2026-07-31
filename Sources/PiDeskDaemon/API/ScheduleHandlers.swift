@@ -54,7 +54,7 @@ enum ScheduleHandlers {
                 let schedule = Schedule(
                     id: id, name: name, enabled: enabled,
                     target: target, prompt: prompt, mode: body.mode, trigger: body.trigger,
-                    policy: policy, createdAt: now, updatedAt: now, nextRunAt: nextRunAt
+                    policy: policy, agent: body.agent, createdAt: now, updatedAt: now, nextRunAt: nextRunAt
                 )
                 let saved = try await core.scheduleStore.upsert(schedule)
                 core.bus.publish(.schedule(saved))

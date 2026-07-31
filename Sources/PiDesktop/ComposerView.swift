@@ -1,4 +1,5 @@
 import AppKit
+import PiDeskKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -221,37 +222,40 @@ private struct ComposerToolbar: View {
     }
 }
 
-/// `/mode` as a continuous choice from quickest to strongest, which is how the modes actually
-/// differ (model, thinking level, subagents). It disappears as soon as Pi reports a manual
-/// configuration outside that ladder.
+/// The active agent's mode ladder as a continuous choice from most restrained to strongest. For
+/// Pi that is the `/mode` effort ladder (model, thinking level, subagents); for Codex the sandbox
+/// policy; for Claude Code the permission mode. One control, agent-specific stops. It disappears
+/// when the agent has not reported a mode on that ladder.
 struct ModeSlider: View {
     @EnvironmentObject private var store: AppStore
 
-    private var mode: PiMode? { store.statusModel.mode }
+    private var modes: [AgentMode] { store.availableModes }
+    private var mode: AgentMode? { store.currentMode }
+    private var title: String { store.activeCapabilities.modeControlTitle }
 
     @ViewBuilder
     var body: some View {
-        if let mode {
+        if let mode, modes.count > 1 {
+            let rank = modes.firstIndex { $0.id == mode.id } ?? 0
             HStack(spacing: PiTheme.space6) {
-                Text(mode.label)
-                    .font(mode == .ultra ? PiFont.captionEmphasis : PiFont.caption)
-                    .foregroundStyle(mode.piTint)
+                Text(mode.title)
+                    .font(rank == modes.count - 1 ? PiFont.captionEmphasis : PiFont.caption)
+                    .foregroundStyle(PiTheme.effortColor(rank: rank, of: modes.count))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
 
-                // AppKit's slider cannot be restyled, so effort gets its own calm-to-hot track.
-                PiEffortTrack(mode: mode) { store.setMode($0) }
+                // AppKit's slider cannot be restyled, so this gets its own calm-to-hot track.
+                PiEffortTrack(modes: modes, mode: mode) { store.setAgentMode($0.id) }
                     .frame(width: PiTheme.effortTrackWidth, height: PiTheme.effortUltraKnobDiameter)
             }
-            .help("Mode \(mode.label) · \(mode.detail)")
+            .help("\(title) \(mode.title) · \(mode.detail)")
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Effort")
-            .accessibilityValue("\(mode.label), \(mode.detail)")
+            .accessibilityLabel(title)
+            .accessibilityValue("\(mode.title), \(mode.detail)")
             .accessibilityAdjustableAction { direction in
-                guard let current = PiMode.allCases.firstIndex(of: mode) else { return }
-                let next = direction == .increment ? current + 1 : current - 1
-                guard PiMode.allCases.indices.contains(next) else { return }
-                store.setMode(PiMode.allCases[next])
+                let next = direction == .increment ? rank + 1 : rank - 1
+                guard modes.indices.contains(next) else { return }
+                store.setAgentMode(modes[next].id)
             }
         }
     }

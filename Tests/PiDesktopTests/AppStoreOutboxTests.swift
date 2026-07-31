@@ -1,10 +1,11 @@
+import PiDeskKit
 import Foundation
 import XCTest
 @testable import PiDesktop
 
 // MARK: - Fakes (mirrors the pattern in AppStoreMessageEditingTests.swift, private to this file)
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -262,7 +263,7 @@ final class AppStoreOutboxTests: XCTestCase {
     func testSingleEscapeRestoresAFollowUpThatPiDefinitelyRejects() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)
-        runtime.followUpError = PiRPCError.notRunning
+        runtime.followUpError = AgentRuntimeError.notRunning
         store.handleRPCEventForTesting(.object(["type": .string("agent_start")]))
         store.enqueueOutbox(text: "do not lose this", delivery: .followUp)
 

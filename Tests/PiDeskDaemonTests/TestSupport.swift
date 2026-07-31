@@ -50,10 +50,13 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
     private var _createdCwds: [URL] = []
     private var _modelSets: [(String, String)] = []
     private var _thinkingSets: [String] = []
+    private var _agents: [AgentKind] = []
     var created: Int { lock.lock(); defer { lock.unlock() }; return _created }
     var createdCwds: [URL] { lock.lock(); defer { lock.unlock() }; return _createdCwds }
     var modelSets: [(String, String)] { lock.lock(); defer { lock.unlock() }; return _modelSets }
     var thinkingSets: [String] { lock.lock(); defer { lock.unlock() }; return _thinkingSets }
+    /// Which agent each call asked for, so a test can prove the thread's own agent was used.
+    var agents: [AgentKind] { lock.lock(); defer { lock.unlock() }; return _agents }
 
     let thread: PiThread
     var runtime: ThreadRuntimeState
@@ -63,7 +66,8 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
         self.runtime = runtime
     }
 
-    func createIdle(cwd: URL, name: String?) async throws -> PiThread {
+    func createIdle(agent: AgentKind, cwd: URL, name: String?) async throws -> PiThread {
+        recordAgent(agent)
         recordCreate(cwd: cwd)
         var created = thread
         created.cwd = cwd.standardizedFileURL.path
@@ -71,21 +75,32 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
         return created
     }
 
-    func rename(cwd: URL, sessionPath: URL, name: String) async throws {}
+    func rename(agent: AgentKind, cwd: URL, sessionPath: URL, name: String) async throws {
+        recordAgent(agent)
+    }
 
-    func runtimeSnapshot(cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState { runtime }
+    func runtimeSnapshot(agent: AgentKind, cwd: URL, sessionPath: URL) async throws -> ThreadRuntimeState {
+        recordAgent(agent)
+        return runtime
+    }
 
-    func setModel(cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState {
+    func setModel(agent: AgentKind, cwd: URL, sessionPath: URL, provider: String, modelId: String) async throws -> ThreadRuntimeState {
+        recordAgent(agent)
         recordModel(provider, modelId)
         runtime.provider = provider
         runtime.modelId = modelId
         return runtime
     }
 
-    func setThinkingLevel(cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState {
+    func setThinkingLevel(agent: AgentKind, cwd: URL, sessionPath: URL, level: String) async throws -> ThreadRuntimeState {
+        recordAgent(agent)
         recordThinking(level)
         runtime.thinkingLevel = level
         return runtime
+    }
+
+    private func recordAgent(_ agent: AgentKind) {
+        lock.lock(); _agents.append(agent); lock.unlock()
     }
 
     private func recordCreate(cwd: URL) {
@@ -127,7 +142,10 @@ enum TestSupport {
         networkAvailable: @escaping @Sendable () -> Bool = { true },
         interactions: InteractionRegistry = InteractionRegistry(),
         liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
-        threadRPC: ThreadRPCServing? = nil
+        threadRPC: ThreadRPCServing? = nil,
+        /// Seeds another agent's session tree. Pinning Pi's root pins every root, so a test that
+        /// wants a Codex or Claude thread has to say so explicitly.
+        extraSessionRoots: [(agent: AgentKind, url: URL)] = []
     ) -> DaemonCore {
         let settings = DaemonSettings(remoteEnabled: false, port: 0, concurrency: concurrency)
         let sessionRoot = directory.appendingPathComponent("sessions", isDirectory: true)
@@ -141,6 +159,7 @@ enum TestSupport {
             logger: logger(in: directory),
             executor: executor,
             sessionRootURL: sessionRoot,
+            sessionRoots: extraSessionRoots.isEmpty ? nil : [(AgentKind.pi, sessionRoot)] + extraSessionRoots,
             activityDirectoryURL: activityDirectory,
             schedulesFileURL: directory.appendingPathComponent("schedules.json"),
             runHistoryFileURL: directory.appendingPathComponent("runs.jsonl"),
@@ -183,6 +202,23 @@ enum TestSupport {
         var lines = [#"{"type":"session","id":"\#(id)","cwd":"\#(cwd)"}"#]
         if let name { lines.append(#"{"type":"session_info","id":"info","name":"\#(name)"}"#) }
         lines.append(contentsOf: extra)
+        try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+}
+
+extension TestSupport {
+    /// A minimal Codex rollout, in the nested `YYYY/MM/DD` layout Codex actually writes.
+    @discardableResult
+    static func writeCodexRollout(in root: URL, id: String, cwd: String) -> URL {
+        let directory = root.appendingPathComponent("2026/07/31", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("rollout-2026-07-31T00-00-00-\(id).jsonl")
+        let lines = [
+            #"{"timestamp":"2026-07-31T00:00:00.000Z","type":"session_meta","payload":{"session_id":"\#(id)","cwd":"\#(cwd)","timestamp":"2026-07-31T00:00:00.000Z","thread_source":"user"}}"#,
+            #"{"timestamp":"2026-07-31T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"a codex question"}]}}"#,
+            #"{"timestamp":"2026-07-31T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a codex answer"}]}}"#
+        ]
         try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         return url
     }

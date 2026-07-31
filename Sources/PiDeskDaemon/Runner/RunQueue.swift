@@ -17,12 +17,14 @@ actor RunQueue {
     private let logger: DaemonLogger
 
     private var pending: [RunJob] = []
+    /// Agent-qualified exclusion keys (see `RunTarget.exclusionKey`), never bare thread ids, so
+    /// two agents cannot block each other by minting the same session id.
     private var runningThreadIDs: Set<String> = []
     /// Idle sessions temporarily attached for model/thinking RPCs. Queued prompts wait until the
     /// setter has stopped that process, so two Pi runtimes never write one session concurrently.
     private var reservedThreadIDs: Set<String> = []
     private var runningCount = 0
-    private var runningTasks: [String: (threadID: String?, task: Task<Void, Never>)] = [:]
+    private var runningTasks: [String: (threadKey: String?, task: Task<Void, Never>)] = [:]
     private var cancelledRunIDs: Set<String> = []
     private var shutdownRunIDs: Set<String> = []
     private var isShuttingDown = false
@@ -41,36 +43,41 @@ actor RunQueue {
         self.logger = logger
     }
 
-    func activeThreadIDs() -> Set<String> { runningThreadIDs }
+    /// Bare thread ids, because every caller (the scheduler, the activity service) compares these
+    /// against `Thread.id` rather than against a queue key.
+    func activeThreadIDs() -> Set<String> { Set(runningThreadIDs.map(RunTarget.threadID(inExclusionKey:))) }
     func pendingThreadIDs() -> Set<String> { Set(pending.compactMap(\.target.existingThreadID)) }
     func queuedCount() -> Int { pending.count }
     func activeCount() -> Int { runningCount }
 
     /// True if a job for this thread is already running or already waiting its turn \u2014 the
     /// signal `skipIfRunning`/heartbeat-gated triggers consult before enqueueing another one.
-    func isThreadBusy(_ threadID: String) -> Bool {
-        runningThreadIDs.contains(threadID) || reservedThreadIDs.contains(threadID)
-            || pending.contains { $0.target.existingThreadID == threadID }
+    /// `agent` defaults to Pi so a caller that predates multi-agent support keeps its meaning.
+    func isThreadBusy(_ threadID: String, agent: AgentKind = .pi) -> Bool {
+        let key = RunTarget.exclusionKey(agent: agent, threadID: threadID)
+        return runningThreadIDs.contains(key) || reservedThreadIDs.contains(key)
+            || pending.contains { $0.target.exclusionKey == key }
     }
 
-    func reserveRuntime(threadID: String) -> Bool {
-        guard !isThreadBusy(threadID) else { return false }
-        reservedThreadIDs.insert(threadID)
+    func reserveRuntime(threadID: String, agent: AgentKind = .pi) -> Bool {
+        guard !isThreadBusy(threadID, agent: agent) else { return false }
+        reservedThreadIDs.insert(RunTarget.exclusionKey(agent: agent, threadID: threadID))
         return true
     }
 
-    func releaseRuntime(threadID: String) {
-        reservedThreadIDs.remove(threadID)
+    func releaseRuntime(threadID: String, agent: AgentKind = .pi) {
+        reservedThreadIDs.remove(RunTarget.exclusionKey(agent: agent, threadID: threadID))
         pump()
     }
 
     /// `POST /v1/threads/{id}/abort`. Drops queued jobs and cancels the running task; the real
     /// executor then terminates its Pi process, so nothing for this thread can restart afterward.
     @discardableResult
-    func abort(threadId: String) async -> Bool {
-        let cancelled = pending.filter { $0.target.existingThreadID == threadId }
-        pending.removeAll { $0.target.existingThreadID == threadId }
-        let running = runningTasks.first { $0.value.threadID == threadId }
+    func abort(threadId: String, agent: AgentKind = .pi) async -> Bool {
+        let key = RunTarget.exclusionKey(agent: agent, threadID: threadId)
+        let cancelled = pending.filter { $0.target.exclusionKey == key }
+        pending.removeAll { $0.target.exclusionKey == key }
+        let running = runningTasks.first { $0.value.threadKey == key }
         if let running {
             cancelledRunIDs.insert(running.key)
             running.value.task.cancel()
@@ -106,7 +113,8 @@ actor RunQueue {
         let queued = Run(
             id: job.id, scheduleId: job.scheduleId, threadId: job.target.existingThreadID,
             trigger: job.trigger, startedAt: job.queuedAt, status: .queued,
-            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt
+            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt,
+            agent: job.target.agent
         )
         await historyStore.record(queued)
         bus.publish(.run(queued))
@@ -121,7 +129,8 @@ actor RunQueue {
             id: job.id, scheduleId: job.scheduleId, threadId: job.target.existingThreadID,
             trigger: job.trigger, startedAt: job.queuedAt, finishedAt: job.queuedAt,
             status: .skipped, error: reason, summary: nil,
-            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt
+            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt,
+            agent: job.target.agent
         )
         await historyStore.record(run)
         bus.publish(.run(run))
@@ -139,8 +148,8 @@ actor RunQueue {
 
     private func nextRunnableIndex() -> Int? {
         for (index, job) in pending.enumerated() {
-            if let threadID = job.target.existingThreadID,
-               runningThreadIDs.contains(threadID) || reservedThreadIDs.contains(threadID) { continue }
+            if let key = job.target.exclusionKey,
+               runningThreadIDs.contains(key) || reservedThreadIDs.contains(key) { continue }
             return index
         }
         return nil
@@ -148,14 +157,15 @@ actor RunQueue {
 
     private func start(_ job: RunJob) {
         runningCount += 1
-        if let threadID = job.target.existingThreadID { runningThreadIDs.insert(threadID) }
+        if let key = job.target.exclusionKey { runningThreadIDs.insert(key) }
 
         let startedRun = Run(
             id: job.id, scheduleId: job.scheduleId, threadId: job.target.existingThreadID,
             trigger: job.trigger, startedAt: Date(), status: .running,
-            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt
+            occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt,
+            agent: job.target.agent
         )
-        logger.info("Run \(job.id) started (\(job.trigger.rawValue), target=\(job.target.existingThreadID ?? "new thread in \(job.target.cwd)"))")
+        logger.info("Run \(job.id) started (\(job.trigger.rawValue), agent=\(job.target.agent.rawValue), target=\(job.target.existingThreadID ?? "new thread in \(job.target.cwd)"))")
 
         let task = Task {
             await historyStore.record(startedRun)
@@ -163,13 +173,13 @@ actor RunQueue {
             let outcome = await manager.run(job)
             await finish(job: job, outcome: outcome)
         }
-        runningTasks[job.id] = (job.target.existingThreadID, task)
+        runningTasks[job.id] = (job.target.exclusionKey, task)
     }
 
     private func finish(job: RunJob, outcome: RunOutcome) async {
         runningCount -= 1
         runningTasks.removeValue(forKey: job.id)
-        if let threadID = job.target.existingThreadID { runningThreadIDs.remove(threadID) }
+        if let key = job.target.exclusionKey { runningThreadIDs.remove(key) }
 
         var finalOutcome = outcome
         if cancelledRunIDs.remove(job.id) != nil {
@@ -195,7 +205,8 @@ actor RunQueue {
             status: finalOutcome.status, error: finalOutcome.error, summary: finalOutcome.summary,
             occurrenceId: job.occurrenceId, scheduledAt: job.scheduledAt, attempt: job.attempt,
             promptStartedAt: finalOutcome.promptStartedAt,
-            promptAcceptedAt: finalOutcome.promptAcceptedAt, retryable: finalOutcome.retryable
+            promptAcceptedAt: finalOutcome.promptAcceptedAt, retryable: finalOutcome.retryable,
+            agent: job.target.agent
         )
         await historyStore.record(finished)
         bus.publish(.run(finished))

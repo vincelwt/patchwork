@@ -39,7 +39,7 @@ struct StatusBarView: View {
         .background(Color.piTranscript)
         .overlay(alignment: .top) { PiHairline() }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Pi session status")
+        .accessibilityLabel("Agent session status")
     }
 
 }
@@ -80,9 +80,9 @@ private struct RuntimeStateLabel: View {
         }
         if store.isSelectedRuntime, store.runtimeState.isStreaming {
             if store.runtimeState.phase == .waitingForModel {
-                return ("Waiting for first response…", "Pi is preparing the provider request or waiting for its first response", nil)
+                return ("Waiting for first response…", "The agent is preparing the provider request or waiting for its first response", nil)
             }
-            return ("Working", "Pi is working on this turn", nil)
+            return ("Working", "The agent is working on this turn", nil)
         }
         if let session = store.selectedSession, store.isRunning(session) {
             return ("Working", "This conversation is working", nil)

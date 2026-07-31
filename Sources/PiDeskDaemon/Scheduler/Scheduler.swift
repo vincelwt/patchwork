@@ -166,7 +166,7 @@ actor Scheduler {
                 continue
             }
 
-            guard let target = await resolve(schedule.target) else {
+            guard let target = await resolve(schedule.target, agent: schedule.agent) else {
                 await failUnresolvable(schedule, occurrence: occurrence, now: now)
                 continue
             }
@@ -235,7 +235,7 @@ actor Scheduler {
         guard let schedule = await scheduleStore.get(id: scheduleId) else {
             throw DaemonHTTPError.notFound("Schedule \(scheduleId)")
         }
-        guard let target = await resolve(schedule.target) else {
+        guard let target = await resolve(schedule.target, agent: schedule.agent) else {
             throw DaemonHTTPError.badRequest(code: "unresolvable_target", message: "Could not resolve this schedule's target thread.")
         }
         let runID = "run_\(UUID().uuidString)"
@@ -520,21 +520,24 @@ actor Scheduler {
 
     // MARK: - Helpers
 
-    private func resolve(_ target: ScheduleTarget) async -> RunTarget? {
+    /// A thread target's agent comes from the thread itself; only a `newThread` target has to
+    /// remember the one the schedule was created with.
+    private func resolve(_ target: ScheduleTarget, agent: AgentKind?) async -> RunTarget? {
         switch target {
         case let .existingThread(threadId):
             guard let thread = await threadStore.thread(idOrPath: threadId) else { return nil }
-            return .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd)
+            return .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd, agent: thread.agent)
         case let .newThread(cwd, namePattern):
             guard !cwd.isEmpty else { return nil }
-            return .newThread(cwd: cwd, namePattern: namePattern)
+            return .newThread(cwd: cwd, namePattern: namePattern, agent: agent ?? .pi)
         case .other:
             return nil
         }
     }
 
     private func makeJob(id: String, schedule: Schedule, trigger: RunTrigger, queuedAt: Date) async -> RunJob {
-        let target = await resolve(schedule.target) ?? .newThread(cwd: "", namePattern: nil)
+        let target = await resolve(schedule.target, agent: schedule.agent)
+            ?? .newThread(cwd: "", namePattern: nil, agent: schedule.agent ?? .pi)
         return RunJob(
             id: id, scheduleId: schedule.id, trigger: trigger, target: target,
             prompt: schedule.prompt, mode: schedule.mode,
