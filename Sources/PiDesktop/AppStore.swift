@@ -372,8 +372,25 @@ final class AppStore: ObservableObject {
 
     var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
 
-    /// Modes offered for the current agent, ordered least to most permissive.
-    var availableModes: [AgentMode] { activeCapabilities.modes }
+    /// The composer ladder's stops for the current agent, weakest first.
+    ///
+    /// Pi's ladder is its declared `/mode` list. Codex and Claude Code have no comparable
+    /// effort ladder, but they do have a model list, and picking a stronger model is the same
+    /// gesture; agents present those strongest-first, so the ladder reads them in reverse.
+    var availableModes: [AgentMode] {
+        switch activeCapabilities.ladder {
+        case .modes:
+            return activeCapabilities.modes
+        case .models:
+            let models = scopedModels
+            guard models.count > 1 else { return [] }
+            return models.reversed().enumerated().map { rank, model in
+                AgentMode(
+                    id: model.id, title: model.compactLabel, detail: model.detailLabel, rank: rank
+                )
+            }
+        }
+    }
 
     /// Menu/toolbar enablement for the capability-gated actions, so a greyed-out item and the
     /// toast behind it can never disagree about whether the agent supports something.
@@ -401,7 +418,16 @@ final class AppStore: ObservableObject {
     /// line, which is more authoritative than anything the app remembers; the other agents
     /// answer over their protocol and are tracked here.
     var currentMode: AgentMode? {
-        let id = activeAgent == .pi ? statusModel.mode?.rawValue : runtimeMode
+        let id: String?
+        switch activeCapabilities.ladder {
+        case .modes:
+            id = activeAgent == .pi ? statusModel.mode?.rawValue : runtimeMode
+        case .models:
+            // The ladder *is* the model selection, so the runtime's own model is the position.
+            id = currentProviderID.flatMap { provider in
+                currentModelID.map { "\(provider)/\($0)" }
+            }
+        }
         guard let id else { return nil }
         return availableModes.first { $0.id == id }
     }
@@ -1468,7 +1494,11 @@ final class AppStore: ObservableObject {
         await Task.detached(priority: .utility) {
             let url = URL(fileURLWithPath: path)
             return SessionActivityClassifier.readTail(at: url, limit: SessionParser.tailScanWindowBytes)
-                .flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))?.id
+                .flatMap {
+                    SessionParser.latestTerminalAssistantCompletion(
+                        inTail: $0, transcoder: .forSessionPath(path)
+                    )
+                }?.id
         }.value
     }
 
@@ -3357,6 +3387,15 @@ final class AppStore: ObservableObject {
     func setAgentMode(_ mode: String) {
         guard runtimeMatchesCurrentRoute, availableModes.contains(where: { $0.id == mode }) else { return }
         let slot = activeRuntimeSlot
+
+        // For an agent whose ladder is its model list, this control and the model picker are the
+        // same choice, so it goes down the same path rather than inventing a second one.
+        if slot.capabilities.ladder == .models {
+            guard let model = scopedModels.first(where: { $0.id == mode }) else { return }
+            setModel(model)
+            return
+        }
+
         persistence.updateState { $0.agentModes[slot.agent.rawValue] = mode }
 
         if slot.agent == .pi {

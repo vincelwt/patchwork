@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Darwin
 import Foundation
+import PiDeskKit
 
 /// How a session file's tail classifies right now.
 enum SessionRunState: String, Equatable, Sendable {
@@ -86,12 +87,19 @@ enum SessionActivityClassifier {
 
     /// Extracts the last decodable JSONL record from a tail buffer, tolerating a partially
     /// written final line.
-    static func lastEntry(inTail tail: Data) -> JSONValue? {
+    /// How far back to look for a record that means something. Pi writes almost only renderable
+    /// entries, but an agent whose log is mostly bookkeeping (Codex writes token counts and
+    /// world state constantly) can bury the last real entry well beyond the previous four lines,
+    /// and giving up would report every busy Codex thread as idle.
+    static let lastEntryScanLines = 64
+
+    static func lastEntry(inTail tail: Data, transcoder: AgentSessionTranscoder = .pi) -> JSONValue? {
         let lines = tail.split(separator: 0x0A, omittingEmptySubsequences: true)
-        for line in lines.reversed().prefix(4) {
+        for line in lines.reversed().prefix(lastEntryScanLines) {
             var record = Data(line)
             if record.last == 0x0D { record.removeLast() }
-            guard !record.isEmpty, let value = try? JSONValue.decode(record) else { continue }
+            guard !record.isEmpty, let projected = transcoder.transcode(record),
+                  let value = try? JSONValue.decode(projected) else { continue }
             return value
         }
         return nil
@@ -114,9 +122,12 @@ enum SessionActivityClassifier {
         guard let values = try? fresh.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
               let modifiedAt = values.contentModificationDate else { return nil }
         let age = now.timeIntervalSince(modifiedAt)
+        let transcoder = AgentSessionTranscoder.forSessionPath(url.path)
         let tail = readTail(at: fresh)
-        let entry = tail.flatMap(lastEntry(inTail:))
-        let completion = tail.flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))
+        let entry = tail.flatMap { lastEntry(inTail: $0, transcoder: transcoder) }
+        let completion = tail.flatMap {
+            SessionParser.latestTerminalAssistantCompletion(inTail: $0, transcoder: transcoder)
+        }
         let state = classify(lastEntry: entry, age: age)
         return SessionActivity(
             state: state,
@@ -419,8 +430,13 @@ final class SessionActivityMonitor: ObservableObject {
                         tailReads += 1
                         readTail = true
                         let tail = SessionActivityClassifier.readTail(at: url)
-                        entry = tail.flatMap(SessionActivityClassifier.lastEntry(inTail:))
-                        tailCompletion = tail.flatMap(SessionParser.latestTerminalAssistantCompletion(inTail:))
+                        let transcoder = AgentSessionTranscoder.forSessionPath(path)
+                        entry = tail.flatMap {
+                            SessionActivityClassifier.lastEntry(inTail: $0, transcoder: transcoder)
+                        }
+                        tailCompletion = tail.flatMap {
+                            SessionParser.latestTerminalAssistantCompletion(inTail: $0, transcoder: transcoder)
+                        }
                         stamps[path] = fingerprint
                     } else {
                         // Keep both retry signals until this changed/disappeared writer gets one

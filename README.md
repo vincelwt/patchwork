@@ -19,7 +19,7 @@ vocabulary that each adapter translates into.
 | Branching history | yes | linear log | yes |
 | Model list | live query | live query | curated aliases |
 | Thinking level | live | next turn | next launch |
-| Mode control | `/mode` effort ladder | sandbox policy | permission mode |
+| Composer ladder | `/mode` effort | model, weakest to strongest | model, weakest to strongest |
 | Compaction | yes | yes | `/compact` |
 | Mid-turn steering | yes | yes | yes |
 | Edit and resend | yes | linear, no branch | no |

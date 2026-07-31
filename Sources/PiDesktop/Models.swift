@@ -64,6 +64,9 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     /// A subagent transcript that happens to live in the same directory as user threads.
     /// Parsed like any other session but never promoted into the sidebar.
     var isSubsession = false
+    /// True when this summary came from a sampled read of an oversized transcript, so counts
+    /// derived by walking every record (message count) are a lower bound rather than exact.
+    var hasPartialCounts = false
     var searchKey = ""
 
     var capabilities: AgentCapabilities { agent.capabilities }
@@ -76,6 +79,16 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     var displayName: String {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? "Untitled conversation" : clean
+    }
+
+    /// Adopts the agent's own name for this conversation when it keeps one outside the
+    /// transcript. Only replaces a name this app derived itself, so an explicit in-session name
+    /// still wins, and it re-folds the search key so search matches what the sidebar shows.
+    mutating func applyExternalName() {
+        guard let external = agent.externalName(forSessionPath: fileURL.path)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !external.isEmpty else { return }
+        name = external
+        prepareSearchKey()
     }
 
     /// Folded once during summary projection/cache hydration, not per sidebar render.
@@ -210,12 +223,27 @@ struct ToolCallPayload: Hashable, Sendable {
     let arguments: JSONValue
 }
 
+/// A recognised structured section inside a message: an agent's environment block, its memory
+/// citations, an automation's trigger. These are real content rather than unsupported payloads,
+/// so they get a titled, collapsed card instead of the forward-compatibility fallback.
+struct NotePayload: Identifiable, Hashable, Sendable {
+    let id: String
+    /// SF Symbol for the card's leading glyph.
+    let symbol: String
+    let title: String
+    /// One line shown next to the title while collapsed. Empty hides it.
+    let summary: String
+    /// Full text, revealed on expand.
+    let body: String
+}
+
 struct MessageBlock: Identifiable, Hashable, Sendable {
     enum Kind: Hashable, Sendable {
         case text(String)
         case image(ImagePayload)
         case thinking(String)
         case toolCall(ToolCallPayload)
+        case note(NotePayload)
         case unknown(type: String, raw: JSONValue)
     }
 

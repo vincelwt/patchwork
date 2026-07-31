@@ -85,7 +85,12 @@ struct SessionParser {
         var metrics = TokenMetrics()
         var pullRequestCreationCallIDs: Set<String> = []
 
-        try JSONLFileReader.read(url: url) { rawRecord in
+        // A summary is derived from a file that may be appended to constantly, so it is
+        // recomputed whenever that file changes. Reading a multi-hundred-megabyte transcript in
+        // full for that took over a minute per pass; the head and tail carry everything a
+        // sidebar row shows, and `isWindowed` records that the counts are partial.
+        let windowed = JSONLFileReader.isWindowed(url: url)
+        try JSONLFileReader.read(url: url, window: .default) { rawRecord in
             try Task.checkCancellation()
             guard let data = transcoder.transcode(rawRecord) else { return }
             guard let raw = try? JSONValue.decode(data), let object = raw.objectValue else { return }
@@ -110,7 +115,21 @@ struct SessionParser {
             if type == "session_info", let name = object["name"]?.stringValue, !name.isEmpty {
                 explicitName = name
             }
-            if type == "usage" { metrics.addUsage(raw["usage"]) }
+            if type == "usage" {
+                // A cumulative record is the whole running total, so it supersedes what came
+                // before instead of adding to it. That is also what makes the windowed read
+                // correct: the newest one in the tail is the complete figure.
+                if object["cumulative"]?.boolValue == true {
+                    var replacement = TokenMetrics()
+                    replacement.addUsage(raw["usage"])
+                    replacement.contextWindow = object["contextWindow"]?.intValue ?? metrics.contextWindow
+                    replacement.contextTokens = object["contextTokens"]?.intValue ?? metrics.contextTokens
+                    replacement.cost = metrics.cost
+                    metrics = replacement
+                } else {
+                    metrics.addUsage(raw["usage"])
+                }
+            }
 
             guard let id = object["id"]?.stringValue else { return }
             let parentID = object["parentId"]?.stringValue
@@ -213,7 +232,8 @@ struct SessionParser {
             pullRequestURL: createdPullRequest?.createdPullRequestURL,
             pullRequestCreatedAt: createdPullRequest?.createdPullRequestAt,
             isArchived: archivedIDs.contains(sessionID),
-            isSubsession: isSubsession
+            isSubsession: isSubsession,
+            hasPartialCounts: windowed
         )
         summary.prepareSearchKey()
         return summary
@@ -296,13 +316,17 @@ struct SessionParser {
     /// Finds the newest completed assistant answer in a bounded JSONL tail. Pi commits records
     /// with a trailing newline, so an unterminated final fragment is ignored even if it happens
     /// to be temporarily decodable while another process is still writing it.
-    static func latestTerminalAssistantCompletion(inTail tail: Data) -> AssistantCompletion? {
+    static func latestTerminalAssistantCompletion(
+        inTail tail: Data,
+        transcoder: AgentSessionTranscoder = .pi
+    ) -> AssistantCompletion? {
         guard let lastNewline = tail.lastIndex(of: 0x0A) else { return nil }
         let complete = tail[...lastNewline]
         for line in complete.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
             var record = Data(line)
             if record.last == 0x0D { record.removeLast() }
-            guard let entry = try? JSONValue.decode(record),
+            guard let projected = transcoder.transcode(record),
+                  let entry = try? JSONValue.decode(projected),
                   let completion = terminalAssistantCompletion(from: entry) else { continue }
             return completion
         }
@@ -831,6 +855,14 @@ struct SessionParser {
                     fileName: raw["fileName"]?.stringValue,
                     budget: &budget
                 ))
+            case "note":
+                admitted.append(MessageBlock(id: id, kind: .note(NotePayload(
+                    id: id,
+                    symbol: raw["symbol"]?.stringValue ?? "text.alignleft",
+                    title: raw["title"]?.stringValue ?? "Note",
+                    summary: bounded(raw["summary"]?.stringValue ?? "", max: 400),
+                    body: bounded(raw["body"]?.stringValue ?? "", max: 40_000)
+                ))))
             case "toolCall":
                 let call = ToolCallPayload(
                     id: raw["id"]?.stringValue ?? id,

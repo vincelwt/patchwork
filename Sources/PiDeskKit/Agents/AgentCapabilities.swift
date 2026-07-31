@@ -21,6 +21,15 @@ public enum ThinkingApplyStyle: String, Codable, Hashable, Sendable {
     case unsupported
 }
 
+/// What the composer's left-to-right ladder actually changes for an agent.
+public enum AgentLadder: String, Codable, Hashable, Sendable {
+    /// A fixed set of named operating modes the agent declares (Pi's `/mode`).
+    case modes
+    /// The agent's own model list, weakest to strongest. Agents that present models in a picker
+    /// order them strongest-first, so the ladder is that list reversed.
+    case models
+}
+
 /// The agent's analogue of Pi's `/mode` slider: a small ordered set of named operating modes.
 public struct AgentMode: Codable, Hashable, Sendable, Identifiable {
     public let id: String
@@ -45,6 +54,8 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
     public var thinking: ThinkingApplyStyle
     /// Ordered modes for the composer control. Empty hides the control entirely.
     public var modes: [AgentMode]
+    /// Which axis the composer ladder drives.
+    public var ladder: AgentLadder
     /// Human label for the mode control ("Mode", "Approvals", "Permissions").
     public var modeControlTitle: String
     public var canCompact: Bool
@@ -69,6 +80,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         modelSelection: ModelSelectionStyle,
         thinking: ThinkingApplyStyle,
         modes: [AgentMode],
+        ladder: AgentLadder = .modes,
         modeControlTitle: String,
         canCompact: Bool,
         canFork: Bool,
@@ -84,6 +96,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         self.modelSelection = modelSelection
         self.thinking = thinking
         self.modes = modes
+        self.ladder = ladder
         self.modeControlTitle = modeControlTitle
         self.canCompact = canCompact
         self.canFork = canFork
@@ -149,7 +162,8 @@ public extension AgentKind {
                 modelSelection: .queried,
                 thinking: .nextTurn,
                 modes: Self.codexModes,
-                modeControlTitle: "Sandbox",
+                ladder: .models,
+                modeControlTitle: "Model",
                 canCompact: true,
                 canFork: true,
                 canExportHTML: false,
@@ -166,7 +180,8 @@ public extension AgentKind {
                 modelSelection: .aliases,
                 thinking: .relaunch,
                 modes: Self.claudeModes,
-                modeControlTitle: "Permissions",
+                ladder: .models,
+                modeControlTitle: "Model",
                 canCompact: true,
                 canFork: false,
                 canExportHTML: false,

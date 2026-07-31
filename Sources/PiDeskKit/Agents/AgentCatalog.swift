@@ -163,3 +163,13 @@ public enum AgentCatalog {
         return environment
     }
 }
+
+public extension AgentKind {
+    /// The agent's own name for a conversation, when it keeps one outside the transcript.
+    /// Codex does; Pi and Claude Code both write their name into the session file, where the
+    /// ordinary parse already finds it.
+    func externalName(forSessionPath path: String) -> String? {
+        guard self == .codex, let threadID = CodexThreadTitles.threadID(fromRolloutPath: path) else { return nil }
+        return CodexThreadTitles.shared.title(forThreadID: threadID)
+    }
+}

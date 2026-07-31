@@ -153,6 +153,7 @@ struct FileSessionRepository: SessionRepositoryProtocol {
             transcoder: .make(for: candidate.agent)
         )
         summary.agent = candidate.agent
+        summary.applyExternalName()
         return (summary, candidate.fingerprint)
     }
 
@@ -176,6 +177,7 @@ struct FileSessionRepository: SessionRepositoryProtocol {
             try SessionParser.summary(at: fresh, archivedIDs: archivedIDs, transcoder: .make(for: agent))
         }
         summary.agent = agent
+        summary.applyExternalName()
         await summaryCache.store(summary, fingerprint: fingerprint)
         try? await summaryCache.persist()
         return summary

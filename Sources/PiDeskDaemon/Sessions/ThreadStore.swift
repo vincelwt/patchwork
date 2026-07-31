@@ -262,6 +262,7 @@ actor ThreadStore {
         do {
             var thread = try SessionThreadParser.thread(at: url, transcoder: .make(for: agent))
             thread.agent = agent
+            if let external = agent.externalName(forSessionPath: url.path) { thread.name = external }
             return thread
         } catch SessionThreadParser.ParseError.subsession {
             return nil
