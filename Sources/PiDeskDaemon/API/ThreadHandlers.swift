@@ -343,6 +343,17 @@ enum ThreadHandlers {
         live: @Sendable (RuntimeRequesting, Bool) async throws -> ThreadRuntimeState,
         idle: @Sendable () async throws -> ThreadRuntimeState
     ) async throws -> ThreadRuntimeState {
+        // Every runtime route funnels through here, and the idle path attaches
+        // `pi --mode rpc --session <path>`. Pointing that at a Codex rollout or a Claude
+        // transcript would have Pi append its own records to another agent's file, so the
+        // guard belongs here rather than on each route.
+        guard thread.agent == .pi else {
+            throw DaemonHTTPError.conflict(
+                code: "agent_unsupported",
+                message: RunnerError.agentNotExecutable(thread.agent).localizedDescription
+            )
+        }
+
         if await core.leaseStore.isLeased(threadId: thread.id) {
             throw DaemonHTTPError.conflict(
                 code: "thread_leased", message: "The app is currently attached to this thread's runtime."

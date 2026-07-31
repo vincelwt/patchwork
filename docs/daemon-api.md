@@ -166,9 +166,12 @@ client.
 `GET /v1/threads?agent=` filters by exact agent and returns `400 invalid_agent` for a value
 outside the set — a filter that silently matched everything would look like it worked.
 
-Only Pi threads can be *driven* by the daemon today. `POST /v1/threads` with any other agent,
-and `POST /v1/threads/{id}/name` on a non-Pi thread, return a clear `agent_unsupported` error
-instead of launching `pi` against another agent's transcript. Reading (list, detail, messages,
+Only Pi threads can be *driven* by the daemon today. Every route that would attach a runtime —
+`POST /v1/threads`, `POST /v1/threads/{id}/name`, `GET /v1/threads/{id}/runtime`, and both
+`runtime/model` and `runtime/thinking` — returns a clear `agent_unsupported` error for a non-Pi
+thread instead of launching `pi --mode rpc --session` against another agent's transcript, which
+would append Pi's own records to that file. Sending a message to a non-Pi thread is accepted by
+the queue and fails the run with the same explanation. Reading (list, detail, messages,
 images) works for all three. Codex subagent rollouts (`"subsession": true`) are read but never
 listed as threads.
 
