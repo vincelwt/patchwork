@@ -110,7 +110,6 @@ struct NewChatView: View {
                     Label("Global", systemImage: isGlobal ? "checkmark" : "globe")
                 }
                 .accessibilityValue(isGlobal ? "Selected" : "")
-                if !workingFolders.isEmpty { Divider() }
                 ForEach(workingFolders, id: \.path) { folder in
                     let selected = store.selectedFolder?.standardizedFileURL.path == folder.standardizedFileURL.path
                     Button {
@@ -123,6 +122,9 @@ struct NewChatView: View {
                     }
                     .help(folder.path)
                     .accessibilityValue(selected ? "Selected" : folder.path)
+                }
+                Button(action: store.importProjectFolder) {
+                    Label("Import Folder…", systemImage: "folder.badge.plus")
                 }
             } label: {
                 Text("Choose…").font(PiFont.caption)

@@ -148,6 +148,10 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
             return value
         }
         let project = directory.appendingPathComponent("project", isDirectory: true)
+        let imported = directory.appendingPathComponent("imported", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: imported, withIntermediateDirectories: true)
+        store.importProjectFolder(imported)
         let filedProjectSession = session("project-a", cwd: project)
         store.sessions = [
             session("global", cwd: WorkspaceOrganization.globalWorkingDirectory),
@@ -157,12 +161,19 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         let virtualFolder = try XCTUnwrap(store.createVirtualFolder(named: "Filed"))
         store.moveSession(filedProjectSession, toVirtualFolder: virtualFolder.id)
 
-        XCTAssertEqual(store.sidebarFolders.map(\.standardizedFileURL.path), [project.standardizedFileURL.path])
+        XCTAssertEqual(
+            store.sidebarFolders.map(\.standardizedFileURL.path),
+            [imported.standardizedFileURL.path, project.standardizedFileURL.path]
+        )
+
+        let restored = makeStore()
+        XCTAssertEqual(restored.sidebarFolders.map(\.path), [imported.standardizedFileURL.path])
     }
 
     func testDaemonWorktreeMappingKeepsCLIThreadUnderItsSourceProject() async throws {
         let project = directory.appendingPathComponent("project", isDirectory: true)
         let worktree = directory.appendingPathComponent("worktrees/task", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         let file = directory.appendingPathComponent("cli.jsonl")
         var session = SessionSummary(
             id: "cli", fileURL: file, cwd: worktree,

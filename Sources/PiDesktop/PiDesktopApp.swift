@@ -36,6 +36,7 @@ struct PiDesktopApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") { store.openNewChat() }
                     .keyboardShortcut("n", modifiers: .command)
+                Button("Import Folder…", action: store.importProjectFolder)
                 Button("New Virtual Folder…") { store.newVirtualFolderRequested = true }
                     .keyboardShortcut("n", modifiers: [.command, .option])
             }

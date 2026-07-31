@@ -1312,15 +1312,37 @@ final class AppStore: ObservableObject {
         selectedSession?.cwd ?? newChatWorktree ?? selectedFolder
     }
 
-    /// Filesystem projects already known from sidebar conversations. A virtual-folder assignment
-    /// must not make its underlying project disappear from the new-chat chooser.
+    /// The canonical real-project list for both the sidebar and the new-chat chooser. Explicit
+    /// imports remain even before their first conversation; session and organization paths keep
+    /// older state forward-compatible without creating duplicate rows.
     var sidebarFolders: [URL] {
         var seen: Set<String> = []
-        return sessions.compactMap { session in
-            let folder = projectFolder(for: session).standardizedFileURL
-            guard !WorkspaceOrganization.isGlobalWorkingDirectory(folder), seen.insert(folder.path).inserted else { return nil }
-            return folder
+        var folders: [URL] = []
+
+        func append(path: String) {
+            let normalized = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+            guard seen.insert(normalized.path).inserted,
+                  let folder = Self.existingFolder(atPath: normalized.path),
+                  !WorkspaceOrganization.isGlobalWorkingDirectory(folder),
+                  !WorktreeService.isManaged(folder) else { return }
+            folders.append(folder)
         }
+
+        persistence.state.importedFolders.forEach { append(path: $0) }
+        sessions.forEach { append(path: projectFolder(for: $0).path) }
+        // Older builds remembered an explicitly chosen folder only as recent. Treat those paths
+        // as known projects so upgrading does not make a previously available folder disappear.
+        persistence.state.recentFolders.forEach { append(path: $0) }
+        projectFolderAssignments.keys.forEach { append(path: $0) }
+        for folder in virtualFolders {
+            guard let parent = WorkspaceOrganization.effectiveParentID(
+                of: folder,
+                in: virtualFolders,
+                projectAssignments: projectFolderAssignments
+            ), WorkspaceOrganization.virtualFolderID(fromGroupID: parent) == nil else { continue }
+            append(path: parent)
+        }
+        return folders
     }
 
     /// `NSApplication.shared` rather than the `NSApp` global so headless test hosts stay safe.
@@ -2570,8 +2592,48 @@ final class AppStore: ObservableObject {
 
     /// A remembered folder path that still exists, standardized. `nil` for anything moved away.
     static func existingFolder(atPath path: String?) -> URL? {
-        guard let path, FileManager.default.fileExists(atPath: path) else { return nil }
+        var isDirectory: ObjCBool = false
+        guard let path,
+              FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
         return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+
+    /// Opens the system directory picker and imports the chosen real folder into the project
+    /// tree. This is intentionally the one picker path used by the sidebar, File menu, and the
+    /// new-chat scope menu.
+    func importProjectFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Project Folder"
+        panel.prompt = "Import"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = selectedFolder.flatMap {
+            WorkspaceOrganization.isGlobalWorkingDirectory($0) ? nil : $0
+        }
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        importProjectFolder(folder)
+    }
+
+    /// Testable import boundary: only existing real directories become persistent projects.
+    func importProjectFolder(_ url: URL) {
+        guard let folder = Self.existingFolder(atPath: url.path) else {
+            showToast("That folder is no longer available.", style: .warning)
+            return
+        }
+        if WorkspaceOrganization.isGlobalWorkingDirectory(folder) {
+            chooseFolder(folder)
+            showToast("Desktop is already available as Global.", style: .info)
+            return
+        }
+        guard !WorktreeService.isManaged(folder) else {
+            showToast("Import the project folder instead of an app-created worktree.", style: .warning)
+            return
+        }
+        persistence.rememberImportedFolder(folder)
+        chooseFolder(folder)
+        showToast("Imported \(folder.lastPathComponent).", style: .info)
     }
 
     /// Where ⌘N starts: the folder the last chat used, else Global.

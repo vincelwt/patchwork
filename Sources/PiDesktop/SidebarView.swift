@@ -17,6 +17,7 @@ struct SidebarView: View {
         let snapshot = SidebarSnapshot(
             sessions: store.sessions,
             query: store.searchText,
+            projectPaths: store.sidebarFolders.map(\.path),
             virtualFolders: store.virtualFolders,
             assignments: store.virtualFolderAssignments,
             projectAssignments: store.projectFolderAssignments,
@@ -25,6 +26,9 @@ struct SidebarView: View {
         )
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
+            SidebarActionRow(
+                title: "Import folder", symbol: "folder.badge.plus", shortcut: "", action: store.importProjectFolder
+            )
             SidebarActionRow(
                 title: "Automations", symbol: "clock.arrow.2.circlepath", shortcut: "⌥⌘S",
                 action: { store.schedulesPresented = true },
@@ -103,6 +107,7 @@ struct SidebarView: View {
         }
         .contextMenu {
             Button("New Folder…") { store.newVirtualFolderRequested = true }
+            Button("Import Folder…", action: store.importProjectFolder)
         }
         // Search now lives only in the ⌘K quick switcher; `store.searchText` (and the
         // filtering it drives below) stays wired for when a query is ever supplied again.
@@ -282,6 +287,7 @@ struct SidebarSnapshot {
     init(
         sessions: [SessionSummary],
         query: String,
+        projectPaths: [String] = [],
         virtualFolders: [VirtualFolder] = [],
         assignments: [String: String] = [:],
         projectAssignments: [String: String] = [:],
@@ -302,8 +308,12 @@ struct SidebarSnapshot {
                   let folder = virtualFolders.first(where: { $0.id == id }) else { return false }
             return folder.name.lowercased().contains(folded)
         }
+        let visibleProjectPaths = projectPaths.filter {
+            folded.isEmpty || $0.lowercased().contains(folded)
+        }
         activeGroups = Self.groups(
             all.filter { !$0.isArchived },
+            knownProjectPaths: Set(visibleProjectPaths),
             virtualFolders: virtualFolders,
             assignments: assignments,
             projectAssignments: projectAssignments,
@@ -319,6 +329,7 @@ struct SidebarSnapshot {
     /// every session appears exactly once.
     private static func groups(
         _ sessions: [SessionSummary],
+        knownProjectPaths: Set<String>,
         virtualFolders: [VirtualFolder],
         assignments: [String: String],
         projectAssignments: [String: String],
@@ -346,7 +357,7 @@ struct SidebarSnapshot {
             let groupID = WorkspaceOrganization.groupID(forVirtualFolderID: folder.id)
             if virtualByGroupID[groupID] == nil { virtualByGroupID[groupID] = folder }
         }
-        var projectPaths = Set(filesystemSessions.keys)
+        var projectPaths = Set(filesystemSessions.keys).union(knownProjectPaths)
         for folder in virtualFolders {
             guard let parent = WorkspaceOrganization.effectiveParentID(
                 of: folder,
@@ -384,7 +395,7 @@ struct SidebarSnapshot {
             }
             guard projectPaths.contains(groupID) else { return nil }
             let own = (filesystemSessions[groupID] ?? []).sorted { $0.modifiedAt > $1.modifiedAt }
-            guard !own.isEmpty || !children.isEmpty else { return nil }
+            guard knownProjectPaths.contains(groupID) || !own.isEmpty || !children.isEmpty else { return nil }
             return SessionFolderGroup(path: groupID, sessions: own, children: children)
         }
 

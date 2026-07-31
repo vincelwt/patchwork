@@ -399,6 +399,11 @@ final class AppPersistence {
         save()
     }
 
+    func rememberImportedFolder(_ url: URL) {
+        state.rememberImportedFolder(path: url.standardizedFileURL.path)
+        save()
+    }
+
     func setManagedWorktreeProject(_ project: URL?, for worktree: URL) {
         let worktreePath = worktree.standardizedFileURL.path
         let projectPath = project?.standardizedFileURL.path
