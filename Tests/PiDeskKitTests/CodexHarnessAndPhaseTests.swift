@@ -27,16 +27,63 @@ final class CodexHarnessAndPhaseTests: XCTestCase {
 
     // MARK: - Scaffolding
 
+    private func blocks(of record: [String: Any]?) -> [[String: Any]] {
+        ((record?["message"] as? [String: Any])?["content"] as? [[String: Any]]) ?? []
+    }
+
     /// Every one of these was observed as a real `user`-role turn in this machine's rollouts.
-    func testScaffoldingTurnsAreNotTreatedAsTheUserTalking() {
-        for injected in [
-            "<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n\n- Atlassian Rovo",
-            "<environment_context>\n  <current_date>2026-07-31</current_date>\n</environment_context>",
-            "# AGENTS.md instructions for /Users/x/project\n\n<INSTRUCTIONS>\nDo the thing.\n</INSTRUCTIONS>",
-            "## Code review guidelines:\n# Review Guidelines\n\nYou are acting as a reviewer"
+    /// They are Codex's scaffolding, not the user talking, so they become a titled card rather
+    /// than pages of markup in the middle of the conversation.
+    func testScaffoldingBecomesACardRatherThanProse() {
+        for (injected, title) in [
+            ("<recommended_plugins>\nHere is a list of plugins available.\n</recommended_plugins>", "Recommended plugins"),
+            ("<environment_context>\n  <current_date>2026-07-31</current_date>\n</environment_context>", "Environment"),
+            ("# AGENTS.md instructions for /Users/x/project\n\nDo the thing.", "Project instructions"),
+            ("## Code review guidelines:\nYou are acting as a reviewer", "Review guidelines")
         ] {
-            XCTAssertNil(transcode(userMessage(injected)), "expected scaffolding to be dropped: \(injected.prefix(30))")
+            let rendered = blocks(of: transcode(userMessage(injected)))
+            XCTAssertEqual(rendered.count, 1, "expected one card for \(title)")
+            XCTAssertEqual(rendered.first?["type"] as? String, "note")
+            XCTAssertEqual(rendered.first?["title"] as? String, title)
+            XCTAssertFalse((rendered.first?["symbol"] as? String ?? "").isEmpty)
         }
+    }
+
+    /// A card carries no prose, so it cannot become the conversation's name — which is how every
+    /// Codex thread ended up called after the plugin catalogue.
+    func testACardContributesNoTextForNaming() {
+        let rendered = blocks(of: transcode(userMessage("<recommended_plugins>\nplugins\n</recommended_plugins>")))
+        XCTAssertNil(rendered.first?["text"])
+    }
+
+    /// Memory citations trail a real answer; the answer must stay prose and the citation must not.
+    func testMemoryCitationIsSplitOutOfAnAnswer() {
+        let record = transcode("""
+        {"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer",\
+        "content":[{"type":"output_text","text":"Done, the branch is merged.\\n\\n\
+        <oai-mem-citation>\\n<citation_entries>\\nMEMORY.md:25-28|note=[x]\\n</citation_entries>\\n</oai-mem-citation>"}]}}
+        """)
+        let rendered = blocks(of: record)
+        XCTAssertEqual(rendered.count, 2)
+        XCTAssertEqual(rendered.first?["type"] as? String, "text")
+        XCTAssertEqual(rendered.first?["text"] as? String, "Done, the branch is merged.")
+        XCTAssertEqual(rendered.last?["type"] as? String, "note")
+        XCTAssertEqual(rendered.last?["title"] as? String, "Memory")
+    }
+
+    /// An automation's trigger is a card, but its instructions stay readable inside it.
+    func testHeartbeatBecomesAnAutomationCardKeepingItsInstructions() {
+        let rendered = blocks(of: transcode(userMessage(
+            "<heartbeat>\n<automation_id>verify-live</automation_id>\n<instructions>\nCheck the thing.\n</instructions>\n</heartbeat>"
+        )))
+        XCTAssertEqual(rendered.first?["title"] as? String, "Automation trigger")
+        XCTAssertTrue((rendered.first?["body"] as? String ?? "").contains("Check the thing."))
+    }
+
+    /// An unterminated tag is prose, not an excuse to swallow the rest of the message.
+    func testAnUnterminatedTagStaysProse() {
+        let rendered = blocks(of: transcode(userMessage("<environment_context> never closed, and then real words")))
+        XCTAssertEqual(rendered.first?["type"] as? String, "text")
     }
 
     func testARealUserTurnIsKept() {
@@ -55,8 +102,13 @@ final class CodexHarnessAndPhaseTests: XCTestCase {
                        "Does the price cut in Luna become interesting for any of our tasks?")
     }
 
-    func testAWrapperWithNoRequestBodyIsDropped() {
-        XCTAssertNil(transcode(userMessage("# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n\n## My request for Codex:\n   ")))
+    /// The attachment list survives as a card even when the request body is empty.
+    func testAWrapperWithNoRequestBodyKeepsOnlyItsAttachmentCard() {
+        let rendered = blocks(of: transcode(userMessage(
+            "# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n\n## My request for Codex:\n   "
+        )))
+        XCTAssertEqual(rendered.count, 1)
+        XCTAssertEqual(rendered.first?["title"] as? String, "Attachments")
     }
 
     /// An attachment-only turn is a real turn even with no prose.
@@ -91,5 +143,28 @@ final class CodexHarnessAndPhaseTests: XCTestCase {
         "content":[{"type":"output_text","text":"text"}]}}
         """)
         XCTAssertEqual((record?["message"] as? [String: Any])?["stopReason"] as? String, "toolUse")
+    }
+}
+
+/// Claude Code's transcript is an append-only log, not one parent chain: compaction and resume
+/// leave parents pointing at records the file no longer contains. Walking back from the leaf
+/// found 13 of 1,897 real records on this machine, so a conversation rendered as a stub.
+final class ClaudeTranscriptShapeTests: XCTestCase {
+    func testClaudeIsReadInFileOrder() {
+        XCTAssertEqual(AgentSessionTranscoder.make(for: .claude).chain, .linear)
+    }
+
+    /// Pi does keep a real chain, and its branch selection must not change.
+    func testPiStillFollowsItsParentChain() {
+        XCTAssertEqual(AgentSessionTranscoder.make(for: .pi).chain, .parentPointer)
+    }
+
+    /// The parent pointers are still emitted, so nothing is lost if the chain is ever usable.
+    func testParentPointersAreStillRecorded() throws {
+        let transcoder = AgentSessionTranscoder.make(for: .claude)
+        let line = #"{"type":"assistant","uuid":"u2","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#
+        let out = try XCTUnwrap(transcoder.transcode(Data(line.utf8)))
+        let record = try XCTUnwrap((try? JSONSerialization.jsonObject(with: out)) as? [String: Any])
+        XCTAssertEqual(record["parentId"] as? String, "u1")
     }
 }

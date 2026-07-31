@@ -98,21 +98,26 @@ final class AgentSessionTranscoderTests: XCTestCase {
         XCTAssertEqual(blocks?.first?["thinking"] as? String, "**Planning**")
     }
 
-    /// Codex reports cumulative totals plus the last turn's delta. Summing totals would multiply
-    /// the real usage by the number of turns, so only the delta may be emitted.
-    func testCodexTokenCountEmitsLastTurnDeltaWithCacheSplitOut() {
+    /// Codex reports a running total for the whole thread on every turn. Taking that total and
+    /// marking it as superseding is what lets a summary read usage from the file's tail instead
+    /// of walking every record, which on a large rollout took over a minute.
+    func testCodexTokenCountEmitsTheRunningTotalWithCacheSplitOut() {
         let record = transcode(.codex, """
         {"type":"event_msg","payload":{"type":"token_count","info":{\
-        "total_token_usage":{"input_tokens":999999,"output_tokens":999999},\
-        "last_token_usage":{"input_tokens":25818,"cached_input_tokens":25344,\
-        "cache_write_input_tokens":12,"output_tokens":391}}}}
+        "model_context_window":258400,\
+        "total_token_usage":{"input_tokens":25818,"cached_input_tokens":25344,\
+        "cache_write_input_tokens":12,"output_tokens":391,"total_tokens":26209},\
+        "last_token_usage":{"input_tokens":11,"output_tokens":2}}}}
         """)
         XCTAssertEqual(record?["type"] as? String, "usage")
+        XCTAssertEqual(record?["cumulative"] as? Bool, true, "a running total replaces, it does not add")
         let usage = record?["usage"] as? [String: Any]
-        XCTAssertEqual(usage?["input"] as? Int, 474)
+        XCTAssertEqual(usage?["input"] as? Int, 474, "the cached portion is counted separately")
         XCTAssertEqual(usage?["cacheRead"] as? Int, 25344)
         XCTAssertEqual(usage?["cacheWrite"] as? Int, 12)
         XCTAssertEqual(usage?["output"] as? Int, 391)
+        XCTAssertEqual(record?["contextWindow"] as? Int, 258400)
+        XCTAssertEqual(record?["contextTokens"] as? Int, 26209)
     }
 
     func testCodexEventMessageDuplicateOfResponseItemIsDropped() {
@@ -172,7 +177,9 @@ final class AgentSessionTranscoderTests: XCTestCase {
         XCTAssertEqual(message?["provider"] as? String, "anthropic")
         XCTAssertEqual(message?["stopReason"] as? String, "stop")
         XCTAssertEqual((message?["usage"] as? [String: Any])?["cacheWrite"] as? Int, 1)
-        XCTAssertEqual(AgentSessionTranscoder.make(for: .claude).chain, .parentPointer)
+        // Claude's parent pointers routinely dangle (compaction and resume rewrite the file),
+        // so the transcript is read in file order; see `testClaudeIsReadInFileOrder`.
+        XCTAssertEqual(AgentSessionTranscoder.make(for: .claude).chain, .linear)
     }
 
     func testClaudeToolUseBecomesToolCallAndToolResultBecomesToolRole() {
@@ -355,7 +362,7 @@ final class CodexPrefilterTests: XCTestCase {
     /// dropping it on a guess would silently lose token usage.
     func testAnEventMessageWithADistantPayloadTypeFallsThroughInsteadOfGuessing() {
         let padding = String(repeating: "p", count: CodexSessionTranscoder.Prefilter.prefixBytes)
-        let line = #"{"note":"\#(padding)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":3}}}}"#
+        let line = #"{"note":"\#(padding)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":3}}}}"#
         XCTAssertNil(CodexSessionTranscoder.Prefilter.decide(Data(line.utf8)))
         let transcoded = transcoder.transcode(Data(line.utf8))
         XCTAssertEqual((transcoded.flatMap(TranscodeSupport.decode))?["type"] as? String, "usage")

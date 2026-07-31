@@ -137,6 +137,7 @@ final class TranscriptCache: @unchecked Sendable {
                 case let .text(text): return blockTotal + text.utf8.count
                 case let .thinking(text): return blockTotal + text.utf8.count
                 case let .image(image): return blockTotal + image.data.count
+                case let .note(note): return blockTotal + note.body.utf8.count + note.summary.utf8.count
                 case .toolCall, .unknown: return blockTotal + 256
                 }
             }

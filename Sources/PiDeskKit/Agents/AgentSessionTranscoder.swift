@@ -42,7 +42,7 @@ public struct AgentSessionTranscoder: Sendable {
         switch kind {
         case .pi: pi
         case .codex: AgentSessionTranscoder(chain: .linear, transcode: CodexSessionTranscoder.transcode)
-        case .claude: AgentSessionTranscoder(chain: .parentPointer, transcode: ClaudeSessionTranscoder.transcode)
+        case .claude: AgentSessionTranscoder(chain: .linear, transcode: ClaudeSessionTranscoder.transcode)
         }
     }
 }

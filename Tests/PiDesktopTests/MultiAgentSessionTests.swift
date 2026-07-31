@@ -63,7 +63,7 @@ final class MultiAgentSessionTests: XCTestCase {
             #"{"timestamp":"2026-07-30T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codex question"}]}}"#,
             #"{"timestamp":"2026-07-30T10:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"ls\"}"}}"#,
             #"{"timestamp":"2026-07-30T10:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"file.txt"}}"#,
-            #"{"timestamp":"2026-07-30T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":99999},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":7}}}}"#,
+            #"{"timestamp":"2026-07-30T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":7}}}}"#,
             #"{"timestamp":"2026-07-30T10:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex answer"}]}}"#,
             #"{"timestamp":"2026-07-30T10:00:07.000Z","type":"world_state","payload":{"full":true}}"#
         ], to: url)
@@ -139,7 +139,7 @@ final class MultiAgentSessionTests: XCTestCase {
         XCTAssertEqual(summary.preview, "codex question")
         XCTAssertEqual(summary.model, "gpt-5.6-sol")
         XCTAssertEqual(summary.thinkingLevel, "high")
-        // Only the last-turn delta counts, and the cached portion is split out of input.
+        // Codex's running total is the whole figure, and the cached portion is split out.
         XCTAssertEqual(summary.metrics.input, 20)
         XCTAssertEqual(summary.metrics.cacheRead, 10)
         XCTAssertEqual(summary.metrics.output, 7)

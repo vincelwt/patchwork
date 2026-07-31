@@ -182,6 +182,17 @@ struct MessageView: View, Equatable {
                 }
             case let .toolCall(call):
                 ToolCallRow(call: call)
+            case let .note(note):
+                DisclosureRow(
+                    symbol: note.symbol,
+                    title: note.summary.isEmpty ? note.title : "\(note.title) · \(note.summary)"
+                ) {
+                    if note.body.isEmpty {
+                        EmptyView()
+                    } else {
+                        CodeBlockView(language: nil, code: note.body)
+                    }
+                }
             case let .unknown(type, raw):
                 DisclosureRow(symbol: "questionmark.square.dashed", title: "Unsupported content · \(type)") {
                     CodeBlockView(language: nil, code: raw.prettyPrinted(maxLength: PiTheme.unknownPayloadLimit))
