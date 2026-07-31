@@ -73,6 +73,17 @@ final class SidebarPresentationTests: XCTestCase {
         XCTAssertEqual(snapshot.activeGroups.first?.sessions.map(\.id), ["global"])
     }
 
+    func testKnownRealFolderAppearsBeforeItHasAConversation() {
+        let snapshot = SidebarSnapshot(
+            sessions: [],
+            query: "",
+            projectPaths: ["/tmp/imported-project"]
+        )
+
+        XCTAssertEqual(snapshot.activeGroups.map(\.path), ["/tmp/imported-project"])
+        XCTAssertTrue(snapshot.activeGroups.first?.sessions.isEmpty == true)
+    }
+
     func testRunningLabelShowsElapsedTimeUntilTheRowIsHovered() {
         let now = Date()
         let startedAt = now.addingTimeInterval(-125)

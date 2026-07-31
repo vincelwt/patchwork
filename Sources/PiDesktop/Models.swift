@@ -533,6 +533,9 @@ struct PersistedAppState: Codable {
     /// worktree it ran in) without ever touching Pi's own session file.
     var archivedAt: [String: Date] = [:]
     var recentFolders: [String] = []
+    /// Real project folders the user explicitly imported. Kept separately from recency so an
+    /// older import does not disappear merely because other projects were opened afterward.
+    var importedFolders: [String] = []
     /// The folder the last chat was started in, so a new chat reopens where work happens.
     /// App-created worktrees are deliberately never recorded here.
     var lastFolder: String?
@@ -591,6 +594,8 @@ struct PersistedAppState: Codable {
         archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
         archivedAt = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
+        let decodedImports = try container.decodeIfPresent([String].self, forKey: .importedFolders) ?? []
+        importedFolders = Array(decodedImports.prefix(Self.maxImportedFolders))
         lastFolder = try container.decodeIfPresent(String.self, forKey: .lastFolder)
         // Every field this type carries has to be listed here: decoding is explicit, so a
         // property added without a line below is written to disk and silently read back as its
@@ -634,8 +639,15 @@ struct PersistedAppState: Codable {
 
     static let maxRetainedCompletionSessions = 2_000
     static let maxManagedTurnRecoveries = 32
+    static let maxImportedFolders = 256
     static let maxProjectFolderAssignments = 2_000
     static let maxManagedWorktreeProjects = 2_000
+
+    mutating func rememberImportedFolder(path: String) {
+        importedFolders.removeAll { $0 == path }
+        importedFolders.insert(path, at: 0)
+        importedFolders = Array(importedFolders.prefix(Self.maxImportedFolders))
+    }
 
     mutating func setProjectFolderAssignment(projectPath: String, folderID: String?) {
         if let folderID { projectFolderAssignments[projectPath] = folderID }
