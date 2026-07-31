@@ -147,7 +147,7 @@ final class QuestionnaireParserTests: XCTestCase {
     }
 }
 
-private final class QuestionnaireRuntime: PiRuntimeProtocol {
+private final class QuestionnaireRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false

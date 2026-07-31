@@ -29,10 +29,11 @@ enum ThreadsCommand {
     // MARK: - list
 
     private static let listHelp = CommandHelp(
-        usage: "pidesk threads list [--query TEXT] [--running] [--automated] [--archived | --all] [--limit N] [--cursor C] [--json]",
+        usage: "pidesk threads list [--query TEXT] [--agent AGENT] [--running] [--automated] [--archived | --all] [--limit N] [--cursor C] [--json]",
         summary: "List active threads newest first. UUIDs use their compact final segment.",
         flags: [
             FlagSpec("--query", takesValue: true, placeholder: "TEXT", help: "filter by name/preview text"),
+            FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "only one agent's threads: pi, codex, or claude"),
             FlagSpec("--running", takesValue: false, help: "only threads with a run in progress"),
             FlagSpec("--automated", takesValue: false, help: "only threads targeted by an automation"),
             FlagSpec("--archived", takesValue: false, help: "only archived threads"),
@@ -43,6 +44,7 @@ enum ThreadsCommand {
         examples: [
             "pidesk threads list",
             "pidesk threads list --running --json",
+            "pidesk threads list --agent codex --limit 10",
             "pidesk threads list --query \"nightly triage\" --limit 10"
         ]
     )
@@ -60,7 +62,8 @@ enum ThreadsCommand {
                 cursor: parsed.value("--cursor"),
                 archived: parsed.flag("--all") ? nil : parsed.flag("--archived"),
                 running: parsed.flag("--running") ? true : nil,
-                automated: parsed.flag("--automated") ? true : nil
+                automated: parsed.flag("--automated") ? true : nil,
+                agent: try validatedAgent(parsed.value("--agent"))
             )
             if global.jsonOutput {
                 context.out.json(response)
@@ -71,7 +74,7 @@ enum ThreadsCommand {
                 return
             }
             let rows = response.threads.map { Rendering.threadRow($0, colorEnabled: context.out.colorEnabled) }
-            for line in Table.render(headers: ["ID", "NAME", "LOCATION", "STATUS", "UPDATED", "PREVIEW"], rows: rows) {
+            for line in Table.render(headers: ["ID", "AGENT", "NAME", "LOCATION", "STATUS", "UPDATED", "PREVIEW"], rows: rows) {
                 context.out.line(line)
             }
             if let cursor = response.nextCursor {
@@ -117,6 +120,7 @@ enum ThreadsCommand {
             } else {
                 context.out.line("cwd: \(thread.cwd ?? "-")")
             }
+            context.out.line("agent: \(Rendering.threadAgent(thread))")
             context.out.line("status: \(Rendering.threadStatus(thread, colorEnabled: context.out.colorEnabled))   updated: \(FlexibleDate.displayLocal(thread.updatedAt))")
             if let cost = thread.cost { context.out.line("cost: $\(String(format: "%.2f", cost))") }
             context.out.line("")
@@ -136,10 +140,11 @@ enum ThreadsCommand {
     // MARK: - new
 
     private static let newHelp = CommandHelp(
-        usage: "pidesk threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]",
+        usage: "pidesk threads new --cwd DIR [--agent AGENT] [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]",
         summary: "Create a thread. Without --message the session is created idle (no run starts).",
         flags: [
             FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "working directory or source project (required)"),
+            FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "agent to run: pi, codex, or claude (default pi)"),
             FlagSpec("--worktree", takesValue: false, help: "run in a fresh managed git worktree"),
             FlagSpec("--name", takesValue: true, placeholder: "NAME", help: "thread name (default: chosen by the daemon)"),
             FlagSpec("--message", takesValue: true, placeholder: "TEXT", help: "first message to send; \"-\" reads it from stdin"),
@@ -166,7 +171,8 @@ enum ThreadsCommand {
             let response = try await plane.createThread(
                 WireCreateThreadRequest(
                     cwd: cwd, name: parsed.value("--name"), message: message,
-                    mode: parsed.value("--mode"), worktree: parsed.flag("--worktree") ? true : nil
+                    mode: parsed.value("--mode"), worktree: parsed.flag("--worktree") ? true : nil,
+                    agent: try validatedAgent(parsed.value("--agent"))
                 )
             )
             if global.jsonOutput {
@@ -355,6 +361,20 @@ enum ThreadsCommand {
             throw UsageError.custom("stdin was not valid UTF-8 text")
         }
         return text.trimmingCharacters(in: .newlines)
+    }
+
+    /// Caught here rather than at the daemon so a typo costs no round trip and the error names
+    /// the valid agents. The list is the CLI's own, so a newer daemon's agent is still accepted
+    /// on the wire \u2014 it just cannot be typed as a filter until this CLI learns it.
+    static let agents = ["pi", "codex", "claude"]
+
+    private static func validatedAgent(_ raw: String?) throws -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let value = raw.lowercased()
+        guard agents.contains(value) else {
+            throw UsageError.invalidValue(flag: "--agent", value: raw, reason: "expected one of: \(agents.joined(separator: ", "))")
+        }
+        return value
     }
 
     private static func positiveInt(_ raw: String?, flag: String, default value: Int) throws -> Int {

@@ -30,15 +30,19 @@ struct PiProcessRunExecutor: RunExecuting {
     }
 
     private func runProtocol(_ job: RunJob) async throws -> RunOutcome {
-        guard let piURL = piExecutableOverride ?? PiLocator.resolve() else { throw RunnerError.piNotFound }
+        // This executor speaks Pi's `--mode rpc` protocol and nothing else. Launching `pi`
+        // against a Codex or Claude transcript would corrupt it, so an unsupported agent fails
+        // loudly and non-retryably instead.
+        guard job.target.agent == .pi else { throw RunnerError.agentNotExecutable(job.target.agent) }
+        guard let piURL = piExecutableOverride ?? PiLocator.resolve() else { throw RunnerError.agentNotFound(.pi) }
 
         let cwd: URL
         let sessionPath: URL?
         switch job.target {
-        case let .existingThread(_, path, cwdPath):
+        case let .existingThread(_, path, cwdPath, _):
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = URL(fileURLWithPath: path)
-        case let .newThread(cwdPath, _):
+        case let .newThread(cwdPath, _, _):
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = nil
         }

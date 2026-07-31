@@ -34,7 +34,7 @@ enum RPCTimeoutPolicy {
         return .outcomeUnknown(after: sideEffectTimeout)
     }
 
-    static func error(for command: String) -> PiRPCError {
+    static func error(for command: String) -> AgentRuntimeError {
         switch outcome(for: command) {
         case let .authoritativeFailure(after): return .timedOut(command, seconds: after)
         case .outcomeUnknown: return .outcomeUnknown(command)
@@ -54,7 +54,7 @@ enum RPCFailureHandling {
     /// True when the command may still have been applied, so callers must not roll back
     /// drafts, remove optimistic messages, or resubmit.
     static func isOutcomeUnknown(_ error: Error) -> Bool {
-        if case PiRPCError.outcomeUnknown = error { return true }
+        if case AgentRuntimeError.outcomeUnknown = error { return true }
         return false
     }
 }
@@ -84,7 +84,7 @@ final class RuntimeGeneration: @unchecked Sendable {
 
 /// Generation-scoped pending-response registry.
 ///
-/// Extracted from `PiRPCClient` so the race that matters (a late response or a queued
+/// Extracted from `AgentRuntimeClient` so the race that matters (a late response or a queued
 /// callback from a stopped runtime landing in its replacement) is deterministically testable
 /// without spawning a process.
 final class RPCPendingRegistry {

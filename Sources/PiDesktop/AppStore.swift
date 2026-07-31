@@ -76,11 +76,17 @@ private enum ManagedWriterState: Sendable {
     case fileFallback
 }
 
-/// One independent Pi process plus the route-visible state that must follow it when the user
+/// One independent agent process plus the route-visible state that must follow it when the user
 /// switches conversations mid-turn. Idle processes are still reused; only live work is parked.
 private final class RuntimeSlot {
     let id = UUID()
-    let runtime: PiRuntimeProtocol
+    let runtime: AgentRuntimeProtocol
+    /// Which agent this process is. Read from the runtime so a slot can never disagree with the
+    /// binary actually running behind it.
+    var agent: AgentKind { runtime.agent }
+    var capabilities: AgentCapabilities { runtime.agent.capabilities }
+    /// The agent's current operating mode (Pi `/mode`, Codex sandbox, Claude permission mode).
+    var mode: String?
     var sessionPath: String?
     var cwd: String?
     var startedForNewChat = false
@@ -122,12 +128,14 @@ private final class RuntimeSlot {
     var managedProcessStartedAt: Date?
     var isSuperseded = false
 
-    init(runtime: PiRuntimeProtocol) { self.runtime = runtime }
+    init(runtime: AgentRuntimeProtocol) { self.runtime = runtime }
 }
 
+/// Runtime routes are keyed by agent as well as location: a parked Pi process for a folder is
+/// not a usable runtime for a Codex conversation in the same folder.
 private enum RuntimeRouteKey: Hashable {
     case session(String)
-    case newChat(String)
+    case newChat(AgentKind, String)
 }
 
 typealias RuntimeRetirementScheduler = (
@@ -287,6 +295,18 @@ final class AppStore: ObservableObject {
     /// Once submitted, navigation may hide this selection but must never delete its live cwd.
     private var newChatWorktreeSubmitted = false
     @Published var runtimeState = RuntimeState()
+    /// Agents whose executable resolved at launch, in a stable order. Empty means nothing is
+    /// installed, which the new-chat surface reports instead of failing at spawn time.
+    @Published private(set) var installedAgents: [AgentKind] = []
+    /// The agent a new conversation will use. Persisted so the choice survives relaunch.
+    @Published var newChatAgent: AgentKind = .pi {
+        didSet {
+            guard newChatAgent != oldValue else { return }
+            persistence.updateState { $0.lastAgent = newChatAgent.rawValue }
+            // Options are agent-specific, so anything cached for the previous agent is wrong now.
+            if route == .newChat { resetRuntimeOptionsForNewChat() }
+        }
+    }
     @Published private(set) var isOffline = false
     @Published private(set) var isCaffeinated = false
     @Published var liveMetrics = TokenMetrics()
@@ -341,6 +361,50 @@ final class AppStore: ObservableObject {
     /// True only while the ephemeral status probe runtime is attached.
     @Published private(set) var isProbingStatuses = false
     @Published private(set) var unknownRPCEvents: [String] = []
+    /// The operating mode of the attached runtime (Pi `/mode`, Codex sandbox, Claude permission
+    /// mode). Nil when the agent has not reported one yet.
+    @Published var runtimeMode: String?
+
+    /// The agent behind whatever is on screen. Drives every capability-gated affordance.
+    var activeAgent: AgentKind {
+        route == .newChat ? newChatAgent : activeRuntimeSlot.agent
+    }
+
+    var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
+
+    /// Modes offered for the current agent, ordered least to most permissive.
+    var availableModes: [AgentMode] { activeCapabilities.modes }
+
+    /// Menu/toolbar enablement for the capability-gated actions, so a greyed-out item and the
+    /// toast behind it can never disagree about whether the agent supports something.
+    var canCompact: Bool {
+        isSelectedRuntime && !runtimeState.isBusy && activeRuntimeSlot.capabilities.canCompact
+    }
+
+    var canExportHTML: Bool {
+        isSelectedRuntime && activeRuntimeSlot.capabilities.canExportHTML
+    }
+
+    var canEditHistory: Bool {
+        isSelectedRuntime && activeRuntimeSlot.capabilities.canFork
+    }
+
+    /// Whether sidebar rows should carry an agent glyph. On a machine with one agent it is noise
+    /// on every row, so it only appears once history actually spans more than one.
+    var showsAgentBadges: Bool {
+        var seen: Set<AgentKind> = []
+        for session in sessions where seen.insert(session.agent).inserted && seen.count > 1 { return true }
+        return installedAgents.count > 1
+    }
+
+    /// The mode currently in force. Pi reports its own through the `mode` extension's status
+    /// line, which is more authoritative than anything the app remembers; the other agents
+    /// answer over their protocol and are tracked here.
+    var currentMode: AgentMode? {
+        let id = activeAgent == .pi ? statusModel.mode?.rawValue : runtimeMode
+        guard let id else { return nil }
+        return availableModes.first { $0.id == id }
+    }
 
     let activityMonitor: SessionActivityMonitor
 
@@ -349,10 +413,10 @@ final class AppStore: ObservableObject {
     private let pullRequestStateProvider: PullRequestStateProviding
     /// Internal rather than private so focused extensions (the outbox, message editing) can
     /// speak to whichever selected conversation owns the current runtime.
-    var runtime: PiRuntimeProtocol { activeRuntimeSlot.runtime }
+    var runtime: AgentRuntimeProtocol { activeRuntimeSlot.runtime }
     let persistence: AppPersistence
     private let activityPresenter: ActivityPresenting
-    private let runtimeFactory: () -> PiRuntimeProtocol
+    private let runtimeFactory: (AgentKind) -> AgentRuntimeProtocol
     private let connectivityMonitor: ConnectivityMonitor?
     private let runtimeRetirementDelay: TimeInterval
     private let runtimeRetirementScheduler: RuntimeRetirementScheduler
@@ -366,7 +430,7 @@ final class AppStore: ObservableObject {
     private var parkedRuntimes: [RuntimeRouteKey: RuntimeSlot] = [:]
     /// Creates the short-lived `--no-session` runtime used only to refresh extension statuses.
     /// `nil` disables probing entirely (tests never spawn a process).
-    private let probeRuntimeFactory: (() -> PiRuntimeProtocol)?
+    private let probeRuntimeFactory: (() -> AgentRuntimeProtocol)?
     private var bootstrapped = false
     private var activeRuntimePath: String? {
         get { activeRuntimeSlot.sessionPath }
@@ -411,7 +475,7 @@ final class AppStore: ObservableObject {
     private var initialPreviousSeenCompletionID: String?
     private var toastTask: Task<Void, Never>?
     private var dialogTimeoutTask: Task<Void, Never>?
-    private var probeRuntime: PiRuntimeProtocol?
+    private var probeRuntime: AgentRuntimeProtocol?
     private var probeTask: Task<Void, Never>?
     private var probeStatuses: [String: String] = [:]
     private var appCancellables: Set<AnyCancellable> = []
@@ -467,13 +531,13 @@ final class AppStore: ObservableObject {
         repository: SessionRepositoryProtocol = FileSessionRepository(),
         gitService: GitStatusProviding = GitService(),
         pullRequestStateProvider: PullRequestStateProviding = GitHubPullRequestStateService(),
-        runtime: PiRuntimeProtocol = PiRPCClient(),
-        runtimeFactory: @escaping () -> PiRuntimeProtocol = { PiRPCClient() },
+        runtime: AgentRuntimeProtocol = AgentRuntimeClient(),
+        runtimeFactory: @escaping (AgentKind) -> AgentRuntimeProtocol = { AgentRuntimeClient.make(for: $0) },
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
         connectivityMonitor: ConnectivityMonitor? = nil,
-        probeRuntimeFactory: (() -> PiRuntimeProtocol)? = nil,
+        probeRuntimeFactory: (() -> AgentRuntimeProtocol)? = nil,
         notificationService: NotificationPresenting? = nil,
         sleepPrevention: @escaping SleepPreventionHandler = { _ in },
         isActiveOverride: Bool? = nil,
@@ -557,6 +621,16 @@ final class AppStore: ObservableObject {
         draftStore = DraftStore(texts: self.persistence.state.drafts)
         draft = draftStore.text(for: Self.newChatDraftKey)
 
+        // Detection is a filesystem check, cheap enough to do once at launch and honest enough
+        // that an uninstalled agent never appears as a choice that would fail at spawn time.
+        let installed = AgentCatalog.installed()
+        installedAgents = installed
+        let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
+        // Fall back through: remembered choice, first installed agent, then Pi. Never offer an
+        // agent that is not there.
+        newChatAgent = remembered.flatMap { installed.contains($0) ? $0 : nil } ?? installed.first ?? .pi
+        runtimeMode = self.persistence.state.agentModes[newChatAgent.rawValue]
+
         bindRuntime(activeRuntimeSlot)
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in
@@ -611,15 +685,26 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func runtimeKey(cwd: URL, sessionPath: URL?) -> RuntimeRouteKey {
+    private func runtimeKey(agent: AgentKind, cwd: URL, sessionPath: URL?) -> RuntimeRouteKey {
         if let sessionPath { return .session(sessionPath.standardizedFileURL.path) }
-        return .newChat(cwd.standardizedFileURL.path)
+        return .newChat(agent, cwd.standardizedFileURL.path)
     }
 
     private func runtimeKey(for slot: RuntimeSlot) -> RuntimeRouteKey? {
-        if slot.startedForNewChat, let cwd = slot.cwd { return .newChat(cwd) }
+        if slot.startedForNewChat, let cwd = slot.cwd { return .newChat(slot.agent, cwd) }
         if let path = slot.sessionPath { return .session(path) }
         return nil
+    }
+
+    /// Which agent owns a route. An existing conversation belongs to whichever agent wrote its
+    /// transcript, which is never a guess; a new chat belongs to the agent the user picked.
+    func agent(forSessionPath sessionPath: URL?) -> AgentKind {
+        guard let sessionPath else { return newChatAgent }
+        let path = sessionPath.standardizedFileURL.path
+        if let known = sessions.first(where: { $0.fileURL.standardizedFileURL.path == path }) {
+            return known.agent
+        }
+        return repository.agent(for: sessionPath)
     }
 
     private func removeParkedReference(to slot: RuntimeSlot) {
@@ -1176,7 +1261,7 @@ final class AppStore: ObservableObject {
     private var currentRouteKey: RuntimeRouteKey? {
         if let selectedSession { return .session(selectedSession.fileURL.standardizedFileURL.path) }
         guard let selectedExecutionFolder else { return nil }
-        return .newChat(selectedExecutionFolder.standardizedFileURL.path)
+        return .newChat(activeAgent, selectedExecutionFolder.standardizedFileURL.path)
     }
 
     var selectedMetrics: TokenMetrics {
@@ -1810,7 +1895,7 @@ final class AppStore: ObservableObject {
         // of leaving an orphan under ~/.pi/worktrees.
         discardPendingWorktree()
         let newFolder = defaultNewChatFolder
-        if runtimeKey(for: activeRuntimeSlot) != .newChat(newFolder.standardizedFileURL.path) {
+        if runtimeKey(for: activeRuntimeSlot) != .newChat(newChatAgent, newFolder.standardizedFileURL.path) {
             detachActiveRuntimePresentation()
         }
         route = .newChat
@@ -2377,7 +2462,7 @@ final class AppStore: ObservableObject {
         if case .newChat = route, selectedFolder?.standardizedFileURL.path != folder.path {
             discardPendingWorktree()
         }
-        if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(folder.path) {
+        if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(newChatAgent, folder.path) {
             detachActiveRuntimePresentation()
         }
         selectedFolder = folder
@@ -2418,7 +2503,7 @@ final class AppStore: ObservableObject {
                 newChatWorktreeOrigin = folder
                 newChatWorktreeSubmitted = false
                 newChatWorktree = worktree
-                if runtimeKey(for: activeRuntimeSlot) != .newChat(worktree.path) {
+                if runtimeKey(for: activeRuntimeSlot) != .newChat(newChatAgent, worktree.path) {
                     detachActiveRuntimePresentation()
                 }
                 showToast("Worktree ready: \(worktree.lastPathComponent)", style: .info)
@@ -3147,20 +3232,38 @@ final class AppStore: ObservableObject {
             slot.runtime.stop()
         }
         for waiter in readyWaiters {
-            waiter(.failure(PiRPCError.processExited("Pi was stopped.")))
+            waiter(.failure(AgentRuntimeError.processExited("Pi was stopped.")))
         }
         activityMonitor.tickNow()
     }
 
     func compact() {
-        guard isSelectedRuntime else { showToast("Open this conversation with Pi first.", style: .warning); return }
+        guard requireAttachedRuntime(\.canCompact, named: "compaction") else { return }
         runtime.send(type: "compact", payload: [:]) { [weak self] result in
             if case let .failure(error) = result { self?.showToast(error.localizedDescription, style: .error) }
         }
     }
 
+    /// One gate for every capability-dependent action: the runtime has to be attached *and* the
+    /// agent behind it has to actually support the thing, with a truthful message either way.
+    private func requireAttachedRuntime(
+        _ capability: KeyPath<AgentCapabilities, Bool>,
+        named what: String
+    ) -> Bool {
+        guard isSelectedRuntime else {
+            showToast("Open this conversation with \(activeAgent.displayName) first.", style: .warning)
+            return false
+        }
+        let agent = activeRuntimeSlot.agent
+        guard agent.capabilities[keyPath: capability] else {
+            showToast("\(agent.displayName) does not support \(what).", style: .warning)
+            return false
+        }
+        return true
+    }
+
     func exportHTML() {
-        guard isSelectedRuntime else { showToast("Open this conversation with Pi first.", style: .warning); return }
+        guard requireAttachedRuntime(\.canExportHTML, named: "HTML export") else { return }
         runtime.send(type: "export_html", payload: [:]) { [weak self] result in
             guard let self else { return }
             switch result {
@@ -3211,7 +3314,8 @@ final class AppStore: ObservableObject {
                 runtimeState.modelName = value?["name"]?.stringValue ?? model.name
                 runtimeState.provider = value?["provider"]?.stringValue ?? model.provider
                 refreshRuntimeStateAfterPickerChange(slot: slot)
-            case let .success(response): showToast(responseError(response) ?? "Pi rejected the model.", style: .error)
+            case let .success(response):
+                showToast(responseError(response) ?? "\(slot.agent.displayName) rejected the model.", style: .error)
             case let .failure(error): showToast(error.localizedDescription, style: .error)
             }
         }
@@ -3225,10 +3329,64 @@ final class AppStore: ObservableObject {
             switch result {
             case let .success(response) where responseError(response) == nil:
                 runtimeState.thinkingLevel = level
-            case let .success(response): showToast(responseError(response) ?? "Pi rejected the thinking level.", style: .error)
+                // An agent that only carries effort per turn or per launch still has to show the
+                // new level immediately, or the control looks broken.
+                if slot.capabilities.thinking != .live { refreshRuntimeStateAfterPickerChange(slot: slot) }
+            case let .success(response):
+                showToast(responseError(response) ?? "\(slot.agent.displayName) rejected the thinking level.", style: .error)
             case let .failure(error): showToast(error.localizedDescription, style: .error)
             }
         }
+    }
+
+    /// Applies the agent's operating mode: Pi's `/mode` effort ladder, Codex's sandbox policy,
+    /// Claude Code's permission mode. All three are the same control to the user, so they are one
+    /// entry point here even though only Pi's is a slash command rather than a protocol call.
+    func setAgentMode(_ mode: String) {
+        guard runtimeMatchesCurrentRoute, availableModes.contains(where: { $0.id == mode }) else { return }
+        let slot = activeRuntimeSlot
+        persistence.updateState { $0.agentModes[slot.agent.rawValue] = mode }
+
+        if slot.agent == .pi {
+            // Pi's mode lives in an extension, not the RPC surface, and the extension's own
+            // status line is the authoritative reading afterwards.
+            let title = availableModes.first { $0.id == mode }?.title ?? mode
+            runExtensionCommand("/mode \(mode)", successToast: "Mode set to \(title)")
+            return
+        }
+
+        let previous = runtimeMode
+        runtimeMode = mode
+        slot.mode = mode
+        slot.runtime.send(type: "set_mode", payload: ["mode": .string(mode)]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                break
+            case let .success(response):
+                runtimeMode = previous
+                slot.mode = previous
+                showToast(responseError(response) ?? "\(slot.agent.displayName) rejected the mode.", style: .error)
+            case let .failure(error):
+                // Outcome-unknown must not be rolled back: the mode may well have applied.
+                if !RPCFailureHandling.isOutcomeUnknown(error) {
+                    runtimeMode = previous
+                    slot.mode = previous
+                }
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+    }
+
+    /// Clears cached picker choices when the pending new chat switches agents; the old agent's
+    /// models and levels are meaningless for the new one.
+    private func resetRuntimeOptionsForNewChat() {
+        availableModels = []
+        availableThinkingLevels = ["off"]
+        composerOptionsLoading = false
+        runtimeMode = persistence.state.agentModes[newChatAgent.rawValue]
+            ?? newChatAgent.capabilities.modes.first(where: { $0.id == "default" })?.id
+            ?? newChatAgent.capabilities.modes.first?.id
     }
 
     // Kept for menu/status-bar compatibility; composer controls use the explicit RPC setters.
@@ -3686,9 +3844,12 @@ final class AppStore: ObservableObject {
         if probeRuntime != nil { finishProbe() }
         cancelRuntimeRetirementLease()
 
-        let key = runtimeKey(cwd: cwd, sessionPath: sessionPath)
+        // Derived here rather than threaded through every caller: the agent is a property of the
+        // route, and every caller already supplies the route.
+        let agent = agent(forSessionPath: sessionPath)
+        let key = runtimeKey(agent: agent, cwd: cwd, sessionPath: sessionPath)
         if let parked = parkedRuntimes[key] {
-            if parked.runtime.isRunning {
+            if parked.runtime.isRunning, parked.agent == agent {
                 activateRuntime(parked)
                 completeOrWait(for: parked, completion: completion)
                 return
@@ -3696,14 +3857,14 @@ final class AppStore: ObservableObject {
             parkedRuntimes.removeValue(forKey: key)
         }
 
-        if runtime.isRunning, runtimeKey(for: activeRuntimeSlot) == key {
+        if runtime.isRunning, activeRuntimeSlot.agent == agent, runtimeKey(for: activeRuntimeSlot) == key {
             if activePresentationDetached { restoreRuntimePresentation(activeRuntimeSlot) }
             completeOrWait(for: activeRuntimeSlot, completion: completion)
             return
         }
 
         let previous = activeRuntimeSlot
-        if canReuseProcess(previous, in: cwd) {
+        if canReuseProcess(previous, agent: agent, in: cwd) {
             let oldSessionPath = state(for: previous).sessionFile ?? previous.sessionPath
             removeParkedReference(to: previous)
             previous.isSuperseded = true
@@ -3722,15 +3883,24 @@ final class AppStore: ObservableObject {
         let slot: RuntimeSlot
         if shouldPark(previous) {
             guard let currentKey = runtimeKey(for: previous) else {
-                completion(.failure(PiRPCError.processExited("Could not preserve the current Pi run.")))
+                completion(.failure(AgentRuntimeError.processExited(
+                    "Could not preserve the current \(previous.agent.displayName) run."
+                )))
                 return
             }
             saveActiveRuntimePresentation()
             parkedRuntimes[currentKey] = previous
-            slot = RuntimeSlot(runtime: runtimeFactory())
-        } else {
+            slot = RuntimeSlot(runtime: runtimeFactory(agent))
+        } else if previous.agent == agent {
             removeParkedReference(to: previous)
             slot = RuntimeSlot(runtime: previous.runtime)
+        } else {
+            // A different agent needs a different binary, so the idle process cannot be reused
+            // and would otherwise be orphaned: nothing else will ever stop it.
+            removeParkedReference(to: previous)
+            previous.runtime.onEvent = nil
+            previous.runtime.stop()
+            slot = RuntimeSlot(runtime: runtimeFactory(agent))
         }
         bindRuntime(slot)
         activeRuntimeSlot = slot
@@ -3750,8 +3920,9 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func canReuseProcess(_ slot: RuntimeSlot, in cwd: URL) -> Bool {
-        slot.runtime.isRunning
+    private func canReuseProcess(_ slot: RuntimeSlot, agent: AgentKind, in cwd: URL) -> Bool {
+        slot.agent == agent
+            && slot.runtime.isRunning
             && slot.isReady
             && slot.cwd == cwd.standardizedFileURL.path
             && state(for: slot).lastError == nil
@@ -3870,7 +4041,7 @@ final class AppStore: ObservableObject {
                 switch result {
                 case let .failure(value): error = value
                 case let .success(response):
-                    error = PiRPCError.processExited(responseError(response) ?? "Pi rejected get_state.")
+                    error = AgentRuntimeError.processExited(responseError(response) ?? "Pi rejected get_state.")
                 }
                 failRuntimeStart(slot, error: error)
                 return
@@ -5307,7 +5478,7 @@ final class AppStore: ObservableObject {
         isLoadingNewerMessages = false
     }
 
-    private func showToast(_ text: String, style: ToastMessage.Style, sessionPath: String? = nil) {
+    func showToast(_ text: String, style: ToastMessage.Style, sessionPath: String? = nil) {
         toastTask?.cancel()
         withAnimation(.easeOut(duration: 0.2)) {
             toast = ToastMessage(text: text, style: style, sessionPath: sessionPath)

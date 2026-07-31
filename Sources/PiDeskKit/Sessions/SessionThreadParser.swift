@@ -34,12 +34,26 @@ public enum SessionThreadParser {
     /// still listed, as `omitted`, so nothing silently disappears from the transcript.
     public static let imagesPerRequestLimit = 40
 
-    public enum ParseError: Error { case notASession }
+    public enum ParseError: Error {
+        case notASession
+        /// A subagent transcript (Codex marks its rollouts `"subsession": true`). Parseable, but
+        /// a tool's working notes rather than one of the user's threads.
+        case subsession
+    }
 
     /// Single forward pass: every retained value is a scalar accumulator, so memory use does not
     /// grow with session size regardless of how many entries the file contains.
-    public static func thread(at url: URL) throws -> PiThread {
+    ///
+    /// `transcoder` rewrites one foreign record into the Pi shape before it is read, exactly as
+    /// the app's own `SessionParser.summary(at:archivedIDs:transcoder:)` does; `.pi` is identity.
+    /// ponytail: `transcoder.chain` is not consulted here because this parser has no parent walk
+    /// at all — it reads every record in file order — so `.linear` and `.parentPointer` already
+    /// produce the same projection. If a branch-aware summary is ever needed, that is where the
+    /// chain style comes in.
+    public static func thread(at url: URL, transcoder: AgentSessionTranscoder = .pi) throws -> PiThread {
         var sessionID = url.deletingPathExtension().lastPathComponent
+        var sawSessionRecord = false
+        var isSubsession = false
         var cwd = url.deletingLastPathComponent()
         var createdAt: Date?
         var explicitName: String?
@@ -49,19 +63,30 @@ public enum SessionThreadParser {
         var cost = 0.0
         var sawAnyEntry = false
 
-        try JSONLFileReader.read(url: url) { data in
+        try JSONLFileReader.read(url: url) { rawRecord in
             try Task.checkCancellation()
+            guard let data = transcoder.transcode(rawRecord) else { return }
             guard let value = try? PiJSONValue.decode(data), let object = value.objectValue else { return }
             let type = object["type"]?.stringValue ?? "unknown"
             sawAnyEntry = true
 
+            // Agents without a session header record (Claude) repeat `cwd`/`sessionId` on every
+            // conversation entry, and name a thread with an id-less `session_info`. Both are read
+            // before the switch so neither is lost.
+            if !sawSessionRecord, type != "session" {
+                if let path = object["cwd"]?.stringValue, !path.isEmpty { cwd = URL(fileURLWithPath: path) }
+                if let session = object["sessionId"]?.stringValue, !session.isEmpty { sessionID = session }
+            }
+
             switch type {
             case "session":
+                sawSessionRecord = true
                 sessionID = object["id"]?.stringValue ?? sessionID
                 if let path = object["cwd"]?.stringValue, !path.isEmpty { cwd = URL(fileURLWithPath: path) }
+                if object["subsession"]?.boolValue == true { isSubsession = true }
                 createdAt = object["timestamp"]?.stringValue.flatMap(PiDeskDate.date(from:))
             case "session_info":
-                explicitName = object["name"]?.stringValue
+                if let name = object["name"]?.stringValue, !name.isEmpty { explicitName = name }
             case "message":
                 messageCount += 1
                 guard let message = object["message"] else { return }
@@ -88,6 +113,7 @@ public enum SessionThreadParser {
         }
 
         guard sawAnyEntry else { throw ParseError.notASession }
+        guard !isSubsession else { throw ParseError.subsession }
 
         let resourceValues = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
         let modifiedAt = resourceValues?.contentModificationDate ?? createdAt ?? .distantPast
@@ -116,6 +142,8 @@ public enum SessionThreadParser {
             unread: false, // overlaid by the caller from app state, best-effort
             archived: false, // overlaid by the caller from app state, best-effort
             preview: preview,
+            // Overlaid by the caller, which knows which root the file came from.
+            agent: .pi,
             cost: messageCount > 0 ? cost : nil,
             // Only known live, from `get_session_stats`; a static file scan cannot recover it.
             contextPercent: nil
@@ -124,21 +152,24 @@ public enum SessionThreadParser {
 
     /// The last `limit` messages in file order. Reads backward from EOF so opening a 120 MB
     /// conversation costs roughly the size of its visible tail, not the size of its history.
-    public static func messages(at url: URL, limit: Int) throws -> [Message] {
-        try messagePage(at: url, limit: limit, offset: 0, conversationOnly: false).messages
+    public static func messages(
+        at url: URL, limit: Int, transcoder: AgentSessionTranscoder = .pi
+    ) throws -> [Message] {
+        try messagePage(at: url, limit: limit, offset: 0, conversationOnly: false, transcoder: transcoder).messages
     }
 
     /// A bounded page from newest toward oldest. `offset` counts messages after applying the role
     /// filter, so an agent can page through dialogue without tool results shifting every page.
     public static func messagePage(
-        at url: URL, limit: Int, offset: Int, conversationOnly: Bool
+        at url: URL, limit: Int, offset: Int, conversationOnly: Bool,
+        transcoder: AgentSessionTranscoder = .pi
     ) throws -> (messages: [Message], nextOffset: Int?) {
         guard limit > 0, offset >= 0 else { return ([], nil) }
         let pageLimit = min(limit, 500)
         let pageOffset = min(offset, 5_000)
         let target = pageLimit + pageOffset + 1
-        let retained = try tailMessages(at: url, limit: target, conversationOnly: conversationOnly)
-            ?? forwardMessages(at: url, limit: target, conversationOnly: conversationOnly)
+        let retained = try tailMessages(at: url, limit: target, conversationOnly: conversationOnly, transcoder: transcoder)
+            ?? forwardMessages(at: url, limit: target, conversationOnly: conversationOnly, transcoder: transcoder)
         let hasMore = retained.count == target
         let withoutNewer = retained.dropLast(min(pageOffset, retained.count))
         let page = applyImageBudget(to: Array(withoutNewer.suffix(pageLimit)))
@@ -147,12 +178,12 @@ public enum SessionThreadParser {
 
     /// `nil` means the bounded reverse window did not contain enough complete records, so the
     /// caller must use the slower full scan rather than silently return incomplete history.
-    static func tailMessages(at url: URL, limit: Int) throws -> [Message]? {
-        try tailMessages(at: url, limit: limit, conversationOnly: false)
+    static func tailMessages(at url: URL, limit: Int, transcoder: AgentSessionTranscoder = .pi) throws -> [Message]? {
+        try tailMessages(at: url, limit: limit, conversationOnly: false, transcoder: transcoder)
     }
 
     private static func tailMessages(
-        at url: URL, limit: Int, conversationOnly: Bool
+        at url: URL, limit: Int, conversationOnly: Bool, transcoder: AgentSessionTranscoder
     ) throws -> [Message]? {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -172,8 +203,11 @@ public enum SessionThreadParser {
                 try Task.checkCancellation()
                 var record = Data(line)
                 if record.last == 0x0D { record.removeLast() }
+                // The offset is into the *raw* file, so an image id minted here still addresses
+                // the untranscoded record `image(at:imageId:)` will seek back to.
                 let offset = start + UInt64(line.startIndex)
-                guard let value = try? PiJSONValue.decode(record), let object = value.objectValue,
+                guard let transcoded = transcoder.transcode(record),
+                      let value = try? PiJSONValue.decode(transcoded), let object = value.objectValue,
                       let message = wireMessage(from: object, locator: .offset(offset)),
                       !conversationOnly || message.role == .user || message.role == .assistant else { continue }
                 messages.append(message)
@@ -188,16 +222,19 @@ public enum SessionThreadParser {
     }
 
     private static func forwardMessages(
-        at url: URL, limit: Int, conversationOnly: Bool
+        at url: URL, limit: Int, conversationOnly: Bool, transcoder: AgentSessionTranscoder
     ) throws -> [Message] {
         var buffer: [Message] = []
         buffer.reserveCapacity(min(limit, 512))
         var ordinal = 0
-        try JSONLFileReader.read(url: url) { data in
+        try JSONLFileReader.read(url: url) { rawRecord in
             try Task.checkCancellation()
+            // Counted over raw records, including any the transcoder drops, so a legacy ordinal
+            // image id resolves to the same record from both directions.
             let entryOrdinal = ordinal
             ordinal += 1
-            guard let value = try? PiJSONValue.decode(data), let object = value.objectValue,
+            guard let data = transcoder.transcode(rawRecord),
+                  let value = try? PiJSONValue.decode(data), let object = value.objectValue,
                   let message = wireMessage(from: object, locator: .ordinal(entryOrdinal)),
                   !conversationOnly || message.role == .user || message.role == .assistant else { return }
             buffer.append(message)
@@ -452,22 +489,26 @@ public enum SessionThreadParser {
     /// Reads exactly one image back out of the session file by the id `messages(at:limit:)`
     /// handed out. New byte-offset ids seek directly to the record; legacy ordinal ids still scan
     /// forward, so an in-memory older client survives a daemon upgrade.
-    public static func image(at url: URL, imageId: String) throws -> MessageImageResponse? {
+    public static func image(
+        at url: URL, imageId: String, transcoder: AgentSessionTranscoder = .pi
+    ) throws -> MessageImageResponse? {
         guard let target = ImageRef(id: imageId) else { return nil }
         switch target.location {
         case let .offset(offset):
-            guard let data = try record(at: offset, in: url) else { return nil }
+            guard let raw = try record(at: offset, in: url), let data = transcoder.transcode(raw) else { return nil }
             return decodedImage(from: data, target: target, imageId: imageId)
         case let .ordinal(targetOrdinal):
             var ordinal = 0
             var found: MessageImageResponse?
             do {
-                try JSONLFileReader.read(url: url) { data in
+                try JSONLFileReader.read(url: url) { rawRecord in
                     try Task.checkCancellation()
                     let current = ordinal
                     ordinal += 1
                     guard current == targetOrdinal else { return }
-                    found = decodedImage(from: data, target: target, imageId: imageId)
+                    if let data = transcoder.transcode(rawRecord) {
+                        found = decodedImage(from: data, target: target, imageId: imageId)
+                    }
                     throw ScanFinished()
                 }
             } catch is ScanFinished {

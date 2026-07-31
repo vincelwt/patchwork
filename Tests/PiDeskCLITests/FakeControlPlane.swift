@@ -46,11 +46,11 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
     }
 
     func listThreads(
-        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?
+        query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?, agent: String?
     ) async throws -> WireThreadListResponse {
         calls.append(Call(
             method: "listThreads",
-            detail: "query=\(query ?? "") limit=\(limit) cursor=\(cursor ?? "") archived=\(String(describing: archived)) running=\(String(describing: running)) automated=\(String(describing: automated))"
+            detail: "query=\(query ?? "") limit=\(limit) cursor=\(cursor ?? "") archived=\(String(describing: archived)) running=\(String(describing: running)) automated=\(String(describing: automated)) agent=\(agent ?? "")"
         ))
         if let error { throw error }
         return threadListResult
@@ -63,7 +63,7 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
     }
 
     func createThread(_ request: WireCreateThreadRequest) async throws -> WireCreateThreadResponse {
-        calls.append(Call(method: "createThread", detail: "cwd=\(request.cwd) name=\(request.name ?? "") message=\(request.message ?? "") mode=\(request.mode ?? "")"))
+        calls.append(Call(method: "createThread", detail: "cwd=\(request.cwd) name=\(request.name ?? "") message=\(request.message ?? "") mode=\(request.mode ?? "") agent=\(request.agent ?? "")"))
         lastCreateThreadRequest = request
         if let error { throw error }
         return createThreadResult

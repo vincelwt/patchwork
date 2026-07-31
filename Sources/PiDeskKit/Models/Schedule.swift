@@ -16,6 +16,8 @@ public struct QuietHours: Codable, Hashable, Sendable {
 }
 
 /// `{"kind":"existingThread","threadId":"…"}` or `{"kind":"newThread","cwd":"…","namePattern":"…"}`.
+/// The agent lives on `Schedule.agent`, not here: an `existingThread` target already resolves to
+/// a thread that knows its own agent, and only a `newThread` target has to remember one.
 /// `.other` preserves an unrecognised kind (from a newer daemon/CLI) instead of failing decode;
 /// the daemon rejects it at creation time the same way it rejects an unparseable cron expression.
 public enum ScheduleTarget: Hashable, Sendable {
@@ -207,6 +209,9 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
     public var mode: String?
     public var trigger: ScheduleTrigger
     public var policy: SchedulePolicy
+    /// Which agent this schedule runs. Absent in every pre-multi-agent `schedules.json`, which
+    /// means Pi.
+    public var agent: AgentKind?
     public var createdAt: Date
     public var updatedAt: Date
     public var lastRunAt: Date?
@@ -225,6 +230,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         mode: String? = nil,
         trigger: ScheduleTrigger,
         policy: SchedulePolicy = SchedulePolicy(),
+        agent: AgentKind? = nil,
         createdAt: Date,
         updatedAt: Date,
         lastRunAt: Date? = nil,
@@ -240,6 +246,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         self.mode = mode
         self.trigger = trigger
         self.policy = policy
+        self.agent = agent
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.lastRunAt = lastRunAt
@@ -258,6 +265,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         mode = try container.decodeIfPresent(String.self, forKey: .mode)
         trigger = try container.decode(ScheduleTrigger.self, forKey: .trigger)
         policy = try container.decodeIfPresent(SchedulePolicy.self, forKey: .policy) ?? SchedulePolicy()
+        agent = try container.decodeIfPresent(AgentKind.self, forKey: .agent)
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
         lastRunAt = try container.decodeIfPresent(Date.self, forKey: .lastRunAt)
@@ -279,6 +287,7 @@ public struct ScheduleCreateRequest: Codable, Sendable {
     public var mode: String?
     public var trigger: ScheduleTrigger
     public var policy: SchedulePolicy?
+    public var agent: AgentKind?
 
     public init(
         idempotencyKey: String? = nil,
@@ -288,7 +297,8 @@ public struct ScheduleCreateRequest: Codable, Sendable {
         prompt: String,
         mode: String? = nil,
         trigger: ScheduleTrigger,
-        policy: SchedulePolicy? = nil
+        policy: SchedulePolicy? = nil,
+        agent: AgentKind? = nil
     ) {
         self.idempotencyKey = idempotencyKey
         self.name = name
@@ -298,6 +308,7 @@ public struct ScheduleCreateRequest: Codable, Sendable {
         self.mode = mode
         self.trigger = trigger
         self.policy = policy
+        self.agent = agent
     }
 }
 

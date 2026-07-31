@@ -16,6 +16,7 @@ import {
   statusLabel
 } from "../pending.mjs";
 import { applyInteractionLoad } from "../interactions.mjs";
+import { agentLabel, shouldShowAgentBadge } from "../agents.mjs";
 import { imageCache, ImageCacheBusyError } from "../imagecache.mjs";
 import { renderInteraction } from "./interaction.js";
 import {
@@ -107,6 +108,7 @@ export function renderThreadView(state, actions, threadId) {
   const titleBtn = h("button", { class: "thread-title", type: "button", "aria-label": "Rename thread", onclick: onRenameStart });
   const titleInput = h("input", { type: "text", class: "visually-hidden", "aria-hidden": "true", "aria-label": "Thread name" });
   const cwdEl = h("div", { class: "cwd" });
+  const agentEl = h("span", { class: "agent-badge", hidden: true });
   // A word, not a glyph: "archive" has no icon a reader can be expected to guess, and the label
   // has to say which way the toggle goes.
   const archiveBtn = h("button", { class: "link-btn topbar-action", type: "button", onclick: onToggleArchive }, "Archive");
@@ -188,7 +190,7 @@ export function renderThreadView(state, actions, threadId) {
       "header",
       { class: "topbar" },
       h("button", { class: "icon-btn icon-btn-back", type: "button", "aria-label": "Back to threads", onclick: () => actions.navigate("/") }, "\u2039"),
-      h("div", { class: "thread-header" }, h("div", null, titleBtn, titleInput), cwdEl),
+      h("div", { class: "thread-header" }, h("div", null, titleBtn, titleInput), h("div", { class: "thread-subhead" }, agentEl, cwdEl)),
       archiveBtn
     ),
     scroll,
@@ -476,6 +478,10 @@ export function renderThreadView(state, actions, threadId) {
     scroll.setAttribute("aria-label", name);
     cwdEl.textContent = thread?.cwd || "";
     cwdEl.hidden = !thread?.cwd;
+    // Only non-Pi threads carry a badge: Pi is the historical default and labelling every thread
+    // would be noise on a machine that only runs Pi.
+    agentEl.hidden = !shouldShowAgentBadge(thread?.agent);
+    agentEl.textContent = agentLabel(thread?.agent);
     runStatus.hidden = !thread?.running;
     sendBtn.textContent = thread?.running ? "Steer" : "Send";
     archiveBtn.textContent = thread?.archived ? "Unarchive" : "Archive";

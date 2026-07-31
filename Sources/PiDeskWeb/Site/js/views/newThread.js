@@ -1,5 +1,6 @@
 import { h, mount } from "../dom.js";
 import { describeError } from "../api.js";
+import { AGENTS } from "../agents.mjs";
 
 const MODES = ["xfast", "fast", "smart", "ultra"];
 
@@ -143,6 +144,14 @@ export function renderNewThread(state, actions) {
     )
   );
 
+  // A plain select: the daemon validates the value and says plainly when it cannot drive an
+  // agent, so this never has to know which agents are installed on the Mac.
+  const agentSelect = h(
+    "select",
+    { id: "new-agent" },
+    AGENTS.map((agent) => h("option", { value: agent.id }, agent.label))
+  );
+
   const nameInput = h("input", { id: "new-name", type: "text", name: "name", placeholder: "Untitled", autocomplete: "off" });
   const messageInput = h("textarea", { id: "new-message", name: "message", rows: "3", placeholder: "Leave blank to create an idle thread" });
   const errorBox = h("div", { class: "inline-error", role: "alert", hidden: true });
@@ -167,7 +176,8 @@ export function renderNewThread(state, actions) {
             cwd,
             name: nameInput.value.trim() || undefined,
             message: messageInput.value.trim() || undefined,
-            mode: mode ? mode.dataset.mode : undefined
+            mode: mode ? mode.dataset.mode : undefined,
+            agent: agentSelect.value || undefined
           })
           .catch((err) => {
             errorBox.hidden = false;
@@ -188,6 +198,7 @@ export function renderNewThread(state, actions) {
       h("div", { class: "field-hint", id: "new-cwd-hint" }, "Pick a recent folder or type any path on the Mac.")
     ),
     worktreeField,
+    h("div", { class: "field" }, h("label", { for: "new-agent" }, "Agent"), agentSelect),
     h("div", { class: "field" }, h("label", { for: "new-name" }, "Name (optional)"), nameInput),
     h(
       "div",

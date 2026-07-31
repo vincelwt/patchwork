@@ -111,7 +111,7 @@ struct ConversationView: View {
             Button("Rename") { store.renameSelectedSession(renameValue) }
                 .disabled(renameValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         } message: {
-            Text("The name is stored in the Pi session without contacting a model.")
+            Text("The name is stored in the session file without contacting a model.")
         }
     }
 
@@ -140,6 +140,7 @@ struct ConversationView: View {
                     ComposerView(
                         model: store.composer,
                         isStreaming: store.isSelectedRuntime && store.runtimeState.isBusy,
+                        placeholder: "Ask \(store.activeAgent.displayName) anything…",
                         autofocus: true,
                         focusSignal: composerFocusTick,
                         onSend: {
@@ -214,9 +215,9 @@ struct ConversationView: View {
                     }
                     Divider()
                     Button("Compact Context", action: store.compact)
-                        .disabled(!store.isSelectedRuntime || store.runtimeState.isBusy)
+                        .disabled(!store.canCompact)
                     Button("Export as HTML…", action: store.exportHTML)
-                        .disabled(!store.isSelectedRuntime)
+                        .disabled(!store.canExportHTML)
                     Divider()
                     Button("Reveal Session File") {
                         if let file = store.selectedSession?.fileURL { NSWorkspace.shared.activateFileViewerSelecting([file]) }
@@ -278,7 +279,7 @@ struct ConversationView: View {
             VStack(spacing: PiTheme.space6) {
                 Text("Ready for a new turn")
                     .font(PiFont.title)
-                Text("Send a message to resume this Pi session.")
+                Text("Send a message to resume this \(store.activeAgent.displayName) session.")
                     .font(PiFont.caption)
                     .foregroundStyle(.secondary)
             }

@@ -1,4 +1,5 @@
 import AppKit
+import PiDeskKit
 import SwiftUI
 
 /// The model and thinking controls are the same two views everywhere they appear, so the
@@ -29,11 +30,13 @@ extension AppStore {
         return composerOptionsLoading ? "loading" : "unavailable"
     }
 
-    /// The RPC model list narrowed to what Pi itself has enabled in `settings.json`. Falls
-    /// back to the unfiltered list whenever there is no scoping information to read — degrade
-    /// to "show everything", never to "show nothing".
+    /// The model list narrowed to what Pi itself has enabled in `settings.json`. Falls back to
+    /// the unfiltered list whenever there is no scoping information to read — degrade to "show
+    /// everything", never to "show nothing". Scoping is Pi's own policy file, so it is applied
+    /// only to Pi: running it over Codex's or Claude's models would reject every entry.
     var scopedModels: [AvailableModel] {
-        PiModelScope.scoped(
+        guard activeAgent == .pi else { return availableModels }
+        return PiModelScope.scoped(
             availableModels,
             by: PiModelScopeCache.shared.current(),
             currentProvider: currentProviderID,
@@ -41,12 +44,26 @@ extension AppStore {
         )
     }
 
+    /// Only an agent that answers a live model query has anything to cycle through.
+    private var allowsPickerCycling: Bool { activeCapabilities.modelSelection == .queried }
+
     var modelPickerPresentation: RuntimePickerPresentation {
-        .model(attached: isCurrentRouteRuntime, models: scopedModels, loading: composerOptionsLoading)
+        .model(
+            attached: isCurrentRouteRuntime,
+            models: scopedModels,
+            loading: composerOptionsLoading,
+            allowsCycle: allowsPickerCycling
+        )
     }
 
     var thinkingPickerPresentation: RuntimePickerPresentation {
-        .thinking(attached: isCurrentRouteRuntime, levels: availableThinkingLevels, loading: composerOptionsLoading)
+        guard activeCapabilities.thinking != .unsupported else { return .disabled }
+        return .thinking(
+            attached: isCurrentRouteRuntime,
+            levels: availableThinkingLevels,
+            loading: composerOptionsLoading,
+            allowsCycle: allowsPickerCycling
+        )
     }
 }
 
@@ -85,11 +102,19 @@ struct ThinkingPickerControl: View {
                 }
                 .buttonStyle(.plain)
                 .opacity(0.55)
-                .help("Prepare thinking options")
+                .help(thinkingDisabledHelp)
             }
         }
         .accessibilityLabel("Thinking level")
         .accessibilityValue(label)
+    }
+
+    /// Says *why* the control is inert, which differs per agent: not attached yet, versus an
+    /// agent that genuinely has no reasoning dial.
+    private var thinkingDisabledHelp: String {
+        store.activeCapabilities.thinking == .unsupported
+            ? "\(store.activeAgent.displayName) has no thinking level"
+            : "Prepare thinking options"
     }
 }
 

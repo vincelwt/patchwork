@@ -1,7 +1,10 @@
 import Foundation
+import PiDeskKit
 
 protocol SessionRepositoryProtocol {
     var rootURL: URL { get }
+    /// Which agent wrote a transcript, decided by the session root it lives under.
+    func agent(for fileURL: URL) -> AgentKind
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary]
     func loadConversation(from fileURL: URL) async throws -> SessionConversation
     func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage
@@ -18,6 +21,9 @@ protocol SessionRepositoryProtocol {
 }
 
 extension SessionRepositoryProtocol {
+    /// Fakes and legacy repositories only ever hold Pi sessions.
+    func agent(for fileURL: URL) -> AgentKind { .pi }
+
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary] { [] }
     /// Defaulted to a full load reported as already-complete: fakes/tests that never override
     /// this behave exactly as if every selection were a full-file parse in one step, which is
@@ -52,37 +58,56 @@ extension SessionRepositoryProtocol {
 }
 
 struct FileSessionRepository: SessionRepositoryProtocol {
+    /// Pi's own root. Retained because callers still use it as "where a new Pi thread lands";
+    /// discovery itself walks every agent root in `roots`.
     let rootURL: URL
+    /// Every agent whose session tree exists on this machine, with the root to scan for it.
+    let roots: [(agent: AgentKind, url: URL)]
     let summaryCache: SessionSummaryCache
 
-    init(rootURL: URL = FileSessionRepository.defaultRootURL(), summaryCache: SessionSummaryCache? = nil) {
+    init(
+        rootURL: URL = FileSessionRepository.defaultRootURL(),
+        roots: [(agent: AgentKind, url: URL)]? = nil,
+        summaryCache: SessionSummaryCache? = nil
+    ) {
         self.rootURL = rootURL
+        // Pinning Pi's root to a fixture tree pins all of them; see `SessionScanner.roots`.
+        self.roots = roots ?? SessionScanner.roots(piRootURL: rootURL)
         self.summaryCache = summaryCache ?? SessionSummaryCache()
     }
 
     static func defaultRootURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
-        if let override = environment["PI_CODING_AGENT_SESSION_DIR"], !override.isEmpty {
-            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".pi/agent/sessions", isDirectory: true)
+        AgentCatalog.sessionRoot(for: .pi, environment: environment)
+    }
+
+    /// Which agent owns an already-discovered file. Falls back to the roots this repository was
+    /// actually built with, so a test fixture root resolves to its declared agent.
+    func agent(for fileURL: URL) -> AgentKind {
+        let path = fileURL.standardizedFileURL.path
+        let match = roots
+            .map { ($0.agent, $0.url.standardizedFileURL.path) }
+            .sorted { $0.1.count > $1.1.count }
+            .first { path.hasPrefix($0.1 + "/") || path == $0.1 }
+        return match?.0 ?? AgentCatalog.agent(forSessionPath: path) ?? .pi
     }
 
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] {
-        let rootURL = rootURL
+        let roots = roots
         let candidates = try await Self.detached(priority: .utility) {
-            try Self.sessionCandidates(rootURL: rootURL)
+            try roots.flatMap { root in
+                try Self.sessionCandidates(agent: root.agent, rootURL: root.url)
+            }
         }
         try Task.checkCancellation()
 
         var summaries: [SessionSummary] = []
-        var misses: [(URL, SessionFileFingerprint)] = []
+        var misses: [Candidate] = []
         summaries.reserveCapacity(candidates.count)
         for candidate in candidates {
             if let cached = await summaryCache.summary(for: candidate.fingerprint, archivedIDs: archivedIDs) {
                 summaries.append(cached)
             } else {
-                misses.append((candidate.url, candidate.fingerprint))
+                misses.append(candidate)
             }
         }
 
@@ -90,20 +115,14 @@ struct FileSessionRepository: SessionRepositoryProtocol {
             var iterator = misses.makeIterator()
             for _ in 0..<min(4, misses.count) {
                 guard let candidate = iterator.next() else { break }
-                group.addTask {
-                    try Task.checkCancellation()
-                    return (try SessionParser.summary(at: candidate.0, archivedIDs: archivedIDs), candidate.1)
-                }
+                group.addTask { try Self.parse(candidate, archivedIDs: archivedIDs) }
             }
 
             var values: [(SessionSummary, SessionFileFingerprint)] = []
             while let result = try await group.next() {
                 if let result { values.append(result) }
                 if let candidate = iterator.next() {
-                    group.addTask {
-                        try Task.checkCancellation()
-                        return (try SessionParser.summary(at: candidate.0, archivedIDs: archivedIDs), candidate.1)
-                    }
+                    group.addTask { try Self.parse(candidate, archivedIDs: archivedIDs) }
                 }
             }
             return values
@@ -115,17 +134,35 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         _ = await summaryCache.pruneMissingFiles()
         try? await summaryCache.persist()
 
-        return summaries.sorted { lhs, rhs in
+        // Subagent transcripts are parsed and cached like anything else, but never listed: they
+        // are a tool's working notes, not one of the user's conversations.
+        return summaries.filter { !$0.isSubsession }.sorted { lhs, rhs in
             if lhs.modifiedAt == rhs.modifiedAt { return lhs.displayName < rhs.displayName }
             return lhs.modifiedAt > rhs.modifiedAt
         }
     }
 
+    private static func parse(
+        _ candidate: Candidate,
+        archivedIDs: Set<String>
+    ) throws -> (SessionSummary, SessionFileFingerprint) {
+        try Task.checkCancellation()
+        var summary = try SessionParser.summary(
+            at: candidate.url,
+            archivedIDs: archivedIDs,
+            transcoder: .make(for: candidate.agent)
+        )
+        summary.agent = candidate.agent
+        return (summary, candidate.fingerprint)
+    }
+
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary] {
-        await summaryCache.liveSummaries(archivedIDs: archivedIDs).sorted { lhs, rhs in
-            if lhs.modifiedAt == rhs.modifiedAt { return lhs.displayName < rhs.displayName }
-            return lhs.modifiedAt > rhs.modifiedAt
-        }
+        await summaryCache.liveSummaries(archivedIDs: archivedIDs)
+            .filter { !$0.isSubsession }
+            .sorted { lhs, rhs in
+                if lhs.modifiedAt == rhs.modifiedAt { return lhs.displayName < rhs.displayName }
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
     }
 
     func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary {
@@ -134,43 +171,52 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         let values = try fresh.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let fingerprint = SessionFileFingerprint(url: fresh, values: values)
         if let cached = await summaryCache.summary(for: fingerprint, archivedIDs: archivedIDs) { return cached }
-        let summary = try await Self.detached(priority: .utility) {
-            try SessionParser.summary(at: fresh, archivedIDs: archivedIDs)
+        let agent = agent(for: fresh)
+        var summary = try await Self.detached(priority: .utility) {
+            try SessionParser.summary(at: fresh, archivedIDs: archivedIDs, transcoder: .make(for: agent))
         }
+        summary.agent = agent
         await summaryCache.store(summary, fingerprint: fingerprint)
         try? await summaryCache.persist()
         return summary
     }
 
     func loadConversation(from fileURL: URL) async throws -> SessionConversation {
-        try await Self.detached(priority: .userInitiated) {
+        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
+        return try await Self.detached(priority: .userInitiated) {
             try Task.checkCancellation()
-            return try SessionParser.conversation(at: fileURL)
+            return try SessionParser.conversation(at: fileURL, transcoder: transcoder)
         }
     }
 
     func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan {
-        try await Self.detached(priority: .userInitiated) {
+        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
+        return try await Self.detached(priority: .userInitiated) {
             try Task.checkCancellation()
-            return try SessionParser.conversationTail(at: fileURL, limit: limit)
+            return try SessionParser.conversationTail(at: fileURL, limit: limit, transcoder: transcoder)
         }
     }
 
     func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage {
-        try await Self.detached(priority: .userInitiated) {
-            try SessionParser.conversationPage(at: fileURL)
+        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
+        return try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(at: fileURL, transcoder: transcoder)
         }
     }
 
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
-        try await Self.detached(priority: .userInitiated) {
-            try SessionParser.conversationPage(at: fileURL, cursor: cursor)
+        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
+        return try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(at: fileURL, cursor: cursor, transcoder: transcoder)
         }
     }
 
     func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
-        try await Self.detached(priority: .userInitiated) {
-            try SessionParser.conversationPage(at: fileURL, cursor: cursor, projection: .focusedHistory)
+        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
+        return try await Self.detached(priority: .userInitiated) {
+            try SessionParser.conversationPage(
+                at: fileURL, cursor: cursor, projection: .focusedHistory, transcoder: transcoder
+            )
         }
     }
 
@@ -189,40 +235,60 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     }
 
     private struct Candidate: Sendable {
+        let agent: AgentKind
         let url: URL
         let fingerprint: SessionFileFingerprint
     }
 
-    private static func sessionCandidates(rootURL: URL) throws -> [Candidate] {
+    private static let resourceKeys: Set<URLResourceKey> =
+        [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
+
+    /// Walks one agent's session root to that agent's declared depth. Pi and Claude keep one
+    /// project folder below the root; Codex nests `YYYY/MM/DD`. Going deeper than an agent
+    /// declares would sweep up its subagent and process artifacts.
+    private static func sessionCandidates(agent: AgentKind, rootURL: URL) throws -> [Candidate] {
         let manager = FileManager.default
         guard manager.fileExists(atPath: rootURL.path) else { return [] }
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
-        let rootItems = try manager.contentsOfDirectory(
-            at: rootURL,
-            includingPropertiesForKeys: Array(keys),
-            options: []
-        )
+        let descriptor = AgentCatalog.descriptor(for: agent)
 
-        // Pi stores one project directory below the session root. Only JSONLs directly in the
-        // root or those project directories are user threads; deeper session.jsonl files are
-        // subagent/process artifacts and must not be promoted into the sidebar.
-        var files = rootItems.filter { $0.pathExtension.lowercased() == "jsonl" }
-        for folder in rootItems where (try? folder.resourceValues(forKeys: keys).isDirectory) == true {
-            try Task.checkCancellation()
-            files += (try? manager.contentsOfDirectory(
-                at: folder,
-                includingPropertiesForKeys: Array(keys),
-                options: []
-            ).filter { $0.pathExtension.lowercased() == "jsonl" }) ?? []
+        var files: [URL] = []
+        var frontier = [rootURL]
+        for depth in 0...max(0, descriptor.sessionScanDepth) {
+            var next: [URL] = []
+            for directory in frontier {
+                try Task.checkCancellation()
+                let items = (try? manager.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: Array(resourceKeys),
+                    options: []
+                )) ?? []
+                for item in items {
+                    if (try? item.resourceValues(forKeys: resourceKeys).isDirectory) == true {
+                        if depth < descriptor.sessionScanDepth { next.append(item) }
+                    } else if item.pathExtension.lowercased() == "jsonl" {
+                        guard let prefix = descriptor.sessionFilePrefix else {
+                            files.append(item)
+                            continue
+                        }
+                        if item.lastPathComponent.hasPrefix(prefix) { files.append(item) }
+                    }
+                }
+            }
+            if next.isEmpty { break }
+            frontier = next
         }
 
         var seen: Set<String> = []
         return files.compactMap { file in
             let normalized = file.standardizedFileURL
             guard seen.insert(normalized.path).inserted,
-                  let values = try? normalized.resourceValues(forKeys: keys),
+                  let values = try? normalized.resourceValues(forKeys: resourceKeys),
                   values.isRegularFile == true else { return nil }
-            return Candidate(url: normalized, fingerprint: SessionFileFingerprint(url: normalized, values: values))
+            return Candidate(
+                agent: agent,
+                url: normalized,
+                fingerprint: SessionFileFingerprint(url: normalized, values: values)
+            )
         }
     }
 }

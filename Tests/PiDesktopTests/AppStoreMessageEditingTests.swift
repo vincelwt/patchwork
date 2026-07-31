@@ -4,7 +4,7 @@ import XCTest
 
 // MARK: - Fakes (mirrors the pattern in AppStoreRollbackTests.swift, private to this file)
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false

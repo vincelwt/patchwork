@@ -18,7 +18,7 @@ final class CLIRunnerTests: XCTestCase {
         XCTAssertTrue(result.stdout.contains("Usage:"))
         XCTAssertEqual(
             plane.calls.first?.detail,
-            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil"
+            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil agent="
         )
     }
 

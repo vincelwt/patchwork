@@ -53,6 +53,13 @@ extension AppStore {
     /// regardless, so a stale click can never apply to the wrong turn.
     func beginEditingLastMessage() {
         let state = editState
+        // Editing branches the transcript, which only an agent with a fork/branch model can do.
+        // Gated on the agent alone, never on whether a runtime happens to be attached: arming an
+        // edit is a composer action and has always worked before the runtime warms up.
+        guard activeAgent.capabilities.canFork else {
+            showToast("\(activeAgent.displayName) cannot branch a conversation.", style: .warning)
+            return
+        }
         guard !isBrowsingEarlierHistory, !state.isResubmitting, let target = lastUserMessage else { return }
         draft = Self.editableText(from: target)
         attachments = target.images.compactMap(ImageImportService.attachment)

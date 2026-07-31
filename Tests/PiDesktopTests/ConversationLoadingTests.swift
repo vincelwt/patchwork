@@ -4,7 +4,7 @@ import XCTest
 
 // MARK: - Fakes
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -920,7 +920,7 @@ final class ConversationLoadingTests: XCTestCase {
     private func makeStore(
         repository: SessionRepositoryProtocol,
         gitService: GitStatusProviding = FakeGitService(),
-        runtime: PiRuntimeProtocol = FakeRuntime(),
+        runtime: AgentRuntimeProtocol = FakeRuntime(),
         persistence: AppPersistence? = nil,
         activityMonitor: SessionActivityMonitor? = nil,
         isActiveOverride: Bool? = nil

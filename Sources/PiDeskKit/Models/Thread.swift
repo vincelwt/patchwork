@@ -18,6 +18,10 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
     public var unread: Bool
     public var archived: Bool
     public var preview: String
+    /// Which agent wrote this transcript, decided by the session root it was discovered under.
+    /// Older daemons never send it, so it decodes to `.pi` — which is what every thread was
+    /// before Pi Desktop could drive more than one agent.
+    public var agent: AgentKind
     public var cost: Double?
     public var contextPercent: Double?
     /// Compact random UUID tail advertised only by daemons that accept abbreviated ids.
@@ -40,6 +44,7 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         unread: Bool = false,
         archived: Bool = false,
         preview: String = "",
+        agent: AgentKind = .pi,
         cost: Double? = nil,
         contextPercent: Double? = nil,
         shortId: String? = nil,
@@ -58,6 +63,7 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         self.unread = unread
         self.archived = archived
         self.preview = preview
+        self.agent = agent
         self.cost = cost
         self.contextPercent = contextPercent
         self.shortId = shortId
@@ -79,6 +85,9 @@ public struct PiThread: Codable, Hashable, Sendable, Identifiable {
         unread = try container.decodeIfPresent(Bool.self, forKey: .unread) ?? false
         archived = try container.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         preview = try container.decodeIfPresent(String.self, forKey: .preview) ?? ""
+        // `AgentKind` already folds an unrecognised raw value into `.pi`, so a newer daemon's
+        // agent name never fails a whole thread list here.
+        agent = try container.decodeIfPresent(AgentKind.self, forKey: .agent) ?? .pi
         cost = try container.decodeIfPresent(Double.self, forKey: .cost)
         contextPercent = try container.decodeIfPresent(Double.self, forKey: .contextPercent)
         shortId = try container.decodeIfPresent(String.self, forKey: .shortId)
@@ -400,15 +409,19 @@ public struct CreateThreadRequest: Codable, Sendable {
     public var message: String?
     public var mode: String?
     public var worktree: Bool?
+    /// Which agent should own the new thread. Absent means Pi, so an older client keeps the
+    /// behaviour it has always had.
+    public var agent: AgentKind?
     public init(
         cwd: String, name: String? = nil, message: String? = nil, mode: String? = nil,
-        worktree: Bool? = nil
+        worktree: Bool? = nil, agent: AgentKind? = nil
     ) {
         self.cwd = cwd
         self.name = name
         self.message = message
         self.mode = mode
         self.worktree = worktree
+        self.agent = agent
     }
 }
 

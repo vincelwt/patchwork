@@ -4,7 +4,7 @@ import XCTest
 
 // MARK: - Fakes
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -74,15 +74,15 @@ private final class FakeRuntime: PiRuntimeProtocol {
         pending.removeValue(forKey: command)?(.failure(error))
     }
 
-    /// Mirrors `PiRPCClient`'s real ordering on a crash: every pending completion is rejected
+    /// Mirrors `AgentRuntimeClient`'s real ordering on a crash: every pending completion is rejected
     /// first — classified exactly like `RPCTimeoutPolicy` classifies a timeout for the same
     /// command, outcome-unknown unless it is a read-only state query — and only then does
     /// `onExit` fire.
     func crash(_ message: String) {
         for command in Array(pending.keys) {
             let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
-                ? PiRPCError.processExited(message)
-                : PiRPCError.outcomeUnknown(command)
+                ? AgentRuntimeError.processExited(message)
+                : AgentRuntimeError.outcomeUnknown(command)
             pending.removeValue(forKey: command)?(.failure(error))
         }
         isRunning = false
@@ -186,7 +186,7 @@ final class AppStoreRollbackTests: XCTestCase {
         // The user moves to another conversation and starts typing before A's failure arrives.
         store.selectSession(sessionB)
         store.draft = "unrelated text in B"
-        runtime.fail("prompt", with: PiRPCError.processExited("Pi crashed in A"))
+        runtime.fail("prompt", with: AgentRuntimeError.processExited("Pi crashed in A"))
 
         XCTAssertEqual(store.draft, "unrelated text in B", "A's failure must not inject text into B")
         XCTAssertTrue(store.attachments.isEmpty, "A's images must not appear in B")
@@ -277,7 +277,7 @@ final class AppStoreRollbackTests: XCTestCase {
         runtime.sessionID = sessionA.id
         store.draft = "prompt for A"
         store.submitDraft()
-        runtime.fail("prompt", with: PiRPCError.processExited("rejected"))
+        runtime.fail("prompt", with: AgentRuntimeError.processExited("rejected"))
 
         XCTAssertEqual(store.draft, "prompt for A")
         XCTAssertEqual(store.toast?.style, .error)
@@ -370,7 +370,7 @@ final class AppStoreRollbackTests: XCTestCase {
         let (store, _, session, _) = makeStore(
             managedTurnResumer: { path, instruction, clientID in
                 capture.calls.append((path, instruction, clientID))
-                throw PiRPCError.outcomeUnknown("recovery")
+                throw AgentRuntimeError.outcomeUnknown("recovery")
             },
             managedTurnWriterProbe: { _ in false }
         )
@@ -465,7 +465,7 @@ final class AppStoreRollbackTests: XCTestCase {
 
     /// Task 2: a crash mid-turn restores the exact last user message for a one-click resend, and
     /// — the specific bug this guards — does so exactly once. `crash()` rejects the pending
-    /// "prompt" completion as outcome-unknown (mirroring a real `PiRPCClient`) before calling
+    /// "prompt" completion as outcome-unknown (mirroring a real `AgentRuntimeClient`) before calling
     /// `onExit`, so both `dispatchMessage`'s completion and `handleRuntimeExit` observe the same
     /// crash; only one of them may ever actually restore the draft.
     func testCrashDuringAnInFlightPromptRestoresTheDraftExactlyOnceNotTwice() async throws {
@@ -820,7 +820,7 @@ final class AppStoreRollbackTests: XCTestCase {
 
     func testResumeHelperQueryFailureFallsBackToAPlainContinuation() {
         let (store, runtime, session, _) = makeStore()
-        runtime.getCommandsFailure = PiRPCError.processExited("query unavailable")
+        runtime.getCommandsFailure = AgentRuntimeError.processExited("query unavailable")
         store.selectSession(session)
         runtime.sessionFile = session.fileURL.path
         runtime.sessionID = session.id
@@ -903,7 +903,7 @@ final class AppStoreRollbackTests: XCTestCase {
 
         // The new chat is promoted in place, so the failure still belongs to this composer.
         XCTAssertEqual(store.route, .session(URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path))
-        runtime.fail("prompt", with: PiRPCError.processExited("provider unreachable"))
+        runtime.fail("prompt", with: AgentRuntimeError.processExited("provider unreachable"))
         XCTAssertEqual(store.draft, "first prompt of a new chat")
     }
 
@@ -917,7 +917,7 @@ final class AppStoreRollbackTests: XCTestCase {
         store.submitDraft()
 
         // Settle the run so switching conversations is allowed.
-        runtime.fail("prompt", with: PiRPCError.processExited("failed in A"))
+        runtime.fail("prompt", with: AgentRuntimeError.processExited("failed in A"))
         XCTAssertFalse(store.runtimeState.isStreaming)
 
         runtime.onEvent?(dialogEvent(id: "dialog-1", message: "first"))
@@ -1027,7 +1027,7 @@ final class AppStoreRollbackTests: XCTestCase {
             repository: FakeRepository(),
             gitService: FakeGitService(),
             runtime: runtime,
-            runtimeFactory: { FakeRuntime() },
+            runtimeFactory: { _ in FakeRuntime() },
             persistence: AppPersistence(baseURL: temporaryDirectory),
             activityPresenter: ActivityPresenter(),
             providerRetryScheduler: providerRetryScheduler,

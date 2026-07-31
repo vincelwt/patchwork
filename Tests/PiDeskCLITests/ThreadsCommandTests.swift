@@ -8,7 +8,7 @@ final class ThreadsListShowTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(
             plane.calls.first?.detail,
-            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil"
+            "query= limit=20 cursor= archived=Optional(false) running=nil automated=nil agent="
         )
     }
 
@@ -18,7 +18,7 @@ final class ThreadsListShowTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(
             plane.calls.first?.detail,
-            "query=triage limit=5 cursor=abc archived=Optional(true) running=Optional(true) automated=nil"
+            "query=triage limit=5 cursor=abc archived=Optional(true) running=Optional(true) automated=nil agent="
         )
     }
 
@@ -27,7 +27,7 @@ final class ThreadsListShowTests: XCTestCase {
         _ = await runCLI(["threads", "list", "--all", "--automated"], controlPlane: plane)
         XCTAssertEqual(
             plane.calls.first?.detail,
-            "query= limit=20 cursor= archived=nil running=nil automated=Optional(true)"
+            "query= limit=20 cursor= archived=nil running=nil automated=Optional(true) agent="
         )
     }
 
