@@ -2,26 +2,36 @@ import Foundation
 import PiDeskKit
 
 enum RunnerError: Error, LocalizedError, Sendable {
-    case piNotFound
+    case agentNotFound(AgentKind)
+    /// The daemon can read this agent's threads but cannot drive its runtime yet. Said out loud
+    /// rather than silently launching `pi` against someone else's transcript.
+    case agentNotExecutable(AgentKind)
     case timedOut(afterSeconds: TimeInterval)
     case processExited(String)
     case ioFailure(String)
 
+    static let piNotFound = RunnerError.agentNotFound(.pi)
+
     var errorDescription: String? {
         switch self {
-        case .piNotFound: "Pi CLI was not found. Set PI_DESKTOP_PI_PATH or install pi in ~/.local/bin."
-        case let .timedOut(seconds): "Pi did not respond within \(Int(seconds))s."
-        case let .processExited(detail): detail.isEmpty ? "Pi exited unexpectedly." : "Pi exited: \(detail)"
-        case let .ioFailure(detail): detail
+        case let .agentNotFound(agent):
+            let descriptor = AgentCatalog.descriptor(for: agent)
+            return "\(agent.displayName) was not found. Set \(descriptor.executableOverrideKey) or install \(descriptor.executableNames[0]) in ~/.local/bin."
+        case let .agentNotExecutable(agent):
+            return "Pi Desktop's background service cannot run \(agent.displayName) threads yet; open this thread in the Mac app."
+        case let .timedOut(seconds): return "Pi did not respond within \(Int(seconds))s."
+        case let .processExited(detail): return detail.isEmpty ? "Pi exited unexpectedly." : "Pi exited: \(detail)"
+        case let .ioFailure(detail): return detail
         }
     }
 
-    /// Safe to retry only before prompt delivery begins. Missing Pi is configuration, not a
-    /// temporary outage; process/pipe failures are definite non-delivery at that stage.
+    /// Safe to retry only before prompt delivery begins. A missing or undrivable agent is
+    /// configuration, not a temporary outage; process/pipe failures are definite non-delivery at
+    /// that stage.
     var retryableBeforePrompt: Bool {
         switch self {
         case .timedOut, .processExited, .ioFailure: true
-        case .piNotFound: false
+        case .agentNotFound, .agentNotExecutable: false
         }
     }
 }
@@ -29,19 +39,41 @@ enum RunnerError: Error, LocalizedError, Sendable {
 /// Where a run's prompt goes. `newThread` has no identity until Pi creates the session, so it
 /// never collides with anything for concurrency/skip-if-running purposes.
 enum RunTarget: Sendable, Equatable {
-    case existingThread(threadId: String, path: String, cwd: String)
-    case newThread(cwd: String, namePattern: String?)
+    case existingThread(threadId: String, path: String, cwd: String, agent: AgentKind = .pi)
+    case newThread(cwd: String, namePattern: String?, agent: AgentKind = .pi)
 
     var existingThreadID: String? {
-        if case let .existingThread(threadId, _, _) = self { return threadId }
+        if case let .existingThread(threadId, _, _, _) = self { return threadId }
         return nil
     }
 
     var cwd: String {
         switch self {
-        case let .existingThread(_, _, cwd): cwd
-        case let .newThread(cwd, _): cwd
+        case let .existingThread(_, _, cwd, _): cwd
+        case let .newThread(cwd, _, _): cwd
         }
+    }
+
+    var agent: AgentKind {
+        switch self {
+        case let .existingThread(_, _, _, agent): agent
+        case let .newThread(_, _, agent): agent
+        }
+    }
+
+    /// Mutual-exclusion key for `RunQueue`. Agent-qualified so two agents that ever mint the same
+    /// session id cannot block each other's runs.
+    var exclusionKey: String? {
+        existingThreadID.map { RunTarget.exclusionKey(agent: agent, threadID: $0) }
+    }
+
+    static func exclusionKey(agent: AgentKind, threadID: String) -> String {
+        "\(agent.rawValue):\(threadID)"
+    }
+
+    /// The bare thread id inside an exclusion key, for callers that compare against thread ids.
+    static func threadID(inExclusionKey key: String) -> String {
+        key.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).last.map(String.init) ?? key
     }
 }
 

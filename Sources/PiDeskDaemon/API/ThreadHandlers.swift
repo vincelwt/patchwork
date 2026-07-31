@@ -14,7 +14,8 @@ enum ThreadHandlers {
                     archived: request.query["archived"].flatMap(parseBool),
                     running: request.query["running"].flatMap(parseBool),
                     automated: request.query["automated"].flatMap(parseBool),
-                    automatedThreadIDs: automatedIDs
+                    automatedThreadIDs: automatedIDs,
+                    agent: try parseAgentFilter(request.query["agent"])
                 )
                 return .json(ThreadListResponse(threads: threads, nextCursor: next))
             },
@@ -26,7 +27,7 @@ enum ThreadHandlers {
                 let includeTools = request.query["all"].flatMap(parseBool) ?? true
                 let page = (try? SessionThreadParser.messagePage(
                     at: URL(fileURLWithPath: thread.path), limit: limit, offset: offset,
-                    conversationOnly: !includeTools
+                    conversationOnly: !includeTools, transcoder: .make(for: thread.agent)
                 )) ?? (messages: [], nextOffset: nil)
                 return .json(ThreadDetailResponse(
                     thread: thread, messages: page.messages, nextOffset: page.nextOffset
@@ -41,7 +42,10 @@ enum ThreadHandlers {
                 guard let imageId = params["imageId"], !imageId.isEmpty else {
                     throw DaemonHTTPError.badRequest(code: "missing_image_id", message: "Missing image id.")
                 }
-                let image = (try? SessionThreadParser.image(at: URL(fileURLWithPath: thread.path), imageId: imageId)) ?? nil
+                let image = (try? SessionThreadParser.image(
+                    at: URL(fileURLWithPath: thread.path), imageId: imageId,
+                    transcoder: .make(for: thread.agent)
+                )) ?? nil
                 guard let image else { throw DaemonHTTPError.notFound("Image \(imageId)") }
                 return .json(image)
             },
@@ -65,6 +69,16 @@ enum ThreadHandlers {
 
             Route("POST", "/v1/threads") { request, _ in
                 let body = try request.decodeJSON(CreateThreadRequest.self)
+                let agent = body.agent ?? .pi
+                // Reading another agent's threads works; creating one needs a runtime this
+                // daemon does not drive yet. Refuse rather than hand back a Pi session under a
+                // Codex or Claude label.
+                guard agent == .pi else {
+                    throw DaemonHTTPError.badRequest(
+                        code: "agent_unsupported",
+                        message: RunnerError.agentNotExecutable(agent).localizedDescription
+                    )
+                }
                 let projectURL = try existingDirectory(body.cwd)
                 let worktreeURL: URL?
                 if body.worktree == true {
@@ -108,7 +122,7 @@ enum ThreadHandlers {
 
                 let job = RunJob(
                     id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
-                    target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd),
+                    target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd, agent: thread.agent),
                     prompt: message, mode: body.mode, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
                 )
                 await core.runQueue.enqueue(job)
@@ -224,7 +238,7 @@ enum ThreadHandlers {
 
             Route("POST", "/v1/threads/:id/abort") { _, params in
                 let thread = try await requireThread(core, params)
-                let aborted = await core.runQueue.abort(threadId: thread.id)
+                let aborted = await core.runQueue.abort(threadId: thread.id, agent: thread.agent)
                 return .json(AbortResponse(aborted: aborted))
             },
 
@@ -252,8 +266,14 @@ enum ThreadHandlers {
                 if await core.leaseStore.isLeased(threadId: thread.id) {
                     throw DaemonHTTPError.conflict(code: "thread_leased", message: "The app is currently attached to this thread's runtime.")
                 }
-                if await core.runQueue.isThreadBusy(thread.id) {
+                if await core.runQueue.isThreadBusy(thread.id, agent: thread.agent) {
                     throw DaemonHTTPError.conflict(code: "thread_busy", message: "Rename once the thread is idle.")
+                }
+                guard thread.agent == .pi else {
+                    throw DaemonHTTPError.conflict(
+                        code: "agent_unsupported",
+                        message: RunnerError.agentNotExecutable(thread.agent).localizedDescription
+                    )
                 }
                 // Renaming goes through Pi's own `set_session_name` RPC — Pi appends the new
                 // `session_info` entry itself, so this never touches a Pi JSONL file directly.
@@ -339,14 +359,14 @@ enum ThreadHandlers {
             throw DaemonHTTPError.conflict(code: "runtime_failed", message: runtimeErrorMessage(error))
         }
 
-        guard !thread.running, await core.runQueue.reserveRuntime(threadID: thread.id) else {
+        guard !thread.running, await core.runQueue.reserveRuntime(threadID: thread.id, agent: thread.agent) else {
             throw DaemonHTTPError.conflict(code: "thread_busy", message: "Runtime controls are temporarily busy. Try again in a moment.")
         }
         let leaseOwner = "web-runtime-\(UUID().uuidString)"
         guard await core.leaseStore.acquireIfAvailable(
             threadId: thread.id, owner: leaseOwner, ttlSeconds: 180
         ) != nil else {
-            await core.runQueue.releaseRuntime(threadID: thread.id)
+            await core.runQueue.releaseRuntime(threadID: thread.id, agent: thread.agent)
             throw DaemonHTTPError.conflict(
                 code: "thread_leased", message: "The app is currently attached to this thread's runtime."
             )
@@ -355,11 +375,11 @@ enum ThreadHandlers {
         do {
             let state = try await idle()
             await core.leaseStore.release(threadId: thread.id, owner: leaseOwner)
-            await core.runQueue.releaseRuntime(threadID: thread.id)
+            await core.runQueue.releaseRuntime(threadID: thread.id, agent: thread.agent)
             return state
         } catch {
             await core.leaseStore.release(threadId: thread.id, owner: leaseOwner)
-            await core.runQueue.releaseRuntime(threadID: thread.id)
+            await core.runQueue.releaseRuntime(threadID: thread.id, agent: thread.agent)
             throw DaemonHTTPError.conflict(code: "runtime_failed", message: runtimeErrorMessage(error))
         }
     }
@@ -412,10 +432,10 @@ enum ThreadHandlers {
             }
         }
 
-        let alreadyBusy = await core.runQueue.isThreadBusy(thread.id)
+        let alreadyBusy = await core.runQueue.isThreadBusy(thread.id, agent: thread.agent)
         let job = RunJob(
             id: "run_\(UUID().uuidString)", scheduleId: nil, trigger: .api,
-            target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd),
+            target: .existingThread(threadId: thread.id, path: thread.path, cwd: thread.cwd, agent: thread.agent),
             prompt: text, mode: nil, timeoutSeconds: ScheduleEngine.defaultTimeoutSeconds, queuedAt: Date()
         )
         await core.runQueue.enqueue(job)
@@ -445,6 +465,20 @@ enum ThreadHandlers {
         case .followUp: "follow_up"
         case .auto, nil: nil
         }
+    }
+
+    /// A filter value the daemon does not know is the caller's mistake, so it is rejected with the
+    /// list of valid agents rather than silently listing everything (which would look like the
+    /// filter worked). Unknown agents *in stored data* still degrade to Pi \u2014 see `AgentKind`.
+    private static func parseAgentFilter(_ raw: String?) throws -> AgentKind? {
+        guard let raw, !raw.isEmpty else { return nil }
+        guard let agent = AgentKind(rawValue: raw.lowercased()) else {
+            throw DaemonHTTPError.badRequest(
+                code: "invalid_agent",
+                message: "agent must be one of: \(AgentKind.allCases.map(\.rawValue).joined(separator: ", "))."
+            )
+        }
+        return agent
     }
 
     private static func parseBool(_ text: String) -> Bool? {

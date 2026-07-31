@@ -16,7 +16,7 @@ struct ControlPlaneEvent: Equatable {
 protocol ControlPlane: Sendable {
     func health() async throws -> WireHealth
 
-    func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?) async throws -> WireThreadListResponse
+    func listThreads(query: String?, limit: Int, cursor: String?, archived: Bool?, running: Bool?, automated: Bool?, agent: String?) async throws -> WireThreadListResponse
     func showThread(id: String, messages: Int, offset: Int, includeTools: Bool) async throws -> WireThreadDetailResponse
     func createThread(_ request: WireCreateThreadRequest) async throws -> WireCreateThreadResponse
     func sendMessage(threadId: String, request: WireSendMessageRequest) async throws -> WireSendMessageResponse

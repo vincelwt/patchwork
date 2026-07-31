@@ -37,7 +37,10 @@ struct AvailableModel: Identifiable, Hashable, Sendable {
 
 /// Deterministic selection normalization used by menus while asynchronous RPC options refresh.
 enum RuntimePickerState {
-    static let allThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    /// Every reasoning level any supported agent can report, weakest first. An agent's own list
+    /// is intersected with this, so a level missing here silently disappears from the picker:
+    /// `ultra` is Codex's strongest effort and has to be present even though Pi never reports it.
+    static let allThinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 
     static func thinkingLevels(from value: JSONValue?) -> [String] {
         let received = value?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -63,6 +66,8 @@ enum RuntimePickerState {
 
 /// The scoping fields from Pi's own `~/.pi/agent/settings.json`. Pi decides which models a
 /// session may actually pick from; the desktop only ever reads this file, never writes it.
+/// This is Pi's file and Pi's policy: it must never be applied to another agent's model list,
+/// which would filter every entry out and leave an empty picker.
 struct PiModelScope: Equatable {
     /// Raw `enabledModels` entries, e.g. `"openai-codex/*"` or `"anthropic/claude-opus-5"`.
     let enabledModels: [String]
@@ -180,16 +185,31 @@ enum RuntimePickerPresentation: Equatable {
     /// Nothing is attached (or options are still loading): show the label, disabled.
     case disabled
 
-    static func model(attached: Bool, models: [AvailableModel], loading: Bool) -> RuntimePickerPresentation {
+    /// `allowsCycle` is false for agents with no cycle command: offering a button that can only
+    /// fail is worse than showing the label disabled.
+    static func model(
+        attached: Bool,
+        models: [AvailableModel],
+        loading: Bool,
+        allowsCycle: Bool = true
+    ) -> RuntimePickerPresentation {
         guard attached else { return .disabled }
         if !models.isEmpty { return .menu }
-        return loading ? .disabled : .cycle
+        if loading || !allowsCycle { return .disabled }
+        return .cycle
     }
 
-    /// A single known level is not a choice, so the cycle command stays the honest fallback.
-    static func thinking(attached: Bool, levels: [String], loading: Bool) -> RuntimePickerPresentation {
+    /// A single known level is not a choice, so the cycle command stays the honest fallback
+    /// wherever the agent has one.
+    static func thinking(
+        attached: Bool,
+        levels: [String],
+        loading: Bool,
+        allowsCycle: Bool = true
+    ) -> RuntimePickerPresentation {
         guard attached else { return .disabled }
         if levels.count > 1 { return .menu }
-        return loading ? .disabled : .cycle
+        if loading || !allowsCycle { return .disabled }
+        return .cycle
     }
 }

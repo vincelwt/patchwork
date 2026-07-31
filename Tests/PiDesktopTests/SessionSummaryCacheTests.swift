@@ -45,7 +45,7 @@ final class SessionSummaryCacheTests: XCTestCase {
         XCTAssertEqual(remaining, 0)
     }
 
-    func testV4CachePaintsImmediatelyThenReparsesForPullRequestReviewMetadata() async throws {
+    func testOneVersionOldCachePaintsImmediatelyThenReparsesForTheNewMetadata() async throws {
         struct LegacyEntry: Encodable {
             let fingerprint: SessionFileFingerprint
             let summary: SessionSummary
@@ -65,15 +65,15 @@ final class SessionSummaryCacheTests: XCTestCase {
         let fingerprint = SessionFileFingerprint(url: file, values: values)
         var summary = try SessionParser.summary(at: file)
         let legacy = LegacyEnvelope(
-            version: 4,
+            version: 5,
             entries: [file.standardizedFileURL.path: LegacyEntry(fingerprint: fingerprint, summary: summary)]
         )
         try JSONEncoder().encode(legacy).write(
-            to: root.appendingPathComponent("session-summaries-v4.json"), options: .atomic
+            to: root.appendingPathComponent("session-summaries-v5.json"), options: .atomic
         )
 
-        let v5URL = root.appendingPathComponent("session-summaries-v5.json")
-        let cache = SessionSummaryCache(fileURL: v5URL)
+        let currentURL = root.appendingPathComponent("session-summaries-v6.json")
+        let cache = SessionSummaryCache(fileURL: currentURL)
         let hydrated = await cache.liveSummaries(archivedIDs: [])
         let staleLookup = await cache.summary(for: fingerprint, archivedIDs: [])
         XCTAssertEqual(hydrated.map(\.id), ["cache-session"])
@@ -83,7 +83,7 @@ final class SessionSummaryCacheTests: XCTestCase {
         summary.pullRequestCreatedAt = Date(timeIntervalSince1970: 1_700_000_000)
         await cache.store(summary, fingerprint: fingerprint)
         try await cache.persist()
-        let reloaded = SessionSummaryCache(fileURL: v5URL)
+        let reloaded = SessionSummaryCache(fileURL: currentURL)
         let upgraded = await reloaded.summary(for: fingerprint, archivedIDs: [])
         XCTAssertEqual(upgraded?.pullRequestURL, summary.pullRequestURL)
         XCTAssertEqual(upgraded?.pullRequestCreatedAt, summary.pullRequestCreatedAt)

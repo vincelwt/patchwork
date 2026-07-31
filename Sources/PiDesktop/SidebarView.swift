@@ -922,8 +922,10 @@ private struct SessionRow: View {
         .accessibilityLabel("\(session.displayName)\(hint.map { ", in \($0)" } ?? ""), \(store.liveModifiedAt(session).relativeShort)\(waitingForQuestion ? ", waiting for your answer" : (running ? ", running" : ""))\(resourceUsage.map { ", \(NumberFormatting.cpuPercent($0.cpuPercent)) CPU, \(NumberFormatting.memoryBytes($0.memoryBytes)) memory" } ?? "")\(unread ? ", unread" : "")\(scheduled ? ", scheduled" : "")")
     }
 
-    /// Reserved for the hover archive/restore button alone: status lives on the trailing edge,
-    /// so this column stays empty until the pointer arrives and the title never shifts sideways.
+    /// Hover archive/restore, and otherwise the agent that wrote this conversation. Status still
+    /// lives on the trailing edge, so this column keeps one fixed width and the title never
+    /// shifts sideways whichever of the three it is showing. The badge is suppressed when only
+    /// one agent has any history, where it would be noise on every row.
     @ViewBuilder
     private var leadingIcon: some View {
         if hovering {
@@ -938,6 +940,9 @@ private struct SessionRow: View {
                 .help(archived ? "Restore" : "Archive")
                 .accessibilityLabel(archived ? "Restore conversation" : "Archive conversation")
                 .accessibilityAddTraits(.isButton)
+        } else if store.showsAgentBadges {
+            AgentBadge(agent: session.agent, isProminent: selected || running)
+                .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight, alignment: .center)
         } else {
             Color.clear
                 .frame(width: PiTheme.sidebarIconColumn, height: PiTheme.sidebarRowHeight)
@@ -960,7 +965,7 @@ private struct SessionRow: View {
                 }
                 .help(resourceUsage.map {
                     "\(NumberFormatting.cpuPercent($0.cpuPercent)) CPU · \(NumberFormatting.memoryBytes($0.memoryBytes)) memory"
-                } ?? "Pi is working")
+                } ?? "\(session.agent.displayName) is working")
                 .accessibilityHidden(true)
             } else if hovering {
                 Text(store.liveModifiedAt(session).relativeShort).font(SidebarTypography.metadata).foregroundStyle(.tertiary)

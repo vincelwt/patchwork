@@ -49,6 +49,8 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
     public var promptStartedAt: Date?
     public var promptAcceptedAt: Date?
     public var retryable: Bool?
+    /// Which agent executed the run. Absent on every record written before multi-agent support.
+    public var agent: AgentKind?
 
     public init(
         id: String,
@@ -66,7 +68,8 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         nextAttemptAt: Date? = nil,
         promptStartedAt: Date? = nil,
         promptAcceptedAt: Date? = nil,
-        retryable: Bool? = nil
+        retryable: Bool? = nil,
+        agent: AgentKind? = nil
     ) {
         self.id = id
         self.scheduleId = scheduleId
@@ -84,6 +87,7 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         self.promptStartedAt = promptStartedAt
         self.promptAcceptedAt = promptAcceptedAt
         self.retryable = retryable
+        self.agent = agent
     }
 
     public init(from decoder: Decoder) throws {
@@ -104,6 +108,7 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         promptStartedAt = try container.decodeIfPresent(Date.self, forKey: .promptStartedAt)
         promptAcceptedAt = try container.decodeIfPresent(Date.self, forKey: .promptAcceptedAt)
         retryable = try container.decodeIfPresent(Bool.self, forKey: .retryable)
+        agent = try container.decodeIfPresent(AgentKind.self, forKey: .agent)
     }
 }
 

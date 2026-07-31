@@ -61,6 +61,8 @@ enum PiTheme {
     /// in their header row rather than a dedicated chevron slot.
     static let sidebarDisclosureColumn: CGFloat = 12
     static let sidebarIconColumn: CGFloat = 14
+    /// Agent glyph point size. Sized to sit inside `sidebarIconColumn` without widening the row.
+    static let agentBadgeSize: CGFloat = 9
     /// Extra leading space per nesting level in the virtual folder tree, applied to both a
     /// folder header and the sessions/subfolders indented one step past it.
     static let sidebarIndentStep: CGFloat = 14
@@ -552,17 +554,36 @@ enum ContextBudget {
 
 // MARK: - Effort ramp
 
-/// The `/mode` ladder reads as an intensity dial, not a flat list of names: colour warms from a
-/// calm teal at `xfast` to a hot pink at `ultra`, so the composer's effort control communicates
-/// "how hard is this about to work" before anyone reads the label. Ordered by both hue and
+/// Every agent's mode ladder reads as an intensity dial, not a flat list of names: colour warms
+/// from a calm teal at the most restrained stop to a hot pink at the strongest, so the composer's
+/// control communicates "how hard is this about to work" (Pi) or "how much can this touch"
+/// (Codex sandbox, Claude permissions) before anyone reads the label. Ordered by both hue and
 /// value/temperature so the ramp still reads correctly for colour-blind users.
 extension PiTheme {
     static let effortRamp: [Color] = [
-        Color(nsColor: .systemTeal),   // xfast — calm
-        Color(nsColor: .systemBlue),   // fast
-        Color(nsColor: .systemOrange), // smart
-        Color(nsColor: .systemPink)    // ultra — intense
+        Color(nsColor: .systemTeal),   // most restrained — calm
+        Color(nsColor: .systemBlue),
+        Color(nsColor: .systemOrange),
+        Color(nsColor: .systemPink)    // strongest — intense
     ]
+
+    /// The ramp stop for one position in a ladder of any length. Agents have different numbers
+    /// of modes (Pi 4, Codex 3, Claude 5), so the fixed four-colour ramp is sampled rather than
+    /// indexed, and a ladder longer than the ramp still ends on the hottest colour.
+    static func effortColor(rank: Int, of count: Int) -> Color {
+        guard count > 1 else { return effortRamp[0] }
+        let position = Double(min(max(0, rank), count - 1)) / Double(count - 1)
+        let index = Int((position * Double(effortRamp.count - 1)).rounded())
+        return effortRamp[min(effortRamp.count - 1, max(0, index))]
+    }
+
+    /// The gradient stops behind the knob for a ladder of any length.
+    static func effortFill(rank: Int, of count: Int) -> [Color] {
+        let upper = count > 1
+            ? Int((Double(min(max(0, rank), count - 1)) / Double(count - 1) * Double(effortRamp.count - 1)).rounded())
+            : 0
+        return Array(effortRamp[0...min(effortRamp.count - 1, max(0, upper))])
+    }
     /// The far end of `ultra`'s glow: pushes past the ramp's pink into red so the strongest mode
     /// gets a genuinely distinctive treatment instead of just another flat colour stop.
     static let effortUltraAccent = Color(nsColor: .systemRed)

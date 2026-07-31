@@ -63,7 +63,7 @@ final class DraftStoreTests: XCTestCase {
 
 // MARK: - AppStore integration
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
@@ -125,7 +125,7 @@ final class DraftPersistenceIntegrationTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    private func makeStore(persistence: AppPersistence, runtime: PiRuntimeProtocol = FakeRuntime()) -> AppStore {
+    private func makeStore(persistence: AppPersistence, runtime: AgentRuntimeProtocol = FakeRuntime()) -> AppStore {
         AppStore(
             repository: FakeRepository(),
             gitService: FakeGitService(),

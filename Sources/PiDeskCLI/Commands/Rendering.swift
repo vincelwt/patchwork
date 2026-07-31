@@ -21,6 +21,17 @@ enum Rendering {
         return parts.isEmpty ? "-" : parts.joined(separator: ",")
     }
 
+    /// Short label for the agent column. An agent this CLI predates prints its raw wire name
+    /// (bounded) instead of being blanked out or mapped to the wrong agent.
+    static func threadAgent(_ thread: WireThread) -> String {
+        switch thread.agent {
+        case nil, "", "pi": "pi"
+        case "codex": "codex"
+        case "claude": "claude"
+        case let other?: truncated(other, max: 12)
+        }
+    }
+
     static func threadRow(_ thread: WireThread, colorEnabled: Bool) -> [String] {
         let location: String
         if let worktree = thread.worktree {
@@ -31,6 +42,7 @@ enum Rendering {
         }
         return [
             threadID(thread),
+            threadAgent(thread),
             truncated(thread.name ?? "(unnamed)", max: nameWidth),
             truncated(location, max: locationWidth),
             threadStatus(thread, colorEnabled: colorEnabled),

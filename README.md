@@ -1,9 +1,44 @@
 # Pi Desktop
 
-A native macOS interface for [Pi](https://pi.dev), built with SwiftUI and AppKit. Pi remains the source of truth: the app reads existing Pi sessions and starts the installed Pi CLI in RPC mode only for commands that need it. Browsing, Git inspection, and renaming never send a provider prompt.
+A native macOS interface for coding agents, built with SwiftUI and AppKit. It drives **Pi**, **Codex**, and **Claude Code** as equal peers, each through its own native protocol. Each agent remains the source of truth for its own conversations: the app reads existing session files and starts the installed CLI only for commands that need it. Browsing, Git inspection, and renaming never send a provider prompt.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black)
 ![Swift](https://img.shields.io/badge/Swift-5.10-orange)
+
+## Agents
+
+Pi Desktop detects which agents are installed and offers only those. Nothing is a plugin or a
+second-class path: Pi's `--mode rpc`, Codex's `codex app-server` JSON-RPC, and Claude Code's
+`--input-format stream-json` all sit behind one adapter seam, and the app speaks one internal
+vocabulary that each adapter translates into.
+
+| | Pi | Codex | Claude Code |
+|---|---|---|---|
+| Protocol | `pi --mode rpc` | `codex app-server --stdio` | `claude -p` stream-json |
+| History | `~/.pi/agent/sessions` | `~/.codex/sessions/YYYY/MM/DD` | `~/.claude/projects` |
+| Branching history | yes | linear log | yes |
+| Model list | live query | live query | curated aliases |
+| Thinking level | live | next turn | next launch |
+| Mode control | `/mode` effort ladder | sandbox policy | permission mode |
+| Compaction | yes | yes | `/compact` |
+| Mid-turn steering | yes | yes | queued instead |
+| Edit and resend | yes | linear, no branch | no |
+| HTML export | yes | — | — |
+
+Every affordance is gated on that table rather than on the agent's name, so a control is either
+live, or visibly disabled with a reason. The Environment inspector names what the current agent
+cannot do instead of leaving greyed-out menu items unexplained. Conversations from all three
+agents share one sidebar, one search, one archive, and one set of automations; a small glyph on
+each row identifies the agent, and appears only once history actually spans more than one.
+
+Another agent's transcript is rewritten record by record into Pi's session-record shape before
+parsing, so paging, tail-first painting, the summary cache, image budgets, and search work on
+all three without a second implementation. Codex subagent rollouts and Claude sidechain turns
+are parsed but never listed: they are a tool's working notes, not conversations.
+
+Overrides: `PI_DESKTOP_CODEX_PATH`, `PI_DESKTOP_CLAUDE_PATH`, `PI_DESKTOP_CODEX_SESSION_DIR`,
+`PI_DESKTOP_CLAUDE_SESSION_DIR`. An explicit override is a pin: if it does not resolve, that
+agent is reported as not installed rather than silently falling back to another binary.
 
 ## Features
 
@@ -178,7 +213,7 @@ Pi Desktop searches for Pi in this order:
 4. `/usr/local/bin/pi`
 5. `/usr/bin/pi`
 
-The child process receives an augmented `PATH`, so Pi's `#!/usr/bin/env node` launcher also works from Finder. Set `PI_CODING_AGENT_SESSION_DIR` to use a non-default session directory.
+The child process receives an augmented `PATH`, so Pi's `#!/usr/bin/env node` launcher also works from Finder. Set `PI_CODING_AGENT_SESSION_DIR` to use a non-default session directory. Codex and Claude Code are resolved from the same directories under their own names. Pinning `PI_CODING_AGENT_SESSION_DIR` to a fixture tree pins every agent's root, so a test or sandboxed daemon never sweeps in the machine's real history.
 
 On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-activity.ts` (source of truth: `Resources/pi-desktop-activity.ts`) so every Pi session — terminal or RPC — reports its own run state and can name a new conversation during its first turn. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
 
@@ -274,6 +309,10 @@ node --test docs/js-checks/*.test.mjs      # pure web-remote logic, no DOM, no n
 Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. The remote-parity work adds coverage for the wire's structured message blocks (order, tool-call identity, one shared bounded budget, and older payloads that carry none of them), the web transcript projection (narration folded into the work log while the answer stays top level, results attached by call id, live status, failed steps vs a failed answer, compaction, orphan results, and unknown roles), optimistic pending-message reconciliation and its eviction rules (only server-accepted bubbles are evictable, and a run event that beat its own response is replayed), submission replay protection (in-flight claims are never evicted; the 257th concurrent submission is refused with `503` instead), the live-session settlement boundary (steer-joins-this-turn vs follow-up-owns-the-next, in-flight deliveries crossing the boundary, late callers refused during it, concurrent credit bounds, and the bounded shutdown drain that keeps a timeout or an abort from killing Pi under a write in flight), bounded pipe writes against a child that never reads, folder-tree cycle/depth/legacy handling on both sides including the app's own depth boundary from top level and inside a project, inline-image projection with encoding validation and bounded retrieval, the bounded image cache and its in-flight bound, interaction loads that preserve the last good set and retry with backoff, the interaction registry's bounds, method-appropriate response validation and expiry-cancels-never-answers rule, `tool_execution_start` questionnaire parsing, live steer/follow-up delivery outcomes, concurrent stdin writes against a fake `pi`, bounded read-only worktree discovery (porcelain parsing, entry and output caps, a non-repository folder, a missing or non-directory `cwd`), and the archive restore boundary between the daemon's own flag and the app's. Set `PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
 
 ## Current limitations
+
+The background daemon executes automations for Pi threads only; a scheduled run against a Codex or Claude thread fails with a clear message rather than launching the wrong binary against its transcript. Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch), cannot rename a session, and queues a mid-turn message instead of steering into the turn. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
+
+The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 
 Pi Desktop keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed detailed transcript page retains at most 1,000 messages, but dialogue-focused page replacement can navigate through the entire active branch; a page scan reports an explicit unreadable-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
 

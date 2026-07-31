@@ -69,7 +69,7 @@ final class NewChatFolderResolutionTests: XCTestCase {
 
 // MARK: - AppStore integration: the pending assignment survives to a real session
 
-private final class FakeRuntime: PiRuntimeProtocol {
+private final class FakeRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false

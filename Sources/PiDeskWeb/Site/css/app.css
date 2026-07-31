@@ -502,6 +502,20 @@ details.advanced[open] summary { color: var(--text); }
   letter-spacing: 0.03em;
 }
 .row-unread .row-title { font-weight: 700; }
+/* Agent chip, shown only for non-Pi threads. Same weight/letterspacing as .row-folder so a row
+   with a badge keeps the same rhythm as one without. */
+.agent-badge {
+  display: inline-block;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-right: 6px;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
 
 .dot {
   display: inline-block; /* a <span> is inline by default and ignores width/height without this */
@@ -730,6 +744,12 @@ details.advanced[open] summary { color: var(--text); }
   font-weight: 600;
   padding: 3px 8px;
   min-height: 34px;
+}
+.thread-subhead {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
 }
 .thread-header .cwd {
   font-size: 11.5px;

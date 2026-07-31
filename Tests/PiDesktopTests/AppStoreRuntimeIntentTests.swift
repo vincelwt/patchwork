@@ -1,8 +1,9 @@
 import Foundation
+import PiDeskKit
 import XCTest
 @testable import PiDesktop
 
-private final class IntentRuntime: PiRuntimeProtocol {
+private final class IntentRuntime: AgentRuntimeProtocol {
     enum RouteOutcome { case success, cancelled, error }
 
     var onEvent: ((JSONValue) -> Void)?
@@ -338,7 +339,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
     func testBusyRuntimeIsPreservedAndReuseCancellationOrErrorFallsBackCold() {
         let busy = IntentRuntime()
         let replacement = IntentRuntime()
-        let store = makeStore(runtime: busy, factory: { replacement })
+        let store = makeStore(runtime: busy, factory: { _ in replacement })
         let a = summary("a", cwd: root)
         let b = summary("b", cwd: root)
         store.sessions = [a, b]
@@ -463,7 +464,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
     func testManagedProcessKeepsBackgroundConversationRunningUntilItsLifecycleUpdate() {
         let runtime = IntentRuntime()
         let replacement = IntentRuntime()
-        let store = makeStore(runtime: runtime, factory: { replacement })
+        let store = makeStore(runtime: runtime, factory: { _ in replacement })
         let a = summary("a", cwd: root)
         let b = summary("b", cwd: root)
         store.sessions = [a, b]
@@ -488,7 +489,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
     func testSwitchingAwayParksARuntimeWithSubagentsAndRetiresItWhenTheyFinish() {
         let runtime = IntentRuntime()
         let replacement = IntentRuntime()
-        let store = makeStore(runtime: runtime, factory: { replacement })
+        let store = makeStore(runtime: runtime, factory: { _ in replacement })
         let a = summary("a", cwd: root)
         let b = summary("b", cwd: root)
         store.sessions = [a, b]
@@ -556,7 +557,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
 
     private func makeStore(
         runtime: IntentRuntime,
-        factory: @escaping () -> PiRuntimeProtocol = { IntentRuntime() },
+        factory: @escaping (AgentKind) -> AgentRuntimeProtocol = { _ in IntentRuntime() },
         probe: IntentRuntime? = nil,
         lease: ManualRuntimeLease? = nil
     ) -> AppStore {

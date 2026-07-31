@@ -21,6 +21,9 @@ struct WireThread: Codable, Equatable {
     var unread: Bool?
     var archived: Bool?
     var preview: String?
+    /// `pi|codex|claude`. Kept a raw `String` like every other tolerant field here: an agent a
+    /// newer daemon knows about must show up in the table, not fail the whole list decode.
+    var agent: String? = nil
     var cost: Double?
     var contextPercent: Double?
     var shortId: String? = nil
@@ -54,6 +57,7 @@ struct WireCreateThreadRequest: Codable {
     var message: String?
     var mode: String?
     var worktree: Bool? = nil
+    var agent: String? = nil
 }
 
 struct WireCreateThreadResponse: Codable, Equatable {

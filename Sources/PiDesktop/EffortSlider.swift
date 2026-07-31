@@ -1,15 +1,20 @@
+import PiDeskKit
 import SwiftUI
 
-/// A calm-to-intense replacement for the native `Slider` behind the composer's effort control.
-/// AppKit's `Slider` cannot be given a custom track or knob on macOS, so `/mode` gets its own
-/// drawing: a capsule track that fills with `PiTheme.effortRamp` up to the current step, and a
-/// knob that grows modestly at `ultra`. Used by `ModeSlider` in `ComposerView.swift`.
+/// A calm-to-intense replacement for the native `Slider` behind the composer's mode control.
+/// AppKit's `Slider` cannot be given a custom track or knob on macOS, so the mode ladder gets its
+/// own drawing: a capsule track that fills with `PiTheme.effortRamp` up to the current step, and a
+/// knob that grows modestly at the strongest stop. Used by `ModeSlider` in `ComposerView.swift`.
+///
+/// Agent-agnostic: it renders whatever ladder it is handed, so Pi's effort modes, Codex's sandbox
+/// policies, and Claude Code's permission modes are all the same control with different stops.
 ///
 /// Interaction: press or drag anywhere along the track jumps to the nearest step;
 /// `ModeSlider` layers keyboard/VoiceOver adjustment on top via `accessibilityAdjustableAction`.
 struct PiEffortTrack: View {
-    let mode: PiMode?
-    let onSelect: (PiMode) -> Void
+    let modes: [AgentMode]
+    let mode: AgentMode?
+    let onSelect: (AgentMode) -> Void
 
     /// Tracks the pointer while a press/drag is active; nil the rest of the time.
     @State private var dragIndex: Double?
@@ -20,29 +25,33 @@ struct PiEffortTrack: View {
     @State private var pendingIndex: Int?
     @State private var reconcileTask: Task<Void, Never>?
 
-    private static var steps: Int { PiMode.allCases.count }
+    private var steps: Int { max(1, modes.count) }
     /// The larger (`ultra`) radius is used as the inset at both ends regardless of the current
     /// stop, so the track's usable range — and the mapping from a click's x position back to a
     /// step — never shifts depending on which mode happens to be selected.
     private static var knobInset: CGFloat { PiTheme.effortUltraKnobDiameter / 2 }
-    /// `/mode` never calls a provider (see `AppStore.runExtensionCommand`), so a real response
-    /// is always fast; this is only a backstop against a rejected or lost command leaving the
-    /// knob showing a guess forever.
+    /// Applying a mode never calls a provider, so a real response is always fast; this is only a
+    /// backstop against a rejected or lost command leaving the knob showing a guess forever.
     private static let reconcileTimeoutNanoseconds: UInt64 = 4_000_000_000
 
-    private var currentModeIndex: Int { PiMode.allCases.firstIndex(of: mode ?? .smart) ?? 0 }
+    private var currentModeIndex: Int {
+        mode.flatMap { current in modes.firstIndex { $0.id == current.id } } ?? 0
+    }
     private var index: Double {
         PiEffortTrackGeometry.displayedIndex(dragIndex: dragIndex, pendingIndex: pendingIndex, reportedIndex: currentModeIndex)
     }
-    private var clampedIndex: Int { min(Self.steps - 1, max(0, Int(index.rounded()))) }
-    private var isUltra: Bool { mode == .ultra }
-    private var knobDiameter: CGFloat { isUltra ? PiTheme.effortUltraKnobDiameter : PiTheme.effortKnobDiameter }
-    private var knobTint: Color { mode?.piTint ?? Color.secondary.opacity(0.4) }
+    private var clampedIndex: Int { min(steps - 1, max(0, Int(index.rounded()))) }
+    /// The strongest stop of whatever ladder this is, not a hardcoded mode name.
+    private var isHottest: Bool { mode != nil && currentModeIndex == steps - 1 }
+    private var knobDiameter: CGFloat { isHottest ? PiTheme.effortUltraKnobDiameter : PiTheme.effortKnobDiameter }
+    private var knobTint: Color {
+        mode == nil ? Color.secondary.opacity(0.4) : PiTheme.effortColor(rank: currentModeIndex, of: steps)
+    }
 
     var body: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
-            let knobX = PiEffortTrackGeometry.knobCenterX(index: index, steps: Self.steps, width: width, inset: Self.knobInset)
+            let knobX = PiEffortTrackGeometry.knobCenterX(index: index, steps: steps, width: width, inset: Self.knobInset)
 
             ZStack(alignment: .leading) {
                 Capsule()
@@ -60,7 +69,7 @@ struct PiEffortTrack: View {
                     .overlay(Circle().stroke(Color.piWindow, lineWidth: 1.5))
                     // Restrained: a bare hint of depth normally, a genuine but still tasteful
                     // glow at `ultra` — the previous radius/opacity read as a lens flare.
-                    .shadow(color: knobTint.opacity(isUltra ? 0.4 : 0.12), radius: isUltra ? 3 : 1)
+                    .shadow(color: knobTint.opacity(isHottest ? 0.4 : 0.12), radius: isHottest ? 3 : 1)
                     .frame(width: knobDiameter, height: knobDiameter)
                     // Centred on the space this `GeometryReader` actually reports, not on
                     // `effortTrackHeight / 2` — that measured against the track's own thickness
@@ -73,15 +82,17 @@ struct PiEffortTrack: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
-                        let raw = PiEffortTrackGeometry.index(forX: value.location.x, steps: Self.steps, width: width, inset: Self.knobInset)
+                        let raw = PiEffortTrackGeometry.index(forX: value.location.x, steps: steps, width: width, inset: Self.knobInset)
                         dragIndex = raw
-                        let candidate = PiMode.allCases[min(Self.steps - 1, max(0, Int(raw.rounded())))]
-                        if candidate != mode { onSelect(candidate) }
+                        let position = min(steps - 1, max(0, Int(raw.rounded())))
+                        guard modes.indices.contains(position) else { return }
+                        let candidate = modes[position]
+                        if candidate.id != mode?.id { onSelect(candidate) }
                     }
                     .onEnded { value in
-                        let raw = PiEffortTrackGeometry.index(forX: value.location.x, steps: Self.steps, width: width, inset: Self.knobInset)
+                        let raw = PiEffortTrackGeometry.index(forX: value.location.x, steps: steps, width: width, inset: Self.knobInset)
                         dragIndex = nil
-                        pendingIndex = min(Self.steps - 1, max(0, Int(raw.rounded())))
+                        pendingIndex = min(steps - 1, max(0, Int(raw.rounded())))
                         armReconciliation()
                     }
             )
@@ -106,9 +117,9 @@ struct PiEffortTrack: View {
     }
 
     private var fillStyle: LinearGradient {
-        let stops = isUltra
+        let stops = isHottest
             ? PiTheme.effortRamp + [PiTheme.effortUltraAccent]
-            : Array(PiTheme.effortRamp[0...clampedIndex])
+            : PiTheme.effortFill(rank: clampedIndex, of: steps)
         return LinearGradient(colors: stops, startPoint: .leading, endPoint: .trailing)
     }
 }
