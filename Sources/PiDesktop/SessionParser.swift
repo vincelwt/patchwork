@@ -160,7 +160,9 @@ struct SessionParser {
                         provider = message["provider"]?.stringValue ?? provider
                         let available = max(0, 1_000 - pullRequestCreationCallIDs.count)
                         pullRequestCreationCallIDs.formUnion(
-                            pullRequestCreateCallIDs(in: message["content"]).prefix(available)
+                            pullRequestCreateCallIDs(
+                                in: message["content"], shapes: transcoder.agent.toolShapes
+                            ).prefix(available)
                         )
                     } else if role == "toolResult",
                               let callID = message["toolCallId"]?.stringValue,
@@ -923,16 +925,49 @@ struct SessionParser {
         )))
     }
 
-    private static func pullRequestCreateCallIDs(in content: JSONValue?) -> Set<String> {
+    /// Tool calls in this message that open a pull request, so the matching result can be read
+    /// for its URL.
+    ///
+    /// Two shapes, because agents differ. A shell tool is matched by scanning its whole argument
+    /// payload for `gh pr create` rather than one named key: Codex puts the command under `cmd`,
+    /// and its `exec` tool buries it inside a script that calls `exec_command`, so naming keys
+    /// would miss both. A tool that *is* a pull request (Codex opens them through MCP without a
+    /// shell at all) needs no command text.
+    private static func pullRequestCreateCallIDs(
+        in content: JSONValue?,
+        shapes: AgentToolShapes
+    ) -> Set<String> {
         Set((content?.arrayValue ?? []).prefix(32).compactMap { block in
             guard block["type"]?.stringValue == "toolCall",
-                  block["name"]?.stringValue?.lowercased() == "bash",
                   let id = block["id"]?.stringValue,
-                  let command = block["arguments"]?["command"]?.stringValue,
-                  PullRequestLink.invokesCreation(command)
-            else { return nil }
-            return id
+                  let name = block["name"]?.stringValue else { return nil }
+
+            if shapes.opensPullRequest(name) { return id }
+            guard shapes.isShellTool(name) else { return nil }
+            guard let arguments = block["arguments"] else { return nil }
+            return commandStrings(in: arguments).contains { text in
+                if PullRequestLink.invokesCreation(text) { return true }
+                // Inside a script, the command sits in a string literal, so the shell-quoting
+                // rules `invokesCreation` applies would reject it.
+                return shapes.allowsScriptedCommands && text.contains(PullRequestLink.creationNeedle)
+            } ? id : nil
         })
+    }
+
+    /// Every string in a bounded walk of a tool's arguments. Bounded in both depth and count so
+    /// a pathological payload cannot turn this into a deep scan on every summary.
+    private static func commandStrings(in value: JSONValue, depth: Int = 0) -> [String] {
+        guard depth < 4 else { return [] }
+        switch value {
+        case let .string(text):
+            return [String(text.prefix(20_000))]
+        case let .array(values):
+            return values.prefix(32).flatMap { commandStrings(in: $0, depth: depth + 1) }
+        case let .object(values):
+            return values.values.prefix(32).flatMap { commandStrings(in: $0, depth: depth + 1) }
+        default:
+            return []
+        }
     }
 
     private static func extractText(from content: JSONValue?) -> String? {

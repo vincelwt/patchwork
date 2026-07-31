@@ -368,7 +368,7 @@ enum ThreadsCommand {
     /// on the wire \u2014 it just cannot be typed as a filter until this CLI learns it.
     static let agents = ["pi", "codex", "claude"]
 
-    private static func validatedAgent(_ raw: String?) throws -> String? {
+    static func validatedAgent(_ raw: String?) throws -> String? {
         guard let raw, !raw.isEmpty else { return nil }
         let value = raw.lowercased()
         guard agents.contains(value) else {

@@ -26,6 +26,12 @@ vocabulary that each adapter translates into.
 | HTML export | yes | — | — |
 | Background automations | yes | yes | yes |
 
+Automations follow the agent too. A schedule against an existing conversation resolves its
+agent from that conversation every time it fires, so it never goes stale; a schedule that starts
+a fresh conversation each run records one (`pidesk schedule add --cwd … --agent claude`, default
+Pi). `pidesk` itself is on every agent's PATH, so an agent can create and inspect its own
+automations.
+
 The same three adapters drive the app *and* the headless background service, so automations, the
 `pidesk` CLI, and the web remote reach every agent rather than Pi alone. A route that has to
 launch an agent reports `agent_not_installed` if its binary is gone; reading history never needs

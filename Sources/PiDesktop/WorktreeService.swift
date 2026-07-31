@@ -23,8 +23,10 @@ enum PullRequestLink {
         return nil
     }
 
+    static let creationNeedle = "gh pr create"
+
     static func invokesCreation(_ command: String) -> Bool {
-        let needle = "gh pr create"
+        let needle = creationNeedle
         var quote: Character?
         var escaped = false
         var index = command.startIndex

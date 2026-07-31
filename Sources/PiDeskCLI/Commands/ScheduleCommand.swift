@@ -59,6 +59,7 @@ enum ScheduleCommand {
             FlagSpec("--name", takesValue: true, placeholder: "NAME", help: "schedule name (required)"),
             FlagSpec("--thread", takesValue: true, placeholder: "ID", help: "run against an existing thread"),
             FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "create a new thread each run, in this directory"),
+            FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "agent for --cwd runs: pi, codex, or claude (default pi; --thread uses the thread's own)"),
             FlagSpec("--name-pattern", takesValue: true, placeholder: "PATTERN", help: "new-thread name pattern, e.g. \"Triage {date}\" (only with --cwd; defaults to --name)"),
             FlagSpec("--prompt", takesValue: true, placeholder: "TEXT", help: "prompt to send each run (required)"),
             FlagSpec("--at", takesValue: true, placeholder: "ISO|LOCAL", help: "fire once, e.g. 2026-07-27T09:00:00Z or 2026-07-27T09:00"),
@@ -96,9 +97,18 @@ enum ScheduleCommand {
                 policy = WireSchedulePolicy(skipIfRunning: parsed.flag("--skip-if-running") ? true : nil, catchUpMissed: nil, timeoutSeconds: timeoutSeconds, quietHours: nil)
             }
 
+            let agent = try ThreadsCommand.validatedAgent(parsed.value("--agent"))
+            // An existing thread resolves its agent from the thread itself at every fire, so
+            // pinning one here could only ever disagree with the transcript.
+            if agent != nil, parsed.value("--thread") != nil {
+                throw UsageError.invalidValue(
+                    flag: "--agent", value: agent ?? "",
+                    reason: "only applies with --cwd; a --thread run uses that thread's own agent"
+                )
+            }
             let request = WireScheduleCreateRequest(
                 name: name, enabled: true, target: target, prompt: prompt,
-                mode: parsed.value("--mode"), trigger: trigger.wire, policy: policy
+                mode: parsed.value("--mode"), trigger: trigger.wire, policy: policy, agent: agent
             )
             let response = try await context.makeControlPlane(global).createSchedule(request)
             if global.jsonOutput {

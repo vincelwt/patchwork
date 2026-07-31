@@ -138,6 +138,9 @@ struct WireScheduleCreateRequest: Codable {
     var mode: String?
     var trigger: WireTrigger
     var policy: WireSchedulePolicy?
+    /// Only meaningful for a `--cwd` target: an existing thread already knows its own agent, and
+    /// the scheduler reads it from the thread at every fire rather than from here.
+    var agent: String? = nil
 }
 
 struct WireScheduleListResponse: Codable, Equatable {

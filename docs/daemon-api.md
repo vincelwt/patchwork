@@ -183,6 +183,10 @@ message was steered will not resend it, so the claim has to be true.
 
 Codex subagent rollouts (`"subsession": true`) are read but never listed as threads.
 
+`Schedule.agent` only applies to a `newThread` target. An `existingThread` schedule resolves its
+agent from the thread itself at every fire, so it always matches the transcript and never goes
+stale; `POST /v1/schedules` with both is a caller error rather than a preference.
+
 `Schedule.agent` and `Run.agent` are optional and absent means Pi, so every pre-multi-agent
 `schedules.json` and `runs.jsonl` record keeps its meaning.
 
