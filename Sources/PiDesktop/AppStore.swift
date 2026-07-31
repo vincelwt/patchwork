@@ -94,6 +94,9 @@ private final class RuntimeSlot {
     var metrics = TokenMetrics()
     var models: [AvailableModel] = []
     var thinkingLevels = ["off"]
+    /// This agent's slash commands / skills, bounded by `AgentCommand.parse`.
+    var commands: [AgentCommand] = []
+    var commandsLoading = false
     var optionsLoading = false
     var optionsPrepared = false
     var capability: ToolCapability?
@@ -328,6 +331,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var availableModels: [AvailableModel] = []
     @Published private(set) var availableThinkingLevels: [String] = ["off"]
     @Published private(set) var composerOptionsLoading = false
+    /// The attached runtime's slash commands, for the composer palette.
+    @Published private(set) var availableCommands: [AgentCommand] = []
+    @Published private(set) var commandsLoading = false
     @Published private(set) var activeCapability: ToolCapability?
     @Published private(set) var pendingQuestionnaire: QuestionnaireSession?
 
@@ -386,6 +392,14 @@ final class AppStore: ObservableObject {
     }
 
     var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
+
+    /// True while the slash-command palette has no authoritative answer yet: the route's runtime
+    /// is still attaching, or `get_commands` is in flight. Lets the palette say "Loading…"
+    /// instead of claiming the agent has no commands.
+    var isLoadingCommands: Bool {
+        guard activeCapabilities.listsCommands else { return false }
+        return commandsLoading || !isCurrentRouteRuntime
+    }
 
     /// The composer ladder's stops for the current agent, weakest first.
     ///
@@ -1156,6 +1170,8 @@ final class AppStore: ObservableObject {
         slot.metrics = liveMetrics
         slot.models = availableModels
         slot.thinkingLevels = availableThinkingLevels
+        slot.commands = availableCommands
+        slot.commandsLoading = commandsLoading
         slot.optionsLoading = composerOptionsLoading
         slot.capability = activeCapability
         slot.questionnaire = pendingQuestionnaire
@@ -1175,6 +1191,8 @@ final class AppStore: ObservableObject {
         liveMetrics = slot.metrics
         availableModels = slot.models
         availableThinkingLevels = slot.thinkingLevels
+        availableCommands = slot.commands
+        commandsLoading = slot.commandsLoading
         composerOptionsLoading = slot.optionsLoading
         activeCapability = slot.capability
         pendingQuestionnaire = slot.questionnaire
@@ -1200,6 +1218,8 @@ final class AppStore: ObservableObject {
         liveMetrics = TokenMetrics()
         availableModels.removeAll()
         availableThinkingLevels = ["off"]
+        availableCommands.removeAll()
+        commandsLoading = false
         composerOptionsLoading = false
         activeCapability = nil
         extensionStatuses.removeAll()
@@ -3086,8 +3106,10 @@ final class AppStore: ObservableObject {
 
     // MARK: - Extension commands
 
-    /// Extension commands (`/mode`, `/codex-fast`, `/limits`) run through the normal prompt path.
-    /// Pi executes them immediately and makes no provider call, so this never starts a turn.
+    /// Slash commands (`/mode`, `/codex-fast`, `/limits`, and anything the palette lists) run
+    /// through the normal prompt path, which is how every agent accepts them. Pi's own extension
+    /// commands execute immediately and make no provider call; another agent's command may well
+    /// start a turn, which is exactly what running it is supposed to do.
     func runExtensionCommand(_ command: String, successToast: String? = nil) {
         let clean = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clean.hasPrefix("/") else { return }
@@ -3494,6 +3516,8 @@ final class AppStore: ObservableObject {
     private func resetRuntimeOptionsForNewChat() {
         availableModels = []
         availableThinkingLevels = ["off"]
+        availableCommands = []
+        commandsLoading = false
         composerOptionsLoading = false
         runtimeMode = persistence.state.agentModes[newChatAgent.rawValue]
             ?? newChatAgent.capabilities.modes.first(where: { $0.id == "default" })?.id
@@ -3543,6 +3567,7 @@ final class AppStore: ObservableObject {
         guard !slot.optionsLoading, !slot.optionsPrepared else { return }
         slot.optionsLoading = true
         composerOptionsLoading = true
+        requestCommandOptions(slot: slot)
         slot.runtime.send(type: "get_available_models", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             if case let .success(response) = result, responseError(response) == nil {
@@ -3568,6 +3593,28 @@ final class AppStore: ObservableObject {
             slot.optionsLoading = false
             slot.optionsPrepared = true
             resetRuntimeRetirementLease(for: slot)
+        }
+    }
+
+    /// The composer palette's command list. `get_commands` is query-only (it is in
+    /// `RPCTimeoutPolicy.stateQueries` and never sends a provider prompt), and it rides the same
+    /// once-per-slot prewarm as the model and thinking pickers rather than any keystroke. Agents
+    /// that cannot enumerate their commands are never asked.
+    private func requestCommandOptions(slot: RuntimeSlot) {
+        guard slot.capabilities.listsCommands else { return }
+        slot.commandsLoading = true
+        commandsLoading = true
+        slot.runtime.send(type: "get_commands", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            slot.commandsLoading = false
+            if case let .success(response) = result, responseError(response) == nil {
+                slot.commands = AgentCommand.parse(response["data"]?["commands"])
+            }
+            // The slot keeps its own answer either way; only the visible route publishes, so a
+            // late reply from a superseded or backgrounded runtime cannot overwrite the palette.
+            guard slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            availableCommands = slot.commands
+            commandsLoading = false
         }
     }
 
@@ -4055,6 +4102,8 @@ final class AppStore: ObservableObject {
         slot.metrics = TokenMetrics()
         slot.models.removeAll()
         slot.thinkingLevels = ["off"]
+        slot.commands.removeAll()
+        slot.commandsLoading = false
         slot.optionsLoading = false
         slot.optionsPrepared = false
         slot.capability = nil

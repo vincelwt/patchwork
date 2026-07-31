@@ -40,6 +40,10 @@ struct ComposerView: View {
     @State private var editorHeight: CGFloat = PiTheme.composerMinEditorHeight
     /// Starting Pi is a first-edit side effect, not work every repeated key should perform.
     @State private var preparedRuntimeRouteID: String?
+    @State private var paletteSelection = 0
+    /// Escape closes the palette without touching the draft; it stays closed until the draft
+    /// stops being a bare `/token`.
+    @State private var paletteDismissed = false
 
     private var content: Binding<ComposerContent> {
         Binding(
@@ -47,6 +51,7 @@ struct ComposerView: View {
             set: { value in
                 guard model.content != value else { return }
                 model.content = value
+                if paletteDismissed, SlashCommandPalette.query(in: value) == nil { paletteDismissed = false }
                 let routeID = runtimeRouteID
                 if preparedRuntimeRouteID != routeID {
                     preparedRuntimeRouteID = routeID
@@ -65,7 +70,50 @@ struct ComposerView: View {
         }
     }
 
+    /// Non-nil only while the draft is a bare `/token` and the agent can enumerate commands.
+    private var paletteQuery: String? {
+        guard !paletteDismissed, store.activeCapabilities.listsCommands else { return nil }
+        return SlashCommandPalette.query(in: model.content)
+    }
+
+    private var paletteMatches: [AgentCommand] {
+        // Another conversation's runtime must never lend its commands to a composer that is not
+        // attached to it; until this route answers, `isLoadingCommands` keeps the box honest.
+        guard let paletteQuery, store.isCurrentRouteRuntime else { return [] }
+        return SlashCommandPalette.filter(
+            store.availableCommands,
+            query: paletteQuery,
+            limit: PiTheme.commandPaletteResultLimit
+        )
+    }
+
     var body: some View {
+        VStack(spacing: PiTheme.space6) {
+            if let paletteQuery {
+                SlashCommandPaletteView(
+                    query: paletteQuery,
+                    matches: paletteMatches,
+                    agent: store.activeAgent,
+                    isLoading: store.isLoadingCommands,
+                    selection: $paletteSelection,
+                    run: runCommand
+                )
+                // Idempotent: the same query-only prewarm the first edit already performs, so a
+                // palette opened after a failed or skipped prepare still fills itself.
+                .onAppear { store.prepareComposerOptions() }
+            }
+            editor
+        }
+        .onChange(of: paletteQuery) { _, _ in paletteSelection = 0 }
+        // A conversation switch swaps the draft without passing through the editor, so the
+        // dismissal has to be forgotten here or the next `/` would open nothing.
+        .onChange(of: store.route) { _, _ in
+            paletteDismissed = false
+            paletteSelection = 0
+        }
+    }
+
+    private var editor: some View {
         VStack(spacing: 0) {
             OutboxStrip()
 
@@ -76,6 +124,7 @@ struct ComposerView: View {
                 autofocus: autofocus,
                 onSubmit: handleSend,
                 onEscape: { store.stopFromEscape(fully: $0) },
+                onPaletteKey: handlePaletteKey,
                 admitImages: { store.admitAttachments($0, existing: $1) },
                 onHeightChange: { editorHeight = $0 }
             )
@@ -106,6 +155,41 @@ struct ComposerView: View {
 
     private var canSend: Bool {
         !AppStore.sanitizedMessage(text).isEmpty || !attachments.isEmpty
+    }
+
+    // MARK: - Slash commands
+
+    /// The palette gets first refusal on Up/Down/Return/Escape. Returning false hands the key
+    /// straight back to the text view, so send, Shift+Return, caret movement, and the
+    /// single/double Escape sequence are untouched whenever the palette is closed or empty.
+    private func handlePaletteKey(_ key: ComposerPaletteKey) -> Bool {
+        guard paletteQuery != nil else { return false }
+        switch SlashCommandPalette.outcome(
+            for: key,
+            selection: paletteSelection,
+            matchCount: paletteMatches.count
+        ) {
+        case .ignored:
+            return false
+        case let .move(index):
+            paletteSelection = index
+            return true
+        case let .run(index):
+            guard paletteMatches.indices.contains(index) else { return false }
+            runCommand(paletteMatches[index])
+            return true
+        case .dismiss:
+            paletteDismissed = true
+            return true
+        }
+    }
+
+    /// Runs through the store's single command path; the agent's own output is the feedback.
+    private func runCommand(_ command: AgentCommand) {
+        model.content = .empty
+        paletteSelection = 0
+        paletteDismissed = false
+        store.runExtensionCommand(command.prompt)
     }
 
     private var clampedHeight: CGFloat {
