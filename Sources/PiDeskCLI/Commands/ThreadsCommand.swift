@@ -144,7 +144,7 @@ enum ThreadsCommand {
         summary: "Create a thread. Without --message the session is created idle (no run starts).",
         flags: [
             FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "working directory or source project (required)"),
-            FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "agent to run: pi, codex, or claude (default pi)"),
+            FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "agent to run (default pi); the background service only creates pi threads today"),
             FlagSpec("--worktree", takesValue: false, help: "run in a fresh managed git worktree"),
             FlagSpec("--name", takesValue: true, placeholder: "NAME", help: "thread name (default: chosen by the daemon)"),
             FlagSpec("--message", takesValue: true, placeholder: "TEXT", help: "first message to send; \"-\" reads it from stdin"),
