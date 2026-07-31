@@ -15,7 +15,7 @@ public protocol AgentRuntimeProtocol: AnyObject {
 }
 
 public extension AgentRuntimeProtocol {
-    public var agent: AgentKind { .pi }
+    var agent: AgentKind { .pi }
 }
 
 public enum AgentRuntimeError: LocalizedError {

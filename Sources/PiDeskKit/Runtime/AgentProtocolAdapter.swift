@@ -61,9 +61,9 @@ public protocol AgentProtocolAdapter: AnyObject {
 }
 
 public extension AgentProtocolAdapter {
-    public var environmentOverrides: [String: String] { [:] }
-    public func startupLines(sessionPath: URL?, cwd: URL) -> [Data] { [] }
-    public func reset() {}
+    var environmentOverrides: [String: String] { [:] }
+    func startupLines(sessionPath: URL?, cwd: URL) -> [Data] { [] }
+    func reset() {}
 }
 
 // MARK: - Adapter helpers
