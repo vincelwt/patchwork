@@ -399,6 +399,9 @@ final class AppStore: ObservableObject {
     private var conversationLoadGeneration = 0
     private var loadedConversationPage: ConversationPage?
     private var latestConversationPage: ConversationPage?
+    /// Frozen visible latest window shown below the focused history page. This keeps history and
+    /// the live turn visibly connected without retaining every intervening page.
+    private var latestConversationMessages: [ChatMessage] = []
     private var historyDepth = 0
     /// ponytail: Reload cursors make nearby Newer navigation one bounded read. Deep history keeps
     /// only an LRU; a miss replays with constant page memory. Add a disk index only if measured.
@@ -452,9 +455,9 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
-    /// One detailed parser page may finish a pathological turn at this ceiling. History itself
-    /// has no accumulated-message ceiling because navigation replaces this bounded page.
-    private static let displayedMessageLimit = ConversationPage.maximumMessageCount
+    /// History retains one focused page, one detailed latest page, and that session's bounded
+    /// optimistic/RPC overlay. Older navigation replaces only the focused page.
+    private static let displayedMessageLimit = ConversationPage.maximumMessageCount * 2 + liveMessageLimit + 1
     private static let connectivityResumeCommand = "/pi-desktop-resume"
     private static let connectivityResumeDescription = "Continue an interrupted turn after a transient failure"
     private static let connectivityResumeInstruction =
@@ -1948,7 +1951,7 @@ final class AppStore: ObservableObject {
     }
 
     /// Refreshes only the selected latest page's changed tail. Historical pages stay frozen until
-    /// the reader returns to Latest, so live work never replaces what they are reading.
+    /// the reader returns to Live, so live work never replaces what they are reading.
     private func refreshSelectedConversationIfNeeded() {
         guard !isConversationLoading, !isLoadingEarlierMessages, !isLoadingNewerMessages,
               !isBrowsingEarlierHistory,
@@ -2040,6 +2043,7 @@ final class AppStore: ObservableObject {
         cancelEditingLastMessage()
         let generation = conversationLoadGeneration
         let nextDepth = historyDepth + 1
+        let latestMessages = messages
         isLoadingEarlierMessages = true
         historyNavigationTask = Task { [weak self] in
             guard let self else { return }
@@ -2049,7 +2053,10 @@ final class AppStore: ObservableObject {
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
-                if historyDepth == 0 { latestConversationPage = current }
+                if historyDepth == 0 {
+                    latestConversationPage = current
+                    latestConversationMessages = latestMessages
+                }
                 rememberHistoryReloadCursor(cursor, depth: nextDepth)
                 publishHistoryPage(older, depth: nextDepth)
                 isLoadingEarlierMessages = false
@@ -2148,7 +2155,9 @@ final class AppStore: ObservableObject {
         conversationHistoryLimitReached = page.isTruncated && page.olderCursor == nil
         hasEarlierMessages = page.olderCursor != nil
         streamingMessage = nil
-        messages = enforcingLoadedImageBudget(page.messages)
+        let latestIDs = Set(latestConversationMessages.map(\.id))
+        let history = page.messages.filter { !latestIDs.contains($0.id) }
+        messages = enforcingLoadedImageBudget(history + latestConversationMessages)
     }
 
     private func restoreLatestConversation(_ latest: ConversationPage) {
@@ -2156,6 +2165,7 @@ final class AppStore: ObservableObject {
         isBrowsingEarlierHistory = false
         hasNewerMessages = false
         latestConversationPage = nil
+        latestConversationMessages.removeAll(keepingCapacity: false)
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)
         loadedConversationPage = latest
@@ -2187,6 +2197,7 @@ final class AppStore: ObservableObject {
     ) {
         loadedConversationPage = page
         latestConversationPage = nil
+        latestConversationMessages.removeAll(keepingCapacity: false)
         historyDepth = 0
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)
@@ -2215,6 +2226,7 @@ final class AppStore: ObservableObject {
     private func resetConversationPageState() {
         loadedConversationPage = nil
         latestConversationPage = nil
+        latestConversationMessages.removeAll(keepingCapacity: false)
         historyDepth = 0
         historyReloadCursors.removeAll(keepingCapacity: false)
         historyReloadOrder.removeAll(keepingCapacity: false)

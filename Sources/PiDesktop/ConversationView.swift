@@ -312,6 +312,7 @@ struct MessageScrollView: View {
     /// SwiftUI render pass against the viewport actually on screen after an open settles.
     @State private var healTick = 0
     @State private var scrollBridge = ConversationScrollBridge()
+    @State private var historyPrependArmed = false
     @State private var pageReplacementArmed = false
     @State private var pageReplacementGeneration = 0
     @State private var didMarkFirstTextPaint = false
@@ -322,8 +323,7 @@ struct MessageScrollView: View {
             revision: store.transcriptRevision,
             messages: messages,
             streaming: stream.message,
-            isRunning: isRunning,
-            mode: store.isBrowsingEarlierHistory ? .focusedHistory : .detailed
+            isRunning: isRunning
         )
     }
 
@@ -444,14 +444,18 @@ struct MessageScrollView: View {
             releasePageReplacementSoon()
         }
         .onChange(of: store.isLoadingEarlierMessages) { wasLoading, isLoading in
-            if pageReplacementArmed, wasLoading, !isLoading { releasePageReplacementSoon() }
+            guard wasLoading, !isLoading else { return }
+            if historyPrependArmed { releaseHistoryPrependSoon() }
+            if pageReplacementArmed { releasePageReplacementSoon() }
         }
         .onChange(of: store.isLoadingNewerMessages) { wasLoading, isLoading in
             if pageReplacementArmed, wasLoading, !isLoading { releasePageReplacementSoon() }
         }
         .onChange(of: store.latestScrollRequest) { _, _ in
+            historyPrependArmed = false
             pageReplacementArmed = false
             pageReplacementGeneration &+= 1
+            scrollBridge.disarmPrepend()
             scrollBridge.disarmPageReplacement()
             isPinnedToBottom = true
             scrollBridge.pinToBottom()
@@ -486,9 +490,9 @@ struct MessageScrollView: View {
 
     private var historyNavigationBar: some View {
         HStack(spacing: PiTheme.space8) {
-            Text("History · work omitted")
+            Text("Earlier history · work omitted")
                 .foregroundStyle(.tertiary)
-                .accessibilityLabel("Conversation history. Work details are omitted.")
+                .accessibilityLabel("Earlier conversation history. Work details are omitted from this page.")
             Divider()
                 .frame(height: PiTheme.space16)
                 .accessibilityHidden(true)
@@ -509,11 +513,11 @@ struct MessageScrollView: View {
             Button {
                 store.jumpToLatestMessages()
             } label: {
-                Label("Latest", systemImage: "arrow.down.to.line")
+                Label("Live", systemImage: "arrow.down.to.line")
             }
             .buttonStyle(.plain)
-            .accessibilityHint("Return to the live conversation and its newest message")
-            .help("Return to the live conversation")
+            .accessibilityHint("Scroll to the live end of this conversation")
+            .help("Scroll to the live end")
         }
         .font(PiFont.caption)
         .padding(.horizontal, PiTheme.space10)
@@ -550,8 +554,17 @@ struct MessageScrollView: View {
 
     private func requestEarlierMessages() {
         guard store.hasEarlierMessages, !store.isLoadingEarlierMessages, !store.isLoadingNewerMessages else { return }
-        armPageReplacement(.bottom)
-        if !store.loadEarlierMessages() { cancelPageReplacement() }
+        if store.isBrowsingEarlierHistory {
+            armPageReplacement(.top)
+        } else {
+            historyPrependArmed = true
+            scrollBridge.armPrepend()
+        }
+        if !store.loadEarlierMessages() {
+            historyPrependArmed = false
+            scrollBridge.disarmPrepend()
+            cancelPageReplacement()
+        }
     }
 
     private func requestNewerMessages() {
@@ -561,6 +574,8 @@ struct MessageScrollView: View {
     }
 
     private func armPageReplacement(_ edge: ConversationPageEdge) {
+        historyPrependArmed = false
+        scrollBridge.disarmPrepend()
         pageReplacementGeneration &+= 1
         pageReplacementArmed = true
         scrollBridge.armPageReplacement(edge)
@@ -570,6 +585,15 @@ struct MessageScrollView: View {
         pageReplacementGeneration &+= 1
         pageReplacementArmed = false
         scrollBridge.disarmPageReplacement()
+    }
+
+    private func releaseHistoryPrependSoon() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard historyPrependArmed, !store.isLoadingEarlierMessages else { return }
+            historyPrependArmed = false
+            scrollBridge.disarmPrepend()
+        }
     }
 
     private func releasePageReplacementSoon() {
