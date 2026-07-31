@@ -32,6 +32,12 @@ public struct AgentSessionTranscoder: Sendable {
     /// nothing beyond a closure call.
     public static let pi = AgentSessionTranscoder(chain: .parentPointer) { $0 }
 
+    /// The transform for whichever agent owns a file, decided by the session root it lives
+    /// under. Liveness detection reads raw file tails and only has a path to go on.
+    public static func forSessionPath(_ path: String) -> AgentSessionTranscoder {
+        make(for: AgentCatalog.agent(forSessionPath: path) ?? .pi)
+    }
+
     public static func make(for kind: AgentKind) -> AgentSessionTranscoder {
         switch kind {
         case .pi: pi

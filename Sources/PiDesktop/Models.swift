@@ -78,6 +78,16 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
         return clean.isEmpty ? "Untitled conversation" : clean
     }
 
+    /// Adopts the agent's own name for this conversation when it keeps one outside the
+    /// transcript. Only replaces a name this app derived itself, so an explicit in-session name
+    /// still wins, and it re-folds the search key so search matches what the sidebar shows.
+    mutating func applyExternalName() {
+        guard let external = agent.externalName(forSessionPath: fileURL.path)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !external.isEmpty else { return }
+        name = external
+        prepareSearchKey()
+    }
+
     /// Folded once during summary projection/cache hydration, not per sidebar render.
     mutating func prepareSearchKey() {
         searchKey = "\(displayName)\n\(preview)\n\(cwd.path)".lowercased().prefixString(2_000)

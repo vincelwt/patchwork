@@ -43,11 +43,13 @@ final class AgentSessionTranscoderTests: XCTestCase {
     func testCodexAssistantMessageBecomesAssistantEntry() {
         let record = transcode(.codex, """
         {"timestamp":"2026-07-30T18:26:21.400Z","type":"response_item","payload":{"type":"message",\
-        "id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello there"}]}}
+        "id":"msg_1","role":"assistant","phase":"final_answer",\
+        "content":[{"type":"output_text","text":"Hello there"}]}}
         """)
         let message = record?["message"] as? [String: Any]
         XCTAssertEqual(record?["type"] as? String, "message")
         XCTAssertEqual(message?["role"] as? String, "assistant")
+        // Only Codex's own final answer is a completed answer; see `CodexHarnessAndPhaseTests`.
         XCTAssertEqual(message?["stopReason"] as? String, "stop")
         let blocks = message?["content"] as? [[String: Any]]
         XCTAssertEqual(blocks?.first?["text"] as? String, "Hello there")

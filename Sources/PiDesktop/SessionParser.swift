@@ -296,13 +296,17 @@ struct SessionParser {
     /// Finds the newest completed assistant answer in a bounded JSONL tail. Pi commits records
     /// with a trailing newline, so an unterminated final fragment is ignored even if it happens
     /// to be temporarily decodable while another process is still writing it.
-    static func latestTerminalAssistantCompletion(inTail tail: Data) -> AssistantCompletion? {
+    static func latestTerminalAssistantCompletion(
+        inTail tail: Data,
+        transcoder: AgentSessionTranscoder = .pi
+    ) -> AssistantCompletion? {
         guard let lastNewline = tail.lastIndex(of: 0x0A) else { return nil }
         let complete = tail[...lastNewline]
         for line in complete.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
             var record = Data(line)
             if record.last == 0x0D { record.removeLast() }
-            guard let entry = try? JSONValue.decode(record),
+            guard let projected = transcoder.transcode(record),
+                  let entry = try? JSONValue.decode(projected),
                   let completion = terminalAssistantCompletion(from: entry) else { continue }
             return completion
         }

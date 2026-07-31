@@ -117,10 +117,22 @@ enum CodexSessionTranscoder {
         guard let role = payload["role"] as? String else { return nil }
         // Developer/system turns are Codex's own injected harness context, not conversation.
         guard role == "user" || role == "assistant" else { return nil }
-        let blocks = contentBlocks(payload["content"])
+        var blocks = contentBlocks(payload["content"])
         guard !blocks.isEmpty else { return nil }
+
+        if role == "user" {
+            guard let cleaned = HarnessText.userBlocks(blocks) else { return nil }
+            blocks = cleaned
+        }
+
         var message: [String: Any] = ["role": role, "content": blocks]
-        if role == "assistant" { message["stopReason"] = "stop" }
+        if role == "assistant" {
+            // Codex narrates continuously while it works and marks which of those messages is
+            // actually the answer. Treating every one as a completed answer made each mid-turn
+            // remark close a turn: the transcript never collapsed its reasoning, and the sidebar
+            // flipped between running and done on every write.
+            message["stopReason"] = (payload["phase"] as? String) == "final_answer" ? "stop" : "toolUse"
+        }
         return entry(id: id, timestamp: timestamp, message: message)
     }
 
@@ -364,6 +376,73 @@ extension CodexSessionTranscoder {
                 cursor = bytes.index(after: cursor)
             }
             return true
+        }
+    }
+}
+
+// MARK: - Harness text
+
+extension CodexSessionTranscoder {
+    /// Codex delivers its own scaffolding as `user`-role turns: the plugin catalogue, the
+    /// environment block, project instructions, review guidelines. None of it is the user
+    /// talking, and because a conversation's name comes from its first user message, every
+    /// Codex thread was being titled after the plugin catalogue.
+    ///
+    /// One turn can also *wrap* a real message ("Files mentioned by the user" puts attachments
+    /// above the actual request), so a wrapper is unwrapped rather than dropped.
+    enum HarnessText {
+        /// A turn consisting only of one of these is scaffolding.
+        static let injectedPrefixes = [
+            "<recommended_plugins>",
+            "<environment_context>",
+            "<user_instructions>",
+            "<project_doc>",
+            "# AGENTS.md instructions",
+            "## Code review guidelines:",
+            "# Review Guidelines"
+        ]
+
+        /// Everything after this marker is the real request; everything before it is attachment
+        /// bookkeeping Codex prepended.
+        static let requestMarkers = ["## My request for Codex:", "# My request for Codex:"]
+
+        /// Returns the blocks a user turn should actually render, or nil when the whole turn is
+        /// scaffolding. Non-text blocks (images) always survive: an attachment-only turn is real.
+        static func userBlocks(_ blocks: [[String: Any]]) -> [[String: Any]]? {
+            var kept: [[String: Any]] = []
+            var sawText = false
+            for block in blocks {
+                guard (block["type"] as? String) == "text", let text = block["text"] as? String else {
+                    kept.append(block)
+                    continue
+                }
+                sawText = true
+                guard let visible = visibleText(in: text) else { continue }
+                kept.append(TranscodeSupport.textBlock(visible))
+            }
+            // A turn whose only text was scaffolding, and which carried nothing else, is dropped.
+            if sawText, !kept.contains(where: { ($0["type"] as? String) == "text" }),
+               !kept.contains(where: { ($0["type"] as? String) == "image" }) {
+                return nil
+            }
+            return kept.isEmpty ? nil : kept
+        }
+
+        /// The user-authored part of one text block, or nil when there is none.
+        static func visibleText(in raw: String) -> String? {
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+
+            // An unwrapped request wins over the prefix check: the wrapper's own heading would
+            // otherwise look like scaffolding and take the real message down with it.
+            for marker in requestMarkers {
+                guard let range = text.range(of: marker) else { continue }
+                let request = text[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                return request.isEmpty ? nil : request
+            }
+
+            for prefix in injectedPrefixes where text.hasPrefix(prefix) { return nil }
+            return text
         }
     }
 }
