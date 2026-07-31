@@ -333,6 +333,29 @@ final class AppPersistence {
         state.pruneCompletionState()
     }
 
+    /// Records a conversation this app started. Bounded: the oldest entries are dropped rather
+    /// than letting the set grow without limit, which at worst makes a very old conversation
+    /// look foreign again.
+    static let maxAppStartedPaths = 5_000
+
+    func recordAppStarted(sessionPath: String) {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        guard !path.isEmpty, !state.appStartedSessionPaths.contains(path) else { return }
+        state.appStartedSessionPaths.insert(path)
+        if state.appStartedSessionPaths.count > Self.maxAppStartedPaths {
+            state.appStartedSessionPaths = Set(
+                state.appStartedSessionPaths.sorted().suffix(Self.maxAppStartedPaths)
+            )
+        }
+        save()
+    }
+
+    func setShowsForeignConversations(_ shows: Bool) {
+        guard state.showsForeignConversations != shows else { return }
+        state.showsForeignConversations = shows
+        save()
+    }
+
     func setArchived(_ archived: Bool, sessionID: String, now: Date = Date()) {
         if archived {
             state.archivedSessionIDs.insert(sessionID)

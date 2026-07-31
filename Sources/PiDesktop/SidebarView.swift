@@ -89,6 +89,11 @@ struct SidebarView: View {
                 }
             }
 
+            if store.hiddenForeignCount > 0, !store.showsForeignConversations {
+                PiHairline()
+                ForeignConversationsRow(count: store.hiddenForeignCount)
+            }
+
             PiHairline()
             SidebarFooter(
                 archivedCount: snapshot.all.filter(\.isArchived).count,
@@ -137,6 +142,38 @@ private struct SidebarActionRow: View {
         .padding(.horizontal, PiTheme.space6)
         .help(shortcut.isEmpty ? title : "\(title) (\(shortcut))")
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// Conversations this app did not start are hidden by default, so this says how many and offers
+/// to show them. Silently swallowing a few hundred conversations would look like data loss.
+private struct ForeignConversationsRow: View {
+    @EnvironmentObject private var store: AppStore
+    let count: Int
+    @State private var hovering = false
+
+    var body: some View {
+        Button { store.setShowsForeignConversations(true) } label: {
+            HStack(spacing: PiTheme.space6) {
+                Image(systemName: "eye.slash")
+                    .font(.system(size: PiIcon.micro))
+                    .foregroundStyle(.tertiary)
+                Text("\(count) started elsewhere")
+                    .font(SidebarTypography.metadata)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer(minLength: PiTheme.space4)
+                Text("Show")
+                    .font(SidebarTypography.metadata)
+                    .foregroundStyle(hovering ? AnyShapeStyle(Color.primary) : AnyShapeStyle(.tertiary))
+            }
+            .padding(.horizontal, PiTheme.sidebarIconInset)
+            .frame(height: PiTheme.sidebarRowHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Conversations started in a terminal, another app, or by an automation are hidden. Driving one from here would mean two processes writing the same transcript.")
     }
 }
 

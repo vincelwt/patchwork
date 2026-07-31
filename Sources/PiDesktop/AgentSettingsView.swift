@@ -32,6 +32,22 @@ struct AgentSettingsView: View {
                 }
             }
 
+            Divider()
+
+            VStack(alignment: .leading, spacing: PiTheme.space6) {
+                Toggle(isOn: Binding(
+                    get: { store.showsForeignConversations },
+                    set: { store.setShowsForeignConversations($0) }
+                )) {
+                    Text("Show conversations started elsewhere").font(PiFont.body)
+                }
+                .toggleStyle(.switch)
+                Text("An agent's directory also holds work from terminals, other desktop apps, and automations. Driving one of those from here means two processes writing the same transcript.")
+                    .font(PiFont.micro)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if !missing.isEmpty {
                 Text("Not installed: \(missing.map(\.displayName).joined(separator: ", "))")
                     .font(PiFont.micro)

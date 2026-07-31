@@ -302,6 +302,14 @@ final class AppStore: ObservableObject {
     /// Every agent found on this machine, whether or not it is switched on. Settings needs both
     /// so a disabled agent is still shown as a thing that exists.
     @Published private(set) var detectedAgents: [AgentKind] = []
+    /// Whether the sidebar also lists conversations this app did not start. Off by default: an
+    /// agent's directory holds work from terminals, other desktop apps, and automations, and
+    /// driving one of those means two processes writing one transcript.
+    @Published private(set) var showsForeignConversations = false
+    /// How many discovered conversations the ownership filter is currently hiding, so the
+    /// sidebar can offer to show them rather than silently swallowing history.
+    @Published private(set) var hiddenForeignCount = 0
+
     /// Agents the user switched off. Their conversations stop being scanned and they stop being
     /// offered for a new chat; nothing about their history is touched.
     @Published private(set) var disabledAgents: Set<AgentKind> = []
@@ -417,6 +425,19 @@ final class AppStore: ObservableObject {
     /// where narrowing would only cost a set construction per scan).
     private var enabledAgentFilter: Set<AgentKind>? {
         disabledAgents.isEmpty ? nil : Set(AgentKind.allCases.filter { !disabledAgents.contains($0) })
+    }
+
+    /// Shows or hides conversations this app did not start.
+    func setShowsForeignConversations(_ shows: Bool) {
+        guard showsForeignConversations != shows else { return }
+        showsForeignConversations = shows
+        persistence.setShowsForeignConversations(shows)
+        Task { await refreshSessions() }
+    }
+
+    /// True when this app started the conversation, or the agent's own record says it did.
+    private func isAppStarted(_ summary: SessionSummary) -> Bool {
+        persistence.state.appStartedSessionPaths.contains(summary.fileURL.standardizedFileURL.path)
     }
 
     /// Switches an agent on or off. Disabling stops scanning its transcripts and offering it for
@@ -683,6 +704,7 @@ final class AppStore: ObservableObject {
         // that an uninstalled agent never appears as a choice that would fail at spawn time.
         detectedAgents = AgentCatalog.installed()
         disabledAgents = Set(self.persistence.state.disabledAgents.compactMap(AgentKind.init(rawValue:)))
+        showsForeignConversations = self.persistence.state.showsForeignConversations
         let installed = detectedAgents.filter { !disabledAgents.contains($0) }
         installedAgents = installed
         let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
@@ -1828,12 +1850,16 @@ final class AppStore: ObservableObject {
             let daemonWorktrees = await Task.detached(priority: .utility) {
                 DaemonWorktreeProjects.load(from: overlayURL)
             }.value
-            let discovered = applyArchiveRetention(
+            let scanned = applyArchiveRetention(
                 to: try await repository.discoverSessions(
                     archivedIDs: persistence.state.archivedSessionIDs,
                     agents: enabledAgentFilter
                 )
             )
+            // Ownership is applied after discovery rather than inside it: the hidden count has
+            // to be honest, and a conversation only stops being listed, never stops existing.
+            let discovered = showsForeignConversations ? scanned : scanned.filter(isAppStarted)
+            hiddenForeignCount = scanned.count - discovered.count
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(
                 daemonWorktrees.filter { discoveredCwds.contains($0.key) }
@@ -4577,6 +4603,12 @@ final class AppStore: ObservableObject {
         }
         if let path = state(for: slot).sessionFile, !path.isEmpty {
             slot.sessionPath = URL(fileURLWithPath: path).standardizedFileURL.path
+            // A conversation this app opened as a new chat is one it started. Recorded the
+            // moment the agent names its file, which is the only point where the two are
+            // known together.
+            if slot.startedForNewChat, let owned = slot.sessionPath {
+                persistence.recordAppStarted(sessionPath: owned)
+            }
         }
     }
 
