@@ -66,6 +66,15 @@ final class RelayPairingProofTests: XCTestCase {
         XCTAssertEqual(highest, 7)
     }
 
+    func testHeartbeatRequiresAPongBeforeItsDeadline() async {
+        let pong = await RelayHeartbeat.succeeds(timeoutNanoseconds: 1_000_000_000) { $0(nil) }
+        let failure = await RelayHeartbeat.succeeds(timeoutNanoseconds: 1_000_000_000) { $0(URLError(.networkConnectionLost)) }
+        let timeout = await RelayHeartbeat.succeeds(timeoutNanoseconds: 1_000_000) { _ in }
+        XCTAssertTrue(pong)
+        XCTAssertFalse(failure)
+        XCTAssertFalse(timeout)
+    }
+
     private func base64URL(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
