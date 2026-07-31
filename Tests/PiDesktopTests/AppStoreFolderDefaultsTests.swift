@@ -179,6 +179,9 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
             persistence: AppPersistence(baseURL: directory),
             daemonWorktreeProjectsURL: overlay
         )
+        // This is a thread the CLI started, so it is only listed at all in the mode that shows
+        // conversations this app did not start.
+        store.setShowsForeignConversations(true)
 
         await store.refreshSessions()
 

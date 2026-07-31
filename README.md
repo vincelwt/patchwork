@@ -26,6 +26,17 @@ vocabulary that each adapter translates into.
 | HTML export | yes | — | — |
 | Background automations | yes | yes | yes |
 
+The sidebar lists **conversations this app started**. An agent's directory also holds work from
+terminals, other desktop apps, and automations; opening one of those from here would mean two
+processes writing a single transcript. Nothing is hidden silently: when any are filtered out the
+sidebar carries a row saying how many and offering to show them, and Settings has the same
+switch. Ownership is recorded when an agent names the file for a new chat, so it only applies
+from this version onward — earlier conversations are one click away behind that switch.
+
+Typing `/` at the start of an empty composer opens a **slash command palette** listing whatever
+the attached agent exposes: Pi's extension commands, Codex's skills, Claude Code's slash
+commands. Arrows move, Return runs, Escape dismisses.
+
 Settings has an **Agents** pane: switch an agent off and Pi Desktop stops reading its
 transcripts and stops offering it for new conversations, without touching anything that agent
 owns. Codex and Claude Code can also be given a small `pi-desktop` skill from there, teaching
