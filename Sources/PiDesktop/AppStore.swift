@@ -449,11 +449,6 @@ final class AppStore: ObservableObject {
         Task { await refreshSessions() }
     }
 
-    /// True when this app started the conversation, or the agent's own record says it did.
-    private func isAppStarted(_ summary: SessionSummary) -> Bool {
-        persistence.state.appStartedSessionPaths.contains(summary.fileURL.standardizedFileURL.path)
-    }
-
     /// Switches an agent on or off. Disabling stops scanning its transcripts and offering it for
     /// a new chat; it never deletes or rewrites anything the agent owns.
     func setAgent(_ agent: AgentKind, enabled: Bool) {
@@ -513,7 +508,7 @@ final class AppStore: ObservableObject {
     private let providerRetryScheduler: RuntimeRetirementScheduler
     private let managedTurnResumer: ManagedTurnResumer
     private let managedTurnWriterProbe: ManagedTurnWriterProbe?
-    private let daemonWorktreeProjectsURL: URL
+    private let daemonThreadOverlayURL: URL
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -674,7 +669,7 @@ final class AppStore: ObservableObject {
             )
         },
         managedTurnWriterProbe: ManagedTurnWriterProbe? = nil,
-        daemonWorktreeProjectsURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json")
+        daemonThreadOverlayURL: URL = PiDeskPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json")
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -685,7 +680,7 @@ final class AppStore: ObservableObject {
         self.providerRetryScheduler = providerRetryScheduler
         self.managedTurnResumer = managedTurnResumer
         self.managedTurnWriterProbe = managedTurnWriterProbe
-        self.daemonWorktreeProjectsURL = daemonWorktreeProjectsURL
+        self.daemonThreadOverlayURL = daemonThreadOverlayURL
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
@@ -1866,9 +1861,9 @@ final class AppStore: ObservableObject {
         scanError = nil
         do {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
-            let overlayURL = daemonWorktreeProjectsURL
-            let daemonWorktrees = await Task.detached(priority: .utility) {
-                DaemonWorktreeProjects.load(from: overlayURL)
+            let overlayURL = daemonThreadOverlayURL
+            let daemonOverlay = await Task.detached(priority: .utility) {
+                DaemonThreadOverlay.load(from: overlayURL)
             }.value
             let scanned = applyArchiveRetention(
                 to: try await repository.discoverSessions(
@@ -1878,11 +1873,21 @@ final class AppStore: ObservableObject {
             )
             // Ownership is applied after discovery rather than inside it: the hidden count has
             // to be honest, and a conversation only stops being listed, never stops existing.
-            let discovered = showsForeignConversations ? scanned : scanned.filter(isAppStarted)
+            // Remote-created conversations live in the daemon overlay because the daemon never
+            // races this process by writing app-owned state.json.
+            let visibility = SidebarVisibility(
+                showsForeignConversations: showsForeignConversations,
+                appStartedSessionPaths: persistence.state.appStartedSessionPaths,
+                desktopStartedThreadPaths: daemonOverlay.desktopStartedThreadPaths,
+                disabledAgents: disabledAgents
+            )
+            let discovered = scanned.filter {
+                visibility.includes(path: $0.fileURL.path, agent: $0.agent)
+            }
             hiddenForeignCount = scanned.count - discovered.count
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(
-                daemonWorktrees.filter { discoveredCwds.contains($0.key) }
+                daemonOverlay.managedWorktreeProjects.filter { discoveredCwds.contains($0.key) }
             )
             sessions = discovered
             refreshPullRequestStates(for: discovered)

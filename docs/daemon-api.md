@@ -111,7 +111,7 @@ accepted wherever `{id}` appears. A unique id prefix or suffix is also accepted;
 abbreviations return `400 ambiguous_thread_id` rather than choosing one.
 
 ```
-GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=&automated=&agent=
+GET  /v1/threads?query=&limit=50&cursor=&archived=false&running=&automated=&agent=&sidebar=
 → {"threads":[Thread],"nextCursor":null}
 
 GET  /v1/threads/{id}?messages=20&offset=0&all=true
@@ -119,7 +119,7 @@ GET  /v1/threads/{id}?messages=20&offset=0&all=true
 
 POST /v1/threads
      {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra","worktree":true,
-      "agent":"pi"}
+      "agent":"pi","desktopManaged":true}
 → {"thread":Thread,"runId":"…"}          // message is optional; `thread.id` is always a real session id
 
 GET  /v1/threads/{id}/runtime
@@ -155,6 +155,12 @@ Thread detail defaults to the existing raw projection (`all=true`) for API compa
 `all=false` to retain only user and assistant roles. `offset` is applied after that filter and
 `nextOffset` is present only when an older page exists. List `automated=true` keeps threads
 associated with any automation, including paused ones.
+
+List `sidebar=true` to apply the Mac sidebar's current ownership and disabled-agent settings.
+The web remote uses that projection and follows `nextCursor` until it has the complete bounded
+list, so a full first page never hides older sidebar conversations. A create with
+`desktopManaged:true` records its session path in the daemon-owned overlay, which makes a thread
+started from the remote belong to the same sidebar without racing the Mac app's `state.json`.
 
 ### Agents
 

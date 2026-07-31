@@ -455,6 +455,82 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(unknownThread.status, 404)
     }
 
+    // MARK: - Sidebar visibility
+
+    func testSidebarThreadListUsesTheAppsOwnershipAndAgentSettings() async throws {
+        let ours = TestSupport.writeSessionFile(in: directory, id: "ours", cwd: directory.path)
+        _ = TestSupport.writeSessionFile(in: directory, id: "foreign", cwd: directory.path)
+        TestSupport.writeAppState(in: directory, appStartedSessionPaths: [ours.path])
+
+        let sidebar = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(sidebar.threads.map(\.id), ["ours"])
+
+        let unfiltered = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["limit": "200"])
+        )
+        XCTAssertEqual(Set(unfiltered.threads.map(\.id)), ["ours", "foreign"])
+
+        TestSupport.writeAppState(
+            in: directory,
+            appStartedSessionPaths: [ours.path],
+            showsForeignConversations: true
+        )
+        let showingForeign = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(Set(showingForeign.threads.map(\.id)), ["ours", "foreign"])
+
+        TestSupport.writeAppState(
+            in: directory,
+            appStartedSessionPaths: [ours.path],
+            showsForeignConversations: true,
+            disabledAgents: ["pi"]
+        )
+        let disabled = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertTrue(disabled.threads.isEmpty)
+    }
+
+    func testDesktopManagedCreateStaysInBothSidebarProjections() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "remote-created", cwd: directory.path)
+        let created = PiThread(
+            id: "remote-created", path: file.path, name: "Remote", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        core = TestSupport.makeCore(
+            in: directory,
+            executor: executor,
+            interactions: interactions,
+            liveSessions: liveSessions,
+            threadRPC: FakeThreadRPCService(thread: created)
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","desktopManaged":true}"#
+        )
+        XCTAssertEqual(response.status, 201)
+
+        let sidebar = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(sidebar.threads.map(\.id), ["remote-created"])
+        XCTAssertEqual(
+            DaemonThreadOverlay.load(from: directory.appendingPathComponent("overlay.json"))
+                .desktopStartedThreadPaths,
+            Set([file.standardizedFileURL.path])
+        )
+    }
+
     // MARK: - Folders
 
     func testFoldersEndpointIsEmptyWhenTheAppHasNoStateFileAtAll() async throws {

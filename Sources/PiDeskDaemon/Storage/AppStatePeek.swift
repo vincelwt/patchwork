@@ -25,12 +25,16 @@ enum AppStatePeek {
         var virtualFolderAssignments: [String: String] = [:]
         var projectFolderAssignments: [String: String] = [:]
         var managedWorktreeProjects: [String: String] = [:]
+        var appStartedSessionPaths: Set<String> = []
+        var showsForeignConversations = false
+        var disabledAgents: Set<String> = []
 
         private enum CodingKeys: String, CodingKey {
             case archivedSessionIDs, manuallyUnreadSessionPaths
             case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
             case virtualFolders, virtualFolderAssignments, projectFolderAssignments
             case managedWorktreeProjects
+            case appStartedSessionPaths, showsForeignConversations, disabledAgents
         }
 
         init() {}
@@ -60,6 +64,15 @@ enum AppStatePeek {
                 managedWorktreeProjects[URL(fileURLWithPath: worktree).standardizedFileURL.path] =
                     URL(fileURLWithPath: project).standardizedFileURL.path
             }
+            appStartedSessionPaths = Set((try container.decodeIfPresent(
+                Set<String>.self, forKey: .appStartedSessionPaths
+            ) ?? []).sorted().suffix(5_000).map {
+                URL(fileURLWithPath: $0).standardizedFileURL.path
+            })
+            showsForeignConversations = try container.decodeIfPresent(
+                Bool.self, forKey: .showsForeignConversations
+            ) ?? false
+            disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
         }
 
         /// The cycle-safe, depth-capped projection `GET /v1/folders` returns. Assignment keys are
@@ -78,6 +91,15 @@ enum AppStatePeek {
         }
 
         func isArchived(sessionID: String) -> Bool { archivedSessionIDs.contains(sessionID) }
+
+        func sidebarVisibility(desktopStartedThreadPaths: Set<String>) -> SidebarVisibility {
+            SidebarVisibility(
+                showsForeignConversations: showsForeignConversations,
+                appStartedSessionPaths: appStartedSessionPaths,
+                desktopStartedThreadPaths: desktopStartedThreadPaths,
+                disabledAgents: Set(disabledAgents.compactMap(AgentKind.init(rawValue:)))
+            )
+        }
 
         func isUnread(path: String, latestCompletionID: String?, modifiedAt: Date) -> Bool {
             if manuallyUnreadSessionPaths.contains(path) { return true }

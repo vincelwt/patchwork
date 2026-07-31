@@ -177,7 +177,8 @@ export function renderNewThread(state, actions) {
             name: nameInput.value.trim() || undefined,
             message: messageInput.value.trim() || undefined,
             mode: mode ? mode.dataset.mode : undefined,
-            agent: agentSelect.value || undefined
+            agent: agentSelect.value || undefined,
+            desktopManaged: true
           })
           .catch((err) => {
             errorBox.hidden = false;

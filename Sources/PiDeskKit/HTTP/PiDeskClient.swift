@@ -63,7 +63,7 @@ public final class PiDeskClient: Sendable {
     public func listThreads(
         query: String? = nil, limit: Int? = nil, cursor: String? = nil,
         archived: Bool? = nil, running: Bool? = nil, automated: Bool? = nil,
-        agent: AgentKind? = nil
+        agent: AgentKind? = nil, sidebar: Bool? = nil
     ) async throws -> ThreadListResponse {
         try await get("/v1/threads", query: [
             "query": query,
@@ -72,7 +72,8 @@ public final class PiDeskClient: Sendable {
             "archived": archived.map(String.init),
             "running": running.map(String.init),
             "automated": automated.map(String.init),
-            "agent": agent?.rawValue
+            "agent": agent?.rawValue,
+            "sidebar": sidebar.map(String.init)
         ])
     }
 
