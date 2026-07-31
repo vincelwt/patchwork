@@ -259,6 +259,33 @@ enum RelayMutationCounter {
     }
 }
 
+enum RelayHeartbeat {
+    static func succeeds(
+        timeoutNanoseconds: UInt64,
+        send: @escaping @Sendable (@escaping @Sendable (Error?) -> Void) -> Void
+    ) async -> Bool {
+        let replies = AsyncStream<Bool>(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            send { error in
+                continuation.yield(error == nil)
+                continuation.finish()
+            }
+        }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await reply in replies { return reply }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                return false
+            }
+            let reply = await group.next() ?? false
+            group.cancelAll()
+            return reply
+        }
+    }
+}
+
 enum RelayServiceError: Error, LocalizedError {
     case offline
     case invalidIdentity
@@ -284,6 +311,8 @@ actor RelayService {
     static let websocketOrigin = "wss://remote.ai.gloom.sh"
     static let pairingLifetime: TimeInterval = 5 * 60
     static let maxRPCBodyBytes = 2 * 1_024 * 1_024
+    private static let heartbeatIntervalNanoseconds: UInt64 = 15_000_000_000
+    private static let heartbeatTimeoutNanoseconds: UInt64 = 10_000_000_000
     private static let maxEncryptedPlaintextBytes = 1_500_000
     private static let deviceToHost = Data("pi-remote-v1:device-to-host".utf8)
     private static let hostToDevice = Data("pi-remote-v1:host-to-device".utf8)
@@ -515,6 +544,11 @@ actor RelayService {
         self.session = session
         self.socket = socket
         socket.resume()
+        let heartbeat = Task { [weak self, weak socket] in
+            guard let self, let socket else { return }
+            await self.keepAlive(socket)
+        }
+        defer { heartbeat.cancel() }
 
         while !Task.isCancelled {
             let frame = try await socket.receive()
@@ -529,6 +563,23 @@ actor RelayService {
             try await handle(message)
         }
         throw CancellationError()
+    }
+
+    /// Detects a half-open relay socket without relying on the pairing sheet to send an offer.
+    private func keepAlive(_ socket: URLSessionWebSocketTask) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: Self.heartbeatIntervalNanoseconds)
+            guard !Task.isCancelled else { return }
+            let alive = await RelayHeartbeat.succeeds(timeoutNanoseconds: Self.heartbeatTimeoutNanoseconds) { reply in
+                socket.sendPing(pongReceiveHandler: reply)
+            }
+            guard !Task.isCancelled else { return }
+            if !alive {
+                logger.error("Hosted remote heartbeat failed; reconnecting")
+                socket.cancel(with: .goingAway, reason: nil)
+                return
+            }
+        }
     }
 
     private func send(_ message: RelayWireMessage) async throws {
