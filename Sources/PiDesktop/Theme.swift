@@ -63,6 +63,8 @@ enum PiTheme {
     static let sidebarIconColumn: CGFloat = 14
     /// Agent glyph point size. Sized to sit inside `sidebarIconColumn` without widening the row.
     static let agentBadgeSize: CGFloat = 9
+    /// Settings panes share one width so switching tabs does not resize the window.
+    static let settingsWidth: CGFloat = 460
     /// Extra leading space per nesting level in the virtual folder tree, applied to both a
     /// folder header and the sessions/subfolders indented one step past it.
     static let sidebarIndentStep: CGFloat = 14

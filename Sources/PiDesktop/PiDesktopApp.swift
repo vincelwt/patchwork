@@ -97,9 +97,18 @@ struct PiDesktopApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            DaemonSettingsView()
-                .environmentObject(appDelegate.daemonSupervisor)
-                .font(PiFont.body)
+            TabView {
+                DaemonSettingsView()
+                    .environmentObject(appDelegate.daemonSupervisor)
+                    .padding(PiTheme.space20)
+                    .tabItem { Label("Service", systemImage: "bolt.horizontal") }
+                AgentSettingsView()
+                    .environmentObject(store)
+                    .padding(PiTheme.space20)
+                    .tabItem { Label("Agents", systemImage: "square.stack.3d.up") }
+            }
+            .font(PiFont.body)
+            .frame(width: PiTheme.settingsWidth, alignment: .topLeading)
         }
     }
 

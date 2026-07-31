@@ -542,6 +542,9 @@ struct PersistedAppState: Codable {
     /// Per-agent operating mode (Pi `/mode`, Codex sandbox, Claude permission mode), keyed by
     /// agent raw value, so switching agents restores each one's last choice.
     var agentModes: [String: String] = [:]
+    /// Agents the user has switched off, by raw value. Absent means enabled, so an agent this
+    /// build does not know about is never hidden by an older preferences file.
+    var disabledAgents: Set<String> = []
     /// One app-wide choice: changing conversations or relaunching never reopens a panel the user closed.
     var inspectorVisible = true
     /// Sidebar folders the user explicitly opened or closed. Anything absent falls back to the
@@ -583,6 +586,12 @@ struct PersistedAppState: Codable {
         archivedAt = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
         lastFolder = try container.decodeIfPresent(String.self, forKey: .lastFolder)
+        // Every field this type carries has to be listed here: decoding is explicit, so a
+        // property added without a line below is written to disk and silently read back as its
+        // default on the next launch.
+        lastAgent = try container.decodeIfPresent(String.self, forKey: .lastAgent)
+        agentModes = try container.decodeIfPresent([String: String].self, forKey: .agentModes) ?? [:]
+        disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
         inspectorVisible = try container.decodeIfPresent(Bool.self, forKey: .inspectorVisible) ?? true
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []

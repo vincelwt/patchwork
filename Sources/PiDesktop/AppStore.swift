@@ -297,7 +297,14 @@ final class AppStore: ObservableObject {
     @Published var runtimeState = RuntimeState()
     /// Agents whose executable resolved at launch, in a stable order. Empty means nothing is
     /// installed, which the new-chat surface reports instead of failing at spawn time.
+    /// Excludes any the user has switched off; `detectedAgents` is the unfiltered list.
     @Published private(set) var installedAgents: [AgentKind] = []
+    /// Every agent found on this machine, whether or not it is switched on. Settings needs both
+    /// so a disabled agent is still shown as a thing that exists.
+    @Published private(set) var detectedAgents: [AgentKind] = []
+    /// Agents the user switched off. Their conversations stop being scanned and they stop being
+    /// offered for a new chat; nothing about their history is touched.
+    @Published private(set) var disabledAgents: Set<AgentKind> = []
     /// The agent a new conversation will use. Persisted so the choice survives relaunch.
     @Published var newChatAgent: AgentKind = .pi {
         didSet {
@@ -404,6 +411,28 @@ final class AppStore: ObservableObject {
 
     var canEditHistory: Bool {
         isSelectedRuntime && activeRuntimeSlot.capabilities.canFork
+    }
+
+    /// The agents discovery should read, or nil when nothing is switched off (the common case,
+    /// where narrowing would only cost a set construction per scan).
+    private var enabledAgentFilter: Set<AgentKind>? {
+        disabledAgents.isEmpty ? nil : Set(AgentKind.allCases.filter { !disabledAgents.contains($0) })
+    }
+
+    /// Switches an agent on or off. Disabling stops scanning its transcripts and offering it for
+    /// a new chat; it never deletes or rewrites anything the agent owns.
+    func setAgent(_ agent: AgentKind, enabled: Bool) {
+        let wasDisabled = disabledAgents.contains(agent)
+        guard wasDisabled == enabled else { return }
+        if enabled { disabledAgents.remove(agent) } else { disabledAgents.insert(agent) }
+        persistence.updateState { $0.disabledAgents = Set(disabledAgents.map(\.rawValue)) }
+        installedAgents = detectedAgents.filter { !disabledAgents.contains($0) }
+        if disabledAgents.contains(newChatAgent) {
+            newChatAgent = installedAgents.first ?? .pi
+        }
+        // The repository's roots are fixed at construction, so the sidebar is refiltered here and
+        // the next full scan picks up the narrower root list.
+        Task { await refreshSessions() }
     }
 
     /// Whether sidebar rows should carry an agent glyph. On a machine with one agent it is noise
@@ -652,7 +681,9 @@ final class AppStore: ObservableObject {
 
         // Detection is a filesystem check, cheap enough to do once at launch and honest enough
         // that an uninstalled agent never appears as a choice that would fail at spawn time.
-        let installed = AgentCatalog.installed()
+        detectedAgents = AgentCatalog.installed()
+        disabledAgents = Set(self.persistence.state.disabledAgents.compactMap(AgentKind.init(rawValue:)))
+        let installed = detectedAgents.filter { !disabledAgents.contains($0) }
         installedAgents = installed
         let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
         // Fall back through: remembered choice, first installed agent, then Pi. Never offer an
@@ -1798,7 +1829,10 @@ final class AppStore: ObservableObject {
                 DaemonWorktreeProjects.load(from: overlayURL)
             }.value
             let discovered = applyArchiveRetention(
-                to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+                to: try await repository.discoverSessions(
+                    archivedIDs: persistence.state.archivedSessionIDs,
+                    agents: enabledAgentFilter
+                )
             )
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(

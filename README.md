@@ -26,6 +26,12 @@ vocabulary that each adapter translates into.
 | HTML export | yes | — | — |
 | Background automations | yes | yes | yes |
 
+Settings has an **Agents** pane: switch an agent off and Pi Desktop stops reading its
+transcripts and stops offering it for new conversations, without touching anything that agent
+owns. Codex and Claude Code can also be given a small `pi-desktop` skill from there, teaching
+them the `pidesk` CLI that is already on their PATH; Pi already learns it from the extension. A
+skill file with no recognisable version marker is treated as your own and never overwritten.
+
 Automations follow the agent too. A schedule against an existing conversation resolves its
 agent from that conversation every time it fires, so it never goes stale; a schedule that starts
 a fresh conversation each run records one (`pidesk schedule add --cwd … --agent claude`, default
