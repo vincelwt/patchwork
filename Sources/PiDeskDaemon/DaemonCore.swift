@@ -41,6 +41,9 @@ final class DaemonCore: @unchecked Sendable {
         logger: DaemonLogger,
         executor: RunExecuting,
         sessionRootURL: URL = SessionScanner.defaultRootURL(),
+        /// Injectable so a test can seed another agent's tree; production derives every root from
+        /// the Pi root, which pins all of them when it is itself pinned.
+        sessionRoots: [(agent: AgentKind, url: URL)]? = nil,
         activityDirectoryURL: URL = PiDeskPaths.activityDirectory,
         schedulesFileURL: URL = PiDeskPaths.schedules,
         runHistoryFileURL: URL = PiDeskPaths.runHistory,
@@ -80,7 +83,7 @@ final class DaemonCore: @unchecked Sendable {
         leaseStore = LeaseStore()
         let overlay = DaemonOverlayStore(fileURL: overlayFileURL)
         threadStore = ThreadStore(
-            rootURL: sessionRootURL, activityDirectoryURL: activityDirectoryURL,
+            rootURL: sessionRootURL, roots: sessionRoots, activityDirectoryURL: activityDirectoryURL,
             appStateURL: appStateURL, logger: logger, overlay: overlay
         )
         limitsCache = LimitsCache()
