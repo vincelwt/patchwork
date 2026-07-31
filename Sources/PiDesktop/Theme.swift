@@ -129,6 +129,15 @@ enum PiTheme {
     static let quickSwitchRowHeight: CGFloat = 34
     static let quickSwitchResultLimit = 60
 
+    /// Slash-command palette above the composer. Denser than ⌘K because it sits inside the
+    /// conversation rather than over it, and capped so it never takes the transcript's screen.
+    static let commandPaletteRowHeight: CGFloat = 30
+    static var commandPaletteMaxHeight: CGFloat { commandPaletteRowHeight * 6 }
+    static let commandPaletteResultLimit = 40
+    /// Bounds on what a runtime's reported command list may retain.
+    static let commandListLimit = 300
+    static let commandDetailLimit = 200
+
     // Hosted remote pairing sheet.
     static let remoteAccessWidth: CGFloat = 560
     static let remoteAccessHeight: CGFloat = 620

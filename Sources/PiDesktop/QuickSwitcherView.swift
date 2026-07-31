@@ -257,7 +257,8 @@ private struct PaletteField: NSViewRepresentable {
     }
 }
 
-private struct HintLabel: View {
+/// The shared keyboard-hint chip: ⌘K's footer and the composer's slash-command palette.
+struct HintLabel: View {
     let keys: String
     let text: String
 

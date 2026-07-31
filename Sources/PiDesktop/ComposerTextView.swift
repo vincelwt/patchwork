@@ -69,6 +69,8 @@ struct NativeComposerTextView: NSViewRepresentable {
     var autofocus = false
     let onSubmit: () -> Void
     var onEscape: ((Bool) -> Void)? = nil
+    /// Slash-command palette interception. Returns true only when the palette consumed the key.
+    var onPaletteKey: ((ComposerPaletteKey) -> Bool)? = nil
     /// Applies the image budgets and returns the accepted subset.
     let admitImages: ([ImageAttachment], [ImageAttachment]) -> [ImageAttachment]
     /// Intrinsic content height, so the composer grows with the text (and inline images)
@@ -107,6 +109,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
         textView.onEscape = onEscape
+        textView.onPaletteKey = onPaletteKey
         textView.onHeightChange = onHeightChange
         textView.setAccessibilityLabel("Message")
         textView.registerForDraggedTypes([.fileURL, .png, .tiff])
@@ -135,6 +138,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.autofocusOnWindow = autofocus
         textView.onSubmit = onSubmit
         textView.onEscape = onEscape
+        textView.onPaletteKey = onPaletteKey
         textView.onHeightChange = onHeightChange
         // Only rebuild when the model diverges from what the view last published, so typing is
         // never interrupted by a round trip through SwiftUI state.
@@ -172,6 +176,7 @@ struct NativeComposerTextView: NSViewRepresentable {
 final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onEscape: ((Bool) -> Void)? { didSet { if onEscape == nil { firstEscapeTime = nil } } }
+    var onPaletteKey: ((ComposerPaletteKey) -> Bool)?
     var onHeightChange: ((CGFloat) -> Void)?
     var placeholder = "" { didSet { needsDisplay = true } }
     var autofocusOnWindow = false
@@ -336,6 +341,14 @@ final class ComposerTextView: NSTextView {
 
     override func keyDown(with event: NSEvent) {
         let modifiers = event.modifierFlags.intersection([.shift, .option, .command, .control])
+        // The slash-command palette gets first refusal on four unmodified keys. When it is
+        // closed it declines, and everything below runs exactly as it did before.
+        if modifiers.isEmpty, !hasMarkedText(),
+           let key = ComposerPaletteKey(keyCode: event.keyCode), onPaletteKey?(key) == true {
+            // Closing the palette is not the first press of a stop sequence.
+            if key == .dismiss { firstEscapeTime = nil }
+            return
+        }
         if event.keyCode == 53, modifiers.isEmpty, !hasMarkedText(), let onEscape {
             guard !event.isARepeat else { return }
             let fullyStops = firstEscapeTime.map {
