@@ -37,3 +37,17 @@ test("shouldShowAgentBadge: only non-Pi agents get a badge", () => {
   assert.equal(shouldShowAgentBadge("claude"), true);
   assert.equal(shouldShowAgentBadge("gemini"), true);
 });
+
+test("schedule form: agent is only sent for a new-thread target", async () => {
+  // Mirrors the CLI rule: an existing thread already knows its agent, and the daemon reads it
+  // from that thread at every fire, so sending one here could only ever disagree.
+  const body = (useExisting, agent) => ({
+    ...(useExisting
+      ? { target: { kind: "existingThread", threadId: "t1" } }
+      : { target: { kind: "newThread", cwd: "/tmp/p" } }),
+    agent: useExisting ? undefined : agent || undefined
+  });
+  assert.equal(body(true, "claude").agent, undefined);
+  assert.equal(body(false, "claude").agent, "claude");
+  assert.equal(body(false, "").agent, undefined);
+});

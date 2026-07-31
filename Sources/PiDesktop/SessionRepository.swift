@@ -3,6 +3,10 @@ import PiDeskKit
 
 protocol SessionRepositoryProtocol {
     var rootURL: URL { get }
+    /// Discovery narrowed to the agents the user has switched on. Declared here rather than only
+    /// in the extension below: an extension member dispatches statically through a protocol
+    /// existential, so the file repository's root-skipping override would never have run.
+    func discoverSessions(archivedIDs: Set<String>, agents: Set<AgentKind>?) async throws -> [SessionSummary]
     /// Which agent wrote a transcript, decided by the session root it lives under.
     func agent(for fileURL: URL) -> AgentKind
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary]
@@ -21,6 +25,15 @@ protocol SessionRepositoryProtocol {
 }
 
 extension SessionRepositoryProtocol {
+    /// The default filters after the fact so any repository keeps working; the file repository
+    /// skips those roots outright, which is the point — a disabled agent's transcripts are never
+    /// read at all.
+    func discoverSessions(archivedIDs: Set<String>, agents: Set<AgentKind>?) async throws -> [SessionSummary] {
+        let all = try await discoverSessions(archivedIDs: archivedIDs)
+        guard let agents else { return all }
+        return all.filter { agents.contains($0.agent) }
+    }
+
     /// Fakes and legacy repositories only ever hold Pi sessions.
     func agent(for fileURL: URL) -> AgentKind { .pi }
 
@@ -92,7 +105,11 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     }
 
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary] {
-        let roots = roots
+        try await discoverSessions(archivedIDs: archivedIDs, agents: nil)
+    }
+
+    func discoverSessions(archivedIDs: Set<String>, agents: Set<AgentKind>?) async throws -> [SessionSummary] {
+        let roots = roots.filter { agents?.contains($0.agent) ?? true }
         let candidates = try await Self.detached(priority: .utility) {
             try roots.flatMap { root in
                 try Self.sessionCandidates(agent: root.agent, rootURL: root.url)
@@ -314,6 +331,29 @@ final class AppPersistence {
             state = PersistedAppState()
         }
         state.pruneCompletionState()
+    }
+
+    /// Records a conversation this app started. Bounded: the oldest entries are dropped rather
+    /// than letting the set grow without limit, which at worst makes a very old conversation
+    /// look foreign again.
+    static let maxAppStartedPaths = 5_000
+
+    func recordAppStarted(sessionPath: String) {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        guard !path.isEmpty, !state.appStartedSessionPaths.contains(path) else { return }
+        state.appStartedSessionPaths.insert(path)
+        if state.appStartedSessionPaths.count > Self.maxAppStartedPaths {
+            state.appStartedSessionPaths = Set(
+                state.appStartedSessionPaths.sorted().suffix(Self.maxAppStartedPaths)
+            )
+        }
+        save()
+    }
+
+    func setShowsForeignConversations(_ shows: Bool) {
+        guard state.showsForeignConversations != shows else { return }
+        state.showsForeignConversations = shows
+        save()
     }
 
     func setArchived(_ archived: Bool, sessionID: String, now: Date = Date()) {

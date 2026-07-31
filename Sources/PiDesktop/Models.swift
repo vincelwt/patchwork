@@ -542,6 +542,15 @@ struct PersistedAppState: Codable {
     /// Per-agent operating mode (Pi `/mode`, Codex sandbox, Claude permission mode), keyed by
     /// agent raw value, so switching agents restores each one's last choice.
     var agentModes: [String: String] = [:]
+    /// Session files this app started, by standardized path. An agent's own directory also
+    /// holds conversations started in a terminal, in Codex Desktop, or by another tool; those
+    /// are someone else's to drive, and attaching to one means two processes on one transcript.
+    var appStartedSessionPaths: Set<String> = []
+    /// Whether the sidebar also lists conversations this app did not start.
+    var showsForeignConversations = false
+    /// Agents the user has switched off, by raw value. Absent means enabled, so an agent this
+    /// build does not know about is never hidden by an older preferences file.
+    var disabledAgents: Set<String> = []
     /// One app-wide choice: changing conversations or relaunching never reopens a panel the user closed.
     var inspectorVisible = true
     /// Sidebar folders the user explicitly opened or closed. Anything absent falls back to the
@@ -583,6 +592,14 @@ struct PersistedAppState: Codable {
         archivedAt = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
         lastFolder = try container.decodeIfPresent(String.self, forKey: .lastFolder)
+        // Every field this type carries has to be listed here: decoding is explicit, so a
+        // property added without a line below is written to disk and silently read back as its
+        // default on the next launch.
+        lastAgent = try container.decodeIfPresent(String.self, forKey: .lastAgent)
+        agentModes = try container.decodeIfPresent([String: String].self, forKey: .agentModes) ?? [:]
+        disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
+        appStartedSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .appStartedSessionPaths) ?? []
+        showsForeignConversations = try container.decodeIfPresent(Bool.self, forKey: .showsForeignConversations) ?? false
         inspectorVisible = try container.decodeIfPresent(Bool.self, forKey: .inspectorVisible) ?? true
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []

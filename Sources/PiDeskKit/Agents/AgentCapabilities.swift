@@ -212,3 +212,60 @@ public enum AgentThinkingLevels {
         return known.isEmpty ? ["off"] : known
     }
 }
+
+/// How each agent names the tools that can open a pull request, and where the command text
+/// lives in their arguments.
+///
+/// This exists because pull-request detection used to match one hardcoded shape — a tool called
+/// `bash` with a `command` argument. Pi and Claude Code happen to fit it; Codex calls its shell
+/// `exec_command` with a `cmd` argument, wraps shell calls inside a `exec` script, and can also
+/// open a pull request through an MCP tool that never touches a shell at all. Every Codex pull
+/// request was therefore invisible: no toolbar link, no Open PRs bucket, no review watching.
+public struct AgentToolShapes: Sendable {
+    /// Tools that run a shell command, lowercased.
+    public let shellToolNames: Set<String>
+    /// Tools whose invocation *is* a pull request, whatever their arguments say.
+    public let pullRequestToolNames: Set<String>
+    /// True when a shell tool's argument can be a *program* that calls the shell, rather than a
+    /// shell command itself. Shell quoting rules do not apply inside one, so a command there is
+    /// matched literally. A false positive is harmless: a link is only adopted if the call's
+    /// result actually contains one.
+    public let allowsScriptedCommands: Bool
+
+    public init(
+        shellToolNames: Set<String>,
+        pullRequestToolNames: Set<String>,
+        allowsScriptedCommands: Bool = false
+    ) {
+        self.shellToolNames = shellToolNames
+        self.pullRequestToolNames = pullRequestToolNames
+        self.allowsScriptedCommands = allowsScriptedCommands
+    }
+
+    public func isShellTool(_ name: String) -> Bool { shellToolNames.contains(name.lowercased()) }
+
+    /// MCP tool names arrive namespaced and vary by server, so this matches on the suffix.
+    public func opensPullRequest(_ name: String) -> Bool {
+        let lowered = name.lowercased()
+        return pullRequestToolNames.contains { lowered == $0 || lowered.hasSuffix($0) }
+    }
+}
+
+public extension AgentKind {
+    var toolShapes: AgentToolShapes {
+        switch self {
+        case .pi:
+            AgentToolShapes(shellToolNames: ["bash"], pullRequestToolNames: [])
+        case .codex:
+            AgentToolShapes(
+                // `exec` runs a script that calls `exec_command`, so the command text is nested
+                // rather than a top-level argument; both are scanned the same way.
+                shellToolNames: ["exec", "exec_command", "shell", "local_shell", "run"],
+                pullRequestToolNames: ["_create_pull_request", "create_pull_request"],
+                allowsScriptedCommands: true
+            )
+        case .claude:
+            AgentToolShapes(shellToolNames: ["bash"], pullRequestToolNames: ["create_pull_request"])
+        }
+    }
+}

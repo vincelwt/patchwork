@@ -1,5 +1,6 @@
 import { h } from "../dom.js";
 import { describeError } from "../api.js";
+import { AGENTS } from "../agents.mjs";
 import { buildTrigger, parseDurationToSeconds } from "../trigger.mjs";
 
 const MODES = ["xfast", "fast", "smart", "ultra"];
@@ -36,6 +37,13 @@ export function renderScheduleForm(state, actions) {
   paintThreadOptions(state.threads);
   const targetCwd = h("input", { type: "text", id: "sched-cwd", placeholder: "/Users/you/code/project" });
   const targetNamePattern = h("input", { type: "text", id: "sched-name-pattern", placeholder: "Triage {date}" });
+  // Only meaningful for a new-thread target: an existing thread already knows its own agent, and
+  // the daemon reads it from that thread at every fire rather than from the schedule.
+  const agentSelect = h(
+    "select",
+    { id: "sched-agent" },
+    AGENTS.map((agent) => h("option", { value: agent.id }, agent.label))
+  );
   const targetKindButtons = ["existingThread", "newThread"].map((kind, i) =>
     h(
       "button",
@@ -60,7 +68,8 @@ export function renderScheduleForm(state, actions) {
             "div",
             null,
             h("div", { class: "field" }, h("label", { for: "sched-cwd" }, "Working directory"), targetCwd),
-            h("div", { class: "field" }, h("label", { for: "sched-name-pattern" }, "Name pattern (optional)"), targetNamePattern)
+            h("div", { class: "field" }, h("label", { for: "sched-name-pattern" }, "Name pattern (optional)"), targetNamePattern),
+            h("div", { class: "field" }, h("label", { for: "sched-agent" }, "Agent"), agentSelect)
           )
     );
   }
@@ -218,6 +227,7 @@ export function renderScheduleForm(state, actions) {
         target,
         prompt,
         mode: mode ? mode.dataset.mode : undefined,
+        agent: useExisting ? undefined : agentSelect.value || undefined,
         trigger: triggerResult.trigger,
         policy
       })

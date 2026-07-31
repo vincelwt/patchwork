@@ -26,6 +26,29 @@ vocabulary that each adapter translates into.
 | HTML export | yes | — | — |
 | Background automations | yes | yes | yes |
 
+The sidebar lists **conversations this app started**. An agent's directory also holds work from
+terminals, other desktop apps, and automations; opening one of those from here would mean two
+processes writing a single transcript. Nothing is hidden silently: when any are filtered out the
+sidebar carries a row saying how many and offering to show them, and Settings has the same
+switch. Ownership is recorded when an agent names the file for a new chat, so it only applies
+from this version onward — earlier conversations are one click away behind that switch.
+
+Typing `/` at the start of an empty composer opens a **slash command palette** listing whatever
+the attached agent exposes: Pi's extension commands, Codex's skills, Claude Code's slash
+commands. Arrows move, Return runs, Escape dismisses.
+
+Settings has an **Agents** pane: switch an agent off and Pi Desktop stops reading its
+transcripts and stops offering it for new conversations, without touching anything that agent
+owns. Codex and Claude Code can also be given a small `pi-desktop` skill from there, teaching
+them the `pidesk` CLI that is already on their PATH; Pi already learns it from the extension. A
+skill file with no recognisable version marker is treated as your own and never overwritten.
+
+Automations follow the agent too. A schedule against an existing conversation resolves its
+agent from that conversation every time it fires, so it never goes stale; a schedule that starts
+a fresh conversation each run records one (`pidesk schedule add --cwd … --agent claude`, default
+Pi). `pidesk` itself is on every agent's PATH, so an agent can create and inspect its own
+automations.
+
 The same three adapters drive the app *and* the headless background service, so automations, the
 `pidesk` CLI, and the web remote reach every agent rather than Pi alone. A route that has to
 launch an agent reports `agent_not_installed` if its binary is gone; reading history never needs
@@ -72,6 +95,7 @@ agent is reported as not installed rather than silently falling back to another 
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. One Escape stops the current turn and preserves queued messages as follow-ups; double-Escape, ⌘., and the stop button fully stop the thread.
 - A status bar that stays quiet when idle and distinguishes provider queueing, waiting for the first response, and retry countdowns (with the provider error on hover). It also shows provider/model, thinking level, an always-available fast-priority toggle, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
 - One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
+- Typing `/` at the start of an empty composer opens the active agent's own commands: Pi's extension commands, Codex's skills, and Claude Code's slash commands, each with its description and source. Typing filters, Up/Down moves, Return runs the highlighted command, Escape closes, and a space (`/mode fast`) hands the line back to the composer to send as written. The list is fetched once per runtime with the same query-only prewarm as the model and thinking pickers, and agents that cannot enumerate their commands never show it.
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. An opened image opens fitted to the viewer (large screenshots scale down with their aspect ratio, small images stay at intrinsic size, zoom scrolls) and closes on Escape, Done, or a click outside the panel. It steps to the previous/next image of the same message with Left/Right (or the viewer's arrow buttons), stopping at the first and last. Multiple previews sit side by side in a horizontally scrolling strip instead of stacking down the transcript. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
 - Subagent/background-process lifecycle presentation, with compact agent type, model, tool-call count, and runtime metadata, plus Pi extension UI dialogs/status/widgets/title/editor bridge
@@ -247,6 +271,11 @@ Node are intentionally not bundled.
 | `Esc Esc` | Fully stop the active thread |
 | `Return` | Send when idle; steer while running |
 | `Shift-Return` | Insert a newline |
+| `/` | Open the agent's slash-command palette in an empty composer |
+
+While the palette is open it takes only Up/Down, Return, and Escape, and only when it has a
+highlighted command; every other key, and all four of them once it is closed or empty, keep the
+composer's normal send, newline, caret, and single/double-Escape behavior.
 
 While Pi is running, Send and **Steer current run** hand the message to Pi immediately so it can be applied at the next model/tool boundary. **Queue as follow-up** keeps the message editable until the active turn's final assistant message settles, then sends it as the next prompt. The queue badge shows complete bounded queue strings and exposes steering/follow-up processing modes (`all` or `one-at-a-time`). A single Escape preserves every app-held message, aborts the current turn, then sends those follow-ups as soon as that turn settles. Double-Escape, ⌘., and the stop button clear queues and terminate that thread's runtime. Draft text and images are restored if Pi startup, `get_state`, or command acceptance fails.
 

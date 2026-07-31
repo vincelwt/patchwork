@@ -63,6 +63,8 @@ enum PiTheme {
     static let sidebarIconColumn: CGFloat = 14
     /// Agent glyph point size. Sized to sit inside `sidebarIconColumn` without widening the row.
     static let agentBadgeSize: CGFloat = 9
+    /// Settings panes share one width so switching tabs does not resize the window.
+    static let settingsWidth: CGFloat = 460
     /// Extra leading space per nesting level in the virtual folder tree, applied to both a
     /// folder header and the sessions/subfolders indented one step past it.
     static let sidebarIndentStep: CGFloat = 14
@@ -128,6 +130,15 @@ enum PiTheme {
     static let quickSwitchWidth: CGFloat = 560
     static let quickSwitchRowHeight: CGFloat = 34
     static let quickSwitchResultLimit = 60
+
+    /// Slash-command palette above the composer. Denser than ⌘K because it sits inside the
+    /// conversation rather than over it, and capped so it never takes the transcript's screen.
+    static let commandPaletteRowHeight: CGFloat = 30
+    static var commandPaletteMaxHeight: CGFloat { commandPaletteRowHeight * 6 }
+    static let commandPaletteResultLimit = 40
+    /// Bounds on what a runtime's reported command list may retain.
+    static let commandListLimit = 300
+    static let commandDetailLimit = 200
 
     // Hosted remote pairing sheet.
     static let remoteAccessWidth: CGFloat = 560

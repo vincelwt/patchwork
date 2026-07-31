@@ -20,17 +20,25 @@ public enum AgentChainStyle: String, Sendable {
 /// If a very large Codex or Claude transcript ever feels slow to open, the upgrade path is to
 /// hand the parsers a decoded entry instead of bytes.
 public struct AgentSessionTranscoder: Sendable {
+    /// Which agent wrote the records this transform reads. Carried so a parser working from a
+    /// transcoder alone can still reach that agent's tool shapes.
+    public let agent: AgentKind
     public let chain: AgentChainStyle
     public let transcode: @Sendable (Data) -> Data?
 
-    public init(chain: AgentChainStyle, transcode: @escaping @Sendable (Data) -> Data?) {
+    public init(
+        agent: AgentKind = .pi,
+        chain: AgentChainStyle,
+        transcode: @escaping @Sendable (Data) -> Data?
+    ) {
+        self.agent = agent
         self.chain = chain
         self.transcode = transcode
     }
 
     /// Pi records are already in the target shape, so this is the identity transform and costs
     /// nothing beyond a closure call.
-    public static let pi = AgentSessionTranscoder(chain: .parentPointer) { $0 }
+    public static let pi = AgentSessionTranscoder(agent: .pi, chain: .parentPointer) { $0 }
 
     /// The transform for whichever agent owns a file, decided by the session root it lives
     /// under. Liveness detection reads raw file tails and only has a path to go on.
@@ -41,8 +49,8 @@ public struct AgentSessionTranscoder: Sendable {
     public static func make(for kind: AgentKind) -> AgentSessionTranscoder {
         switch kind {
         case .pi: pi
-        case .codex: AgentSessionTranscoder(chain: .linear, transcode: CodexSessionTranscoder.transcode)
-        case .claude: AgentSessionTranscoder(chain: .linear, transcode: ClaudeSessionTranscoder.transcode)
+        case .codex: AgentSessionTranscoder(agent: .codex, chain: .linear, transcode: CodexSessionTranscoder.transcode)
+        case .claude: AgentSessionTranscoder(agent: .claude, chain: .linear, transcode: ClaudeSessionTranscoder.transcode)
         }
     }
 }

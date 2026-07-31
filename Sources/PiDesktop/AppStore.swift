@@ -94,6 +94,9 @@ private final class RuntimeSlot {
     var metrics = TokenMetrics()
     var models: [AvailableModel] = []
     var thinkingLevels = ["off"]
+    /// This agent's slash commands / skills, bounded by `AgentCommand.parse`.
+    var commands: [AgentCommand] = []
+    var commandsLoading = false
     var optionsLoading = false
     var optionsPrepared = false
     var capability: ToolCapability?
@@ -297,7 +300,22 @@ final class AppStore: ObservableObject {
     @Published var runtimeState = RuntimeState()
     /// Agents whose executable resolved at launch, in a stable order. Empty means nothing is
     /// installed, which the new-chat surface reports instead of failing at spawn time.
+    /// Excludes any the user has switched off; `detectedAgents` is the unfiltered list.
     @Published private(set) var installedAgents: [AgentKind] = []
+    /// Every agent found on this machine, whether or not it is switched on. Settings needs both
+    /// so a disabled agent is still shown as a thing that exists.
+    @Published private(set) var detectedAgents: [AgentKind] = []
+    /// Whether the sidebar also lists conversations this app did not start. Off by default: an
+    /// agent's directory holds work from terminals, other desktop apps, and automations, and
+    /// driving one of those means two processes writing one transcript.
+    @Published private(set) var showsForeignConversations = false
+    /// How many discovered conversations the ownership filter is currently hiding, so the
+    /// sidebar can offer to show them rather than silently swallowing history.
+    @Published private(set) var hiddenForeignCount = 0
+
+    /// Agents the user switched off. Their conversations stop being scanned and they stop being
+    /// offered for a new chat; nothing about their history is touched.
+    @Published private(set) var disabledAgents: Set<AgentKind> = []
     /// The agent a new conversation will use. Persisted so the choice survives relaunch.
     @Published var newChatAgent: AgentKind = .pi {
         didSet {
@@ -313,6 +331,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var availableModels: [AvailableModel] = []
     @Published private(set) var availableThinkingLevels: [String] = ["off"]
     @Published private(set) var composerOptionsLoading = false
+    /// The attached runtime's slash commands, for the composer palette.
+    @Published private(set) var availableCommands: [AgentCommand] = []
+    @Published private(set) var commandsLoading = false
     @Published private(set) var activeCapability: ToolCapability?
     @Published private(set) var pendingQuestionnaire: QuestionnaireSession?
 
@@ -372,6 +393,14 @@ final class AppStore: ObservableObject {
 
     var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
 
+    /// True while the slash-command palette has no authoritative answer yet: the route's runtime
+    /// is still attaching, or `get_commands` is in flight. Lets the palette say "Loading…"
+    /// instead of claiming the agent has no commands.
+    var isLoadingCommands: Bool {
+        guard activeCapabilities.listsCommands else { return false }
+        return commandsLoading || !isCurrentRouteRuntime
+    }
+
     /// The composer ladder's stops for the current agent, weakest first.
     ///
     /// Pi's ladder is its declared `/mode` list. Codex and Claude Code have no comparable
@@ -404,6 +433,41 @@ final class AppStore: ObservableObject {
 
     var canEditHistory: Bool {
         isSelectedRuntime && activeRuntimeSlot.capabilities.canFork
+    }
+
+    /// The agents discovery should read, or nil when nothing is switched off (the common case,
+    /// where narrowing would only cost a set construction per scan).
+    private var enabledAgentFilter: Set<AgentKind>? {
+        disabledAgents.isEmpty ? nil : Set(AgentKind.allCases.filter { !disabledAgents.contains($0) })
+    }
+
+    /// Shows or hides conversations this app did not start.
+    func setShowsForeignConversations(_ shows: Bool) {
+        guard showsForeignConversations != shows else { return }
+        showsForeignConversations = shows
+        persistence.setShowsForeignConversations(shows)
+        Task { await refreshSessions() }
+    }
+
+    /// True when this app started the conversation, or the agent's own record says it did.
+    private func isAppStarted(_ summary: SessionSummary) -> Bool {
+        persistence.state.appStartedSessionPaths.contains(summary.fileURL.standardizedFileURL.path)
+    }
+
+    /// Switches an agent on or off. Disabling stops scanning its transcripts and offering it for
+    /// a new chat; it never deletes or rewrites anything the agent owns.
+    func setAgent(_ agent: AgentKind, enabled: Bool) {
+        let wasDisabled = disabledAgents.contains(agent)
+        guard wasDisabled == enabled else { return }
+        if enabled { disabledAgents.remove(agent) } else { disabledAgents.insert(agent) }
+        persistence.updateState { $0.disabledAgents = Set(disabledAgents.map(\.rawValue)) }
+        installedAgents = detectedAgents.filter { !disabledAgents.contains($0) }
+        if disabledAgents.contains(newChatAgent) {
+            newChatAgent = installedAgents.first ?? .pi
+        }
+        // The repository's roots are fixed at construction, so the sidebar is refiltered here and
+        // the next full scan picks up the narrower root list.
+        Task { await refreshSessions() }
     }
 
     /// Whether sidebar rows should carry an agent glyph. On a machine with one agent it is noise
@@ -652,7 +716,10 @@ final class AppStore: ObservableObject {
 
         // Detection is a filesystem check, cheap enough to do once at launch and honest enough
         // that an uninstalled agent never appears as a choice that would fail at spawn time.
-        let installed = AgentCatalog.installed()
+        detectedAgents = AgentCatalog.installed()
+        disabledAgents = Set(self.persistence.state.disabledAgents.compactMap(AgentKind.init(rawValue:)))
+        showsForeignConversations = self.persistence.state.showsForeignConversations
+        let installed = detectedAgents.filter { !disabledAgents.contains($0) }
         installedAgents = installed
         let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
         // Fall back through: remembered choice, first installed agent, then Pi. Never offer an
@@ -1103,6 +1170,8 @@ final class AppStore: ObservableObject {
         slot.metrics = liveMetrics
         slot.models = availableModels
         slot.thinkingLevels = availableThinkingLevels
+        slot.commands = availableCommands
+        slot.commandsLoading = commandsLoading
         slot.optionsLoading = composerOptionsLoading
         slot.capability = activeCapability
         slot.questionnaire = pendingQuestionnaire
@@ -1122,6 +1191,8 @@ final class AppStore: ObservableObject {
         liveMetrics = slot.metrics
         availableModels = slot.models
         availableThinkingLevels = slot.thinkingLevels
+        availableCommands = slot.commands
+        commandsLoading = slot.commandsLoading
         composerOptionsLoading = slot.optionsLoading
         activeCapability = slot.capability
         pendingQuestionnaire = slot.questionnaire
@@ -1147,6 +1218,8 @@ final class AppStore: ObservableObject {
         liveMetrics = TokenMetrics()
         availableModels.removeAll()
         availableThinkingLevels = ["off"]
+        availableCommands.removeAll()
+        commandsLoading = false
         composerOptionsLoading = false
         activeCapability = nil
         extensionStatuses.removeAll()
@@ -1797,9 +1870,16 @@ final class AppStore: ObservableObject {
             let daemonWorktrees = await Task.detached(priority: .utility) {
                 DaemonWorktreeProjects.load(from: overlayURL)
             }.value
-            let discovered = applyArchiveRetention(
-                to: try await repository.discoverSessions(archivedIDs: persistence.state.archivedSessionIDs)
+            let scanned = applyArchiveRetention(
+                to: try await repository.discoverSessions(
+                    archivedIDs: persistence.state.archivedSessionIDs,
+                    agents: enabledAgentFilter
+                )
             )
+            // Ownership is applied after discovery rather than inside it: the hidden count has
+            // to be honest, and a conversation only stops being listed, never stops existing.
+            let discovered = showsForeignConversations ? scanned : scanned.filter(isAppStarted)
+            hiddenForeignCount = scanned.count - discovered.count
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(
                 daemonWorktrees.filter { discoveredCwds.contains($0.key) }
@@ -3026,8 +3106,10 @@ final class AppStore: ObservableObject {
 
     // MARK: - Extension commands
 
-    /// Extension commands (`/mode`, `/codex-fast`, `/limits`) run through the normal prompt path.
-    /// Pi executes them immediately and makes no provider call, so this never starts a turn.
+    /// Slash commands (`/mode`, `/codex-fast`, `/limits`, and anything the palette lists) run
+    /// through the normal prompt path, which is how every agent accepts them. Pi's own extension
+    /// commands execute immediately and make no provider call; another agent's command may well
+    /// start a turn, which is exactly what running it is supposed to do.
     func runExtensionCommand(_ command: String, successToast: String? = nil) {
         let clean = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clean.hasPrefix("/") else { return }
@@ -3434,6 +3516,8 @@ final class AppStore: ObservableObject {
     private func resetRuntimeOptionsForNewChat() {
         availableModels = []
         availableThinkingLevels = ["off"]
+        availableCommands = []
+        commandsLoading = false
         composerOptionsLoading = false
         runtimeMode = persistence.state.agentModes[newChatAgent.rawValue]
             ?? newChatAgent.capabilities.modes.first(where: { $0.id == "default" })?.id
@@ -3483,6 +3567,7 @@ final class AppStore: ObservableObject {
         guard !slot.optionsLoading, !slot.optionsPrepared else { return }
         slot.optionsLoading = true
         composerOptionsLoading = true
+        requestCommandOptions(slot: slot)
         slot.runtime.send(type: "get_available_models", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             if case let .success(response) = result, responseError(response) == nil {
@@ -3508,6 +3593,28 @@ final class AppStore: ObservableObject {
             slot.optionsLoading = false
             slot.optionsPrepared = true
             resetRuntimeRetirementLease(for: slot)
+        }
+    }
+
+    /// The composer palette's command list. `get_commands` is query-only (it is in
+    /// `RPCTimeoutPolicy.stateQueries` and never sends a provider prompt), and it rides the same
+    /// once-per-slot prewarm as the model and thinking pickers rather than any keystroke. Agents
+    /// that cannot enumerate their commands are never asked.
+    private func requestCommandOptions(slot: RuntimeSlot) {
+        guard slot.capabilities.listsCommands else { return }
+        slot.commandsLoading = true
+        commandsLoading = true
+        slot.runtime.send(type: "get_commands", payload: [:]) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            slot.commandsLoading = false
+            if case let .success(response) = result, responseError(response) == nil {
+                slot.commands = AgentCommand.parse(response["data"]?["commands"])
+            }
+            // The slot keeps its own answer either way; only the visible route publishes, so a
+            // late reply from a superseded or backgrounded runtime cannot overwrite the palette.
+            guard slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            availableCommands = slot.commands
+            commandsLoading = false
         }
     }
 
@@ -3995,6 +4102,8 @@ final class AppStore: ObservableObject {
         slot.metrics = TokenMetrics()
         slot.models.removeAll()
         slot.thinkingLevels = ["off"]
+        slot.commands.removeAll()
+        slot.commandsLoading = false
         slot.optionsLoading = false
         slot.optionsPrepared = false
         slot.capability = nil
@@ -4543,6 +4652,12 @@ final class AppStore: ObservableObject {
         }
         if let path = state(for: slot).sessionFile, !path.isEmpty {
             slot.sessionPath = URL(fileURLWithPath: path).standardizedFileURL.path
+            // A conversation this app opened as a new chat is one it started. Recorded the
+            // moment the agent names its file, which is the only point where the two are
+            // known together.
+            if slot.startedForNewChat, let owned = slot.sessionPath {
+                persistence.recordAppStarted(sessionPath: owned)
+            }
         }
     }
 
