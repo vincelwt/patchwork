@@ -176,9 +176,10 @@ A thread's history outlives its agent's installation. Reading always works; a ro
 launch the agent returns `409 agent_not_installed` when its executable no longer resolves.
 
 Delivery is capability-aware. `delivery: "steer"` is honoured only by agents that can fold a
-message into the turn already running; for one that cannot (Claude Code queues it instead) the
-request is downgraded and the response reports `delivery: "followUp"` rather than claiming a
-steer that did not happen.
+message into the turn already running. All three supported agents can today, so nothing is
+downgraded; for one that could not, the request is downgraded and the response reports
+`delivery: "followUp"` rather than claiming a steer that did not happen — a caller told its
+message was steered will not resend it, so the claim has to be true.
 
 Codex subagent rollouts (`"subsession": true`) are read but never listed as threads.
 

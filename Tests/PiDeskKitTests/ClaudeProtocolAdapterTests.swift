@@ -360,7 +360,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertNil(answered.first?.1["error"])
     }
 
-    func testAPromptSentMidTurnIsReportedAsQueuedUntilTheTurnSettles() throws {
+    func testAPromptSentMidTurnIsReportedAsSteeringUntilTheTurnSettles() throws {
         let adapter = adapter()
         _ = decode(adapter, [
             "type": "assistant", "session_id": "s", "uuid": "u1",
@@ -372,21 +372,24 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         _ = adapter.encode(command: "prompt", id: "p2", payload: ["message": .string("also check tests")])
 
         let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "s1", payload: [:])))
-        XCTAssertEqual(state["followUpQueue"]?.arrayValue?.compactMap { $0.stringValue }, ["also check tests"])
+        // Claude takes a mid-turn message into the running turn, so it is outstanding *steering*
+        // rather than work waiting behind the turn.
+        XCTAssertEqual(state["steeringQueue"]?.arrayValue?.compactMap { $0.stringValue }, ["also check tests"])
+        XCTAssertEqual(state["followUpQueue"]?.arrayValue?.count, 0)
 
         let replay = decode(adapter, [
             "type": "user", "session_id": "s", "uuid": "u2",
             "message": ["role": "user", "content": [["type": "text", "text": "also check tests"]]]
         ])
         let queued = try XCTUnwrap(events(replay).first { $0["type"]?.stringValue == "queue_update" })
-        XCTAssertEqual(queued["followUp"]?.arrayValue?.count, 1)
+        XCTAssertEqual(queued["steering"]?.arrayValue?.count, 1)
 
         let settled = decode(adapter, [
             "type": "result", "subtype": "success", "is_error": false,
             "result": "ok", "session_id": "s", "num_turns": 1, "duration_ms": 5
         ])
         let cleared = try XCTUnwrap(events(settled).first { $0["type"]?.stringValue == "queue_update" })
-        XCTAssertEqual(cleared["followUp"]?.arrayValue?.count, 0)
+        XCTAssertEqual(cleared["steering"]?.arrayValue?.count, 0)
     }
 
     func testCompactIsSentAsASlashCommandPrompt() throws {

@@ -194,8 +194,11 @@ final class AgentCatalogTests: XCTestCase {
 
         XCTAssertEqual(AgentKind.claude.capabilities.modelSelection, .aliases)
         XCTAssertEqual(AgentKind.claude.capabilities.thinking, .relaunch)
-        XCTAssertFalse(AgentKind.claude.capabilities.canSteerMidTurn)
         XCTAssertFalse(AgentKind.claude.capabilities.canFork)
+        // Claude Code takes a message sent mid-turn into the running turn; its own release build
+        // advertises "send messages to Claude while it works to steer Claude in real-time" and
+        // logs "processed message(s) that were delivered mid-turn".
+        XCTAssertTrue(AgentKind.claude.capabilities.canSteerMidTurn)
     }
 
     func testAgentGlyphsAndNamesAreDistinct() {

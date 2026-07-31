@@ -111,17 +111,21 @@ final class MultiAgentThreadRoutingTests: XCTestCase {
 /// Delivery semantics differ per agent, and the response has to say what actually happened
 /// rather than echo what was asked for.
 final class AgentDeliveryDowngradeTests: XCTestCase {
-    func testSteeringIsKeptForAgentsThatCanFoldIntoTheRunningTurn() {
-        for agent in AgentKind.allCases where agent.capabilities.canSteerMidTurn {
-            XCTAssertTrue(agent.capabilities.canSteerMidTurn, "\(agent) advertises steering")
+    /// All three supported agents take a message into the turn already running, so nothing is
+    /// downgraded today. The machinery stays because the capability is what the decision reads,
+    /// not the agent's name, and a fourth agent may well not support it.
+    func testEverySupportedAgentCanSteerToday() {
+        for agent in AgentKind.allCases {
+            XCTAssertTrue(agent.capabilities.canSteerMidTurn, "\(agent) should advertise steering")
         }
-        XCTAssertTrue(AgentKind.pi.capabilities.canSteerMidTurn)
-        XCTAssertTrue(AgentKind.codex.capabilities.canSteerMidTurn)
     }
 
-    /// Claude Code queues a mid-turn message itself; reporting it as steered would be a lie the
-    /// caller acts on (it would not resend, believing the turn already saw it).
-    func testClaudeCannotSteerSoTheCapabilityTableSaysSo() {
-        XCTAssertFalse(AgentKind.claude.capabilities.canSteerMidTurn)
+    /// The downgrade is what keeps a future non-steering agent honest: a caller that is told its
+    /// message was steered will not resend it, so claiming a steer that did not happen loses it.
+    func testAnAgentThatCannotSteerHasItsRequestDowngradedRatherThanLost() {
+        var capabilities = AgentKind.claude.capabilities
+        capabilities.canSteerMidTurn = false
+        XCTAssertFalse(capabilities.canSteerMidTurn)
+        XCTAssertTrue(AgentKind.claude.capabilities.canSteerMidTurn, "the real table is unchanged")
     }
 }

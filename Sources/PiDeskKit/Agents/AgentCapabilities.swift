@@ -171,7 +171,7 @@ public extension AgentKind {
                 canFork: false,
                 canExportHTML: false,
                 canRenameSession: false,
-                canSteerMidTurn: false,
+                canSteerMidTurn: true,
                 reportsUsage: true,
                 listsCommands: true,
                 requestsToolPermission: true,

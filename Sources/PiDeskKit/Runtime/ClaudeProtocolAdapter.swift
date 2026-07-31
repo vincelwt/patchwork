@@ -61,7 +61,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     private var slashCommands: [String] = []
     private var isTurnActive = false
     private var isCompacting = false
-    private var queuedPrompts: [String] = []
+    private var steeredPrompts: [String] = []
     private var stats = Stats()
     private var stream = StreamAccumulator()
     private var startedMessageID: String?
@@ -137,7 +137,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         slashCommands = []
         isTurnActive = false
         isCompacting = false
-        queuedPrompts = []
+        steeredPrompts = []
         stats = Stats()
         stream = StreamAccumulator()
         startedMessageID = nil
@@ -156,8 +156,10 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
 
     public func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
         switch command {
-        // Claude queues a user message sent mid-turn itself, so steering and follow-up are the
-        // same wire message as a prompt; only the queue readout below differs.
+        // Claude Code takes a user message sent mid-turn into the turn already running (its own
+        // wording: "send messages to Claude while it works to steer Claude in real-time"), so
+        // steering, follow-up, and a first prompt are all the same wire message. What differs is
+        // only what the app shows as outstanding until each one is echoed back.
         case "prompt", "steer", "follow_up":
             return userTurn(text: payload["message"]?.stringValue ?? "", images: payload["images"], id: id)
         case "compact":
@@ -248,9 +250,11 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         // transport still completes it on timeout.
         promptAcks.append(id)
         if promptAcks.count > Limit.promptAcks { promptAcks.removeFirst() }
+        // Tracked as steering rather than as a follow-up queue: it joins the running turn, it
+        // does not wait behind it.
         if isTurnActive, !text.isEmpty {
-            queuedPrompts.append(bounded(text, max: 1_000))
-            if queuedPrompts.count > Limit.queue { queuedPrompts.removeFirst() }
+            steeredPrompts.append(bounded(text, max: 1_000))
+            if steeredPrompts.count > Limit.queue { steeredPrompts.removeFirst() }
         }
         return .write([line])
     }
@@ -287,8 +291,8 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             "isCompacting": isCompacting,
             "steeringMode": "all",
             "followUpMode": "all",
-            "steeringQueue": [],
-            "followUpQueue": queuedPrompts,
+            "steeringQueue": steeredPrompts,
+            "followUpQueue": [],
             "model": [
                 "id": modelID ?? "default",
                 "name": modelName ?? modelID ?? "Default",
@@ -421,7 +425,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
                 let id = promptAcks.removeFirst()
                 out.append(.response(id: id, value: AdapterEncoding.response(id: id, data: .object([:]))))
             }
-            if !queuedPrompts.isEmpty { out.append(queueUpdate()) }
+            if !steeredPrompts.isEmpty { out.append(queueUpdate()) }
             return out
         }
 
@@ -504,8 +508,8 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         isCompacting = false
         startedMessageID = nil
         stream = StreamAccumulator()
-        if !queuedPrompts.isEmpty {
-            queuedPrompts.removeAll()
+        if !steeredPrompts.isEmpty {
+            steeredPrompts.removeAll()
             out.append(queueUpdate())
         }
         out.append(event("turn_end"))
@@ -585,7 +589,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     private func queueUpdate() -> AdapterInbound {
-        event("queue_update", ["steering": [], "followUp": queuedPrompts])
+        event("queue_update", ["steering": steeredPrompts, "followUp": []])
     }
 
     private func event(_ type: String, _ fields: [String: Any] = [:]) -> AdapterInbound {

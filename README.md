@@ -21,7 +21,7 @@ vocabulary that each adapter translates into.
 | Thinking level | live | next turn | next launch |
 | Mode control | `/mode` effort ladder | sandbox policy | permission mode |
 | Compaction | yes | yes | `/compact` |
-| Mid-turn steering | yes | yes | queued instead |
+| Mid-turn steering | yes | yes | yes |
 | Edit and resend | yes | linear, no branch | no |
 | HTML export | yes | — | — |
 | Background automations | yes | yes | yes |
@@ -314,7 +314,7 @@ Tests cover JSONL framing, bounded active-branch pages, compaction traversal, to
 
 ## Current limitations
 
-Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch), cannot rename a session, and queues a mid-turn message instead of steering into the turn. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
+Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch) and cannot rename a session. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
 
 The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 
