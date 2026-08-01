@@ -1,0 +1,362 @@
+//! HTTP API request and response bodies.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
+
+use crate::ids::{Id, Millis};
+use crate::models::*;
+
+// --- auth -------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub invite_code: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// A friendly name for this device, used to name its host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub token: String,
+    pub member: Member,
+    pub workspace: Workspace,
+}
+
+/// One request that gives a freshly connected client everything the shell needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bootstrap {
+    pub workspace: Workspace,
+    pub me: Member,
+    pub members: Vec<Member>,
+    pub sections: Vec<Section>,
+    pub channels: Vec<Channel>,
+    pub projects: Vec<Project>,
+    pub hosts: Vec<Host>,
+    pub tasks: Vec<Task>,
+    pub inbox: Vec<InboxItem>,
+    pub automations: Vec<Automation>,
+    pub open_questions: Vec<Question>,
+    pub active_runs: Vec<Run>,
+    pub previews: Vec<Preview>,
+    /// Latest event sequence number; resume the stream from here.
+    pub seq: i64,
+}
+
+// --- messages ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SendMessage {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Id>,
+    #[serde(default)]
+    pub kind: Option<MessageKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<MessageCard>,
+    #[serde(default)]
+    pub attachment_ids: Vec<Id>,
+    /// Set by agents so the message is attributed to their run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePage {
+    pub messages: Vec<Message>,
+    /// Cursor for the previous (older) page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Id>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReactionRequest {
+    pub emoji: String,
+}
+
+// --- channels ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateChannel {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
+    #[serde(default)]
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateChannel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenDm {
+    pub member_id: Id,
+}
+
+// --- tasks ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateTask {
+    pub title: String,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Id>,
+    /// `new_worktree` (default when a project is set), `existing_worktree`,
+    /// `main_checkout`, or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_worktree_id: Option<Id>,
+    /// Start the owning agent immediately.
+    #[serde(default)]
+    pub start: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetail {
+    pub task: Task,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<Worktree>,
+    pub runs: Vec<Run>,
+    pub attachments: Vec<Attachment>,
+    pub previews: Vec<Preview>,
+    pub questions: Vec<Question>,
+}
+
+// --- runs -------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StartRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<Id>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub run: Run,
+    pub events: Vec<RunEvent>,
+    pub questions: Vec<Question>,
+}
+
+// --- questions --------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskQuestion {
+    pub run_id: Id,
+    #[serde(default)]
+    pub headline: String,
+    pub items: Vec<QuestionItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerQuestion {
+    pub answers: Vec<QuestionAnswer>,
+}
+
+// --- agents, projects, hosts ------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateAgent {
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default)]
+    pub profile: AgentProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateAgent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<AgentProfile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateProject {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProjectKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    /// host id -> absolute path
+    #[serde(default)]
+    pub paths: std::collections::BTreeMap<Id, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_port: Option<u16>,
+}
+
+// --- automations ------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAutomation {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub trigger: AutomationTrigger,
+    pub agent_id: Id,
+    pub action: AutomationAction,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_channel_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_channel_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Id>,
+    #[serde(default)]
+    pub location: ExecutionLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Id>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationDebug {
+    pub automation: Automation,
+    pub runs: Vec<AutomationRun>,
+}
+
+// --- search -----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub messages: Vec<SearchHit>,
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub message: Message,
+    pub channel_name: String,
+    pub author_name: String,
+    pub snippet: String,
+}
+
+// --- previews ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartPreview {
+    pub task_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+// --- misc -------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub error: ApiErrorBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorBody {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Health {
+    pub ok: bool,
+    pub version: String,
+    pub api: u32,
+    pub started_at: Millis,
+    pub hosts_online: usize,
+    pub runs_active: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateInvite {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ok {
+    pub ok: bool,
+}
+
+impl Default for Ok {
+    fn default() -> Self {
+        Self { ok: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Raw(pub Json);

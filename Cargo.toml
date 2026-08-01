@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/patchwork-core",
+    "crates/patchwork-agent",
+    "crates/patchwork-relay",
+    "crates/patchwork-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/vincelwt/patchwork"
+rust-version = "1.88"
+
+[workspace.dependencies]
+patchwork-core = { path = "crates/patchwork-core" }
+patchwork-agent = { path = "crates/patchwork-agent" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+clap = { version = "4", features = ["derive", "env"] }
+agent-client-protocol = "2"
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+dirs = "6"
+which = "7"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

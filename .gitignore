@@ -1,0 +1,16 @@
+target/
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.local
+
+# local runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+
+desktop/src-tauri/gen/
+desktop/src-tauri/target/

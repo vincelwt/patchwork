@@ -1,0 +1,14 @@
+[package]
+name = "patchwork-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared domain model and wire protocol for Patchwork"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+time.workspace = true
