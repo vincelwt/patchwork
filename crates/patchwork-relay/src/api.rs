@@ -875,6 +875,13 @@ async fn wait_for_answer(
     }
 
     let rx = state.wait_for_answer(&id).await;
+    // Re-read after registering: an answer that landed in between would
+    // otherwise make the agent wait out the whole long-poll for nothing.
+    if let Some(answered) = state.store.question(&id)? {
+        if answered.status != QuestionStatus::Open {
+            return Ok(Json(answered));
+        }
+    }
     match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
         Ok(Result::Ok(answered)) => Ok(Json(answered)),
         // A timeout is not an error: the caller polls again.

@@ -143,6 +143,7 @@ impl AcpConnection {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let line = strip_ansi(&line);
                     if !line.trim().is_empty() {
                         let _ = event_tx.send(AgentEvent::Stderr(line));
                     }
@@ -449,6 +450,29 @@ async fn write_text_file(params: &Value) -> Result<Value, String> {
     Ok(json!({}))
 }
 
+/// Runtimes colour their logs. Those escape codes are noise once the text is
+/// stored in a run event and rendered in the UI.
+pub fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // CSI sequences end at a byte in the range @ to ~.
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pick the permission option that lets autonomous work continue, preferring a
 /// durable "always" grant so the agent is not asked again for the same tool.
 pub fn choose_permission(options: &[PermissionOption]) -> Option<String> {
@@ -480,6 +504,13 @@ mod tests {
             opt("no", "reject_once"),
         ];
         assert_eq!(choose_permission(&options).as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn ansi_colour_is_removed_from_runtime_logs() {
+        let coloured = "\u{1b}[2m2026-08-01\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m failed to load";
+        assert_eq!(strip_ansi(coloured), "2026-08-01 ERROR failed to load");
+        assert_eq!(strip_ansi("plain text"), "plain text");
     }
 
     #[test]

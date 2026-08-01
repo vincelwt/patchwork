@@ -433,17 +433,12 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         None => None,
     };
 
-    let host_id = choose_host(
-        state,
-        &profile,
-        params.host_id.clone().or_else(|| {
-            task.as_ref()
-                .and_then(|t| t.host_id.clone())
-                .or_else(|| project.as_ref().map(|_| String::new()).and(None))
-        }),
-        project.as_ref(),
-    )
-    .await?;
+    // A task that already has work on a machine stays on that machine.
+    let pinned_host = params
+        .host_id
+        .clone()
+        .or_else(|| task.as_ref().and_then(|t| t.host_id.clone()));
+    let host_id = choose_host(state, &profile, pinned_host, project.as_ref()).await?;
 
     // Where the agent will work.
     let (worktree_spec, existing_worktree) = resolve_worktree(state, &task, &project, &host_id)?;

@@ -28,7 +28,7 @@ const BUILTINS: &[Builtin] = &[
         label: "Codex",
         native: &["codex-acp"],
         base_cli: "codex",
-        npm_package: "@zed-industries/codex-acp",
+        npm_package: "@agentclientprotocol/codex-acp",
     },
     Builtin {
         id: "claude",

@@ -126,10 +126,13 @@ impl Runner {
                     error: Some(message.clone()),
                     token_usage: None,
                 });
+                // The channel gets the headline; the detail stays in the run
+                // log, where someone debugging will look for it.
+                let headline = message.lines().next().unwrap_or(&message).trim();
                 this.emit(HostToRelay::RunMessage {
                     run_id: run_id.clone(),
                     kind: MessageKind::Status,
-                    body: format!("I couldn't complete this run: {message}"),
+                    body: format!("I couldn't complete this run: {headline}"),
                 });
             }
             this.running.lock().await.remove(&run_id);
@@ -306,7 +309,7 @@ async fn execute(
                             drop(s);
                             let _ = out.send(HostToRelay::RunEvent {
                                 run_id: run_id.clone(),
-                                kind: RunEventKind::Error,
+                                kind: classify_stderr(&line),
                                 text: line,
                                 data: None,
                             });
@@ -605,6 +608,18 @@ async fn handle_update(
                 data: Some(update.clone()),
             });
         }
+    }
+}
+
+/// Runtimes are chatty on stderr. A deprecation notice from a package manager
+/// is not an error, and marking it as one makes real failures harder to find.
+fn classify_stderr(line: &str) -> RunEventKind {
+    let lowered = line.to_lowercase();
+    let noisy = ["warn", "notice", "deprecat", "info"];
+    if noisy.iter().any(|needle| lowered.contains(needle)) && !lowered.contains("error") {
+        RunEventKind::Lifecycle
+    } else {
+        RunEventKind::Error
     }
 }
 
