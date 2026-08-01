@@ -6,7 +6,7 @@ import {
   durationSeconds,
   formatDuration,
   projectTranscript
-} from "../../Sources/PiDeskWeb/Site/js/transcript.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/transcript.mjs";
 
 let seq = 0;
 const at = (seconds) => new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).toISOString();

@@ -1,20 +1,20 @@
-# `pidesk` — the Pi Desktop CLI
+# `patchwork` — the Patchwork CLI
 
-`pidesk` is a thin client over the control API described in
+`patchwork` is a thin client over the control API described in
 [`daemon-api.md`](daemon-api.md). It exists so another agent, a voice assistant, or a script can
-fully operate Pi Desktop without a window: create threads, send follow-ups, manage schedules, and
+fully operate Patchwork without a window: create threads, send follow-ups, manage schedules, and
 watch what's happening — all with `--json` for machine consumption.
 
 ```
-pidesk threads list|show|new|send|abort|archive|unarchive|rename|watch
-pidesk schedule list|add|show|pause|resume|remove|run
-pidesk daemon status|start|stop|restart|install|uninstall|logs
-pidesk remote enable|disable|url|token
-pidesk limits
+patchwork threads list|show|new|send|abort|archive|unarchive|rename|watch
+patchwork schedule list|add|show|pause|resume|remove|run
+patchwork daemon status|start|stop|restart|install|uninstall|logs
+patchwork remote enable|disable|url|token
+patchwork limits
 ```
 
-Every level answers `--help`/`-h` with real examples: `pidesk --help`, `pidesk threads --help`,
-`pidesk threads send --help`. Running bare `pidesk` lists the 20 newest active threads, then
+Every level answers `--help`/`-h` with real examples: `patchwork --help`, `patchwork threads --help`,
+`patchwork threads send --help`. Running bare `patchwork` lists the 20 newest active threads, then
 prints top-level help, so an agent gets both discovery and usage in one call.
 
 ## Global flags
@@ -23,21 +23,21 @@ These work on every command, in any position (before or after the subcommand):
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--socket PATH` | `~/Library/Application Support/Pi Desktop/daemon.sock` | Unix domain socket |
+| `--socket PATH` | `~/Library/Application Support/Patchwork/daemon.sock` | Unix domain socket |
 | `--url URL` | — | talk to the loopback remote instead, e.g. `http://127.0.0.1:7717` |
-| `--token TOKEN` | `$PIDESK_TOKEN` | bearer token, only sent with `--url` |
-| `--timeout SECONDS` | `10`, or `$PIDESK_TIMEOUT` | per-request timeout |
+| `--token TOKEN` | `$PATCHWORK_TOKEN` | bearer token, only sent with `--url` |
+| `--timeout SECONDS` | `10`, or `$PATCHWORK_TIMEOUT` | per-request timeout |
 | `--json` | off | machine-readable output (see below) |
 | `--quiet` / `-q` | off | suppress incidental/progress text; requested data and errors still print |
 
 `--` stops flag parsing, so an argument that legitimately starts with `-` (message text, a
-schedule name, whatever) can be passed through untouched: `pidesk threads send abc -- "-1 degree
+schedule name, whatever) can be passed through untouched: `patchwork threads send abc -- "-1 degree
 today"`. Without `--`, a token starting with `-` that isn't a known flag is a usage error rather
 than a guess — ambiguity is rejected, not silently misparsed.
 
 One deliberate exception: **inside `schedule add`, `--timeout DURATION` sets the run's own
 timeout** (e.g. `30m`), not the request timeout above — see [`schedule add`](#schedule-add). Set
-the client request timeout for that one command via `$PIDESK_TIMEOUT` if you ever need to.
+the client request timeout for that one command via `$PATCHWORK_TIMEOUT` if you ever need to.
 
 ## Exit codes
 
@@ -52,9 +52,9 @@ A missing daemon always prints a short, actionable message on stderr and exits `
 stack trace:
 
 ```
-$ pidesk threads list
-pidesk: cannot reach the Pi Desktop daemon (socket not found)
-start it with `pidesk daemon start` (or `pidesk daemon install` to run at login); check `pidesk daemon status`
+$ patchwork threads list
+patchwork: cannot reach the Patchwork daemon (socket not found)
+start it with `patchwork daemon start` (or `patchwork daemon install` to run at login); check `patchwork daemon status`
 ```
 
 ## JSON output contract
@@ -89,16 +89,16 @@ start it with `pidesk daemon start` (or `pidesk daemon install` to run at login)
 ## `threads`
 
 ```
-pidesk threads list [--query TEXT] [--running] [--automated] [--archived | --all]
+patchwork threads list [--query TEXT] [--running] [--automated] [--archived | --all]
                     [--limit N] [--cursor C] [--json]
-pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
-pidesk threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]
-pidesk threads send <id> <text|-> [--steer | --follow-up] [--wait] [--json]
-pidesk threads abort <id> [--json]
-pidesk threads archive <id> [--json]
-pidesk threads unarchive <id> [--json]
-pidesk threads rename <id> <name> [--json]
-pidesk threads watch [<id>] [--json]
+patchwork threads show <id> [--messages N] [--offset N] [--all] [--json]
+patchwork threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]
+patchwork threads send <id> <text|-> [--steer | --follow-up] [--wait] [--json]
+patchwork threads abort <id> [--json]
+patchwork threads archive <id> [--json]
+patchwork threads unarchive <id> [--json]
+patchwork threads rename <id> <name> [--json]
+patchwork threads watch [<id>] [--json]
 ```
 
 Notes:
@@ -116,7 +116,7 @@ Notes:
   `~/.pi/worktrees`, `pi/` branch naming, non-force cleanup on failed creation, and source-project
   organization in the app. The session `cwd` remains the real worktree path.
 - `<text>` (in `send`) and `--message` (in `new`) accept `-` to read the message from stdin:
-  `echo "continue" | pidesk threads send <id> -`.
+  `echo "continue" | patchwork threads send <id> -`.
 - Delivery: no flag is `"auto"`; `--steer` interrupts the current turn; `--follow-up` queues
   behind it. They're mutually exclusive.
 - `--wait` subscribes to `/v1/events`, filters for the run just started, and streams until it
@@ -130,16 +130,16 @@ Notes:
 ## `schedule`
 
 ```
-pidesk schedule list [--json]
-pidesk schedule add --name NAME (--thread ID | --cwd DIR) --prompt TEXT
+patchwork schedule list [--json]
+patchwork schedule add --name NAME (--thread ID | --cwd DIR) --prompt TEXT
                      (--at ISO|LOCAL | --every DUR | --cron EXPR | --heartbeat DUR)
                      [--name-pattern PATTERN] [--timezone TZ] [--start-at ISO|LOCAL]
                      [--mode MODE] [--skip-if-running] [--timeout DUR] [--json]
-pidesk schedule show <id> [--json]
-pidesk schedule pause <id> [--json]
-pidesk schedule resume <id> [--json]
-pidesk schedule remove <id> [--json]
-pidesk schedule run <id> [--json]
+patchwork schedule show <id> [--json]
+patchwork schedule pause <id> [--json]
+patchwork schedule resume <id> [--json]
+patchwork schedule remove <id> [--json]
+patchwork schedule run <id> [--json]
 ```
 
 ### Target
@@ -181,27 +181,27 @@ reaches the daemon and silently never fires. `--timezone` defaults to your machi
 ## `daemon`
 
 ```
-pidesk daemon status [--json]
-pidesk daemon start
-pidesk daemon stop
-pidesk daemon restart
-pidesk daemon install
-pidesk daemon uninstall
-pidesk daemon logs [-f] [--lines N] [--json]
+patchwork daemon status [--json]
+patchwork daemon start
+patchwork daemon stop
+patchwork daemon restart
+patchwork daemon install
+patchwork daemon uninstall
+patchwork daemon logs [-f] [--lines N] [--json]
 ```
 
-`pidesk daemon status` reports reachability itself — when the daemon is down this is expected
+`patchwork daemon status` reports reachability itself — when the daemon is down this is expected
 output, not a crash, but it still exits `3` (consistent with every other command) so scripts can
-branch on it. It also reports **mode**: `app-managed` (hosted inside Pi Desktop.app by default —
+branch on it. It also reports **mode**: `app-managed` (hosted inside Patchwork.app by default —
 see daemon-api.md's "Lifecycle"), `LaunchAgent` (installed with `install` below or
 `scripts/install-daemon.sh`), reachable-but-neither ("external" — started by hand, or by
-`daemon start`'s own fallback), or not running at all. `install` registers `pi-deskd` as a
-LaunchAgent (`dev.pi.desktop.daemon`, starts at login, restarts on crash but not on a clean
+`daemon start`'s own fallback), or not running at all. `install` registers `patchworkd` as a
+LaunchAgent (`app.patchwork.desktop.daemon`, starts at login, restarts on crash but not on a clean
 exit); `start`/`stop`/`restart` drive that LaunchAgent via `launchctl`. If it was never installed,
 `start` falls back to a direct, non-persistent spawn (logged to the same log file) so a one-off
 local session still works; `stop`/`restart` in that case tell you so rather than pretending to
-manage a process they never tracked — including Pi Desktop.app itself, which
-`pidesk daemon stop` never terminates (quit the app to stop its in-process service).
+manage a process they never tracked — including Patchwork.app itself, which
+`patchwork daemon stop` never terminates (quit the app to stop its in-process service).
 
 `logs` shows the last 100 lines by default (bounded read from the tail of the file, never the
 whole file); `-f` follows new output.
@@ -209,10 +209,10 @@ whole file); `-f` follows new output.
 ## `remote`
 
 ```
-pidesk remote enable [--port 7717] [--json]
-pidesk remote disable [--json]
-pidesk remote url [--json]
-pidesk remote token [--json]
+patchwork remote enable [--port 7717] [--json]
+patchwork remote disable [--json]
+patchwork remote url [--json]
+patchwork remote token [--json]
 ```
 
 **Design note:** the control-plane contract defines `daemon.json`'s fields (port, concurrency,
@@ -220,16 +220,16 @@ remote-enabled) but no HTTP endpoint to change them — everything else in the c
 API call, but toggling the loopback listener is daemon-process configuration. `enable`/`disable`
 therefore write `daemon.json` directly (same `0600`/`0700` permissions the service uses) and
 print a restart reminder, since settings are read at host startup. Restart the LaunchAgent with
-`pidesk daemon restart`; for app-hosted mode, quit and reopen Pi Desktop. If a future contract
+`patchwork daemon restart`; for app-hosted mode, quit and reopen Patchwork. If a future contract
 revision adds a settings endpoint, this is the one command group that should move over to it.
 
 `token` reads (or, on first use, generates: 32 random bytes, base64url, `0600`) the bearer token
-at `~/Library/Application Support/Pi Desktop/daemon-token` — the same file `remote enable` seeds.
+at `~/Library/Application Support/Patchwork/daemon-token` — the same file `remote enable` seeds.
 
 ## `limits`
 
 ```
-pidesk limits [--json]
+patchwork limits [--json]
 ```
 
 `--json` prints `{"report":..., "generatedAt":..., "stale":...}` verbatim from `GET /v1/limits`.
@@ -242,7 +242,7 @@ be there.
 ### A nightly CI-triage schedule
 
 ```
-pidesk schedule add \
+patchwork schedule add \
   --name "Nightly triage" \
   --cwd ~/code/myapp \
   --prompt "Check overnight CI failures on main and summarise what needs attention" \
@@ -251,24 +251,24 @@ pidesk schedule add \
   --skip-if-running \
   --timeout 20m
 
-pidesk schedule list
-pidesk schedule show sch_xxxxx --json | jq '.runs[0]'
+patchwork schedule list
+patchwork schedule show sch_xxxxx --json | jq '.runs[0]'
 ```
 
 Every morning at 07:00 local time, if the target thread isn't already busy, this sends the prompt
 and aborts if it runs longer than 20 minutes. Check in on it later with `schedule show`, or force
-an out-of-band run with `pidesk schedule run sch_xxxxx`.
+an out-of-band run with `patchwork schedule run sch_xxxxx`.
 
 ### A voice agent creating a thread and following up
 
 ```
 # 1. Create a thread. `new` can send the first message too, but splitting it out lets us
 #    --wait on a single, uniform code path for both the first turn and every follow-up.
-result=$(pidesk threads new --cwd ~/code/myapp --name "Voice session" --json)
+result=$(patchwork threads new --cwd ~/code/myapp --name "Voice session" --json)
 thread_id=$(echo "$result" | jq -r '.thread.id')
 
 # 2. Speak the user's request, wait for the full turn, then speak the answer.
-reply=$(pidesk threads send "$thread_id" "Summarise what changed in the last 3 commits" --wait --json)
+reply=$(patchwork threads send "$thread_id" "Summarise what changed in the last 3 commits" --wait --json)
 if [ $? -ne 0 ]; then
   say "Sorry, that run failed."
 else
@@ -276,16 +276,16 @@ else
 fi
 
 # 3. Later, follow up in the same thread the same way.
-reply=$(pidesk threads send "$thread_id" "Now do the same for the last PR" --wait --json)
+reply=$(patchwork threads send "$thread_id" "Now do the same for the last PR" --wait --json)
 say "$(echo "$reply" | jq -r '.run.summary')"
 ```
 
 `--wait` does the event-filtering loop internally, so a voice agent never needs its own polling
 loop. For a dashboard that reacts to *every* thread's activity rather than one run it started
-itself, use `pidesk threads watch --json` instead and filter the NDJSON stream.
+itself, use `patchwork threads watch --json` instead and filter the NDJSON stream.
 
-## Talking to the daemon directly (no `pidesk`)
+## Talking to the daemon directly (no `patchwork`)
 
 Everything above is a thin wrapper around the control API in `daemon-api.md`. If you'd rather
-speak HTTP yourself: same Unix socket, same JSON bodies, same error envelope — `pidesk`'s
+speak HTTP yourself: same Unix socket, same JSON bodies, same error envelope — `patchwork`'s
 `--socket`/`--url`/`--token` flags exist so you never have to.

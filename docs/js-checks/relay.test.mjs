@@ -9,7 +9,7 @@ import {
   fromBase64URL,
   pairingCredentials,
   pairingTranscript
-} from "../../Sources/PiDeskWeb/Site/js/relayCrypto.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/relayCrypto.mjs";
 
 test("relay base64url and challenge wire format are stable", () => {
   const bytes = Uint8Array.from([0, 1, 2, 253, 254, 255]);

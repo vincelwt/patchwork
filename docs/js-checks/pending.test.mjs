@@ -16,7 +16,7 @@ import {
   resolveDelivery,
   statusLabel,
   userTextCounts
-} from "../../Sources/PiDeskWeb/Site/js/pending.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/pending.mjs";
 
 const user = (text) => ({ role: "user", text });
 

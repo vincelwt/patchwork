@@ -1,7 +1,7 @@
-// Node-only checks for the pure time helpers (Sources/PiDeskWeb/Site/js/time.mjs).
+// Node-only checks for the pure time helpers (Sources/PatchworkWeb/Site/js/time.mjs).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { relativeTime, clockTime } from "../../Sources/PiDeskWeb/Site/js/time.mjs";
+import { relativeTime, clockTime } from "../../Sources/PatchworkWeb/Site/js/time.mjs";
 
 const NOW = new Date("2026-06-15T12:00:00Z");
 

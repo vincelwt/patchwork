@@ -3,74 +3,76 @@
 import PackageDescription
 
 let package = Package(
-    name: "PiDesktop",
+    name: "Patchwork",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "PiDesktop", targets: ["PiDesktop"]),
-        // Optional always-on host for the same control service embedded in Pi Desktop.
-        .executable(name: "pi-deskd", targets: ["PiDeskDaemonMain"]),
-        .executable(name: "pidesk", targets: ["PiDeskCLI"]),
-        .library(name: "PiDeskKit", targets: ["PiDeskKit"]),
-        .library(name: "PiDeskWeb", targets: ["PiDeskWeb"])
+        // Keep the internal build artifact distinct from the lowercase `patchwork` CLI on
+        // case-insensitive filesystems. Packaging still installs this as Patchwork.app/Patchwork.
+        .executable(name: "PatchworkApp", targets: ["Patchwork"]),
+        // Optional always-on host for the same control service embedded in Patchwork.
+        .executable(name: "patchworkd", targets: ["PatchworkDaemonMain"]),
+        .executable(name: "patchwork", targets: ["PatchworkCLI"]),
+        .library(name: "PatchworkKit", targets: ["PatchworkKit"]),
+        .library(name: "PatchworkWeb", targets: ["PatchworkWeb"])
     ],
     targets: [
         .target(
-            name: "PiDeskKit",
-            path: "Sources/PiDeskKit"
+            name: "PatchworkKit",
+            path: "Sources/PatchworkKit"
         ),
         .executableTarget(
-            name: "PiDesktop",
-            dependencies: ["PiDeskKit", "PiDeskDaemon"],
-            path: "Sources/PiDesktop"
+            name: "Patchwork",
+            dependencies: ["PatchworkKit", "PatchworkDaemon"],
+            path: "Sources/Patchwork"
         ),
         .target(
-            name: "PiDeskDaemon",
-            dependencies: ["PiDeskKit", "PiDeskWeb"],
-            path: "Sources/PiDeskDaemon"
+            name: "PatchworkDaemon",
+            dependencies: ["PatchworkKit", "PatchworkWeb"],
+            path: "Sources/PatchworkDaemon"
         ),
         .executableTarget(
-            name: "PiDeskDaemonMain",
-            dependencies: ["PiDeskDaemon"],
-            path: "Sources/PiDeskDaemonMain"
+            name: "PatchworkDaemonMain",
+            dependencies: ["PatchworkDaemon", "PatchworkKit"],
+            path: "Sources/PatchworkDaemonMain"
         ),
         .executableTarget(
-            name: "PiDeskCLI",
-            dependencies: ["PiDeskKit"],
-            path: "Sources/PiDeskCLI"
+            name: "PatchworkCLI",
+            dependencies: ["PatchworkKit"],
+            path: "Sources/PatchworkCLI"
         ),
         // The remote web UI, embedded as resources so the daemon serves it without a build step.
         .target(
-            name: "PiDeskWeb",
-            dependencies: ["PiDeskKit"],
-            path: "Sources/PiDeskWeb",
+            name: "PatchworkWeb",
+            dependencies: ["PatchworkKit"],
+            path: "Sources/PatchworkWeb",
             resources: [.copy("Site")]
         ),
         .testTarget(
-            name: "PiDesktopTests",
-            dependencies: ["PiDesktop"],
-            path: "Tests/PiDesktopTests"
+            name: "PatchworkTests",
+            dependencies: ["Patchwork"],
+            path: "Tests/PatchworkTests"
         ),
         .testTarget(
-            name: "PiDeskKitTests",
-            dependencies: ["PiDeskKit"],
-            path: "Tests/PiDeskKitTests"
+            name: "PatchworkKitTests",
+            dependencies: ["PatchworkKit"],
+            path: "Tests/PatchworkKitTests"
         ),
         .testTarget(
-            name: "PiDeskDaemonTests",
-            dependencies: ["PiDeskDaemon", "PiDeskKit"],
-            path: "Tests/PiDeskDaemonTests"
+            name: "PatchworkDaemonTests",
+            dependencies: ["PatchworkDaemon", "PatchworkKit"],
+            path: "Tests/PatchworkDaemonTests"
         ),
         .testTarget(
-            name: "PiDeskCLITests",
-            dependencies: ["PiDeskCLI", "PiDeskKit"],
-            path: "Tests/PiDeskCLITests"
+            name: "PatchworkCLITests",
+            dependencies: ["PatchworkCLI", "PatchworkKit"],
+            path: "Tests/PatchworkCLITests"
         ),
         .testTarget(
-            name: "PiDeskWebTests",
-            dependencies: ["PiDeskWeb"],
-            path: "Tests/PiDeskWebTests"
+            name: "PatchworkWebTests",
+            dependencies: ["PatchworkWeb"],
+            path: "Tests/PatchworkWebTests"
         )
     ]
 )

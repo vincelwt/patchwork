@@ -1,6 +1,6 @@
 # Web remote
 
-Pi Desktop can be used from a phone or another browser without a VPN, inbound port, or tunnel.
+Patchwork can be used from a phone or another browser without a VPN, inbound port, or tunnel.
 The active control service opens an outbound WebSocket to the Cloudflare relay at
 [`remote.ai.gloom.sh`](https://remote.ai.gloom.sh); the same phone-first static app remains
 available over the older loopback listener for local/tunnel use.
@@ -10,8 +10,8 @@ event envelopes but never receives Pi provider credentials or session files.
 
 ## Hosted remote
 
-The hosted connection starts with Pi Desktop’s in-process control service. If the optional
-`pi-deskd` LaunchAgent is installed, it hosts the same connection and stays reachable after the
+The hosted connection starts with Patchwork’s in-process control service. If the optional
+`patchworkd` LaunchAgent is installed, it hosts the same connection and stays reachable after the
 window app quits.
 
 Pair a browser once:
@@ -39,7 +39,7 @@ counter makes captured mutations fail closed if replayed. Clearing site data, us
 browsing, or revoking the device requires pairing again. Each browser has its own identity and
 can be revoked independently from the same sheet.
 
-The Mac must be online and either Pi Desktop or the optional `pi-deskd` host must be running to
+The Mac must be online and either Patchwork or the optional `patchworkd` host must be running to
 execute or read conversations. The
 relay deliberately does not queue mutations while the host is offline, avoiding an ambiguous
 "did this prompt run twice?" failure after reconnect.
@@ -54,7 +54,7 @@ One hibernatable Durable Object coordinates each random installation ID. It reta
 host-token hash, public device keys, device labels/timestamps, and one bounded pairing offer
 (ticket hash, expiry, and host public key). Pending approvals expire at the same five-minute
 deadline. There is no D1, KV, R2, plaintext conversation cache, or offline prompt queue. Static
-files are the same `Sources/PiDeskWeb/Site/` assets bundled into Pi Desktop and the standalone host.
+files are the same `Sources/PatchworkWeb/Site/` assets bundled into Patchwork and the standalone host.
 
 Deployment lives in `CloudflareRelay/`:
 
@@ -68,21 +68,21 @@ npx wrangler deploy
 
 ## Local loopback remote
 
-The Unix socket used by the Mac app and `pidesk` is always on. The optional local web listener
+The Unix socket used by the Mac app and `patchwork` is always on. The optional local web listener
 remains available for development, SSH forwarding, or a user-managed tunnel:
 
 ```bash
-pidesk remote enable            # 127.0.0.1:7717
-pidesk remote enable --port 8080
-pidesk remote url
-pidesk remote token
-pidesk remote disable
+patchwork remote enable            # 127.0.0.1:7717
+patchwork remote enable --port 8080
+patchwork remote url
+patchwork remote token
+patchwork remote disable
 ```
 
-After changing this setting, reopen Pi Desktop or restart the LaunchAgent host. The token lives at:
+After changing this setting, reopen Patchwork or restart the LaunchAgent host. The token lives at:
 
 ```text
-~/Library/Application Support/Pi Desktop/daemon-token
+~/Library/Application Support/Patchwork/daemon-token
 ```
 
 It is 32 random bytes, base64url-encoded, and stored with mode `0600`. Local TCP API requests
@@ -122,8 +122,8 @@ The hosted relay does not use this listener or token and does not expose a port 
 
 ## Web app
 
-`Sources/PiDeskWeb/Site/` is plain HTML/CSS/JavaScript with no framework, CDN, or build step.
-`PiDeskWeb.asset(for:)` bundles it for loopback use, while Wrangler serves the same directory on
+`Sources/PatchworkWeb/Site/` is plain HTML/CSS/JavaScript with no framework, CDN, or build step.
+`PatchworkWeb.asset(for:)` bundles it for loopback use, while Wrangler serves the same directory on
 the hosted origin. Hosted JavaScript and CSS bypass conditional caching because Safari 27 can
 receive a `304` from memory and then refuse access to the cached module body; the Worker forces a
 full response with `Cache-Control: no-store`. Local mode uses HTTP + authenticated SSE; hosted mode

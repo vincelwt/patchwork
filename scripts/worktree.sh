@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Manage git worktrees for parallel Pi Desktop work.
+# Manage git worktrees for parallel Patchwork work.
 #
-#   scripts/worktree.sh new <name> [base-ref]   create ../pi-desktop-worktrees/<name> on feat/<name>
+#   scripts/worktree.sh new <name> [base-ref]   create ../patchwork-worktrees/<name> on feat/<name>
 #   scripts/worktree.sh list                    show worktrees and their branches
 #   scripts/worktree.sh rm <name> [--force]     remove the worktree (keeps the branch)
 #   scripts/worktree.sh clean                   prune stale worktree metadata
 #
 # Worktrees live outside the repo so SwiftPM builds, dist bundles, and Pi
 # session folders stay separate per agent. Override the location with
-# PI_DESKTOP_WORKTREE_ROOT.
+# PATCHWORK_WORKTREE_ROOT.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKTREE_ROOT="${PI_DESKTOP_WORKTREE_ROOT:-$(dirname "$ROOT")/pi-desktop-worktrees}"
+WORKTREE_ROOT="${PATCHWORK_WORKTREE_ROOT:-$(dirname "$ROOT")/patchwork-worktrees}"
 BRANCH_PREFIX="feat"
 
 cd "$ROOT"

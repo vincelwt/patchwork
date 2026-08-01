@@ -2,30 +2,32 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_NAME="Pi Desktop"
+APP_NAME="Patchwork"
 APP="$ROOT/dist/$APP_NAME.app"
 INSTALLED_APP="/Applications/$APP_NAME.app"
+LEGACY_APP="$ROOT/dist/Pi Desktop.app"
+LEGACY_INSTALLED_APP="/Applications/Pi Desktop.app"
 
 cd "$ROOT"
 echo "Building release binaries…"
 # One `swift build` invocation per product: `--product` does not accumulate across repeated
 # flags (a later one wins), it only selects a single target to build.
-swift build -c release --product PiDesktop
-swift build -c release --product pi-deskd
-swift build -c release --product pidesk
+swift build -c release --product PatchworkApp
+swift build -c release --product patchworkd
+swift build -c release --product patchwork
 BIN_DIR="$(swift build -c release --show-bin-path)"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
-cp "$BIN_DIR/PiDesktop" "$APP/Contents/MacOS/PiDesktop"
-chmod +x "$APP/Contents/MacOS/PiDesktop"
+cp "$BIN_DIR/PatchworkApp" "$APP/Contents/MacOS/Patchwork"
+chmod +x "$APP/Contents/MacOS/Patchwork"
 
-# Pi Desktop hosts the control service in-process. Keep the standalone host only for the explicit
-# `pidesk daemon install` LaunchAgent path, and bundle the CLI for direct terminal access.
-cp "$BIN_DIR/pi-deskd" "$APP/Contents/Helpers/pi-deskd"
-cp "$BIN_DIR/pidesk" "$APP/Contents/Helpers/pidesk"
-ditto "$BIN_DIR/PiDesktop_PiDeskWeb.bundle" "$APP/Contents/Resources/PiDesktop_PiDeskWeb.bundle"
-chmod +x "$APP/Contents/Helpers/pi-deskd" "$APP/Contents/Helpers/pidesk"
+# Patchwork hosts the control service in-process. Keep the standalone host only for the explicit
+# `patchwork daemon install` LaunchAgent path, and bundle the CLI for direct terminal access.
+cp "$BIN_DIR/patchworkd" "$APP/Contents/Helpers/patchworkd"
+cp "$BIN_DIR/patchwork" "$APP/Contents/Helpers/patchwork"
+ditto "$BIN_DIR/Patchwork_PatchworkWeb.bundle" "$APP/Contents/Resources/Patchwork_PatchworkWeb.bundle"
+chmod +x "$APP/Contents/Helpers/patchworkd" "$APP/Contents/Helpers/patchwork"
 
 # Compile the layered Icon Composer source. actool emits both the dynamic catalog used by
 # current macOS and a legacy .icns fallback for the app's macOS 14 minimum.
@@ -47,7 +49,7 @@ cp "$ICON_OUT/AppIcon.icns" "$ICON_OUT/Assets.car" "$APP/Contents/Resources/"
 
 # Source of truth for the activity-heartbeat extension the app installs into
 # ~/.pi/agent/extensions/; see ActivityExtensionInstaller.swift.
-cp "$ROOT/Resources/pi-desktop-activity.ts" "$APP/Contents/Resources/pi-desktop-activity.ts"
+cp "$ROOT/Resources/patchwork-activity.ts" "$APP/Contents/Resources/patchwork-activity.ts"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -57,11 +59,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Pi Desktop</string>
+    <string>Patchwork</string>
     <key>CFBundleExecutable</key>
-    <string>PiDesktop</string>
+    <string>Patchwork</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.pi.desktop</string>
+    <string>app.patchwork.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleIconFile</key>
@@ -69,7 +71,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleName</key>
-    <string>Pi Desktop</string>
+    <string>Patchwork</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -79,7 +81,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Pi Desktop uses Apple Events to control Mac apps on your behalf.</string>
+    <string>Patchwork uses Apple Events to control Mac apps on your behalf.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>
@@ -93,7 +95,7 @@ PLIST
 # Ad-hoc signing avoids a damaged-app warning for local builds. Distribution
 # signing/notarization can replace this identity later.
 if command -v codesign >/dev/null 2>&1; then
-    cat > "$ICON_OUT/PiDesktop.entitlements" <<'PLIST'
+    cat > "$ICON_OUT/Patchwork.entitlements" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -106,9 +108,9 @@ PLIST
 
     # The optional standalone host and CLI are separate executables, so sign them before the
     # whole-bundle pass reseals the outer resource envelope.
-    codesign --force --sign - "$APP/Contents/Helpers/pi-deskd" >/dev/null
-    codesign --force --sign - "$APP/Contents/Helpers/pidesk" >/dev/null
-    codesign --force --deep --sign - --entitlements "$ICON_OUT/PiDesktop.entitlements" "$APP" >/dev/null
+    codesign --force --sign - "$APP/Contents/Helpers/patchworkd" >/dev/null
+    codesign --force --sign - "$APP/Contents/Helpers/patchwork" >/dev/null
+    codesign --force --deep --sign - --entitlements "$ICON_OUT/Patchwork.entitlements" "$APP" >/dev/null
     codesign --verify --deep --strict "$APP"
     plutil -extract NSAppleEventsUsageDescription raw -o - "$APP/Contents/Info.plist" | grep -q .
     codesign -d --entitlements :- "$APP" 2>/dev/null > "$ICON_OUT/SignedEntitlements.plist"
@@ -117,8 +119,9 @@ fi
 
 rm -rf "$INSTALLED_APP"
 ditto "$APP" "$INSTALLED_APP"
+rm -rf "$LEGACY_APP" "$LEGACY_INSTALLED_APP"
 
 echo "Created: $APP"
 echo "Installed: $INSTALLED_APP"
 echo "Run with: open '$INSTALLED_APP'"
-echo "Bundled CLI/optional host: Contents/Helpers/pidesk, Contents/Helpers/pi-deskd"
+echo "Bundled CLI/optional host: Contents/Helpers/patchwork, Contents/Helpers/patchworkd"

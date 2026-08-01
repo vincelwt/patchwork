@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RETRY_DELAYS_MS, applyInteractionLoad } from "../../Sources/PiDeskWeb/Site/js/interactions.mjs";
+import { RETRY_DELAYS_MS, applyInteractionLoad } from "../../Sources/PatchworkWeb/Site/js/interactions.mjs";
 
 const card = (id) => ({ id, method: "ask", title: "Pick one", options: ["a", "b"] });
 

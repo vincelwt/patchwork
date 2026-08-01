@@ -1,17 +1,17 @@
-# Pi Desktop control plane
+# Patchwork control plane
 
-Pi Desktop grows a headless half so threads can run, be scheduled, and be driven when the
+Patchwork grows a headless half so threads can run, be scheduled, and be driven when the
 window is closed — from a CLI, from another agent, or from a phone. This document is the
 contract between the four pieces. It is normative: the service host, CLI, web remote, and app
 all implement exactly what is written here.
 
 ```
-        pidesk (CLI)        web remote (browser)        Pi Desktop.app
+        patchwork (CLI)        web remote (browser)        Patchwork.app
               \                    |                        /
                \                   |                       /
                 +-------- HTTP/JSON control API ----------+
                                    |
-                 in-app service (default) or pi-deskd
+                 in-app service (default) or patchworkd
                                    |
                      spawns `pi --mode rpc` per run
                                    |
@@ -26,39 +26,39 @@ app-owned metadata.
 
 | Piece | Target | Binary | Role |
 |---|---|---|---|
-| Service | `PiDeskDaemon` | linked into the app | Scheduler, thread runner, control API |
-| Standalone host | `PiDeskDaemonMain` | `pi-deskd` | Optional LaunchAgent host for the same service |
-| CLI | `PiDeskCLI` | `pidesk` | Thin client over the control API |
-| Shared | `PiDeskKit` | — | Wire models, client, and shared paths |
-| App | `PiDesktop` | `Pi Desktop.app` | Window UI and default service host |
+| Service | `PatchworkDaemon` | linked into the app | Scheduler, thread runner, control API |
+| Standalone host | `PatchworkDaemonMain` | `patchworkd` | Optional LaunchAgent host for the same service |
+| CLI | `PatchworkCLI` | `patchwork` | Thin client over the control API |
+| Shared | `PatchworkKit` | — | Wire models, client, and shared paths |
+| App | `Patchwork` | `Patchwork.app` | Window UI and default service host |
 
 The service must be safe to host either inside the app or in the optional standalone process.
 
 ## Lifecycle
 
-There are two hosts for one `PiDeskControlService`, and exactly one owns the control socket:
+There are two hosts for one `PatchworkControlService`, and exactly one owns the control socket:
 
-- **Inside Pi Desktop (default).** The scheduler, API, relay, run queue, and Pi workers are linked
-  into `Pi Desktop.app` and created from `AppDelegate`. There is no child daemon process. The app
+- **Inside Patchwork (default).** The scheduler, API, relay, run queue, and Pi workers are linked
+  into `Patchwork.app` and created from `AppDelegate`. There is no child daemon process. The app
   stops accepting work, cancels its service-owned runs cooperatively, and waits for teardown
   before it exits.
 - **LaunchAgent (explicit, always-on).** `scripts/install-daemon.sh` (or
-  `pidesk daemon install`) runs the small `pi-deskd` host at login. It uses the same service code
+  `patchwork daemon install`) runs the small `patchworkd` host at login. It uses the same service code
   and storage but remains independent of the window app.
 
-Both modes use the same `~/Library/Application Support/Pi Desktop/*` files. Before starting its
+Both modes use the same `~/Library/Application Support/Patchwork/*` files. Before starting its
 in-process host, the app defers to an installed LaunchAgent or any healthy owner of the Unix
 socket. A leftover socket file is not evidence of a live host; `POSIXListener` probes it and
 rebinds when nothing answers.
 
-**Ownership and migration.** In default mode `daemon-owner.json` contains the Pi Desktop process
-PID plus an app-host marker, preserving `pidesk daemon status` compatibility without mistaking a
+**Ownership and migration.** In default mode `daemon-owner.json` contains the Patchwork process
+PID plus an app-host marker, preserving `patchwork daemon status` compatibility without mistaking a
 second live app instance for the legacy child process. A previous release may have left an
-app-spawned `pi-deskd` child alive after a crash; the first new launch retires only that recorded
+app-spawned `patchworkd` child alive after a crash; the first new launch retires only that recorded
 legacy PID before binding in-process. Ownerless and LaunchAgent hosts are never stopped by the
 app.
 
-**Shutdown and recovery.** Quitting Pi Desktop stops scheduling immediately and cancels every
+**Shutdown and recovery.** Quitting Patchwork stops scheduling immediately and cancels every
 run owned by its in-process service. Each Pi child still receives cooperative SIGTERM with a
 bounded SIGKILL fallback; direct terminal `pi` processes are unrelated and untouched. Queued
 scheduled occurrences remain durable for the next launch. Pre-prompt scheduled work may retry,
@@ -74,14 +74,14 @@ cancellation.
 
 ## Transports
 
-1. **Unix domain socket** (always on): `~/Library/Application Support/Pi Desktop/daemon.sock`.
+1. **Unix domain socket** (always on): `~/Library/Application Support/Patchwork/daemon.sock`.
    Authorization is filesystem permissions: the socket's directory is `0700`, the socket `0600`.
    This is what the CLI and the app use.
 2. **Loopback TCP** (opt-in, for local/tunnel use): `127.0.0.1:<port>`, default port `7717`,
-   enabled by `pidesk remote enable`. Every request must carry
+   enabled by `patchwork remote enable`. Every request must carry
    `Authorization: Bearer <token>`, where the token lives in
-   `~/Library/Application Support/Pi Desktop/daemon-token` (`0600`, 32 random bytes, base64url).
-3. **Hosted relay** (outbound, automatic): `pi-deskd` connects by WSS to
+   `~/Library/Application Support/Patchwork/daemon-token` (`0600`, 32 random bytes, base64url).
+3. **Hosted relay** (outbound, automatic): `patchworkd` connects by WSS to
    `remote.ai.gloom.sh`. QR-approved browsers prove possession of the fragment-only ticket, then
    authenticate with a per-device P-256 key and send direction-bound AES-256-GCM envelopes
    through a Cloudflare Durable Object. The Mac retains the approved public key and highest
@@ -91,7 +91,7 @@ cancellation.
 
 Protocol is HTTP/1.1 with JSON bodies, `Content-Type: application/json`, UTF-8. Errors use the
 shape `{"error": {"code": "…", "message": "…"}}` with a matching HTTP status. Every response
-carries `X-Pi-Desktop-Api: 1`.
+carries `X-Patchwork-Api: 1`.
 
 ## Endpoints (v1)
 
@@ -363,7 +363,7 @@ GET /v1/activity
 ```
 
 Run state comes from the same heartbeat files the app uses
-(`~/.pi/agent/desktop-activity/*.json`), so the CLI, the web remote, and the app always agree.
+(`~/.pi/agent/patchwork-activity/*.json`), so the CLI, the web remote, and the app always agree.
 
 ### Schedules
 
@@ -533,17 +533,17 @@ forward-compatibility rule the app applies to Pi's own RPC events.
 ## Storage
 
 ```
-~/Library/Application Support/Pi Desktop/
+~/Library/Application Support/Patchwork/
   daemon.sock          control socket
   daemon-token         bearer token for the loopback listener (0600)
   daemon.json          daemon settings: port, concurrency, loopback remote enabled
   relay-identity.json  hosted installation/host keys, approved device keys, replay counters (0600)
   daemon-owner.json    pid + start time + host kind of the active app-hosted service, if any — local
-                       coordination between Pi Desktop and pidesk, not part of this API
+                       coordination between Patchwork and patchwork, not part of this API
   schedules.json       every Schedule, written atomically
   runs.jsonl           append-only run history, rotated at a bounded size
   state.json           app state (archive, folders, drafts, unread, bounded native-turn recovery)
-~/Library/Logs/Pi Desktop/daemon.log
+~/Library/Logs/Patchwork/daemon.log
 ```
 
 The active control-service host owns `schedules.json` and `runs.jsonl`. UI code reads them through
@@ -602,25 +602,25 @@ the API, never by touching the files, so there is exactly one writer.
 ## CLI surface
 
 ```
-pidesk                                      # active thread list, then help
-pidesk threads list [--query q] [--agent pi|codex|claude] [--running] [--automated]
+patchwork                                      # active thread list, then help
+patchwork threads list [--query q] [--agent pi|codex|claude] [--running] [--automated]
                     [--archived|--all] [--json]
-pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
-pidesk threads new --cwd DIR [--agent pi|codex|claude] [--worktree] [--name N]
+patchwork threads show <id> [--messages N] [--offset N] [--all] [--json]
+patchwork threads new --cwd DIR [--agent pi|codex|claude] [--worktree] [--name N]
                    [--message M] [--mode ultra]
-pidesk threads send <id> "text" [--steer|--follow-up] [--wait]
-pidesk threads abort|archive|unarchive|rename <id> [args]
-pidesk threads watch [<id>]                     # streams /v1/events
+patchwork threads send <id> "text" [--steer|--follow-up] [--wait]
+patchwork threads abort|archive|unarchive|rename <id> [args]
+patchwork threads watch [<id>]                     # streams /v1/events
 
-pidesk schedule list [--json]
-pidesk schedule add --name N (--thread ID | --cwd DIR) --prompt P
+patchwork schedule list [--json]
+patchwork schedule add --name N (--thread ID | --cwd DIR) --prompt P
                     (--at ISO | --every 15m | --cron "0 9 * * 1-5" | --heartbeat 15m)
                     [--mode ultra] [--skip-if-running] [--timeout 30m]
-pidesk schedule show|pause|resume|remove|run <id>
+patchwork schedule show|pause|resume|remove|run <id>
 
-pidesk daemon status|start|stop|restart|install|uninstall|logs [-f]
-pidesk remote enable [--port 7717] | disable | url | token
-pidesk limits [--json]
+patchwork daemon status|start|stop|restart|install|uninstall|logs [-f]
+patchwork remote enable [--port 7717] | disable | url | token
+patchwork limits [--json]
 ```
 
 Every command supports `--json` so another agent can drive the app without screen-scraping.
@@ -628,7 +628,7 @@ Exit codes: `0` ok, `1` request failed, `2` bad usage, `3` daemon unreachable.
 
 ## Compatibility rules
 
-- `X-Pi-Desktop-Api` is bumped only for breaking changes; additive fields never bump it.
+- `X-Patchwork-Api` is bumped only for breaking changes; additive fields never bump it.
 - Unknown fields in requests are rejected with `400 unknown_field` only when they change
   behaviour; otherwise they are ignored, so an older daemon and a newer CLI still interoperate.
 - Every client shows a clear, non-fatal message when the daemon is missing, outdated, or
