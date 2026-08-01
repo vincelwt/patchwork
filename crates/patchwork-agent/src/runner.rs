@@ -228,27 +228,26 @@ async fn execute(
         token_usage: None,
     });
 
-    let (conn, mut events) = AcpConnection::spawn(&command, &prepared.path, &env).await?;
+    let (conn, mut events) = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        AcpConnection::spawn(&command, &prepared.path, &env),
+    )
+    .await
+    .map_err(|_| anyhow!("`{}` did not answer the ACP handshake", spec.runtime))??;
     let conn = Arc::new(conn);
-
-    // Some runtimes require an explicit auth handshake before sessions work.
-    if let Some(method) = conn
-        .auth_methods
-        .first()
-        .and_then(|m| m.get("id"))
-        .and_then(|v| v.as_str())
-    {
-        if let Err(err) = conn.authenticate(method).await {
-            tracing::debug!(?err, "authenticate declined; continuing");
-        }
-    }
 
     let session_id = match spec.resume_session_id.as_deref() {
         Some(sid) if conn.supports_load_session() => {
-            conn.load_session(sid, &prepared.path).await?;
-            sid.to_string()
+            match conn.load_session(sid, &prepared.path).await {
+                Ok(()) => sid.to_string(),
+                // A stale session id must not strand the task.
+                Err(err) => {
+                    tracing::debug!(?err, "could not resume session; starting a fresh one");
+                    open_session(&conn, &prepared.path).await?
+                }
+            }
         }
-        _ => conn.new_session(&prepared.path, json!([])).await?,
+        _ => open_session(&conn, &prepared.path).await?,
     };
     emit(HostToRelay::RunStatus {
         run_id: run_id.clone(),
@@ -298,11 +297,20 @@ async fn execute(
                         conn.respond_permission(&request_id, chosen.as_deref());
                     }
                     AgentEvent::Stderr(line) => {
+                        // Setup failures live here — a missing login, a bad
+                        // config — so they belong in the run log where someone
+                        // debugging will actually look.
                         let mut s = state.lock().await;
                         if s.stderr.len() < 200 {
                             s.stderr.push(line.clone());
+                            drop(s);
+                            let _ = out.send(HostToRelay::RunEvent {
+                                run_id: run_id.clone(),
+                                kind: RunEventKind::Error,
+                                text: line,
+                                data: None,
+                            });
                         }
-                        tracing::debug!(target: "acp_stderr", "{line}");
                     }
                     AgentEvent::Exited(code) => {
                         let _ = out.send(HostToRelay::RunEvent {
@@ -351,7 +359,7 @@ async fn execute(
                     }
                 };
                 pump.abort();
-                Arc::try_unwrap(conn).ok().unwrap().shutdown().await;
+                conn.shutdown().await;
                 return Err(anyhow!("{err}{detail}"));
             }
         };
@@ -409,10 +417,56 @@ async fn execute(
         token_usage: None,
     });
 
-    if let Ok(conn) = Arc::try_unwrap(conn) {
-        conn.shutdown().await;
-    }
+    conn.shutdown().await;
     Ok(())
+}
+
+/// Open a session, authenticating only if the runtime insists — and only with
+/// a method that needs no human at a browser, since nobody is watching this
+/// process.
+async fn open_session(conn: &AcpConnection, cwd: &str) -> Result<String> {
+    match conn.new_session(cwd, json!([])).await {
+        Ok(session_id) => Ok(session_id),
+        Err(first_error) => {
+            let Some(method) = non_interactive_auth_method(conn) else {
+                return Err(first_error.context(
+                    "the runtime needs to be signed in on this machine \
+(run it once yourself, or set its API key environment variable)",
+                ));
+            };
+            conn.authenticate(&method).await?;
+            conn.new_session(cwd, json!([])).await
+        }
+    }
+}
+
+/// An `env_var` method whose variables are actually set. Interactive logins are
+/// never triggered automatically.
+fn non_interactive_auth_method(conn: &AcpConnection) -> Option<String> {
+    conn.auth_methods.iter().find_map(|method| {
+        if method.get("type").and_then(|v| v.as_str()) != Some("env_var") {
+            return None;
+        }
+        let ready = method
+            .get("vars")
+            .and_then(|v| v.as_array())
+            .map(|vars| {
+                vars.iter().all(|var| {
+                    var.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| std::env::var(name).is_ok())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !ready {
+            return None;
+        }
+        method
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 async fn wait_for_cancel(control: &mut mpsc::UnboundedReceiver<RelayToHost>) -> Option<RelayToHost> {

@@ -18,6 +18,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// How long a handshake, session open or authentication may take.
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A notification or request coming *from* the agent.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -50,7 +53,9 @@ pub struct PermissionOption {
 struct Pending(Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>);
 
 pub struct AcpConnection {
-    child: Child,
+    /// Behind a mutex so shutdown never needs to own the connection: the
+    /// event pump holds a clone for as long as the run lives.
+    child: Mutex<Option<Child>>,
     stdin_tx: mpsc::UnboundedSender<String>,
     pending: Arc<Pending>,
     next_id: AtomicI64,
@@ -76,6 +81,12 @@ impl AcpConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Patchwork is this agent's harness. Markers left by whatever launched
+        // Patchwork itself would make some runtimes refuse to start, believing
+        // they are nested inside another session.
+        for marker in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"] {
+            cmd.env_remove(marker);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -140,7 +151,7 @@ impl AcpConnection {
         }
 
         let mut conn = Self {
-            child,
+            child: Mutex::new(Some(child)),
             stdin_tx,
             pending,
             next_id: AtomicI64::new(1),
@@ -149,7 +160,7 @@ impl AcpConnection {
         };
 
         let init = conn
-            .request(
+            .setup_request(
                 "initialize",
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
@@ -186,9 +197,17 @@ impl AcpConnection {
             .unwrap_or(false)
     }
 
+    /// Setup calls get a deadline; a runtime that never answers must fail the
+    /// run rather than leave a task looking busy forever.
+    async fn setup_request(&self, method: &str, params: Value) -> Result<Value> {
+        tokio::time::timeout(SETUP_TIMEOUT, self.request(method, params))
+            .await
+            .map_err(|_| anyhow!("{method}: the agent did not answer in time"))?
+    }
+
     pub async fn new_session(&self, cwd: &str, mcp_servers: Value) -> Result<String> {
         let res = self
-            .request(
+            .setup_request(
                 "session/new",
                 json!({ "cwd": cwd, "mcpServers": mcp_servers }),
             )
@@ -200,7 +219,7 @@ impl AcpConnection {
     }
 
     pub async fn load_session(&self, session_id: &str, cwd: &str) -> Result<()> {
-        self.request(
+        self.setup_request(
             "session/load",
             json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
         )
@@ -209,7 +228,7 @@ impl AcpConnection {
     }
 
     pub async fn authenticate(&self, method_id: &str) -> Result<()> {
-        self.request("authenticate", json!({ "methodId": method_id }))
+        self.setup_request("authenticate", json!({ "methodId": method_id }))
             .await?;
         Ok(())
     }
@@ -280,9 +299,11 @@ impl AcpConnection {
         }
     }
 
-    pub async fn shutdown(mut self) {
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+    pub async fn shutdown(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
     }
 }
 

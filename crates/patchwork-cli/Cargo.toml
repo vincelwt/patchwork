@@ -3,5 +3,19 @@ name = "patchwork-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+description = "The patchwork CLI: an agent's native access to its workspace"
+
+[[bin]]
+name = "patchwork"
+path = "src/main.rs"
 
 [dependencies]
+patchwork-core.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+reqwest.workspace = true
