@@ -19,7 +19,7 @@ struct StatusBarView: View {
                 CodexAccountControl(account: statuses.codexAccount, isLive: statuses.isLive, isStale: statuses.codexAccountIsStale)
                 StatusSeparator()
             }
-            FastPriorityControl(status: statuses.fastPriority, isLive: statuses.isLive)
+            FastModeControl()
 
             StatusSeparator()
 
@@ -228,23 +228,23 @@ private struct CodexAccountControl: View {
     }
 }
 
-// MARK: - fast-priority
+// MARK: - fast mode
 
-private struct FastPriorityControl: View {
+private struct FastModeControl: View {
     @EnvironmentObject private var store: AppStore
-    let status: FastPriorityStatus
-    let isLive: Bool
     @State private var hovering = false
 
+    private var status: FastModePresentation { store.fastModePresentation }
+
     var body: some View {
-        Button { store.toggleFastPriority() } label: {
+        Button { store.toggleFastMode() } label: {
             HStack(spacing: PiTheme.space4) {
                 Image(systemName: "bolt.fill").font(.system(size: PiIcon.micro, weight: .bold))
                 Text("fast")
             }
             .font(PiFont.micro)
             .foregroundStyle(status.isActive ? Color.piGreen : Color.secondary)
-            .opacity(isLive ? 1 : 0.55)
+            .opacity(status.isLive ? 1 : 0.55)
             .padding(.horizontal, PiTheme.space6)
             .frame(height: 20)
             .contentShape(Rectangle())
@@ -254,9 +254,10 @@ private struct FastPriorityControl: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(!status.isAvailable)
         .onHover { hovering = $0 }
-        .help(status.isActive ? "Fast priority active — click to toggle (/codex-fast)" : "Fast priority inactive — click to toggle (/codex-fast)")
-        .accessibilityLabel("Fast priority")
+        .help(status.help)
+        .accessibilityLabel("Fast mode")
         .accessibilityValue(status.isActive ? "active" : "inactive")
     }
 }

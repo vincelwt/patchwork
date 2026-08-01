@@ -296,7 +296,7 @@ final class CachedAccountProbeTests: XCTestCase {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try String(contentsOf: root.appendingPathComponent("Sources/PiDesktop/StatusBarView.swift"), encoding: .utf8)
         let start = try XCTUnwrap(source.range(of: "private struct CodexAccountControl"))
-        let end = try XCTUnwrap(source.range(of: "// MARK: - fast-priority", range: start.lowerBound..<source.endIndex))
+        let end = try XCTUnwrap(source.range(of: "// MARK: - fast mode", range: start.lowerBound..<source.endIndex))
         XCTAssertFalse(source[start.lowerBound..<end.lowerBound].contains(".frame(maxWidth:"),
                        "The account chip must use its intrinsic width before truncating")
     }

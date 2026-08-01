@@ -207,18 +207,21 @@ final class AgentCatalogTests: XCTestCase {
     /// agent are pinned here rather than rediscovered by hand.
     func testCapabilitiesMatchWhatEachAgentActuallySupports() {
         XCTAssertEqual(AgentKind.pi.capabilities.thinking, .live)
+        XCTAssertEqual(AgentKind.pi.capabilities.fastMode, .extensionCommand)
         XCTAssertTrue(AgentKind.pi.capabilities.canExportHTML)
         XCTAssertTrue(AgentKind.pi.capabilities.supportsActivityExtension)
         XCTAssertTrue(AgentKind.pi.capabilities.persistsSessionBeforeFirstPrompt)
 
         XCTAssertEqual(AgentKind.codex.capabilities.modelSelection, .queried)
+        XCTAssertEqual(AgentKind.codex.capabilities.fastMode, .threadSetting)
         XCTAssertTrue(AgentKind.codex.capabilities.canSteerMidTurn)
         XCTAssertFalse(AgentKind.codex.capabilities.canExportHTML)
         XCTAssertFalse(AgentKind.codex.capabilities.supportsActivityExtension)
         XCTAssertTrue(AgentKind.codex.capabilities.persistsSessionBeforeFirstPrompt)
 
         XCTAssertEqual(AgentKind.claude.capabilities.modelSelection, .aliases)
-        XCTAssertEqual(AgentKind.claude.capabilities.thinking, .unsupported)
+        XCTAssertEqual(AgentKind.claude.capabilities.thinking, .relaunch)
+        XCTAssertEqual(AgentKind.claude.capabilities.fastMode, .relaunch)
         XCTAssertFalse(AgentKind.claude.capabilities.canFork)
         // Claude Code takes a message sent mid-turn into the running turn; its own release build
         // advertises "send messages to Claude while it works to steer Claude in real-time" and

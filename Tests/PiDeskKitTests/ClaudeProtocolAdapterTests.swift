@@ -83,7 +83,8 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
              "--verbose", "--include-partial-messages", "--replay-user-messages", "--session-id"]
         )
         XCTAssertFalse(arguments.contains("--resume"))
-        let generated = try XCTUnwrap(arguments.last)
+        let sessionIndex = try XCTUnwrap(arguments.firstIndex(of: "--session-id"))
+        let generated = arguments[sessionIndex + 1]
         XCTAssertNotNil(UUID(uuidString: generated))
 
         let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
@@ -139,7 +140,8 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let transcript = URL(fileURLWithPath: "/Users/x/.claude/projects/-tmp-p/abcd-1234.jsonl")
         let arguments = adapter.launchArguments(sessionPath: transcript, cwd: cwd)
 
-        XCTAssertEqual(arguments.suffix(2).map { $0 }, ["--resume", "abcd-1234"])
+        let resumeIndex = try XCTUnwrap(arguments.firstIndex(of: "--resume"))
+        XCTAssertEqual(Array(arguments[resumeIndex...(resumeIndex + 1)]), ["--resume", "abcd-1234"])
         XCTAssertFalse(arguments.contains("--session-id"))
         let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
         XCTAssertEqual(state["sessionId"]?.stringValue, "abcd-1234")
@@ -176,6 +178,47 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertTrue(arguments.contains("xhigh"))
         XCTAssertTrue(arguments.contains("--model"))
         XCTAssertTrue(arguments.contains("opus"))
+    }
+
+    func testPresetChoicesConfigureLaunchArgumentsBeforeTheProcessStarts() {
+        let adapter = adapter()
+        adapter.configureLaunch(modelID: "sonnet", thinkingLevel: "max")
+
+        let arguments = adapter.launchArguments(sessionPath: nil, cwd: cwd)
+
+        XCTAssertTrue(arguments.contains("--model"))
+        XCTAssertTrue(arguments.contains("sonnet"))
+        XCTAssertTrue(arguments.contains("--effort"))
+        XCTAssertTrue(arguments.contains("max"))
+    }
+
+    func testFastModeIsLaunchScopedAndReportedInState() throws {
+        let adapter = adapter()
+        adapter.configureFastMode(true)
+
+        let arguments = adapter.launchArguments(sessionPath: nil, cwd: cwd)
+        let settingsIndex = try XCTUnwrap(arguments.firstIndex(of: "--settings"))
+        XCTAssertEqual(arguments[settingsIndex + 1], #"{"fastMode":true}"#)
+
+        var state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
+        XCTAssertEqual(state["fastModeEnabled"]?.boolValue, true)
+        XCTAssertEqual(state["fastModeAvailable"]?.boolValue, true)
+
+        adapter.reset()
+        state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "2", payload: [:])))
+        XCTAssertEqual(state["fastModeEnabled"]?.boolValue, true, "a process restart keeps the task's setting")
+    }
+
+    func testInitCanCorrectFastModeStateReportedByClaude() throws {
+        let adapter = adapter()
+        adapter.configureFastMode(true)
+        var initRecord = initLine()
+        initRecord["fast_mode_state"] = "off"
+
+        _ = decode(adapter, initRecord)
+
+        let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
+        XCTAssertEqual(state["fastModeEnabled"]?.boolValue, false)
     }
 
     // MARK: - system/init

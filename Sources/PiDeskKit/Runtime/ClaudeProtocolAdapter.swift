@@ -55,6 +55,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     private var permissionMode: String?
     private var initialSessionID: String?
     private var initialSessionName: String?
+    private var fastModeEnabled = false
 
     // MARK: - Session state (cleared by `reset`)
 
@@ -72,6 +73,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     private var stats = Stats()
     private var stream = StreamAccumulator()
     private var startedMessageID: String?
+    private var fastModeAvailable = ProcessInfo.processInfo.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] != "1"
 
     /// Correlation ids waiting for their replayed user line, oldest first.
     private var promptAcks: [String] = []
@@ -104,6 +106,15 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             return
         }
         initialSessionName = String(clean.prefix(256))
+    }
+
+    public func configureLaunch(modelID: String?, thinkingLevel: String?) {
+        if let modelID, !modelID.isEmpty { self.modelID = modelID }
+        if let thinkingLevel, Self.effortLevels.contains(thinkingLevel) { effort = thinkingLevel }
+    }
+
+    public func configureFastMode(_ enabled: Bool) {
+        fastModeEnabled = enabled
     }
 
     public func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
@@ -143,6 +154,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             sessionName = initialSessionName
             arguments += ["--name", initialSessionName]
         }
+        arguments += ["--settings", fastModeEnabled ? #"{"fastMode":true}"# : #"{"fastMode":false}"#]
         return arguments
     }
 
@@ -170,6 +182,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         stats = Stats()
         stream = StreamAccumulator()
         startedMessageID = nil
+        fastModeAvailable = ProcessInfo.processInfo.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] != "1"
         promptAcks = []
         controlRequests = []
         permissions = []
@@ -368,6 +381,8 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             "followUpMode": "all",
             "steeringQueue": steeredPrompts,
             "followUpQueue": followUps.map(\.summary),
+            "fastModeEnabled": fastModeEnabled,
+            "fastModeAvailable": fastModeAvailable,
             "model": [
                 "id": modelID ?? "default",
                 "name": modelName ?? modelID ?? "Default",
@@ -423,6 +438,10 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     private func system(_ record: [String: Any]) -> [AdapterInbound] {
+        if let enabled = Self.fastModeState(in: record) { fastModeEnabled = enabled }
+        if let reason = record["fast_mode_disabled_reason"] as? String, !reason.isEmpty {
+            fastModeAvailable = false
+        }
         switch record["subtype"] as? String {
         case "init":
             if let id = record["session_id"] as? String, !id.isEmpty {
@@ -454,6 +473,20 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             // permission_denied: no app-side equivalent, so nothing is emitted.
             return []
         }
+    }
+
+    private static func fastModeState(in record: [String: Any]) -> Bool? {
+        for key in ["fastModeEnabled", "fast_mode_enabled", "fastMode", "fast_mode_state"] {
+            if let enabled = record[key] as? Bool { return enabled }
+            if let state = record[key] as? String {
+                if ["on", "enabled", "active", "fast"].contains(state.lowercased()) { return true }
+                if ["off", "disabled", "inactive", "standard"].contains(state.lowercased()) { return false }
+            }
+            if let state = record[key] as? [String: Any], let enabled = state["enabled"] as? Bool {
+                return enabled
+            }
+        }
+        return nil
     }
 
     private func assistant(_ record: [String: Any]) -> [AdapterInbound] {

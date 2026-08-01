@@ -50,6 +50,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             retryCount: Int
         )
         case compact(appID: String)
+        case fastMode(appID: String, enabled: Bool)
         /// Answer the caller with an empty object once Codex confirms the request.
         case acknowledge(appID: String)
 
@@ -59,7 +60,8 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
                 nil
             case let .models(appID):
                 appID
-            case let .commands(appID), let .compact(appID), let .acknowledge(appID):
+            case let .commands(appID), let .compact(appID), let .fastMode(appID, _),
+                 let .acknowledge(appID):
                 appID
             case let .turn(entry, _, _, _, _):
                 entry.id
@@ -121,6 +123,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     private var models: [PiJSONValue] = []
     private var modelID: String?
     private var effort: String?
+    private var serviceTier: String?
     private var steeringMode = "all"
     private var followUpMode = "all"
 
@@ -197,6 +200,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         models.removeAll()
         modelID = nil
         effort = nil
+        serviceTier = nil
         steeringMode = "all"
         followUpMode = "all"
         turnID = nil
@@ -259,6 +263,8 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             }
             effort = Self.codexEffort(forLevel: level)
             return .immediate(.object(["level": .string(level)]))
+        case "set_fast_mode":
+            return threadScoped(command, id: id, payload: payload)
         case "cycle_model":
             cycleModel()
             return .immediate(.object([
@@ -387,6 +393,13 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             // Held with the thread-scoped commands only because `model/list` must not race the
             // handshake, not because it needs a thread.
             return request("model/list", params: [:], as: .models(appID: id))
+        case "set_fast_mode":
+            let enabled = payload["enabled"]?.boolValue == true
+            guard !enabled || models.isEmpty || selectedModelSupportsFastMode else { return nil }
+            return request("thread/settings/update", params: [
+                "threadId": threadID,
+                "serviceTier": enabled ? "priority" : NSNull()
+            ], as: .fastMode(appID: id, enabled: enabled))
         default:
             return nil
         }
@@ -599,6 +612,12 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
                 .response(id: appID, value: AdapterEncoding.response(id: appID, data: .object([:]))),
                 .event(AdapterEncoding.event("compaction_start"))
             ]
+        case let .fastMode(appID, enabled):
+            serviceTier = enabled ? "priority" : nil
+            return [.response(id: appID, value: AdapterEncoding.response(
+                id: appID,
+                data: fastModeValue()
+            ))]
         case let .acknowledge(appID):
             return [.response(id: appID, value: AdapterEncoding.response(id: appID, data: .object([:])))]
         }
@@ -676,7 +695,8 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
                 }
             }
             return [.response(id: entry.id, value: rejection(id: entry.id, message: message))]
-        case let .commands(appID), let .compact(appID), let .acknowledge(appID):
+        case let .commands(appID), let .compact(appID), let .fastMode(appID, _),
+             let .acknowledge(appID):
             if case .compact = entry { isCompacting = false }
             return [.response(id: appID, value: rejection(id: appID, message: message))]
         }
@@ -705,6 +725,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         sessionName = thread["name"] as? String ?? sessionName
         modelID = result["model"] as? String ?? modelID
         effort = result["reasoningEffort"] as? String ?? effort
+        serviceTier = result["serviceTier"] as? String
         return flushQueuedCommands()
     }
 
@@ -785,6 +806,13 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             sessionName = params["threadName"] as? String
             return [.event(AdapterEncoding.event("session_info_changed", [
                 "name": .string(sessionName ?? "")
+            ]))]
+        case "thread/settings/updated":
+            let settings = params["threadSettings"] as? [String: Any] ?? [:]
+            serviceTier = settings["serviceTier"] as? String
+            return [.event(AdapterEncoding.event("fast_mode_changed", [
+                "enabled": .bool(fastModeEnabled),
+                "available": .bool(selectedModelSupportsFastMode)
             ]))]
         case "thread/tokenUsage/updated":
             recordUsage(params["tokenUsage"] as? [String: Any] ?? [:])
@@ -1289,7 +1317,9 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             "steeringQueue": .array(pendingSteers.map { .string($0.payload["message"]?.stringValue ?? "") }),
             "followUpQueue": .array(followUps.map { .string($0.payload["message"]?.stringValue ?? "") }),
             "thinkingLevel": .string(Self.thinkingLevel(forEffort: effort)),
-            "model": selectedModelValue()
+            "model": selectedModelValue(),
+            "fastModeEnabled": .bool(fastModeEnabled),
+            "fastModeAvailable": .bool(selectedModelSupportsFastMode)
         ]
         if let threadID { object["sessionId"] = .string(threadID) }
         if let sessionFile { object["sessionFile"] = .string(sessionFile) }
@@ -1311,15 +1341,20 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     }
 
     private func modelsValue() -> PiJSONValue {
-        .object(["models": .array(models.compactMap { model in
+        .object([
+            "models": .array(models.compactMap { model in
             guard let id = model["id"]?.stringValue else { return nil }
             return .object([
                 "provider": .string(Self.provider),
                 "id": .string(id),
                 "name": .string(model["displayName"]?.stringValue ?? id),
-                "reasoning": .bool(!(model["supportedReasoningEfforts"]?.arrayValue ?? []).isEmpty)
+                "reasoning": .bool(!(model["supportedReasoningEfforts"]?.arrayValue ?? []).isEmpty),
+                "supportsFastMode": .bool(modelSupportsFastMode(model))
             ])
-        })])
+            }),
+            "fastModeAvailable": .bool(selectedModelSupportsFastMode),
+            "fastModeEnabled": .bool(fastModeEnabled)
+        ])
     }
 
     private func selectedModelValue() -> PiJSONValue {
@@ -1329,6 +1364,28 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             "name": .string(models.first { $0["id"]?.stringValue == modelID }?["displayName"]?.stringValue ?? modelID),
             "provider": .string(Self.provider)
         ])
+    }
+
+    private var selectedModelSupportsFastMode: Bool {
+        guard let selected = models.first(where: { $0["id"]?.stringValue == modelID }) ?? models.first else {
+            return false
+        }
+        return modelSupportsFastMode(selected)
+    }
+
+    private var fastModeEnabled: Bool {
+        serviceTier == "priority"
+    }
+
+    private func fastModeValue() -> PiJSONValue {
+        .object([
+            "enabled": .bool(fastModeEnabled),
+            "available": .bool(selectedModelSupportsFastMode)
+        ])
+    }
+
+    private func modelSupportsFastMode(_ model: PiJSONValue) -> Bool {
+        (model["serviceTiers"]?.arrayValue ?? []).contains { $0["id"]?.stringValue == "priority" }
     }
 
     private func commandsValue(_ result: [String: Any]) -> PiJSONValue {

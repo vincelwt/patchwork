@@ -73,6 +73,14 @@ public protocol AgentProtocolAdapter: AnyObject {
     /// The default preserves adapters whose server owns identity allocation.
     func prepareNewSession(id: String?, name: String?)
 
+    /// Supplies launch-scoped model and thinking choices before the process starts. Most agents
+    /// apply both over their live protocol, so the default implementation intentionally does
+    /// nothing. Adapters with launch-only options retain the values for `launchArguments`.
+    func configureLaunch(modelID: String?, thinkingLevel: String?)
+
+    /// Supplies an agent's launch-scoped fast-mode choice. Live-setting agents ignore this.
+    func configureFastMode(_ enabled: Bool)
+
     /// Extra environment for this launch, merged over the shared agent environment.
     var environmentOverrides: [String: String] { get }
 
@@ -121,6 +129,8 @@ public extension AgentProtocolAdapter {
         return launchArguments(sessionPath: sessionPath, cwd: cwd)
     }
     var environmentOverrides: [String: String] { [:] }
+    func configureLaunch(modelID: String?, thinkingLevel: String?) {}
+    func configureFastMode(_ enabled: Bool) {}
     func startupLines(sessionPath: URL?, cwd: URL) -> [Data] { [] }
     func rollbackRejectedEncoding(command: String, id: String, payload: [String: PiJSONValue]) {}
     func encodeUncorrelatedWithDisposition(_ value: PiJSONValue) -> AdapterUncorrelatedOutbound {

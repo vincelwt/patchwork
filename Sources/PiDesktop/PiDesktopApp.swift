@@ -2,6 +2,12 @@ import Foundation
 import PiDeskKit
 import SwiftUI
 
+enum SettingsPane: Hashable {
+    case service
+    case agents
+    case presets
+}
+
 @main
 struct PiDesktopApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
@@ -43,6 +49,9 @@ struct PiDesktopApp: App {
             CommandMenu("Conversation") {
                 Button("Quick Switch…") { store.quickSwitchPresented = true }
                     .keyboardShortcut("k", modifiers: .command)
+                Button("Cycle New Chat Preset") { store.cyclePreset() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(store.route != .newChat || store.availablePresets.count < 2)
                 Button("Refresh") {
                     Task { await store.refreshSessions(); await store.refreshScheduledThreads() }
                 }
@@ -76,9 +85,10 @@ struct PiDesktopApp: App {
                     }
                 }
                 .disabled(store.availableModes.isEmpty)
-                // Fast priority, limits, and extension statuses all come from Pi extensions.
+                Button("Toggle Fast Mode") { store.toggleFastMode() }
+                    .disabled(store.activeCapabilities.fastMode == .unsupported)
+                // Limits and extension statuses come from Pi extensions.
                 Group {
-                    Button("Toggle Fast Priority") { store.toggleFastPriority() }
                     Button("Show Limits…") { store.showLimits() }
                     Divider()
                     Button("Refresh Extension Statuses") { store.refreshExtensionStatuses() }
@@ -98,15 +108,21 @@ struct PiDesktopApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            TabView {
+            TabView(selection: $store.settingsPane) {
                 DaemonSettingsView()
                     .environmentObject(appDelegate.daemonSupervisor)
                     .padding(PiTheme.space20)
                     .tabItem { Label("Service", systemImage: "bolt.horizontal") }
+                    .tag(SettingsPane.service)
                 AgentSettingsView()
                     .environmentObject(store)
                     .padding(PiTheme.space20)
                     .tabItem { Label("Agents", systemImage: "square.stack.3d.up") }
+                    .tag(SettingsPane.agents)
+                PresetSettingsView()
+                    .environmentObject(store)
+                    .tabItem { Label("Presets", systemImage: "slider.horizontal.3") }
+                    .tag(SettingsPane.presets)
             }
             .font(PiFont.body)
             .frame(width: PiTheme.settingsWidth, alignment: .topLeading)
