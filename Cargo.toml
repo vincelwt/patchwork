@@ -5,6 +5,7 @@ members = [
     "crates/patchwork-agent",
     "crates/patchwork-relay",
     "crates/patchwork-cli",
+    "desktop/src-tauri",
 ]
 
 [workspace.package]
