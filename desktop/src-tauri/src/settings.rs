@@ -34,10 +34,12 @@ impl Settings {
     }
 }
 
+/// Deliberately not plain `patchwork`: on a case-insensitive filesystem that
+/// would share a directory with anything else of that name.
 pub fn settings_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("patchwork")
+        .join("patchwork-desktop")
         .join("settings.json")
 }
 

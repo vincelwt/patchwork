@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("patchwork")
+        .join("patchwork-relay")
 }
 
 fn ensure_relay_host(store: &Store) -> Result<String> {
