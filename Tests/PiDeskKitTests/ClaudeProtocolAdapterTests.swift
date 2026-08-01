@@ -89,7 +89,49 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
         XCTAssertEqual(state["sessionId"]?.stringValue, generated)
         let file = try XCTUnwrap(state["sessionFile"]?.stringValue)
-        XCTAssertTrue(file.hasSuffix("/-tmp-Pi Desktop Claude/\(generated).jsonl"), file)
+        XCTAssertTrue(file.hasSuffix("/-tmp-Pi-Desktop-Claude/\(generated).jsonl"), file)
+    }
+
+    func testFreshLaunchCarriesABoundedInitialNameWithoutAffectingResume() {
+        let fresh = adapter()
+        let arguments = fresh.launchArguments(
+            sessionPath: nil, cwd: cwd,
+            initialSessionName: "  \(String(repeating: "n", count: 300))  "
+        )
+        let nameIndex = try! XCTUnwrap(arguments.firstIndex(of: "--name"))
+        XCTAssertEqual(arguments[nameIndex + 1].count, 256)
+
+        let resumed = adapter()
+        let transcript = URL(fileURLWithPath: "/tmp/existing.jsonl")
+        let resumedArguments = resumed.launchArguments(
+            sessionPath: transcript, cwd: cwd, initialSessionName: "ignored"
+        )
+        XCTAssertFalse(resumedArguments.contains("--name"))
+    }
+
+    func testFreshLaunchUsesAPreallocatedSessionIdentity() throws {
+        let expected = "11111111-1111-4111-8111-111111111111"
+        let fresh = adapter()
+        let arguments = fresh.launchArguments(
+            sessionPath: nil, cwd: cwd,
+            initialSessionID: expected, initialSessionName: nil
+        )
+
+        let idIndex = try XCTUnwrap(arguments.firstIndex(of: "--session-id"))
+        XCTAssertEqual(arguments[idIndex + 1], expected)
+        let state = try XCTUnwrap(
+            immediate(fresh.encode(command: "get_state", id: "preallocated", payload: [:]))
+        )
+        XCTAssertEqual(state["sessionId"]?.stringValue, expected)
+        XCTAssertTrue(state["sessionFile"]?.stringValue?.hasSuffix("/\(expected).jsonl") == true)
+    }
+
+    func testTranscriptPathMatchesClaudeProjectSlugRules() {
+        let path = ClaudeProtocolAdapter.transcriptPath(
+            sessionID: "session",
+            cwd: URL(fileURLWithPath: "/Users/x/02. Project_One/app+#-beta", isDirectory: true)
+        )
+        XCTAssertTrue(path.hasSuffix("/-Users-x-02--Project_One-app---beta/session.jsonl"), path)
     }
 
     func testResumingParsesTheSessionIdFromTheTranscriptFilename() throws {
@@ -101,6 +143,17 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertFalse(arguments.contains("--session-id"))
         let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
         XCTAssertEqual(state["sessionId"]?.stringValue, "abcd-1234")
+        XCTAssertEqual(state["sessionFile"]?.stringValue, transcript.path)
+    }
+
+    func testInitPreservesAnExplicitResumePathFromAnotherWorkingDirectory() throws {
+        let adapter = adapter()
+        let transcript = URL(fileURLWithPath: "/Users/x/.claude/projects/-original/reused.jsonl")
+        _ = adapter.launchArguments(sessionPath: transcript, cwd: cwd)
+
+        _ = decode(adapter, initLine(sessionID: "reused"))
+
+        let state = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "1", payload: [:])))
         XCTAssertEqual(state["sessionFile"]?.stringValue, transcript.path)
     }
 
@@ -171,6 +224,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         let updates = events(emitted).filter { $0["type"]?.stringValue == "message_update" }
         XCTAssertEqual(updates.count, 3)
         let latest = try XCTUnwrap(updates.last)
+        XCTAssertTrue(updates.allSatisfy { $0["message"]?["id"]?.stringValue == "msg_1" })
         XCTAssertEqual(latest["message"]?["role"]?.stringValue, "assistant")
         XCTAssertEqual(latest["message"]?["model"]?.stringValue, "claude-sonnet-5")
         XCTAssertEqual(latest["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "Hello")
@@ -189,6 +243,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         // The message already started from the stream, so it is not restarted.
         XCTAssertEqual(eventTypes(final), ["message_end"])
         let message = try XCTUnwrap(events(final).first?["message"])
+        XCTAssertEqual(message["id"]?.stringValue, "msg_1")
         XCTAssertEqual(message["stopReason"]?.stringValue, "stop")
         XCTAssertEqual(message["provider"]?.stringValue, "anthropic")
         XCTAssertEqual(message["usage"]?["cacheRead"]?.intValue, 7)
@@ -224,11 +279,38 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(content.compactMap { $0["type"]?.stringValue }, ["thinking", "text"])
     }
 
+    func testSplitTerminalRecordsEmitUniqueMessageIDs() throws {
+        let adapter = adapter()
+        let thinking = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "entry-thinking",
+            "message": [
+                "id": "msg_shared", "role": "assistant", "stop_reason": "end_turn",
+                "content": [["type": "thinking", "thinking": "Plan"]]
+            ]
+        ])
+        let answer = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "entry-answer",
+            "message": [
+                "id": "msg_shared", "role": "assistant", "stop_reason": "end_turn",
+                "content": [["type": "text", "text": "Done"]]
+            ]
+        ])
+
+        let thinkingEnd = try XCTUnwrap(events(thinking).last { $0["type"]?.stringValue == "message_end" })
+        let answerEnd = try XCTUnwrap(events(answer).last { $0["type"]?.stringValue == "message_end" })
+        XCTAssertEqual(thinkingEnd["message"]?["id"]?.stringValue, "entry-thinking")
+        XCTAssertEqual(answerEnd["message"]?["id"]?.stringValue, "msg_shared")
+        XCTAssertNotEqual(
+            thinkingEnd["message"]?["id"]?.stringValue,
+            answerEnd["message"]?["id"]?.stringValue
+        )
+    }
+
     // MARK: - Tools
 
     func testToolUseBecomesExecutionStartAndTheMatchingResultEndsIt() throws {
-        let adapter = adapter()
-        let started = decode(adapter, [
+        let sut = adapter()
+        let started = decode(sut, [
             "type": "assistant", "session_id": "s", "uuid": "u1",
             "message": [
                 "id": "msg_1", "role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use",
@@ -244,8 +326,9 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(start["toolName"]?.stringValue, "Bash")
         XCTAssertEqual(start["args"]?["command"]?.stringValue, "ls")
         XCTAssertEqual(events(started)[3]["message"]?["stopReason"]?.stringValue, "toolUse")
+        XCTAssertEqual(events(started)[3]["message"]?["id"]?.stringValue, "u1")
 
-        let ended = decode(adapter, [
+        let ended = decode(sut, [
             "type": "user", "session_id": "s", "uuid": "u2",
             "message": ["role": "user", "content": [[
                 "type": "tool_result", "tool_use_id": "toolu_9",
@@ -258,6 +341,52 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(end["isError"]?.boolValue, false)
         XCTAssertEqual(end["result"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "a.txt")
         XCTAssertEqual(events(ended).last?["message"]?["role"]?.stringValue, "toolResult")
+        XCTAssertEqual(events(ended).last?["message"]?["id"]?.stringValue, "u2")
+    }
+
+    func testSplitWorkRecordsSharingAProviderMessageIDRemainDistinct() throws {
+        let adapter = adapter()
+        let first = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "entry-thinking",
+            "message": [
+                "id": "msg_shared", "role": "assistant", "stop_reason": "tool_use",
+                "content": [["type": "thinking", "thinking": "Plan"]]
+            ]
+        ])
+        let second = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "entry-tool",
+            "message": [
+                "id": "msg_shared", "role": "assistant", "stop_reason": "tool_use",
+                "content": [["type": "tool_use", "id": "toolu_1", "name": "Bash", "input": [:]]]
+            ]
+        ])
+        let firstEnd = try XCTUnwrap(events(first).first { $0["type"]?.stringValue == "message_end" })
+        let secondEnd = try XCTUnwrap(events(second).first { $0["type"]?.stringValue == "message_end" })
+
+        XCTAssertEqual(firstEnd["message"]?["id"]?.stringValue, "entry-thinking")
+        XCTAssertEqual(secondEnd["message"]?["id"]?.stringValue, "entry-tool")
+    }
+
+    func testParallelToolResultsProduceOneDurableIdentityRow() throws {
+        let adapter = adapter()
+        let ended = decode(adapter, [
+            "type": "user", "session_id": "s", "uuid": "parallel-results",
+            "timestamp": "2026-07-31T12:00:00.000Z",
+            "message": ["role": "user", "content": [
+                ["type": "tool_result", "tool_use_id": "tool-a", "content": "first"],
+                ["type": "tool_result", "tool_use_id": "tool-b", "content": "second"]
+            ]]
+        ])
+        XCTAssertEqual(eventTypes(ended), ["agent_start", "turn_start", "tool_execution_end", "tool_execution_end", "message_end"])
+        let messages = events(ended).filter { $0["type"]?.stringValue == "message_end" }
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?["message"]?["id"]?.stringValue, "parallel-results")
+        XCTAssertEqual(messages.first?["message"]?["toolCallId"]?.stringValue, "tool-a")
+        XCTAssertEqual(
+            messages.first?["message"]?["content"]?.arrayValue?.compactMap { $0["text"]?.stringValue },
+            ["first", "second"]
+        )
+        XCTAssertEqual(messages.first?["message"]?["timestamp"]?.stringValue, "2026-07-31T12:00:00.000Z")
     }
 
     func testFailingToolResultIsMarkedAsAnError() throws {
@@ -392,6 +521,81 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(cleared["steering"]?.arrayValue?.count, 0)
     }
 
+    func testFollowUpsWaitForDistinctClaudeTurnsAndDrainOneAtEachResult() throws {
+        let adapter = adapter()
+        _ = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "u1",
+            "message": [
+                "id": "msg_1", "role": "assistant", "stop_reason": "tool_use",
+                "content": [["type": "tool_use", "id": "toolu_1", "name": "Read", "input": [:]]]
+            ]
+        ])
+
+        for (id, text) in [("f1", "first later"), ("f2", "second later")] {
+            guard case let .immediateWithEvents(_, emitted) = adapter.encode(
+                command: "follow_up", id: id, payload: ["message": .string(text)]
+            ) else { return XCTFail("Expected a locally queued follow-up") }
+            XCTAssertEqual(emitted.first?["followUp"]?.arrayValue?.count, id == "f1" ? 1 : 2)
+        }
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty, "Nothing joins the active turn")
+
+        let firstBoundary = decode(adapter, [
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "first", "session_id": "s", "num_turns": 1
+        ])
+        XCTAssertEqual(eventTypes(firstBoundary).suffix(2), ["turn_end", "agent_settled"])
+        let first = try XCTUnwrap(adapter.drainPendingWrites().first.flatMap { try? PiJSONValue.decode($0) })
+        XCTAssertEqual(first["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "first later")
+
+        let afterFirst = try XCTUnwrap(immediate(adapter.encode(command: "get_state", id: "s1", payload: [:])))
+        XCTAssertEqual(afterFirst["followUpQueue"]?.arrayValue?.compactMap(\.stringValue), ["second later"])
+
+        let replay = decode(adapter, [
+            "type": "user", "session_id": "s", "uuid": "u2",
+            "message": ["role": "user", "content": [["type": "text", "text": "first later"]]]
+        ])
+        XCTAssertEqual(eventTypes(replay).prefix(2), ["agent_start", "turn_start"])
+        XCTAssertTrue(responses(replay).isEmpty, "The queued command was already acknowledged locally")
+
+        _ = decode(adapter, [
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "second", "session_id": "s", "num_turns": 1
+        ])
+        let second = try XCTUnwrap(adapter.drainPendingWrites().first.flatMap { try? PiJSONValue.decode($0) })
+        XCTAssertEqual(second["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "second later")
+    }
+
+    func testSteerStillWritesIntoTheActiveClaudeTurn() {
+        let adapter = adapter()
+        _ = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "u1",
+            "message": [
+                "id": "msg_1", "role": "assistant", "stop_reason": "tool_use",
+                "content": [["type": "tool_use", "id": "toolu_1", "name": "Read", "input": [:]]]
+            ]
+        ])
+        XCTAssertEqual(
+            written(adapter.encode(command: "steer", id: "s1", payload: ["message": .string("adjust")]))
+                .first?["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue,
+            "adjust"
+        )
+    }
+
+    func testNilStopReasonRemainsNonterminalProgress() throws {
+        let adapter = adapter()
+        let output = decode(adapter, [
+            "type": "assistant", "session_id": "s", "uuid": "progress-record",
+            "message": [
+                "id": "msg_shared", "role": "assistant",
+                "content": [["type": "text", "text": "I am checking that now."]]
+            ]
+        ])
+        let ended = try XCTUnwrap(events(output).first { $0["type"]?.stringValue == "message_end" })
+        XCTAssertEqual(ended["message"]?["stopReason"]?.stringValue, "toolUse")
+        XCTAssertEqual(ended["message"]?["id"]?.stringValue, "progress-record")
+        XCTAssertFalse(eventTypes(output).contains("agent_settled"))
+    }
+
     func testCompactIsSentAsASlashCommandPrompt() throws {
         let adapter = adapter()
         let line = try XCTUnwrap(written(adapter.encode(command: "compact", id: "c1", payload: [:])).first)
@@ -471,6 +675,31 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         XCTAssertTrue(arguments.contains("acceptEdits"))
     }
 
+    func testSetSessionNameUsesClaudesRenameControlAndPublishesTheAppliedTitle() throws {
+        let adapter = adapter()
+        _ = adapter.launchArguments(sessionPath: nil, cwd: cwd)
+        let line = try XCTUnwrap(written(
+            adapter.encode(
+                command: "set_session_name", id: "rename-1",
+                payload: ["name": .string("  Release review  ")]
+            )
+        ).first)
+        XCTAssertEqual(line["request"]?["subtype"]?.stringValue, "rename_session")
+        XCTAssertEqual(line["request"]?["title"]?.stringValue, "Release review")
+
+        let applied = decode(adapter, [
+            "type": "control_response",
+            "response": ["subtype": "success", "request_id": "rename-1"]
+        ])
+        XCTAssertEqual(responses(applied).first?.1["data"]?["name"]?.stringValue, "Release review")
+        XCTAssertEqual(eventTypes(applied), ["session_info_changed"])
+        XCTAssertEqual(events(applied).first?["name"]?.stringValue, "Release review")
+        let state = try XCTUnwrap(immediate(
+            adapter.encode(command: "get_state", id: "state", payload: [:])
+        ))
+        XCTAssertEqual(state["sessionName"]?.stringValue, "Release review")
+    }
+
     func testAnUncorrelatedControlResponseIsIgnored() {
         let adapter = adapter()
         let stray = decode(adapter, [
@@ -537,7 +766,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
         }
         let drained = adapter.drainPendingWrites().compactMap { try? PiJSONValue.decode($0) }
         XCTAssertEqual(drained.count, 1)
-        XCTAssertEqual(drained.first?["response"]?["request_id"]?.stringValue, "req-0")
+        XCTAssertEqual(drained.first?["response"]?["request_id"]?.stringValue, "req-16")
         XCTAssertEqual(drained.first?["response"]?["response"]?["behavior"]?.stringValue, "deny")
         XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
     }
@@ -548,7 +777,10 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
             "type": "control_request", "request_id": "req-9",
             "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": [:]]
         ])
-        XCTAssertTrue(decode(adapter, ["type": "control_cancel_request", "request_id": "req-9"]).isEmpty)
+        let cancelled = events(decode(adapter, ["type": "control_cancel_request", "request_id": "req-9"]))
+        XCTAssertEqual(cancelled.count, 1)
+        XCTAssertEqual(cancelled.first?["type"]?.stringValue, "extension_ui_cancel")
+        XCTAssertEqual(cancelled.first?["id"]?.stringValue, "req-9")
         XCTAssertTrue(adapter.encodeUncorrelated(.object([
             "type": .string("extension_ui_response"), "id": .string("req-9"), "confirmed": .bool(true)
         ])).isEmpty)
@@ -579,7 +811,7 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
 
     func testCommandsWithNoClaudeEquivalentAreReportedAsUnsupported() {
         let adapter = adapter()
-        for command in ["set_session_name", "export_html", "get_fork_messages", "get_entries",
+        for command in ["export_html", "get_fork_messages", "get_entries",
                         "cycle_model", "cycle_thinking_level", "something_new"] {
             guard case .unsupported = adapter.encode(command: command, id: "1", payload: [:]) else {
                 return XCTFail("\(command) should be unsupported")
@@ -629,7 +861,74 @@ final class ClaudeProtocolAdapterTests: XCTestCase {
             last = events(emitted).last ?? last
         }
         let text = try XCTUnwrap(last?["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue)
-        XCTAssertLessThanOrEqual(text.count, ClaudeProtocolAdapter.Limit.blockText + chunk.count)
+        XCTAssertLessThanOrEqual(text.count, ClaudeProtocolAdapter.Limit.blockText)
+    }
+
+    func testOneOversizedStreamingDeltaAndInitialBlockAreClampedExactly() throws {
+        let oversized = String(repeating: "x", count: ClaudeProtocolAdapter.Limit.blockText * 2)
+        let first = adapter()
+        let started = decode(first, [
+            "type": "stream_event", "session_id": "s", "uuid": "start",
+            "event": [
+                "type": "content_block_start", "index": 0,
+                "content_block": ["type": "text", "text": oversized]
+            ]
+        ])
+        let initial = try XCTUnwrap(
+            events(started).last?["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue
+        )
+        XCTAssertEqual(initial.count, ClaudeProtocolAdapter.Limit.blockText)
+
+        let second = adapter()
+        let delta = decode(second, [
+            "type": "stream_event", "session_id": "s", "uuid": "delta",
+            "event": [
+                "type": "content_block_delta", "index": 0,
+                "delta": ["type": "text_delta", "text": oversized]
+            ]
+        ])
+        let streamed = try XCTUnwrap(
+            events(delta).last?["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue
+        )
+        XCTAssertEqual(streamed.count, ClaudeProtocolAdapter.Limit.blockText)
+    }
+
+    func testPromptCorrelationCapacityRejectsNewMessagesWithoutEvictingFIFO() {
+        let adapter = adapter()
+        for index in 0..<ClaudeProtocolAdapter.Limit.promptAcks {
+            guard case .write = adapter.encode(
+                command: "prompt", id: "p\(index)", payload: ["message": .string("message \(index)")]
+            ) else { return XCTFail("Expected accepted prompt \(index)") }
+        }
+        guard case .unsupported = adapter.encode(
+            command: "prompt", id: "overflow", payload: ["message": .string("overflow")]
+        ) else { return XCTFail("Expected bounded rejection") }
+
+        var ids: [String] = []
+        for index in 0..<ClaudeProtocolAdapter.Limit.promptAcks {
+            ids += responses(decode(adapter, [
+                "type": "user", "session_id": "s", "uuid": "u\(index)",
+                "message": ["role": "user", "content": [["type": "text", "text": "message \(index)"]]]
+            ])).map(\.0)
+        }
+        XCTAssertEqual(ids, (0..<ClaudeProtocolAdapter.Limit.promptAcks).map { "p\($0)" })
+    }
+
+    func testControlCorrelationCapacityKeepsTheOldestResponseMatchable() {
+        let adapter = adapter()
+        for index in 0..<ClaudeProtocolAdapter.Limit.controlRequests {
+            guard case .write = adapter.encode(command: "abort", id: "c\(index)", payload: [:]) else {
+                return XCTFail("Expected accepted control \(index)")
+            }
+        }
+        guard case .unsupported = adapter.encode(command: "abort", id: "overflow", payload: [:]) else {
+            return XCTFail("Expected bounded rejection")
+        }
+        let reply = responses(decode(adapter, [
+            "type": "control_response",
+            "response": ["subtype": "success", "request_id": "c0"]
+        ]))
+        XCTAssertEqual(reply.map(\.0), ["c0"])
     }
 
     func testResetDropsSessionStateButKeepsLaunchPreferences() throws {

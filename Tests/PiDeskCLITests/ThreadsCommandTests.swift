@@ -192,6 +192,80 @@ final class ThreadsNewTests: XCTestCase {
         XCTAssertEqual(plane.lastCreateThreadRequest?.cwd, "/code")
         XCTAssertNil(plane.lastCreateThreadRequest?.message)
         XCTAssertFalse(result.stdout.contains("Run started"))
+        XCTAssertNotNil(plane.lastCreateThreadRequest?.clientId.flatMap(UUID.init(uuidString:)))
+    }
+
+    func testCreateUsesExplicitStableClientID() async {
+        let plane = FakeControlPlane()
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--client-id", "create_retry_1"],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(plane.lastCreateThreadRequest?.clientId, "create_retry_1")
+    }
+
+    func testCreateRejectsInvalidClientIDBeforeCallingDaemon() async {
+        for value in ["", "contains space", String(repeating: "a", count: 129), "nonascii_é"] {
+            let plane = FakeControlPlane()
+            let result = await runCLI(
+                ["threads", "new", "--cwd", "/code", "--client-id", value],
+                controlPlane: plane
+            )
+
+            XCTAssertEqual(result.exitCode, 2, "value: \(value)")
+            XCTAssertNil(plane.lastCreateThreadRequest, "value: \(value)")
+            XCTAssertTrue(result.stderr.contains("--client-id"), "value: \(value)")
+        }
+    }
+
+    func testCreateFailurePrintsTheStableRetryID() async {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.transportFailure("connection closed")
+
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--client-id", "create_retry_2"],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertTrue(result.stderr.contains("--client-id create_retry_2"))
+    }
+
+    func testRetryableCreationStatesPreserveTheStableRetryID() async {
+        for code in ["create_retryable", "creation_pending"] {
+            let plane = FakeControlPlane()
+            plane.error = ControlPlaneError.apiError(
+                status: 503, code: code, message: "try the protected creation again"
+            )
+
+            let result = await runCLI(
+                ["threads", "new", "--cwd", "/code", "--client-id", "create_retry_state"],
+                controlPlane: plane
+            )
+
+            XCTAssertEqual(result.exitCode, 1, "code: \(code)")
+            XCTAssertTrue(result.stderr.contains("Retry the exact thread creation"), "code: \(code)")
+            XCTAssertTrue(result.stderr.contains("--client-id create_retry_state"), "code: \(code)")
+            XCTAssertFalse(result.stderr.contains("Do not retry"), "code: \(code)")
+        }
+    }
+
+    func testAmbiguousCreateFailureRequiresReviewInsteadOfRetry() async {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.apiError(
+            status: 409, code: "creation_outcome_unknown", message: "may exist"
+        )
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--client-id", "create_retry_3"],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertTrue(result.stderr.contains("Review the thread list"))
+        XCTAssertTrue(result.stderr.contains("Do not retry"))
+        XCTAssertFalse(result.stderr.contains("Retry the exact"))
     }
 
     func testCreatesWithMessageModeAndWorktree() async {
@@ -206,6 +280,34 @@ final class ThreadsNewTests: XCTestCase {
         XCTAssertEqual(plane.lastCreateThreadRequest?.mode, "ultra")
         XCTAssertEqual(plane.lastCreateThreadRequest?.worktree, true)
         XCTAssertTrue(result.stderr.contains("run_1")) // "Run started: ..." is incidental, not the primary result line
+    }
+
+    func testModeRequiresAMessageAndAPiAgent() async {
+        let idlePlane = FakeControlPlane()
+        let idle = await runCLI([
+            "threads", "new", "--cwd", "/code", "--mode", "ultra"
+        ], controlPlane: idlePlane)
+        XCTAssertEqual(idle.exitCode, 2)
+        XCTAssertNil(idlePlane.lastCreateThreadRequest)
+        XCTAssertTrue(idle.stderr.contains("--message"))
+
+        let otherAgentPlane = FakeControlPlane()
+        let otherAgent = await runCLI([
+            "threads", "new", "--cwd", "/code", "--agent", "claude",
+            "--message", "work", "--mode", "ultra"
+        ], controlPlane: otherAgentPlane)
+        XCTAssertEqual(otherAgent.exitCode, 2)
+        XCTAssertNil(otherAgentPlane.lastCreateThreadRequest)
+        XCTAssertTrue(otherAgent.stderr.contains("--agent pi"))
+    }
+
+    func testWhitespaceOnlyFirstMessageIsRejectedLocally() async {
+        let plane = FakeControlPlane()
+        let result = await runCLI([
+            "threads", "new", "--cwd", "/code", "--message", "   "
+        ], controlPlane: plane)
+        XCTAssertEqual(result.exitCode, 2)
+        XCTAssertNil(plane.lastCreateThreadRequest)
     }
 
     func testWorktreeRefusesAnOlderDaemonBeforeCreatingAnything() async {
@@ -232,6 +334,24 @@ final class ThreadsNewTests: XCTestCase {
         let result = await runCLI(["threads", "new", "--cwd", "/code", "--message", "hi", "--json"], controlPlane: plane)
         let decoded = try? JSONDecoder().decode(WireCreateThreadResponse.self, from: Data(result.stdout.utf8))
         XCTAssertEqual(decoded?.runId, "run_9")
+    }
+
+    func testCreatedThreadWithRejectedFirstMessagePrintsSafeRecovery() async {
+        let plane = FakeControlPlane()
+        plane.createThreadResult = WireCreateThreadResponse(
+            thread: WireThread(id: "t1"), runId: nil,
+            firstMessageError: "The daemon is shutting down."
+        )
+
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--message", "keep me"],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("Created thread"))
+        XCTAssertTrue(result.stderr.contains("first message was not sent"))
+        XCTAssertTrue(result.stderr.contains("pidesk threads send t1 -"))
     }
 }
 
@@ -309,5 +429,6 @@ final class ThreadsHelpTests: XCTestCase {
         let result = await runCLI(["threads", "new", "--help"])
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertFalse(result.stderr.contains("missing"))
+        XCTAssertTrue(result.stdout.contains("Claude Code requires --message"))
     }
 }

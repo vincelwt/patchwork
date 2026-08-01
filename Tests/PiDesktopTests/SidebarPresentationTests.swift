@@ -73,6 +73,26 @@ final class SidebarPresentationTests: XCTestCase {
         XCTAssertEqual(snapshot.activeGroups.first?.sessions.map(\.id), ["global"])
     }
 
+    func testMoveDestinationsArePrecomputedFromAllSessionsAndVirtualFolders() {
+        let desktop = WorkspaceOrganization.globalWorkingDirectory.standardizedFileURL.path
+        let folders = [
+            VirtualFolder(id: "first", name: "First", createdAt: Date(timeIntervalSince1970: 1)),
+            VirtualFolder(id: "second", name: "Second", createdAt: Date(timeIntervalSince1970: 2))
+        ]
+        let snapshot = SidebarSnapshot(
+            sessions: [
+                summary(id: "z", cwd: "/tmp/zulu", archived: false),
+                summary(id: "a", cwd: "/tmp/alpha", archived: true),
+                summary(id: "global", cwd: desktop, archived: false)
+            ],
+            query: "zulu",
+            virtualFolders: folders
+        )
+
+        XCTAssertEqual(snapshot.moveDestinations.folderEntries.map(\.folder.id), ["first", "second"])
+        XCTAssertEqual(snapshot.moveDestinations.projectPaths, ["/tmp/alpha", "/tmp/zulu"])
+    }
+
     func testRunningLabelShowsElapsedTimeUntilTheRowIsHovered() {
         let now = Date()
         let startedAt = now.addingTimeInterval(-125)
@@ -167,5 +187,18 @@ final class GitIndicatorPolicyTests: XCTestCase {
 
     func testHidesTheIndicatorOutsideARepository() {
         XCTAssertFalse(GitIndicatorPolicy.showsBranchIndicator(.none))
+    }
+
+    func testProjectGitUsesItsIndexedCWDsAndPrefersDirtyWorktrees() {
+        let project = "/tmp/project"
+        let clean = GitSnapshot(isRepository: true, branch: "main")
+        let dirty = dirtySnapshot(branch: "feature")
+        let selected = SidebarProjectGit.snapshot(
+            projectPath: project,
+            cwdPathsByProject: [project: [project, "/tmp/worktree"]],
+            folderGit: [project: clean, "/tmp/worktree": dirty]
+        )
+
+        XCTAssertEqual(selected, dirty)
     }
 }

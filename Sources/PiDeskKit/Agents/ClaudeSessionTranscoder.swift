@@ -48,10 +48,21 @@ enum ClaudeSessionTranscoder {
             projected["model"] = model
             projected["provider"] = "anthropic"
         }
-        projected["stopReason"] = stopReason(message["stop_reason"] as? String, blocks: blocks)
+        let resolvedStopReason = stopReason(message["stop_reason"] as? String, blocks: blocks)
+        projected["stopReason"] = resolvedStopReason
         if let usage = usage(message["usage"] as? [String: Any]) { projected["usage"] = usage }
         if record["isApiErrorMessage"] as? Bool == true { projected["isError"] = true }
-        return entry(record, message: projected)
+        // Claude reuses one provider message id across the thinking, narration, and tool-call
+        // records of a response. Those records need their transcript UUIDs so SwiftUI and the
+        // live overlay do not overwrite one another. The terminal answer keeps the provider id
+        // to reconcile the streamed answer with its durable copy without a visible duplicate.
+        let hydrationID = ClaudeMessageIdentity.preferredID(
+            providerID: message["id"] as? String,
+            recordID: record["uuid"] as? String,
+            stopReason: resolvedStopReason,
+            blocks: blocks
+        )
+        return entry(record, id: hydrationID, message: projected)
     }
 
     private static func user(_ record: [String: Any]) -> [String: Any]? {
@@ -197,9 +208,9 @@ enum ClaudeSessionTranscoder {
         case "refusal": return "error"
         case let value?: return value
         case nil:
-            // Streaming records occasionally land without a stop reason; a turn that only called
-            // tools is not a completed answer and must not be reported as one.
-            return blocks.contains { ($0["type"] as? String) == "toolCall" } ? "toolUse" : "stop"
+            // Progressive Claude narration records commonly omit a stop reason. A later record
+            // with the same provider id carries the explicit tool or terminal boundary.
+            return "toolUse"
         }
     }
 
@@ -215,13 +226,33 @@ enum ClaudeSessionTranscoder {
 
     /// Claude has no session header record, so cwd and session id ride on every conversation
     /// entry and the summary pass takes them from the first entry that carries them.
-    private static func entry(_ record: [String: Any], message: [String: Any]) -> [String: Any]? {
+    private static func entry(
+        _ record: [String: Any], id preferredID: String? = nil, message: [String: Any]
+    ) -> [String: Any]? {
         guard let uuid = record["uuid"] as? String else { return nil }
-        var projected: [String: Any] = ["type": "message", "id": uuid, "message": message]
+        var projected: [String: Any] = ["type": "message", "id": preferredID ?? uuid, "message": message]
         if let parent = record["parentUuid"] as? String { projected["parentId"] = parent }
         if let timestamp = record["timestamp"] as? String { projected["timestamp"] = timestamp }
         if let cwd = record["cwd"] as? String { projected["cwd"] = cwd }
         if let session = record["sessionId"] as? String { projected["sessionId"] = session }
         return projected
+    }
+}
+
+/// Claude writes one provider response as multiple transcript records. Only the answer-bearing
+/// terminal record shares the live stream's provider id; thinking and tool records retain their
+/// transcript UUIDs so every projected row stays unique.
+enum ClaudeMessageIdentity {
+    static func preferredID(
+        providerID: String?, recordID: String?, stopReason: String, blocks: [[String: Any]]
+    ) -> String? {
+        let isTerminal = ["stop", "length", "error", "aborted"].contains(stopReason)
+        let carriesAnswer = blocks.contains {
+            let type = $0["type"] as? String
+            return type == "text" || type == "image"
+        }
+        return isTerminal && carriesAnswer
+            ? (providerID ?? recordID)
+            : (recordID ?? providerID)
     }
 }

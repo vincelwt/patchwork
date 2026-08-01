@@ -30,6 +30,12 @@ public enum RawSocket {
     public static func connectUnix(path: String, timeout: TimeInterval) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw RawSocketError.ioFailure("socket() failed: \(lastError())") }
+        do {
+            try suppressBrokenPipeSignal(fd: fd)
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -62,8 +68,17 @@ public enum RawSocket {
     /// Loopback TCP only, matching the doc's transport (`127.0.0.1:<port>`); `host` must be a
     /// numeric IPv4 address.
     public static func connectTCP(host: String, port: Int, timeout: TimeInterval) throws -> Int32 {
+        guard (1...65_535).contains(port) else {
+            throw RawSocketError.ioFailure("TCP port must be between 1 and 65535.")
+        }
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw RawSocketError.ioFailure("socket() failed: \(lastError())") }
+        do {
+            try suppressBrokenPipeSignal(fd: fd)
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -88,10 +103,33 @@ public enum RawSocket {
     }
 
     public static func setTimeouts(fd: Int32, timeout: TimeInterval) {
-        guard timeout > 0 else { return }
-        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout.truncatingRemainder(dividingBy: 1)) * 1_000_000))
+        let bounded: TimeInterval
+        if timeout.isNaN || timeout <= 0 {
+            bounded = 0
+        } else if !timeout.isFinite {
+            bounded = TimeInterval(Int32.max)
+        } else {
+            bounded = min(timeout, TimeInterval(Int32.max))
+        }
+        let wholeSeconds = Int(bounded)
+        var tv = timeval(
+            tv_sec: wholeSeconds,
+            tv_usec: Int32((bounded.truncatingRemainder(dividingBy: 1)) * 1_000_000)
+        )
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    /// macOS otherwise raises SIGPIPE when a peer disappears during `send`, which can terminate
+    /// the standalone CLI before Swift has a chance to surface the socket error.
+    public static func suppressBrokenPipeSignal(fd: Int32) throws {
+        var enabled: Int32 = 1
+        guard setsockopt(
+            fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            throw RawSocketError.ioFailure("setsockopt(SO_NOSIGPIPE) failed: \(lastError())")
+        }
     }
 
     public static func writeAll(fd: Int32, data: Data) throws {
@@ -110,8 +148,8 @@ public enum RawSocket {
         }
     }
 
-    /// One read. `nil` covers EOF, a timeout, and a hard error alike — a one-shot request/
-    /// response connection treats all three the same way: stop reading and parse what arrived.
+    /// One lenient read for long-lived streams. `nil` covers EOF, a timeout, and a hard error;
+    /// aggregate request/response reads use the strict helper below so those cases stay distinct.
     public static func read(fd: Int32, maxBytes: Int) -> Data? {
         var buffer = [UInt8](repeating: 0, count: maxBytes)
         let count = buffer.withUnsafeMutableBytes { pointer in
@@ -123,11 +161,30 @@ public enum RawSocket {
 
     public static func readAllUntilClosed(fd: Int32, maxBytes: Int) throws -> Data {
         var result = Data()
-        while let chunk = read(fd: fd, maxBytes: 64 * 1_024) {
+        while let chunk = try readStrict(fd: fd, maxBytes: 64 * 1_024) {
             result.append(chunk)
             if result.count > maxBytes { throw RawSocketError.ioFailure("response exceeded \(maxBytes) bytes") }
         }
         return result
+    }
+
+    /// `nil` means a clean peer close. A timeout or hard receive error is thrown because a
+    /// mutation may have reached the daemon even when its response did not reach the client.
+    private static func readStrict(fd: Int32, maxBytes: Int) throws -> Data? {
+        while true {
+            var buffer = [UInt8](repeating: 0, count: maxBytes)
+            let count = buffer.withUnsafeMutableBytes { pointer in
+                Darwin.recv(fd, pointer.baseAddress, maxBytes, 0)
+            }
+            if count > 0 { return Data(buffer.prefix(count)) }
+            if count == 0 { return nil }
+            let code = errno
+            if code == EINTR { continue }
+            if code == EAGAIN || code == EWOULDBLOCK {
+                throw RawSocketError.ioFailure("recv() timed out")
+            }
+            throw RawSocketError.ioFailure("recv() failed: \(String(cString: strerror(code)))")
+        }
     }
 
     /// Unblocks a thread parked in `recv` on this fd before closing it, so a cancelled SSE

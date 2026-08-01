@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AGENTS, agentLabel, shouldShowAgentBadge } from "../../Sources/PiDeskWeb/Site/js/agents.mjs";
+import {
+  AGENTS, agentLabel, canChangeThinking, canRenameSession, shouldShowAgentBadge
+} from "../../Sources/PiDeskWeb/Site/js/agents.mjs";
 
 test("agentLabel: every agent this build ships has a label", () => {
   assert.deepEqual(AGENTS.map((agent) => agent.id), ["pi", "codex", "claude"]);
@@ -36,6 +38,14 @@ test("shouldShowAgentBadge: only non-Pi agents get a badge", () => {
   assert.equal(shouldShowAgentBadge("codex"), true);
   assert.equal(shouldShowAgentBadge("claude"), true);
   assert.equal(shouldShowAgentBadge("gemini"), true);
+});
+
+test("remote mutations match each agent's supported controls", () => {
+  assert.equal(canRenameSession("pi"), true);
+  assert.equal(canRenameSession("codex"), true);
+  assert.equal(canRenameSession("claude"), true);
+  assert.equal(canChangeThinking("claude"), false);
+  assert.equal(canRenameSession("future-agent"), false);
 });
 
 test("schedule form: agent is only sent for a new-thread target", async () => {

@@ -98,6 +98,14 @@ public enum AgentCatalog {
         if let override = environment[descriptor.sessionRootOverrideKey], !override.isEmpty {
             return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
         }
+        if kind == .pi,
+           let agentDirectory = environment["PI_CODING_AGENT_DIR"],
+           !agentDirectory.isEmpty {
+            return URL(
+                fileURLWithPath: (agentDirectory as NSString).expandingTildeInPath,
+                isDirectory: true
+            ).appendingPathComponent("sessions", isDirectory: true)
+        }
         return fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent(descriptor.sessionRootSuffix, isDirectory: true)
     }
@@ -169,7 +177,11 @@ public extension AgentKind {
     /// Codex does; Pi and Claude Code both write their name into the session file, where the
     /// ordinary parse already finds it.
     func externalName(forSessionPath path: String) -> String? {
+        externalName(forSessionPath: path, titles: CodexThreadTitles.shared.snapshot())
+    }
+
+    func externalName(forSessionPath path: String, titles: [String: String]) -> String? {
         guard self == .codex, let threadID = CodexThreadTitles.threadID(fromRolloutPath: path) else { return nil }
-        return CodexThreadTitles.shared.title(forThreadID: threadID)
+        return titles[threadID]
     }
 }

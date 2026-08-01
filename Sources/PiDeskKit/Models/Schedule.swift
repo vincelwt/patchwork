@@ -151,9 +151,10 @@ public struct ScheduleOccurrence: Codable, Hashable, Sendable {
         public init(rawValue: String) { self.rawValue = rawValue }
 
         public static let pending = Phase(rawValue: "pending")
+        public static let starting = Phase(rawValue: "starting")
         public static let dispatching = Phase(rawValue: "dispatching")
         public static let accepted = Phase(rawValue: "accepted")
-        public static var knownCases: [Phase] { [.pending, .dispatching, .accepted] }
+        public static var knownCases: [Phase] { [.pending, .starting, .dispatching, .accepted] }
         public static func other(_ rawValue: String) -> Phase { Phase(rawValue: rawValue) }
     }
 
@@ -163,10 +164,15 @@ public struct ScheduleOccurrence: Codable, Hashable, Sendable {
     public var attemptCount: Int
     public var notBefore: Date
     public var runId: String?
+    /// A fresh thread's identity is stored with the occurrence before any name or prompt command.
+    /// Run history is a projection and may be unavailable after a partial disk failure.
+    public var threadId: String?
+    public var threadPath: String?
 
     public init(
         id: String, scheduledAt: Date, phase: Phase = .pending,
-        attemptCount: Int = 0, notBefore: Date, runId: String? = nil
+        attemptCount: Int = 0, notBefore: Date, runId: String? = nil,
+        threadId: String? = nil, threadPath: String? = nil
     ) {
         self.id = id
         self.scheduledAt = scheduledAt
@@ -174,6 +180,8 @@ public struct ScheduleOccurrence: Codable, Hashable, Sendable {
         self.attemptCount = attemptCount
         self.notBefore = notBefore
         self.runId = runId
+        self.threadId = threadId
+        self.threadPath = threadPath
     }
 }
 
@@ -217,6 +225,10 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
     public var lastRunAt: Date?
     public var lastStatus: RunStatus?
     public var nextRunAt: Date?
+    /// Opaque equality token for the raw target on an idempotent create. It lets an identical
+    /// retry replay after a path alias is renamed or removed without retaining that path as the
+    /// schedule's executable target.
+    public var creationTargetFingerprint: String?
     /// Durable work owed by this schedule. Optional so every pre-resilience schedules.json still
     /// decodes unchanged.
     public var pendingOccurrence: ScheduleOccurrence?
@@ -236,6 +248,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         lastRunAt: Date? = nil,
         lastStatus: RunStatus? = nil,
         nextRunAt: Date? = nil,
+        creationTargetFingerprint: String? = nil,
         pendingOccurrence: ScheduleOccurrence? = nil
     ) {
         self.id = id
@@ -252,6 +265,7 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         self.lastRunAt = lastRunAt
         self.lastStatus = lastStatus
         self.nextRunAt = nextRunAt
+        self.creationTargetFingerprint = creationTargetFingerprint
         self.pendingOccurrence = pendingOccurrence
     }
 
@@ -271,6 +285,12 @@ public struct Schedule: Codable, Hashable, Sendable, Identifiable {
         lastRunAt = try container.decodeIfPresent(Date.self, forKey: .lastRunAt)
         lastStatus = try container.decodeIfPresent(RunStatus.self, forKey: .lastStatus)
         nextRunAt = try container.decodeIfPresent(Date.self, forKey: .nextRunAt)
+        let fingerprint = try container.decodeIfPresent(
+            String.self, forKey: .creationTargetFingerprint
+        )
+        creationTargetFingerprint = fingerprint.flatMap {
+            $0.utf8.count <= 128 ? $0 : nil
+        }
         pendingOccurrence = try container.decodeIfPresent(ScheduleOccurrence.self, forKey: .pendingOccurrence)
     }
 }
@@ -323,6 +343,7 @@ public struct ScheduleUpdateRequest: Codable, Sendable {
     public var mode: String?
     public var trigger: ScheduleTrigger?
     public var policy: SchedulePolicy?
+    public var agent: AgentKind?
 
     public init(
         name: String? = nil,
@@ -331,7 +352,8 @@ public struct ScheduleUpdateRequest: Codable, Sendable {
         prompt: String? = nil,
         mode: String? = nil,
         trigger: ScheduleTrigger? = nil,
-        policy: SchedulePolicy? = nil
+        policy: SchedulePolicy? = nil,
+        agent: AgentKind? = nil
     ) {
         self.name = name
         self.enabled = enabled
@@ -340,6 +362,7 @@ public struct ScheduleUpdateRequest: Codable, Sendable {
         self.mode = mode
         self.trigger = trigger
         self.policy = policy
+        self.agent = agent
     }
 }
 
@@ -362,7 +385,12 @@ public struct ScheduleDetailResponse: Codable, Sendable {
     }
 }
 
-public struct ScheduleRunResponse: Codable, Sendable {
+public struct ScheduleRunRequest: Codable, Hashable, Sendable {
+    public var clientId: String?
+    public init(clientId: String? = nil) { self.clientId = clientId }
+}
+
+public struct ScheduleRunResponse: Codable, Equatable, Sendable {
     public var runId: String
     public init(runId: String) { self.runId = runId }
 }

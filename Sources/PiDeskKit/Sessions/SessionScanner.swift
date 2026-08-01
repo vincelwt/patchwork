@@ -6,6 +6,10 @@ import Foundation
 /// `AgentDescriptor` declares, with the filename prefix it declares, so a subagent's nested
 /// transcript is never promoted into the thread list.
 public enum SessionScanner {
+    /// Both the app and daemon keep their own bounded ownership sets. Their union must remain
+    /// representable, or one side reaching its cap could make a still-owned thread disappear.
+    public static let supplementalPathLimit = ArchiveStateBounds.itemLimit * 2
+
     /// One discovered file plus the agent whose root contained it.
     public struct DiscoveredSession: Sendable, Hashable {
         public let agent: AgentKind
@@ -14,6 +18,16 @@ public enum SessionScanner {
         public init(agent: AgentKind, url: URL) {
             self.agent = agent
             self.url = url
+        }
+    }
+
+    public struct DiscoveredCatalog: Sendable {
+        public let sessions: [DiscoveredSession]
+        public let directories: [URL]
+
+        public init(sessions: [DiscoveredSession], directories: [URL]) {
+            self.sessions = sessions
+            self.directories = directories
         }
     }
 
@@ -52,16 +66,24 @@ public enum SessionScanner {
     /// machine that has never run that agent degrades gracefully instead of failing every
     /// thread-listing request.
     public static func discoverSessionFiles(agent: AgentKind, rootURL: URL) -> [URL] {
+        discoverSessionTree(agent: agent, rootURL: rootURL).files
+    }
+
+    private static func discoverSessionTree(
+        agent: AgentKind, rootURL: URL
+    ) -> (files: [URL], directories: [URL]) {
         let manager = FileManager.default
-        guard manager.fileExists(atPath: rootURL.path) else { return [] }
+        guard manager.fileExists(atPath: rootURL.path) else { return ([], [rootURL.standardizedFileURL]) }
         let descriptor = AgentCatalog.descriptor(for: agent)
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
 
         var files: [URL] = []
+        var directories: [URL] = []
         var frontier = [rootURL]
         for depth in 0...max(0, descriptor.sessionScanDepth) {
             var next: [URL] = []
             for directory in frontier {
+                directories.append(directory.standardizedFileURL)
                 let items = (try? manager.contentsOfDirectory(
                     at: directory, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles]
                 )) ?? []
@@ -82,13 +104,19 @@ public enum SessionScanner {
         }
 
         var seen: Set<String> = []
-        return files.compactMap { file in
+        let normalizedFiles = files.compactMap { file -> URL? in
             let normalized = file.standardizedFileURL
             guard seen.insert(normalized.path).inserted else { return nil }
             var isDirectory: ObjCBool = false
             guard manager.fileExists(atPath: normalized.path, isDirectory: &isDirectory), !isDirectory.boolValue else { return nil }
             return normalized
         }
+        var seenDirectories: Set<String> = []
+        let normalizedDirectories = directories.compactMap { directory -> URL? in
+            let normalized = directory.standardizedFileURL
+            return seenDirectories.insert(normalized.path).inserted ? normalized : nil
+        }
+        return (normalizedFiles, normalizedDirectories)
     }
 
     /// Every agent's sessions in one pass. Roots are visited longest-path first so a nested
@@ -97,13 +125,48 @@ public enum SessionScanner {
     public static func discoverSessions(
         roots: [(agent: AgentKind, url: URL)] = SessionScanner.roots()
     ) -> [DiscoveredSession] {
+        discoverCatalog(roots: roots).sessions
+    }
+
+    public static func discoverCatalog(
+        roots: [(agent: AgentKind, url: URL)] = SessionScanner.roots(),
+        supplementalPaths: Set<String> = []
+    ) -> DiscoveredCatalog {
         var seen: Set<String> = []
+        var seenDirectories: Set<String> = []
         var results: [DiscoveredSession] = []
-        for root in roots.sorted(by: { $0.url.standardizedFileURL.path.count > $1.url.standardizedFileURL.path.count }) {
-            for url in discoverSessionFiles(agent: root.agent, rootURL: root.url) where seen.insert(url.path).inserted {
+        var directories: [URL] = []
+        let orderedRoots = roots.sorted {
+            $0.url.standardizedFileURL.path.count > $1.url.standardizedFileURL.path.count
+        }
+        for root in orderedRoots {
+            let tree = discoverSessionTree(agent: root.agent, rootURL: root.url)
+            for directory in tree.directories where seenDirectories.insert(directory.path).inserted {
+                directories.append(directory)
+            }
+            for url in tree.files where seen.insert(url.path).inserted {
                 results.append(DiscoveredSession(agent: root.agent, url: url))
             }
         }
-        return results
+
+        // Pi can choose a cwd-specific sessionDir which is intentionally impossible to model as
+        // one static root. App- and daemon-owned exact paths are bounded discovery seeds. They do
+        // not broaden the scan: only that regular JSONL is considered, and its parent is watched
+        // so deletion invalidates a warm daemon projection.
+        for rawPath in supplementalPaths.sorted().suffix(supplementalPathLimit) {
+            let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+            guard url.pathExtension.lowercased() == "jsonl" else { continue }
+            let parent = url.deletingLastPathComponent().standardizedFileURL
+            if seenDirectories.insert(parent.path).inserted { directories.append(parent) }
+            guard seen.insert(url.path).inserted,
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+            let agent = orderedRoots.first { root in
+                let rootPath = root.url.standardizedFileURL.path
+                return url.path == rootPath || url.path.hasPrefix(rootPath + "/")
+            }?.agent ?? .pi
+            results.append(DiscoveredSession(agent: agent, url: url))
+        }
+        return DiscoveredCatalog(sessions: results, directories: directories)
     }
 }

@@ -23,6 +23,13 @@ private final class FakeRuntime: AgentRuntimeProtocol {
     var getCommandsFailure: Error?
 
     func start(cwd: URL, sessionPath: URL?) throws {
+        if sessionFile.isEmpty {
+            sessionFile = sessionPath?.standardizedFileURL.path
+                ?? cwd.appendingPathComponent("fake-new-session.jsonl").standardizedFileURL.path
+        }
+        if sessionID.isEmpty {
+            sessionID = URL(fileURLWithPath: sessionFile).deletingPathExtension().lastPathComponent
+        }
         isRunning = true
         startCount += 1
     }
@@ -79,16 +86,18 @@ private final class FakeRuntime: AgentRuntimeProtocol {
     /// first — classified exactly like `RPCTimeoutPolicy` classifies a timeout for the same
     /// command, outcome-unknown unless it is a read-only state query — and only then does
     /// `onExit` fire.
-    func crash(_ message: String) {
+    func exit(_ message: String?) {
         for command in Array(pending.keys) {
             let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
-                ? AgentRuntimeError.processExited(message)
+                ? AgentRuntimeError.processExited(message ?? "Pi exited.")
                 : AgentRuntimeError.outcomeUnknown(command)
             pending.removeValue(forKey: command)?(.failure(error))
         }
         isRunning = false
         onExit?(message)
     }
+
+    func crash(_ message: String) { exit(message) }
 
     func succeed(_ command: String, data: JSONValue) {
         pending.removeValue(forKey: command)?(.success(.object([
@@ -223,6 +232,52 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("prompt"), 1)
         XCTAssertEqual(runtime.commandCount("get_messages"), 0)
         XCTAssertEqual(store.messages.map(\.textContent), ["show this now"])
+    }
+
+    func testStartupMessageBacklogIsBoundedAndRejectsTheNewestDraft() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        runtime.delaysStateResponse = true
+
+        for index in 0 ... OutboxPolicy.limit {
+            store.draft = "startup message \(index)"
+            store.submitDraft()
+        }
+
+        XCTAssertEqual(runtime.commandCount("prompt"), 0)
+        XCTAssertEqual(store.draft, "startup message \(OutboxPolicy.limit)")
+        XCTAssertTrue(store.toast?.text.contains("Too many messages") == true)
+        runtime.succeed("get_state", data: .object([
+            "isStreaming": .bool(false),
+            "sessionFile": .string(session.fileURL.path),
+            "sessionId": .string(session.id)
+        ]))
+        XCTAssertEqual(runtime.commandCount("prompt"), 1)
+        XCTAssertEqual(
+            runtime.commandCount("prompt") + runtime.commandCount("follow_up"),
+            OutboxPolicy.limit,
+            "Every admitted startup message is sent exactly once after the runtime becomes ready"
+        )
+        XCTAssertEqual(runtime.commandCount("steer"), 0, "Startup timing must not turn ordinary sends into steering")
+    }
+
+    func testSharedStartupFailureRestoresDraftsInSubmissionOrder() {
+        let (store, runtime, session, _) = makeStore()
+        store.selectSession(session)
+        runtime.sessionFile = session.fileURL.path
+        runtime.sessionID = session.id
+        runtime.delaysStateResponse = true
+
+        for text in ["first", "second", "third"] {
+            store.draft = text
+            store.submitDraft()
+        }
+        runtime.fail("get_state", with: AgentRuntimeError.processExited("startup failed"))
+
+        XCTAssertEqual(store.draft, "first\nsecond\nthird")
+        XCTAssertEqual(runtime.commandCount("prompt"), 0)
     }
 
     func testEscapeDuringStartupAbortsThePromptAtAgentStart() {
@@ -464,12 +519,9 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertFalse(store.canStopCurrentThread)
     }
 
-    /// Task 2: a crash mid-turn restores the exact last user message for a one-click resend, and
-    /// — the specific bug this guards — does so exactly once. `crash()` rejects the pending
-    /// "prompt" completion as outcome-unknown (mirroring a real `AgentRuntimeClient`) before calling
-    /// `onExit`, so both `dispatchMessage`'s completion and `handleRuntimeExit` observe the same
-    /// crash; only one of them may ever actually restore the draft.
-    func testCrashDuringAnInFlightPromptRestoresTheDraftExactlyOnceNotTwice() async throws {
+    /// A crash cannot prove whether the agent stored the prompt before exiting. Keep its
+    /// optimistic row visible, but do not manufacture a one-click resend in the composer.
+    func testCrashDuringAnInFlightPromptDoesNotCreateADuplicateResendAffordance() async throws {
         let (store, runtime, sessionA, _) = makeStore()
         store.selectSession(sessionA)
         runtime.sessionFile = sessionA.fileURL.path
@@ -481,11 +533,54 @@ final class AppStoreRollbackTests: XCTestCase {
 
         runtime.crash("Pi exited with status 139.")
 
-        XCTAssertEqual(store.draft, "fix the crash", "Restored exactly once, never concatenated with itself")
+        XCTAssertEqual(store.draft, "", "An ambiguous prompt must not become an automatic resend")
         XCTAssertNotNil(store.runtimeState.lastError, "The failure is persisted, not just a toast that disappears")
-        XCTAssertEqual(store.toast?.style, .error)
+        XCTAssertEqual(store.toast?.style, .warning)
         XCTAssertTrue(store.messages.contains { $0.id.hasPrefix("local-") },
                       "The optimistic message stays: Pi may already have accepted it before dying")
+    }
+
+    func testCleanExitWithAnInFlightPromptStillSurfacesDeliveryUncertainty() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "possibly accepted"
+        store.submitDraft()
+
+        runtime.exit(nil)
+
+        XCTAssertEqual(store.draft, "")
+        XCTAssertTrue(store.runtimeState.lastError?.contains("may already have been delivered") == true)
+        XCTAssertEqual(store.toast?.style, .warning)
+
+        runtime.crash("a later unrelated exit")
+        XCTAssertEqual(store.draft, "", "the earlier uncertain message must never resurrect")
+    }
+
+    func testAcceptedPromptRecoverySurvivesAnExitBeforeSettlement() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "accepted but unfinished"
+        store.submitDraft()
+        runtime.delaysStateResponse = true
+        runtime.succeed("prompt", data: .object([:]))
+        let path = sessionA.fileURL.standardizedFileURL.path
+        XCTAssertEqual(
+            store.persistence.state.managedTurnRecoveries[path]?.phase,
+            ManagedTurnRecovery.accepted
+        )
+
+        runtime.crash("process ended before settlement")
+
+        XCTAssertEqual(store.draft, "")
+        XCTAssertEqual(
+            store.persistence.state.managedTurnRecoveries[path]?.phase,
+            ManagedTurnRecovery.accepted,
+            "an accepted interrupted turn remains eligible for safe recovery"
+        )
     }
 
     func testCrashWhileNoPromptWasInFlightNeverTouchesTheDraft() async throws {
@@ -983,6 +1078,26 @@ final class AppStoreRollbackTests: XCTestCase {
         XCTAssertNotNil(store.activeDialog)
         runtime.onExit?("Pi exited with status 1.")
         XCTAssertNil(store.activeDialog)
+    }
+
+    func testProviderCancellationRemovesTheMatchingDialogAndAdvancesTheQueue() async throws {
+        let (store, runtime, sessionA, _) = makeStore()
+        store.selectSession(sessionA)
+        runtime.sessionFile = sessionA.fileURL.path
+        runtime.sessionID = sessionA.id
+        store.draft = "start"
+        store.submitDraft()
+        runtime.fail("prompt", with: AgentRuntimeError.processExited("failed"))
+
+        runtime.onEvent?(dialogEvent(id: "dialog-1", message: "first"))
+        runtime.onEvent?(dialogEvent(id: "dialog-2", message: "second"))
+        runtime.onEvent?(.object([
+            "type": .string("extension_ui_cancel"),
+            "id": .string("dialog-1")
+        ]))
+
+        XCTAssertEqual(store.activeDialog?.id, "dialog-2")
+        XCTAssertTrue(runtime.uncorrelated.isEmpty)
     }
 
     func testExtensionSetTitleAndWidgetPlacementAreRetained() async throws {

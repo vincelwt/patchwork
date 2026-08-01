@@ -216,4 +216,18 @@ final class FileRunStateFallbackTests: XCTestCase {
         // Anything genuinely old is idle regardless.
         XCTAssertFalse(FileRunStateFallback.isRunning(lastEntry: entry(role: "user"), age: 600))
     }
+
+    func testFreshIncompleteAgentRecordIsRunningButMetadataOnlyRecordIsNot() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FileRunState-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("rollout.jsonl")
+        try Data("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"".utf8).write(to: file)
+        XCTAssertTrue(FileRunStateFallback.isRunning(sessionFile: file, agent: .codex))
+
+        try Data("{\"type\":\"session_meta\",\"payload\":{\"id\":\"new\"}}\n".utf8).write(to: file)
+        XCTAssertFalse(FileRunStateFallback.isRunning(sessionFile: file, agent: .codex))
+    }
 }

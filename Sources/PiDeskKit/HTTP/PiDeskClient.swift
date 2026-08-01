@@ -12,22 +12,26 @@ public enum PiDeskTransport: Sendable, Equatable {
 /// answered with an error", since only the former means "fall back to local/read-only mode".
 public enum PiDeskClientError: Error, LocalizedError, Sendable {
     case daemonUnreachable(String)
+    case transportFailure(String)
     case unauthorized
     case notFound(String)
     case badRequest(code: String, message: String)
     case server(status: Int, code: String, message: String)
     case invalidResponse(String)
     case decodingFailed(String)
+    case outcomeUnknown(String)
 
     public var errorDescription: String? {
         switch self {
         case let .daemonUnreachable(detail): "Pi Desktop's daemon is not reachable: \(detail)"
+        case let .transportFailure(detail): "The daemon connection failed after the request began: \(detail)"
         case .unauthorized: "The daemon rejected this request's bearer token."
         case let .notFound(what): "\(what) was not found."
         case let .badRequest(code, message): "\(message) (\(code))"
         case let .server(status, code, message): "Daemon error \(status) \(code): \(message)"
         case let .invalidResponse(detail): "The daemon's response could not be parsed: \(detail)"
         case let .decodingFailed(detail): "The daemon's response did not match the expected shape: \(detail)"
+        case let .outcomeUnknown(detail): "The mutation result could not be confirmed: \(detail)"
         }
     }
 }
@@ -86,7 +90,13 @@ public final class PiDeskClient: Sendable {
     }
 
     public func createThread(_ request: CreateThreadRequest) async throws -> CreateThreadResponse {
-        try await post("/v1/threads", body: request)
+        guard request.clientId != nil else { return try await post("/v1/threads", body: request) }
+        return try await retryingProtectedMutation(
+            capability: \.threadCreationIdempotency,
+            isRetryable: Self.isRetryableCreationError
+        ) {
+            try await self.post("/v1/threads", body: request)
+        }
     }
 
     public func threadRuntime(id: String) async throws -> ThreadRuntimeResponse {
@@ -102,7 +112,14 @@ public final class PiDeskClient: Sendable {
     }
 
     public func sendMessage(threadId: String, _ request: SendMessageRequest) async throws -> SendMessageResponse {
-        try await post("/v1/threads/\(pathComponent: threadId)/messages", body: request)
+        let path = "/v1/threads/\(pathComponent: threadId)/messages"
+        guard request.clientId != nil else { return try await post(path, body: request) }
+        return try await retryingProtectedMutation(
+            capability: \.messageSubmissionIdempotency,
+            isRetryable: Self.isRetryableSubmissionError
+        ) {
+            try await self.post(path, body: request)
+        }
     }
 
     public func abortThread(id: String) async throws -> AbortResponse {
@@ -134,7 +151,15 @@ public final class PiDeskClient: Sendable {
     public func listSchedules() async throws -> ScheduleListResponse { try await get("/v1/schedules") }
 
     public func createSchedule(_ request: ScheduleCreateRequest) async throws -> ScheduleResponse {
-        try await post("/v1/schedules", body: request)
+        guard request.idempotencyKey != nil else {
+            return try await post("/v1/schedules", body: request)
+        }
+        return try await retryingProtectedMutation(
+            capability: \.scheduleIdempotency,
+            isRetryable: Self.isRetryableProtectedMutationError
+        ) {
+            try await self.post("/v1/schedules", body: request)
+        }
     }
 
     public func getSchedule(id: String) async throws -> ScheduleDetailResponse {
@@ -149,8 +174,14 @@ public final class PiDeskClient: Sendable {
         try await send("DELETE", "/v1/schedules/\(pathComponent: id)", body: Optional<Empty>.none)
     }
 
-    public func runSchedule(id: String) async throws -> ScheduleRunResponse {
-        try await post("/v1/schedules/\(pathComponent: id)/run", body: Optional<Empty>.none)
+    public func runSchedule(id: String, clientId: String? = nil) async throws -> ScheduleRunResponse {
+        let request = ScheduleRunRequest(clientId: clientId ?? UUID().uuidString.lowercased())
+        return try await retryingProtectedMutation(
+            capability: \.scheduleRunIdempotency,
+            isRetryable: Self.isRetryableProtectedMutationError
+        ) {
+            try await self.post("/v1/schedules/\(pathComponent: id)/run", body: request)
+        }
     }
 
     public func pauseSchedule(id: String, paused: Bool) async throws -> ScheduleResponse {
@@ -201,13 +232,14 @@ public final class PiDeskClient: Sendable {
     public func events() -> AsyncThrowingStream<PiDeskEvent, Error> {
         let transport = transport
         let timeout = requestTimeout
+        let maxBytes = maxResponseBytes
         let box = FileDescriptorBox()
 
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             Thread.detachNewThread {
                 do {
                     let fd = try Self.openConnection(transport: transport, connectTimeout: timeout)
-                    box.fd = fd
+                    guard box.install(fd) else { return }
                     // No read timeout on the long-lived stream itself: the server's own 20s
                     // keep-alive comment is what proves the connection is still alive.
                     RawSocket.setTimeouts(fd: fd, timeout: 0)
@@ -216,24 +248,37 @@ public final class PiDeskClient: Sendable {
 
                     var head: RawHTTPResponse?
                     var pending = Data()
-                    var parser = SSEParser()
+                    var parser = SSEParser(maxBufferedBytes: maxBytes)
                     while !box.cancelled {
                         guard let chunk = RawSocket.read(fd: fd, maxBytes: 64 * 1_024) else { break }
                         if head == nil {
                             pending.append(chunk)
+                            guard pending.count <= maxBytes else {
+                                throw PiDeskClientError.decodingFailed("GET /v1/events response header exceeded the client limit")
+                            }
                             guard let split = HTTPWireFormat.splitHeadFromStream(pending) else { continue }
                             head = split.head
                             guard split.head.status == 200 else {
                                 throw PiDeskClientError.server(status: split.head.status, code: "events_failed", message: "GET /v1/events returned \(split.head.status)")
                             }
-                            for frame in parser.append(split.leftover) { continuation.yield(frame.decodedEvent()) }
+                            for frame in parser.append(split.leftover) {
+                                guard Self.yield(frame.decodedEvent(), to: continuation, box: box) else { return }
+                            }
+                            if parser.failed {
+                                throw PiDeskClientError.decodingFailed("GET /v1/events contained an invalid or oversized frame")
+                            }
                             continue
                         }
-                        for frame in parser.append(chunk) { continuation.yield(frame.decodedEvent()) }
+                        for frame in parser.append(chunk) {
+                            guard Self.yield(frame.decodedEvent(), to: continuation, box: box) else { return }
+                        }
+                        if parser.failed {
+                            throw PiDeskClientError.decodingFailed("GET /v1/events contained an invalid or oversized frame")
+                        }
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error is PiDeskClientError ? error : PiDeskClientError.daemonUnreachable(String(describing: error)))
+                    continuation.finish(throwing: Self.postConnectError(error))
                 }
                 box.closeOnce()
             }
@@ -241,6 +286,27 @@ public final class PiDeskClient: Sendable {
                 box.cancelled = true
                 box.closeOnce()
             }
+        }
+    }
+
+    private static func yield(
+        _ event: PiDeskEvent,
+        to continuation: AsyncThrowingStream<PiDeskEvent, Error>.Continuation,
+        box: FileDescriptorBox
+    ) -> Bool {
+        switch continuation.yield(event) {
+        case .enqueued:
+            return true
+        case .dropped:
+            continuation.finish(throwing: PiDeskClientError.daemonUnreachable("event consumer fell behind"))
+            box.closeOnce()
+            return false
+        case .terminated:
+            box.closeOnce()
+            return false
+        @unknown default:
+            box.closeOnce()
+            return false
         }
     }
 
@@ -254,6 +320,125 @@ public final class PiDeskClient: Sendable {
 
     private func post<Body: Encodable, Response: Decodable>(_ path: String, body: Body?) async throws -> Response {
         try await send("POST", path, body: body)
+    }
+
+    private func retryingProtectedMutation<Response>(
+        capability: KeyPath<HealthStatus, Bool>,
+        isRetryable: (Error) -> Bool,
+        _ operation: () async throws -> Response
+    ) async throws -> Response {
+        guard await supports(capability) else {
+            do {
+                return try await operation()
+            } catch where isRetryable(error) {
+                guard Self.mutationOutcomeMayBeUnknown(error) else { throw error }
+                throw PiDeskClientError.outcomeUnknown(Self.outcomeUnknownMessage(for: error))
+            }
+        }
+        var lastError: Error?
+        var lastPotentiallyAmbiguousError: Error?
+        var anAttemptMayHaveReachedDaemon = false
+        for attempt in 0..<4 {
+            do {
+                return try await operation()
+            } catch where isRetryable(error) {
+                lastError = error
+                if Self.mutationOutcomeMayBeUnknown(error) {
+                    lastPotentiallyAmbiguousError = error
+                }
+                anAttemptMayHaveReachedDaemon = anAttemptMayHaveReachedDaemon
+                    || Self.mutationOutcomeMayBeUnknown(error)
+                guard attempt < 3 else { break }
+                guard await supports(capability) else {
+                    guard anAttemptMayHaveReachedDaemon else { throw error }
+                    throw PiDeskClientError.outcomeUnknown(Self.outcomeUnknownMessage(for: error))
+                }
+                try await Task.sleep(nanoseconds: UInt64(50_000_000 * (attempt + 1)))
+            }
+        }
+        // A later pre-connect refusal cannot make an earlier response-loss attempt unsent.
+        // Surface the ambiguous attempt so the caller retains and reuses its protected id.
+        if let lastPotentiallyAmbiguousError { throw lastPotentiallyAmbiguousError }
+        throw lastError ?? PiDeskClientError.invalidResponse("protected mutation did not complete")
+    }
+
+    private func supports(_ capability: KeyPath<HealthStatus, Bool>) async -> Bool {
+        guard let status = try? await health() else { return false }
+        return status[keyPath: capability]
+    }
+
+    private static func outcomeUnknownMessage(for error: Error) -> String {
+        guard let error = error as? PiDeskClientError else { return String(describing: error) }
+        return switch error {
+        case let .daemonUnreachable(detail), let .transportFailure(detail),
+             let .invalidResponse(detail),
+             let .decodingFailed(detail), let .outcomeUnknown(detail): detail
+        case .unauthorized: "the daemon rejected authorization"
+        case let .notFound(detail): "\(detail) was not found"
+        case let .badRequest(code, message): "\(code): \(message)"
+        case let .server(_, code, message): "\(code): \(message)"
+        }
+    }
+
+    private static func isRetryableCreationError(_ error: Error) -> Bool {
+        guard let error = error as? PiDeskClientError else { return false }
+        return switch error {
+        case .daemonUnreachable, .transportFailure, .invalidResponse, .decodingFailed:
+            true
+        case let .badRequest(code, _):
+            code == "creation_in_flight" || code == "creations_busy"
+                || code == "submission_ledger_unavailable"
+        case let .server(_, code, _):
+            code == "creation_pending" || code == "create_retryable" || code == "creations_busy"
+                || code == "submission_ledger_unavailable"
+        case .unauthorized, .notFound, .outcomeUnknown:
+            false
+        }
+    }
+
+    private static func isRetryableSubmissionError(_ error: Error) -> Bool {
+        guard let error = error as? PiDeskClientError else { return false }
+        return switch error {
+        case .daemonUnreachable, .transportFailure, .invalidResponse, .decodingFailed:
+            true
+        case let .badRequest(code, _):
+            code == "submission_in_flight" || code == "submissions_busy"
+                || code == "submission_ledger_unavailable"
+        case let .server(_, code, _):
+            code == "submissions_busy" || code == "submission_ledger_unavailable"
+        case .unauthorized, .notFound, .outcomeUnknown:
+            false
+        }
+    }
+
+    private static func isRetryableProtectedMutationError(_ error: Error) -> Bool {
+        guard let error = error as? PiDeskClientError else { return false }
+        return switch error {
+        case .daemonUnreachable, .transportFailure, .invalidResponse, .decodingFailed:
+            true
+        case let .badRequest(code, _):
+            code == "schedule_run_in_flight" || code == "submissions_busy"
+                || code == "submission_ledger_unavailable"
+        case let .server(_, code, _):
+            code == "submissions_busy" || code == "submission_ledger_unavailable"
+        case .unauthorized, .notFound, .outcomeUnknown:
+            false
+        }
+    }
+
+    /// `daemonUnreachable` is raised only before a descriptor is connected, so no request bytes
+    /// can have been accepted. Every response/read failure after that point is ambiguous.
+    private static func mutationOutcomeMayBeUnknown(_ error: Error) -> Bool {
+        guard let error = error as? PiDeskClientError else { return false }
+        return switch error {
+        case .daemonUnreachable, .unauthorized, .notFound:
+            false
+        case .transportFailure, .invalidResponse, .decodingFailed, .outcomeUnknown:
+            true
+        case let .badRequest(code, _), let .server(_, code, _):
+            code == "submission_in_flight" || code == "creation_in_flight"
+                || code == "schedule_run_in_flight"
+        }
     }
 
     private func send<Body: Encodable, Response: Decodable>(_ method: String, _ path: String, query: [String: String?] = [:], body: Body?) async throws -> Response {
@@ -275,12 +460,26 @@ public final class PiDeskClient: Sendable {
         return try await Self.performBlocking {
             let fd = try Self.openConnection(transport: transport, connectTimeout: timeout)
             defer { RawSocket.shutdownAndClose(fd: fd) }
-            let headers = Self.baseHeaders(transport: transport)
-            try RawSocket.writeAll(fd: fd, data: HTTPWireFormat.buildRequest(method: method, path: fullPath, headers: headers, body: bodyData))
-            let raw = try RawSocket.readAllUntilClosed(fd: fd, maxBytes: maxBytes)
-            let response = try HTTPWireFormat.parseResponse(raw)
-            return try Self.mapStatus(response)
+            do {
+                let headers = Self.baseHeaders(transport: transport)
+                try RawSocket.writeAll(fd: fd, data: HTTPWireFormat.buildRequest(method: method, path: fullPath, headers: headers, body: bodyData))
+                let raw = try RawSocket.readAllUntilClosed(fd: fd, maxBytes: maxBytes)
+                let response = try HTTPWireFormat.parseResponse(raw)
+                return try Self.mapStatus(response)
+            } catch let error as PiDeskClientError {
+                throw error
+            } catch {
+                throw Self.postConnectError(error)
+            }
         }
+    }
+
+    private static func postConnectError(_ error: Error) -> PiDeskClientError {
+        if let error = error as? PiDeskClientError { return error }
+        if let error = error as? RawSocketError {
+            return .transportFailure(error.localizedDescription)
+        }
+        return .transportFailure(String(describing: error))
     }
 
     private static func openConnection(transport: PiDeskTransport, connectTimeout: TimeInterval) throws -> Int32 {
@@ -354,14 +553,18 @@ private final class FileDescriptorBox: @unchecked Sendable {
     private var _cancelled = false
     private var closed = false
 
-    var fd: Int32? {
-        get { lock.lock(); defer { lock.unlock() }; return _fd }
-        set { lock.lock(); _fd = newValue; lock.unlock() }
-    }
-
     var cancelled: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _cancelled }
         set { lock.lock(); _cancelled = newValue; lock.unlock() }
+    }
+
+    func install(_ descriptor: Int32) -> Bool {
+        lock.lock()
+        let shouldClose = closed || _cancelled
+        if !shouldClose { _fd = descriptor }
+        lock.unlock()
+        if shouldClose { RawSocket.shutdownAndClose(fd: descriptor) }
+        return !shouldClose
     }
 
     func closeOnce() {
@@ -377,6 +580,11 @@ private extension String.StringInterpolation {
     /// `"\(pathComponent: id)"` percent-encodes a single path segment, so a thread id or
     /// schedule id with an unusual character cannot corrupt the request line.
     mutating func appendInterpolation(pathComponent value: String) {
-        appendLiteral(value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value)
+        var allowed = CharacterSet.urlPathAllowed
+        // Foundation's urlPathAllowed intentionally includes '/', which is valid in a whole path
+        // but not inside one router parameter. '%' is excluded too so pre-escaped-looking ids are
+        // treated as literal input and decoded exactly once by the server.
+        allowed.remove(charactersIn: "/?#%")
+        appendLiteral(value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value)
     }
 }

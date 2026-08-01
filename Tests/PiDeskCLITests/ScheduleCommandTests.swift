@@ -32,6 +32,42 @@ final class ScheduleAddTests: XCTestCase {
         XCTAssertEqual(plane.lastScheduleCreateRequest?.target.threadId, "t1")
         XCTAssertEqual(plane.lastScheduleCreateRequest?.trigger.kind, "heartbeat")
         XCTAssertEqual(plane.lastScheduleCreateRequest?.trigger.everySeconds, 900)
+        XCTAssertTrue((16...64).contains(plane.lastScheduleCreateRequest?.idempotencyKey?.utf8.count ?? 0))
+    }
+
+    func testExplicitScheduleCreationIDIsPassedThroughAndInvalidIDsAreRejected() async {
+        let plane = FakeControlPlane()
+        let stableID = "schedule-create-001"
+        let result = await runCLI([
+            "schedule", "add", "--name", "n", "--cwd", ".", "--prompt", "p",
+            "--every", "15m", "--client-id", stableID
+        ], controlPlane: plane)
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(plane.lastScheduleCreateRequest?.idempotencyKey, stableID)
+
+        let invalid = FakeControlPlane()
+        let invalidResult = await runCLI([
+            "schedule", "add", "--name", "n", "--cwd", ".", "--prompt", "p",
+            "--every", "15m", "--client-id", "short"
+        ], controlPlane: invalid)
+        XCTAssertEqual(invalidResult.exitCode, 2)
+        XCTAssertNil(invalid.lastScheduleCreateRequest)
+    }
+
+    func testTriggerModifiersRequireTheirMatchingTrigger() async {
+        let timezone = await runCLI([
+            "schedule", "add", "--name", "n", "--cwd", ".", "--prompt", "p",
+            "--every", "15m", "--timezone", "UTC"
+        ])
+        XCTAssertEqual(timezone.exitCode, 2)
+        XCTAssertTrue(timezone.stderr.contains("--cron"))
+
+        let start = await runCLI([
+            "schedule", "add", "--name", "n", "--cwd", ".", "--prompt", "p",
+            "--heartbeat", "15m", "--start-at", "2026-08-02T10:00"
+        ])
+        XCTAssertEqual(start.exitCode, 2)
+        XCTAssertTrue(start.stderr.contains("--every"))
     }
 
     func testNewThreadTargetDefaultsNamePatternToName() async {
@@ -156,6 +192,48 @@ final class ScheduleOtherCommandsTests: XCTestCase {
         let result = await runCLI(["schedule", "run", "sch_1"], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertTrue(result.stdout.contains("run_9"))
+        XCTAssertFalse(plane.lastScheduleRunRequest?.clientId?.isEmpty ?? true)
+    }
+
+    func testRunPassesAnExplicitIDAndExplainsProtectedInFlightRetry() async {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.apiError(
+            status: 409, code: "schedule_run_in_flight", message: "still admitting"
+        )
+        let result = await runCLI([
+            "schedule", "run", "sch_1", "--client-id", "manual-run-001"
+        ], controlPlane: plane)
+
+        XCTAssertEqual(plane.lastScheduleRunRequest?.clientId, "manual-run-001")
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertTrue(result.stderr.contains("--client-id manual-run-001"))
+    }
+
+    func testRunWithUnprotectedUnknownOutcomeRequiresHistoryReview() async {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.outcomeUnknown("connection closed")
+        let result = await runCLI([
+            "schedule", "run", "sch_1", "--client-id", "manual-run-002"
+        ], controlPlane: plane)
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertTrue(result.stderr.contains("Review the schedule's run history"))
+        XCTAssertFalse(result.stderr.contains("Retry the exact"))
+    }
+
+    func testCreateWithUnprotectedUnknownOutcomeRequiresScheduleListReview() async {
+        let plane = FakeControlPlane()
+        plane.error = ControlPlaneError.outcomeUnknown("connection closed")
+        let result = await runCLI([
+            "schedule", "add", "--name", "Nightly", "--cwd", "/tmp/project",
+            "--prompt", "work", "--every", "1h",
+            "--client-id", "schedule-create-001"
+        ], controlPlane: plane)
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertTrue(result.stderr.contains("Review the schedule list"))
+        XCTAssertFalse(result.stderr.contains("Review the thread"))
+        XCTAssertFalse(result.stderr.contains("Retry the exact"))
     }
 
     func testUnknownSubcommandIsBadUsage() async {

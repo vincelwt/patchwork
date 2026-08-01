@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import XCTest
 @testable import PiDesktop
 
@@ -77,6 +78,7 @@ final class ConversationWorktreeTests: XCTestCase {
         let group = try XCTUnwrap(snapshot.activeGroups.first)
         XCTAssertEqual(group.path, project)
         XCTAssertEqual(group.sessions.map(\.id), [session.id])
+        XCTAssertEqual(snapshot.projectCWDPaths[project], [worktree])
         XCTAssertEqual(
             WorkspaceOrganization.categorization(
                 of: session,
@@ -112,21 +114,24 @@ final class ConversationWorktreeTests: XCTestCase {
             summary(id: "active", cwd: "/tmp/c", archived: false)
         ]
         let archivedAt: [String: Date] = [
-            "fresh": now.addingTimeInterval(-AppStore.archiveRetention + 60),
-            "stale": now.addingTimeInterval(-AppStore.archiveRetention - 60),
-            "active": now.addingTimeInterval(-AppStore.archiveRetention * 10)
+            sessions[0].fileURL.path: now.addingTimeInterval(-AppStore.archiveRetention + 60),
+            sessions[1].fileURL.path: now.addingTimeInterval(-AppStore.archiveRetention - 60),
+            sessions[2].fileURL.path: now.addingTimeInterval(-AppStore.archiveRetention * 10)
         ]
 
-        let expired = AppStore.expiredArchiveIDs(sessions, archivedAt: archivedAt, now: now)
+        let expired = AppStore.expiredArchivePaths(sessions, archivedAt: archivedAt, now: now)
 
-        XCTAssertEqual(expired, ["stale"], "Only archived conversations past the window are pruned")
+        XCTAssertEqual(
+            expired, [sessions[1].fileURL.path],
+            "Only archived conversations past the window are pruned"
+        )
     }
 
     /// Sessions archived by an older build carry no timestamp; their clock starts when this build
     /// first sees them rather than expiring them instantly.
     @MainActor
     func testUnstampedArchivesAreNotExpiredImmediately() {
-        let expired = AppStore.expiredArchiveIDs(
+        let expired = AppStore.expiredArchivePaths(
             [summary(id: "legacy", cwd: "/tmp/a", archived: true)],
             archivedAt: [:],
             now: Date()
@@ -134,6 +139,32 @@ final class ConversationWorktreeTests: XCTestCase {
         XCTAssertTrue(expired.isEmpty)
     }
 
+    @MainActor
+    func testArchiveRetentionUsesTranscriptPathsWhenCopiedHistoriesShareAnID() {
+        let now = Date()
+        let first = SessionSummary(
+            id: "copied", fileURL: URL(fileURLWithPath: "/tmp/first.jsonl"),
+            cwd: URL(fileURLWithPath: "/tmp/a"), createdAt: now, modifiedAt: now,
+            name: "first", preview: "", messageCount: 0, metrics: TokenMetrics(), isArchived: true
+        )
+        let second = SessionSummary(
+            id: "copied", fileURL: URL(fileURLWithPath: "/tmp/second.jsonl"),
+            cwd: URL(fileURLWithPath: "/tmp/b"), createdAt: now, modifiedAt: now,
+            name: "second", preview: "", messageCount: 0, metrics: TokenMetrics(), isArchived: true
+        )
+        let expired = AppStore.expiredArchivePaths(
+            [first, second],
+            archivedAt: [
+                first.fileURL.path: now.addingTimeInterval(-AppStore.archiveRetention - 1),
+                second.fileURL.path: now
+            ],
+            now: now
+        )
+
+        XCTAssertEqual(expired, [first.fileURL.path])
+    }
+
+    @MainActor
     func testRetentionIsSevenDays() {
         XCTAssertEqual(AppStore.archiveRetention, 7 * 24 * 60 * 60)
     }
@@ -171,15 +202,24 @@ final class ConversationWorktreeTests: XCTestCase {
 
     func testArchiveDatesLastFolderAndWorktreeProjectsSurviveAStateRoundTrip() throws {
         var state = PersistedAppState()
+        state.archivedSessionIDs = ["a"]
         state.archivedAt = ["a": Date(timeIntervalSince1970: 1_700_000_000)]
         state.lastFolder = "/tmp/project"
         state.managedWorktreeProjects = ["/tmp/worktree": "/tmp/project"]
+        state.pendingDaemonArchiveIntentBySessionPath = [
+            "/tmp/archive.jsonl": true,
+            "/tmp/restore.jsonl": false
+        ]
 
         let decoded = try JSONDecoder().decode(PersistedAppState.self, from: JSONEncoder().encode(state))
 
         XCTAssertEqual(decoded.archivedAt["a"], state.archivedAt["a"])
         XCTAssertEqual(decoded.lastFolder, "/tmp/project")
         XCTAssertEqual(decoded.managedWorktreeProjects, state.managedWorktreeProjects)
+        XCTAssertEqual(
+            decoded.pendingDaemonArchiveIntentBySessionPath,
+            state.pendingDaemonArchiveIntentBySessionPath
+        )
     }
 
     /// A `state.json` written before this feature must still decode, archive flags intact.
@@ -190,6 +230,120 @@ final class ConversationWorktreeTests: XCTestCase {
         XCTAssertEqual(decoded.archivedSessionIDs, ["kept"])
         XCTAssertTrue(decoded.archivedAt.isEmpty)
         XCTAssertNil(decoded.lastFolder)
+    }
+
+    @MainActor
+    func testTouchingALegacyArchiveMigratesCopiesBeforeRestoringOnePath() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiArchiveMigration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let archivedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let persistence = AppPersistence(baseURL: directory)
+        persistence.updateState { state in
+            state.archivedSessionIDs = ["copied"]
+            state.archivedAt = ["copied": archivedAt]
+        }
+
+        persistence.setArchived(
+            false,
+            sessionID: "copied",
+            sessionPath: "/tmp/first.jsonl"
+        )
+
+        XCTAssertFalse(persistence.isArchived(sessionID: "copied", sessionPath: "/tmp/first.jsonl"))
+        XCTAssertTrue(persistence.isArchived(sessionID: "copied", sessionPath: "/tmp/second.jsonl"))
+        XCTAssertEqual(
+            persistence.archivedDate(sessionID: "copied", sessionPath: "/tmp/second.jsonl"),
+            archivedAt
+        )
+        XCTAssertTrue(persistence.state.archivedSessionIDs.contains("copied"))
+        XCTAssertTrue(persistence.state.archiveExemptSessionPaths.contains("/tmp/first.jsonl"))
+    }
+
+    @MainActor
+    func testLegacyRestoreCapRetainsThePathBeingRestored() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let persistence = AppPersistence(baseURL: base)
+        persistence.updateState { state in
+            state.archivedSessionIDs = ["legacy"]
+            state.archiveExemptSessionPaths = Set((0..<ArchiveStateBounds.itemLimit).map {
+                String(format: "/z/%05d.jsonl", $0)
+            })
+        }
+        let restoredPath = "/a/current.jsonl"
+
+        persistence.setArchived(false, sessionID: "legacy", sessionPath: restoredPath)
+
+        XCTAssertEqual(persistence.state.archiveExemptSessionPaths.count, ArchiveStateBounds.itemLimit)
+        XCTAssertTrue(persistence.state.archiveExemptSessionPaths.contains(restoredPath))
+        XCTAssertFalse(persistence.isArchived(sessionID: "legacy", sessionPath: restoredPath))
+    }
+
+    @MainActor
+    func testPendingArchiveRestoreSurvivesPersistenceRestart() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let path = "/tmp/restored.jsonl"
+        let first = AppPersistence(baseURL: base)
+        first.setArchived(
+            false, sessionID: "restored", sessionPath: path, queueDaemonSync: true
+        )
+
+        let restarted = AppPersistence(baseURL: base)
+        XCTAssertEqual(
+            restarted.state.pendingDaemonArchiveIntentBySessionPath[path], false
+        )
+        XCTAssertFalse(restarted.isArchived(sessionID: "restored", sessionPath: path))
+    }
+
+    @MainActor
+    func testArchiveAcknowledgementCannotClearANewerOppositeIntent() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let path = "/tmp/thread.jsonl"
+        let persistence = AppPersistence(baseURL: base)
+        persistence.setArchived(
+            false, sessionID: "thread", sessionPath: path, queueDaemonSync: true
+        )
+        persistence.setArchived(
+            true, sessionID: "thread", sessionPath: path, queueDaemonSync: true
+        )
+
+        XCTAssertFalse(persistence.acknowledgeArchiveSync(path: path, expected: false))
+        XCTAssertEqual(persistence.state.pendingDaemonArchiveIntentBySessionPath[path], true)
+        XCTAssertTrue(persistence.acknowledgeArchiveSync(path: path, expected: true))
+        XCTAssertNil(persistence.state.pendingDaemonArchiveIntentBySessionPath[path])
+    }
+
+    @MainActor
+    func testAppStartedPathCapRetainsTheConversationJustRecorded() {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let persistence = AppPersistence(baseURL: base)
+        persistence.updateState { state in
+            state.appStartedSessionPaths = Set((0..<AppPersistence.maxAppStartedPaths).map {
+                String(format: "/z/%05d.jsonl", $0)
+            })
+        }
+        let current = "/a/current.jsonl"
+
+        persistence.recordAppStarted(sessionPath: current)
+
+        XCTAssertEqual(persistence.state.appStartedSessionPaths.count, AppPersistence.maxAppStartedPaths)
+        XCTAssertTrue(persistence.state.appStartedSessionPaths.contains(current))
+        XCTAssertTrue(AppPersistence(baseURL: base).state.appStartedSessionPaths.contains(current))
+    }
+
+    func testArchivePathBoundsDeduplicateAliasesBeforeApplyingTheCap() {
+        let aliases = Set((0..<ArchiveStateBounds.itemLimit).map {
+            String(format: "/z/%05d.jsonl", $0)
+        } + ["/z/folder/../00000.jsonl"])
+
+        let bounded = ArchiveStateBounds.standardizedPaths(aliases)
+
+        XCTAssertEqual(bounded.count, ArchiveStateBounds.itemLimit)
+        XCTAssertEqual(bounded.filter { $0 == "/z/00000.jsonl" }.count, 1)
     }
 
     // MARK: - Pull request link

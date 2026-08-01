@@ -58,22 +58,26 @@ struct WireCreateThreadRequest: Codable {
     var mode: String?
     var worktree: Bool? = nil
     var agent: String? = nil
+    var clientId: String? = nil
 }
 
 struct WireCreateThreadResponse: Codable, Equatable {
     var thread: WireThread
     var runId: String?
+    var firstMessageError: String? = nil
 }
 
 struct WireSendMessageRequest: Codable {
     var text: String
     var delivery: String
     var attachments: [String]
+    var clientId: String? = nil
 }
 
 struct WireSendMessageResponse: Codable, Equatable {
     var runId: String
-    var queued: Bool?
+    var queued: Bool = false
+    var delivery: String? = nil
 }
 
 struct WireAbortResponse: Codable, Equatable {
@@ -122,6 +126,7 @@ struct WireSchedule: Codable, Equatable {
     var mode: String?
     var trigger: WireTrigger?
     var policy: WireSchedulePolicy?
+    var agent: String? = nil
     var createdAt: String?
     var updatedAt: String?
     var lastRunAt: String?
@@ -164,16 +169,33 @@ struct WireScheduleRunResponse: Codable, Equatable {
     var runId: String
 }
 
+struct WireScheduleRunRequest: Codable, Equatable {
+    var clientId: String? = nil
+}
+
 struct WireRun: Codable, Equatable {
     var id: String
     var scheduleId: String?
     var threadId: String?
+    var threadPath: String?
     var trigger: String?
     var startedAt: String?
     var finishedAt: String?
     var status: String?
     var error: String?
     var summary: String?
+    var promptStartedAt: String?
+    var promptAcceptedAt: String?
+    var retryable: Bool?
+    var occurrenceId: String? = nil
+    var scheduledAt: String? = nil
+    var attempt: Int? = nil
+    var nextAttemptAt: String? = nil
+    var agent: String? = nil
+}
+
+struct WireRunResponse: Codable, Equatable {
+    var run: WireRun
 }
 
 struct WireHealth: Codable, Equatable {
@@ -186,6 +208,9 @@ struct WireHealth: Codable, Equatable {
     var piVersion: String?
     var schedulesEnabled: Bool?
     var scheduleIdempotency: Bool? = nil
+    var threadCreationIdempotency: Bool? = nil
+    var messageSubmissionIdempotency: Bool? = nil
+    var scheduleRunIdempotency: Bool? = nil
     var threadWorktrees: Bool? = nil
 }
 

@@ -80,6 +80,29 @@ final class AgentCatalogTests: XCTestCase {
         XCTAssertEqual(resolved.standardizedFileURL, root.standardizedFileURL)
     }
 
+    func testPiSessionRootFallsBackToTheAgentDirectorySessionsFolder() {
+        let resolved = AgentCatalog.sessionRoot(
+            for: .pi,
+            environment: ["PI_CODING_AGENT_DIR": root.path]
+        )
+        XCTAssertEqual(
+            resolved.standardizedFileURL,
+            root.appendingPathComponent("sessions", isDirectory: true).standardizedFileURL
+        )
+    }
+
+    func testExplicitPiSessionRootWinsOverTheAgentDirectory() {
+        let explicit = root.appendingPathComponent("explicit", isDirectory: true)
+        let resolved = AgentCatalog.sessionRoot(
+            for: .pi,
+            environment: [
+                "PI_CODING_AGENT_SESSION_DIR": explicit.path,
+                "PI_CODING_AGENT_DIR": root.appendingPathComponent("agent-home").path,
+            ]
+        )
+        XCTAssertEqual(resolved.standardizedFileURL, explicit.standardizedFileURL)
+    }
+
     func testAgentForSessionPathMatchesTheOwningRoot() {
         let environment = [
             "PI_CODING_AGENT_SESSION_DIR": root.appendingPathComponent("pi").path,
@@ -186,19 +209,23 @@ final class AgentCatalogTests: XCTestCase {
         XCTAssertEqual(AgentKind.pi.capabilities.thinking, .live)
         XCTAssertTrue(AgentKind.pi.capabilities.canExportHTML)
         XCTAssertTrue(AgentKind.pi.capabilities.supportsActivityExtension)
+        XCTAssertTrue(AgentKind.pi.capabilities.persistsSessionBeforeFirstPrompt)
 
         XCTAssertEqual(AgentKind.codex.capabilities.modelSelection, .queried)
         XCTAssertTrue(AgentKind.codex.capabilities.canSteerMidTurn)
         XCTAssertFalse(AgentKind.codex.capabilities.canExportHTML)
         XCTAssertFalse(AgentKind.codex.capabilities.supportsActivityExtension)
+        XCTAssertTrue(AgentKind.codex.capabilities.persistsSessionBeforeFirstPrompt)
 
         XCTAssertEqual(AgentKind.claude.capabilities.modelSelection, .aliases)
-        XCTAssertEqual(AgentKind.claude.capabilities.thinking, .relaunch)
+        XCTAssertEqual(AgentKind.claude.capabilities.thinking, .unsupported)
         XCTAssertFalse(AgentKind.claude.capabilities.canFork)
         // Claude Code takes a message sent mid-turn into the running turn; its own release build
         // advertises "send messages to Claude while it works to steer Claude in real-time" and
         // logs "processed message(s) that were delivered mid-turn".
         XCTAssertTrue(AgentKind.claude.capabilities.canSteerMidTurn)
+        XCTAssertTrue(AgentKind.claude.capabilities.canRenameSession)
+        XCTAssertFalse(AgentKind.claude.capabilities.persistsSessionBeforeFirstPrompt)
     }
 
     func testAgentGlyphsAndNamesAreDistinct() {

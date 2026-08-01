@@ -116,7 +116,9 @@ struct MenuBarContentView: View {
                                 .padding(.horizontal, PiTheme.space8)
                                 .frame(height: PiTheme.folderHeaderHeight, alignment: .leading)
                                 .accessibilityLabel("\(group.section.rawValue), \(group.sessions.count) conversations")
-                            ForEach(group.sessions) { MenuBarSessionRow(session: $0, section: group.section) }
+                            ForEach(group.sessions, id: \.instanceID) {
+                                MenuBarSessionRow(session: $0, section: group.section)
+                            }
                         }
                         if visible.hidden > 0 {
                             Text("\(visible.hidden) more")

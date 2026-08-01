@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import PiDeskKit
 @testable import PiDeskDaemon
 
@@ -20,7 +21,7 @@ final class MultiAgentThreadRoutingTests: XCTestCase {
         codexRoot = directory.appendingPathComponent("codex-sessions", isDirectory: true)
         try FileManager.default.createDirectory(at: codexRoot, withIntermediateDirectories: true)
         TestSupport.writeCodexRollout(in: codexRoot, id: "codex-thread", cwd: directory.path)
-        TestSupport.writeSessionFile(in: directory, id: "pi-thread", cwd: directory.path)
+        _ = TestSupport.writeSessionFile(in: directory, id: "pi-thread", cwd: directory.path)
 
         // A fake RPC service keeps these deterministic: no agent binary is ever launched, and the
         // agent each call asked for is recorded instead.
@@ -97,14 +98,164 @@ final class MultiAgentThreadRoutingTests: XCTestCase {
     }
 
     func testCreatingAThreadHonoursTheRequestedAgent() async throws {
-        _ = try await client.createThread(CreateThreadRequest(cwd: directory.path, agent: AgentKind.codex))
+        var iterator = client.events().makeAsyncIterator()
+        let ready = try await iterator.next()
+        guard case let .unknown(name, _) = ready, name == "ready" else {
+            return XCTFail("expected the ready barrier, got \(String(describing: ready))")
+        }
+        let created = try await client.createThread(CreateThreadRequest(cwd: directory.path, agent: AgentKind.codex))
+        let event = try await iterator.next()
+        guard case let .thread(eventThread) = event else {
+            return XCTFail("expected the created thread event, got \(String(describing: event))")
+        }
         XCTAssertEqual(threadRPC.agents, [.codex])
+        XCTAssertEqual(eventThread.id, created.thread.id)
+        XCTAssertEqual(eventThread.path, created.thread.path)
+        XCTAssertEqual(eventThread.agent, .codex)
+        let snapshot = DaemonWorktreeProjects.loadSnapshot(from: directory.appendingPathComponent("overlay.json"))
+        XCTAssertTrue(snapshot.managedThreadPaths.contains(created.thread.path))
+    }
+
+    func testProtectedIdleCreatePublishesExactlyOnceForPiAndCodexReplays() async throws {
+        let publications = ThreadPublicationBox()
+        let drained = expectation(description: "event bus drained through barrier")
+        let subscription = core.bus.subscribe { name, payload in
+            if name == "thread", let thread = try? PiDeskJSON.decoder.decode(PiThread.self, from: payload) {
+                publications.append(thread)
+            } else if name == "test-barrier" {
+                drained.fulfill()
+            }
+        }
+        defer { core.bus.unsubscribe(subscription) }
+
+        for agent in [AgentKind.pi, .codex] {
+            let request = CreateThreadRequest(
+                cwd: directory.path,
+                agent: agent,
+                clientId: "idle-once-\(agent.rawValue)"
+            )
+            let first = try await client.createThread(request)
+            let replay = try await client.createThread(request)
+            XCTAssertEqual(replay, first, agent.rawValue)
+        }
+
+        core.bus.publish(.unknown(name: "test-barrier", data: .object([:])))
+        await fulfillment(of: [drained], timeout: 2)
+
+        XCTAssertEqual(threadRPC.created, 2, "one physical create per distinct protected request")
+        XCTAssertEqual(threadRPC.agents, [.pi, .codex], "replays never call an agent again")
+        XCTAssertEqual(publications.all.map(\.agent), [.pi, .codex])
+    }
+
+    func testCreatingANonPiThreadRejectsThePiOnlyModeField() async throws {
+        do {
+            _ = try await client.createThread(CreateThreadRequest(
+                cwd: directory.path, mode: "ultra", agent: .codex
+            ))
+            XCTFail("expected mode rejection")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "mode_not_supported")
+        }
+        XCTAssertTrue(threadRPC.agents.isEmpty, "rejection must happen before thread creation")
     }
 
     /// Absent means Pi, which is what every client written before multi-agent support sends.
     func testCreatingWithoutAnAgentStillMeansPi() async throws {
         _ = try await client.createThread(CreateThreadRequest(cwd: directory.path))
         XCTAssertEqual(threadRPC.agents, [.pi])
+    }
+
+    func testScheduleAgentOnlyAppliesToNewThreadsAndModeOnlyToPi() async throws {
+        do {
+            _ = try await client.createSchedule(ScheduleCreateRequest(
+                name: "Wrong owner", target: .existingThread(threadId: "codex-thread"),
+                prompt: "continue", trigger: .interval(everySeconds: 60, startAt: nil), agent: .codex
+            ))
+            XCTFail("expected existing-thread agent rejection")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "agent_not_supported")
+        }
+
+        do {
+            _ = try await client.createSchedule(ScheduleCreateRequest(
+                name: "Wrong existing mode", target: .existingThread(threadId: "codex-thread"),
+                prompt: "continue", mode: "ultra",
+                trigger: .interval(everySeconds: 60, startAt: nil)
+            ))
+            XCTFail("expected existing-thread mode rejection")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "mode_not_supported")
+        }
+
+        do {
+            _ = try await client.createSchedule(ScheduleCreateRequest(
+                name: "Wrong mode", target: .newThread(cwd: directory.path, namePattern: nil),
+                prompt: "continue", mode: "ultra", trigger: .interval(everySeconds: 60, startAt: nil),
+                agent: .codex
+            ))
+            XCTFail("expected non-Pi mode rejection")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "mode_not_supported")
+        }
+
+        let valid = try await client.createSchedule(ScheduleCreateRequest(
+            name: "Alternate agent schedule", target: .newThread(cwd: directory.path, namePattern: nil),
+            prompt: "continue", trigger: .interval(everySeconds: 60, startAt: nil), agent: .codex
+        )).schedule
+        XCTAssertEqual(valid.agent, .codex)
+
+        let piWithMode = try await client.createSchedule(ScheduleCreateRequest(
+            name: "Pi mode", target: .newThread(cwd: directory.path, namePattern: nil),
+            prompt: "continue", mode: "ultra",
+            trigger: .interval(everySeconds: 60, startAt: nil)
+        )).schedule
+        do {
+            _ = try await client.updateSchedule(
+                id: piWithMode.id, ScheduleUpdateRequest(agent: .codex)
+            )
+            XCTFail("changing agent while retaining a Pi mode must fail")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "mode_not_supported")
+        }
+        let changed = try await client.updateSchedule(
+            id: piWithMode.id, ScheduleUpdateRequest(mode: "", agent: .codex)
+        ).schedule
+        XCTAssertEqual(changed.agent, .codex)
+        XCTAssertNil(changed.mode)
+
+        do {
+            _ = try await client.updateSchedule(
+                id: changed.id,
+                ScheduleUpdateRequest(
+                    target: .existingThread(threadId: "codex-thread"), agent: .codex
+                )
+            )
+            XCTFail("an existing target cannot accept a supplied agent")
+        } catch let PiDeskClientError.badRequest(code, _) {
+            XCTAssertEqual(code, "agent_not_supported")
+        }
+        let existing = try await client.updateSchedule(
+            id: changed.id,
+            ScheduleUpdateRequest(target: .existingThread(threadId: "codex-thread"))
+        ).schedule
+        XCTAssertNil(existing.agent)
+    }
+}
+
+private final class ThreadPublicationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [PiThread] = []
+
+    func append(_ value: PiThread) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    var all: [PiThread] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }
 

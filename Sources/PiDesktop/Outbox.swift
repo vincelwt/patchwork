@@ -43,8 +43,9 @@ enum OutboxPolicy {
     /// Never let a runaway loop stack an unbounded number of pending messages.
     static let limit = 20
 
-    static func append(_ entry: OutboxEntry, to entries: [OutboxEntry]) -> [OutboxEntry] {
-        Array((entries + [entry]).suffix(limit))
+    static func append(_ entry: OutboxEntry, to entries: [OutboxEntry]) -> [OutboxEntry]? {
+        guard entries.count < limit else { return nil }
+        return entries + [entry]
     }
 
     /// Entries due at a given moment in the run, in the order the user queued them.
@@ -57,7 +58,7 @@ enum OutboxPolicy {
     }
 
     static func restoring(_ entry: OutboxEntry, to entries: [OutboxEntry]) -> [OutboxEntry] {
-        Array((entries + [entry]).sorted { $0.queuedAt < $1.queuedAt }.suffix(limit))
+        (entries + [entry]).sorted { $0.queuedAt < $1.queuedAt }
     }
 }
 
@@ -132,13 +133,24 @@ enum OutboxPresentation {
 @MainActor
 extension AppStore {
     /// Queues a message locally instead of handing it to Pi immediately.
-    func enqueueOutbox(text: String, delivery: OutboxEntry.Delivery, attachments: [ImageAttachment] = []) {
+    @discardableResult
+    func enqueueOutbox(
+        text: String,
+        delivery: OutboxEntry.Delivery,
+        attachments: [ImageAttachment] = []
+    ) -> Bool {
         let clean = Self.sanitizedMessage(text)
-        guard !clean.isEmpty || !attachments.isEmpty else { return }
-        outbox = OutboxPolicy.append(
+        guard !clean.isEmpty || !attachments.isEmpty else { return false }
+        guard outbox.count + activeOutboxDispatchCount < OutboxPolicy.limit,
+              let updated = OutboxPolicy.append(
             OutboxEntry(text: clean, delivery: delivery, attachments: attachments),
             to: outbox
-        )
+        ) else {
+            showToast("The message queue is full. Send or remove an item first.", style: .warning)
+            return false
+        }
+        outbox = updated
+        return true
     }
 
     func updateOutbox(id: UUID, text: String) {

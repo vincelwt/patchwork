@@ -19,14 +19,24 @@ import {
 import { renderTokenScreen } from "./views/token.js";
 import { renderPairingScreen } from "./views/pairing.js";
 import { renderThreadList } from "./views/threadList.js";
-import { loadThreadPages } from "./threadPages.mjs";
 import { renderThreadView } from "./views/threadView.js";
 import { renderNewThread } from "./views/newThread.js";
 import { renderSchedules, renderScheduleDetail } from "./views/schedules.js";
 import { renderScheduleForm } from "./views/scheduleForm.js";
-import { applyThreadUpdate } from "./folders.mjs";
+import { applyThreadUpdate, findThreadByReference, threadIdentity } from "./folders.mjs";
+import { createThreadViewStateStore } from "./threadState.mjs";
+import {
+  applyActivityAndRunEventsToThreads,
+  applyRunEventToThreads,
+  applyScheduleEvent,
+  createBoundedThreadMutationGate,
+  createCoalescedTask,
+  createRequestGate,
+  createSnapshotGate
+} from "./liveSync.mjs";
 
 const hosted = isRelayMode();
+const threadViewStates = createThreadViewStateStore();
 const openingPairingLink = hosted && location.pathname.startsWith("/pair/");
 const state = {
   authed: hosted ? hasRelayDevice() && !openingPairingLink : hasToken(),
@@ -34,6 +44,8 @@ const state = {
   connection: "connecting", // "connecting" | "online" | "offline"
   threads: [],
   threadsLoading: false,
+  threadsLoadingMore: false,
+  threadsNextCursor: null,
   threadsError: null,
   // Which list the Threads tab is showing. Archiving is only useful if the archived thread
   // actually leaves the list and stays reachable somewhere, so the list has two explicit modes
@@ -55,7 +67,11 @@ const state = {
   lastThreadEvent: null,
   lastScheduleEvent: null,
   lastRunEvent: null,
-  lastInteractionEvent: null
+  lastActivityEvent: null,
+  lastInteractionEvent: null,
+  // Incremented for every authoritative reconnect pass. Detail views use this to re-read their
+  // transcript, runtime, runs, and dialogs even if all point events were missed while offline.
+  authoritativeGeneration: 0
 };
 
 let currentView = null;
@@ -142,7 +158,9 @@ async function waitForCreatedThread(runId) {
     let run;
     try {
       ({ run } = await api.run(runId));
-      if (run?.threadId) return (await api.thread(run.threadId, 0)).thread;
+      if (run?.threadPath || run?.threadId) {
+        return (await api.thread(run.threadPath || run.threadId, 0)).thread;
+      }
       if (terminalRunStatuses.has(run?.status)) {
         throw new ApiError(409, "create_failed", run.error || "Pi could not create this thread.");
       }
@@ -157,65 +175,263 @@ async function waitForCreatedThread(runId) {
 
 // ---------- data loading ----------
 
-let threadsRequest = 0;
+const threadsGate = createSnapshotGate();
+const foldersGate = createRequestGate();
+const schedulesGate = createSnapshotGate();
+const activityGate = createSnapshotGate();
+let authoritativeGeneration = 0;
+const recentRunByThread = new Map();
+const threadMutationGate = createBoundedThreadMutationGate(512);
 
-function loadThreads() {
+function beginThreadMutation(reference) {
+  return threadMutationGate.begin(reference);
+}
+
+function recordThreadEvent(thread) {
+  threadMutationGate.recordEvent([thread?.path, thread?.id]);
+}
+
+function canPublishThreadMutation(ticket) {
+  return threadMutationGate.canPublish(ticket);
+}
+
+function rememberRunState(run) {
+  const key = run?.threadPath || run?.threadId;
+  if (!key) return;
+  recentRunByThread.delete(key);
+  recentRunByThread.set(key, run);
+  while (recentRunByThread.size > 256) recentRunByThread.delete(recentRunByThread.keys().next().value);
+}
+
+function applyActivityAndRecentRunStates(threads, activity = state.activity) {
+  const runs = [...recentRunByThread.values()];
+  return applyActivityAndRunEventsToThreads(threads, activity, runs);
+}
+
+function uniqueThreads(threads) {
+  const unique = [];
+  const seen = new Set();
+  for (const thread of threads) {
+    const identity = threadIdentity(thread);
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    unique.push(thread);
+  }
+  return unique;
+}
+
+async function loadThreadsOnce() {
   const archived = state.showArchived;
-  const request = ++threadsRequest;
-  setState({ threadsLoading: true, threadsError: null });
-  return loadThreadPages(api.threads, { archived, sidebar: true })
-    .then((threads) => {
-      // A slow response for the list the user has since switched away from must not replace the
-      // one now on screen.
-      if (request !== threadsRequest || archived !== state.showArchived) return;
-      setState({ threads: sortByUpdatedAt(threads), threadsLoading: false });
+  const request = threadsGate.begin();
+  setState({ threadsLoading: true, threadsLoadingMore: false, threadsError: null });
+  try {
+    const page = await api.threads({ limit: 200, archived, sidebar: true });
+    const disposition = threadsGate.disposition(request);
+    if (disposition === "superseded" || archived !== state.showArchived) return;
+    if (disposition === "eventChanged") {
+      threadsLoader.markDirty();
+      return;
+    }
+    const unique = applyActivityAndRecentRunStates(uniqueThreads(
+      Array.isArray(page?.threads) ? page.threads : []
+    ));
+    setState({
+      threads: sortByUpdatedAt(unique),
+      threadsLoading: false,
+      threadsLoadingMore: false,
+      threadsNextCursor: page?.nextCursor || null
+    });
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return;
+    const disposition = threadsGate.disposition(request);
+    if (disposition === "superseded" || archived !== state.showArchived) return;
+    if (disposition === "eventChanged") {
+      threadsLoader.markDirty();
+      return;
+    }
+    setState({ threadsLoading: false, threadsError: describeError(err) });
+  }
+}
+
+const threadsLoader = createCoalescedTask(loadThreadsOnce);
+function loadThreads() {
+  return threadsLoader.run();
+}
+
+let loadMoreThreadsPromise = null;
+function loadMoreThreads() {
+  if (loadMoreThreadsPromise) return loadMoreThreadsPromise;
+  const archived = state.showArchived;
+  const cursor = state.threadsNextCursor;
+  if (!cursor || state.threadsLoading) return Promise.resolve();
+  const request = threadsGate.begin();
+  setState({ threadsLoadingMore: true, threadsError: null });
+  loadMoreThreadsPromise = api
+    .threads({ limit: 200, cursor, archived, sidebar: true })
+    .then((page) => {
+      const disposition = threadsGate.disposition(request);
+      if (disposition === "superseded" || archived !== state.showArchived) return;
+      if (disposition === "eventChanged") {
+        setState({ threadsLoadingMore: false });
+        threadsLoader.markDirty();
+        return;
+      }
+      if (state.threadsNextCursor !== cursor) return;
+      const appended = uniqueThreads([
+        ...state.threads,
+        ...(Array.isArray(page?.threads) ? page.threads : [])
+      ]);
+      setState({
+        threads: sortByUpdatedAt(applyActivityAndRecentRunStates(appended)),
+        threadsLoadingMore: false,
+        threadsNextCursor: page?.nextCursor || null
+      });
     })
     .catch((err) => {
       if (err instanceof ApiError && err.status === 401) return;
-      if (request !== threadsRequest || archived !== state.showArchived) return;
-      setState({ threadsLoading: false, threadsError: describeError(err) });
+      const disposition = threadsGate.disposition(request);
+      if (disposition === "superseded" || archived !== state.showArchived) return;
+      if (err?.code === "cursor_expired" || disposition === "eventChanged") {
+        setState({ threadsLoadingMore: false, threadsNextCursor: null });
+        threadsLoader.markDirty();
+        return;
+      }
+      setState({ threadsLoadingMore: false, threadsError: describeError(err) });
+    })
+    .finally(() => {
+      loadMoreThreadsPromise = null;
     });
+  return loadMoreThreadsPromise;
 }
 
 // Folders change only when someone edits them in the Mac app, so this is loaded with the thread
 // list rather than polled. A daemon without the endpoint leaves `folders` null: the list falls
 // back to project grouping instead of showing an error for a purely organisational feature.
 function loadFolders() {
+  const request = foldersGate.begin();
   return api
     .folders()
-    .then((folders) => setState({ folders }))
-    .catch(() => setState({ folders: null }));
+    .then((folders) => {
+      if (foldersGate.isCurrent(request)) setState({ folders });
+    })
+    .catch(() => {
+      if (foldersGate.isCurrent(request)) setState({ folders: null });
+    });
 }
 
-function loadSchedules() {
+function loadSchedulesOnce() {
+  const request = schedulesGate.begin();
   setState({ schedulesLoading: true, schedulesError: null });
   return api
     .schedules()
-    .then(({ schedules }) => setState({ schedules, schedulesLoading: false }))
+    .then(({ schedules }) => {
+      const disposition = schedulesGate.disposition(request);
+      if (disposition === "superseded") return;
+      if (disposition === "eventChanged") {
+        schedulesLoader.markDirty();
+        return;
+      }
+      setState({ schedules, schedulesLoading: false });
+    })
     .catch((err) => {
       if (err instanceof ApiError && err.status === 401) return;
+      const disposition = schedulesGate.disposition(request);
+      if (disposition === "superseded") return;
+      if (disposition === "eventChanged") {
+        schedulesLoader.markDirty();
+        return;
+      }
       setState({ schedulesLoading: false, schedulesError: describeError(err) });
     });
+}
+
+const schedulesLoader = createCoalescedTask(loadSchedulesOnce);
+function loadSchedules() {
+  return schedulesLoader.run();
+}
+
+function loadActivity() {
+  const request = activityGate.begin();
+  return api
+    .activity()
+    .then((activity) => {
+      if (activityGate.disposition(request) === "current") {
+        threadsGate.recordEvent();
+        setState((s) => ({
+          activity,
+          threads: applyActivityAndRecentRunStates(s.threads, activity),
+          lastActivityEvent: activity
+        }));
+      }
+    })
+    .catch(() => {});
+}
+
+function reloadAuthoritativeState() {
+  authoritativeGeneration += 1;
+  setState({ authoritativeGeneration });
+  return Promise.allSettled([loadThreads(), loadFolders(), loadSchedules(), loadActivity()]);
+}
+
+function invalidateLoads() {
+  threadsGate.invalidate();
+  foldersGate.invalidate();
+  schedulesGate.invalidate();
+  activityGate.invalidate();
 }
 
 // ---------- live updates ----------
 
 function handleEvent(name, data) {
+  if (name === "ready") {
+    // `ready` is a barrier for this new stream, not proof that the preceding connection delivered
+    // every mutation. Replace every cached projection from its authoritative endpoint.
+    recentRunByThread.clear();
+    reloadAuthoritativeState();
+    return;
+  }
   if (!data || typeof data !== "object") return;
   if (name === "thread") {
+    threadsGate.recordEvent();
+    activityGate.recordEvent();
+    recordThreadEvent(data);
     // The event carries the thread's current `archived` flag, so a thread that no longer belongs
     // in the visible list leaves it instead of being merged back in.
+    setState((s) => {
+      const updated = applyThreadUpdate(s.threads, data, s.showArchived);
+      return {
+        threads: updated === s.threads ? s.threads : sortByUpdatedAt(updated),
+        lastThreadEvent: data
+      };
+    });
+  } else if (name === "schedule" || name === "schedule_deleted") {
+    schedulesGate.recordEvent();
     setState((s) => ({
-      threads: sortByUpdatedAt(applyThreadUpdate(s.threads, data, s.showArchived)),
-      lastThreadEvent: data
+      schedules: applyScheduleEvent(s.schedules, name, data),
+      lastScheduleEvent: name === "schedule_deleted" ? { ...data, deleted: true } : data
     }));
-  } else if (name === "schedule") {
-    setState((s) => ({ schedules: upsertBy(s.schedules, data, "id"), lastScheduleEvent: data }));
   } else if (name === "run") {
-    setState({ lastRunEvent: data });
-    loadThreads();
+    threadsGate.recordEvent();
+    activityGate.recordEvent();
+    rememberRunState(data);
+    setState((s) => {
+      const updated = applyRunEventToThreads(s.threads, data);
+      return {
+        // The point event is newer than the cached activity response. Discard that projection so
+        // a later catalog read cannot resurrect its old running bit before the next heartbeat.
+        activity: null,
+        threads: updated === s.threads ? s.threads : sortByUpdatedAt(updated),
+        lastRunEvent: data
+      };
+    });
   } else if (name === "activity") {
-    setState({ activity: data });
+    activityGate.recordEvent();
+    threadsGate.recordEvent();
+    setState((s) => ({
+      activity: data,
+      threads: applyActivityAndRecentRunStates(s.threads, data),
+      lastActivityEvent: data
+    }));
   } else if (name === "interaction") {
     // Only a hint. The thread view re-reads GET /v1/interactions rather than accumulating
     // frames, so a missed or out-of-order event cannot leave a stale dialog on screen.
@@ -226,12 +442,22 @@ function handleEvent(name, data) {
 
 function startEvents() {
   events?.close();
-  events = connectEvents({ onEvent: handleEvent, onStatus: (status) => setState({ connection: status }) });
+  events = connectEvents({
+    onEvent: handleEvent,
+    onStatus: (status) => {
+      const wasOnline = state.connection === "online";
+      setState({ connection: status });
+      // The hosted relay has its own connection-ready control frame rather than the local SSE
+      // barrier. Its offline-to-online edge is the equivalent authoritative refresh boundary.
+      if (hosted && status === "online" && !wasOnline) reloadAuthoritativeState();
+    }
+  });
 }
 
 function stopEvents() {
   events?.close();
   events = null;
+  invalidateLoads();
 }
 
 // ---------- actions passed to every view ----------
@@ -247,6 +473,7 @@ const actions = {
         loadThreads();
         loadFolders();
         loadSchedules();
+        loadActivity();
         startEvents();
         go("/", { replace: true });
       },
@@ -259,12 +486,15 @@ const actions = {
 
   async signOut() {
     stopEvents();
+    threadMutationGate.clear();
     if (hosted) await forgetRelayDevice();
     else clearToken();
     Object.assign(state, {
       authed: false,
       relayPairing: relayPairingState(),
       threads: [],
+      threadsNextCursor: null,
+      threadsLoadingMore: false,
       schedules: [],
       connection: "connecting"
     });
@@ -272,13 +502,19 @@ const actions = {
   },
 
   refreshThreads: () => Promise.all([loadThreads(), loadFolders()]),
+  loadMoreThreads: () => loadMoreThreads(),
   refreshSchedules: () => loadSchedules(),
 
   showArchivedThreads(showArchived) {
     if (state.showArchived === showArchived) return;
     // Clear first: the previous list belongs to the other mode entirely, and leaving it up while
     // the new one loads would show archived threads under "Active".
-    setState({ showArchived, threads: [] });
+    setState({
+      showArchived,
+      threads: [],
+      threadsNextCursor: null,
+      threadsLoadingMore: false
+    });
     loadThreads();
   },
 
@@ -297,50 +533,76 @@ const actions = {
       ? await waitForCreatedThread(response.runId)
       : response.thread;
     setState((s) => ({ threads: sortByUpdatedAt(applyThreadUpdate(s.threads, thread, s.showArchived)) }));
-    if (location.pathname === "/new") go(`/thread/${encodeURIComponent(thread.id)}`, { replace: true });
+    if (response.firstMessageError && body.message) {
+      const saved = await threadViewStates.updateAtomic(threadIdentity(thread), (shared) => ({
+        ...shared,
+        draft: shared.draft || body.message,
+        notice: `The thread was created, but its first message was not sent. ${response.firstMessageError}`
+      }));
+      if (!saved) {
+        // Creation succeeded. Keep the original form visible and let the new-thread view offer an
+        // explicit route to the real thread; replaying the create id cannot send this message.
+        return {
+          ...thread,
+          firstMessageRecoveryError:
+            `Thread ${thread.name || thread.id} was created, but its first message was not sent. The message remains in this form.`
+        };
+      }
+    }
+    if (location.pathname === "/new") go(`/thread/${encodeURIComponent(threadIdentity(thread))}`, { replace: true });
     return thread;
   },
 
   sendMessage(id, body) {
-    return api.sendMessage(id, body).then((response) => {
-      setState((s) => ({ threads: applyThreadUpdate(s.threads, { id, archived: false }, s.showArchived) }));
-      return response;
-    });
+    return api.sendMessage(id, body);
   },
   abortThread: (id) => api.abortThread(id),
   respondInteraction: (id, body) => api.respondInteraction(id, body),
+  loadThreadViewState: (id) => threadViewStates.load(id),
+  updateThreadViewStateAtomic: (id, updater) => threadViewStates.updateAtomic(id, updater),
+  subscribeThreadViewState: (id, listener) => threadViewStates.subscribe(id, listener),
 
   archiveThread(id, archived) {
+    const ticket = beginThreadMutation(id);
     return api.archiveThread(id, archived).then(({ thread }) => {
-      setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
-      return thread;
+      if (canPublishThreadMutation(ticket)) {
+        setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
+      }
+      return findThreadByReference(state.threads, id) || thread;
     });
   },
 
   renameThread(id, name) {
+    const ticket = beginThreadMutation(id);
     return api.renameThread(id, name).then(({ thread }) => {
-      setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
-      return thread;
+      if (canPublishThreadMutation(ticket)) {
+        setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
+      }
+      return findThreadByReference(state.threads, id) || thread;
     });
   },
 
   markRead(id) {
+    const ticket = beginThreadMutation(id);
     return api
       .markThreadRead(id, false)
-      .then(({ thread }) => setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) })))
+      .then(({ thread }) => {
+        if (canPublishThreadMutation(ticket)) {
+          setState((s) => ({ threads: applyThreadUpdate(s.threads, thread, s.showArchived) }));
+        }
+      })
       .catch(() => {}); // best-effort; not worth surfacing a failure to mark something read
   },
 
   createSchedule(body) {
     return api.createSchedule(body).then(({ schedule }) => {
       setState((s) => ({ schedules: upsertBy(s.schedules, schedule, "id") }));
-      go("/schedules", { replace: true });
       return schedule;
     });
   },
 
   pauseSchedule: (id, paused) => api.pauseSchedule(id, paused),
-  runScheduleNow: (id) => api.runScheduleNow(id),
+  runScheduleNow: (id, body) => api.runScheduleNow(id, body),
   deleteSchedule(id) {
     return api.deleteSchedule(id).then(() => {
       setState((s) => ({ schedules: s.schedules.filter((sched) => sched.id !== id) }));
@@ -413,7 +675,14 @@ window.addEventListener("hashchange", () => {
 window.addEventListener("pi:unauthorized", () => {
   stopEvents();
   clearToken();
-  Object.assign(state, { authed: false, threads: [], schedules: [], connection: "connecting" });
+  Object.assign(state, {
+    authed: false,
+    threads: [],
+    threadsNextCursor: null,
+    threadsLoadingMore: false,
+    schedules: [],
+    connection: "connecting"
+  });
   mountRoute();
 });
 window.addEventListener("pi:relay-pairing", (event) => {
@@ -422,6 +691,8 @@ window.addEventListener("pi:relay-pairing", (event) => {
     Object.assign(state, {
       authed: false,
       threads: [],
+      threadsNextCursor: null,
+      threadsLoadingMore: false,
       schedules: [],
       connection: "connecting",
       relayPairing: event.detail
@@ -437,6 +708,7 @@ window.addEventListener("pi:relay-paired", () => {
   loadThreads();
   loadFolders();
   loadSchedules();
+  loadActivity();
   startEvents();
   go("/", { replace: true });
 });
@@ -448,6 +720,7 @@ if (state.authed) {
   loadThreads();
   loadFolders();
   loadSchedules();
+  loadActivity();
   startEvents();
 }
 mountRoute();

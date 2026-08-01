@@ -106,6 +106,18 @@ final class AppStoreOutboxTests: XCTestCase {
         XCTAssertEqual(runtime.commandCount("steer"), 0, "Nothing reaches Pi until the matching boundary fires")
     }
 
+    func testAFullQueueRejectsTheNewestMessageAndKeepsEveryExistingEntry() {
+        let (store, runtime, session) = makeStore()
+        attach(store, runtime, session)
+        for index in 0..<OutboxPolicy.limit {
+            XCTAssertTrue(store.enqueueOutbox(text: "m\(index)", delivery: .followUp))
+        }
+
+        XCTAssertFalse(store.enqueueOutbox(text: "newest", delivery: .followUp))
+        XCTAssertEqual(store.outbox.map(\.text), (0..<OutboxPolicy.limit).map { "m\($0)" })
+        XCTAssertEqual(store.toast?.style, .warning)
+    }
+
     func testTurnEndFlushesOnlySteeringEntries() {
         let (store, runtime, session) = makeStore()
         attach(store, runtime, session)

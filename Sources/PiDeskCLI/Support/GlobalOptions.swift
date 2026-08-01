@@ -57,9 +57,11 @@ struct GlobalOptions {
         let token = parsed.value("--token") ?? environment["PIDESK_TOKEN"]
 
         var timeoutSeconds = 10.0
-        if let raw = environment["PIDESK_TIMEOUT"], let value = Double(raw), value > 0 { timeoutSeconds = value }
+        if let raw = environment["PIDESK_TIMEOUT"], let value = Double(raw), value.isFinite, value > 0 {
+            timeoutSeconds = value
+        }
         if !commandOwnsTimeout, let raw = parsed.value("--timeout") {
-            guard let value = Double(raw), value > 0 else {
+            guard let value = Double(raw), value.isFinite, value > 0 else {
                 throw UsageError.invalidValue(flag: "--timeout", value: raw, reason: "expected a positive number of seconds")
             }
             timeoutSeconds = value

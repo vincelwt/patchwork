@@ -738,6 +738,10 @@ details.advanced[open] summary { color: var(--text); }
   white-space: nowrap;
   cursor: pointer;
 }
+.thread-title:disabled {
+  opacity: 1;
+  cursor: default;
+}
 .topbar-action { flex: none; padding-inline: var(--space-2); }
 .thread-header input[type="text"] {
   font-size: 16px;
@@ -863,6 +867,7 @@ details.advanced[open] summary { color: var(--text); }
    browser's; only the marker and spacing are restyled. */
 
 .work, .act, .step, .work-compaction { min-width: 0; }
+.work-static,
 .work > summary, .act > summary, .step > summary, .work-compaction > summary {
   display: flex;
   align-items: center;
@@ -879,6 +884,7 @@ details.advanced[open] summary { color: var(--text); }
 .act > summary::-webkit-details-marker,
 .step > summary::-webkit-details-marker,
 .work-compaction > summary::-webkit-details-marker { display: none; }
+.work-static { cursor: default; }
 .work > summary::before,
 .act > summary::before,
 .step > summary::before,
@@ -910,13 +916,13 @@ details.advanced[open] summary { color: var(--text); }
   font-variant-numeric: tabular-nums;
 }
 .work-failed { flex: none; color: var(--red); }
-.work > summary .dot {
+.work > summary .dot, .work-static > .dot {
   flex: none;
   animation: work-pulse 1.5s ease-in-out infinite;
 }
 @keyframes work-pulse { 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {
-  .work > summary .dot { animation: none; }
+  .work > summary .dot, .work-static > .dot { animation: none; }
 }
 
 .work-body, .act-body {
@@ -924,7 +930,6 @@ details.advanced[open] summary { color: var(--text); }
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-2) 0 var(--space-2) var(--space-3);
-  border-left: 1px solid var(--hairline);
   margin-left: 4px;
 }
 .work-think, .work-note .prose {

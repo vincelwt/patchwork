@@ -171,7 +171,10 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
         )
         session.prepareSearchKey()
         let overlay = directory.appendingPathComponent("daemon-overlay.json")
-        let payload = ["managedWorktreeProjects": [worktree.path: project.path]]
+        let payload: [String: Any] = [
+            "managedWorktreeProjects": [worktree.path: project.path],
+            "managedThreadPaths": [file.path]
+        ]
         try JSONSerialization.data(withJSONObject: payload).write(to: overlay)
         let store = AppStore(
             repository: FakeRepository(sessions: [session]),
@@ -179,14 +182,56 @@ final class AppStoreFolderDefaultsTests: XCTestCase {
             persistence: AppPersistence(baseURL: directory),
             daemonThreadOverlayURL: overlay
         )
-        // This is a thread the CLI started, so it is only listed at all in the mode that shows
-        // conversations this app did not start.
-        store.setShowsForeignConversations(true)
-
         await store.refreshSessions()
 
+        XCTAssertEqual(store.sessions.map(\.id), ["cli"], "control-plane threads are native-owned even after an offline create")
         XCTAssertEqual(store.managedWorktreeProjects[worktree.path], project.path)
         XCTAssertEqual(store.sidebarFolders.map(\.path), [project.path])
+    }
+
+    func testDaemonThreadEventsInsertOnceAndApplyArchiveByPath() {
+        let path = directory.appendingPathComponent("external.jsonl").path
+        let overlay = directory.appendingPathComponent("daemon-overlay.json")
+        func writeOverlay(archived: Bool) throws {
+            let payload: [String: Any] = [
+                "managedThreadPaths": [path],
+                "archivedThreadPaths": archived ? [path] : []
+            ]
+            try JSONSerialization.data(withJSONObject: payload).write(to: overlay)
+        }
+        XCTAssertNoThrow(try writeOverlay(archived: false))
+        let store = AppStore(
+            repository: FakeRepository(), gitService: FakeGitService(counter: CallCounter()),
+            runtime: FakeRuntime(), persistence: AppPersistence(baseURL: directory),
+            daemonWorktreeProjectsURL: overlay
+        )
+        var thread = PiThread(
+            id: "external", path: path, name: "From CLI", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date(), agent: .claude
+        )
+
+        store.applyDaemonThreadUpdate(
+            thread, daemonOverlay: DaemonWorktreeProjects.loadSnapshot(from: overlay)
+        )
+        store.applyDaemonThreadUpdate(
+            thread, daemonOverlay: DaemonWorktreeProjects.loadSnapshot(from: overlay)
+        )
+        XCTAssertEqual(store.sessions.count, 1)
+        XCTAssertEqual(store.sessions.first?.agent, .claude)
+        XCTAssertEqual(store.sessions.first?.name, "From CLI")
+
+        thread.archived = true
+        XCTAssertNoThrow(try writeOverlay(archived: true))
+        store.applyDaemonThreadUpdate(
+            thread, daemonOverlay: DaemonWorktreeProjects.loadSnapshot(from: overlay)
+        )
+        XCTAssertEqual(store.sessions.first?.isArchived, true)
+        thread.archived = false
+        XCTAssertNoThrow(try writeOverlay(archived: false))
+        store.applyDaemonThreadUpdate(
+            thread, daemonOverlay: DaemonWorktreeProjects.loadSnapshot(from: overlay)
+        )
+        XCTAssertEqual(store.sessions.first?.isArchived, false)
     }
 
     func testWorktreeKeepsTheProjectSelectedButStartsPiInsideTheWorktree() async throws {

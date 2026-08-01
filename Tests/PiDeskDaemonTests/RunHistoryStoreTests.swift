@@ -69,6 +69,34 @@ final class RunHistoryStoreTests: XCTestCase {
         XCTAssertEqual(all.count, 1, "must not resurrect the stale intermediate snapshot as a second entry")
     }
 
+    func testRecordReportsFailureAndFlushesTheLatestSnapshotAfterRepair() async throws {
+        let file = directory.appendingPathComponent("runs.jsonl")
+        let logger = TestSupport.logger(in: directory)
+        let store = RunHistoryStore(fileURL: file, logger: logger)
+        let initialPersisted = await store.record(run(id: "durable", status: .running))
+        XCTAssertTrue(initialPersisted)
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file.path)
+        }
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file.path)
+
+        let persisted = await store.record(run(id: "durable", status: .ok))
+        XCTAssertFalse(persisted)
+        let dirty = await store.isPersisted(id: "durable")
+        XCTAssertFalse(dirty)
+        let inMemory = await store.get(id: "durable")
+        XCTAssertEqual(inMemory?.status, .ok)
+
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file.path)
+        let flushed = await store.flush(id: "durable")
+        XCTAssertTrue(flushed)
+        let durable = await store.isPersisted(id: "durable")
+        XCTAssertTrue(durable)
+        let reopened = RunHistoryStore(fileURL: file, logger: logger)
+        let restored = await reopened.get(id: "durable")
+        XCTAssertEqual(restored?.status, .ok)
+    }
+
     func testMalformedLineIsSkippedOnReloadInsteadOfFailingEverything() async {
         let file = directory.appendingPathComponent("runs.jsonl")
         let logger = TestSupport.logger(in: directory)

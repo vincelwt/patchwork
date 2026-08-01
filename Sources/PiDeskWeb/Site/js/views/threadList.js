@@ -1,7 +1,7 @@
 import { h, mount } from "../dom.js";
 import { relativeTime } from "../time.mjs";
 import { attachPullToRefresh } from "../pulltorefresh.js";
-import { buildThreadTree, flattenTree, isFlatList } from "../folders.mjs";
+import { buildThreadTree, flattenTree, isFlatList, threadIdentity } from "../folders.mjs";
 import { agentLabel, shouldShowAgentBadge } from "../agents.mjs";
 
 const SKELETON_ROWS = 6;
@@ -68,15 +68,42 @@ export function renderThreadList(state, actions) {
 
   attachPullToRefresh(scroll, indicator, () => actions.refreshThreads());
   paintList(listBody, state, actions);
-  actions.refreshThreads();
+  let painted = listPaintInputs(state);
 
   return {
     node,
     onStateChange: (next) => {
-      paintFilter(next);
+      if (painted.showArchived !== next.showArchived) paintFilter(next);
+      const inputs = listPaintInputs(next);
+      if (sameListPaintInputs(painted, inputs)) return;
       paintList(listBody, next, actions);
+      painted = inputs;
     }
   };
+}
+
+function listPaintInputs(state) {
+  return {
+    threads: state.threads,
+    threadsLoading: state.threadsLoading,
+    threadsLoadingMore: state.threadsLoadingMore,
+    threadsNextCursor: state.threadsNextCursor,
+    threadsError: state.threadsError,
+    folders: state.folders,
+    collapsedGroups: state.collapsedGroups,
+    showArchived: state.showArchived
+  };
+}
+
+function sameListPaintInputs(lhs, rhs) {
+  return lhs.threads === rhs.threads
+    && lhs.threadsLoading === rhs.threadsLoading
+    && lhs.threadsLoadingMore === rhs.threadsLoadingMore
+    && lhs.threadsNextCursor === rhs.threadsNextCursor
+    && lhs.threadsError === rhs.threadsError
+    && lhs.folders === rhs.folders
+    && lhs.collapsedGroups === rhs.collapsedGroups
+    && lhs.showArchived === rhs.showArchived;
 }
 
 // Toggling a folder repaints the whole list, which destroys the button that was just pressed and
@@ -87,7 +114,7 @@ let pendingFocusGroupId = null;
 function paintList(container, state, actions) {
   // A refresh that fails leaves the last good list on screen rather than replacing it with an
   // error page; the error only takes over when there is nothing else to show.
-  container.setAttribute("aria-busy", String(state.threadsLoading));
+  container.setAttribute("aria-busy", String(state.threadsLoading || state.threadsLoadingMore));
   if (state.threadsError && !state.threads.length) {
     mount(
       container,
@@ -113,9 +140,23 @@ function paintList(container, state, actions) {
         row.kind === "group" ? renderGroup(row, actions) : renderRow(row.thread, actions, row.depth)
       );
 
+  const loadMore = state.threadsNextCursor
+    ? h(
+        "button",
+        {
+          class: "btn btn-block",
+          type: "button",
+          disabled: state.threadsLoading || state.threadsLoadingMore,
+          onclick: () => actions.loadMoreThreads()
+        },
+        state.threadsLoadingMore ? "Loading\u2026" : "Load more"
+      )
+    : null;
+
   mount(container, [
     state.threadsError ? h("div", { class: "banner banner-error", role: "status" }, state.threadsError) : null,
-    ...rows
+    ...rows,
+    loadMore
   ]);
   restoreGroupFocus(container);
 }
@@ -221,7 +262,7 @@ function renderRow(thread, actions, depth = 0) {
       ]
         .filter(Boolean)
         .join(", "),
-      onclick: () => actions.navigate(`/thread/${encodeURIComponent(thread.id)}`)
+      onclick: () => actions.navigate(`/thread/${encodeURIComponent(threadIdentity(thread))}`)
     },
     h(
       "div",

@@ -76,11 +76,16 @@ private final class FakeRuntime: AgentRuntimeProtocol {
     var isRunning = false
     var sessionFile = ""
     var sessionID = ""
+    private var promptCompletion: ((Result<JSONValue, Error>) -> Void)?
 
     func start(cwd: URL, sessionPath: URL?) throws { isRunning = true }
     func stop() { isRunning = false }
 
     func send(type: String, payload: [String: JSONValue], completion: ((Result<JSONValue, Error>) -> Void)?) {
+        if type == "prompt" {
+            promptCompletion = completion
+            return
+        }
         guard type == "get_state" else { return }
         completion?(.success(.object([
             "success": .bool(true),
@@ -93,6 +98,18 @@ private final class FakeRuntime: AgentRuntimeProtocol {
     }
 
     func sendUncorrelated(_ value: JSONValue) {}
+
+    func succeedPrompt() {
+        promptCompletion?(.success(.object(["success": .bool(true), "data": .object([:])])))
+        promptCompletion = nil
+    }
+
+    func rejectPrompt() {
+        promptCompletion?(.success(.object([
+            "success": .bool(false), "error": .string("prompt rejected")
+        ])))
+        promptCompletion = nil
+    }
 }
 
 private struct FakeRepository: SessionRepositoryProtocol {
@@ -164,7 +181,73 @@ final class NewChatFolderIntentIntegrationTests: XCTestCase {
         let path = cwd.appendingPathComponent("fresh.jsonl").standardizedFileURL.path
         XCTAssertEqual(store.route, .session(path), "AppStore's own promotion logic is untouched")
         XCTAssertEqual(store.virtualFolderAssignments[path], folder.id)
+        XCTAssertNil(
+            store.persistence.state.virtualFolderAssignments[path],
+            "the provisional path must not be persisted before prompt materialization"
+        )
         XCTAssertNil(intent.pending, "Resolved exactly once")
+    }
+
+    func testPromptSuccessCommitsTheStagedFolderAssignment() throws {
+        let (store, runtime) = makeStore()
+        let folder = try XCTUnwrap(store.createVirtualFolder(named: "Focus"))
+        store.openNewChat()
+        store.chooseFolder(directory)
+        let intent = NewChatFolderIntent()
+        intent.arm(folderID: folder.id, cwd: directory, store: store)
+        runtime.sessionFile = directory.appendingPathComponent("fresh.jsonl").path
+        runtime.sessionID = "fresh-session"
+        store.draft = "hello"
+
+        store.submitDraft()
+        runtime.succeedPrompt()
+
+        let path = URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path
+        XCTAssertEqual(store.persistence.state.virtualFolderAssignments[path], folder.id)
+    }
+
+    func testRejectedPromptKeepsFolderForRetryWithoutPersistingAnOrphan() throws {
+        let (store, runtime) = makeStore()
+        let folder = try XCTUnwrap(store.createVirtualFolder(named: "Focus"))
+        store.openNewChat()
+        store.chooseFolder(directory)
+        let intent = NewChatFolderIntent()
+        intent.arm(folderID: folder.id, cwd: directory, store: store)
+        runtime.sessionFile = directory.appendingPathComponent("fresh.jsonl").path
+        runtime.sessionID = "fresh-session"
+        store.draft = "first attempt"
+
+        store.submitDraft()
+        runtime.rejectPrompt()
+
+        let path = URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertNil(store.persistence.state.virtualFolderAssignments[path])
+        XCTAssertEqual(store.virtualFolderAssignments[path], folder.id, "the in-memory retry keeps its intended folder")
+
+        store.submitDraft()
+        runtime.succeedPrompt()
+        XCTAssertEqual(store.persistence.state.virtualFolderAssignments[path], folder.id)
+    }
+
+    func testAbandoningARejectedPromptDiscardsTheStagedFolderAssignment() throws {
+        let (store, runtime) = makeStore()
+        let folder = try XCTUnwrap(store.createVirtualFolder(named: "Focus"))
+        store.openNewChat()
+        store.chooseFolder(directory)
+        let intent = NewChatFolderIntent()
+        intent.arm(folderID: folder.id, cwd: directory, store: store)
+        runtime.sessionFile = directory.appendingPathComponent("fresh.jsonl").path
+        runtime.sessionID = "fresh-session"
+        store.draft = "first attempt"
+        store.submitDraft()
+        runtime.rejectPrompt()
+
+        let path = URL(fileURLWithPath: runtime.sessionFile).standardizedFileURL.path
+        store.openNewChat()
+
+        XCTAssertNil(store.virtualFolderAssignments[path])
+        XCTAssertNil(store.persistence.state.virtualFolderAssignments[path])
     }
 
     func testAbandoningTheIntentForAnExistingConversationNeverAppliesTheAssignment() throws {

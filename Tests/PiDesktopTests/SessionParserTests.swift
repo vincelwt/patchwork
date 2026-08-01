@@ -1,4 +1,5 @@
 import Foundation
+import PiDeskKit
 import XCTest
 @testable import PiDesktop
 
@@ -36,6 +37,40 @@ final class SessionParserTests: XCTestCase {
         XCTAssertFalse(conversation.messages.contains { $0.textContent.contains("Abandoned branch") })
         XCTAssertEqual(conversation.messages.first(where: { $0.role == .user })?.images.count, 1)
         XCTAssertEqual(conversation.messages.last?.role, .unknown)
+    }
+
+    func testWindowedSummaryKeepsFirstUserTitleAcrossSkippedParentChain() throws {
+        let file = temporaryDirectory.appendingPathComponent("sparse-summary.jsonl")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let writer = try FileHandle(forWritingTo: file)
+        defer { try? writer.close() }
+
+        func append(_ object: [String: Any]) throws {
+            try writer.write(contentsOf: JSONSerialization.data(withJSONObject: object))
+            try writer.write(contentsOf: Data([0x0A]))
+        }
+
+        try append(["type": "session", "version": 3, "id": "sparse", "cwd": temporaryDirectory.path])
+        try append([
+            "type": "message", "id": "root", "parentId": NSNull(),
+            "message": ["role": "user", "content": "Keep this exact title"]
+        ])
+        try writer.seek(toOffset: UInt64(2 * 1_024 * 1_024))
+        try append([
+            "type": "message", "id": "middle", "parentId": "root",
+            "message": ["role": "assistant", "content": "middle"]
+        ])
+        try writer.seek(toOffset: UInt64(4 * 1_024 * 1_024))
+        try append([
+            "type": "message", "id": "tail", "parentId": "middle",
+            "message": ["role": "assistant", "content": "tail"]
+        ])
+        try writer.synchronize()
+
+        let summary = try SessionParser.summary(at: file)
+        XCTAssertEqual(summary.displayName, "Keep this exact title")
+        XCTAssertEqual(summary.preview, "Keep this exact title")
+        XCTAssertTrue(summary.hasPartialCounts)
     }
 
     func testSummaryTracksOnlyPullRequestsCreatedOnTheActiveBranch() throws {
@@ -598,8 +633,9 @@ final class SessionParserTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: repository.rootURL.path) else {
             throw XCTSkip("No installed Pi session directory")
         }
-        let sessions = try await repository.discoverSessions(archivedIDs: [])
+        let sessions = try await repository.discoverSessions(archivedIDs: [], agents: [.pi])
         XCTAssertFalse(sessions.isEmpty)
+        XCTAssertTrue(sessions.allSatisfy { $0.agent == .pi })
         XCTAssertTrue(sessions.allSatisfy { $0.fileURL.deletingLastPathComponent().deletingLastPathComponent() == repository.rootURL })
     }
 

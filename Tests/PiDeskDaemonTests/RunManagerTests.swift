@@ -43,6 +43,46 @@ final class RunManagerTests: XCTestCase {
         XCTAssertTrue(observed, "the executor must observe Task.isCancelled once the deadline wins the race")
     }
 
+    func testTimeoutPreservesAnAcceptedPromptBoundaryAndSuppressesRetry() async {
+        let started = Date(timeIntervalSince1970: 100)
+        let accepted = Date(timeIntervalSince1970: 101)
+        let executor = FakeRunExecutor { _ in
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 10_000_000) }
+            return RunOutcome(
+                status: .interrupted, error: "cancelled", summary: "partial answer",
+                resolvedThreadId: "thread-1", resolvedThreadPath: "/tmp/thread-1.jsonl",
+                retryable: true, promptStartedAt: started, promptAcceptedAt: accepted
+            )
+        }
+
+        let outcome = await RunManager(executor: executor).run(job(timeoutSeconds: 1))
+
+        XCTAssertEqual(outcome.status, .timeout)
+        XCTAssertEqual(outcome.summary, "partial answer")
+        XCTAssertEqual(outcome.resolvedThreadId, "thread-1")
+        XCTAssertEqual(outcome.resolvedThreadPath, "/tmp/thread-1.jsonl")
+        XCTAssertEqual(outcome.promptStartedAt, started)
+        XCTAssertEqual(outcome.promptAcceptedAt, accepted)
+        XCTAssertFalse(outcome.retryable)
+    }
+
+    func testTimeoutKeepsRetryableOnlyWhenPromptDeliveryNeverStarted() async {
+        let executor = FakeRunExecutor { _ in
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 10_000_000) }
+            return RunOutcome(
+                status: .interrupted, error: "cancelled", summary: nil,
+                resolvedThreadId: "thread-2", retryable: true
+            )
+        }
+
+        let outcome = await RunManager(executor: executor).run(job(timeoutSeconds: 1))
+
+        XCTAssertEqual(outcome.status, .timeout)
+        XCTAssertTrue(outcome.retryable)
+        XCTAssertNil(outcome.promptStartedAt)
+        XCTAssertEqual(outcome.resolvedThreadId, "thread-2")
+    }
+
     func testTimeoutIsPerJobNotGlobal() async {
         let executor = FakeRunExecutor { job in
             RunOutcome(status: .ok, error: nil, summary: "\(job.timeoutSeconds)")
@@ -52,6 +92,19 @@ final class RunManagerTests: XCTestCase {
         let long = await manager.run(job(timeoutSeconds: 60))
         XCTAssertEqual(short.summary, "1")
         XCTAssertEqual(long.summary, "60")
+    }
+
+    func testCorruptTimeoutValuesAreBoundedBeforeExecutionWithoutOverflow() async {
+        let executor = FakeRunExecutor { job in
+            RunOutcome(status: .ok, error: nil, summary: "\(job.timeoutSeconds)")
+        }
+        let manager = RunManager(executor: executor)
+
+        let oversized = await manager.run(job(timeoutSeconds: .max))
+        let negative = await manager.run(job(timeoutSeconds: .min))
+
+        XCTAssertEqual(oversized.summary, "\(ScheduleEngine.maximumTimeoutSeconds)")
+        XCTAssertEqual(negative.summary, "1")
     }
 }
 

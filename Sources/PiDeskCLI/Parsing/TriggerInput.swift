@@ -46,6 +46,12 @@ func resolveTrigger(_ flags: TriggerFlags, localTimeZone: TimeZone = .current) t
     guard present.count == 1 else {
         throw UsageError.conflictingFlags(present)
     }
+    if flags.timezone != nil, flags.cron == nil {
+        throw UsageError.custom("--timezone only applies with --cron")
+    }
+    if flags.startAt != nil, flags.every == nil {
+        throw UsageError.custom("--start-at only applies with --every")
+    }
 
     if let at = flags.at {
         return .once(at: try FlexibleDate.parse(at, timeZone: localTimeZone))

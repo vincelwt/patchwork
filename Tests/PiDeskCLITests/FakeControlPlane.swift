@@ -29,15 +29,22 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
     var scheduleDetailResult = WireScheduleDetailResponse(schedule: WireSchedule(id: "sch_1"), runs: [])
     var scheduleDeleteResult = WireScheduleDeleteResponse(deleted: true)
     var scheduleRunResult = WireScheduleRunResponse(runId: "run_1")
+    var runResult = WireRunResponse(run: WireRun(id: "run_1", status: "running"))
+    var runResultsToReturn: [WireRunResponse] = []
+    var showRunError: Error?
     var limitsResult = WireLimits(report: .object(["accounts": .array([])]), generatedAt: "2026-01-01T00:00:00Z", stale: false)
     var eventsToEmit: [ControlPlaneEvent] = []
     var eventsError: Error?
+    var keepEventsOpen = false
+    var onEventsTermination: (() -> Void)?
+    private var heldEventsContinuation: AsyncThrowingStream<ControlPlaneEvent, Error>.Continuation?
 
     /// Captures every argument a command builds, for shape assertions independent of the fake's
     /// canned responses.
     var lastCreateThreadRequest: WireCreateThreadRequest?
     var lastSendMessageRequest: WireSendMessageRequest?
     var lastScheduleCreateRequest: WireScheduleCreateRequest?
+    var lastScheduleRunRequest: WireScheduleRunRequest?
 
     func health() async throws -> WireHealth {
         calls.append(Call(method: "health", detail: ""))
@@ -125,10 +132,19 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
         return scheduleDeleteResult
     }
 
-    func runSchedule(id: String) async throws -> WireScheduleRunResponse {
+    func runSchedule(id: String, request: WireScheduleRunRequest) async throws -> WireScheduleRunResponse {
         calls.append(Call(method: "runSchedule", detail: "id=\(id)"))
+        lastScheduleRunRequest = request
         if let error { throw error }
         return scheduleRunResult
+    }
+
+    func showRun(id: String) async throws -> WireRunResponse {
+        calls.append(Call(method: "showRun", detail: "id=\(id)"))
+        if let showRunError { throw showRunError }
+        if let error { throw error }
+        if !runResultsToReturn.isEmpty { return runResultsToReturn.removeFirst() }
+        return runResult
     }
 
     func limits() async throws -> WireLimits {
@@ -141,10 +157,17 @@ final class FakeControlPlane: ControlPlane, @unchecked Sendable {
         calls.append(Call(method: "events", detail: ""))
         let events = eventsToEmit
         let streamError = eventsError
-        return AsyncThrowingStream { continuation in
+        let staysOpen = keepEventsOpen
+        return AsyncThrowingStream { [weak self] continuation in
+            continuation.onTermination = { [weak self] _ in
+                self?.heldEventsContinuation = nil
+                self?.onEventsTermination?()
+            }
             for event in events { continuation.yield(event) }
             if let streamError {
                 continuation.finish(throwing: streamError)
+            } else if staysOpen {
+                self?.heldEventsContinuation = continuation
             } else {
                 continuation.finish()
             }

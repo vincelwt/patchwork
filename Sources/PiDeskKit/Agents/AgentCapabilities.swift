@@ -30,6 +30,15 @@ public enum AgentLadder: String, Codable, Hashable, Sendable {
     case models
 }
 
+/// How the control plane can make an empty conversation durable without sending a provider
+/// prompt. `sessionName` is still prompt-free, but the runtime's start acknowledgement alone is
+/// not enough: the name command is the write barrier that creates the transcript.
+public enum IdleThreadCreationStyle: String, Codable, Hashable, Sendable {
+    case processStart
+    case sessionName
+    case unavailable
+}
+
 /// The agent's analogue of Pi's `/mode` slider: a small ordered set of named operating modes.
 public struct AgentMode: Codable, Hashable, Sendable, Identifiable {
     public let id: String
@@ -75,6 +84,12 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
     public var reportsPlan: Bool
     /// True when Pi Desktop's own activity extension can be installed for this agent.
     public var supportsActivityExtension: Bool
+    public var idleThreadCreation: IdleThreadCreationStyle
+
+    /// Kept as the product-level gate used by existing call sites. A true value means the control
+    /// plane has a prompt-free materialization sequence, not necessarily that process launch by
+    /// itself writes the transcript.
+    public var persistsSessionBeforeFirstPrompt: Bool { idleThreadCreation != .unavailable }
 
     public init(
         modelSelection: ModelSelectionStyle,
@@ -91,7 +106,8 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         listsCommands: Bool,
         requestsToolPermission: Bool,
         reportsPlan: Bool,
-        supportsActivityExtension: Bool
+        supportsActivityExtension: Bool,
+        idleThreadCreation: IdleThreadCreationStyle
     ) {
         self.modelSelection = modelSelection
         self.thinking = thinking
@@ -108,6 +124,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         self.requestsToolPermission = requestsToolPermission
         self.reportsPlan = reportsPlan
         self.supportsActivityExtension = supportsActivityExtension
+        self.idleThreadCreation = idleThreadCreation
     }
 }
 
@@ -155,7 +172,8 @@ public extension AgentKind {
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: false,
-                supportsActivityExtension: true
+                supportsActivityExtension: true,
+                idleThreadCreation: .processStart
             )
         case .codex:
             AgentCapabilities(
@@ -173,25 +191,27 @@ public extension AgentKind {
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: true,
-                supportsActivityExtension: false
+                supportsActivityExtension: false,
+                idleThreadCreation: .sessionName
             )
         case .claude:
             AgentCapabilities(
                 modelSelection: .aliases,
-                thinking: .relaunch,
+                thinking: .unsupported,
                 modes: Self.claudeModes,
                 ladder: .models,
                 modeControlTitle: "Model",
                 canCompact: true,
                 canFork: false,
                 canExportHTML: false,
-                canRenameSession: false,
+                canRenameSession: true,
                 canSteerMidTurn: true,
                 reportsUsage: true,
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: true,
-                supportsActivityExtension: false
+                supportsActivityExtension: false,
+                idleThreadCreation: .unavailable
             )
         }
     }

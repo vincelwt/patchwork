@@ -5,6 +5,10 @@ import PiDeskKit
 /// malformed entry is quarantined (skipped, recorded as a `HealthIssue`) rather than taking the
 /// rest of the file, or daemon startup, down with it.
 actor ScheduleStore {
+    enum InsertResult: Sendable {
+        case inserted(Schedule)
+        case existing(Schedule)
+    }
     private let fileURL: URL
     private let logger: DaemonLogger
     private var schedules: [String: Schedule] = [:]
@@ -24,6 +28,17 @@ actor ScheduleStore {
 
     func get(id: String) -> Schedule? { schedules[id] }
 
+    /// Inserts exactly once under actor isolation. Idempotent HTTP creates cannot split an
+    /// existence check and write across two actor turns, which would allow last-writer-wins.
+    func insertIfAbsent(_ schedule: Schedule) throws -> InsertResult {
+        if let existing = schedules[schedule.id] { return .existing(existing) }
+        var updated = schedules
+        updated[schedule.id] = schedule
+        try persist(updated)
+        schedules = updated
+        return .inserted(schedule)
+    }
+
     @discardableResult
     func upsert(_ schedule: Schedule) throws -> Schedule {
         var updated = schedules
@@ -38,6 +53,24 @@ actor ScheduleStore {
     @discardableResult
     func update(id: String, _ transform: (inout Schedule) -> Bool) throws -> Schedule? {
         guard var schedule = schedules[id], transform(&schedule) else { return nil }
+        var updated = schedules
+        updated[id] = schedule
+        try persist(updated)
+        schedules = updated
+        return schedule
+    }
+
+    /// Compare-and-update for request handlers that derive several fields from one snapshot.
+    /// A concurrent client must never let a stale validation overwrite a newer target, agent,
+    /// or mode combination.
+    @discardableResult
+    func update(
+        id: String,
+        matching expected: Schedule,
+        _ transform: (inout Schedule) -> Void
+    ) throws -> Schedule? {
+        guard var schedule = schedules[id], schedule == expected else { return nil }
+        transform(&schedule)
         var updated = schedules
         updated[id] = schedule
         try persist(updated)

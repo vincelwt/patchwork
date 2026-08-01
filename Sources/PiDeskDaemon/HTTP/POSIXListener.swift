@@ -71,6 +71,9 @@ final class POSIXListener {
     }
 
     static func tcpLoopback(port: Int) throws -> POSIXListener {
+        guard (0...65_535).contains(port) else {
+            throw ListenerError.failed("TCP port must be between 0 and 65535.")
+        }
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ListenerError.failed("socket() failed: \(lastError())") }
         var reuse: Int32 = 1
@@ -108,6 +111,12 @@ final class POSIXListener {
             if client < 0 {
                 if errno == EINTR { continue }
                 return // listener closed (EBADF) or unrecoverable; stop this loop quietly
+            }
+            do {
+                try RawSocket.suppressBrokenPipeSignal(fd: client)
+            } catch {
+                Darwin.close(client)
+                continue
             }
             onAccept(client)
         }

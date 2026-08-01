@@ -11,7 +11,7 @@ final class GatedLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
     private let started = DispatchSemaphore(value: 0)
     private let release = DispatchSemaphore(value: 0)
 
-    var delivered: [(command: String, message: String)] { lock.lock(); defer { lock.unlock() }; return _delivered }
+    var delivered: [(command: String, message: String)] { lock.withLock { _delivered } }
     var result: LiveDelivery = .acknowledged
     /// When true, `deliver` blocks until `finishDelivery()` is called.
     var gated = false
@@ -19,7 +19,7 @@ final class GatedLiveRuntime: LiveRuntimeHandle, @unchecked Sendable {
     var throwsAfterGate = false
 
     func deliver(command: String, message: String) async throws -> LiveDelivery {
-        lock.lock(); _delivered.append((command, message)); lock.unlock()
+        lock.withLock { _delivered.append((command, message)) }
         if gated {
             started.signal()
             await withCheckedContinuation { continuation in
@@ -479,20 +479,167 @@ final class SubmissionRegistryTests: XCTestCase {
         SendMessageResponse(runId: runID, queued: false, delivery: .auto)
     }
 
+    private func ledgerURL() -> (directory: URL, file: URL) {
+        let directory = TestSupport.tempDirectory()
+        return (directory, directory.appendingPathComponent("submission-replays.json"))
+    }
+
+    private func ownership(
+        _ claim: SubmissionRegistry.Claim,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> SubmissionRegistry.Ownership {
+        guard let ownership = claim.ownership else {
+            XCTFail("expected a new claim, got \(claim)", file: file, line: line)
+            fatalError("missing claim ownership")
+        }
+        return ownership
+    }
+
     func testAFirstSubmissionProceedsAndARepeatReplaysTheSameAnswer() async {
         let registry = SubmissionRegistry()
         let claim = await registry.claim(threadID: "t1", clientID: "c1")
-        XCTAssertEqual(claim, .proceed)
+        let owner = ownership(claim)
 
-        await registry.complete(threadID: "t1", clientID: "c1", response: response("run_1"))
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: owner, response: response("run_1")
+        )
         let again = await registry.claim(threadID: "t1", clientID: "c1")
         XCTAssertEqual(again, .replay(response("run_1")), "a retry gets the original answer, not a second run")
+    }
+
+    func testACompletedSubmissionReplaysAfterTheDaemonRestarts() async {
+        let location = ledgerURL()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        let firstProcess = SubmissionRegistry(fileURL: location.file)
+        let claimed = await firstProcess.claim(threadID: "t1", clientID: "c1")
+        await firstProcess.complete(
+            threadID: "t1", clientID: "c1", ownership: ownership(claimed),
+            response: response("run_1")
+        )
+
+        let restarted = SubmissionRegistry(fileURL: location.file)
+        let replay = await restarted.claim(threadID: "t1", clientID: "c1")
+        XCTAssertEqual(replay, .replay(response("run_1")))
+    }
+
+    func testAnInFlightSubmissionBecomesOutcomeUnknownAfterRestart() async {
+        let location = ledgerURL()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        let firstProcess = SubmissionRegistry(fileURL: location.file)
+        let claimed = await firstProcess.claim(threadID: "t1", clientID: "c1")
+        _ = ownership(claimed)
+
+        let restarted = SubmissionRegistry(fileURL: location.file)
+        let ambiguous = await restarted.claim(threadID: "t1", clientID: "c1")
+        XCTAssertEqual(ambiguous, .outcomeUnknown)
+    }
+
+    func testAnExpiredAmbiguousSubmissionCanBeRetriedAfterRestart() async {
+        let location = ledgerURL()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let started = Date()
+
+        let firstProcess = SubmissionRegistry(fileURL: location.file)
+        _ = await firstProcess.claim(threadID: "t1", clientID: "c1", now: started)
+
+        let restarted = SubmissionRegistry(fileURL: location.file)
+        let afterTTL = started.addingTimeInterval(SubmissionRegistry.entryTTL + 1)
+        let retry = await restarted.claim(threadID: "t1", clientID: "c1", now: afterTTL)
+        _ = ownership(retry)
+    }
+
+    func testACorruptOrOversizedLedgerFailsClosed() async throws {
+        for data in [Data("not json".utf8), Data(repeating: 0, count: 2 * 1_024 * 1_024 + 1)] {
+            let location = ledgerURL()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            try data.write(to: location.file)
+
+            let registry = SubmissionRegistry(fileURL: location.file)
+            let claim = await registry.claim(threadID: "t1", clientID: UUID().uuidString)
+            guard case .unavailable = claim else {
+                return XCTFail("bad persisted state must block a send before delivery, got \(claim)")
+            }
+        }
+    }
+
+    func testStructurallyInvalidLedgersFailClosedAsAWhole() async throws {
+        let mutations: [(inout [String: Any]) -> Void] = [
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                guard let entry = entries.first else { return }
+                entries.append(entry)
+                envelope["entries"] = entries
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["state"] = "unexpected"
+                envelope["entries"] = entries
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["state"] = "done"
+                entries[0].removeValue(forKey: "payload")
+                entries[0].removeValue(forKey: "response")
+                envelope["entries"] = entries
+            },
+            { envelope in
+                let entry = (envelope["entries"] as? [[String: Any]])?.first ?? [:]
+                envelope["entries"] = (0...SubmissionRegistry.maxEntries).map { index in
+                    var copy = entry
+                    copy["clientID"] = "client-\(index)"
+                    return copy
+                }
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["messageAliases"] = ["one", "two", "three"]
+                envelope["entries"] = entries
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["messageAliases"] = ["not/a/thread-id"]
+                envelope["entries"] = entries
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["messageAliases"] = [String(repeating: "x", count: 513)]
+                envelope["entries"] = entries
+            },
+            { envelope in
+                var entries = envelope["entries"] as? [[String: Any]] ?? []
+                entries[0]["scope"] = "creation"
+                entries[0]["messageAliases"] = ["thread-id"]
+                envelope["entries"] = entries
+            }
+        ]
+
+        for mutate in mutations {
+            let location = ledgerURL()
+            defer { try? FileManager.default.removeItem(at: location.directory) }
+            let initial = SubmissionRegistry(fileURL: location.file)
+            _ = await initial.claim(threadID: "t1", clientID: "seed")
+            let data = try Data(contentsOf: location.file)
+            var envelope = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            mutate(&envelope)
+            try JSONSerialization.data(withJSONObject: envelope).write(to: location.file)
+
+            let registry = SubmissionRegistry(fileURL: location.file)
+            let claim = await registry.claim(threadID: "t2", clientID: "fresh")
+            guard case .unavailable = claim else {
+                return XCTFail("invalid persisted structure must block new delivery, got \(claim)")
+            }
+        }
     }
 
     func testAnOverlappingRepeatIsRefusedRatherThanRun() async {
         let registry = SubmissionRegistry()
         let first = await registry.claim(threadID: "t1", clientID: "c1")
-        XCTAssertEqual(first, .proceed)
+        _ = ownership(first)
         let overlapping = await registry.claim(threadID: "t1", clientID: "c1")
         XCTAssertEqual(overlapping, .inFlight)
     }
@@ -501,45 +648,41 @@ final class SubmissionRegistryTests: XCTestCase {
         let registry = SubmissionRegistry()
         _ = await registry.claim(threadID: "t1", clientID: "c1")
         let other = await registry.claim(threadID: "t2", clientID: "c1")
-        XCTAssertEqual(other, .proceed)
+        _ = ownership(other)
     }
 
     func testAbandoningAFailedClaimLetsAnHonestRetryThrough() async {
         let registry = SubmissionRegistry()
-        _ = await registry.claim(threadID: "t1", clientID: "c1")
-        await registry.abandon(threadID: "t1", clientID: "c1")
+        let first = await registry.claim(threadID: "t1", clientID: "c1")
+        await registry.abandon(
+            threadID: "t1", clientID: "c1", ownership: ownership(first)
+        )
         let retry = await registry.claim(threadID: "t1", clientID: "c1")
-        XCTAssertEqual(retry, .proceed)
+        _ = ownership(retry)
     }
 
     func testEntriesExpireSoTheRegistryCannotGrowWithoutBound() async {
         let registry = SubmissionRegistry()
         let start = Date()
-        _ = await registry.claim(threadID: "t1", clientID: "c1", now: start)
-        await registry.complete(threadID: "t1", clientID: "c1", response: response("run_1"), now: start)
+        let first = await registry.claim(threadID: "t1", clientID: "c1", now: start)
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: ownership(first),
+            response: response("run_1"), now: start
+        )
 
         let later = start.addingTimeInterval(SubmissionRegistry.entryTTL + 60)
         let expired = await registry.claim(threadID: "t1", clientID: "c1", now: later)
-        XCTAssertEqual(expired, .proceed)
-    }
-
-    func testAnInFlightClaimThatNeverFinishedIsEventuallyReleased() async {
-        let registry = SubmissionRegistry()
-        let start = Date()
-        _ = await registry.claim(threadID: "t1", clientID: "c1", now: start)
-
-        let later = start.addingTimeInterval(SubmissionRegistry.entryTTL + 60)
-        let released = await registry.claim(threadID: "t1", clientID: "c1", now: later)
-        XCTAssertEqual(released, .proceed, "a crashed handler must not block that submission forever")
+        _ = ownership(expired)
     }
 
     func testAnInFlightClaimIsNeverEvictedToMakeRoomForANewOne() async {
         // Evicting one would un-protect a send that is still running: its retry would be a second
         // prompt, which is the exact failure `clientId` exists to prevent.
         let registry = SubmissionRegistry()
+        var owners: [SubmissionRegistry.Ownership] = []
         for index in 0..<SubmissionRegistry.maxEntries {
             let claim = await registry.claim(threadID: "t1", clientID: "c\(index)")
-            XCTAssertEqual(claim, .proceed, "claim \(index)")
+            owners.append(ownership(claim))
         }
 
         let overflow = await registry.claim(threadID: "t1", clientID: "one-too-many")
@@ -547,48 +690,250 @@ final class SubmissionRegistryTests: XCTestCase {
         let oldest = await registry.claim(threadID: "t1", clientID: "c0")
         XCTAssertEqual(oldest, .inFlight, "the oldest is still protected")
 
-        // Finishing one frees exactly one slot, and the completed entry is the eviction victim.
-        await registry.complete(threadID: "t1", clientID: "c0", response: response("run_0"))
+        // Finishing does not prove the caller received the answer, so it remains protected too.
+        await registry.complete(
+            threadID: "t1", clientID: "c0", ownership: owners[0], response: response("run_0")
+        )
+        let stillFull = await registry.claim(threadID: "t1", clientID: "one-too-many")
+        XCTAssertEqual(stillFull, .overloaded)
+        let completed = await registry.claim(threadID: "t1", clientID: "c0")
+        XCTAssertEqual(completed, .replay(response("run_0")))
+
+        // Only a definitively failed request releases capacity before the TTL.
+        await registry.abandon(threadID: "t1", clientID: "c1", ownership: owners[1])
         let admitted = await registry.claim(threadID: "t1", clientID: "one-too-many")
-        XCTAssertEqual(admitted, .proceed)
+        _ = ownership(admitted)
         let stillRunning = await registry.claim(threadID: "t1", clientID: "c1")
-        XCTAssertEqual(stillRunning, .inFlight, "and no in-flight claim was touched")
+        XCTAssertEqual(stillRunning, .overloaded, "no protected claim was silently forgotten")
     }
 
     func testALateCompletionCannotResurrectAClaimNobodyOwnsAnyMore() async {
         let registry = SubmissionRegistry()
-        _ = await registry.claim(threadID: "t1", clientID: "c1")
-        await registry.abandon(threadID: "t1", clientID: "c1")
+        let first = await registry.claim(threadID: "t1", clientID: "c1")
+        let firstOwner = ownership(first)
+        await registry.abandon(threadID: "t1", clientID: "c1", ownership: firstOwner)
 
         // The handler failed, released its claim, and only then managed to report a response.
-        await registry.complete(threadID: "t1", clientID: "c1", response: response("run_1"))
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: firstOwner, response: response("run_1")
+        )
         let retry = await registry.claim(threadID: "t1", clientID: "c1")
-        XCTAssertEqual(retry, .proceed, "a released claim stays released")
+        _ = ownership(retry)
     }
 
-    func testACompletionAfterTheTTLDoesNotReviveTheEntry() async {
+    func testALiveOwnerRemainsProtectedPastTheReplayTTLAndCanComplete() async {
         let registry = SubmissionRegistry()
         let start = Date()
-        _ = await registry.claim(threadID: "t1", clientID: "c1", now: start)
+        let first = await registry.claim(threadID: "t1", clientID: "c1", now: start)
+        let oldOwner = ownership(first)
 
         let later = start.addingTimeInterval(SubmissionRegistry.entryTTL + 60)
-        // Any call prunes; this one is a different submission entirely.
+        // A different claim runs pruning, but cannot evict a handler that is still alive.
         _ = await registry.claim(threadID: "t2", clientID: "c9", now: later)
-        await registry.complete(threadID: "t1", clientID: "c1", response: response("run_1"), now: later)
+        let protected = await registry.claim(threadID: "t1", clientID: "c1", now: later)
+        XCTAssertEqual(protected, .inFlight)
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: oldOwner,
+            response: response("run_1"), now: later
+        )
         let afterTTL = await registry.claim(threadID: "t1", clientID: "c1", now: later)
-        XCTAssertEqual(afterTTL, .proceed, "not replayed from a dead claim")
+        XCTAssertEqual(afterTTL, .replay(response("run_1")))
     }
 
     func testTheRegistryIsBoundedByEntryCount() async {
         let registry = SubmissionRegistry()
-        for index in 0...(SubmissionRegistry.maxEntries + 10) {
-            _ = await registry.claim(threadID: "t1", clientID: "c\(index)")
-            await registry.complete(threadID: "t1", clientID: "c\(index)", response: response("run_\(index)"))
+        let started = Date()
+        for index in 0..<SubmissionRegistry.maxEntries {
+            let claim = await registry.claim(threadID: "t1", clientID: "c\(index)", now: started)
+            await registry.complete(
+                threadID: "t1", clientID: "c\(index)", ownership: ownership(claim),
+                response: response("run_\(index)"), now: started
+            )
         }
-        let evicted = await registry.claim(threadID: "t1", clientID: "c0")
-        XCTAssertEqual(evicted, .proceed, "the oldest entries were evicted")
-        let newest = SubmissionRegistry.maxEntries + 10
-        let retained = await registry.claim(threadID: "t1", clientID: "c\(newest)")
-        XCTAssertEqual(retained, .replay(response("run_\(newest)")), "the newest are still protected")
+        let overflow = await registry.claim(threadID: "t1", clientID: "overflow", now: started)
+        XCTAssertEqual(overflow, .overloaded)
+        let oldest = await registry.claim(threadID: "t1", clientID: "c0", now: started)
+        XCTAssertEqual(oldest, .replay(response("run_0")), "old lost responses remain replayable")
+
+        let afterTTL = started.addingTimeInterval(SubmissionRegistry.entryTTL + 1)
+        let admitted = await registry.claim(threadID: "t1", clientID: "overflow", now: afterTTL)
+        _ = ownership(admitted)
+    }
+
+    func testALiveHandlerCannotBeReplacedAfterTheTTL() async {
+        let registry = SubmissionRegistry()
+        let start = Date()
+        let old = await registry.claim(threadID: "t1", clientID: "c1", now: start)
+        let oldOwner = ownership(old)
+        let later = start.addingTimeInterval(SubmissionRegistry.entryTTL + 1)
+        let protected = await registry.claim(threadID: "t1", clientID: "c1", now: later)
+        XCTAssertEqual(protected, .inFlight)
+
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: oldOwner,
+            response: response("original"), now: later
+        )
+        let replay = await registry.claim(threadID: "t1", clientID: "c1", now: later)
+        XCTAssertEqual(replay, .replay(response("original")))
+    }
+
+    func testAClientIDIsBoundToTheOriginalRequestFingerprintAcrossRestart() async {
+        let location = ledgerURL()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let firstFingerprint = SubmissionRegistry.fingerprint(parts: ["one"])
+        let secondFingerprint = SubmissionRegistry.fingerprint(parts: ["two"])
+        let registry = SubmissionRegistry(fileURL: location.file)
+        let first = await registry.claim(
+            threadID: "t1", clientID: "c1", requestFingerprint: firstFingerprint
+        )
+        await registry.complete(
+            threadID: "t1", clientID: "c1", ownership: ownership(first),
+            response: response("run_1")
+        )
+        let conflict = await registry.claim(
+            threadID: "t1", clientID: "c1", requestFingerprint: secondFingerprint
+        )
+        XCTAssertEqual(conflict, .conflict)
+
+        let restarted = SubmissionRegistry(fileURL: location.file)
+        let persistedConflict = await restarted.claim(
+            threadID: "t1", clientID: "c1", requestFingerprint: secondFingerprint
+        )
+        XCTAssertEqual(persistedConflict, .conflict)
+    }
+
+    func testMessageLookupFindsACanonicalPathWithoutAliases() async throws {
+        let registry = SubmissionRegistry()
+        let thread = ThreadInstanceKey(path: "/tmp/pi-desktop/message-lookup.jsonl")
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let claim = await registry.claim(
+            thread: thread, clientID: "path-only", requestFingerprint: fingerprint
+        )
+        let answer = response("run_path")
+        await registry.complete(
+            thread: thread, clientID: "path-only",
+            ownership: try XCTUnwrap(claim.ownership), response: answer
+        )
+
+        let located = await registry.lookupMessage(
+            reference: thread.path, clientID: "path-only", requestFingerprint: fingerprint
+        )
+        let lookup = try XCTUnwrap(located)
+        XCTAssertEqual(lookup.thread, thread)
+        XCTAssertEqual(lookup.claim, .replay(answer))
+    }
+
+    func testMessageAliasesReplayAcrossRegistryRestart() async throws {
+        let location = ledgerURL()
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let thread = ThreadInstanceKey(path: "/tmp/pi-desktop/aliased-message.jsonl")
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let first = SubmissionRegistry(fileURL: location.file)
+        let claim = await first.claim(
+            thread: thread, clientID: "aliased", requestFingerprint: fingerprint,
+            messageAliases: ["session-full-id", "session-prefix"]
+        )
+        let answer = response("run_alias")
+        await first.complete(
+            thread: thread, clientID: "aliased",
+            ownership: try XCTUnwrap(claim.ownership), response: answer
+        )
+
+        let restarted = SubmissionRegistry(fileURL: location.file)
+        for reference in ["session-full-id", "session-prefix"] {
+            let located = await restarted.lookupMessage(
+                reference: reference, clientID: "aliased",
+                requestFingerprint: fingerprint
+            )
+            let lookup = try XCTUnwrap(located)
+            XCTAssertEqual(lookup.thread, thread)
+            XCTAssertEqual(lookup.claim, .replay(answer))
+        }
+    }
+
+    func testMessageAliasLookupNeverCreatesAClaim() async {
+        let registry = SubmissionRegistry()
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let missing = await registry.lookupMessage(
+            reference: "missing", clientID: "lookup-only", requestFingerprint: fingerprint
+        )
+        XCTAssertNil(missing)
+        let claim = await registry.claim(
+            threadID: "real-thread", clientID: "lookup-only",
+            requestFingerprint: fingerprint
+        )
+        XCTAssertNotNil(claim.ownership)
+    }
+
+    func testMessageAliasCollisionNeverChoosesAThread() async throws {
+        let registry = SubmissionRegistry()
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let firstThread = ThreadInstanceKey(path: "/tmp/pi-desktop/copy-one.jsonl")
+        let secondThread = ThreadInstanceKey(path: "/tmp/pi-desktop/copy-two.jsonl")
+        let first = await registry.claim(
+            thread: firstThread, clientID: "same-client", requestFingerprint: fingerprint,
+            messageAliases: ["copied-id"]
+        )
+        let second = await registry.claim(
+            thread: secondThread, clientID: "same-client", requestFingerprint: fingerprint,
+            messageAliases: ["copied-id"]
+        )
+        await registry.complete(
+            thread: firstThread, clientID: "same-client",
+            ownership: try XCTUnwrap(first.ownership), response: response("run_one")
+        )
+        await registry.complete(
+            thread: secondThread, clientID: "same-client",
+            ownership: try XCTUnwrap(second.ownership), response: response("run_two")
+        )
+
+        let ambiguous = await registry.lookupMessage(
+            reference: "copied-id", clientID: "same-client",
+            requestFingerprint: fingerprint
+        )
+        XCTAssertNil(ambiguous)
+        let replayOne = await registry.claim(
+            thread: firstThread, clientID: "same-client",
+            requestFingerprint: fingerprint
+        )
+        XCTAssertEqual(replayOne, .replay(response("run_one")))
+        let replayTwo = await registry.claim(
+            thread: secondThread, clientID: "same-client",
+            requestFingerprint: fingerprint
+        )
+        XCTAssertEqual(replayTwo, .replay(response("run_two")))
+    }
+
+    func testAbandoningAndExpiringClaimsDropMessageAliases() async throws {
+        let registry = SubmissionRegistry()
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let thread = ThreadInstanceKey(path: "/tmp/pi-desktop/alias-cleanup.jsonl")
+        let started = Date()
+        let first = await registry.claim(
+            thread: thread, clientID: "cleanup", requestFingerprint: fingerprint,
+            messageAliases: ["cleanup-id"], now: started
+        )
+        await registry.abandon(
+            thread: thread, clientID: "cleanup", ownership: try XCTUnwrap(first.ownership)
+        )
+        let abandoned = await registry.lookupMessage(
+            reference: "cleanup-id", clientID: "cleanup", requestFingerprint: fingerprint
+        )
+        XCTAssertNil(abandoned)
+
+        let second = await registry.claim(
+            thread: thread, clientID: "cleanup", requestFingerprint: fingerprint,
+            messageAliases: ["cleanup-id"], now: started
+        )
+        await registry.complete(
+            thread: thread, clientID: "cleanup",
+            ownership: try XCTUnwrap(second.ownership), response: response("run_cleanup"),
+            now: started
+        )
+        let expired = await registry.lookupMessage(
+            reference: "cleanup-id", clientID: "cleanup", requestFingerprint: fingerprint,
+            now: started.addingTimeInterval(SubmissionRegistry.entryTTL + 1)
+        )
+        XCTAssertNil(expired)
     }
 }

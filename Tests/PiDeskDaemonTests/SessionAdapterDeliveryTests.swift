@@ -84,5 +84,12 @@ final class SessionAdapterDeliveryTests: XCTestCase {
             CodexProtocolAdapter().launchArguments(sessionPath: nil, cwd: URL(fileURLWithPath: "/tmp")),
             ["app-server", "--stdio"]
         )
+        XCTAssertEqual(
+            PiProtocolAdapter().launchArguments(
+                sessionPath: nil, cwd: URL(fileURLWithPath: "/tmp"),
+                initialSessionID: "fixed-pi", initialSessionName: "Scheduled"
+            ),
+            ["--mode", "rpc", "--session-id", "fixed-pi", "--name", "Scheduled"]
+        )
     }
 }

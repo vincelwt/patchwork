@@ -7,13 +7,30 @@ import Foundation
 /// Pi-only assumptions from creeping back into it.
 public final class PiProtocolAdapter: AgentProtocolAdapter {
     public let agent: AgentKind = .pi
+    private var initialSessionID: String?
+    private var initialSessionName: String?
 
     public init() {}
 
+    public func prepareNewSession(id: String?, name: String?) {
+        initialSessionID = id
+        initialSessionName = name
+    }
+
     public func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
         var arguments = ["--mode", "rpc"]
-        if let sessionPath { arguments += ["--session", sessionPath.path] }
+        if let sessionPath {
+            arguments += ["--session", sessionPath.path]
+        } else {
+            if let initialSessionID { arguments += ["--session-id", initialSessionID] }
+            if let initialSessionName { arguments += ["--name", initialSessionName] }
+        }
         return arguments
+    }
+
+    public func reset() {
+        initialSessionID = nil
+        initialSessionName = nil
     }
 
     public func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {

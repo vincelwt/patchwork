@@ -9,11 +9,14 @@ private final class IntentRuntime: AgentRuntimeProtocol {
     var onEvent: ((JSONValue) -> Void)?
     var onExit: ((String?) -> Void)?
     var isRunning = false
+    var agent: AgentKind = .pi
     var routeOutcome: RouteOutcome = .success
     var delayState = false
     var delayModels = false
     var delayThinking = false
     var delayStats = false
+    var delayPrompt = false
+    var promptError: String?
     var onStart: (() -> Void)?
     private(set) var starts: [(cwd: URL, session: URL?)] = []
     private(set) var stopCount = 0
@@ -21,6 +24,7 @@ private final class IntentRuntime: AgentRuntimeProtocol {
     private var stateCompletion: ((Result<JSONValue, Error>) -> Void)?
     private var modelCompletion: ((Result<JSONValue, Error>) -> Void)?
     private var thinkingCompletion: ((Result<JSONValue, Error>) -> Void)?
+    private var promptCompletion: ((Result<JSONValue, Error>) -> Void)?
     private(set) var sessionFile = ""
     private var sessionID = ""
 
@@ -69,6 +73,13 @@ private final class IntentRuntime: AgentRuntimeProtocol {
             completion?(success(["levels": .array([.string("off")])]))
         case "get_session_stats" where delayStats:
             break
+        case "prompt" where delayPrompt:
+            promptCompletion = completion
+        case "prompt" where promptError != nil:
+            completion?(.success(.object([
+                "success": .bool(false),
+                "error": .string(promptError ?? "prompt rejected")
+            ])))
         default:
             completion?(success([:]))
         }
@@ -83,6 +94,14 @@ private final class IntentRuntime: AgentRuntimeProtocol {
     func finishThinking() {
         thinkingCompletion?(success(["levels": .array([.string("off")])]))
         thinkingCompletion = nil
+    }
+    func finishPrompt() {
+        promptCompletion?(success([:]))
+        promptCompletion = nil
+    }
+    func finishPrompt(with error: Error) {
+        promptCompletion?(.failure(error))
+        promptCompletion = nil
     }
     func count(_ command: String) -> Int { sent.filter { $0.0 == command }.count }
 
@@ -172,6 +191,15 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         store.submitDraft()
         XCTAssertEqual(store.messages.last?.textContent, "hello")
         XCTAssertEqual(runtime.count("prompt"), 0)
+        XCTAssertTrue(store.currentRouteHasPendingStartupPrompt)
+        XCTAssertTrue(store.isRunning(session), "startup itself must show the transcript waiting state")
+        let startupItems = TranscriptPresenter.items(
+            messages: store.messages, streaming: nil, isRunning: store.isRunning(session)
+        )
+        XCTAssertTrue(startupItems.contains { item in
+            guard case let .work(block) = item else { return false }
+            return block.isActive && block.entries.isEmpty
+        })
 
         runtime.finishState()
         XCTAssertEqual(runtime.count("prompt"), 1, "thinking/stats requests must not gate dispatch")
@@ -194,6 +222,248 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         ]))
         XCTAssertEqual(store.currentRouteRuntimePhase, .working)
         XCTAssertEqual(runtime.count("get_messages"), 0)
+    }
+
+    func testExistingConversationDoesNotStartUntilItsNativeLeaseIsGranted() async {
+        let runtime = IntentRuntime()
+        let gate = LeaseOperationGateForStore()
+        await gate.blockAcquire()
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        let session = summary("leased", cwd: root)
+        store.sessions = [session]
+        store.selectSession(session)
+
+        store.composerContentDidChange()
+        for _ in 0..<50 where await gate.requestCount == 0 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let requestCount = await gate.counts().requests
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(runtime.starts.count, 0)
+
+        await gate.releaseAcquire()
+        for _ in 0..<50 where runtime.starts.isEmpty {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(runtime.starts.count, 1)
+    }
+
+    func testSwitchDuringBlockedLeaseDoesNotLetTheOldContinuationCloseTheReplacementLease() async {
+        let runtime = IntentRuntime()
+        let gate = LeaseOperationGateForStore()
+        await gate.blockAcquire()
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        let first = summary("blocked", cwd: root)
+        let replacement = summary("replacement", cwd: root)
+        store.sessions = [first, replacement]
+        store.selectSession(first)
+        store.draft = "restore this exactly once"
+        store.submitDraft()
+
+        for _ in 0..<50 where await gate.requestCount == 0 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let initialCounts = await gate.counts()
+        XCTAssertEqual(initialCounts.requests, 1)
+        XCTAssertTrue(runtime.starts.isEmpty)
+
+        store.selectSession(replacement)
+        store.composerContentDidChange()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        let blockedCounts = await gate.counts()
+        XCTAssertEqual(
+            blockedCounts.requests, 1,
+            "the replacement waits behind the transferred coordinator's in-flight request"
+        )
+        XCTAssertTrue(runtime.starts.isEmpty)
+
+        await gate.releaseAcquire()
+        for _ in 0..<100 {
+            let current = await gate.counts()
+            if !runtime.starts.isEmpty, current.releases > 0 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        let counts = await gate.counts()
+        XCTAssertEqual(counts.requests, 2)
+        XCTAssertEqual(counts.releases, 1, "only the superseded path is released")
+        XCTAssertEqual(runtime.starts.count, 1)
+        XCTAssertEqual(runtime.starts.first?.session?.standardizedFileURL.path, replacement.fileURL.standardizedFileURL.path)
+        XCTAssertEqual(runtime.stopCount, 0)
+
+        store.selectSession(first)
+        XCTAssertEqual(store.draft, "restore this exactly once")
+    }
+
+    func testFreshClaudeDefersLeaseUntilTheFirstPromptMaterializes() async throws {
+        let runtime = IntentRuntime()
+        runtime.agent = .claude
+        runtime.delayPrompt = true
+        let gate = LeaseOperationGateForStore()
+        await gate.failNextNotFound(2)
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        store.newChatAgent = .claude
+        store.selectedFolder = root
+        store.draft = "hello from a fresh conversation"
+
+        store.submitDraft()
+
+        XCTAssertEqual(runtime.count("prompt"), 1)
+        let requestsBeforeAcknowledgement = await gate.counts().requests
+        XCTAssertEqual(requestsBeforeAcknowledgement, 0)
+        XCTAssertEqual(store.sessions.first?.agent, .claude)
+        try Data("materialized transcript".utf8).write(
+            to: URL(fileURLWithPath: runtime.sessionFile), options: .atomic
+        )
+        runtime.finishPrompt()
+
+        for _ in 0..<100 where await gate.counts().requests < 3 {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let requestsAfterMaterialization = await gate.counts().requests
+        XCTAssertEqual(requestsAfterMaterialization, 3)
+        XCTAssertEqual(runtime.stopCount, 0)
+    }
+
+    func testAmbiguousFreshCodexPromptAcquiresItsMaterializedLease() async throws {
+        let runtime = IntentRuntime()
+        runtime.agent = .codex
+        runtime.delayPrompt = true
+        let gate = LeaseOperationGateForStore()
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        store.newChatAgent = .codex
+        store.selectedFolder = root
+        store.draft = "ambiguous but accepted"
+
+        store.submitDraft()
+        try Data("materialized transcript".utf8).write(
+            to: URL(fileURLWithPath: runtime.sessionFile), options: .atomic
+        )
+        runtime.finishPrompt(with: AgentRuntimeError.outcomeUnknown("prompt acknowledgement timed out"))
+
+        for _ in 0..<50 where await gate.counts().requests == 0 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let requestCount = await gate.counts().requests
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(runtime.stopCount, 0)
+    }
+
+    func testFreshClaudeAgentStartAcquiresLeaseBeforePromptAcknowledgement() async throws {
+        let runtime = IntentRuntime()
+        runtime.agent = .claude
+        runtime.delayPrompt = true
+        let gate = LeaseOperationGateForStore()
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        store.newChatAgent = .claude
+        store.selectedFolder = root
+        store.draft = "event arrives first"
+
+        store.submitDraft()
+        try Data("materialized transcript".utf8).write(
+            to: URL(fileURLWithPath: runtime.sessionFile), options: .atomic
+        )
+        runtime.onEvent?(.object(["type": .string("agent_start")]))
+
+        for _ in 0..<50 where await gate.counts().requests == 0 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let requestCount = await gate.counts().requests
+        XCTAssertEqual(requestCount, 1)
+        runtime.finishPrompt()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        let requestCountAfterAcknowledgement = await gate.counts().requests
+        XCTAssertEqual(requestCountAfterAcknowledgement, 1, "the later acknowledgement is idempotent")
+    }
+
+    func testFreshClaudeSettlementAlsoAcquiresLeaseWhenStartWasMissed() async throws {
+        let runtime = IntentRuntime()
+        runtime.agent = .claude
+        runtime.delayPrompt = true
+        let gate = LeaseOperationGateForStore()
+        let store = makeStore(
+            runtime: runtime,
+            runtimeLeaseOperation: { path, request in
+                try await gate.perform(path: path, request: request)
+            }
+        )
+        store.newChatAgent = .claude
+        store.selectedFolder = root
+        store.draft = "settled event is the first observed lifecycle"
+
+        store.submitDraft()
+        try Data("materialized transcript".utf8).write(
+            to: URL(fileURLWithPath: runtime.sessionFile), options: .atomic
+        )
+        runtime.onEvent?(.object(["type": .string("agent_settled")]))
+
+        for _ in 0..<50 where await gate.counts().requests == 0 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let requestCount = await gate.counts().requests
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testDefiniteFreshPromptFailureRemovesTheUnmaterializedSidebarRow() {
+        let runtime = IntentRuntime()
+        runtime.agent = .claude
+        runtime.promptError = "prompt rejected"
+        let store = makeStore(runtime: runtime)
+        store.newChatAgent = .claude
+        store.selectedFolder = root
+        store.draft = "please retry me"
+
+        store.submitDraft()
+
+        XCTAssertEqual(runtime.count("prompt"), 1)
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertNil(store.selectedSession)
+        XCTAssertEqual(store.draft, "please retry me")
+        XCTAssertTrue(runtime.isRunning, "the untouched fresh runtime can accept the corrected retry")
+    }
+
+    func testDefiniteFreshPromptFailureMakesTheUnusedWorktreeDiscardableAgain() {
+        let runtime = IntentRuntime()
+        runtime.agent = .claude
+        runtime.promptError = "prompt rejected"
+        let store = makeStore(runtime: runtime)
+        let worktree = root.appendingPathComponent("unused-worktree", isDirectory: true)
+        store.newChatAgent = .claude
+        store.selectedFolder = root
+        store.setNewChatWorktreeForTesting(worktree, origin: root)
+        store.draft = "please retry me"
+
+        store.submitDraft()
+
+        XCTAssertFalse(store.newChatWorktreeSubmittedForTesting)
+        store.setNewChatWorktree(false)
+        XCTAssertNil(store.newChatWorktree)
+        XCTAssertNil(store.managedWorktreeProjects[worktree.standardizedFileURL.path])
     }
 
     func testStopDuringStartupPreventsThePendingPromptFromDispatching() {
@@ -276,6 +546,20 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(payload["images"]?.arrayValue?.count, 1)
         XCTAssertEqual(store.messages.last?.textContent, "Build this")
         XCTAssertEqual(store.messages.last?.images.map(\.data), [imageData])
+
+        runtime.onEvent?(.object([
+            "type": .string("message_end"),
+            "message": .object([
+                "id": .string("codex-user-echo"),
+                "role": .string("user"),
+                "content": .string(payload["message"]?.stringValue ?? "")
+            ])
+        ]))
+        let userRows = store.messages.filter { $0.role == .user }
+        XCTAssertEqual(userRows.count, 1, "the lossy Codex echo must not append a second bubble")
+        XCTAssertTrue(userRows[0].id.hasPrefix("local-"), "the richer optimistic row stays until JSONL is durable")
+        XCTAssertEqual(userRows[0].textContent, "Build this")
+        XCTAssertEqual(userRows[0].images.map(\.data), [imageData])
     }
 
     func testIdleSameCwdProcessSwitchesSavedAndNewRoutesButCrossCwdColdStarts() throws {
@@ -559,7 +843,8 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         runtime: IntentRuntime,
         factory: @escaping (AgentKind) -> AgentRuntimeProtocol = { _ in IntentRuntime() },
         probe: IntentRuntime? = nil,
-        lease: ManualRuntimeLease? = nil
+        lease: ManualRuntimeLease? = nil,
+        runtimeLeaseOperation: RuntimeLeaseOperation? = nil
     ) -> AppStore {
         let store = AppStore(
             repository: IntentRepository(rootURL: root),
@@ -572,7 +857,8 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
             isActiveOverride: true,
             runtimeRetirementScheduler: lease.map { value in
                 { delay, action in value.schedule(delay: delay, action: action) }
-            } ?? { _, _ in {} }
+            } ?? { _, _ in {} },
+            runtimeLeaseOperation: runtimeLeaseOperation
         )
         store.cachedScheduleService = InMemoryScheduleService()
         return store
@@ -588,5 +874,44 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         )
         value.prepareSearchKey()
         return value
+    }
+}
+
+private actor LeaseOperationGateForStore {
+    private(set) var requestCount = 0
+    private(set) var releaseCount = 0
+    private var shouldBlock = false
+    private var notFoundFailures = 0
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func blockAcquire() { shouldBlock = true }
+    func failNextNotFound(_ count: Int) { notFoundFailures = max(0, count) }
+
+    func perform(path: String, request: LeaseRequest) async throws -> LeaseResponse {
+        if request.release == true {
+            releaseCount += 1
+            return LeaseResponse(leased: false)
+        }
+        requestCount += 1
+        if notFoundFailures > 0 {
+            notFoundFailures -= 1
+            throw PiDeskClientError.notFound("thread")
+        }
+        if shouldBlock {
+            shouldBlock = false
+            await withCheckedContinuation { waiter = $0 }
+        }
+        return LeaseResponse(
+            leased: true, owner: request.owner, expiresAt: Date().addingTimeInterval(60)
+        )
+    }
+
+    func releaseAcquire() {
+        waiter?.resume()
+        waiter = nil
+    }
+
+    func counts() -> (requests: Int, releases: Int) {
+        (requestCount, releaseCount)
     }
 }

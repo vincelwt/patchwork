@@ -120,6 +120,35 @@ final class MultiAgentThreadParserTests: XCTestCase {
         XCTAssertEqual(messages.map(\.text), ["main task", "done"])
     }
 
+    func testOuterRecordTimestampReachesWireMessagesForEveryAgent() throws {
+        let timestamp = "2026-07-31T10:00:20.000Z"
+        let fixtures: [(agent: AgentKind, lines: [String])] = [
+            (.pi, [
+                #"{"type":"session","id":"pi-time","cwd":"/Users/x/code"}"#,
+                #"{"type":"message","id":"pi-message","timestamp":"2026-07-31T10:00:20.000Z","message":{"role":"user","content":"hello"}}"#
+            ]),
+            (.codex, [
+                codexSession,
+                #"{"type":"response_item","timestamp":"2026-07-31T10:00:20.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#
+            ]),
+            (.claude, [
+                #"{"type":"user","uuid":"claude-message","sessionId":"claude-time","cwd":"/Users/x/code","timestamp":"2026-07-31T10:00:20.000Z","message":{"role":"user","content":"hello"}}"#
+            ])
+        ]
+
+        for fixture in fixtures {
+            let url = write(fixture.lines, name: "\(fixture.agent.rawValue)-timestamp.jsonl")
+            let messages = try SessionThreadParser.messages(
+                at: url, limit: 10, transcoder: .make(for: fixture.agent)
+            )
+            XCTAssertEqual(
+                try XCTUnwrap(messages.first).at,
+                try XCTUnwrap(PiDeskDate.date(from: timestamp)),
+                "\(fixture.agent.displayName) must keep the durable record timestamp"
+            )
+        }
+    }
+
     // MARK: - Pi is unchanged
 
     func testPiTranscoderIsStillTheIdentityPath() throws {
@@ -188,7 +217,31 @@ final class AgentWireCompatibilityTests: XCTestCase {
             as: Schedule.self
         )
         XCTAssertNil(schedule.agent)
+        XCTAssertNil(schedule.creationTargetFingerprint)
         let run = try decode(#"{"id":"run_1","status":"ok","trigger":"api"}"#, as: Run.self)
         XCTAssertNil(run.agent)
+    }
+
+    func testScheduleCreationTargetFingerprintIsAdditiveAndBounded() throws {
+        let fingerprint = "v9:future-compatible-token"
+        let schedule = Schedule(
+            id: "sch_1", name: "n",
+            target: .newThread(cwd: "/tmp", namePattern: nil), prompt: "p",
+            trigger: .heartbeat(everySeconds: 900),
+            createdAt: .distantPast, updatedAt: .distantPast,
+            creationTargetFingerprint: fingerprint
+        )
+        let encoded = try JSONEncoder().encode(schedule)
+        XCTAssertEqual(
+            try JSONDecoder().decode(Schedule.self, from: encoded).creationTargetFingerprint,
+            fingerprint
+        )
+
+        let oversized = String(repeating: "x", count: 129)
+        let decoded = try decode(
+            #"{"id":"sch_1","name":"n","target":{"kind":"newThread","cwd":"/tmp"},"prompt":"p","trigger":{"kind":"heartbeat","everySeconds":900},"creationTargetFingerprint":"\#(oversized)"}"#,
+            as: Schedule.self
+        )
+        XCTAssertNil(decoded.creationTargetFingerprint)
     }
 }

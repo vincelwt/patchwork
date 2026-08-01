@@ -36,6 +36,21 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(all.first?.name, "Nightly")
     }
 
+    func testCreationTargetFingerprintPersistsAcrossReinitialization() async throws {
+        let file = directory.appendingPathComponent("schedules.json")
+        let logger = TestSupport.logger(in: directory)
+        let store = ScheduleStore(fileURL: file, logger: logger)
+        var schedule = sampleSchedule()
+        schedule.creationTargetFingerprint = "v1:opaque-replay-token"
+        _ = try await store.upsert(schedule)
+
+        let reopened = ScheduleStore(fileURL: file, logger: logger)
+        let restored = await reopened.get(id: schedule.id)
+        XCTAssertEqual(restored?.creationTargetFingerprint, "v1:opaque-replay-token")
+        let issues = await reopened.quarantineIssues
+        XCTAssertTrue(issues.isEmpty)
+    }
+
     func testRemoveDeletesAndPersists() async throws {
         let file = directory.appendingPathComponent("schedules.json")
         let logger = TestSupport.logger(in: directory)
@@ -47,6 +62,70 @@ final class ScheduleStoreTests: XCTestCase {
         let reopened = ScheduleStore(fileURL: file, logger: logger)
         let all = await reopened.all()
         XCTAssertTrue(all.isEmpty)
+    }
+
+    func testCompareAndUpdateCannotOverwriteANewerAgentAndModePair() async throws {
+        let store = ScheduleStore(
+            fileURL: directory.appendingPathComponent("schedules.json"),
+            logger: TestSupport.logger(in: directory)
+        )
+        var initial = sampleSchedule()
+        initial.target = .newThread(cwd: directory.path, namePattern: nil)
+        initial.mode = "ultra"
+        _ = try await store.upsert(initial)
+        let storedInitial = await store.get(id: initial.id)
+        let stale = try XCTUnwrap(storedInitial)
+
+        _ = try await store.update(id: initial.id) { schedule in
+            schedule.agent = .codex
+            schedule.mode = nil
+            return true
+        }
+        let staleWrite = try await store.update(id: initial.id, matching: stale) { schedule in
+            schedule.name = "Stale name"
+        }
+
+        XCTAssertNil(staleWrite)
+        let storedCurrent = await store.get(id: initial.id)
+        let current = try XCTUnwrap(storedCurrent)
+        XCTAssertEqual(current.agent, .codex)
+        XCTAssertNil(current.mode)
+        XCTAssertEqual(current.name, initial.name)
+    }
+
+    func testStaleCompareAndUpdateCannotOverwriteANewerOccurrenceIdentity() async throws {
+        let store = ScheduleStore(
+            fileURL: directory.appendingPathComponent("schedules.json"),
+            logger: TestSupport.logger(in: directory)
+        )
+        var initial = sampleSchedule()
+        initial.target = .newThread(cwd: directory.path, namePattern: nil)
+        _ = try await store.upsert(initial)
+        let storedInitial = await store.get(id: initial.id)
+        let stale = try XCTUnwrap(storedInitial)
+        let occurrence = ScheduleOccurrence(
+            id: "occ-newer", scheduledAt: Date(), phase: .starting,
+            attemptCount: 2, notBefore: Date(), runId: "run-newer",
+            threadId: "thread-newer", threadPath: "/tmp/thread-newer.jsonl"
+        )
+        _ = try await store.update(id: initial.id) { schedule in
+            schedule.pendingOccurrence = occurrence
+            return true
+        }
+
+        let staleWrite = try await store.update(
+            id: initial.id, matching: stale
+        ) { schedule in
+            schedule.target = .newThread(cwd: "/tmp/other", namePattern: nil)
+            schedule.agent = .codex
+        }
+
+        XCTAssertNil(staleWrite)
+        let storedCurrent = await store.get(id: initial.id)
+        let current = try XCTUnwrap(storedCurrent)
+        XCTAssertEqual(current.pendingOccurrence, occurrence)
+        XCTAssertEqual(current.target, initial.target)
+        XCTAssertEqual(current.agent, initial.agent)
     }
 
     func testRemovingUnknownIDReturnsFalse() async throws {
