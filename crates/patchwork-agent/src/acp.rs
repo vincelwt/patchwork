@@ -91,6 +91,17 @@ impl AcpConnection {
             cmd.env(k, v);
         }
 
+        // Adapters spawn the real agent CLI, which spawns its own tools. Give
+        // the whole run its own process group so ending a run ends all of it —
+        // an orphaned runtime would keep burning CPU forever.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to start agent `{program}`"))?;
@@ -301,9 +312,39 @@ impl AcpConnection {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let Some(mut child) = self.child.lock().await.take() else {
+            return;
+        };
+        let pid = child.id();
+
+        // Ask the whole process group to stop, give it a moment to unwind, then
+        // insist.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+            for _ in 0..20 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+/// A dropped connection — a cancelled run, a stopping relay — must not leave a
+/// runtime behind.
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(mut guard) = self.child.try_lock() {
+            if let Some(pid) = guard.as_mut().and_then(|child| child.id()) {
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
         }
     }
 }

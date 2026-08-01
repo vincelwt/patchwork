@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         println!();
     }
 
-    start_hosted_execution(&state);
+    let runner = start_hosted_execution(&state);
     tokio::spawn(automations::scheduler(state.clone()));
     tokio::spawn(github::watcher(state.clone()));
     reconcile_interrupted_runs(&state).await;
@@ -154,6 +154,9 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Stop hosted agents deliberately rather than orphaning their runtimes.
+    runner.shutdown().await;
     Ok(())
 }
 
@@ -184,7 +187,7 @@ fn ensure_relay_host(store: &Store) -> Result<String> {
 
 /// The relay is itself an execution host: hosted agents keep working when
 /// every laptop is closed.
-fn start_hosted_execution(state: &Shared) {
+fn start_hosted_execution(state: &Shared) -> std::sync::Arc<Runner> {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let cli_dir = std::env::current_exe()
         .ok()
@@ -236,6 +239,8 @@ fn start_hosted_execution(state: &Shared) {
             }
         });
     }
+
+    runner
 }
 
 /// A run that was in flight when the relay stopped is never left claiming to
