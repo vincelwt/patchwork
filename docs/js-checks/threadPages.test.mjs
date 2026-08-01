@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadThreadPages } from "../../Sources/PiDeskWeb/Site/js/threadPages.mjs";
+import { loadThreadPages } from "../../Sources/PatchworkWeb/Site/js/threadPages.mjs";
 
 test("thread pagination reads every sidebar page in order", async () => {
   const calls = [];

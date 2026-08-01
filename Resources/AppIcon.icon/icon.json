@@ -4,31 +4,84 @@
       "layers": [
         {
           "blend-mode": "normal",
-          "glass": true,
+          "glass": false,
           "hidden": false,
-          "image-name": "AppIconForeground.png",
-          "name": "Continuous Pi",
-          "opacity": 1,
-          "fill-specializations": [
-            {
-              "value": {
-                "solid": "extended-srgb:0.09020,0.09412,0.10196,1.00000"
-              }
-            },
-            {
-              "appearance": "dark",
-              "value": {
-                "solid": "extended-srgb:0.94118,0.93333,0.91373,1.00000"
-              }
-            }
-          ]
+          "image-name": "BubbleTopLeft.png",
+          "name": "Arctic Blue",
+          "opacity": 1
         }
       ],
       "lighting": "combined",
-      "name": "Pi Mark",
+      "name": "Top Left Bubble",
       "shadow": {
         "kind": "neutral",
-        "opacity": 0.3
+        "opacity": 0.16
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.15
+      }
+    },
+    {
+      "layers": [
+        {
+          "blend-mode": "normal",
+          "glass": false,
+          "hidden": false,
+          "image-name": "BubbleTopRight.png",
+          "name": "Luminous Aqua",
+          "opacity": 1
+        }
+      ],
+      "lighting": "combined",
+      "name": "Top Right Bubble",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.16
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.15
+      }
+    },
+    {
+      "layers": [
+        {
+          "blend-mode": "normal",
+          "glass": false,
+          "hidden": false,
+          "image-name": "BubbleBottomLeft.png",
+          "name": "Deep Teal",
+          "opacity": 1
+        }
+      ],
+      "lighting": "combined",
+      "name": "Bottom Left Bubble",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.16
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.15
+      }
+    },
+    {
+      "layers": [
+        {
+          "blend-mode": "normal",
+          "glass": false,
+          "hidden": false,
+          "image-name": "BubbleBottomRight.png",
+          "name": "Cool Periwinkle",
+          "opacity": 1
+        }
+      ],
+      "lighting": "combined",
+      "name": "Bottom Right Bubble",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.16
       },
       "translucency": {
         "enabled": false,
@@ -42,13 +95,13 @@
   "fill-specializations": [
     {
       "value": {
-        "automatic-gradient": "extended-srgb:0.97255,0.96471,0.94510,1.00000"
+        "solid": "extended-srgb:0.97255,0.96471,0.94510,1.00000"
       }
     },
     {
       "appearance": "dark",
       "value": {
-        "automatic-gradient": "extended-srgb:0.07059,0.07451,0.08235,1.00000"
+        "solid": "extended-srgb:0.07059,0.07451,0.08235,1.00000"
       }
     }
   ]

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   canonicalCreationBody,
   createCreationIntentStore
-} from "../../Sources/PiDeskWeb/Site/js/creationIntent.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/creationIntent.mjs";
 
 class MemoryStorage {
   values = new Map();
@@ -102,11 +102,11 @@ test("required durable storage blocks creation before a request id is minted", a
 
 test("corrupt storage is preserved and blocks creation", async () => {
   const storage = new MemoryStorage();
-  storage.setItem("pi-desktop-create-intent-v1", "{broken");
+  storage.setItem("patchwork-create-intent-v1", "{broken");
   const store = createCreationIntentStore({ storage, requireDurable: true });
   assert.equal(await store.begin({ cwd: "/one" }, { replayProtected: true }), null);
   assert.equal(store.isHealthy, false);
-  assert.equal(storage.getItem("pi-desktop-create-intent-v1"), "{broken");
+  assert.equal(storage.getItem("patchwork-create-intent-v1"), "{broken");
 });
 
 test("an oversized first message is rejected before anything is persisted", async () => {
@@ -188,7 +188,7 @@ test("capability loss and an explicit review marker survive reload until reset",
 test("a legacy record without a capability fails closed to review", async () => {
   const storage = new MemoryStorage();
   const body = { cwd: "/legacy" };
-  storage.setItem("pi-desktop-create-intent-v1", JSON.stringify({
+  storage.setItem("patchwork-create-intent-v1", JSON.stringify({
     version: 1,
     body,
     signature: JSON.stringify(body),
@@ -207,7 +207,7 @@ test("a storage read failure blocks a fresh id and preserves the unresolved reco
     idFactory: () => "create-one"
   });
   await first.begin({ cwd: "/one" }, { replayProtected: true });
-  const encoded = storage.values.get("pi-desktop-create-intent-v1");
+  const encoded = storage.values.get("patchwork-create-intent-v1");
   const writesBeforeFailure = storage.writes;
   storage.throwOnRead = true;
 
@@ -220,5 +220,5 @@ test("a storage read failure blocks a fresh id and preserves the unresolved reco
   assert.equal(reloaded.isHealthy, false);
   assert.equal(minted, false);
   assert.equal(storage.writes, writesBeforeFailure);
-  assert.equal(storage.values.get("pi-desktop-create-intent-v1"), encoded);
+  assert.equal(storage.values.get("patchwork-create-intent-v1"), encoded);
 });

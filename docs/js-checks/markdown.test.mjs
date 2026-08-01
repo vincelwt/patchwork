@@ -1,9 +1,9 @@
-// Node-only checks for the pure Markdown renderer (Sources/PiDeskWeb/Site/js/markdown.mjs).
+// Node-only checks for the pure Markdown renderer (Sources/PatchworkWeb/Site/js/markdown.mjs).
 // Not part of `swift build`/`swift test` — see docs/web-remote.md for why and how to run this.
 // Uses only Node's built-in test runner and assert module: no npm, no third-party dependency.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { escapeHtml, renderInline, renderMarkdown } from "../../Sources/PiDeskWeb/Site/js/markdown.mjs";
+import { escapeHtml, renderInline, renderMarkdown } from "../../Sources/PatchworkWeb/Site/js/markdown.mjs";
 
 test("escapeHtml escapes all five HTML-significant characters", () => {
   assert.equal(escapeHtml(`&<>"'`), "&amp;&lt;&gt;&quot;&#39;");

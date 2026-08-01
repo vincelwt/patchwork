@@ -16,7 +16,7 @@ import {
   isActiveRunStatus,
   protectedMutationDisposition,
   runPresentationSignature
-} from "../../Sources/PiDeskWeb/Site/js/liveSync.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/liveSync.mjs";
 
 test("bounded disclosure state prunes invisible keys and its oldest overflow", () => {
   const state = createBoundedDisclosureState(2);

@@ -1,4 +1,4 @@
-# Pi Desktop — working agreement
+# Patchwork — working agreement
 
 Native macOS SwiftUI/AppKit client for the Pi CLI. Pi stays the source of truth; this app reads Pi's session files and drives `pi --mode rpc`.
 
@@ -7,11 +7,11 @@ Native macOS SwiftUI/AppKit client for the Pi CLI. Pi stays the source of truth;
 ```bash
 swift build                 # compile
 swift test                  # 44+ deterministic tests, no provider calls
-./scripts/package-app.sh    # dist/Pi Desktop.app (ad-hoc signed)
-swift run PiDesktop         # run from source
+./scripts/package-app.sh    # dist/Patchwork.app (ad-hoc signed)
+swift run PatchworkApp      # run from source
 ```
 
-`PI_DESKTOP_REAL_SESSION_SMOKE=1 swift test` additionally scans the installed session directory.
+`PATCHWORK_REAL_SESSION_SMOKE=1 swift test` additionally scans the installed session directory.
 
 ## Hard rules
 
@@ -24,21 +24,21 @@ swift run PiDesktop         # run from source
 ## Parallel work with worktrees
 
 ```bash
-scripts/worktree.sh new inline-images     # ../pi-desktop-worktrees/inline-images on feat/inline-images
+scripts/worktree.sh new inline-images     # ../patchwork-worktrees/inline-images on feat/inline-images
 scripts/worktree.sh list
 scripts/worktree.sh rm inline-images
 ```
 
 - One writer per worktree. Never run two writers in the same checkout.
 - Each worktree has its own `.build` and `dist`, so builds and packaged apps do not collide.
-- Only one packaged app should run at a time; they share `~/Library/Application Support/Pi Desktop/state.json` and `~/Library/Caches/Pi Desktop/`.
+- Only one packaged app should run at a time; they share `~/Library/Application Support/Patchwork/state.json` and `~/Library/Caches/Patchwork/`.
 - Rebase or merge back into `main` with `--no-ff`, then re-run build, tests, and packaging.
 
 ## Layout
 
 | Area | Files |
 |---|---|
-| App shell, routing, menus | `PiDesktopApp.swift` |
+| App shell, routing, menus | `PatchworkApp.swift` |
 | State coordinator | `AppStore.swift` |
 | Pi process/protocol | `PiRPCClient.swift`, `RPCPolicy.swift`, `JSONLFramer.swift`, `JSONValue.swift` |
 | Sessions | `SessionRepository.swift`, `SessionParser.swift`, `SessionSummaryCache.swift` |

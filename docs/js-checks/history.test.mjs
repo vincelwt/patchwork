@@ -6,7 +6,7 @@ import {
   mergeLatestPage,
   mergeOlderPage,
   scrollTopAfterPrepend
-} from "../../Sources/PiDeskWeb/Site/js/history.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/history.mjs";
 
 const messages = (from, through, text = (id) => `message ${id}`) =>
   Array.from({ length: through - from + 1 }, (_, index) => {

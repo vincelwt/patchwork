@@ -1,4 +1,4 @@
-# Pi Desktop
+# Patchwork
 
 A native macOS interface for coding agents, built with SwiftUI and AppKit. It drives **Pi**, **Codex**, and **Claude Code** as equal peers, each through its own native protocol. Each agent remains the source of truth for its own conversations: the app reads existing session files and starts the installed CLI only for commands that need it. Browsing, Git inspection, and renaming never send a provider prompt.
 
@@ -7,7 +7,7 @@ A native macOS interface for coding agents, built with SwiftUI and AppKit. It dr
 
 ## Agents
 
-Pi Desktop detects which agents are installed and offers only those. Nothing is a plugin or a
+Patchwork detects which agents are installed and offers only those. Nothing is a plugin or a
 second-class path: Pi's `--mode rpc`, Codex's `codex app-server` JSON-RPC, and Claude Code's
 `--input-format stream-json` all sit behind one adapter seam, and the app speaks one internal
 vocabulary that each adapter translates into.
@@ -37,10 +37,10 @@ Typing `/` at the start of an empty composer opens a **slash command palette** l
 the attached agent exposes: Pi's extension commands, Codex's skills, Claude Code's slash
 commands. Arrows move, Return runs, Escape dismisses.
 
-Settings has an **Agents** pane: switch an agent off and Pi Desktop stops reading its
+Settings has an **Agents** pane: switch an agent off and Patchwork stops reading its
 transcripts and stops offering it for new conversations, without touching anything that agent
-owns. Codex and Claude Code can also be given a small `pi-desktop` skill from there, teaching
-them the `pidesk` CLI that is already on their PATH; Pi already learns it from the extension. A
+owns. Codex and Claude Code can also be given a small `patchwork` skill from there, teaching
+them the `patchwork` CLI that is already on their PATH; Pi already learns it from the extension. A
 skill file with no recognisable version marker is treated as your own and never overwritten.
 
 Settings also has a **Presets** pane. Each preset combines one installed agent, one model from
@@ -50,12 +50,12 @@ agent stays fixed, while model and thinking remain independently adjustable from
 
 Automations follow the agent too. A schedule against an existing conversation resolves its
 agent from that conversation every time it fires, so it never goes stale; a schedule that starts
-a fresh conversation each run records one (`pidesk schedule add --cwd … --agent claude`, default
-Pi). `pidesk` itself is on every agent's PATH, so an agent can create and inspect its own
+a fresh conversation each run records one (`patchwork schedule add --cwd … --agent claude`, default
+Pi). `patchwork` itself is on every agent's PATH, so an agent can create and inspect its own
 automations.
 
 The same three adapters drive the app *and* the headless background service, so automations, the
-`pidesk` CLI, and the web remote reach every agent rather than Pi alone. A route that has to
+`patchwork` CLI, and the web remote reach every agent rather than Pi alone. A route that has to
 launch an agent reports `agent_not_installed` if its binary is gone; reading history never needs
 it. Every affordance is gated on that table rather than on the agent's name, so a control is
 either live, or visibly disabled with a reason. The Environment inspector names what the current agent
@@ -68,31 +68,31 @@ parsing, so paging, tail-first painting, the summary cache, image budgets, and s
 all three without a second implementation. Codex subagent rollouts and Claude sidechain turns
 are parsed but never listed: they are a tool's working notes, not conversations.
 
-Overrides: `PI_DESKTOP_CODEX_PATH`, `PI_DESKTOP_CLAUDE_PATH`, `PI_DESKTOP_CODEX_SESSION_DIR`,
-`PI_DESKTOP_CLAUDE_SESSION_DIR`. An explicit override is a pin: if it does not resolve, that
+Overrides: `PATCHWORK_CODEX_PATH`, `PATCHWORK_CLAUDE_PATH`, `PATCHWORK_CODEX_SESSION_DIR`,
+`PATCHWORK_CLAUDE_SESSION_DIR`. An explicit override is a pin: if it does not resolve, that
 agent is reported as not installed rather than silently falling back to another binary.
 
 ## Features
 
 - Minimal three-column workspace: global conversations under **Recents**, folder-grouped project sessions, a centered transcript/composer, and a reserved Environment inspector column
-- New conversations reopen in the folder the last chat used (Global, with Pi's neutral `~/Desktop` cwd, until you pick one); **Choose…** lists only projects already known from sidebar conversations
+- Import real project folders from the sidebar, File menu, or the new-chat **Choose…** menu. An imported project appears in the sidebar before its first conversation, and **Choose…** lists the same complete set of real sidebar folders
 - A **Worktree** checkbox on the new-chat row runs the conversation in a fresh git worktree cut off the project's main line (`origin/main` → `origin/master` → `main` → `master` → `HEAD`) and stored under `~/.pi/worktrees`, never inside the project. The worktree is execution-only: the new-chat row, sidebar, breadcrumbs, search, and folder defaults keep treating the conversation as part of its original project. Unchecking it before sending removes the worktree again; the branch always survives
 - App-owned folders created from the sidebar context menu, nesting at any depth inside another virtual folder or a real project. Real projects can also be grouped under a virtual folder through “Move Folder to…”. Virtual folders never touch the filesystem.
-- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations under **Running**, **Unread**, **Open PRs**, **Done**, and **Automated**, in that priority so each appears exactly once, with a quiet location hint. Every category header carries a count and folds its rows away on a click, Automated included; categories start expanded. Pi Desktop recognizes the latest GitHub PR created by each active conversation branch and checks current PR/review state through one authenticated `gh` query on refresh and every five minutes while open. Running order follows the stable turn start in both the sidebar and menu bar, so tool writes never reshuffle it; other sections remain newest-first. The menu bar panel lists the same **Running**, **Unread**, and **Done** buckets, filled in that order up to one shared 50-row bound with the remainder as a single line. The menu bar dot carries the Running count, and the Dock icon badge carries the Done count. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
+- A sidebar **Tree**/**Status** switch: Status drops the hierarchy and lists every project's conversations under **Running**, **Unread**, **Open PRs**, **Done**, and **Automated**, in that priority so each appears exactly once, with a quiet location hint. Every category header carries a count and folds its rows away on a click, Automated included; categories start expanded. Patchwork recognizes the latest GitHub PR created by each active conversation branch and checks current PR/review state through one authenticated `gh` query on refresh and every five minutes while open. Running order follows the stable turn start in both the sidebar and menu bar, so tool writes never reshuffle it; other sections remain newest-first. The menu bar panel lists the same **Running**, **Unread**, and **Done** buckets, filled in that order up to one shared 50-row bound with the remainder as a single line. The menu bar dot carries the Running count, and the Dock icon badge carries the Done count. Archived keep their pinned area in both modes, and the toolbar names the open conversation by its full `project > folder > name` path.
 - Codex-style turns: running work stays collapsed to a live latest-reasoning/error/compaction line with elapsed time and a pulsing green dot, expands into borderless details on demand, and settles into one “Worked for 4m 1s” line as the answer starts. Retried errors, compaction, and branch summaries stay inside that same work log.
 - Independent live runtimes per working conversation, plus same-folder idle-process reuse; the one retained idle runtime retires after a resettable 120-second lease
 - One app-owned macOS sleep hold covers every running thread and releases when the last one settles. The coffee icon in the sidebar footer shows the live state; one silent app lease also drives the installed closed-lid companion, with no per-Pi-process sleep workers or failure notifications.
 - Per-conversation drafts that survive switching conversations and relaunching the app, capped and evicted so state stays bounded
 - Desktop notifications when the app is in the background and clickable in-app banners when it is frontmost, for finished turns, questions, settled errors, and approval requests. Banners omit the conversation name; clicking one opens its conversation. The conversation you are looking at never notifies, errors Pi is still retrying stay silent, and a finished-turn notification shows a plain-text beginning of Pi's actual latest answer instead of a generic phrase.
-- Run state and completed-answer IDs verified against a small Pi extension (`pi-desktop-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
+- Run state and completed-answer IDs verified against a small Pi extension (`patchwork-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - Transient provider failures keep retrying without replaying the original prompt. Desktop pauses Pi's retry budget while offline, resumes when connectivity returns, and after Pi exhausts its short built-in retries continues with exponential backoff from 15 seconds to one hour for as long as the app remains open. The installed helper keeps continuations hidden and context-only, with a visible plain continuation fallback if unavailable. If a continuation cannot be sent, the visible **Retry** button uses the same safe path; crashes before prompt acceptance still restore the exact draft.
 - App-owned accepted turns survive an app restart as durable recovery records. A heartbeat-verified provider-only interruption queues one continuation against the same Pi session on launch; unknown ownership or prompt delivery, a live writer, an active tool, or a previously interrupted recovery is surfaced for review instead of being replayed. Plain terminal `pi` sessions are never adopted.
 - Recent conversations and sidebar neighbours prefetch only their newest bounded page. Loading history keeps one detailed older page visibly connected above the frozen latest page, with the same collapsed work rows as live history, and can reach the first active-branch message with bounded memory; Live returns directly to current work
 - Fast native search, app-local non-destructive archive/restore (also one hover click from any row; archiving the open conversation advances to the next active chat, and sending one restores it). Archive intent persists across a service reconnect or app relaunch, and CLI-created or CLI-archived threads project into the sidebar immediately before the next catalog reconciliation. When automations target a conversation, Archive confirms first and deletes them before moving the conversation. Rename works even while Pi is working, alongside HTML export, reveal, and compaction
 - The archive reads as a flat list, most recently archived first, with each row's project as its hint — not the folder tree the active list uses. Archiving keeps the conversation's worktree so a restore still has it; 7 days after archiving, the conversation leaves the sidebar and its worktree is released. Removal is never forced, so a worktree with uncommitted work stays on disk, and Pi's own session file is never touched
-- When a conversation opens a pull or merge request, the toolbar carries a quick link to it (`#482`), pointing at the most recent one. Pi Desktop itself watches fresh GitHub PRs for up to 24 hours, without creating an automation or polling a provider; review findings wake the same conversation to address, test, and push fixes without ever merging
+- When a conversation opens a pull or merge request, the toolbar carries a quick link to it (`#482`), pointing at the most recent one. Patchwork itself watches fresh GitHub PRs for up to 24 hours, without creating an automation or polling a provider; review findings wake the same conversation to address, test, and push fixes without ever merging
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
-- Sidebar rows carry their status on the trailing edge: a pulsing green dot while Pi, a subagent, or a managed process is working, a blue dot when unread, and a clock when any automation (running or paused) targets that conversation. A managed process keeps its conversation's Pi runtime alive until the lifecycle update arrives, and the Inspector keeps that process active until the same update. Real project headers use a Git branch icon, orange when dirty, while virtual folders keep the folder icon. Running rows show live elapsed time and swap it for their Pi process tree's CPU and memory use on hover; the sidebar footer reports the whole Pi Desktop process tree plus any external running conversations. Reduce Motion keeps working indicators static. The composer takes focus as soon as a conversation opens.
+- Sidebar rows carry their status on the trailing edge: a pulsing green dot while Pi, a subagent, or a managed process is working, a blue dot when unread, and a clock when any automation (running or paused) targets that conversation. A managed process keeps its conversation's Pi runtime alive until the lifecycle update arrives, and the Inspector keeps that process active until the same update. Real project headers use a Git branch icon, orange when dirty, while virtual folders keep the folder icon. Running rows show live elapsed time and swap it for their Pi process tree's CPU and memory use on hover; the sidebar footer reports the whole Patchwork process tree plus any external running conversations. Reduce Motion keeps working indicators static. The composer takes focus as soon as a conversation opens.
 - Branch/worktree state and additions/deletions totals with expandable per-file LOC; when tools switch to a repository or linked worktree, the Environment inspector follows it and shows the worktree name. Its open/closed state is global and survives relaunches.
 - Messages appear in the transcript immediately on Send; Pi starts only after a composer edit, attachment edit, picker interaction, or command, while transcript history and live updates continue to come from the session file/cache without replacing the open scroll surface
 - Editing and resubmitting the latest user message creates a new branch inside the current Pi session, keeping the conversation and its alternate history together instead of creating another sidebar conversation
@@ -112,18 +112,18 @@ No provider request is made when the app launches, browses sessions, inspects Gi
 
 ## The headless half
 
-Pi Desktop has a control plane so threads keep running, get scheduled, and can be driven when
+Patchwork has a control plane so threads keep running, get scheduled, and can be driven when
 the window is closed. The wire contract is `docs/daemon-api.md`; the CLI reference is
 `docs/cli.md`; remote access is `docs/web-remote.md`.
 
 | Piece | Binary | Role |
 |---|---|---|
-| Daemon | `pi-deskd` | Scheduler, thread runner, control API over a Unix socket (and loopback TCP when enabled) |
-| CLI | `pidesk` | Full control from a terminal or another agent, `--json` everywhere |
+| Daemon | `patchworkd` | Scheduler, thread runner, control API over a Unix socket (and loopback TCP when enabled) |
+| CLI | `patchwork` | Full control from a terminal or another agent, `--json` everywhere |
 | Web remote | `remote.ai.gloom.sh` | QR-paired, end-to-end encrypted phone UI for threads and schedules |
 
 Click the phone button in the sidebar footer only to pair or manage a browser. After that, the
-hosted relay starts automatically with Pi Desktop and the phone reconnects whenever the app is
+hosted relay starts automatically with Patchwork and the phone reconnects whenever the app is
 open; no VPN, inbound port, or tunnel is needed. A browser stays paired until its site data is
 cleared or it is revoked on the Mac. The Mac still executes every request and must be online.
 
@@ -175,36 +175,36 @@ The phone UI covers the daily loop, not just reading:
   than stopping at the newest 50 conversations, respects the Mac's external-conversation and
   disabled-agent settings, and keeps a conversation started remotely in both lists.
 
-By default the control service runs directly inside `Pi Desktop.app`: the Unix-socket API,
+By default the control service runs directly inside `Patchwork.app`: the Unix-socket API,
 scheduler, remote relay, and their Pi workers start and stop with the app, with no separate
-`pi-deskd` child to supervise. The bundle still includes `pidesk` and the optional standalone
+`patchworkd` child to supervise. The bundle still includes `patchwork` and the optional standalone
 host so the explicit LaunchAgent mode below remains available. If a LaunchAgent or manually
 started host already owns the socket, the app defers to it rather than starting a competing
 service.
 
-The packaged app ships `pidesk` inside its bundle, so it is not on `PATH` until you link it.
-Settings → Daemon has an **Install “pidesk”** button that symlinks it into `~/.local/bin`
+The packaged app ships `patchwork` inside its bundle, so it is not on `PATH` until you link it.
+Settings → Daemon has an **Install “patchwork”** button that symlinks it into `~/.local/bin`
 (next to the Pi CLI); it never overwrites an existing file it does not own.
 
 For a daemon that runs without the app at all — a headless machine, or automations that must
 survive the app never being opened — install it as a LaunchAgent instead:
 
 ```bash
-swift build -c release --product pi-deskd
-swift build -c release --product pidesk
+swift build -c release --product patchworkd
+swift build -c release --product patchwork
 scripts/install-daemon.sh              # LaunchAgent, starts at login, restarts on crash
-pidesk                              # active threads plus help in one call
-pidesk threads new --cwd . --worktree --name "CLI task" --client-id cli_task_1
-pidesk threads new --cwd . --agent claude --message "Survey the repository"
-pidesk threads show <short-id>       # 8 dialogue messages; add --all for tool results
-pidesk threads send <short-id> "continue" --client-id cli_turn_1
-pidesk schedule add --name "Morning triage" --thread <short-id> \
+patchwork                              # active threads plus help in one call
+patchwork threads new --cwd . --worktree --name "CLI task" --client-id cli_task_1
+patchwork threads new --cwd . --agent claude --message "Survey the repository"
+patchwork threads show <short-id>       # 8 dialogue messages; add --all for tool results
+patchwork threads send <short-id> "continue" --client-id cli_turn_1
+patchwork schedule add --name "Morning triage" --thread <short-id> \
     --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
-pidesk remote enable --port 7717      # optional legacy loopback/tunnel listener
+patchwork remote enable --port 7717      # optional legacy loopback/tunnel listener
 ```
 
 If both are present, the app defers to the LaunchAgent rather than running a second daemon;
-`pidesk daemon status` reports which one (or neither) is actually in play. Human thread lists use
+`patchwork daemon status` reports which one (or neither) is actually in play. Human thread lists use
 compact UUID tails, omit archived threads by default, mark automated and managed-worktree threads,
 and include longer previews. See `docs/cli.md` for dialogue-only history paging and raw tool-result
 controls, and docs/daemon-api.md's "Lifecycle" section for the full host contract.
@@ -220,7 +220,7 @@ the scheduled message concise and relies on its durable history instead of repea
 runbook. The Agent extension's session-local scheduler remains the fallback for specialized
 subagent jobs or when the service is off.
 
-The default app-hosted service runs only while Pi Desktop is open. On quit it stops its own Pi
+The default app-hosted service runs only while Patchwork is open. On quit it stops its own Pi
 workers; direct terminal `pi` processes remain external and untouched. Missed one-shot, cron, and
 interval work is kept durably and coalesced into one catch-up run on the next launch; heartbeat
 checks simply resume. An offline Mac keeps work pending without consuming an attempt; temporary
@@ -231,26 +231,26 @@ can have side effects.
 ## Run state
 
 Run state and thread-to-automation routing come from a small Pi extension the app installs into
-`~/.pi/agent/extensions/pi-desktop-activity.ts`. It writes one heartbeat per process to
-`~/.pi/agent/desktop-activity/<sessionId>-<pid>.json`; a session counts as running when any
+`~/.pi/agent/extensions/patchwork-activity.ts`. It writes one heartbeat per process to
+`~/.pi/agent/patchwork-activity/<sessionId>-<pid>.json`; a session counts as running when any
 heartbeat says so, is fresher than ten seconds, and its process is still alive. The same heartbeat
 carries a stable terminal assistant entry ID, which drives unread dots and exactly-once completion
 notifications even when file mtimes collide. Sessions started before the extension existed fall
 back to a bounded file heuristic. Opt out with
-`defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
+`defaults write app.patchwork.desktop PatchworkActivityHeartbeatDisabled -bool YES`.
 
 ## Run during development
 
 Requirements: macOS 14+, Xcode 26+ (for packaging the Icon Composer app icon), and Pi installed.
 
 ```bash
-cd /Users/vince/code/pi-desktop
-swift run PiDesktop
+cd /Users/vince/code/patchwork
+swift run PatchworkApp
 ```
 
-Pi Desktop searches for Pi in this order:
+Patchwork searches for Pi in this order:
 
-1. `PI_DESKTOP_PI_PATH`
+1. `PATCHWORK_PI_PATH`
 2. `~/.local/bin/pi`
 3. `/opt/homebrew/bin/pi`
 4. `/usr/local/bin/pi`
@@ -258,18 +258,18 @@ Pi Desktop searches for Pi in this order:
 
 The child process receives an augmented `PATH`, so Pi's `#!/usr/bin/env node` launcher also works from Finder. Set `PI_CODING_AGENT_SESSION_DIR` to use a non-default session directory. Codex and Claude Code are resolved from the same directories under their own names. Pinning `PI_CODING_AGENT_SESSION_DIR` to a fixture tree pins every agent's root, so a test or sandboxed daemon never sweeps in the machine's real history.
 
-On launch, Pi Desktop installs or repairs `~/.pi/agent/extensions/pi-desktop-activity.ts` (source of truth: `Resources/pi-desktop-activity.ts`) so every Pi session — terminal or RPC — reports its own run state and can name a new conversation during its first turn. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write dev.pi.desktop PiDesktopActivityHeartbeatDisabled -bool YES`.
+On launch, Patchwork installs or repairs `~/.pi/agent/extensions/patchwork-activity.ts` (source of truth: `Resources/patchwork-activity.ts`) so every Pi session — terminal or RPC — reports its own run state and can name a new conversation during its first turn. It only ever writes a missing file or an older version, is never installed over a file it does not recognize, and can be turned off entirely with `defaults write app.patchwork.desktop PatchworkActivityHeartbeatDisabled -bool YES`.
 
 ## Package a local app
 
 ```bash
 ./scripts/package-app.sh
-open "/Applications/Pi Desktop.app"
+open "/Applications/Patchwork.app"
 ```
 
-The script builds, bundles, ad-hoc signs, and installs `/Applications/Pi Desktop.app`. The app
-contains the default control service directly; `Contents/Helpers/` carries `pidesk` plus the
-optional standalone `pi-deskd` LaunchAgent host, each signed before the whole-bundle pass. Pi and
+The script builds, bundles, ad-hoc signs, and installs `/Applications/Patchwork.app`. The app
+contains the default control service directly; `Contents/Helpers/` carries `patchwork` plus the
+optional standalone `patchworkd` LaunchAgent host, each signed before the whole-bundle pass. Pi and
 Node are intentionally not bundled.
 
 ## Keyboard and queue behavior
@@ -309,19 +309,19 @@ While Pi is running, Send and **Steer current run** hand the message to Pi immed
 App-owned archive and recent-folder metadata lives at:
 
 ```text
-~/Library/Application Support/Pi Desktop/state.json
+~/Library/Application Support/Patchwork/state.json
 ```
 
 The summary index lives under:
 
 ```text
-~/Library/Caches/Pi Desktop/session-summaries-v5.json
+~/Library/Caches/Patchwork/session-summaries-v5.json
 ```
 
 Activity heartbeats (app/extension-owned, never Pi session data) live under:
 
 ```text
-~/.pi/agent/desktop-activity/<sessionId>-<pid>.json
+~/.pi/agent/patchwork-activity/<sessionId>-<pid>.json
 ```
 
 Archiving never moves or edits a Pi JSONL file.
@@ -366,7 +366,7 @@ terminal-success-only eviction, durable submission replay after restart, crash a
 fails closed, live-session settlement, bounded pipe writes, folder-tree bounds, inline images,
 interaction retries and validation, live steer and follow-up outcomes, concurrent stdin writes,
 bounded worktree discovery, and app versus daemon archive ownership. Set
-`PI_DESKTOP_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a
+`PATCHWORK_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a
 provider.
 
 ## Current limitations
@@ -375,6 +375,6 @@ Claude Code cannot change reasoning effort mid-session, so the app stores the ch
 
 The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 
-Pi Desktop keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed detailed transcript page retains at most 1,000 messages, but dialogue-focused page replacement can navigate through the entire active branch; a page scan reports an explicit unreadable-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
+Patchwork keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed detailed transcript page retains at most 1,000 messages, but dialogue-focused page replacement can navigate through the entire active branch; a page scan reports an explicit unreadable-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
 
 On the web remote: the transcript is polled while a thread runs (SSE carries no message bodies), so a long turn advances in ~2.5s steps rather than token by token, and unlike the Mac app there is no streaming answer. Work-row disclosures are open per screen and are not restored after a reload. Steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited because Pi's dialog bridge is sequential, so there is no Back. Drafts, creation intent, and unconfirmed messages survive a full reload in bounded local storage. Replay protection is durable and bounded to 256 submissions for 30 minutes. A completed response replays across a daemon restart; an in-flight claim left by a crash is marked outcome-unknown and requires review rather than risking a duplicate. While all 256 are still protected, a new send is refused with `503 submissions_busy`. Message attachments are rejected rather than forwarded. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone. The web remote can select worktrees but not create or remove them. Archiving from the web is the daemon's own flag: a thread archived in the Mac app still shows under Archived, but restoring it answers `409 archived_in_app` and has to be done in the app, because the daemon never writes the app's `state.json`.

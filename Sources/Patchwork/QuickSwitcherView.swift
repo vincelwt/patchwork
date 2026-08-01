@@ -1,0 +1,277 @@
+import AppKit
+import SwiftUI
+
+/// ⌘K palette. Fuzzy/substring ranking over the bounded search key that summary projection
+/// already folded, so hundreds of sessions filter without a visible delay.
+struct QuickSwitcherView: View {
+    @EnvironmentObject private var store: AppStore
+    @Binding var isPresented: Bool
+
+    @State private var query = ""
+    @State private var selection = 0
+
+    private var results: [SessionSummary] {
+        QuickSwitchScoring.rank(
+            store.sessions.filter { !$0.isArchived },
+            query: query,
+            limit: PatchworkTheme.quickSwitchResultLimit,
+            folderName: { store.displayFolderName(for: $0) }
+        )
+    }
+
+    var body: some View {
+        let matches = results
+        VStack(spacing: 0) {
+            HStack(spacing: PatchworkTheme.space8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: PatchworkIcon.medium, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                // A native field so arrow keys and Return are intercepted before the text
+                // field turns them into caret movement.
+                PaletteField(
+                    text: $query,
+                    placeholder: "Go to conversation",
+                    onMove: { delta in
+                        selection = QuickSwitchNavigation.move(selection, by: delta, count: matches.count)
+                    },
+                    onSubmit: { activate(matches) },
+                    onCancel: { isPresented = false }
+                )
+                .frame(height: 20)
+                if !query.isEmpty {
+                    Text("\(matches.count)")
+                        .font(SidebarTypography.metadata.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, PatchworkTheme.space16)
+            .frame(height: 44)
+
+            PatchworkHairline()
+
+            if matches.isEmpty {
+                Text("No conversations match “\(query)”")
+                    .font(SidebarTypography.status)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, PatchworkTheme.space16)
+                    .padding(.vertical, PatchworkTheme.space20)
+            } else {
+                ScrollViewReader { reader in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            // Identified by file path, not `session.id`: that id is read from
+                            // the JSONL's own content and can collide across two distinct
+                            // files, which would otherwise make SwiftUI misrender rows as
+                            // duplicates.
+                            ForEach(Array(matches.enumerated()), id: \.element.fileURL.standardizedFileURL.path) { index, session in
+                                QuickSwitchRow(
+                                    session: session,
+                                    running: store.isRunning(session),
+                                    modifiedAt: store.liveModifiedAt(session),
+                                    folderName: store.displayFolderName(for: session),
+                                    unread: store.isUnread(session),
+                                    selected: index == selection
+                                )
+                                .id(index)
+                                .onTapGesture {
+                                    selection = index
+                                    activate(matches)
+                                }
+                            }
+                        }
+                        .padding(.vertical, PatchworkTheme.space4)
+                    }
+                    .frame(maxHeight: PatchworkTheme.quickSwitchRowHeight * 8)
+                    .onChange(of: selection) { _, value in
+                        withAnimation(.easeOut(duration: 0.12)) { reader.scrollTo(value, anchor: .center) }
+                    }
+                }
+            }
+
+            PatchworkHairline()
+
+            HStack(spacing: PatchworkTheme.space12) {
+                HintLabel(keys: "↑↓", text: "Navigate")
+                HintLabel(keys: "↩", text: "Open")
+                HintLabel(keys: "esc", text: "Dismiss")
+                Spacer()
+            }
+            .padding(.horizontal, PatchworkTheme.space16)
+            .frame(height: 26)
+            // The shortcuts are already spoken by the field and the rows.
+            .accessibilityHidden(true)
+        }
+        .frame(width: PatchworkTheme.quickSwitchWidth)
+        .background(Color.patchworkTranscript, in: RoundedRectangle(cornerRadius: PatchworkTheme.panelRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: PatchworkTheme.panelRadius, style: .continuous)
+                .stroke(Color.patchworkHairline, lineWidth: PatchworkTheme.hairline)
+        }
+        .shadow(color: .black.opacity(0.22), radius: 24, y: 10)
+        .onChange(of: query) { _, _ in selection = 0 }
+        .onExitCommand { isPresented = false }
+        // `contain` rather than a blanket label, otherwise every child inherits the palette
+        // name and VoiceOver repeats it once per hint chip.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Quick conversation switcher")
+    }
+
+    private func activate(_ matches: [SessionSummary]) {
+        guard selection >= 0, selection < matches.count else { return }
+        store.selectSession(matches[selection])
+        isPresented = false
+    }
+}
+
+private struct QuickSwitchRow: View {
+    let session: SessionSummary
+    let running: Bool
+    let modifiedAt: Date
+    let folderName: String
+    let unread: Bool
+    let selected: Bool
+
+    var body: some View {
+        // Same one-icon-column, one-text-origin grid the sidebar rows use, so a result reads
+        // like the conversation list it is drawn from rather than a differently-aligned list.
+        HStack(spacing: PatchworkTheme.space6) {
+            if unread {
+                Circle().fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+                    .frame(width: PatchworkTheme.sidebarIconColumn, alignment: .center)
+            } else {
+                Image(systemName: "folder")
+                    .font(.system(size: PatchworkIcon.small))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: PatchworkTheme.sidebarIconColumn, alignment: .center)
+            }
+            Text(session.displayName)
+                .font(SidebarTypography.conversationTitle(selected: selected))
+                .lineLimit(1)
+                // Wins the tug-of-war for space over the folder tag, so a long title stays
+                // legible and the folder name (secondary, disambiguating info) truncates first.
+                .layoutPriority(1)
+            Text(folderName)
+                .font(SidebarTypography.metadata)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Spacer(minLength: PatchworkTheme.space4)
+            if running {
+                ProgressView().controlSize(.mini)
+            } else {
+                Text(modifiedAt.relativeShort)
+                    .font(SidebarTypography.metadata)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.leading, PatchworkTheme.sidebarIconInset)
+        .padding(.trailing, PatchworkTheme.space8)
+        .frame(height: PatchworkTheme.quickSwitchRowHeight)
+        .contentShape(Rectangle())
+        .background(
+            selected ? Color.patchworkSelection : Color.clear,
+            in: RoundedRectangle(cornerRadius: PatchworkTheme.radiusSmall, style: .continuous)
+        )
+        .padding(.horizontal, PatchworkTheme.space6)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(selected ? "Selected" : "")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [session.displayName, folderName, modifiedAt.relativeShort]
+        if running { parts.append("running") }
+        if unread { parts.append("unread") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// A borderless single-line `NSTextField` that hands arrow/Return/Escape to the palette instead
+/// of consuming them as text editing commands.
+private struct PaletteField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let onMove: (Int) -> Void
+    let onSubmit: () -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField()
+        field.delegate = context.coordinator
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        // Matches the AppKit body-size constant `ComposerTextView` uses for its own native
+        // text view, rather than an unrelated one-off literal for this palette's own field.
+        field.font = PatchworkFont.composerNSFont
+        field.placeholderString = placeholder
+        field.lineBreakMode = .byTruncatingTail
+        field.cell?.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.stringValue = text
+        field.setAccessibilityLabel("Quick switcher query")
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text { field.stringValue = text }
+        if !context.coordinator.hasFocused, field.window != nil {
+            context.coordinator.hasFocused = true
+            DispatchQueue.main.async { field.window?.makeFirstResponder(field) }
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: PaletteField
+        var hasFocused = false
+
+        init(_ parent: PaletteField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.moveUp(_:)):
+                parent.onMove(-1)
+            case #selector(NSResponder.moveDown(_:)):
+                parent.onMove(1)
+            case #selector(NSResponder.insertNewline(_:)):
+                parent.onSubmit()
+            case #selector(NSResponder.cancelOperation(_:)):
+                parent.onCancel()
+            default:
+                return false
+            }
+            return true
+        }
+    }
+}
+
+/// The shared keyboard-hint chip: ⌘K's footer and the composer's slash-command palette.
+struct HintLabel: View {
+    let keys: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: PatchworkTheme.space4) {
+            Text(keys)
+                .font(SidebarTypography.metadata.weight(.medium))
+                .padding(.horizontal, PatchworkTheme.space4)
+                .frame(height: 14)
+                .patchworkInset(radius: 3)
+            Text(text)
+                .font(SidebarTypography.metadata)
+                .foregroundStyle(.tertiary)
+        }
+    }
+}

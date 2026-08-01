@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Installs pi-deskd as a per-user LaunchAgent: builds the release binary, copies it to a stable
+# Installs patchworkd as a per-user LaunchAgent: builds the release binary, copies it to a stable
 # location outside any git worktree (worktrees come and go per scripts/worktree.sh; the running
 # daemon must not depend on one surviving), writes the plist, and (re)loads it.
 #
-# Only needed for always-on use without Pi Desktop.app (e.g. a headless machine): by default the
+# Only needed for always-on use without Patchwork.app (e.g. a headless machine): by default the
 # app hosts the same control service in-process. If this LaunchAgent is installed, the app defers
 # to it rather than binding a competing service (docs/daemon-api.md, "Lifecycle").
 #
@@ -17,12 +17,12 @@ set -euo pipefail
 # Idempotent: safe to re-run after a rebuild, after an uninstall, or on a machine where it was
 # never installed at all.
 
-LABEL="dev.pi.desktop.daemon"
-SUPPORT_DIR="$HOME/Library/Application Support/Pi Desktop"
+LABEL="app.patchwork.desktop.daemon"
+SUPPORT_DIR="$HOME/Library/Application Support/Patchwork"
 BIN_DIR="$SUPPORT_DIR/bin"
-INSTALLED_BINARY="$BIN_DIR/pi-deskd"
-INSTALLED_WEB_BUNDLE="$BIN_DIR/PiDesktop_PiDeskWeb.bundle"
-LOG_DIR="$HOME/Library/Logs/Pi Desktop"
+INSTALLED_BINARY="$BIN_DIR/patchworkd"
+INSTALLED_WEB_BUNDLE="$BIN_DIR/Patchwork_PatchworkWeb.bundle"
+LOG_DIR="$HOME/Library/Logs/Patchwork"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,12 +32,12 @@ usage() {
     cat <<USAGE
 Usage: $(basename "$0") [--uninstall|--status]
 
-Installs pi-deskd as a LaunchAgent (RunAtLoad, restarts on crash) at:
+Installs patchworkd as a LaunchAgent (RunAtLoad, restarts on crash) at:
   $PLIST_PATH
 running the binary installed at:
   $INSTALLED_BINARY
 
-  (no args)     build pi-deskd, install/update the LaunchAgent, (re)load it
+  (no args)     build patchworkd, install/update the LaunchAgent, (re)load it
   --uninstall   unload the LaunchAgent and remove the plist and installed binary
   --status      print whether the LaunchAgent is currently loaded
 USAGE
@@ -89,13 +89,13 @@ case "${1:-}" in
         ;;
 esac
 
-echo "Building pi-deskd (release)…"
-(cd "$ROOT" && swift build -c release --product pi-deskd)
+echo "Building patchworkd (release)…"
+(cd "$ROOT" && swift build -c release --product patchworkd)
 BUILD_DIR="$(cd "$ROOT" && swift build -c release --show-bin-path)"
-BUILT_BINARY="$BUILD_DIR/pi-deskd"
-BUILT_WEB_BUNDLE="$BUILD_DIR/PiDesktop_PiDeskWeb.bundle"
+BUILT_BINARY="$BUILD_DIR/patchworkd"
+BUILT_WEB_BUNDLE="$BUILD_DIR/Patchwork_PatchworkWeb.bundle"
 if [ ! -x "$BUILT_BINARY" ] || [ ! -d "$BUILT_WEB_BUNDLE" ]; then
-    echo "error: build did not produce pi-deskd and its PiDeskWeb resource bundle" >&2
+    echo "error: build did not produce patchworkd and its PatchworkWeb resource bundle" >&2
     exit 1
 fi
 
@@ -149,7 +149,7 @@ launchctl enable "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 
 sleep 1
 if is_loaded; then
-    echo "pi-deskd installed and running."
+    echo "patchworkd installed and running."
     echo "  binary: $INSTALLED_BINARY"
     echo "  plist:  $PLIST_PATH"
     echo "  logs:   $LOG_DIR/daemon.log (application log)"

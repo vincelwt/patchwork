@@ -4,7 +4,7 @@ import {
   createThreadViewStateStore,
   draftAfterSharedUpdate,
   draftAfterSubmit
-} from "../../Sources/PiDeskWeb/Site/js/threadState.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/threadState.mjs";
 
 class MemoryStorage {
   values = new Map();
@@ -29,7 +29,7 @@ test("send admission keeps text typed after the submitted snapshot", () => {
 
 test("cached thread opens do not reread the durable envelope", () => {
   const storage = new MemoryStorage();
-  storage.setItem("pi-desktop-thread-view-state-v1", JSON.stringify({
+  storage.setItem("patchwork-thread-view-state-v1", JSON.stringify({
     version: 1,
     entries: [["thread", { draft: "cached" }]]
   }));
@@ -58,7 +58,7 @@ test("an out-of-order storage event cannot rewind a newer local commit", async (
   const storage = new MemoryStorage();
   const eventTarget = new MemoryEventTarget();
   const lockManager = new MemoryLockManager();
-  const key = "pi-desktop-thread-view-state-v1";
+  const key = "patchwork-thread-view-state-v1";
   const envelope = (draft) => JSON.stringify({ version: 1, entries: [["thread", { draft }]] });
   const oldest = envelope("old");
   storage.setItem(key, oldest);
@@ -166,7 +166,7 @@ test("expired same-id retry state becomes review-only without losing its text", 
 
 test("corrupt durable state is preserved and blocks new commits", () => {
   const storage = new MemoryStorage();
-  storage.setItem("pi-desktop-thread-view-state-v1", JSON.stringify({
+  storage.setItem("patchwork-thread-view-state-v1", JSON.stringify({
     version: 1,
     entries: [["thread", { draft: "one" }], ["thread", { draft: "duplicate" }]]
   }));
@@ -187,7 +187,7 @@ test("required durable storage blocks a send reservation", () => {
 
 test("nine pending records fail closed instead of silently dropping one", () => {
   const storage = new MemoryStorage();
-  storage.setItem("pi-desktop-thread-view-state-v1", JSON.stringify({
+  storage.setItem("patchwork-thread-view-state-v1", JSON.stringify({
     version: 1,
     entries: [["thread", {
       pending: Array.from({ length: 9 }, (_, index) => ({
@@ -270,7 +270,7 @@ test("a locked update fails closed when the authoritative storage read throws", 
   const lockManager = new MemoryLockManager();
   const first = createThreadViewStateStore({ storage, lockManager, requireDurable: true });
   await first.updateAtomic("thread", (state) => ({ ...state, draft: "protected" }));
-  const encoded = storage.values.get("pi-desktop-thread-view-state-v1");
+  const encoded = storage.values.get("patchwork-thread-view-state-v1");
   const writesBeforeFailure = storage.writes;
   storage.throwOnRead = true;
 
@@ -278,5 +278,5 @@ test("a locked update fails closed when the authoritative storage read throws", 
   assert.equal(await second.updateAtomic("thread", (state) => ({ ...state, draft: "lost" })), null);
   assert.equal(second.isHealthy, false);
   assert.equal(storage.writes, writesBeforeFailure);
-  assert.equal(storage.values.get("pi-desktop-thread-view-state-v1"), encoded);
+  assert.equal(storage.values.get("patchwork-thread-view-state-v1"), encoded);
 });

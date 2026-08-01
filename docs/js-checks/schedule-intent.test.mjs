@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   createScheduleCreationIntentStore,
   createScheduleRunIntentStore
-} from "../../Sources/PiDeskWeb/Site/js/scheduleIntent.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/scheduleIntent.mjs";
 
 class MemoryStorage {
   values = new Map();
@@ -234,8 +234,8 @@ test("storage events restore recovery state in another mounted tab", async () =>
     replayProtected: true
   });
   events.dispatch(
-    "pi-desktop-schedule-run-intents-v1",
-    storage.getItem("pi-desktop-schedule-run-intents-v1"),
+    "patchwork-schedule-run-intents-v1",
+    storage.getItem("patchwork-schedule-run-intents-v1"),
     storage
   );
   assert.equal(notifications, 1);
@@ -251,7 +251,7 @@ test("a throwing storage read never mints or overwrites recovery work", async ()
   await first.reserve("schedule-a", { scheduleId: "schedule-a" }, {
     replayProtected: true
   });
-  const encoded = storage.getItem("pi-desktop-schedule-run-intents-v1");
+  const encoded = storage.getItem("patchwork-schedule-run-intents-v1");
   const writes = storage.writes;
   storage.throwOnRead = true;
   let minted = false;
@@ -265,5 +265,5 @@ test("a throwing storage read never mints or overwrites recovery work", async ()
   assert.equal(failed.isHealthy, false);
   assert.equal(minted, false);
   assert.equal(storage.writes, writes);
-  assert.equal(storage.values.get("pi-desktop-schedule-run-intents-v1"), encoded);
+  assert.equal(storage.values.get("patchwork-schedule-run-intents-v1"), encoded);
 });

@@ -1,4 +1,4 @@
-// Node-only checks for the pure schedule-trigger helpers (Sources/PiDeskWeb/Site/js/trigger.mjs).
+// Node-only checks for the pure schedule-trigger helpers (Sources/PatchworkWeb/Site/js/trigger.mjs).
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -7,7 +7,7 @@ import {
   looksLikeCron,
   buildTrigger,
   triggerSummary
-} from "../../Sources/PiDeskWeb/Site/js/trigger.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/trigger.mjs";
 
 test("parseDurationToSeconds: units and bare numbers", () => {
   assert.equal(parseDurationToSeconds("15m"), 900);

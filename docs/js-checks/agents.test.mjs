@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   AGENTS, agentLabel, canChangeThinking, canRenameSession, shouldShowAgentBadge
-} from "../../Sources/PiDeskWeb/Site/js/agents.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/agents.mjs";
 
 test("agentLabel: every agent this build ships has a label", () => {
   assert.deepEqual(AGENTS.map((agent) => agent.id), ["pi", "codex", "claude"]);

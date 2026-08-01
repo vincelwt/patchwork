@@ -9,7 +9,7 @@ import {
   groupIdForFolder,
   isFlatList,
   threadIdentity
-} from "../../Sources/PiDeskWeb/Site/js/folders.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/folders.mjs";
 
 const thread = (id, cwd, extra = {}) => ({
   id,

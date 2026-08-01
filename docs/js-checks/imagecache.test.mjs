@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ImageCacheBusyError, createImageCache, estimateBytes } from "../../Sources/PiDeskWeb/Site/js/imagecache.mjs";
+import { ImageCacheBusyError, createImageCache, estimateBytes } from "../../Sources/PatchworkWeb/Site/js/imagecache.mjs";
 
 const dataURL = (bytes) => `data:image/png;base64,${"A".repeat(Math.ceil(bytes / 3) * 4)}`;
 

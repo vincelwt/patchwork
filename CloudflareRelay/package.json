@@ -1,5 +1,5 @@
 {
-  "name": "pi-desktop-cloudflare-relay",
+  "name": "patchwork-cloudflare-relay",
   "private": true,
   "type": "module",
   "scripts": {

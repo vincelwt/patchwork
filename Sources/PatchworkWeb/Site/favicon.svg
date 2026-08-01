@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="Patchwork">
+  <!-- Flat monochrome pi glyph, no background: matches the native app icon's mark so the
+       browser tab and home-screen icon read as the same product. Uses currentColor so it
+       could be recolored via CSS, though the manifest/apple-touch-icon PNGs are the ones
+       actually shown on a home screen. -->
+  <path fill="currentColor" d="M4 5h16v2.4H16v9.1c0 1.6.7 2.3 2 2.4v2.1c-2.7-.1-4.4-1.6-4.4-4.4V7.4H10.4v7.2c0 2.8-1.7 4.3-4.4 4.4v-2.1c1.3-.1 2-.8 2-2.4V7.4H4V5Z"/>
+</svg>

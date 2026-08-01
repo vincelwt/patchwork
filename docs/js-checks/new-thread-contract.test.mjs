@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AGENTS } from "../../Sources/PiDeskWeb/Site/js/agents.mjs";
-import { createCreationIntentStore } from "../../Sources/PiDeskWeb/Site/js/creationIntent.mjs";
+import { AGENTS } from "../../Sources/PatchworkWeb/Site/js/agents.mjs";
+import { createCreationIntentStore } from "../../Sources/PatchworkWeb/Site/js/creationIntent.mjs";
 import {
   FIRST_MESSAGE_REQUIRED_ERROR,
   firstMessagePresentation,
   firstMessageValidationError,
   requiresFirstMessage,
   supportsProtectedThreadCreation
-} from "../../Sources/PiDeskWeb/Site/js/newThreadContract.mjs";
+} from "../../Sources/PatchworkWeb/Site/js/newThreadContract.mjs";
 
 class MemoryStorage {
   values = new Map();
