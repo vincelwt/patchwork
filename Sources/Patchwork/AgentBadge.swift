@@ -67,3 +67,63 @@ struct AgentPicker: View {
         }
     }
 }
+
+/// The complete runtime choice for a new conversation. A preset owns the agent choice, so the
+/// agent is no longer independently switchable once presets exist.
+struct PresetPicker: View {
+    @EnvironmentObject private var store: AppStore
+    @Environment(\.openSettings) private var openSettings
+
+    @ViewBuilder
+    var body: some View {
+        if store.availablePresets.isEmpty {
+            VStack(spacing: PatchworkTheme.space6) {
+                AgentPicker()
+                Button("Create a Preset…") {
+                    store.settingsPane = .presets
+                    openSettings()
+                }
+                    .font(PatchworkFont.caption)
+            }
+        } else {
+            HStack(spacing: PatchworkTheme.space8) {
+                if let preset = store.selectedPreset {
+                    AgentBadge(agent: preset.agent, isProminent: true)
+                    Menu {
+                        ForEach(store.availablePresets) { choice in
+                            Button { store.selectPreset(choice.id) } label: {
+                                if choice.id == preset.id {
+                                    Label(choice.name, systemImage: "checkmark")
+                                } else {
+                                    Text(choice.name)
+                                }
+                            }
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(preset.name).font(PatchworkFont.captionEmphasis)
+                            Text(preset.detail).font(PatchworkFont.micro).foregroundStyle(.secondary)
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .help("Choose a preset. Press Command-Shift-P to cycle.")
+                    .accessibilityLabel("New chat preset")
+                    .accessibilityValue(preset.name)
+                }
+                Button {
+                    store.settingsPane = .presets
+                    openSettings()
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: PatchworkIcon.small))
+                }
+                .buttonStyle(.plain)
+                .help("Manage presets")
+                .accessibilityLabel("Manage presets")
+            }
+            .padding(.horizontal, PatchworkTheme.space10)
+            .padding(.vertical, PatchworkTheme.space6)
+            .patchworkInset()
+        }
+    }
+}

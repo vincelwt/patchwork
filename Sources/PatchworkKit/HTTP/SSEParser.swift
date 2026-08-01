@@ -10,19 +10,39 @@ struct SSEFrame {
 /// Accumulates raw bytes from a long-lived `GET /v1/events` connection into complete frames.
 /// Line-oriented and tolerant of a frame split across multiple socket reads.
 struct SSEParser {
-    private var buffer = ""
+    private let maxBufferedBytes: Int
+    private var buffer = Data()
     private var pendingEvent: String?
     private var pendingData: [String] = []
+    private var pendingBytes = 0
+    private(set) var failed = false
+
+    init(maxBufferedBytes: Int = 16 * 1_024 * 1_024) {
+        self.maxBufferedBytes = max(1, maxBufferedBytes)
+    }
 
     mutating func append(_ chunk: Data) -> [SSEFrame] {
-        guard let text = String(data: chunk, encoding: .utf8) else { return [] }
-        buffer += text
+        guard !failed, chunk.count <= maxBufferedBytes, buffer.count <= maxBufferedBytes - chunk.count else {
+            fail()
+            return []
+        }
+        buffer.append(chunk)
 
         var frames: [SSEFrame] = []
-        while let newlineRange = buffer.range(of: "\n") {
-            var line = String(buffer[buffer.startIndex..<newlineRange.lowerBound])
-            buffer.removeSubrange(buffer.startIndex..<newlineRange.upperBound)
-            if line.hasSuffix("\r") { line.removeLast() }
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            var lineData = Data(buffer[buffer.startIndex..<newline])
+            buffer.removeSubrange(buffer.startIndex...newline)
+            if lineData.last == 0x0D { lineData.removeLast() }
+            let retainedBytes = lineData.count + 1
+            guard retainedBytes <= maxBufferedBytes, pendingBytes <= maxBufferedBytes - retainedBytes else {
+                fail()
+                return frames
+            }
+            pendingBytes += retainedBytes
+            guard let line = String(data: lineData, encoding: .utf8) else {
+                fail()
+                return frames
+            }
 
             if line.isEmpty {
                 if !pendingData.isEmpty || pendingEvent != nil {
@@ -30,6 +50,7 @@ struct SSEParser {
                 }
                 pendingEvent = nil
                 pendingData = []
+                pendingBytes = 0
                 continue
             }
             if line.hasPrefix(":") { continue } // comment / keep-alive
@@ -39,12 +60,21 @@ struct SSEParser {
                 if value.hasPrefix(" ") { value.removeFirst() }
                 switch field {
                 case "event": pendingEvent = value
-                case "data": pendingData.append(value)
+                case "data":
+                    pendingData.append(value)
                 default: break // "id"/"retry" are not part of this API's contract; ignored
                 }
             }
         }
         return frames
+    }
+
+    private mutating func fail() {
+        failed = true
+        buffer.removeAll(keepingCapacity: false)
+        pendingEvent = nil
+        pendingData.removeAll(keepingCapacity: false)
+        pendingBytes = 0
     }
 }
 
@@ -62,6 +92,7 @@ extension SSEFrame {
             case "activity": return .activity(try PatchworkJSON.decoder.decode(ActivitySnapshot.self, from: payload))
             case "run": return .run(try PatchworkJSON.decoder.decode(Run.self, from: payload))
             case "schedule": return .schedule(try PatchworkJSON.decoder.decode(Schedule.self, from: payload))
+            case "interaction": return .interaction(try PatchworkJSON.decoder.decode(PendingInteraction.self, from: payload))
             default:
                 let value = (try? PiJSONValue.decode(payload)) ?? .null
                 return .unknown(name: event, data: value)

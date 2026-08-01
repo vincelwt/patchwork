@@ -7,8 +7,9 @@ import SwiftUI
 /// The destructive archive the user is deciding on, with the fresh linked-automation count.
 struct ArchiveConfirmation: Identifiable, Equatable {
     let sessionID: String
+    let sessionPath: String
     let automationCount: Int
-    var id: String { sessionID }
+    var id: String { sessionPath }
 
     var message: String {
         automationCount == 1
@@ -54,15 +55,20 @@ struct DraftRecovery {
 }
 
 /// The one user-authored message currently in flight, from the moment "prompt" is sent until
-/// its outcome is fully known (accepted-and-settled, or a receive failure that already restored
-/// it). `handleRuntimeExit` is the only place that ever acts on this when it is still set — by
-/// construction the same crash always rejects the pending RPC completion first — so a crash
-/// mid-turn can be recovered exactly once, never duplicated into the draft by two code paths
-/// reacting to the same event.
+/// its outcome is fully known (accepted-and-settled, or a definite pre-delivery failure that
+/// already restored it). If the runtime exits while this remains set, acceptance is ambiguous.
+/// The optimistic transcript row stays visible and the composer is not repopulated, preventing
+/// an easy resend from duplicating a message the agent may already have stored.
 private struct PendingUserTurn {
     let origin: DraftOrigin
     let text: String
     let attachments: [ImageAttachment]
+}
+
+private struct ProvisionalMaterialization {
+    let path: String
+    let cwd: String
+    var leaseAcquisitionStarted = false
 }
 
 private struct LiveMessageKey: Equatable {
@@ -76,9 +82,207 @@ private enum ManagedWriterState: Sendable {
     case fileFallback
 }
 
+typealias RuntimeLeaseOperation = @Sendable (
+    _ threadID: String, _ request: LeaseRequest
+) async throws -> LeaseResponse
+typealias ArchiveThreadOperation = @Sendable (
+    _ path: String, _ archived: Bool
+) async throws -> ThreadResponse
+
+enum RuntimeLeaseCoordinatorError: Error, LocalizedError {
+    case closed
+    case rejected
+
+    var errorDescription: String? {
+        switch self {
+        case .closed: "The runtime closed before it could attach to this conversation."
+        case .rejected: "Another process is already using this conversation."
+        }
+    }
+}
+
+/// Serializes every lease mutation for one native runtime. Closing is queued behind an in-flight
+/// acquisition, so a late response can never recreate ownership after the process has stopped.
+@MainActor
+final class RuntimeLeaseCoordinator {
+    static let ttlSeconds = 180
+    static let renewalDelayNanoseconds: UInt64 = 60_000_000_000
+    static let retryDelayNanoseconds: UInt64 = 5_000_000_000
+
+    let owner = "native-runtime-\(UUID().uuidString)"
+    private let operation: RuntimeLeaseOperation
+    private var paths: Set<String> = []
+    private var tail: Task<Void, Never>?
+    private var renewalTask: Task<Void, Never>?
+    private var closed = false
+    var onLeaseLost: ((String, Error) -> Void)?
+
+    init(operation: @escaping RuntimeLeaseOperation) {
+        self.operation = operation
+    }
+
+    func acquire(path rawPath: String, materializing: Bool = false) async throws {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            enqueue { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: RuntimeLeaseCoordinatorError.closed)
+                    return
+                }
+                guard !closed else {
+                    continuation.resume(throwing: RuntimeLeaseCoordinatorError.closed)
+                    return
+                }
+                if paths.contains(path) {
+                    continuation.resume()
+                    return
+                }
+                do {
+                    let response = try await requestLease(path: path, materializing: materializing)
+                    guard response.leased else { throw RuntimeLeaseCoordinatorError.rejected }
+                    if closed {
+                        _ = try? await operation(
+                            path, LeaseRequest(owner: owner, release: true)
+                        )
+                        continuation.resume(throwing: RuntimeLeaseCoordinatorError.closed)
+                        return
+                    }
+                    paths.insert(path)
+                    scheduleRenewal(after: Self.renewalDelayNanoseconds)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// The reused process has switched successfully. Keep the new path and release every prior
+    /// route only after that success, so neither transcript is ever momentarily unowned.
+    func retainOnly(path rawPath: String) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        enqueue { [weak self] in
+            guard let self, !closed else { return }
+            let oldPaths = paths.filter { $0 != path }
+            for oldPath in oldPaths {
+                _ = try? await operation(
+                    oldPath, LeaseRequest(owner: owner, release: true)
+                )
+                paths.remove(oldPath)
+            }
+            if !paths.isEmpty { scheduleRenewal(after: Self.renewalDelayNanoseconds) }
+        }
+    }
+
+    /// Re-announces ownership after the daemon's SSE ready barrier, including daemon restarts.
+    func reacquire() {
+        renewNow()
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        renewalTask?.cancel()
+        renewalTask = nil
+        enqueue { [weak self] in
+            guard let self else { return }
+            for path in paths {
+                _ = try? await operation(path, LeaseRequest(owner: owner, release: true))
+            }
+            paths.removeAll()
+        }
+    }
+
+    func owns(path rawPath: String) -> Bool {
+        paths.contains(URL(fileURLWithPath: rawPath).standardizedFileURL.path)
+    }
+
+    private func enqueue(_ work: @escaping @MainActor () async -> Void) {
+        let previous = tail
+        tail = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+    }
+
+    private func requestLease(path: String, materializing: Bool) async throws -> LeaseResponse {
+        var lastError: Error?
+        let delays: [UInt64] = materializing
+            ? [0, 50_000_000, 100_000_000, 200_000_000, 400_000_000, 750_000_000]
+            : [0, 100_000_000, 300_000_000]
+        for delay in delays {
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            do {
+                return try await operation(
+                    path, LeaseRequest(owner: owner, ttlSeconds: Self.ttlSeconds)
+                )
+            } catch {
+                lastError = error
+                guard Self.isDaemonUnavailable(error)
+                        || (materializing && Self.isThreadNotFound(error)) else { throw error }
+            }
+        }
+        throw lastError ?? RuntimeLeaseCoordinatorError.rejected
+    }
+
+    private func renewNow() {
+        renewalTask?.cancel()
+        renewalTask = nil
+        enqueue { [weak self] in
+            guard let self, !closed, !paths.isEmpty else { return }
+            var retrySoon = false
+            for path in paths {
+                do {
+                    let response = try await operation(
+                        path, LeaseRequest(owner: owner, ttlSeconds: Self.ttlSeconds)
+                    )
+                    guard response.leased else { throw RuntimeLeaseCoordinatorError.rejected }
+                } catch {
+                    if Self.isOwnershipConflict(error) {
+                        onLeaseLost?(path, error)
+                        return
+                    }
+                    retrySoon = true
+                }
+            }
+            scheduleRenewal(
+                after: retrySoon ? Self.retryDelayNanoseconds : Self.renewalDelayNanoseconds
+            )
+        }
+    }
+
+    private func scheduleRenewal(after delay: UInt64) {
+        guard !closed, !paths.isEmpty else { return }
+        renewalTask?.cancel()
+        renewalTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return }
+            self?.renewNow()
+        }
+    }
+
+    private static func isDaemonUnavailable(_ error: Error) -> Bool {
+        if case PatchworkClientError.daemonUnreachable = error { return true }
+        return false
+    }
+
+    private static func isThreadNotFound(_ error: Error) -> Bool {
+        if case PatchworkClientError.notFound = error { return true }
+        return false
+    }
+
+    private static func isOwnershipConflict(_ error: Error) -> Bool {
+        if case let PatchworkClientError.badRequest(code, _) = error {
+            return code == "thread_busy" || code == "thread_leased"
+        }
+        return error is RuntimeLeaseCoordinatorError
+    }
+}
+
 /// One independent agent process plus the route-visible state that must follow it when the user
 /// switches conversations mid-turn. Idle processes are still reused; only live work is parked.
 private final class RuntimeSlot {
+    static let maximumReadyWaiters = OutboxPolicy.limit
     let id = UUID()
     let runtime: AgentRuntimeProtocol
     /// Which agent this process is. Read from the runtime so a slot can never disagree with the
@@ -99,6 +303,8 @@ private final class RuntimeSlot {
     var commandsLoading = false
     var optionsLoading = false
     var optionsPrepared = false
+    /// The exact preset already applied to this pending new-chat runtime.
+    var appliedPresetFingerprint: String?
     var capability: ToolCapability?
     var questionnaire: QuestionnaireSession?
     var statuses: [String: String] = [:]
@@ -130,6 +336,9 @@ private final class RuntimeSlot {
     var managedProcessIDs: Set<String> = []
     var managedProcessStartedAt: Date?
     var isSuperseded = false
+    var leaseCoordinator: RuntimeLeaseCoordinator?
+    var provisionalMaterialization: ProvisionalMaterialization?
+    var retriableVirtualFolderPath: String?
 
     init(runtime: AgentRuntimeProtocol) { self.runtime = runtime }
 }
@@ -214,9 +423,28 @@ final class RuntimeActivityModel: ObservableObject {
 
 @MainActor
 final class AppStore: ObservableObject {
-    @Published var sessions: [SessionSummary] = []
-    @Published var route: AppRoute = .newChat
-    @Published var searchText = ""
+    /// One attached runtime plus a small number of active background conversations. When every
+    /// slot is doing work, a new start is refused instead of silently killing work or growing one
+    /// subprocess per visited thread.
+    static let maximumConcurrentRuntimes = 4
+
+    @Published var sessions: [SessionSummary] = [] {
+        didSet { invalidateSidebarProjection() }
+    }
+    @Published var route: AppRoute = .newChat {
+        didSet {
+            if route != oldValue { cancelPendingStreamingPublish() }
+            switch route {
+            case let .session(path): activityMonitor.setPriorityPath(path)
+            case .newChat: activityMonitor.setPriorityPath(nil)
+            }
+        }
+    }
+    @Published var searchText = "" {
+        didSet {
+            if searchText != oldValue { invalidateSidebarProjection() }
+        }
+    }
     @Published var isScanning = false
     @Published var scanError: String?
 
@@ -254,8 +482,15 @@ final class AppStore: ObservableObject {
     /// the whole loaded transcript, and raw `message_update` bursts arrive far faster than the
     /// user can read. Parsing is deferred with the publish, so skipped deltas cost nothing.
     static let streamingPublishInterval: TimeInterval = 0.08
+    private struct PendingStreamingPublication {
+        let generation: Int
+        let slotID: UUID
+        let route: AppRoute
+        let partial: JSONValue
+    }
     private var streamingPublishTask: Task<Void, Never>?
-    private var pendingStreamingUpdate: JSONValue?
+    private var pendingStreamingPublication: PendingStreamingPublication?
+    private var streamingPublishGeneration = 0
     private var lastStreamingPublish = Date.distantPast
     @Published var isConversationLoading = false
     @Published private(set) var isLoadingEarlierMessages = false
@@ -297,6 +532,10 @@ final class AppStore: ObservableObject {
     private var newChatWorktreeOrigin: URL?
     /// Once submitted, navigation may hide this selection but must never delete its live cwd.
     private var newChatWorktreeSubmitted = false
+    /// Folder placement is visible immediately, but is not persisted until the first prompt owns
+    /// its materialized transcript. A definite rejection can therefore retry without leaving an
+    /// assignment in state.json for a conversation that never existed.
+    var provisionalVirtualFolderAssignments: [String: String] = [:]
     @Published var runtimeState = RuntimeState()
     /// Agents whose executable resolved at launch, in a stable order. Empty means nothing is
     /// installed, which the new-chat surface reports instead of failing at spawn time.
@@ -316,10 +555,14 @@ final class AppStore: ObservableObject {
     /// Agents the user switched off. Their conversations stop being scanned and they stop being
     /// offered for a new chat; nothing about their history is touched.
     @Published private(set) var disabledAgents: Set<AgentKind> = []
+    /// Bounded app-owned launch configurations, in the order used by keyboard cycling.
+    @Published private(set) var presets: [AgentPreset] = []
+    @Published private(set) var selectedPresetID: UUID?
     /// The agent a new conversation will use. Persisted so the choice survives relaunch.
     @Published var newChatAgent: AgentKind = .pi {
         didSet {
             guard newChatAgent != oldValue else { return }
+            if route == .newChat { discardRetriableVirtualFolderAssignment(for: activeRuntimeSlot) }
             persistence.updateState { $0.lastAgent = newChatAgent.rawValue }
             // Options are agent-specific, so anything cached for the previous agent is wrong now.
             if route == .newChat { resetRuntimeOptionsForNewChat() }
@@ -364,6 +607,7 @@ final class AppStore: ObservableObject {
     /// Shared request surface: sidebar and application menu present the same creation alert.
     @Published var newVirtualFolderRequested = false
     @Published var schedulesPresented = false
+    @Published var settingsPane: SettingsPane = .service
     /// Messages the user queued while Pi was working, still editable until they are flushed to
     /// Pi at the boundary Pi would have delivered them anyway. See `Outbox.swift`.
     @Published var outbox: [OutboxEntry] = []
@@ -392,6 +636,58 @@ final class AppStore: ObservableObject {
     }
 
     var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
+
+    var fastModePresentation: FastModePresentation {
+        switch activeCapabilities.fastMode {
+        case .extensionCommand:
+            let status = statusModel.fastPriority
+            return FastModePresentation(
+                isActive: status.isActive,
+                isAvailable: true,
+                isLive: statusModel.isLive,
+                help: status.isActive
+                    ? "Fast priority is active. Click to turn it off."
+                    : "Fast priority is inactive. Click to turn it on."
+            )
+        case .threadSetting:
+            let attached = runtimeMatchesCurrentRoute && activeRuntimeSlot.agent == activeAgent
+            let available = attached ? runtimeState.fastModeAvailable : true
+            return FastModePresentation(
+                isActive: attached && runtimeState.fastModeEnabled,
+                isAvailable: available,
+                isLive: attached && runtimeState.isConnected,
+                help: available
+                    ? "Fast service tier for this task. Click to toggle it."
+                    : "The selected model does not advertise a fast service tier."
+            )
+        case .relaunch:
+            let attached = runtimeMatchesCurrentRoute && activeRuntimeSlot.agent == activeAgent
+            let available = attached ? runtimeState.fastModeAvailable : true
+            return FastModePresentation(
+                isActive: attached && runtimeState.fastModeEnabled,
+                isAvailable: available,
+                isLive: attached && runtimeState.isConnected,
+                help: available
+                    ? "Fast mode for this task. It lowers latency at a higher token price."
+                    : "Fast mode is unavailable for this Claude account or environment."
+            )
+        case .unsupported:
+            return FastModePresentation(
+                isActive: false,
+                isAvailable: false,
+                isLive: false,
+                help: "This agent does not support fast mode."
+            )
+        }
+    }
+
+    var selectedPreset: AgentPreset? {
+        selectedPresetID.flatMap { id in presets.first { $0.id == id } }
+    }
+
+    var availablePresets: [AgentPreset] {
+        presets.filter { installedAgents.contains($0.agent) }
+    }
 
     /// True while the slash-command palette has no authoritative answer yet: the route's runtime
     /// is still attaching, or `get_commands` is in flight. Lets the palette say "Loading…"
@@ -431,6 +727,10 @@ final class AppStore: ObservableObject {
         isSelectedRuntime && activeRuntimeSlot.capabilities.canExportHTML
     }
 
+    var canRenameSelectedSession: Bool {
+        selectedSession?.agent.capabilities.canRenameSession == true
+    }
+
     var canEditHistory: Bool {
         isSelectedRuntime && activeRuntimeSlot.capabilities.canFork
     }
@@ -451,7 +751,9 @@ final class AppStore: ObservableObject {
 
     /// True when this app started the conversation, or the agent's own record says it did.
     private func isAppStarted(_ summary: SessionSummary) -> Bool {
-        persistence.state.appStartedSessionPaths.contains(summary.fileURL.standardizedFileURL.path)
+        let path = summary.fileURL.standardizedFileURL.path
+        return persistence.state.appStartedSessionPaths.contains(path)
+            || daemonManagedThreadPaths.contains(path)
     }
 
     /// Switches an agent on or off. Disabling stops scanning its transcripts and offering it for
@@ -465,9 +767,79 @@ final class AppStore: ObservableObject {
         if disabledAgents.contains(newChatAgent) {
             newChatAgent = installedAgents.first ?? .pi
         }
+        repairSelectedPreset()
         // The repository's roots are fixed at construction, so the sidebar is refiltered here and
         // the next full scan picks up the narrower root list.
+        restartSessionCatalogMonitor()
         Task { await refreshSessions() }
+    }
+
+    func savePreset(_ preset: AgentPreset) {
+        guard preset.isValid else { return }
+        if let index = presets.firstIndex(where: { $0.id == preset.id }) {
+            presets[index] = preset
+        } else {
+            guard presets.count < AgentPreset.maximumCount else {
+                showToast("You can keep up to \(AgentPreset.maximumCount) presets.", style: .warning)
+                return
+            }
+            presets.append(preset)
+        }
+        persistPresets()
+        if selectedPresetID == preset.id || selectedPresetID == nil {
+            selectPreset(preset.id)
+        }
+    }
+
+    func deletePreset(id: UUID) {
+        guard let index = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets.remove(at: index)
+        persistPresets()
+        if selectedPresetID == id { repairSelectedPreset(preferredIndex: index) }
+    }
+
+    func movePreset(id: UUID, offset: Int) {
+        guard let source = presets.firstIndex(where: { $0.id == id }) else { return }
+        let destination = source + offset
+        guard presets.indices.contains(destination) else { return }
+        presets.swapAt(source, destination)
+        persistPresets()
+    }
+
+    func selectPreset(_ id: UUID) {
+        guard let preset = presets.first(where: { $0.id == id }),
+              installedAgents.contains(preset.agent) else { return }
+        selectedPresetID = id
+        persistence.updateState { $0.lastPresetID = id }
+        newChatAgent = preset.agent
+        guard route == .newChat else { return }
+        prepareComposerOptions()
+        if let slot = currentRouteRuntimeSlot, slot.startedForNewChat {
+            applySelectedPreset(to: slot) { _ in }
+        }
+    }
+
+    func cyclePreset() {
+        guard route == .newChat, !availablePresets.isEmpty else { return }
+        let currentIndex = selectedPresetID.flatMap { id in availablePresets.firstIndex { $0.id == id } }
+        let nextIndex = currentIndex.map { ($0 + 1) % availablePresets.count } ?? 0
+        selectPreset(availablePresets[nextIndex].id)
+    }
+
+    private func persistPresets() {
+        persistence.updateState { $0.presets = Array(presets.prefix(AgentPreset.maximumCount)) }
+    }
+
+    private func repairSelectedPreset(preferredIndex: Int = 0) {
+        let choices = availablePresets
+        if let selectedPresetID, choices.contains(where: { $0.id == selectedPresetID }) { return }
+        let index = min(max(0, preferredIndex), max(0, choices.count - 1))
+        if choices.indices.contains(index) {
+            selectPreset(choices[index].id)
+        } else {
+            selectedPresetID = nil
+            persistence.updateState { $0.lastPresetID = nil }
+        }
     }
 
     /// Whether sidebar rows should carry an agent glyph. On a machine with one agent it is noise
@@ -514,6 +886,46 @@ final class AppStore: ObservableObject {
     private let managedTurnResumer: ManagedTurnResumer
     private let managedTurnWriterProbe: ManagedTurnWriterProbe?
     private let daemonWorktreeProjectsURL: URL
+    private let daemonClient: PatchworkClient?
+    private let runtimeLeaseOperation: RuntimeLeaseOperation?
+    private let archiveThreadOperation: ArchiveThreadOperation?
+    private var daemonEventTask: Task<Void, Never>?
+    private var daemonReconciliationTask: Task<Void, Never>?
+    private var daemonReconciliationPending = false
+    private var daemonScheduleRefreshTask: Task<Void, Never>?
+    private var daemonScheduleRefreshPending = false
+    private var scheduledRefreshGeneration: UInt64 = 0
+    private var daemonManagedThreadPaths: Set<String> = []
+    private var daemonArchivedThreadIDs: Set<String> = []
+    private var daemonArchivedThreadPaths: Set<String> = []
+    private var daemonArchiveExemptThreadPaths: Set<String> = []
+    private struct DaemonRunActivity {
+        var runID: String
+        var startedAt: Date
+    }
+    private var daemonRunActivityByPath: [String: DaemonRunActivity] = [:]
+    private var pendingArchiveIntentByPath: [String: Bool] = [:]
+    private var archiveSyncTasksByPath: [String: Task<Void, Never>] = [:]
+    private var pendingOwnershipPersistencePaths: Set<String> = []
+    private var ownershipPersistenceRetryTask: Task<Void, Never>?
+    private var readSyncGenerationByPath: [String: UInt64] = [:]
+    private var pendingUnreadIntentByPath: [String: Bool] = [:]
+    private var readSyncTasksByPath: [String: Task<Void, Never>] = [:]
+    private var lastDaemonUnreadByPath: [String: Bool] = [:]
+    /// Any in-memory catalog mutation invalidates an older disk scan before it can publish.
+    private var sessionCatalogRevision = 0
+    /// The launch scan already schedules one bounded activity pass through `setTrackedPaths`.
+    /// Later full scans use this bit to promote only new or changed transcripts without turning
+    /// a large cold catalog into an immediate tail-read burst.
+    private var hasPublishedSessionCatalog = false
+    private var sessionRefreshPending = false
+    private let sessionCatalogMonitor = SessionCatalogMonitor()
+    private var sessionCatalogRefreshTask: Task<Void, Never>?
+    private var sessionCatalogEventGeneration: UInt64 = 0
+    private var pendingSessionCatalogCandidatePaths: Set<String> = []
+    private var sessionCatalogNeedsFullScan = false
+    private var hiddenSessionCatalogCandidatePaths: Set<String> = []
+    private static let maximumIncrementalCatalogCandidates = 256
     private var cancelRuntimeRetirement: (() -> Void)?
     private var activeRuntimeSlot: RuntimeSlot
     private var activePresentationDetached = false
@@ -540,6 +952,8 @@ final class AppStore: ObservableObject {
     private var selectedGitCandidatePath: String?
     private var selectedGitGeneration = 0
     private var gitRefreshTask: Task<Void, Never>?
+    private var folderGitRefreshTask: Task<Void, Never>?
+    private var folderGitRefreshPending = false
     private var pullRequestRefreshTask: Task<Void, Never>?
     private var pullRequestRefreshLoopTask: Task<Void, Never>?
     private var pullRequestRefreshGeneration = 0
@@ -609,8 +1023,8 @@ final class AppStore: ObservableObject {
     private static let prefetchLaunchCount = 8
     private static let prefetchNeighborRadius = 1
     private static let prefetchConcurrency = 3
-    /// History retains one focused page, one detailed latest page, and that session's bounded
-    /// optimistic/RPC overlay. Older navigation replaces only the focused page.
+    /// History retains one detailed older page, one detailed latest page, and that session's
+    /// bounded optimistic/RPC overlay. Older navigation replaces only the older page.
     private static let displayedMessageLimit = ConversationPage.maximumMessageCount * 2 + liveMessageLimit + 1
     private static let connectivityResumeCommand = "/patchwork-resume"
     private static let connectivityResumeDescription = "Continue an interrupted turn after a transient failure"
@@ -626,6 +1040,7 @@ final class AppStore: ObservableObject {
         pullRequestStateProvider: PullRequestStateProviding = GitHubPullRequestStateService(),
         runtime: AgentRuntimeProtocol = AgentRuntimeClient(),
         runtimeFactory: @escaping (AgentKind) -> AgentRuntimeProtocol = { AgentRuntimeClient.make(for: $0) },
+        installedAgentProvider: () -> [AgentKind] = { AgentCatalog.installed() },
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
@@ -674,7 +1089,11 @@ final class AppStore: ObservableObject {
             )
         },
         managedTurnWriterProbe: ManagedTurnWriterProbe? = nil,
-        daemonWorktreeProjectsURL: URL = PatchworkPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json")
+        daemonWorktreeProjectsURL: URL = PatchworkPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json"),
+        daemonThreadOverlayURL: URL? = nil,
+        daemonClient: PatchworkClient? = nil,
+        runtimeLeaseOperation: RuntimeLeaseOperation? = nil,
+        archiveThreadOperation: ArchiveThreadOperation? = nil
     ) {
         self.repository = repository
         self.gitService = gitService
@@ -685,10 +1104,30 @@ final class AppStore: ObservableObject {
         self.providerRetryScheduler = providerRetryScheduler
         self.managedTurnResumer = managedTurnResumer
         self.managedTurnWriterProbe = managedTurnWriterProbe
-        self.daemonWorktreeProjectsURL = daemonWorktreeProjectsURL
+        self.daemonWorktreeProjectsURL = daemonThreadOverlayURL ?? daemonWorktreeProjectsURL
+        self.daemonClient = daemonClient
+        if let runtimeLeaseOperation {
+            self.runtimeLeaseOperation = runtimeLeaseOperation
+        } else if let daemonClient {
+            self.runtimeLeaseOperation = { @Sendable id, request in
+                try await daemonClient.leaseThread(id: id, request)
+            }
+        } else {
+            self.runtimeLeaseOperation = nil
+        }
+        if let archiveThreadOperation {
+            self.archiveThreadOperation = archiveThreadOperation
+        } else if let daemonClient {
+            self.archiveThreadOperation = { @Sendable path, archived in
+                try await daemonClient.archiveThread(id: path, archived: archived)
+            }
+        } else {
+            self.archiveThreadOperation = nil
+        }
         self.connectivityMonitor = connectivityMonitor
         activeRuntimeSlot = RuntimeSlot(runtime: runtime)
         self.persistence = persistence ?? AppPersistence()
+        pendingArchiveIntentByPath = self.persistence.state.pendingDaemonArchiveIntentBySessionPath
         inspectorVisible = self.persistence.state.inspectorVisible
         self.activityPresenter = activityPresenter
         self.activityMonitor = activityMonitor ?? SessionActivityMonitor()
@@ -716,15 +1155,21 @@ final class AppStore: ObservableObject {
 
         // Detection is a filesystem check, cheap enough to do once at launch and honest enough
         // that an uninstalled agent never appears as a choice that would fail at spawn time.
-        detectedAgents = AgentCatalog.installed()
+        detectedAgents = installedAgentProvider()
         disabledAgents = Set(self.persistence.state.disabledAgents.compactMap(AgentKind.init(rawValue:)))
         showsForeignConversations = self.persistence.state.showsForeignConversations
         let installed = detectedAgents.filter { !disabledAgents.contains($0) }
         installedAgents = installed
+        presets = AgentPreset.normalized(self.persistence.state.presets)
         let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
         // Fall back through: remembered choice, first installed agent, then Pi. Never offer an
         // agent that is not there.
         newChatAgent = remembered.flatMap { installed.contains($0) ? $0 : nil } ?? installed.first ?? .pi
+        let rememberedPreset = self.persistence.state.lastPresetID
+            .flatMap { id in presets.first { $0.id == id && installed.contains($0.agent) } }
+        let initialPreset = rememberedPreset ?? presets.first { installed.contains($0.agent) }
+        selectedPresetID = initialPreset?.id
+        if let initialPreset { newChatAgent = initialPreset.agent }
         runtimeMode = self.persistence.state.agentModes[newChatAgent.rawValue]
 
         bindRuntime(activeRuntimeSlot)
@@ -741,6 +1186,15 @@ final class AppStore: ObservableObject {
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
             .sink { [weak self] _ in
                 self?.flushCurrentDraftPersistence()
+                self?.daemonEventTask?.cancel()
+                self?.daemonReconciliationTask?.cancel()
+                self?.daemonScheduleRefreshTask?.cancel()
+                self?.folderGitRefreshTask?.cancel()
+                self?.sessionCatalogRefreshTask?.cancel()
+                self?.sessionCatalogMonitor.stop()
+                if let self {
+                    for slot in self.runtimeSlots() { self.closeRuntimeLease(for: slot) }
+                }
                 self?.setSleepPrevention(false)
             }
             .store(in: &appCancellables)
@@ -807,6 +1261,43 @@ final class AppStore: ObservableObject {
         parkedRuntimes = parkedRuntimes.filter { $0.value !== slot }
     }
 
+    func stageProvisionalVirtualFolderAssignment(path rawPath: String, folderID: String) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        provisionalVirtualFolderAssignments[path] = folderID
+        invalidateSidebarProjection()
+        objectWillChange.send()
+    }
+
+    func discardProvisionalVirtualFolderAssignment(path rawPath: String) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        guard provisionalVirtualFolderAssignments.removeValue(forKey: path) != nil else { return }
+        invalidateSidebarProjection()
+        objectWillChange.send()
+    }
+
+    private func commitProvisionalVirtualFolderAssignment(path: String) {
+        guard let folderID = provisionalVirtualFolderAssignments.removeValue(forKey: path) else { return }
+        persistence.moveSession(path: path, toVirtualFolder: folderID)
+        invalidateSidebarProjection()
+        objectWillChange.send()
+    }
+
+    private func retainVirtualFolderAssignmentForRetry(path: String, slot: RuntimeSlot) {
+        if provisionalVirtualFolderAssignments[path] == nil,
+           let folderID = persistence.state.virtualFolderAssignments[path] {
+            persistence.moveSession(path: path, toVirtualFolder: nil)
+            provisionalVirtualFolderAssignments[path] = folderID
+        }
+        slot.retriableVirtualFolderPath = provisionalVirtualFolderAssignments[path] == nil ? nil : path
+        invalidateSidebarProjection()
+    }
+
+    private func discardRetriableVirtualFolderAssignment(for slot: RuntimeSlot) {
+        guard let path = slot.retriableVirtualFolderPath else { return }
+        slot.retriableVirtualFolderPath = nil
+        discardProvisionalVirtualFolderAssignment(path: path)
+    }
+
     private func state(for slot: RuntimeSlot) -> RuntimeState {
         slot === activeRuntimeSlot ? runtimeState : slot.state
     }
@@ -828,6 +1319,15 @@ final class AppStore: ObservableObject {
     }
 
     func setConnectivityForTesting(isOnline: Bool) { updateConnectivity(isOnline: isOnline) }
+
+    func setNewChatWorktreeForTesting(_ worktree: URL, origin: URL) {
+        newChatWorktree = worktree.standardizedFileURL
+        newChatWorktreeOrigin = origin.standardizedFileURL
+        newChatWorktreeSubmitted = false
+        persistence.setManagedWorktreeProject(origin, for: worktree)
+    }
+
+    var newChatWorktreeSubmittedForTesting: Bool { newChatWorktreeSubmitted }
 
     private func updateConnectivity(isOnline: Bool) {
         let offline = !isOnline
@@ -1032,6 +1532,8 @@ final class AppStore: ObservableObject {
         beginOutboxDispatch(for: activeRuntimeSlot)
     }
 
+    var activeOutboxDispatchCount: Int { activeRuntimeSlot.outboxDispatches.count }
+
     @discardableResult
     func dispatchNextActiveFollowUp() -> Bool {
         guard !activePresentationDetached else { return false }
@@ -1186,6 +1688,7 @@ final class AppStore: ObservableObject {
     }
 
     private func restoreRuntimePresentation(_ slot: RuntimeSlot) {
+        cancelPendingStreamingPublish()
         activePresentationDetached = false
         runtimeState = slot.state
         liveMetrics = slot.metrics
@@ -1212,6 +1715,7 @@ final class AppStore: ObservableObject {
 
     private func detachActiveRuntimePresentation() {
         guard activeRuntimeSlot.runtime.isRunning, !activePresentationDetached else { return }
+        cancelPendingStreamingPublish()
         saveActiveRuntimePresentation()
         activePresentationDetached = true
         clearExtensionDialogs()
@@ -1250,6 +1754,7 @@ final class AppStore: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return !slot.isStarting && !slot.optionsLoading && presentation.phase == .idle && !presentation.isBusy
             && slot.pendingTurn == nil && dialogs.isEmpty && queued.isEmpty
+            && slot.provisionalMaterialization == nil
             && !slot.providerRetryPending && slot.providerRetryID == nil
             && slot.outboxDispatches.isEmpty && slot.deferredEvents.isEmpty
             && capability == nil && questionnaire == nil && stream == nil && subagents.isEmpty
@@ -1270,6 +1775,7 @@ final class AppStore: ObservableObject {
             self.cancelRuntimeRetirement = nil
             slot.isReady = false
             slot.runtime.stop()
+            self.closeRuntimeLease(for: slot)
             self.updateState(for: slot) { state in
                 state.isConnected = false
                 state.phase = .idle
@@ -1289,6 +1795,7 @@ final class AppStore: ObservableObject {
             parkedRuntimes[key] = previous
         } else {
             previous.runtime.stop()
+            closeRuntimeLease(for: previous)
             removeParkedReference(to: previous)
         }
 
@@ -1312,10 +1819,45 @@ final class AppStore: ObservableObject {
         selectedSession?.cwd ?? newChatWorktree ?? selectedFolder
     }
 
+    /// Cached projections keep high-frequency activity changes from rebuilding folder and move
+    /// destination catalogs for every visible row.
+    private var sidebarProjectionRevision: UInt64 = 0
+    private var cachedSidebarFolders: (revision: UInt64, folders: [URL])?
+    private var cachedSidebarSnapshot: (revision: UInt64, snapshot: SidebarSnapshot)?
+
+    func invalidateSidebarProjection() {
+        sidebarProjectionRevision &+= 1
+        cachedSidebarFolders = nil
+        cachedSidebarSnapshot = nil
+    }
+
+    var sidebarSnapshot: SidebarSnapshot {
+        if let cachedSidebarSnapshot,
+           cachedSidebarSnapshot.revision == sidebarProjectionRevision {
+            return cachedSidebarSnapshot.snapshot
+        }
+        let snapshot = SidebarSnapshot(
+            sessions: sessions,
+            query: searchText,
+            projectPaths: sidebarFolders.map(\.path),
+            virtualFolders: virtualFolders,
+            assignments: virtualFolderAssignments,
+            projectAssignments: projectFolderAssignments,
+            managedWorktreeProjects: managedWorktreeProjects,
+            archivedAt: archivedDate
+        )
+        cachedSidebarSnapshot = (sidebarProjectionRevision, snapshot)
+        return snapshot
+    }
+
     /// The canonical real-project list for both the sidebar and the new-chat chooser. Explicit
     /// imports remain even before their first conversation; session and organization paths keep
     /// older state forward-compatible without creating duplicate rows.
     var sidebarFolders: [URL] {
+        if let cachedSidebarFolders,
+           cachedSidebarFolders.revision == sidebarProjectionRevision {
+            return cachedSidebarFolders.folders
+        }
         var seen: Set<String> = []
         var folders: [URL] = []
 
@@ -1342,6 +1884,7 @@ final class AppStore: ObservableObject {
             ), WorkspaceOrganization.virtualFolderID(fromGroupID: parent) == nil else { continue }
             append(path: parent)
         }
+        cachedSidebarFolders = (sidebarProjectionRevision, folders)
         return folders
     }
 
@@ -1392,11 +1935,18 @@ final class AppStore: ObservableObject {
         isSelectedRuntime && runtimeState.isConnected ? liveMetrics : (selectedSession?.metrics ?? TokenMetrics())
     }
 
-    private var runningRuntimePaths: Set<String> {
-        Set(runtimeSlots().compactMap { slot in
-            guard state(for: slot).isBusy || !slot.managedProcessIDs.isEmpty else { return nil }
-            return slot.sessionPath
-        })
+    private func hasRunningRuntime(at path: String) -> Bool {
+        let active = activeRuntimeSlot
+        if active.sessionPath == path,
+           state(for: active).isBusy || active.pendingStartupPrompts > 0
+                || !active.managedProcessIDs.isEmpty {
+            return true
+        }
+        return parkedRuntimes.values.contains { slot in
+            slot !== active && slot.sessionPath == path
+                && (state(for: slot).isBusy || slot.pendingStartupPrompts > 0
+                    || !slot.managedProcessIDs.isEmpty)
+        }
     }
 
     private func updateSleepPrevention(
@@ -1433,7 +1983,8 @@ final class AppStore: ObservableObject {
     /// The app's own runtime state wins, then the file-based monitor.
     func isRunning(_ session: SessionSummary) -> Bool {
         let path = session.fileURL.standardizedFileURL.path
-        if runningRuntimePaths.contains(path) { return true }
+        if hasRunningRuntime(at: path) { return true }
+        if daemonRunActivityByPath[path] != nil { return true }
         return activityMonitor.activity(forPath: path)?.state == .running
     }
 
@@ -1468,6 +2019,7 @@ final class AppStore: ObservableObject {
         if let slot = parkedRuntimes[.session(path)], slot.state.isBusy, let beganAt = slot.promptBeganAt {
             return beganAt
         }
+        if let daemon = daemonRunActivityByPath[path] { return daemon.startedAt }
         if let observed = activityMonitor.activity(forPath: path)?.runningSince { return observed }
         if activeRuntimePath == path, !activeRuntimeSlot.managedProcessIDs.isEmpty {
             return activeRuntimeSlot.managedProcessStartedAt
@@ -1500,6 +2052,12 @@ final class AppStore: ObservableObject {
                     ? $0.fileURL.standardizedFileURL.path < $1.fileURL.standardizedFileURL.path
                     : left > right
             }
+    }
+
+    /// Count-only sidebar/footer path. Sorting every running session just to render a number on
+    /// each timeline tick is avoidable work for large catalogs.
+    var runningSessionCount: Int {
+        sessions.lazy.filter { !$0.isArchived && self.isRunning($0) }.count
     }
 
     var aggregateResourceUsage: ThreadResourceUsage? {
@@ -1710,8 +2268,8 @@ final class AppStore: ObservableObject {
     /// before notification gating so duplicate observations and relaunches stay silent.
     private func handleActivitySnapshot(_ activities: [String: SessionActivity]) {
         defer { updateSleepPrevention(activities: activities) }
-        if let selectedPath = selectedSession?.fileURL.standardizedFileURL.path,
-           activities[selectedPath] != nil {
+        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
+        if let selectedPath, activities[selectedPath] != nil {
             refreshSelectedConversationIfNeeded()
         }
 
@@ -1732,8 +2290,7 @@ final class AppStore: ObservableObject {
             if isWaitingForProviderRecovery(at: path) { continue }
 
             let previousID = persistence.state.latestCompletedEntryIDBySessionPath[path]
-            let focused = isApplicationActive
-                && selectedSession?.fileURL.standardizedFileURL.path == path
+            let focused = isApplicationActive && selectedPath == path
             let alreadySeen = persistence.state.lastSeenCompletedEntryIDBySessionPath[path] == completionID
             if previousID != completionID || (focused && !alreadySeen) || persistence.state.lastReadAt[path] != nil {
                 persistence.observeCompletedEntry(
@@ -1850,12 +2407,22 @@ final class AppStore: ObservableObject {
     func bootstrap() {
         guard !bootstrapped else { return }
         bootstrapped = true
+        // Subscribe before the catalog scan. Point events can paint while a large history tree is
+        // still being indexed, and the catalog revision fence prevents that scan from undoing them.
+        restartSessionCatalogMonitor()
+        startDaemonEventLoop()
         Task {
             // First paint comes straight from the persisted summary cache, then the disk scan
             // reconciles in the background.
             let cached = await repository.cachedSessions(archivedIDs: persistence.state.archivedSessionIDs)
             if sessions.isEmpty, !cached.isEmpty {
-                sessions = cached
+                sessions = cached.map { summary in
+                    var summary = summary
+                    summary.isArchived = persistence.isArchived(
+                        sessionID: summary.id, sessionPath: summary.fileURL.path
+                    )
+                    return summary
+                }
                 syncActivityMonitorPaths()
             }
             await refreshSessions()
@@ -1882,44 +2449,586 @@ final class AppStore: ObservableObject {
         LimitsReportStore.shared.refreshAction = { [weak self] in self?.refreshLimits() }
     }
 
-    func refreshSessions() async {
-        guard !isScanning else { return }
+    private func restartSessionCatalogMonitor() {
+        let roots = repository.observationRoots(
+            agents: enabledAgentFilter,
+            supplementalPaths: persistence.state.appStartedSessionPaths.union(
+                daemonManagedThreadPaths
+            )
+        )
+        sessionCatalogMonitor.start(roots: roots) { [weak self] change in
+            Task { @MainActor [weak self] in
+                self?.scheduleSessionCatalogRefresh(for: change)
+            }
+        }
+    }
+
+    func scheduleSessionCatalogRefresh(for change: SessionCatalogChange) {
+        if !change.activityPaths.isEmpty {
+            activityMonitor.prioritize(paths: change.activityPaths)
+        }
+        guard change.requiresFullScan || !change.candidatePaths.isEmpty else { return }
+        sessionCatalogEventGeneration &+= 1
+        pendingSessionCatalogCandidatePaths.formUnion(change.candidatePaths)
+        sessionCatalogNeedsFullScan = sessionCatalogNeedsFullScan || change.requiresFullScan
+            || pendingSessionCatalogCandidatePaths.count > Self.maximumIncrementalCatalogCandidates
+        guard sessionCatalogRefreshTask == nil else { return }
+        sessionCatalogRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let generation = sessionCatalogEventGeneration
+                let requiresFullScan = sessionCatalogNeedsFullScan
+                let candidates = pendingSessionCatalogCandidatePaths
+                sessionCatalogNeedsFullScan = false
+                pendingSessionCatalogCandidatePaths.removeAll(keepingCapacity: true)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                guard !Task.isCancelled else { break }
+                if requiresFullScan {
+                    _ = await refreshSessions()
+                } else {
+                    var unresolved = await refreshSessionCatalogCandidates(candidates)
+                    // FSEvents can report creation before an agent has flushed a complete header.
+                    // Keep the exact file, never its siblings, on a bounded backoff long enough
+                    // for a slow agent to materialize. Ordinary appends are not catalog work.
+                    for delay in [
+                        UInt64(250_000_000), 500_000_000, 1_000_000_000,
+                        2_000_000_000, 4_000_000_000,
+                    ] where !unresolved.isEmpty {
+                        if generation != sessionCatalogEventGeneration {
+                            pendingSessionCatalogCandidatePaths.formUnion(unresolved)
+                            break
+                        }
+                        try? await Task.sleep(nanoseconds: delay)
+                        guard !Task.isCancelled else { break }
+                        unresolved = await refreshSessionCatalogCandidates(unresolved)
+                    }
+                }
+                if generation == sessionCatalogEventGeneration { break }
+            }
+            sessionCatalogRefreshTask = nil
+        }
+    }
+
+    private func refreshSessionCatalogCandidates(_ paths: Set<String>) async -> Set<String> {
+        guard !paths.isEmpty else { return [] }
+        var changed = false
+        var unresolved: Set<String> = []
+        var hydratedActivityPaths: Set<String> = []
+        for path in paths.sorted() {
+            guard !Task.isCancelled else { return unresolved }
+            let fileURL = URL(fileURLWithPath: path).standardizedFileURL
+            let agent = repository.agent(for: fileURL)
+            guard enabledAgentFilter?.contains(agent) ?? true else { continue }
+            let summaryResult = try? await repository.refreshSummary(
+                at: fileURL, archivedIDs: persistence.state.archivedSessionIDs
+            )
+            guard var summary = summaryResult else {
+                if let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                   values.isRegularFile == true {
+                    unresolved.insert(fileURL.path)
+                }
+                continue
+            }
+            guard !summary.isSubsession else { continue }
+
+            let normalizedPath = summary.fileURL.standardizedFileURL.path
+            summary.isArchived = persistence.isArchived(
+                sessionID: summary.id,
+                sessionPath: normalizedPath
+            ) || isDaemonArchived(sessionID: summary.id, sessionPath: normalizedPath)
+            if let pending = pendingArchiveIntentByPath[normalizedPath] {
+                summary.isArchived = pending
+            }
+            persistence.noteArchivePresentation(summary.isArchived, sessionPath: normalizedPath)
+
+            if let index = sessions.firstIndex(where: {
+                $0.fileURL.standardizedFileURL.path == normalizedPath
+            }) {
+                sessions.remove(at: index)
+                insertSessionInOrder(summary)
+                hydratedActivityPaths.insert(normalizedPath)
+                changed = true
+                continue
+            }
+            guard showsForeignConversations || isAppStarted(summary) else {
+                if hiddenSessionCatalogCandidatePaths.count < 10_000,
+                   hiddenSessionCatalogCandidatePaths.insert(normalizedPath).inserted {
+                    hiddenForeignCount += 1
+                }
+                continue
+            }
+            insertSessionInOrder(summary)
+            hydratedActivityPaths.insert(normalizedPath)
+            changed = true
+        }
+        guard changed else { return unresolved }
+        sessionCatalogRevision &+= 1
+        refreshPullRequestStates(for: sessions)
+        syncActivityMonitorPaths()
+        // Creation can be reported before the path joins the monitor. Reapply the exact
+        // candidate after hydration so a new CLI/Codex/Claude thread gets a bounded tail read
+        // immediately instead of entering the large-history round robin.
+        activityMonitor.prioritize(paths: hydratedActivityPaths)
+        if isApplicationActive { scheduleFolderGitSnapshotsRefresh() }
+        return unresolved
+    }
+
+    private func startDaemonEventLoop() {
+        guard daemonEventTask == nil, let daemonClient else { return }
+        daemonEventTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    var reconciled = false
+                    for try await event in daemonClient.events() {
+                        guard let self, !Task.isCancelled else { return }
+                        guard await consumeDaemonEvent(event, reconciled: &reconciled) else {
+                            break
+                        }
+                    }
+                } catch {
+                    // The app can start before its embedded daemon has bound the socket.
+                }
+                guard self != nil, !Task.isCancelled else { return }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    @discardableResult
+    func consumeDaemonEvent(_ event: PatchworkEvent, reconciled: inout Bool) async -> Bool {
+        if case let .unknown(name, _) = event, name == "ready" {
+            reconciled = true
+            for slot in runtimeSlots() {
+                slot.leaseCoordinator?.reacquire()
+            }
+            if !daemonRunActivityByPath.isEmpty {
+                // Point run events belong to one SSE connection. A reconnect may have missed the
+                // terminal frame, so none of those transient memos can remain authoritative.
+                daemonRunActivityByPath.removeAll(keepingCapacity: true)
+                objectWillChange.send()
+            }
+            resumePendingDaemonSyncs()
+            scheduleDaemonReconciliation()
+            return true
+        }
+        // Compatibility with a daemon that predates the ready barrier.
+        if !reconciled {
+            reconciled = true
+            scheduleDaemonReconciliation()
+        }
+        switch event {
+        case let .thread(thread):
+            let overlay = await loadDaemonOverlaySnapshot()
+            applyDaemonThreadUpdate(thread, daemonOverlay: overlay)
+        case let .run(run):
+            consumeDaemonRunActivity(run)
+            if Self.terminalRunStatuses.contains(run.status.rawValue) {
+                Task { @MainActor [weak self] in await self?.refreshSessions() }
+            }
+        case .schedule:
+            scheduleDaemonScheduleRefresh()
+        case let .activity(snapshot):
+            let knownPaths = Set(sessions.map { $0.fileURL.standardizedFileURL.path })
+            if snapshot.running.contains(where: { running in
+                guard let path = running.threadPath else { return false }
+                return !knownPaths.contains(URL(fileURLWithPath: path).standardizedFileURL.path)
+            }) {
+                scheduleDaemonReconciliation()
+            }
+        case let .unknown(name, _) where name == "schedule_deleted":
+            scheduleDaemonScheduleRefresh()
+        default:
+            break
+        }
+        return true
+    }
+
+    private func scheduleDaemonReconciliation() {
+        guard daemonReconciliationTask == nil else {
+            daemonReconciliationPending = true
+            return
+        }
+        daemonReconciliationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            repeat {
+                daemonReconciliationPending = false
+                let refreshed = await refreshSessions()
+                if !refreshed, !isScanning, !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    _ = await refreshSessions()
+                }
+                _ = await refreshScheduledThreads()
+            } while daemonReconciliationPending && !Task.isCancelled
+            daemonReconciliationTask = nil
+        }
+    }
+
+    private func scheduleDaemonScheduleRefresh() {
+        guard daemonScheduleRefreshTask == nil else {
+            daemonScheduleRefreshPending = true
+            return
+        }
+        daemonScheduleRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            repeat {
+                daemonScheduleRefreshPending = false
+                _ = await refreshScheduledThreads()
+            } while daemonScheduleRefreshPending && !Task.isCancelled
+            daemonScheduleRefreshTask = nil
+        }
+    }
+
+    func waitForDaemonReconciliationForTesting() async {
+        await daemonReconciliationTask?.value
+        await daemonScheduleRefreshTask?.value
+    }
+
+    private static let terminalRunStatuses: Set<String> = ["ok", "failed", "skipped", "timeout", "interrupted"]
+    private static let activeRunStatuses: Set<String> = ["queued", "running"]
+
+    private func consumeDaemonRunActivity(_ run: Run) {
+        let path: String?
+        if let threadPath = run.threadPath, !threadPath.isEmpty {
+            path = URL(fileURLWithPath: threadPath).standardizedFileURL.path
+        } else if let threadID = run.threadId {
+            let matches = sessions.filter { $0.id == threadID }
+            path = matches.count == 1 ? matches[0].fileURL.standardizedFileURL.path : nil
+        } else {
+            path = nil
+        }
+        guard let path else { return }
+
+        if Self.activeRunStatuses.contains(run.status.rawValue) {
+            let value = DaemonRunActivity(runID: run.id, startedAt: run.startedAt)
+            guard daemonRunActivityByPath[path]?.runID != value.runID
+                    || daemonRunActivityByPath[path]?.startedAt != value.startedAt else { return }
+            daemonRunActivityByPath[path] = value
+            objectWillChange.send()
+        } else if Self.terminalRunStatuses.contains(run.status.rawValue),
+                  daemonRunActivityByPath[path]?.runID == run.id {
+            daemonRunActivityByPath.removeValue(forKey: path)
+            objectWillChange.send()
+        }
+    }
+
+    /// Paths, not session IDs, identify sidebar rows because copied histories may share an id.
+    /// This projection is intentionally idempotent: duplicate or out-of-order SSE delivery cannot
+    /// create duplicate rows or undo an app-owned archive.
+    func applyDaemonThreadUpdate(
+        _ thread: PatchworkThread,
+        daemonOverlay: DaemonWorktreeProjects.Snapshot? = nil
+    ) {
+        let path = URL(fileURLWithPath: thread.path).standardizedFileURL.path
+        if let daemonOverlay {
+            let observationPathsChanged = daemonManagedThreadPaths != daemonOverlay.managedThreadPaths
+            daemonManagedThreadPaths = daemonOverlay.managedThreadPaths
+            daemonArchivedThreadIDs = daemonOverlay.archivedThreadIDs
+            daemonArchivedThreadPaths = daemonOverlay.archivedThreadPaths
+            daemonArchiveExemptThreadPaths = daemonOverlay.archiveExemptThreadPaths
+            if observationPathsChanged { restartSessionCatalogMonitor() }
+        }
+        if daemonManagedThreadPaths.contains(path) {
+            recordAppStartedSessionPath(path)
+        }
+        sessionCatalogRevision &+= 1
+
+        let appArchived = persistence.isArchived(sessionID: thread.id, sessionPath: path)
+        let daemonArchived = daemonOverlay?.isArchived(threadID: thread.id, path: path)
+            ?? isDaemonArchived(sessionID: thread.id, sessionPath: path)
+        let presentedArchived = pendingArchiveIntentByPath[path] ?? (appArchived || daemonArchived)
+        persistence.noteArchivePresentation(presentedArchived, sessionPath: path)
+        let previousDaemonUnread = lastDaemonUnreadByPath[path]
+        lastDaemonUnreadByPath[path] = thread.unread
+        if lastDaemonUnreadByPath.count > 10_000 {
+            for stale in lastDaemonUnreadByPath.keys.filter({ $0 != path }).sorted()
+                .prefix(lastDaemonUnreadByPath.count - 10_000) {
+                lastDaemonUnreadByPath.removeValue(forKey: stale)
+            }
+        }
+        if previousDaemonUnread != thread.unread
+            || pendingUnreadIntentByPath[path] != nil
+            || daemonOverlay?.readOverrides[path] != nil {
+            applyDaemonUnreadPresentation(
+                pendingUnreadIntentByPath[path] ?? thread.unread,
+                path: path,
+                markedAt: daemonOverlay?.readOverrides[path]?.markedAt ?? thread.updatedAt
+            )
+        }
+        if let index = sessions.firstIndex(where: { $0.fileURL.standardizedFileURL.path == path }) {
+            sessions[index].name = thread.name
+            sessions[index].preview = thread.preview
+            sessions[index].modifiedAt = thread.updatedAt
+            sessions[index].metrics.cost = thread.cost ?? sessions[index].metrics.cost
+            sessions[index].metrics.contextPercent = thread.contextPercent ?? sessions[index].metrics.contextPercent
+            sessions[index].isArchived = presentedArchived
+            sessions[index].prepareSearchKey()
+            setArchivedPresentation(sessions[index].isArchived, path: path)
+            let updated = sessions.remove(at: index)
+            insertSessionInOrder(updated)
+            return
+        }
+
+        let isOwned = persistence.state.appStartedSessionPaths.contains(path)
+            || daemonManagedThreadPaths.contains(path)
+        guard showsForeignConversations || isOwned else { return }
+
+        var metrics = TokenMetrics()
+        metrics.cost = thread.cost ?? 0
+        metrics.contextPercent = thread.contextPercent
+        var summary = SessionSummary(
+            id: thread.id,
+            fileURL: URL(fileURLWithPath: path),
+            cwd: URL(fileURLWithPath: thread.cwd),
+            agent: thread.agent,
+            createdAt: thread.createdAt,
+            modifiedAt: thread.updatedAt,
+            name: thread.name,
+            preview: thread.preview,
+            messageCount: 0,
+            metrics: metrics,
+            isArchived: presentedArchived
+        )
+        summary.prepareSearchKey()
+        insertSessionInOrder(summary)
+        syncActivityMonitorPaths()
+    }
+
+    private func insertSessionInOrder(_ summary: SessionSummary) {
+        var lower = 0
+        var upper = sessions.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            let candidate = sessions[middle]
+            let precedes = summary.modifiedAt == candidate.modifiedAt
+                ? summary.displayName < candidate.displayName
+                : summary.modifiedAt > candidate.modifiedAt
+            if precedes { upper = middle } else { lower = middle + 1 }
+        }
+        sessions.insert(summary, at: lower)
+    }
+
+    @discardableResult
+    func refreshSessions() async -> Bool {
+        guard !isScanning else {
+            sessionRefreshPending = true
+            return false
+        }
         isScanning = true
         scanError = nil
+        let catalogRevision = sessionCatalogRevision
+        // Bootstrap may already have published a cached sidebar before the first disk scan.
+        // Treat that as an existing catalog so a task created while the app was closed is not
+        // appended behind the cache's large activity rotation.
+        let shouldPrioritizeCatalogChanges = hasPublishedSessionCatalog || !sessions.isEmpty
+        let previousModifiedAtByPath = Dictionary(
+            sessions.map { ($0.fileURL.standardizedFileURL.path, $0.modifiedAt) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        defer {
+            isScanning = false
+            if sessionRefreshPending {
+                sessionRefreshPending = false
+                Task { @MainActor [weak self] in await self?.refreshSessions() }
+            }
+        }
         do {
             let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
             let overlayURL = daemonWorktreeProjectsURL
-            let daemonWorktrees = await Task.detached(priority: .utility) {
-                DaemonWorktreeProjects.load(from: overlayURL)
+            let daemonOverlay = await Task.detached(priority: .utility) {
+                DaemonWorktreeProjects.loadSnapshot(from: overlayURL)
             }.value
-            let scanned = applyArchiveRetention(
-                to: try await repository.discoverSessions(
-                    archivedIDs: persistence.state.archivedSessionIDs,
-                    agents: enabledAgentFilter
-                )
+            let supplementalPaths = persistence.state.appStartedSessionPaths.union(
+                daemonOverlay.managedThreadPaths
             )
+            var scanned = try await repository.discoverSessions(
+                archivedIDs: persistence.state.archivedSessionIDs,
+                agents: enabledAgentFilter,
+                supplementalPaths: supplementalPaths
+            )
+            guard catalogRevision == sessionCatalogRevision else {
+                sessionRefreshPending = true
+                return false
+            }
+            let observationPathsChanged = daemonManagedThreadPaths != daemonOverlay.managedThreadPaths
+            daemonManagedThreadPaths = daemonOverlay.managedThreadPaths
+            daemonArchivedThreadIDs = daemonOverlay.archivedThreadIDs
+            daemonArchivedThreadPaths = daemonOverlay.archivedThreadPaths
+            daemonArchiveExemptThreadPaths = daemonOverlay.archiveExemptThreadPaths
+            if observationPathsChanged { restartSessionCatalogMonitor() }
+            for index in scanned.indices {
+                scanned[index].isArchived = persistence.isArchived(
+                    sessionID: scanned[index].id,
+                    sessionPath: scanned[index].fileURL.path
+                ) || daemonOverlay.isArchived(
+                    threadID: scanned[index].id,
+                    path: scanned[index].fileURL.path
+                )
+                if let pending = pendingArchiveIntentByPath[
+                    scanned[index].fileURL.standardizedFileURL.path
+                ] {
+                    scanned[index].isArchived = pending
+                }
+            }
+            let readUpdates = scanned.compactMap { summary -> AppPersistence.DaemonReadUpdate? in
+                let path = summary.fileURL.standardizedFileURL.path
+                guard let unread = daemonOverlay.unreadOverride(
+                    path: path, updatedAt: summary.modifiedAt
+                ) else { return nil }
+                return AppPersistence.DaemonReadUpdate(
+                    path: path,
+                    unread: pendingUnreadIntentByPath[path] ?? unread,
+                    markedAt: daemonOverlay.readOverrides[path]?.markedAt ?? Date(),
+                    completionID: activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+                        ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
+                )
+            }
+            persistence.applyDaemonReadUpdates(readUpdates)
+            let scannedPaths = Set(scanned.map { $0.fileURL.standardizedFileURL.path })
+            lastDaemonUnreadByPath = lastDaemonUnreadByPath.filter {
+                scannedPaths.contains($0.key) || pendingUnreadIntentByPath[$0.key] != nil
+            }
+            for update in readUpdates { lastDaemonUnreadByPath[update.path] = update.unread }
+            scanned = applyArchiveRetention(to: scanned)
             // Ownership is applied after discovery rather than inside it: the hidden count has
             // to be honest, and a conversation only stops being listed, never stops existing.
-            let discovered = showsForeignConversations ? scanned : scanned.filter(isAppStarted)
+            let visibility = SidebarVisibility(
+                showsForeignConversations: showsForeignConversations,
+                appStartedSessionPaths: persistence.state.appStartedSessionPaths,
+                desktopStartedThreadPaths: daemonOverlay.managedThreadPaths,
+                disabledAgents: disabledAgents
+            )
+            let discovered = scanned.filter {
+                visibility.includes(path: $0.fileURL.path, agent: $0.agent)
+            }
+            let hydratedActivityPaths: Set<String>
+            if shouldPrioritizeCatalogChanges {
+                hydratedActivityPaths = Set<String>(discovered.compactMap {
+                    let path = $0.fileURL.standardizedFileURL.path
+                    return previousModifiedAtByPath[path] != $0.modifiedAt ? path : nil
+                })
+            } else {
+                hydratedActivityPaths = []
+            }
             hiddenForeignCount = scanned.count - discovered.count
             let discoveredCwds = Set(discovered.map { $0.cwd.standardizedFileURL.path })
             persistence.mergeManagedWorktreeProjects(
-                daemonWorktrees.filter { discoveredCwds.contains($0.key) }
+                daemonOverlay.managedWorktreeProjects.filter { discoveredCwds.contains($0.key) }
             )
             sessions = discovered
+            hiddenSessionCatalogCandidatePaths.removeAll(keepingCapacity: true)
             refreshPullRequestStates(for: discovered)
             persistence.pruneCompletionState(retainingSessionPaths: discovered.map { $0.fileURL.path })
             syncActivityMonitorPaths()
+            hasPublishedSessionCatalog = true
+            // Root replacement and dropped/coalesced FSEvents require a full scan. Their exact
+            // write may have arrived before a new path was tracked, so promote every transcript
+            // that the scan just added or observed changing after hydration.
+            activityMonitor.prioritize(paths: hydratedActivityPaths)
             if let selectedPath, sessions.contains(where: { $0.fileURL.standardizedFileURL.path == selectedPath }) {
                 route = .session(selectedPath)
             }
-            if isApplicationActive { await refreshFolderGitSnapshots() }
+            if isApplicationActive { scheduleFolderGitSnapshotsRefresh() }
+            return true
         } catch is CancellationError {
             // A newer route/refresh owns the UI.
+            return false
         } catch {
             scanError = error.localizedDescription
+            return false
         }
-        isScanning = false
+    }
+
+    private func loadDaemonOverlaySnapshot() async -> DaemonWorktreeProjects.Snapshot {
+        let overlayURL = daemonWorktreeProjectsURL
+        return await Task.detached(priority: .utility) {
+            DaemonWorktreeProjects.loadSnapshot(from: overlayURL)
+        }.value
+    }
+
+    private func applyDaemonUnreadPresentation(_ unread: Bool, path: String, markedAt: Date) {
+        let completionID = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
+            ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
+        persistence.applyDaemonReadUpdates([
+            .init(path: path, unread: unread, markedAt: markedAt, completionID: completionID)
+        ])
+    }
+
+    func syncDaemonUnread(path: String, unread: Bool) {
+        guard daemonClient != nil else { return }
+        let path = URL(fileURLWithPath: path).standardizedFileURL.path
+        if pendingUnreadIntentByPath[path] == unread { return }
+        if pendingUnreadIntentByPath[path] == nil, lastDaemonUnreadByPath[path] == unread { return }
+        pendingUnreadIntentByPath[path] = unread
+        startUnreadSync(path: path, unread: unread)
+    }
+
+    private func startUnreadSync(path: String, unread: Bool) {
+        guard let daemonClient else { return }
+        let generation = (readSyncGenerationByPath[path] ?? 0) &+ 1
+        readSyncGenerationByPath[path] = generation
+        readSyncTasksByPath[path]?.cancel()
+        let task = Task { @MainActor [weak self] in
+            var failureCount = 0
+            while !Task.isCancelled {
+                guard self?.readSyncGenerationByPath[path] == generation else { return }
+                do {
+                    let response = try await daemonClient.markThreadRead(id: path, unread: unread)
+                    guard let self,
+                          self.readSyncGenerationByPath[path] == generation else { return }
+                    self.pendingUnreadIntentByPath.removeValue(forKey: path)
+                    let overlay = await self.loadDaemonOverlaySnapshot()
+                    guard self.readSyncGenerationByPath[path] == generation else { return }
+                    self.applyDaemonThreadUpdate(response.thread, daemonOverlay: overlay)
+                    self.readSyncTasksByPath.removeValue(forKey: path)
+                    self.readSyncGenerationByPath.removeValue(forKey: path)
+                    return
+                } catch {
+                    guard !Task.isCancelled,
+                          self?.readSyncGenerationByPath[path] == generation else { return }
+                    failureCount += 1
+                    if failureCount >= Self.daemonSyncAttemptLimit {
+                        self?.finishReadSyncAttempt(path: path, generation: generation)
+                        return
+                    }
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: Self.daemonSyncRetryNanoseconds(failureCount: failureCount)
+                        )
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+        readSyncTasksByPath[path] = task
+    }
+
+    private func finishReadSyncAttempt(path: String, generation: UInt64) {
+        guard readSyncGenerationByPath[path] == generation else { return }
+        readSyncTasksByPath.removeValue(forKey: path)
+        readSyncGenerationByPath.removeValue(forKey: path)
+    }
+
+    private func resumePendingDaemonSyncs() {
+        for (path, _) in pendingArchiveIntentByPath
+            where archiveSyncTasksByPath[path] == nil {
+            startArchiveSync(path: path)
+        }
+        for (path, unread) in pendingUnreadIntentByPath
+            where readSyncTasksByPath[path] == nil {
+            startUnreadSync(path: path, unread: unread)
+        }
+    }
+
+    static let daemonSyncAttemptLimit = 12
+    static func daemonSyncRetryNanoseconds(failureCount: Int) -> UInt64 {
+        switch failureCount {
+        case ...1: 250_000_000
+        case 2: 500_000_000
+        case 3: 1_000_000_000
+        case 4: 2_000_000_000
+        default: 5_000_000_000
+        }
     }
 
     private func refreshPullRequestStates(for summaries: [SessionSummary]) {
@@ -1997,10 +3106,14 @@ final class AppStore: ObservableObject {
     /// Returns whether the load succeeded, so a caller can decide to try once more.
     @discardableResult
     func refreshScheduledThreads() async -> Bool {
+        scheduledRefreshGeneration &+= 1
+        let generation = scheduledRefreshGeneration
         guard let entries = try? await scheduleService.loadSchedules() else { return false }
+        guard generation == scheduledRefreshGeneration else { return false }
         for watch in entries where watch.isInternalPullRequestReviewWatch {
             try? await scheduleService.delete(id: watch.id)
         }
+        guard generation == scheduledRefreshGeneration else { return false }
         updateScheduledThreads(from: entries)
         return true
     }
@@ -2022,6 +3135,7 @@ final class AppStore: ObservableObject {
 
     func openNewChat() {
         if let selectedSession { markRead(selectedSession) }
+        if route == .newChat { discardRetriableVirtualFolderAssignment(for: activeRuntimeSlot) }
         parkCurrentDraft()
         flushDraftPersistence()
         cancelConversationLoad()
@@ -2052,7 +3166,9 @@ final class AppStore: ObservableObject {
     }
 
     func selectSession(_ session: SessionSummary) {
+        if route == .newChat { discardRetriableVirtualFolderAssignment(for: activeRuntimeSlot) }
         let path = session.fileURL.standardizedFileURL.path
+        ConversationPerformance.mark("Conversation selection", path: path, agent: session.agent)
         if let current = selectedSession, current.fileURL.standardizedFileURL.path != path { markRead(current) }
         parkCurrentDraft()
         cancelConversationLoad()
@@ -2141,7 +3257,7 @@ final class AppStore: ObservableObject {
         let startedAt = Date()
         let page = try await repository.loadNewestConversationPage(from: session.fileURL)
         ConversationPerformance.mark(
-            "JSONL newest page", path: path, count: page.messages.count,
+            "JSONL newest page", path: path, agent: session.agent, count: page.messages.count,
             milliseconds: Date().timeIntervalSince(startedAt) * 1_000
         )
         try Task.checkCancellation()
@@ -2153,7 +3269,9 @@ final class AppStore: ObservableObject {
         isConversationLoading = false
         updateSelectedWorkspace(from: page.messages, for: session)
         refreshSelectedConversationIfNeeded()
-        ConversationPerformance.mark("Conversation first publish", path: path, count: page.messages.count)
+        ConversationPerformance.mark(
+            "Conversation first publish", path: path, agent: session.agent, count: page.messages.count
+        )
 
         let projectionStartedAt = Date()
         let projected = await projectActivities(from: page.messages)
@@ -2161,7 +3279,7 @@ final class AppStore: ObservableObject {
               selectedSession?.fileURL.standardizedFileURL.path == path else { return }
         activities = projected
         ConversationPerformance.mark(
-            "Transcript activity projection", path: path, count: projected.count,
+            "Transcript activity projection", path: path, agent: session.agent, count: projected.count,
             milliseconds: Date().timeIntervalSince(projectionStartedAt) * 1_000
         )
         schedulePrefetch(around: session)
@@ -2266,7 +3384,7 @@ final class AppStore: ObservableObject {
             guard let self else { return }
             let startedAt = Date()
             do {
-                let older = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cursor)
+                let older = try await repository.loadOlderConversationPage(from: session.fileURL, cursor: cursor)
                 try Task.checkCancellation()
                 guard conversationLoadGeneration == generation,
                       selectedSession?.fileURL.standardizedFileURL.path == path else { return }
@@ -2279,7 +3397,7 @@ final class AppStore: ObservableObject {
                 isLoadingEarlierMessages = false
                 historyNavigationTask = nil
                 ConversationPerformance.mark(
-                    "Focused history page", path: path, count: older.messages.count,
+                    "History page", path: path, agent: session.agent, count: older.messages.count,
                     milliseconds: Date().timeIntervalSince(startedAt) * 1_000
                 )
             } catch is CancellationError {
@@ -2321,7 +3439,7 @@ final class AppStore: ObservableObject {
                 var remembered: [(Int, ConversationPageCursor)] = []
                 let page: ConversationPage
                 if let cachedCursor {
-                    page = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cachedCursor)
+                    page = try await repository.loadOlderConversationPage(from: session.fileURL, cursor: cachedCursor)
                     remembered.append((targetDepth, cachedCursor))
                 } else {
                     var replayed = latest
@@ -2331,7 +3449,7 @@ final class AppStore: ObservableObject {
                         if depth > targetDepth - Self.historyReloadCursorLimit {
                             remembered.append((depth, cursor))
                         }
-                        replayed = try await repository.loadFocusedHistoryPage(from: session.fileURL, cursor: cursor)
+                        replayed = try await repository.loadOlderConversationPage(from: session.fileURL, cursor: cursor)
                     }
                     page = replayed
                 }
@@ -2644,6 +3762,7 @@ final class AppStore: ObservableObject {
     func chooseFolder(_ url: URL) {
         let folder = url.standardizedFileURL
         if case .newChat = route, selectedFolder?.standardizedFileURL.path != folder.path {
+            discardRetriableVirtualFolderAssignment(for: activeRuntimeSlot)
             discardPendingWorktree()
         }
         if case .newChat = route, runtimeKey(for: activeRuntimeSlot) != .newChat(newChatAgent, folder.path) {
@@ -2656,6 +3775,7 @@ final class AppStore: ObservableObject {
         if !WorkspaceOrganization.isGlobalWorkingDirectory(folder), !WorktreeService.isManaged(folder) {
             persistence.rememberFolder(folder)
         }
+        invalidateSidebarProjection()
         if selectedSession == nil { resetSelectedGitDirectory(to: folder) }
         refreshSelectedGit()
     }
@@ -2716,31 +3836,56 @@ final class AppStore: ObservableObject {
     /// own session file is never touched, so a pruned conversation is hidden, not destroyed.
     static let archiveRetention: TimeInterval = 7 * 24 * 60 * 60
 
-    static func expiredArchiveIDs(
+    static func expiredArchivePaths(
         _ sessions: [SessionSummary],
         archivedAt: [String: Date],
         now: Date
     ) -> Set<String> {
         Set(sessions.lazy
             .filter { $0.isArchived }
-            .filter { now.timeIntervalSince(archivedAt[$0.id] ?? now) >= archiveRetention }
-            .map(\.id))
+            .filter {
+                let path = $0.fileURL.standardizedFileURL.path
+                return now.timeIntervalSince(archivedAt[path] ?? now) >= archiveRetention
+            }
+            .map { $0.fileURL.standardizedFileURL.path })
     }
 
     /// Stamps newly seen archives (including ones archived by older builds, whose clock starts
     /// now) and drops the expired ones, removing any worktree no surviving conversation still uses.
     private func applyArchiveRetention(to discovered: [SessionSummary], now: Date = Date()) -> [SessionSummary] {
-        persistence.updateState { state in
-            for session in discovered where session.isArchived && state.archivedAt[session.id] == nil {
-                state.archivedAt[session.id] = now
+        persistence.updateStateIfChanged { state in
+            var changed = false
+            for session in discovered {
+                let path = session.fileURL.standardizedFileURL.path
+                if session.isArchived, state.archivedAtBySessionPath[path] == nil {
+                    state.archivedAtBySessionPath[path] = state.archivedAt[session.id] ?? now
+                    changed = true
+                } else if !session.isArchived {
+                    if state.archivedAtBySessionPath.removeValue(forKey: path) != nil {
+                        changed = true
+                    }
+                }
             }
+            if state.archivedAtBySessionPath.count > 10_000 {
+                state.archivedAtBySessionPath = Dictionary(uniqueKeysWithValues:
+                    state.archivedAtBySessionPath
+                        .sorted { $0.value < $1.value }
+                        .suffix(10_000)
+                )
+                changed = true
+            }
+            return changed
         }
-        let expired = Self.expiredArchiveIDs(discovered, archivedAt: persistence.state.archivedAt, now: now)
+        let expired = Self.expiredArchivePaths(
+            discovered, archivedAt: persistence.state.archivedAtBySessionPath, now: now
+        )
         guard !expired.isEmpty else { return discovered }
-        let surviving = discovered.filter { !expired.contains($0.id) }
+        let surviving = discovered.filter {
+            !expired.contains($0.fileURL.standardizedFileURL.path)
+        }
         let stillUsed = Set(surviving.map { $0.cwd.standardizedFileURL.path })
         let releasable = Set(discovered
-            .filter { expired.contains($0.id) }
+            .filter { expired.contains($0.fileURL.standardizedFileURL.path) }
             .map(\.cwd)
             .filter { WorktreeService.isManaged($0) && !stillUsed.contains($0.standardizedFileURL.path) }
             .map { $0.standardizedFileURL })
@@ -2752,7 +3897,8 @@ final class AppStore: ObservableObject {
     }
 
     func archivedDate(_ session: SessionSummary) -> Date {
-        persistence.state.archivedAt[session.id] ?? session.modifiedAt
+        persistence.archivedDate(sessionID: session.id, sessionPath: session.fileURL.path)
+            ?? session.modifiedAt
     }
 
     func toggleArchive(_ session: SessionSummary) {
@@ -2769,12 +3915,19 @@ final class AppStore: ObservableObject {
         do {
             let entries = try await scheduleService.loadSchedules()
             updateScheduledThreads(from: entries)
-            guard let current = sessions.first(where: { $0.id == session.id }), !current.isArchived else { return }
+            let path = session.fileURL.standardizedFileURL.path
+            guard let current = sessions.first(where: {
+                $0.fileURL.standardizedFileURL.path == path
+            }), !current.isArchived else { return }
             let linked = linkedSchedules(in: entries, threadID: session.id)
             if linked.isEmpty {
                 setArchived(true, session: current)
             } else {
-                archiveConfirmation = ArchiveConfirmation(sessionID: session.id, automationCount: linked.count)
+                archiveConfirmation = ArchiveConfirmation(
+                    sessionID: session.id,
+                    sessionPath: path,
+                    automationCount: linked.count
+                )
             }
         } catch {
             showToast("Couldn’t check linked automations: \(error.localizedDescription)", style: .error)
@@ -2787,13 +3940,17 @@ final class AppStore: ObservableObject {
 
     func confirmArchive(_ confirmation: ArchiveConfirmation) async {
         archiveConfirmation = nil
-        guard sessions.contains(where: { $0.id == confirmation.sessionID && !$0.isArchived }) else { return }
+        guard sessions.contains(where: {
+            $0.fileURL.standardizedFileURL.path == confirmation.sessionPath && !$0.isArchived
+        }) else { return }
         do {
             let entries = try await scheduleService.loadSchedules()
             let linked = linkedSchedules(in: entries, threadID: confirmation.sessionID)
             for entry in linked { try await scheduleService.delete(id: entry.id) }
             updateScheduledThreads(from: entries.filter { !linked.contains($0) })
-            guard let session = sessions.first(where: { $0.id == confirmation.sessionID }), !session.isArchived else { return }
+            guard let session = sessions.first(where: {
+                $0.fileURL.standardizedFileURL.path == confirmation.sessionPath
+            }), !session.isArchived else { return }
             setArchived(true, session: session)
         } catch {
             await refreshScheduledThreads()
@@ -2809,20 +3966,113 @@ final class AppStore: ObservableObject {
     }
 
     private func setArchived(_ archived: Bool, session: SessionSummary) {
-        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
-        persistence.setArchived(archived, sessionID: session.id)
-        if let index = sessions.firstIndex(where: { $0.id == session.id }) {
-            sessions[index].isArchived = archived
-            if archived, selectedPath == session.fileURL.standardizedFileURL.path {
-                if let next = sessions[(index + 1)...].first(where: { !$0.isArchived })
-                    ?? sessions[..<index].last(where: { !$0.isArchived }) {
-                    selectSession(next)
-                } else {
-                    openNewChat()
+        let path = session.fileURL.standardizedFileURL.path
+        persistence.setArchived(
+            archived,
+            sessionID: session.id,
+            sessionPath: path,
+            queueDaemonSync: true
+        )
+        pendingArchiveIntentByPath[path] = archived
+        sessionCatalogRevision &+= 1
+        setArchivedPresentation(archived, path: path)
+        // Publish both directions through the daemon so connected CLI and web clients update
+        // immediately. The app-owned path remains authoritative if the daemon is unavailable.
+        startArchiveSync(path: path)
+        showToast(archived ? "Conversation archived" : "Conversation restored", style: .info)
+    }
+
+    private func startArchiveSync(path: String) {
+        guard let archiveThreadOperation, archiveSyncTasksByPath[path] == nil else { return }
+        let task = Task { @MainActor [weak self] in
+            var failureCount = 0
+            while !Task.isCancelled {
+                guard let self,
+                      let desired = self.pendingArchiveIntentByPath[path] else { break }
+                do {
+                    let response = try await archiveThreadOperation(path, desired)
+                    guard self.pendingArchiveIntentByPath[path] == desired else {
+                        failureCount = 0
+                        continue
+                    }
+                    let overlay = await self.loadDaemonOverlaySnapshot()
+                    // An opposite click may arrive while either network or disk I/O is suspended.
+                    // Never acknowledge or repaint from that stale response; loop and serialize
+                    // the latest intent behind the request that the daemon has already received.
+                    guard self.pendingArchiveIntentByPath[path] == desired else {
+                        failureCount = 0
+                        continue
+                    }
+                    let acknowledged = self.persistence.acknowledgeArchiveSync(
+                        path: path, expected: desired
+                    )
+                    if acknowledged, self.pendingArchiveIntentByPath[path] == desired {
+                        self.pendingArchiveIntentByPath.removeValue(forKey: path)
+                    }
+                    guard self.pendingArchiveIntentByPath[path] == nil else {
+                        failureCount = 0
+                        continue
+                    }
+                    self.applyDaemonThreadUpdate(response.thread, daemonOverlay: overlay)
+                    break
+                } catch {
+                    guard !Task.isCancelled else { break }
+                    if self.pendingArchiveIntentByPath[path] != desired {
+                        failureCount = 0
+                        continue
+                    }
+                    failureCount += 1
+                    if failureCount == 2 {
+                        self.showToast(
+                            "Archive sync is waiting for the background service to reconnect.",
+                            style: .warning
+                        )
+                    }
+                    if failureCount >= Self.daemonSyncAttemptLimit {
+                        break
+                    }
+                    await self.waitForArchiveRetry(
+                        path: path, attempted: desired, failureCount: failureCount
+                    )
                 }
             }
+            self?.archiveSyncTasksByPath.removeValue(forKey: path)
         }
-        showToast(archived ? "Conversation archived" : "Conversation restored", style: .info)
+        archiveSyncTasksByPath[path] = task
+    }
+
+    private func waitForArchiveRetry(
+        path: String, attempted: Bool, failureCount: Int
+    ) async {
+        let total = Self.daemonSyncRetryNanoseconds(failureCount: failureCount)
+        var remaining = total
+        let responsiveness: UInt64 = 25_000_000
+        while remaining > 0, !Task.isCancelled,
+              pendingArchiveIntentByPath[path] == attempted {
+            let interval = min(responsiveness, remaining)
+            do { try await Task.sleep(nanoseconds: interval) }
+            catch { return }
+            remaining -= interval
+        }
+    }
+
+    func waitForArchiveSyncForTesting(path rawPath: String) async {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        await archiveSyncTasksByPath[path]?.value
+    }
+
+    private func setArchivedPresentation(_ archived: Bool, path: String) {
+        let selectedPath = selectedSession?.fileURL.standardizedFileURL.path
+        guard let index = sessions.firstIndex(where: { $0.fileURL.standardizedFileURL.path == path }) else { return }
+        sessions[index].isArchived = archived
+        if archived, selectedPath == path {
+            if let next = sessions[(index + 1)...].first(where: { !$0.isArchived })
+                ?? sessions[..<index].last(where: { !$0.isArchived }) {
+                selectSession(next)
+            } else {
+                openNewChat()
+            }
+        }
     }
 
     /// ⌘⇧A. Enabled only when a conversation is selected.
@@ -2842,6 +4092,7 @@ final class AppStore: ObservableObject {
         let paths = sessions.map { $0.fileURL.standardizedFileURL.path }
         observedActivityPaths.formIntersection(Set(paths))
         activityMonitor.setTrackedPaths(paths)
+        activityMonitor.setPriorityPath(selectedSession?.fileURL.standardizedFileURL.path)
     }
 
     // MARK: - Draft persistence
@@ -2943,6 +4194,12 @@ final class AppStore: ObservableObject {
 
         let sentText = draft
         let sentAttachments = attachments
+        // Once an ordinary send is already waiting for startup, later ordinary sends are ordered
+        // behind it. Draining ready callbacks must never reinterpret them as live steering merely
+        // because the first callback flipped the runtime to streaming a few microseconds earlier.
+        let dispatchDelivery: DeliveryMode = delivery == .automatic && currentRouteHasPendingStartupPrompt
+            ? .followUp
+            : delivery
         let origin = DraftOrigin(route: route, sessionPath: sessionPath?.standardizedFileURL.path)
         let submittedDraftKey = currentDraftKey
         let optimisticID: String?
@@ -2960,23 +4217,44 @@ final class AppStore: ObservableObject {
         attachments = []
         var completedSynchronously = false
         weak var startupSlot: RuntimeSlot?
+        let failSubmission: (Error) -> Void = { [weak self] error in
+            guard let self else { return }
+            if case .newChat = self.route,
+               self.newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
+                self.newChatWorktreeSubmitted = false
+            }
+            if let optimisticID { self.removeOptimisticMessage(optimisticID, origin: origin) }
+            let restored = self.restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
+            self.showToast(
+                self.failureMessage(error.localizedDescription, restored: restored, origin: origin),
+                style: .error
+            )
+        }
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             completedSynchronously = true
             if let startupSlot { startupSlot.pendingStartupPrompts = max(0, startupSlot.pendingStartupPrompts - 1) }
             guard let self else { return }
             switch result {
             case let .success(slot):
-                dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
-                                delivery: delivery, cwd: cwd, optimisticID: optimisticID,
-                                submissionOrigin: origin, slot: slot)
-            case let .failure(error):
-                if case .newChat = route,
-                   newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
-                    newChatWorktreeSubmitted = false
+                guard sessionPath == nil else {
+                    dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
+                                    delivery: dispatchDelivery, cwd: cwd, optimisticID: optimisticID,
+                                    submissionOrigin: origin, slot: slot)
+                    return
                 }
-                if let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
-                let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
-                showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
+                applySelectedPreset(to: slot) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success:
+                        dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
+                                        delivery: dispatchDelivery, cwd: cwd, optimisticID: optimisticID,
+                                        submissionOrigin: origin, slot: slot)
+                    case let .failure(error):
+                        failSubmission(error)
+                    }
+                }
+            case let .failure(error):
+                failSubmission(error)
             }
         }
         if !completedSynchronously, let slot = currentRouteRuntimeSlot {
@@ -3021,6 +4299,7 @@ final class AppStore: ObservableObject {
                 guard let self, let slot else { return }
                 slot.isReady = false
                 slot.runtime.stop()
+                closeRuntimeLease(for: slot)
                 removeParkedReference(to: slot)
                 updateState(for: slot) { state in
                     state.isConnected = false
@@ -3207,8 +4486,66 @@ final class AppStore: ObservableObject {
         runExtensionCommand("/mode \(mode.rawValue)", successToast: "Mode set to \(mode.label)")
     }
 
+    func toggleFastMode() {
+        switch activeCapabilities.fastMode {
+        case .extensionCommand:
+            runExtensionCommand("/codex-fast")
+        case .threadSetting, .relaunch:
+            guard let cwd = selectedExecutionFolder else {
+                showToast("Choose a working folder first", style: .warning)
+                return
+            }
+            let sessionPath = selectedSession?.fileURL
+            ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
+                guard let self else { return }
+                guard case let .success(slot) = result,
+                      slot === activeRuntimeSlot,
+                      runtimeMatchesCurrentRoute else {
+                    if case let .failure(error) = result {
+                        showToast(error.localizedDescription, style: .error)
+                    }
+                    return
+                }
+                let enabled = !state(for: slot).fastModeEnabled
+                switch slot.capabilities.fastMode {
+                case .threadSetting:
+                    setThreadFastMode(enabled, slot: slot)
+                case .relaunch:
+                    guard !state(for: slot).isBusy else {
+                        showToast("Wait for \(slot.agent.displayName) to finish before changing fast mode.", style: .warning)
+                        return
+                    }
+                    relaunchRuntime(slot, fastMode: enabled)
+                case .extensionCommand, .unsupported:
+                    break
+                }
+            }
+        case .unsupported:
+            showToast("\(activeAgent.displayName) does not support fast mode.", style: .warning)
+        }
+    }
+
+    // Kept for callers compiled against the former Pi-only name.
     func toggleFastPriority() {
-        runExtensionCommand("/codex-fast")
+        toggleFastMode()
+    }
+
+    private func setThreadFastMode(_ enabled: Bool, slot: RuntimeSlot) {
+        slot.runtime.send(type: "set_fast_mode", payload: ["enabled": .bool(enabled)]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                let data = response["data"]
+                updateState(for: slot) { state in
+                    state.fastModeEnabled = data?["enabled"]?.boolValue ?? enabled
+                    state.fastModeAvailable = data?["available"]?.boolValue ?? state.fastModeAvailable
+                }
+            case let .success(response):
+                showToast(responseError(response) ?? "Fast mode could not be changed.", style: .error)
+            case let .failure(error):
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
     }
 
     /// `/limits` renders its report through the existing extension editor dialog bridge.
@@ -3360,6 +4697,7 @@ final class AppStore: ObservableObject {
         if slot === activeRuntimeSlot { cancelRuntimeRetirementLease() }
         else { objectWillChange.send() }
         finalDurabilityTasks.removeValue(forKey: slot.id)?.cancel()
+        if ownsLivePresentation { cancelPendingStreamingPublish() }
 
         // A stop is final: discard every app-held and Pi-owned continuation, retire the process,
         // and ignore any event already en route from its superseded generation.
@@ -3417,6 +4755,7 @@ final class AppStore: ObservableObject {
             slot.runtime.onExit = nil
             slot.runtime.stop()
         }
+        closeRuntimeLease(for: slot)
         for waiter in readyWaiters {
             waiter(.failure(AgentRuntimeError.processExited("Pi was stopped.")))
         }
@@ -3507,9 +4846,134 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Applies a pending new chat's exact model and thinking choice before its first prompt.
+    /// Model goes first because some agents reset reasoning to that model's default.
+    private func applySelectedPreset(
+        to slot: RuntimeSlot,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard slot.startedForNewChat, let preset = selectedPreset, preset.agent == slot.agent else {
+            completion(.success(()))
+            return
+        }
+        let fingerprint = preset.fingerprint
+        guard slot.appliedPresetFingerprint != fingerprint else {
+            completion(.success(()))
+            return
+        }
+
+        if slot.capabilities.thinking == .relaunch {
+            if presetMatchesRuntimeState(preset, slot: slot) {
+                slot.appliedPresetFingerprint = fingerprint
+                completion(.success(()))
+            } else {
+                relaunchNewChatRuntime(slot, with: preset, completion: completion)
+            }
+            return
+        }
+
+        slot.runtime.send(type: "set_model", payload: [
+            "provider": .string(preset.provider),
+            "modelId": .string(preset.modelID)
+        ]) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            guard selectedPreset?.fingerprint == fingerprint else {
+                applySelectedPreset(to: slot, completion: completion)
+                return
+            }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                slot.runtime.send(
+                    type: "set_thinking_level",
+                    payload: ["level": .string(preset.thinkingLevel)]
+                ) { [weak self, weak slot] result in
+                    guard let self, let slot, !slot.isSuperseded else { return }
+                    guard selectedPreset?.fingerprint == fingerprint else {
+                        applySelectedPreset(to: slot, completion: completion)
+                        return
+                    }
+                    switch result {
+                    case let .success(response) where responseError(response) == nil:
+                        updateState(for: slot) { state in
+                            state.provider = preset.provider
+                            state.modelID = preset.modelID
+                            state.modelName = preset.modelName
+                            state.thinkingLevel = preset.thinkingLevel
+                        }
+                        slot.appliedPresetFingerprint = fingerprint
+                        completion(.success(()))
+                    case let .success(response):
+                        completion(.failure(AgentRuntimeError.processExited(
+                            responseError(response) ?? "\(slot.agent.displayName) rejected the thinking level."
+                        )))
+                    case let .failure(error):
+                        completion(.failure(error))
+                    }
+                }
+            case let .success(response):
+                completion(.failure(AgentRuntimeError.processExited(
+                    responseError(response) ?? "\(slot.agent.displayName) rejected the model."
+                )))
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func presetMatchesRuntimeState(_ preset: AgentPreset, slot: RuntimeSlot) -> Bool {
+        let state = state(for: slot)
+        return state.provider == preset.provider
+            && state.modelID == preset.modelID
+            && state.thinkingLevel == preset.thinkingLevel
+    }
+
+    private func relaunchNewChatRuntime(
+        _ slot: RuntimeSlot,
+        with preset: AgentPreset,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard slot === activeRuntimeSlot, slot.startedForNewChat, let cwd = slot.cwd else {
+            completion(.failure(AgentRuntimeError.processExited("The pending new chat changed.")))
+            return
+        }
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        slot.runtime.configureLaunch(modelID: preset.modelID, thinkingLevel: preset.thinkingLevel)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: nil, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                guard selectedPreset?.fingerprint == preset.fingerprint else {
+                    applySelectedPreset(to: slot, completion: completion)
+                    return
+                }
+                guard presetMatchesRuntimeState(preset, slot: slot) else {
+                    completion(.failure(AgentRuntimeError.processExited(
+                        "\(slot.agent.displayName) did not apply the preset."
+                    )))
+                    return
+                }
+                slot.appliedPresetFingerprint = preset.fingerprint
+                completion(.success(()))
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: nil)
+    }
+
     func setThinkingLevel(_ level: String) {
-        guard runtimeMatchesCurrentRoute, availableThinkingLevels.contains(level) else { return }
+        guard runtimeMatchesCurrentRoute,
+              activeRuntimeSlot.capabilities.thinking != .unsupported,
+              availableThinkingLevels.contains(level) else { return }
         let slot = activeRuntimeSlot
+        if slot.capabilities.thinking == .relaunch {
+            guard !state(for: slot).isBusy else {
+                showToast("Wait for \(slot.agent.displayName) to finish before changing thinking.", style: .warning)
+                return
+            }
+            relaunchRuntime(slot, thinkingLevel: level)
+            return
+        }
         slot.runtime.send(type: "set_thinking_level", payload: ["level": .string(level)]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             switch result {
@@ -3523,6 +4987,47 @@ final class AppStore: ObservableObject {
             case let .failure(error): showToast(error.localizedDescription, style: .error)
             }
         }
+    }
+
+    private func relaunchRuntime(_ slot: RuntimeSlot, thinkingLevel: String) {
+        guard slot === activeRuntimeSlot, let cwd = slot.cwd else { return }
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        let sessionURL = slot.sessionPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        slot.runtime.configureLaunch(modelID: state(for: slot).modelID, thinkingLevel: thinkingLevel)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: sessionURL, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                updateState(for: slot) { $0.thinkingLevel = thinkingLevel }
+                requestComposerOptions(slot: slot)
+            case let .failure(error):
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: sessionURL)
+    }
+
+    private func relaunchRuntime(_ slot: RuntimeSlot, fastMode enabled: Bool) {
+        guard slot === activeRuntimeSlot, let cwd = slot.cwd else { return }
+        let previous = state(for: slot).fastModeEnabled
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        let sessionURL = slot.sessionPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        slot.runtime.configureFastMode(enabled)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: sessionURL, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                updateState(for: slot) { state in
+                    state.fastModeEnabled = enabled
+                    state.fastModeAvailable = true
+                }
+                requestComposerOptions(slot: slot)
+            case let .failure(error):
+                slot.runtime.configureFastMode(previous)
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: sessionURL)
     }
 
     /// Applies the agent's operating mode: Pi's `/mode` effort ladder, Codex's sandbox policy,
@@ -3604,7 +5109,8 @@ final class AppStore: ObservableObject {
     }
 
     func cycleThinkingLevel() {
-        guard runtimeMatchesCurrentRoute else { return }
+        guard runtimeMatchesCurrentRoute,
+              activeRuntimeSlot.capabilities.thinking != .unsupported else { return }
         let slot = activeRuntimeSlot
         slot.runtime.send(type: "cycle_thinking_level", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute,
@@ -3635,12 +5141,27 @@ final class AppStore: ObservableObject {
             if case let .success(response) = result, responseError(response) == nil {
                 availableModels = AvailableModel.parse(response["data"]?["models"])
                 slot.models = availableModels
+                if let available = response["data"]?["fastModeAvailable"]?.boolValue {
+                    updateState(for: slot) { $0.fastModeAvailable = available }
+                }
+                if let enabled = response["data"]?["fastModeEnabled"]?.boolValue {
+                    updateState(for: slot) { $0.fastModeEnabled = enabled }
+                }
             }
             requestThinkingOptions(slot: slot)
         }
     }
 
     private func requestThinkingOptions(slot: RuntimeSlot) {
+        guard slot.capabilities.thinking != .unsupported else {
+            availableThinkingLevels = ["off"]
+            slot.thinkingLevels = ["off"]
+            composerOptionsLoading = false
+            slot.optionsLoading = false
+            slot.optionsPrepared = true
+            resetRuntimeRetirementLease(for: slot)
+            return
+        }
         slot.runtime.send(type: "get_available_thinking_levels", payload: [:]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             if case let .success(response) = result, responseError(response) == nil {
@@ -3654,6 +5175,13 @@ final class AppStore: ObservableObject {
             composerOptionsLoading = false
             slot.optionsLoading = false
             slot.optionsPrepared = true
+            if slot.startedForNewChat {
+                applySelectedPreset(to: slot) { [weak self] result in
+                    if case let .failure(error) = result {
+                        self?.showToast(error.localizedDescription, style: .error)
+                    }
+                }
+            }
             resetRuntimeRetirementLease(for: slot)
         }
     }
@@ -3714,6 +5242,13 @@ final class AppStore: ObservableObject {
     }
 
     func renameSession(_ session: SessionSummary, to name: String) {
+        guard session.agent.capabilities.canRenameSession else {
+            showToast(
+                "\(session.agent.displayName) cannot rename this conversation.",
+                style: .warning
+            )
+            return
+        }
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
         let path = session.fileURL.standardizedFileURL.path
@@ -3724,7 +5259,7 @@ final class AppStore: ObservableObject {
                 switch result {
                 case let .success(response) where responseError(response) == nil:
                     updateState(for: slot) { $0.sessionName = clean }
-                    if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    if let index = sessions.firstIndex(where: { $0.instanceID == session.instanceID }) {
                         sessions[index].name = clean
                         sessions[index].prepareSearchKey()
                     }
@@ -4075,6 +5610,7 @@ final class AppStore: ObservableObject {
                 return
             }
             parkedRuntimes.removeValue(forKey: key)
+            closeRuntimeLease(for: parked)
         }
 
         if runtime.isRunning, activeRuntimeSlot.agent == agent, runtimeKey(for: activeRuntimeSlot) == key {
@@ -4087,21 +5623,33 @@ final class AppStore: ObservableObject {
         if canReuseProcess(previous, agent: agent, in: cwd) {
             let oldSessionPath = state(for: previous).sessionFile ?? previous.sessionPath
             removeParkedReference(to: previous)
-            previous.isSuperseded = true
-            previous.runtime.onEvent = nil
+            supersedeRuntimeSlotForReplacement(previous)
             let slot = RuntimeSlot(runtime: previous.runtime)
+            transferRuntimeLease(from: previous, to: slot)
             slot.runtime.onExit = { [weak self, weak slot] error in
                 guard let self, let slot else { return }
                 self.handleRuntimeExit(error, from: slot)
             }
             activeRuntimeSlot = slot
             configureRuntimeSlot(slot, cwd: cwd, sessionPath: sessionPath, phase: .openingConversation, completion: completion)
-            switchReusedRuntime(slot, cwd: cwd, sessionPath: sessionPath, oldSessionPath: oldSessionPath)
+            startWithRuntimeLease(slot, sessionPath: sessionPath) { [weak self, weak slot] in
+                guard let self, let slot else { return }
+                self.switchReusedRuntime(
+                    slot, cwd: cwd, sessionPath: sessionPath, oldSessionPath: oldSessionPath
+                )
+            }
             return
         }
 
         let slot: RuntimeSlot
         if shouldPark(previous) {
+            let uniqueParkedCount = Set(parkedRuntimes.values.map(\.id)).count
+            guard uniqueParkedCount < Self.maximumConcurrentRuntimes - 1 else {
+                completion(.failure(AgentRuntimeError.overloaded(
+                    "\(Self.maximumConcurrentRuntimes) conversations are already active. Stop one before starting another."
+                )))
+                return
+            }
             guard let currentKey = runtimeKey(for: previous) else {
                 completion(.failure(AgentRuntimeError.processExited(
                     "Could not preserve the current \(previous.agent.displayName) run."
@@ -4113,19 +5661,29 @@ final class AppStore: ObservableObject {
             slot = RuntimeSlot(runtime: runtimeFactory(agent))
         } else if previous.agent == agent {
             removeParkedReference(to: previous)
+            // The process has not started yet when a lease acquisition is still in flight. Retire
+            // that route and settle its callers before handing the coordinator to the replacement;
+            // the old acquisition callback will then recognize its superseded owner and leave the
+            // transferred coordinator alone.
+            supersedeRuntimeSlotForReplacement(previous)
             slot = RuntimeSlot(runtime: previous.runtime)
+            transferRuntimeLease(from: previous, to: slot)
         } else {
             // A different agent needs a different binary, so the idle process cannot be reused
             // and would otherwise be orphaned: nothing else will ever stop it.
             removeParkedReference(to: previous)
             previous.runtime.onEvent = nil
             previous.runtime.stop()
+            closeRuntimeLease(for: previous)
             slot = RuntimeSlot(runtime: runtimeFactory(agent))
         }
         bindRuntime(slot)
         activeRuntimeSlot = slot
         configureRuntimeSlot(slot, cwd: cwd, sessionPath: sessionPath, phase: .startingPi, completion: completion)
-        coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
+        startWithRuntimeLease(slot, sessionPath: sessionPath) { [weak self, weak slot] in
+            guard let self, let slot else { return }
+            self.coldStartRuntime(slot, cwd: cwd, sessionPath: sessionPath)
+        }
     }
 
     private func completeOrWait(
@@ -4135,6 +5693,10 @@ final class AppStore: ObservableObject {
         if slot.isReady {
             completion(.success(slot))
             resetRuntimeRetirementLease(for: slot)
+        } else if slot.readyWaiters.count >= RuntimeSlot.maximumReadyWaiters {
+            completion(.failure(AgentRuntimeError.overloaded(
+                "Too many messages are waiting for the agent to finish opening."
+            )))
         } else {
             slot.readyWaiters.append(completion)
         }
@@ -4147,6 +5709,137 @@ final class AppStore: ObservableObject {
             && slot.cwd == cwd.standardizedFileURL.path
             && state(for: slot).lastError == nil
             && isIdleAndClean(slot)
+    }
+
+    private func runtimeLeaseCoordinator(for slot: RuntimeSlot) -> RuntimeLeaseCoordinator? {
+        guard let runtimeLeaseOperation else { return nil }
+        if let coordinator = slot.leaseCoordinator {
+            bindLeaseLossHandler(coordinator, to: slot)
+            return coordinator
+        }
+        let coordinator = RuntimeLeaseCoordinator(operation: runtimeLeaseOperation)
+        slot.leaseCoordinator = coordinator
+        bindLeaseLossHandler(coordinator, to: slot)
+        return coordinator
+    }
+
+    private func bindLeaseLossHandler(
+        _ coordinator: RuntimeLeaseCoordinator, to slot: RuntimeSlot
+    ) {
+        coordinator.onLeaseLost = { [weak self, weak slot] path, error in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            self.stopRuntimeAfterLeaseLoss(slot, path: path, error: error)
+        }
+    }
+
+    private func transferRuntimeLease(from previous: RuntimeSlot, to slot: RuntimeSlot) {
+        slot.leaseCoordinator = previous.leaseCoordinator
+        previous.leaseCoordinator = nil
+        if let coordinator = slot.leaseCoordinator {
+            bindLeaseLossHandler(coordinator, to: slot)
+        }
+    }
+
+    /// Retires the route object while preserving its underlying process for immediate reuse. Any
+    /// startup callers are failed exactly once before a transferred lease can resume them through
+    /// a stale continuation.
+    private func supersedeRuntimeSlotForReplacement(_ slot: RuntimeSlot) {
+        let waiters = slot.readyWaiters
+        slot.readyWaiters.removeAll()
+        slot.isSuperseded = true
+        slot.isReady = false
+        slot.isStarting = false
+        slot.pendingStartupPrompts = 0
+        slot.startupBeganAt = nil
+        slot.runtime.onEvent = nil
+        slot.runtime.onExit = nil
+
+        let error = AgentRuntimeError.processExited(
+            "Opening this conversation was cancelled after you switched away."
+        )
+        for waiter in waiters.reversed() { waiter(.failure(error)) }
+    }
+
+    private func acquireRuntimeLease(
+        for slot: RuntimeSlot,
+        path: String,
+        materializing: Bool = false,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let coordinator = runtimeLeaseCoordinator(for: slot) else {
+            completion(.success(()))
+            return
+        }
+        Task { @MainActor [weak slot] in
+            guard let slot, !slot.isSuperseded else { return }
+            do {
+                try await coordinator.acquire(path: path, materializing: materializing)
+                // A superseded slot may have intentionally transferred this coordinator to its
+                // replacement. Its stale continuation no longer owns the coordinator lifecycle.
+                guard !slot.isSuperseded else { return }
+                guard slot.leaseCoordinator === coordinator else {
+                    coordinator.close()
+                    return
+                }
+                completion(.success(()))
+            } catch {
+                guard !slot.isSuperseded else { return }
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func closeRuntimeLease(for slot: RuntimeSlot) {
+        slot.leaseCoordinator?.close()
+        slot.leaseCoordinator = nil
+    }
+
+    private func stopRuntimeAfterLeaseLoss(
+        _ slot: RuntimeSlot,
+        path: String,
+        error: Error,
+        message: String = "This conversation is active in another process. Its local runtime was stopped to prevent overlapping writes."
+    ) {
+        guard !slot.isSuperseded else { return }
+        let waiters = slot.readyWaiters
+        slot.readyWaiters.removeAll()
+        slot.isSuperseded = true
+        slot.isReady = false
+        slot.isStarting = false
+        slot.runtime.onEvent = nil
+        slot.runtime.onExit = nil
+        slot.runtime.stop()
+        closeRuntimeLease(for: slot)
+        removeParkedReference(to: slot)
+        updateState(for: slot) { state in
+            state.isConnected = false
+            state.isStreaming = false
+            state.phase = .idle
+            state.lastError = message
+        }
+        for waiter in waiters {
+            waiter(.failure(AgentRuntimeError.processExited(message)))
+        }
+        showToast(message, style: .warning, sessionPath: path)
+        _ = error
+    }
+
+    private func startWithRuntimeLease(
+        _ slot: RuntimeSlot,
+        sessionPath: URL?,
+        operation: @escaping () -> Void
+    ) {
+        guard let path = sessionPath?.standardizedFileURL.path else {
+            operation()
+            return
+        }
+        acquireRuntimeLease(for: slot, path: path) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            switch result {
+            case .success: operation()
+            case let .failure(error): self.failRuntimeStart(slot, error: error)
+            }
+        }
     }
 
     private func configureRuntimeSlot(
@@ -4168,6 +5861,7 @@ final class AppStore: ObservableObject {
         slot.commandsLoading = false
         slot.optionsLoading = false
         slot.optionsPrepared = false
+        slot.appliedPresetFingerprint = nil
         slot.capability = nil
         slot.questionnaire = nil
         slot.statuses.removeAll()
@@ -4177,6 +5871,8 @@ final class AppStore: ObservableObject {
         slot.outbox.removeAll()
         slot.streamingMessage = nil
         slot.pendingTurn = nil
+        slot.provisionalMaterialization = nil
+        slot.retriableVirtualFolderPath = nil
         slot.outboxDispatches.removeAll()
         slot.outboxPromptPreflighting = false
         slot.outboxPromptAbortRequested = false
@@ -4234,14 +5930,16 @@ final class AppStore: ObservableObject {
         updateState(for: slot) { $0 = RuntimeState(phase: .startingPi) }
         if slot.runtime.isRunning { slot.runtime.stop() }
         do {
+            if sessionPath == nil, let preset = selectedPreset, preset.agent == slot.agent {
+                slot.runtime.configureLaunch(modelID: preset.modelID, thinkingLevel: preset.thinkingLevel)
+            }
             try slot.runtime.start(cwd: cwd, sessionPath: sessionPath)
             updateState(for: slot) { state in
                 state.isConnected = true
                 state.phase = .openingConversation
             }
         } catch {
-            updateState(for: slot) { $0.lastError = error.localizedDescription }
-            finishRuntimeStart(slot, result: .failure(error))
+            failRuntimeStart(slot, error: error)
             return
         }
         loadRuntimeState(slot, sessionPath: sessionPath, reusedFrom: nil)
@@ -4274,13 +5972,50 @@ final class AppStore: ObservableObject {
                 onReuseFailure?()
                 return
             }
-            if bindOnSuccess { bindRuntime(slot) }
-            let statusSnapshot = slot === activeRuntimeSlot && !activePresentationDetached
-                ? extensionStatuses : slot.statuses
-            replaceCachedStatuses(with: statusSnapshot)
-            finishRuntimeStart(slot, result: .success(slot))
-            if slot === activeRuntimeSlot { requestStats() }
+            guard let leasedPath = slot.sessionPath else {
+                failRuntimeStart(
+                    slot,
+                    error: AgentRuntimeError.processExited(
+                        "The agent did not report a conversation file."
+                    )
+                )
+                return
+            }
+            let freshTranscriptIsMaterializing = sessionPath == nil
+                && !Self.hasPersistedTranscript(at: leasedPath)
+            if freshTranscriptIsMaterializing,
+               slot.capabilities.idleThreadCreation != .processStart {
+                completeRuntimeStart(slot, leasedPath: nil, bindOnSuccess: bindOnSuccess)
+                return
+            }
+            acquireRuntimeLease(
+                for: slot,
+                path: leasedPath,
+                materializing: freshTranscriptIsMaterializing
+            ) { [weak self, weak slot] result in
+                guard let self, let slot, !slot.isSuperseded else { return }
+                switch result {
+                case .success:
+                    self.completeRuntimeStart(
+                        slot, leasedPath: leasedPath, bindOnSuccess: bindOnSuccess
+                    )
+                case let .failure(error):
+                    self.failRuntimeStart(slot, error: error)
+                }
+            }
         }
+    }
+
+    private func completeRuntimeStart(
+        _ slot: RuntimeSlot, leasedPath: String?, bindOnSuccess: Bool
+    ) {
+        if let leasedPath { slot.leaseCoordinator?.retainOnly(path: leasedPath) }
+        if bindOnSuccess { bindRuntime(slot) }
+        let statusSnapshot = slot === activeRuntimeSlot && !activePresentationDetached
+            ? extensionStatuses : slot.statuses
+        replaceCachedStatuses(with: statusSnapshot)
+        finishRuntimeStart(slot, result: .success(slot))
+        if slot === activeRuntimeSlot { requestStats() }
     }
 
     private func runtimeStateMatchesReusedRoute(
@@ -4302,6 +6037,7 @@ final class AppStore: ObservableObject {
             state.phase = .idle
         }
         slot.runtime.stop()
+        closeRuntimeLease(for: slot)
         finishRuntimeStart(slot, result: .failure(error))
     }
 
@@ -4311,7 +6047,8 @@ final class AppStore: ObservableObject {
             slot.isReady = true
             if let beganAt = slot.startupBeganAt {
                 ConversationPerformance.mark(
-                    "Pi runtime ready", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+                    "Agent runtime ready", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+                    agent: slot.agent,
                     milliseconds: Date().timeIntervalSince(beganAt) * 1_000
                 )
             }
@@ -4319,7 +6056,14 @@ final class AppStore: ObservableObject {
         slot.startupBeganAt = nil
         let waiters = slot.readyWaiters
         slot.readyWaiters.removeAll()
-        for waiter in waiters { waiter(result) }
+        switch result {
+        case .success:
+            for waiter in waiters { waiter(result) }
+        case .failure:
+            // Each failure prepends its original text to the composer. Reversing callback order
+            // preserves the user's submission order when several drafts shared one failed start.
+            for waiter in waiters.reversed() { waiter(result) }
+        }
         if slot === activeRuntimeSlot {
             resetRuntimeRetirementLease(for: slot)
         } else if isIdleAndClean(slot) {
@@ -4394,6 +6138,7 @@ final class AppStore: ObservableObject {
             guard let errorText else {
                 if command == "prompt" {
                     updateManagedTurn(for: slot) { $0.phase = ManagedTurnRecovery.accepted }
+                    finalizeProvisionalMaterialization(for: slot)
                 }
                 if command == "steer" { showToast("Steering message sent", style: .info) }
                 if command == "follow_up" { showToast("Follow-up queued", style: .info) }
@@ -4403,6 +6148,7 @@ final class AppStore: ObservableObject {
             // An unconfirmed side-effecting command may already have reached Pi. Only settle or
             // process exit can safely resolve it without risking a duplicate prompt.
             if isOutcomeUnknown {
+                if command == "prompt" { finalizeProvisionalMaterialization(for: slot) }
                 showToast(errorText, style: .warning)
                 return
             }
@@ -4421,11 +6167,111 @@ final class AppStore: ObservableObject {
                 slot.pendingTurn = nil
             }
             if let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
-            let restored = restoreDraft(text: originalDraft, attachments: sentAttachments, origin: origin)
-            showToast(failureMessage(errorText, restored: restored, origin: origin), style: .error)
+            let recoveryOrigin: DraftOrigin
+            if let promotedPath = promotedOrigin?.sessionPath,
+               rollbackProvisionalSessionIfUnmaterialized(path: promotedPath, slot: slot) {
+                recoveryOrigin = submissionOrigin
+            } else {
+                recoveryOrigin = origin
+            }
+            let restored = restoreDraft(
+                text: originalDraft, attachments: sentAttachments, origin: recoveryOrigin
+            )
+            showToast(
+                failureMessage(errorText, restored: restored, origin: recoveryOrigin),
+                style: .error
+            )
             if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
             else if !state(for: slot).isBusy { retireBackgroundRuntime(slot) }
         }
+    }
+
+    /// Exactly-once completion for a fresh session. A correlated prompt reply and runtime events
+    /// can arrive in either order, so both enter this helper and only the first starts acquisition.
+    private func finalizeProvisionalMaterialization(for slot: RuntimeSlot) {
+        guard var promotion = slot.provisionalMaterialization,
+              !promotion.leaseAcquisitionStarted else { return }
+        if slot.leaseCoordinator?.owns(path: promotion.path) == true {
+            completeProvisionalMaterialization(promotion, for: slot)
+            return
+        }
+        promotion.leaseAcquisitionStarted = true
+        slot.provisionalMaterialization = promotion
+        acquireRuntimeLease(
+            for: slot, path: promotion.path, materializing: true
+        ) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded,
+                  slot.provisionalMaterialization?.path == promotion.path else { return }
+            switch result {
+            case .success:
+                self.completeProvisionalMaterialization(promotion, for: slot)
+            case let .failure(error):
+                slot.provisionalMaterialization = nil
+                self.stopRuntimeAfterLeaseLoss(
+                    slot,
+                    path: promotion.path,
+                    error: error,
+                    message: "The message was accepted, but safe ownership of its conversation could not be confirmed. The local runtime was stopped."
+                )
+            }
+        }
+    }
+
+    private func completeProvisionalMaterialization(
+        _ promotion: ProvisionalMaterialization, for slot: RuntimeSlot
+    ) {
+        guard slot.provisionalMaterialization?.path == promotion.path else { return }
+        slot.leaseCoordinator?.retainOnly(path: promotion.path)
+        recordAppStartedSessionPath(promotion.path)
+        commitProvisionalVirtualFolderAssignment(path: promotion.path)
+        completeProvisionalPromotion(cwd: URL(fileURLWithPath: promotion.cwd, isDirectory: true))
+        slot.provisionalMaterialization = nil
+        slot.retriableVirtualFolderPath = nil
+        if slot === activeRuntimeSlot { resetRuntimeRetirementLease(for: slot) }
+        else if isIdleAndClean(slot) { retireBackgroundRuntime(slot) }
+    }
+
+    private func completeProvisionalPromotion(cwd: URL) {
+        guard newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path else {
+            return
+        }
+        newChatWorktree = nil
+        newChatWorktreeOrigin = nil
+        newChatWorktreeSubmitted = false
+    }
+
+    @discardableResult
+    private func rollbackProvisionalSessionIfUnmaterialized(
+        path: String, slot: RuntimeSlot
+    ) -> Bool {
+        guard !Self.hasPersistedTranscript(at: path) else { return false }
+        retainVirtualFolderAssignmentForRetry(path: path, slot: slot)
+        if let cwd = slot.cwd,
+           newChatWorktree?.standardizedFileURL.path == URL(fileURLWithPath: cwd).standardizedFileURL.path {
+            newChatWorktreeSubmitted = false
+        }
+        slot.provisionalMaterialization = nil
+        // This also serializes behind an acquisition already in flight and releases it if it won
+        // the race, so a definite rejection cannot leave either this path or a reused old path held.
+        closeRuntimeLease(for: slot)
+        sessions.removeAll { $0.fileURL.standardizedFileURL.path == path }
+        persistence.discardAppStarted(sessionPath: path)
+        liveMessagesByPath.removeValue(forKey: path)
+        liveMessageOrder.removeAll { $0.path == path }
+        pendingFinalMessagesByPath.removeValue(forKey: path)
+        parkedRuntimes.removeValue(forKey: .session(path))
+        slot.sessionPath = state(for: slot).sessionFile
+        slot.startedForNewChat = true
+        if let cwd = slot.cwd, slot !== activeRuntimeSlot {
+            parkedRuntimes[.newChat(slot.agent, cwd)] = slot
+        }
+        if slot === activeRuntimeSlot, case let .session(routePath) = route, routePath == path {
+            route = .newChat
+            activities = []
+        }
+        sessionCatalogRevision &+= 1
+        syncActivityMonitorPaths()
+        return true
     }
 
     private func reconcilePromptPreflight(_ preflightID: UUID, slot: RuntimeSlot) {
@@ -4487,12 +6333,14 @@ final class AppStore: ObservableObject {
         let title = prompt.trimmingCharacters(in: .whitespacesAndNewlines).prefix(74)
         if !sessions.contains(where: { $0.fileURL.standardizedFileURL.path == path }) {
             var provisional = SessionSummary(
-                id: sessionID, fileURL: url, cwd: cwd, createdAt: Date(), modifiedAt: Date(),
+                id: sessionID, fileURL: url, cwd: cwd, agent: slot.agent,
+                createdAt: Date(), modifiedAt: Date(),
                 name: title.isEmpty ? "New conversation" : String(title), preview: prompt,
                 messageCount: 0, metrics: TokenMetrics()
             )
             provisional.prepareSearchKey()
             sessions.insert(provisional, at: 0)
+            sessionCatalogRevision &+= 1
             syncActivityMonitorPaths()
             // This path was created during this app run, so its first completion is not stale
             // launch history and may notify if the user has moved away.
@@ -4502,13 +6350,12 @@ final class AppStore: ObservableObject {
         removeParkedReference(to: slot)
         slot.sessionPath = path
         slot.startedForNewChat = false
+        slot.provisionalMaterialization = ProvisionalMaterialization(
+            path: path, cwd: cwd.standardizedFileURL.path
+        )
+        slot.retriableVirtualFolderPath = nil
         if slot !== activeRuntimeSlot { parkedRuntimes[.session(path)] = slot }
 
-        if newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
-            newChatWorktree = nil
-            newChatWorktreeOrigin = nil
-            newChatWorktreeSubmitted = false
-        }
         if slot === activeRuntimeSlot, case .newChat = route {
             route = .session(path)
             activities = []
@@ -4587,7 +6434,22 @@ final class AppStore: ObservableObject {
 
     private static func sameOptimisticUserContent(_ local: ChatMessage, _ candidate: ChatMessage) -> Bool {
         local.id.hasPrefix("local-") && candidate.role == .user
-            && candidate.textContent == local.textContent && candidate.images.count == local.images.count
+            && ImageAttachment.visibleText(from: candidate.textContent) == local.textContent
+            && candidate.images.count == local.images.count
+    }
+
+    /// Codex's live `userMessage` completion currently contains only text. The text is the full
+    /// submitted prompt, including Desktop's hidden attachment-path footer, while the durable
+    /// rollout later contains the actual image blocks. Treating that lossy live echo as a new
+    /// message briefly showed two user bubbles and discarded the image from the optimistic one.
+    private static func isDegradedAttachmentEcho(
+        _ candidate: ChatMessage,
+        of local: ChatMessage
+    ) -> Bool {
+        local.id.hasPrefix("local-") && candidate.role == .user
+            && !local.images.isEmpty && candidate.images.isEmpty
+            && candidate.textContent != ImageAttachment.visibleText(from: candidate.textContent)
+            && ImageAttachment.visibleText(from: candidate.textContent) == local.textContent
     }
 
     private func removeLiveMessage(id: String, path: String) {
@@ -4610,9 +6472,12 @@ final class AppStore: ObservableObject {
 
     private func retainLiveMessage(_ message: ChatMessage, path: String) {
         if !message.id.hasPrefix("local-"),
-           let localID = liveMessagesByPath[path]?.last(where: {
+           let local = liveMessagesByPath[path]?.last(where: {
                Self.sameOptimisticUserContent($0, message)
-           })?.id {
+                    || Self.isDegradedAttachmentEcho(message, of: $0)
+           }) {
+            if Self.isDegradedAttachmentEcho(message, of: local) { return }
+            let localID = local.id
             removeLiveMessage(id: localID, path: path)
         }
         let key = LiveMessageKey(path: path, id: message.id)
@@ -4701,6 +6566,8 @@ final class AppStore: ObservableObject {
             state.phase = state.isStreaming ? .working : .idle
             state.isCompacting = data["isCompacting"]?.boolValue ?? false
             state.thinkingLevel = data["thinkingLevel"]?.stringValue
+            state.fastModeEnabled = data["fastModeEnabled"]?.boolValue ?? false
+            state.fastModeAvailable = data["fastModeAvailable"]?.boolValue ?? false
             state.sessionFile = data["sessionFile"]?.stringValue
             state.sessionID = data["sessionId"]?.stringValue
             state.sessionName = data["sessionName"]?.stringValue
@@ -4717,19 +6584,97 @@ final class AppStore: ObservableObject {
             // A conversation this app opened as a new chat is one it started. Recorded the
             // moment the agent names its file, which is the only point where the two are
             // known together.
-            if slot.startedForNewChat, let owned = slot.sessionPath {
-                persistence.recordAppStarted(sessionPath: owned)
+            if slot.startedForNewChat, let owned = slot.sessionPath,
+               Self.hasPersistedTranscript(at: owned) {
+                recordAppStartedSessionPath(owned)
             }
         }
     }
 
+    /// Ownership changes alter the exact supplemental files included in discovery. Invalidate a
+    /// scan before persisting the new seed so a custom-root conversation cannot be removed by a
+    /// catalog result that was captured just before materialization.
+    @discardableResult
+    func recordAppStartedSessionPath(_ rawPath: String) -> Bool {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        guard !persistence.state.appStartedSessionPaths.contains(path) else { return true }
+        guard persistence.recordAppStarted(sessionPath: path) else {
+            queueOwnershipPersistenceRetry(path)
+            return false
+        }
+        pendingOwnershipPersistencePaths.remove(path)
+        sessionCatalogRevision &+= 1
+        if isScanning { sessionRefreshPending = true }
+        restartSessionCatalogMonitor()
+        return true
+    }
+
+    private func queueOwnershipPersistenceRetry(_ path: String) {
+        pendingOwnershipPersistencePaths.insert(path)
+        guard ownershipPersistenceRetryTask == nil else { return }
+        ownershipPersistenceRetryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var failureCount = 0
+            while !Task.isCancelled, !pendingOwnershipPersistencePaths.isEmpty,
+                  failureCount < Self.daemonSyncAttemptLimit {
+                failureCount += 1
+                try? await Task.sleep(
+                    nanoseconds: Self.daemonSyncRetryNanoseconds(failureCount: failureCount)
+                )
+                guard !Task.isCancelled else { break }
+                var persistedAny = false
+                for pending in pendingOwnershipPersistencePaths.sorted() {
+                    if persistence.recordAppStarted(sessionPath: pending) {
+                        pendingOwnershipPersistencePaths.remove(pending)
+                        sessionCatalogRevision &+= 1
+                        persistedAny = true
+                    }
+                }
+                if persistedAny {
+                    if isScanning { sessionRefreshPending = true }
+                    restartSessionCatalogMonitor()
+                }
+            }
+            if !pendingOwnershipPersistencePaths.isEmpty {
+                showToast(
+                    "Conversation ownership could not be saved. Keep the app open and retry after checking disk access.",
+                    style: .error
+                )
+            }
+            ownershipPersistenceRetryTask = nil
+        }
+    }
+
+    private static func hasPersistedTranscript(at path: String) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) else {
+            return false
+        }
+        return values.isRegularFile == true && (values.fileSize ?? 0) > 0
+    }
+
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        if event["type"]?.stringValue == "fast_mode_changed" {
+            updateState(for: slot) { state in
+                state.fastModeEnabled = event["enabled"]?.boolValue ?? state.fastModeEnabled
+                state.fastModeAvailable = event["available"]?.boolValue ?? state.fastModeAvailable
+            }
+            return
+        }
         let wasBusy = state(for: slot).isBusy
         defer {
             if state(for: slot).isBusy != wasBusy { updateSleepPrevention() }
         }
-        switch event["type"]?.stringValue {
+        let eventType = event["type"]?.stringValue
+        switch eventType {
+        case "agent_start", "agent_settled", "message_start", "message_update", "message_end",
+             "tool_execution_start", "tool_execution_end":
+            finalizeProvisionalMaterialization(for: slot)
+        default:
+            break
+        }
+        switch eventType {
         case "tool_execution_start": updateManagedTool(event, running: true, slot: slot)
         case "tool_execution_end": updateManagedTool(event, running: false, slot: slot)
         case "agent_settled": clearManagedTurnRecovery(for: slot)
@@ -4740,7 +6685,7 @@ final class AppStore: ObservableObject {
             updateState(for: slot) { $0.sessionName = name?.isEmpty == false ? name : nil }
             if let session = session(for: slot) {
                 if let name, !name.isEmpty,
-                   let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                   let index = sessions.firstIndex(where: { $0.instanceID == session.instanceID }) {
                     sessions[index].name = name
                     sessions[index].prepareSearchKey()
                 } else {
@@ -4771,29 +6716,55 @@ final class AppStore: ObservableObject {
     /// Publishes a live streaming delta, coalesced to `streamingPublishInterval`. The first
     /// delta after a quiet period publishes immediately; a burst keeps exactly one trailing
     /// publish scheduled with the newest payload.
-    private func publishStreamingUpdate(_ partial: JSONValue) {
+    private func publishStreamingUpdate(_ partial: JSONValue, for slot: RuntimeSlot) {
+        guard slot === activeRuntimeSlot, !activePresentationDetached, !slot.isSuperseded else { return }
+        if let pending = pendingStreamingPublication,
+           pending.slotID != slot.id || pending.route != route {
+            cancelPendingStreamingPublish()
+        }
         let now = Date()
         if streamingPublishTask == nil, now.timeIntervalSince(lastStreamingPublish) >= Self.streamingPublishInterval {
             lastStreamingPublish = now
             if let parsed = SessionParser.chatMessage(fromAgentMessage: partial) {
-                activeRuntimeSlot.streamingMessage = parsed
+                slot.streamingMessage = parsed
                 if !isBrowsingEarlierHistory { streamingMessage = parsed }
             }
             return
         }
-        pendingStreamingUpdate = partial
+        let generation = streamingPublishGeneration
+        let ownerRoute = route
+        pendingStreamingPublication = PendingStreamingPublication(
+            generation: generation,
+            slotID: slot.id,
+            route: ownerRoute,
+            partial: partial
+        )
         guard streamingPublishTask == nil else { return }
-        let route = self.route
-        streamingPublishTask = Task { @MainActor [weak self] in
+        streamingPublishTask = Task { @MainActor [weak self, weak slot] in
             guard let self else { return }
             let wait = Self.streamingPublishInterval - Date().timeIntervalSince(lastStreamingPublish)
-            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000)) }
+            if wait > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000))
+                } catch {
+                    return
+                }
+            }
+            guard let slot,
+                  generation == streamingPublishGeneration,
+                  activeRuntimeSlot === slot,
+                  !activePresentationDetached,
+                  !slot.isSuperseded,
+                  self.route == ownerRoute,
+                  let pending = pendingStreamingPublication,
+                  pending.generation == generation,
+                  pending.slotID == slot.id,
+                  pending.route == ownerRoute else { return }
             streamingPublishTask = nil
-            guard !Task.isCancelled, self.route == route, let pending = pendingStreamingUpdate else { return }
-            pendingStreamingUpdate = nil
+            pendingStreamingPublication = nil
             lastStreamingPublish = Date()
-            if let parsed = SessionParser.chatMessage(fromAgentMessage: pending) {
-                activeRuntimeSlot.streamingMessage = parsed
+            if let parsed = SessionParser.chatMessage(fromAgentMessage: pending.partial) {
+                slot.streamingMessage = parsed
                 if !isBrowsingEarlierHistory { streamingMessage = parsed }
             }
         }
@@ -4801,9 +6772,10 @@ final class AppStore: ObservableObject {
 
     /// A settled or ended stream must never be resurrected by a stale trailing publish.
     private func cancelPendingStreamingPublish() {
+        streamingPublishGeneration &+= 1
         streamingPublishTask?.cancel()
         streamingPublishTask = nil
-        pendingStreamingUpdate = nil
+        pendingStreamingPublication = nil
     }
 
     private func recordRuntimeOutput(for slot: RuntimeSlot) {
@@ -4813,7 +6785,8 @@ final class AppStore: ObservableObject {
         guard let beganAt = slot.promptBeganAt else { return }
         slot.promptBeganAt = nil
         ConversationPerformance.mark(
-            "Pi first output", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+            "Agent first output", path: slot.sessionPath ?? slot.cwd ?? "unknown",
+            agent: slot.agent,
             milliseconds: Date().timeIntervalSince(beganAt) * 1_000
         )
     }
@@ -4944,6 +6917,8 @@ final class AppStore: ObservableObject {
             }
         case "extension_ui_request":
             handleBackgroundExtensionUI(event, slot: slot)
+        case "extension_ui_cancel":
+            if let id = event["id"]?.stringValue { cancelExtensionDialog(id: id, slot: slot) }
         case "extension_error":
             updateState(for: slot) { $0.lastError = event["error"]?.stringValue ?? "A Pi extension failed." }
         case "tool_execution_end":
@@ -5025,6 +7000,23 @@ final class AppStore: ObservableObject {
         }
         slot.deferredEvents.append(event.boundedProjection())
         if slot.deferredEvents.count > 32 { slot.deferredEvents.removeFirst(slot.deferredEvents.count - 32) }
+    }
+
+    private func cancelExtensionDialog(id: String, slot: RuntimeSlot) {
+        slot.deferredEvents.removeAll {
+            $0["type"]?.stringValue == "extension_ui_request" && $0["id"]?.stringValue == id
+        }
+        slot.dialogs.removeAll { $0.id == id }
+
+        guard slot === activeRuntimeSlot, !activePresentationDetached else { return }
+        let removedActive = activeDialog?.id == id
+        dialogQueue.removeAll { $0.id == id }
+        guard removedActive else { return }
+        dialogTimeoutTask?.cancel()
+        dialogTimeoutTask = nil
+        activeDialog = dialogQueue.first
+        if let activeDialog { startDialogTimeout(for: activeDialog) }
+        else { resetRuntimeRetirementLease(for: slot) }
     }
 
     @discardableResult
@@ -5115,6 +7107,7 @@ final class AppStore: ObservableObject {
         slot.runtime.onEvent = nil
         slot.runtime.onExit = nil
         slot.runtime.stop()
+        closeRuntimeLease(for: slot)
     }
 
     private func scheduleFinalDurabilityCheck(for slot: RuntimeSlot, retireWhenDone: Bool) {
@@ -5204,7 +7197,7 @@ final class AppStore: ObservableObject {
         case "message_update":
             recordRuntimeOutput(for: activeRuntimeSlot)
             guard selected, let partial = event["message"] else { return }
-            publishStreamingUpdate(partial)
+            publishStreamingUpdate(partial, for: activeRuntimeSlot)
         case "message_end":
             if event["message"]?["role"]?.stringValue == "assistant" {
                 recordRuntimeOutput(for: activeRuntimeSlot)
@@ -5309,6 +7302,8 @@ final class AppStore: ObservableObject {
         case "extension_ui_request":
             if selected { handleExtensionUI(event) }
             else { handleBackgroundExtensionUI(event, slot: activeRuntimeSlot) }
+        case "extension_ui_cancel":
+            if let id = event["id"]?.stringValue { cancelExtensionDialog(id: id, slot: activeRuntimeSlot) }
         case "extension_error": showToast(event["error"]?.stringValue ?? "A Pi extension failed.", style: .error)
         case "turn_end":
             activeCapability = nil
@@ -5491,7 +7486,7 @@ final class AppStore: ObservableObject {
 
     private func handleRuntimeExit(_ error: String?, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
-        clearManagedTurnRecovery(for: slot)
+        closeRuntimeLease(for: slot)
         slot.managedProcessIDs.removeAll()
         slot.managedProcessStartedAt = nil
         slot.outboxDispatches.removeAll()
@@ -5534,20 +7529,24 @@ final class AppStore: ObservableObject {
             slot.deferredEvents.removeAll()
             removeParkedReference(to: slot)
         }
-        guard let error else { return }
-
-        // Pending prompt rejection is delivered before onExit. Outcome-unknown deliberately
-        // leaves this value set, so this remains the one place that can restore it, exactly once.
         if let pending = slot.pendingTurn {
             slot.pendingTurn = nil
-            let restored = restoreDraft(text: pending.text, attachments: pending.attachments, origin: pending.origin)
-            let message = failureMessage(error, restored: restored, origin: pending.origin)
+            updateManagedTurn(for: slot) { recovery in
+                if recovery.phase != ManagedTurnRecovery.accepted {
+                    recovery.phase = ManagedTurnRecovery.needsReview
+                }
+            }
+            let detail = error ?? "The agent exited before confirming the last message."
+            let message = "\(detail) The message may already have been delivered. Review the conversation before sending it again."
             updateState(for: slot) { $0.lastError = message }
-            showToast(message, style: .error)
-        } else {
-            updateState(for: slot) { $0.lastError = error }
-            showToast(error, style: .error)
+            showToast(message, style: .warning, sessionPath: pending.origin.sessionPath)
+            return
         }
+
+        clearManagedTurnRecovery(for: slot)
+        guard let error else { return }
+        updateState(for: slot) { $0.lastError = error }
+        showToast(error, style: .error)
     }
 
     private func upsertMessage(_ message: ChatMessage) {
@@ -5560,6 +7559,10 @@ final class AppStore: ObservableObject {
         else if message.role == .user,
                 let localIndex = updated.lastIndex(where: { Self.sameOptimisticUserContent($0, message) }) {
             updated[localIndex] = message
+        } else if message.role == .user,
+                  updated.contains(where: { Self.isDegradedAttachmentEcho(message, of: $0) }) {
+            // Keep the richer optimistic row. The authoritative JSONL record will replace it
+            // once its timestamp and image blocks are durable.
         } else { updated.append(message) }
         messages = enforcingLoadedImageBudget(updated)
     }
@@ -5615,16 +7618,51 @@ final class AppStore: ObservableObject {
 
     private func refreshSummary(for session: SessionSummary) async {
         do {
-            let summary = try await repository.refreshSummary(at: session.fileURL, archivedIDs: persistence.state.archivedSessionIDs)
-            if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+            var summary = try await repository.refreshSummary(
+                at: session.fileURL, archivedIDs: persistence.state.archivedSessionIDs
+            )
+            summary.isArchived = persistence.isArchived(
+                sessionID: summary.id, sessionPath: summary.fileURL.path
+            ) || isDaemonArchived(sessionID: summary.id, sessionPath: summary.fileURL.path)
+            let path = session.fileURL.standardizedFileURL.path
+            if let pending = pendingArchiveIntentByPath[path] {
+                summary.isArchived = pending
+            }
+            if let index = sessions.firstIndex(where: {
+                $0.fileURL.standardizedFileURL.path == path
+            }) {
                 sessions[index] = summary
                 refreshPullRequestStates(for: sessions)
             }
         } catch { /* The live conversation remains authoritative; next manual refresh retries. */ }
     }
 
+    private func isDaemonArchived(sessionID: String, sessionPath: String) -> Bool {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        return daemonArchivedThreadPaths.contains(path)
+            || (daemonArchivedThreadIDs.contains(sessionID)
+                && !daemonArchiveExemptThreadPaths.contains(path))
+    }
+
+    private func scheduleFolderGitSnapshotsRefresh() {
+        folderGitRefreshPending = true
+        guard folderGitRefreshTask == nil else { return }
+        folderGitRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            repeat {
+                folderGitRefreshPending = false
+                await refreshFolderGitSnapshots()
+            } while folderGitRefreshPending && !Task.isCancelled
+            folderGitRefreshTask = nil
+        }
+    }
+
     private func refreshFolderGitSnapshots() async {
-        let paths = Array(Set(sessions.map { $0.cwd.standardizedFileURL.path }))
+        var paths = Array(Set(sessions.map { $0.cwd.standardizedFileURL.path }))
+        if let selectedGitDirectoryPath,
+           let index = paths.firstIndex(of: selectedGitDirectoryPath), index != 0 {
+            paths.swapAt(0, index)
+        }
         let service = gitService
         await withTaskGroup(of: (String, GitSnapshot, GitWorktreeInfo?).self) { group in
             var iterator = paths.makeIterator()
@@ -5633,6 +7671,13 @@ final class AppStore: ObservableObject {
                 group.addTask { await Self.fetchGitState(path, service: service) }
             }
             while let (path, snapshot, worktree) = await group.next() {
+                let visiblePaths = Set(sessions.map { $0.cwd.standardizedFileURL.path })
+                guard visiblePaths.contains(path) else {
+                    if let next = iterator.next() {
+                        group.addTask { await Self.fetchGitState(next, service: service) }
+                    }
+                    continue
+                }
                 folderGit[path] = snapshot
                 folderWorktrees[path] = worktree
                 if selectedGitDirectoryPath == path {
@@ -5719,13 +7764,25 @@ final class AppStore: ObservableObject {
     }
 
     deinit {
-        gitRefreshTask?.cancel(); pullRequestRefreshTask?.cancel(); pullRequestRefreshLoopTask?.cancel()
+        for task in archiveSyncTasksByPath.values { task.cancel() }
+        ownershipPersistenceRetryTask?.cancel()
+        for task in readSyncTasksByPath.values { task.cancel() }
+        daemonEventTask?.cancel()
+        daemonReconciliationTask?.cancel(); daemonScheduleRefreshTask?.cancel()
+        sessionCatalogRefreshTask?.cancel(); sessionCatalogMonitor.stop()
+        gitRefreshTask?.cancel(); folderGitRefreshTask?.cancel()
+        pullRequestRefreshTask?.cancel(); pullRequestRefreshLoopTask?.cancel()
         selectedGitTask?.cancel(); conversationLoadTask?.cancel(); conversationRefreshTask?.cancel()
         historyNavigationTask?.cancel(); activityProjectionTask?.cancel()
         toastTask?.cancel(); dialogTimeoutTask?.cancel(); probeTask?.cancel(); draftPersistTask?.cancel()
         prefetchTask?.cancel(); cancelRuntimeRetirement?()
         for task in finalDurabilityTasks.values { task.cancel() }
         probeRuntime?.stop()
+        let leaseCoordinators = (Array(parkedRuntimes.values) + [activeRuntimeSlot])
+            .compactMap(\.leaseCoordinator)
+        Task { @MainActor in
+            for coordinator in leaseCoordinators { coordinator.close() }
+        }
         for slot in parkedRuntimes.values { slot.runtime.stop() }
         activeRuntimeSlot.runtime.stop()
     }

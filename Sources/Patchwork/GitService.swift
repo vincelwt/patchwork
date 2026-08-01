@@ -209,22 +209,28 @@ struct GitService: GitStatusProviding {
         let statusLines = status.output.split(separator: "\n", omittingEmptySubsequences: true)
         if !statusLines.isEmpty {
             let staged = statusLines.filter { $0.first != " " && $0.first != "?" }.count
+            let suffix = status.truncated ? "+" : ""
             snapshot.statusHint = staged > 0
-                ? "\(statusLines.count) changed · \(staged) staged"
-                : "\(statusLines.count) changed"
+                ? "\(statusLines.count)\(suffix) changed · \(staged)\(suffix) staged"
+                : "\(statusLines.count)\(suffix) changed"
         } else {
-            snapshot.statusHint = "Clean"
+            snapshot.statusHint = status.truncated ? "Many changes" : "Clean"
         }
+        snapshot.filesTruncated = status.truncated
 
         guard !Task.isCancelled else { return snapshot }
         let diff = run(["-C", directory.path, "diff", "--numstat", "HEAD", "--"])
+        let parsedDiff: (files: [GitFileChange], truncated: Bool)
         if diff.status == 0 {
-            snapshot.files = parseNumstat(diff.output)
+            parsedDiff = parseNumstat(diff.output, limit: GitSnapshot.maxRetainedFiles)
         } else {
             // Unborn branches do not have HEAD yet; still report working-tree changes.
             let fallback = run(["-C", directory.path, "diff", "--numstat", "--"])
-            snapshot.files = parseNumstat(fallback.output)
+            let parsedFallback = parseNumstat(fallback.output, limit: GitSnapshot.maxRetainedFiles)
+            parsedDiff = (parsedFallback.files, parsedFallback.truncated || fallback.truncated)
         }
+        snapshot.files = parsedDiff.files
+        snapshot.filesTruncated = snapshot.filesTruncated || parsedDiff.truncated || diff.truncated
 
         guard !Task.isCancelled else { return snapshot }
         let untracked = run(["-C", directory.path, "ls-files", "--others", "--exclude-standard", "-z"])
@@ -233,6 +239,10 @@ struct GitService: GitStatusProviding {
             var existing = Set(snapshot.files.map(\.path))
             for path in paths where !existing.contains(path) {
                 if Task.isCancelled { break }
+                guard snapshot.files.count < GitSnapshot.maxRetainedFiles else {
+                    snapshot.filesTruncated = true
+                    break
+                }
                 existing.insert(path)
                 let fileURL = directory.appendingPathComponent(path)
                 let classification = classifyUntrackedFile(fileURL)
@@ -245,6 +255,7 @@ struct GitService: GitStatusProviding {
                     linesUnavailable: classification.lines == nil && !classification.isBinary
                 ))
             }
+            snapshot.filesTruncated = snapshot.filesTruncated || untracked.truncated
         }
 
         snapshot.files.sort {
@@ -253,19 +264,28 @@ struct GitService: GitStatusProviding {
         return snapshot
     }
 
-    private static func parseNumstat(_ output: String) -> [GitFileChange] {
-        output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
+    private static func parseNumstat(_ output: String, limit: Int) -> (files: [GitFileChange], truncated: Bool) {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: true)
+        var files: [GitFileChange] = []
+        files.reserveCapacity(min(lines.count, limit))
+        var truncated = false
+        for line in lines {
             let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
-            guard parts.count == 3 else { return nil }
+            guard parts.count == 3 else { continue }
+            guard files.count < limit else {
+                truncated = true
+                break
+            }
             let binary = parts[0] == "-" || parts[1] == "-"
-            return GitFileChange(
+            files.append(GitFileChange(
                 path: String(parts[2]),
                 additions: Int(parts[0]) ?? 0,
                 deletions: Int(parts[1]) ?? 0,
                 isBinary: binary,
                 isUntracked: false
-            )
+            ))
         }
+        return (files, truncated)
     }
 
     /// Byte ceiling for exact line counting. Larger text files are still reported as text,
@@ -303,7 +323,13 @@ struct GitService: GitStatusProviding {
 
     /// stderr goes to the null device so a chatty git invocation can never fill a pipe and
     /// deadlock the worker, and a hard deadline guarantees the call returns.
-    static func run(_ arguments: [String], timeout: TimeInterval = 15) -> (status: Int32, output: String) {
+    static let maxGitOutputBytes = 4 * 1_024 * 1_024
+
+    static func run(
+        _ arguments: [String],
+        timeout: TimeInterval = 15,
+        maxOutputBytes: Int = maxGitOutputBytes
+    ) -> (status: Int32, output: String, truncated: Bool) {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -314,16 +340,25 @@ struct GitService: GitStatusProviding {
         do {
             try process.run()
         } catch {
-            return (-1, "")
+            return (-1, "", false)
         }
         let watchdog = DispatchWorkItem {
             if process.isRunning { process.terminate() }
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var retained = Data()
+        retained.reserveCapacity(min(max(0, maxOutputBytes), 64 * 1_024))
+        var truncated = false
+        while true {
+            let chunk = pipe.fileHandleForReading.readData(ofLength: 64 * 1_024)
+            guard !chunk.isEmpty else { break }
+            let remaining = max(0, maxOutputBytes - retained.count)
+            if remaining > 0 { retained.append(chunk.prefix(remaining)) }
+            if chunk.count > remaining { truncated = true }
+        }
         process.waitUntilExit()
         watchdog.cancel()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        return (process.terminationStatus, String(decoding: retained, as: UTF8.self), truncated)
     }
 }
 

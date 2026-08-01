@@ -23,6 +23,9 @@ public enum PatchworkPaths {
     public static var relayIdentity: URL { supportDirectory.appendingPathComponent("relay-identity.json") }
     public static var schedules: URL { supportDirectory.appendingPathComponent("schedules.json") }
     public static var runHistory: URL { supportDirectory.appendingPathComponent("runs.jsonl") }
+    public static var submissionReplays: URL {
+        supportDirectory.appendingPathComponent("submission-replays.json")
+    }
 
     public static var cacheDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser

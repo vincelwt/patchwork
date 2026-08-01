@@ -25,6 +25,25 @@ struct HTTPRequest: Sendable {
             throw DaemonHTTPError.badRequest(code: "invalid_body", message: "Could not parse request body: \(error)")
         }
     }
+
+    /// Request agent identities are commands, not forward-compatible stored data. An unknown
+    /// value must fail rather than inherit `AgentKind`'s tolerant history-decoding fallback to Pi.
+    func decodeKnownAgent(field: String = "agent") throws -> AgentKind? {
+        guard !body.isEmpty else { return nil }
+        guard let object = try? PiJSONValue.decode(body).objectValue,
+              let value = object[field] else { return nil }
+        if case .null = value { return nil }
+        guard case let .string(raw) = value, let agent = AgentKind(rawValue: raw) else {
+            throw DaemonHTTPError.badRequest(
+                code: "invalid_agent", message: "agent must be pi, codex, or claude."
+            )
+        }
+        return agent
+    }
+
+    func containsJSONField(_ field: String) -> Bool {
+        (try? PiJSONValue.decode(body).objectValue)?[field] != nil
+    }
 }
 
 struct HTTPResponse: Sendable {
@@ -55,6 +74,7 @@ struct HTTPResponse: Sendable {
         case 401: "Unauthorized"
         case 404: "Not Found"
         case 405: "Method Not Allowed"
+        case 409: "Conflict"
         case 413: "Payload Too Large"
         case 429: "Too Many Requests"
         case 500: "Internal Server Error"
@@ -72,6 +92,7 @@ enum DaemonHTTPError: Error {
     case unauthorized
     case notFound(String)
     case conflict(code: String, message: String)
+    case payloadTooLarge(code: String, message: String)
     case serviceUnavailable(code: String, message: String)
 
     var response: HTTPResponse {
@@ -80,6 +101,7 @@ enum DaemonHTTPError: Error {
         case .unauthorized: .error(401, code: "unauthorized", message: "Missing or invalid bearer token.")
         case let .notFound(what): .error(404, code: "not_found", message: "\(what) was not found.")
         case let .conflict(code, message): .error(409, code: code, message: message)
+        case let .payloadTooLarge(code, message): .error(413, code: code, message: message)
         case let .serviceUnavailable(code, message): .error(503, code: code, message: message)
         }
     }

@@ -140,26 +140,46 @@ enum ThreadsCommand {
     // MARK: - new
 
     private static let newHelp = CommandHelp(
-        usage: "patchwork threads new --cwd DIR [--agent AGENT] [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]",
-        summary: "Create a thread. Without --message the session is created idle (no run starts).",
+        usage: "patchwork threads new --cwd DIR [--agent AGENT] [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--client-id ID] [--json]",
+        summary: "Create a thread. Pi and Codex may be idle; Claude Code requires --message.",
         flags: [
             FlagSpec("--cwd", takesValue: true, placeholder: "DIR", help: "working directory or source project (required)"),
             FlagSpec("--agent", takesValue: true, placeholder: "AGENT", help: "agent to run: pi, codex, or claude (default pi)"),
             FlagSpec("--worktree", takesValue: false, help: "run in a fresh managed git worktree"),
             FlagSpec("--name", takesValue: true, placeholder: "NAME", help: "thread name (default: chosen by the daemon)"),
-            FlagSpec("--message", takesValue: true, placeholder: "TEXT", help: "first message to send; \"-\" reads it from stdin"),
-            FlagSpec("--mode", takesValue: true, placeholder: "MODE", help: "applies /mode before the message, e.g. ultra")
+            FlagSpec("--message", takesValue: true, placeholder: "TEXT", help: "first message to send; required for Claude Code; \"-\" reads it from stdin"),
+            FlagSpec("--mode", takesValue: true, placeholder: "MODE", help: "Pi only: applies /mode before the first message, e.g. ultra"),
+            FlagSpec("--client-id", takesValue: true, placeholder: "ID", help: "stable retry ID (ASCII letters, digits, _ or -; generated automatically)")
         ],
         examples: [
             "patchwork threads new --cwd ~/code/myapp --worktree --name \"Nightly triage\"",
-            "patchwork threads new --cwd ~/code/myapp --message \"survey the repo\" --mode ultra --json"
+            "patchwork threads new --cwd ~/code/myapp --message \"survey the repo\" --mode ultra --json",
+            "patchwork threads new --cwd ~/code/myapp --agent claude --message \"survey the repo\"",
+            "patchwork threads new --cwd ~/code/myapp --client-id nightly_triage_1"
         ]
     )
 
     private static func new(_ args: [String], context: CommandContext) async -> Int32 {
         await runLeaf(args, context: context, help: newHelp) { parsed, global in
             guard let cwd = parsed.value("--cwd") else { throw UsageError.missingRequiredFlag("--cwd") }
-            let message = try resolveMessageText(parsed.value("--message"), context: context)
+            let requestedMessage = try resolveMessageText(parsed.value("--message"), context: context)
+            let message = requestedMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if requestedMessage != nil, message?.isEmpty != false {
+                throw UsageError.invalidValue(flag: "--message", value: requestedMessage ?? "", reason: "message text is empty")
+            }
+            let agent = try validatedAgent(parsed.value("--agent"))
+            if agent == "claude", message == nil {
+                throw UsageError.custom(
+                    "--agent claude requires --message because Claude Code creates its conversation with the first message"
+                )
+            }
+            if parsed.value("--mode") != nil, message == nil {
+                throw UsageError.custom("--mode requires --message because idle threads have no turn to configure")
+            }
+            if parsed.value("--mode") != nil, let agent, agent != "pi" {
+                throw UsageError.custom("--mode is only supported with --agent pi")
+            }
+            let clientID = try submissionClientID(parsed.value("--client-id"))
             let plane = context.makeControlPlane(global)
             if parsed.flag("--worktree"), try await plane.health().threadWorktrees != true {
                 throw CLIFailure(
@@ -168,35 +188,47 @@ enum ThreadsCommand {
                     hint: "update Patchwork and restart the active host"
                 )
             }
-            let response = try await plane.createThread(
-                WireCreateThreadRequest(
-                    cwd: cwd, name: parsed.value("--name"), message: message,
-                    mode: parsed.value("--mode"), worktree: parsed.flag("--worktree") ? true : nil,
-                    agent: try validatedAgent(parsed.value("--agent"))
+            let response: WireCreateThreadResponse
+            do {
+                response = try await plane.createThread(
+                    WireCreateThreadRequest(
+                        cwd: cwd, name: parsed.value("--name"), message: message,
+                        mode: parsed.value("--mode"), worktree: parsed.flag("--worktree") ? true : nil,
+                        agent: agent, clientId: clientID
+                    )
                 )
-            )
+            } catch {
+                throw mutationFailure(error, clientID: clientID, operation: "thread creation")
+            }
             if global.jsonOutput {
                 context.out.json(response)
                 return
             }
             context.out.line("Created thread \(Rendering.threadID(response.thread))\(response.thread.name.map { " (\($0))" } ?? "")")
             if let runId = response.runId { context.out.info("Run started: \(runId)") }
+            if let error = response.firstMessageError {
+                let id = Rendering.threadID(response.thread)
+                context.out.errorLine("Warning: the thread was created, but its first message was not sent: \(error)")
+                context.out.errorLine("Retry it with `patchwork threads send \(id) -` and provide the message on stdin.")
+            }
         }
     }
 
     // MARK: - send
 
     private static let sendHelp = CommandHelp(
-        usage: "patchwork threads send <id> <text|-> [--steer | --follow-up] [--wait] [--json]",
+        usage: "patchwork threads send <id> <text|-> [--steer | --follow-up] [--wait] [--client-id ID] [--json]",
         summary: "Send a message to an existing thread. \"-\" for <text> reads the message from stdin.",
         flags: [
             FlagSpec("--steer", takesValue: false, help: "interrupt the current turn instead of queueing"),
             FlagSpec("--follow-up", takesValue: false, help: "queue behind the current turn (default: daemon decides, \"auto\")"),
-            FlagSpec("--wait", takesValue: false, help: "stream the run to completion; exits non-zero if it failed")
+            FlagSpec("--wait", takesValue: false, help: "stream the run to completion; exits non-zero if it failed"),
+            FlagSpec("--client-id", takesValue: true, placeholder: "ID", help: "stable retry ID (ASCII letters, digits, _ or -; generated by default)")
         ],
         examples: [
             "patchwork threads send 019f9dea-... \"what's the status?\" --wait",
-            "echo \"continue\" | patchwork threads send 019f9dea-... - --follow-up"
+            "echo \"continue\" | patchwork threads send 019f9dea-... - --follow-up",
+            "patchwork threads send 019f9dea-... \"continue\" --client-id followup_1"
         ]
     )
 
@@ -204,34 +236,92 @@ enum ThreadsCommand {
         await runLeaf(args, context: context, help: sendHelp) { parsed, global in
             let positionals = try requirePositionals(parsed, names: ["id", "text"])
             let id = positionals[0]
-            let text = try resolveMessageText(positionals[1], context: context) ?? ""
+            let text = (try resolveMessageText(positionals[1], context: context) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { throw UsageError.custom("message text is empty") }
             if parsed.flag("--steer"), parsed.flag("--follow-up") {
                 throw UsageError.conflictingFlags(["--steer", "--follow-up"])
             }
+            let clientID = try submissionClientID(parsed.value("--client-id"))
             let delivery = parsed.flag("--steer") ? "steer" : (parsed.flag("--follow-up") ? "followUp" : "auto")
             let plane = context.makeControlPlane(global)
-            let response = try await plane.sendMessage(threadId: id, request: WireSendMessageRequest(text: text, delivery: delivery, attachments: []))
+            let waitingEvents = parsed.flag("--wait") ? PreparedControlPlaneEvents(
+                source: plane.events(), readinessTimeoutSeconds: global.timeoutSeconds
+            ) : nil
+            defer { waitingEvents?.cancel() }
+            try await waitingEvents?.waitUntilReady()
+            let response: WireSendMessageResponse
+            do {
+                response = try await plane.sendMessage(
+                    threadId: id,
+                    request: WireSendMessageRequest(
+                        text: text,
+                        delivery: delivery,
+                        attachments: [],
+                        clientId: clientID
+                    )
+                )
+            } catch {
+                throw mutationFailure(error, clientID: clientID, operation: "message submission")
+            }
 
             guard parsed.flag("--wait") else {
                 if global.jsonOutput {
-                    context.out.json(WireSendMessageWithRunResponse(runId: response.runId, queued: response.queued, run: nil))
+                    context.out.json(WireSendMessageWithRunResponse(
+                        runId: response.runId, queued: response.queued,
+                        delivery: response.delivery, run: nil
+                    ))
                 } else {
-                    context.out.line("Run \(response.runId)\(response.queued == true ? " (queued)" : " started")")
+                    context.out.line("Run \(response.runId)\(response.queued ? " (queued)" : " started")")
+                    if let actual = response.delivery, actual != delivery {
+                        context.out.info("Delivered as \(actual), not \(delivery).")
+                    }
                 }
                 return
             }
 
             context.out.info("Waiting for run \(response.runId) to finish…")
-            let run = try await waitForRun(plane: plane, runId: response.runId, out: context.out)
+            guard let waitingEvents else {
+                throw CLIFailure(exitCode: .requestFailed, message: "event stream was not prepared")
+            }
+            let run: WireRun
+            do {
+                run = try await waitForRun(
+                    plane: plane,
+                    events: waitingEvents.events,
+                    runId: response.runId,
+                    out: context.out,
+                    unreachableTimeoutSeconds: global.timeoutSeconds
+                )
+            } catch {
+                let failure = asFailure(error)
+                throw CLIFailure(
+                    exitCode: failure.exitCode,
+                    message: failure.message,
+                    hint: "The daemon accepted run \(response.runId). Review that run or thread before sending the message again."
+                )
+            }
             if global.jsonOutput {
-                context.out.json(WireSendMessageWithRunResponse(runId: response.runId, queued: response.queued, run: run))
+                context.out.json(WireSendMessageWithRunResponse(
+                    runId: response.runId, queued: response.queued,
+                    delivery: response.delivery, run: run
+                ))
             } else {
                 context.out.line("Run \(run.id) finished: \(run.status ?? "unknown")")
                 if let summary = run.summary { context.out.line(summary) }
             }
             guard RunStatus.isSuccess(run.status) else {
-                throw CLIFailure(exitCode: .requestFailed, message: "run \(run.id) did not succeed (\(run.status ?? "unknown"))\(run.error.map { ": \($0)" } ?? "")")
+                let hint: String
+                if run.retryable == true, run.promptStartedAt == nil {
+                    hint = "The prompt did not start. Retry with a new --client-id value; reusing \(clientID) only replays this failed run."
+                } else {
+                    hint = "The prompt may have started. Review the thread before sending the message again."
+                }
+                throw CLIFailure(
+                    exitCode: .requestFailed,
+                    message: "run \(run.id) did not succeed (\(run.status ?? "unknown"))\(run.error.map { ": \($0)" } ?? "")",
+                    hint: hint
+                )
             }
         }
     }
@@ -316,14 +406,21 @@ enum ThreadsCommand {
             context.out.info("Watching for events\(filterId.map { " on thread \($0)" } ?? "")… (Ctrl-C to stop)")
             let events = context.makeControlPlane(global).events()
             for try await event in events {
+                if event.name == "ready" { continue }
                 if let filterId, !eventMatches(event, threadId: filterId) { continue }
                 emit(event, out: context.out, jsonOutput: global.jsonOutput, now: context.now)
             }
+            throw ControlPlaneError.transportFailure("event stream ended")
         }
     }
 
     private static func eventMatches(_ event: ControlPlaneEvent, threadId: String) -> Bool {
         if event.name == "activity" { return true } // global snapshot; not tied to one thread
+        if let eventPath = event.data["path"]?.stringValue ?? event.data["threadPath"]?.stringValue,
+           URL(fileURLWithPath: eventPath).standardizedFileURL.path
+            == URL(fileURLWithPath: threadId).standardizedFileURL.path {
+            return true
+        }
         return [event.data["id"]?.stringValue, event.data["threadId"]?.stringValue]
             .compactMap { $0 }
             .contains { $0 == threadId || $0.hasPrefix(threadId) || $0.hasSuffix(threadId) }
@@ -344,13 +441,49 @@ enum ThreadsCommand {
     /// Waits for one specific run to reach a terminal status by filtering `/v1/events`. Streamed
     /// intermediate events for *other* runs/threads are ignored, not printed, to keep --wait output
     /// focused on the run the caller asked about.
-    private static func waitForRun(plane: ControlPlane, runId: String, out: OutputSink) async throws -> WireRun {
-        for try await event in plane.events() {
-            guard event.name == "run", event.data["id"]?.stringValue == runId else { continue }
-            guard let run = try? event.data.decoded(as: WireRun.self) else { continue }
-            if RunStatus.isTerminal(run.status) { return run }
+    private static func waitForRun(
+        plane: ControlPlane,
+        events: AsyncThrowingStream<ControlPlaneEvent, Error>,
+        runId: String,
+        out: OutputSink,
+        unreachableTimeoutSeconds: Double
+    ) async throws -> WireRun {
+        _ = out
+        if let snapshot = try? await plane.showRun(id: runId), RunStatus.isTerminal(snapshot.run.status) {
+            return snapshot.run
         }
-        throw CLIFailure(exitCode: .requestFailed, message: "event stream ended before run \(runId) finished")
+        do {
+            for try await event in events {
+                guard event.name == "run", event.data["id"]?.stringValue == runId else { continue }
+                guard let run = try? event.data.decoded(as: WireRun.self) else { continue }
+                if RunStatus.isTerminal(run.status) { return run }
+            }
+        } catch {
+            // A bounded event buffer may close under unrelated daemon traffic. The run itself is
+            // still healthy, so its authoritative endpoint becomes the fallback rather than
+            // turning a successful prompt into a failed CLI command.
+        }
+        var unreachableSince: Date?
+        let unreachableLimit = max(0.01, unreachableTimeoutSeconds)
+        while !Task.isCancelled {
+            do {
+                let snapshot = try await plane.showRun(id: runId)
+                unreachableSince = nil
+                if RunStatus.isTerminal(snapshot.run.status) { return snapshot.run }
+            } catch {
+                let firstFailure = unreachableSince ?? Date()
+                unreachableSince = firstFailure
+                if Date().timeIntervalSince(firstFailure) >= unreachableLimit {
+                    throw CLIFailure(
+                        exitCode: .requestFailed,
+                        message: "The daemon remained unreachable while waiting for run \(runId)."
+                    )
+                }
+            }
+            let delay = min(0.5, unreachableLimit)
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        throw CancellationError()
     }
 
     private static func resolveMessageText(_ raw: String?, context: CommandContext) throws -> String? {
@@ -363,13 +496,110 @@ enum ThreadsCommand {
         return text.trimmingCharacters(in: .newlines)
     }
 
+    static func submissionClientID(
+        _ raw: String?, minimumLength: Int = 1, maximumLength: Int = 128
+    ) throws -> String {
+        let value = raw ?? UUID().uuidString.lowercased()
+        let bytes = value.utf8
+        let isAllowed = bytes.allSatisfy { byte in
+            (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45
+        }
+        guard (minimumLength...maximumLength).contains(bytes.count), isAllowed else {
+            throw UsageError.invalidValue(
+                flag: "--client-id", value: value,
+                reason: "expected \(minimumLength) to \(maximumLength) ASCII letters, digits, underscores, or hyphens"
+            )
+        }
+        return value
+    }
+
+    static func mutationFailure(
+        _ error: Error, clientID: String, operation: String
+    ) -> CLIFailure {
+        let failure = asFailure(error)
+        if let plane = error as? ControlPlaneError, case .outcomeUnknown = plane {
+            let review: String
+            switch operation {
+            case "thread creation":
+                review = "Review the thread list before retrying. The active daemon did not confirm replay-safe creation."
+            case "schedule creation":
+                review = "Review the schedule list before retrying. The active daemon did not confirm replay-safe schedule creation."
+            case "manual schedule run":
+                review = "Review the schedule's run history before retrying. The active daemon did not confirm replay-safe manual runs."
+            default:
+                review = "Review the thread before retrying. The active daemon did not confirm replay safety."
+            }
+            return CLIFailure(exitCode: failure.exitCode, message: failure.message, hint: review)
+        }
+        if case let ControlPlaneError.apiError(_, code, _) = error {
+            if code == "submission_outcome_unknown" || code == "creation_outcome_unknown"
+                || code == "schedule_run_outcome_unknown" {
+                let review: String
+                switch operation {
+                case "thread creation":
+                    review = "Review the thread list before doing anything else. Do not retry this creation automatically."
+                case "schedule creation":
+                    review = "Review the schedule list before doing anything else. Do not create another schedule automatically."
+                case "manual schedule run":
+                    review = "Review the schedule's run history before doing anything else. Do not start another run automatically."
+                default:
+                    review = "Review the thread before doing anything else. Do not resend this message automatically."
+                }
+                return CLIFailure(
+                    exitCode: failure.exitCode,
+                    message: failure.message,
+                    hint: failure.hint.map { "\($0). \(review)" } ?? review
+                )
+            }
+            if code == "submission_id_conflict" || code == "creation_id_conflict"
+                || code == "idempotency_conflict" || code == "run_id_conflict" {
+                let review = operation == "schedule creation"
+                    ? "This retry id belongs to different input. Review the schedule list, then use a new id only for a genuinely new schedule."
+                    : "This retry id belongs to different input. Review existing work, then use a new id only for a genuinely new request."
+                return CLIFailure(
+                    exitCode: failure.exitCode,
+                    message: failure.message,
+                    hint: failure.hint.map { "\($0). \(review)" } ?? review
+                )
+            }
+            if code == "submission_in_flight" || code == "creation_in_flight"
+                || code == "schedule_run_in_flight" || code == "submissions_busy"
+                || code == "creations_busy" || code == "create_retryable"
+                || code == "creation_pending" || code == "submission_ledger_unavailable" {
+                let retry = "Retry the exact \(operation) with --client-id \(clientID) within 30 minutes. This keeps the same protected request identity; after that window, review the authoritative list or history before doing anything else."
+                return CLIFailure(
+                    exitCode: failure.exitCode,
+                    message: failure.message,
+                    hint: failure.hint.map { "\($0). \(retry)" } ?? retry
+                )
+            }
+            return failure
+        }
+        guard let plane = error as? ControlPlaneError else { return failure }
+        switch plane {
+        case .unreachable:
+            return failure
+        case .timedOut, .transportFailure, .malformedResponse:
+            break
+        case .apiError, .outcomeUnknown:
+            return failure
+        }
+        let retry = "Retry the exact \(operation) with --client-id \(clientID) within 30 minutes. The daemon will replay an accepted request inside that window; after it expires, review the authoritative list or history before doing anything else."
+        let hint = failure.hint.map { "\($0). \(retry)" } ?? retry
+        return CLIFailure(exitCode: failure.exitCode, message: failure.message, hint: hint)
+    }
+
     /// Caught here rather than at the daemon so a typo costs no round trip and the error names
     /// the valid agents. The list is the CLI's own, so a newer daemon's agent is still accepted
     /// on the wire \u2014 it just cannot be typed as a filter until this CLI learns it.
     static let agents = ["pi", "codex", "claude"]
 
     static func validatedAgent(_ raw: String?) throws -> String? {
-        guard let raw, !raw.isEmpty else { return nil }
+        guard let raw else { return nil }
+        guard !raw.isEmpty else {
+            throw UsageError.invalidValue(flag: "--agent", value: raw, reason: "agent must not be empty")
+        }
         let value = raw.lowercased()
         guard agents.contains(value) else {
             throw UsageError.invalidValue(flag: "--agent", value: raw, reason: "expected one of: \(agents.joined(separator: ", "))")
@@ -394,12 +624,112 @@ enum ThreadsCommand {
     }
 }
 
+/// Opens the event stream before a mutating request and waits until the daemon confirms that the
+/// subscription is installed. Later events stay in a bounded buffer while the request runs.
+private final class PreparedControlPlaneEvents: @unchecked Sendable {
+    let events: AsyncThrowingStream<ControlPlaneEvent, Error>
+    private let ready: AsyncThrowingStream<Void, Error>
+    private let readinessTimeoutSeconds: Double
+    private let readinessTimeoutNanoseconds: UInt64
+    private var task: Task<Void, Never>?
+
+    init(source: AsyncThrowingStream<ControlPlaneEvent, Error>, readinessTimeoutSeconds: Double) {
+        let boundedTimeout = min(max(readinessTimeoutSeconds, 0.001), 86_400)
+        self.readinessTimeoutSeconds = boundedTimeout
+        readinessTimeoutNanoseconds = UInt64(boundedTimeout * 1_000_000_000)
+        var readyContinuation: AsyncThrowingStream<Void, Error>.Continuation!
+        ready = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) {
+            readyContinuation = $0
+        }
+        var eventContinuation: AsyncThrowingStream<ControlPlaneEvent, Error>.Continuation!
+        events = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) {
+            eventContinuation = $0
+        }
+
+        task = Task {
+            var didSignalReady = false
+            do {
+                for try await event in source {
+                    if !didSignalReady, event.name == "ready" {
+                        didSignalReady = true
+                        readyContinuation.yield(())
+                        readyContinuation.finish()
+                    }
+                    if event.name == "ready" { continue }
+                    switch eventContinuation.yield(event) {
+                    case .enqueued:
+                        break
+                    case .dropped:
+                        let error = ControlPlaneError.transportFailure("event consumer fell behind")
+                        eventContinuation.finish(throwing: error)
+                        return
+                    case .terminated:
+                        return
+                    @unknown default:
+                        return
+                    }
+                }
+                if !didSignalReady {
+                    readyContinuation.finish(throwing: ControlPlaneError.transportFailure(
+                        "event stream ended before the ready barrier"
+                    ))
+                }
+                eventContinuation.finish(throwing: ControlPlaneError.transportFailure(
+                    "event stream ended"
+                ))
+            } catch {
+                if !didSignalReady { readyContinuation.finish(throwing: error) }
+                eventContinuation.finish(throwing: error)
+            }
+        }
+    }
+
+    func waitUntilReady() async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            defer { group.cancelAll() }
+            group.addTask { [ready] in
+                var iterator = ready.makeAsyncIterator()
+                guard try await iterator.next() != nil else {
+                    throw ControlPlaneError.transportFailure(
+                        "event stream ended before the ready barrier"
+                    )
+                }
+            }
+            group.addTask { [readinessTimeoutNanoseconds, readinessTimeoutSeconds] in
+                try await Task.sleep(nanoseconds: readinessTimeoutNanoseconds)
+                throw ControlPlaneError.timedOut(
+                    "event stream did not become ready within \(readinessTimeoutSeconds) seconds"
+                )
+            }
+            _ = try await group.next()
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+
+    deinit { task?.cancel() }
+}
+
 /// Stable `threads send --json` shape: `run` is always present (null unless --wait was given) so
 /// scripts can rely on a fixed key set regardless of flags.
 struct WireSendMessageWithRunResponse: Codable, Equatable {
     var runId: String
-    var queued: Bool?
+    var queued: Bool
+    var delivery: String?
     var run: WireRun?
+
+    private enum CodingKeys: String, CodingKey { case runId, queued, delivery, run }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(runId, forKey: .runId)
+        try container.encode(queued, forKey: .queued)
+        try container.encode(delivery, forKey: .delivery)
+        try container.encode(run, forKey: .run)
+    }
 }
 
 /// Stable `threads watch --json` / one-line-per-event shape (this CLI's own envelope — the SSE

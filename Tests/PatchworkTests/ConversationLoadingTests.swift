@@ -93,11 +93,8 @@ private struct DelayedPagingRepository: SessionRepositoryProtocol {
         return try await base.loadNewestConversationPage(from: fileURL)
     }
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
-        try await base.loadOlderConversationPage(from: fileURL, cursor: cursor)
-    }
-    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
         try await Task.sleep(nanoseconds: focusedDelay)
-        return try await base.loadFocusedHistoryPage(from: fileURL, cursor: cursor)
+        return try await base.loadOlderConversationPage(from: fileURL, cursor: cursor)
     }
 }
 
@@ -176,7 +173,7 @@ final class ConversationLoadingTests: XCTestCase {
         XCTAssertEqual(store.messages.last?.textContent, "big-79")
     }
 
-    func testConversationFocusedPagingCrossesThousandsOfToolRecords() async throws {
+    func testConversationPagingCrossesThousandsOfToolRecordsWithoutChangingWorkDetail() async throws {
         let file = temporaryDirectory.appendingPathComponent("tool-heavy.jsonl")
         var lines: [[String: Any]] = [["type": "session", "version": 3, "id": "tool-heavy"]]
         var parent: Any = NSNull()
@@ -225,10 +222,10 @@ final class ConversationLoadingTests: XCTestCase {
             try await waitUntil { !store.isLoadingEarlierMessages }
             XCTAssertEqual(store.messages.last?.textContent, "answer 29",
                            "The detailed latest turn stays below every focused history page")
-            XCTAssertFalse(store.messages.flatMap(\.blocks).contains { block in
+            XCTAssertTrue(store.messages.flatMap(\.blocks).contains { block in
                 guard case let .toolCall(call) = block.kind else { return false }
-                return call.id.hasPrefix("call-28-")
-            }, "Historical tool work stays omitted")
+                return !call.id.hasPrefix("call-29-")
+            }, "Historical turns keep the same collapsible work detail as the latest turn")
             XCTAssertTrue(store.messages.flatMap(\.blocks).contains { block in
                 guard case let .toolCall(call) = block.kind else { return false }
                 return call.id.hasPrefix("call-29-")

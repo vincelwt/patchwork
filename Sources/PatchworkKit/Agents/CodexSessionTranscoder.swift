@@ -14,7 +14,11 @@ enum CodexSessionTranscoder {
               let type = record["type"] as? String else { return nil }
         let payload = record["payload"] as? [String: Any] ?? [:]
         let timestamp = record["timestamp"] as? String
-        let id = TranscodeSupport.contentID("cdx", data)
+        // Response items already carry the app-server item id. Keeping it makes the live event
+        // and its durable rollout projection the same message instead of two lookalikes. Older
+        // records without an id retain the deterministic content hash fallback.
+        let id = (type == "response_item" ? payload["id"] as? String : nil)
+            ?? TranscodeSupport.contentID("cdx", data)
 
         let projected: [String: Any]?
         switch type {

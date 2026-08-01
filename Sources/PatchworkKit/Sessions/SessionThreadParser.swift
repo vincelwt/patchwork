@@ -16,6 +16,11 @@ public enum SessionThreadParser {
     static let blocksPerMessageLimit = 40
     /// IDs, names, reasons, and future block kinds are structural metadata, not payload text.
     static let blockMetadataLimit = 256
+    /// Sidebar/control-plane summaries need only the session header and first prompt from the
+    /// head plus the latest rename and answer from the tail. Keeping this substantially smaller
+    /// than the general-purpose reader window bounds a first daemon scan across hundreds of large
+    /// transcripts; full history paging uses its own larger, record-aware windows below.
+    static let threadSummaryWindow = JSONLFileReader.ReadWindow.threadSummary
     /// Read recent messages from EOF first. Pathological tails fall back to the full scanner once
     /// this bounded window is exhausted, so speed never comes at the cost of missing history.
     static let initialTailBytes = 4 * 1_024 * 1_024
@@ -41,8 +46,9 @@ public enum SessionThreadParser {
         case subsession
     }
 
-    /// Single forward pass: every retained value is a scalar accumulator, so memory use does not
-    /// grow with session size regardless of how many entries the file contains.
+    /// One bounded pass: ordinary files are read whole, while oversized transcripts are sampled
+    /// at record-aligned head and tail windows. Every retained value is a scalar accumulator, so
+    /// memory use does not grow with session size regardless of how many entries the file contains.
     ///
     /// `transcoder` rewrites one foreign record into the Pi shape before it is read, exactly as
     /// the app's own `SessionParser.summary(at:archivedIDs:transcoder:)` does; `.pi` is identity.
@@ -51,6 +57,7 @@ public enum SessionThreadParser {
     /// produce the same projection. If a branch-aware summary is ever needed, that is where the
     /// chain style comes in.
     public static func thread(at url: URL, transcoder: AgentSessionTranscoder = .pi) throws -> PatchworkThread {
+        var isWindowed = JSONLFileReader.isWindowed(url: url, window: threadSummaryWindow)
         var sessionID = url.deletingPathExtension().lastPathComponent
         var sawSessionRecord = false
         var isSubsession = false
@@ -63,7 +70,7 @@ public enum SessionThreadParser {
         var cost = 0.0
         var sawAnyEntry = false
 
-        try JSONLFileReader.read(url: url) { rawRecord in
+        try JSONLFileReader.read(url: url, window: threadSummaryWindow) { rawRecord in
             try Task.checkCancellation()
             guard let data = transcoder.transcode(rawRecord) else { return }
             guard let value = try? PiJSONValue.decode(data), let object = value.objectValue else { return }
@@ -111,6 +118,9 @@ public enum SessionThreadParser {
                 break
             }
         }
+        // The writer may have crossed the threshold while this scan was in progress. Never expose
+        // a partial cost just because the first size check raced that append.
+        isWindowed = isWindowed || JSONLFileReader.isWindowed(url: url, window: threadSummaryWindow)
 
         guard sawAnyEntry else { throw ParseError.notASession }
         guard !isSubsession else { throw ParseError.subsession }
@@ -144,7 +154,9 @@ public enum SessionThreadParser {
             preview: preview,
             // Overlaid by the caller, which knows which root the file came from.
             agent: .pi,
-            cost: messageCount > 0 ? cost : nil,
+            // A head/tail summary deliberately skips the middle, so a partial dollar amount would
+            // be actively misleading. Exact costs remain available for ordinary-sized files.
+            cost: !isWindowed && messageCount > 0 ? cost : nil,
             // Only known live, from `get_session_stats`; a static file scan cannot recover it.
             contextPercent: nil
         )
@@ -288,7 +300,9 @@ public enum SessionThreadParser {
             let role = roleName == "bashExecution" ? MessageRole.toolResult : MessageRole(rawValue: roleName)
             let text = plainText(from: message["content"]) ?? ""
             let isError = message["isError"]?.boolValue ?? (message["stopReason"]?.stringValue == "error")
-            let at = timestamp(from: message["timestamp"]) ?? .distantPast
+            let at = timestamp(from: message["timestamp"])
+                ?? timestamp(from: entry["timestamp"])
+                ?? .distantPast
             return Message(
                 id: id, role: role, text: text, at: at, isError: isError,
                 images: imageRefs(in: message, locator: locator),

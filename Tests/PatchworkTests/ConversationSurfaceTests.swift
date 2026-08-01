@@ -292,6 +292,87 @@ final class TranscriptPresenterTests: XCTestCase {
         XCTAssertEqual(block.latestStatusText, "Latest thought")
     }
 
+    func testWorkDisclosureClosesExactlyWhenLiveWorkSettles() {
+        var state = WorkDisclosureState()
+        XCTAssertFalse(state.isOpen(default: false))
+        state.toggle(default: false)
+        XCTAssertTrue(state.isOpen(default: false))
+
+        state.transition(from: true, to: false)
+        XCTAssertFalse(state.isOpen(default: true))
+
+        state.toggle(default: false)
+        state.transition(from: false, to: false)
+        XCTAssertTrue(state.isOpen(default: false))
+    }
+
+    func testRunningTurnShowsWorkBeforeTheFirstAgentEvent() throws {
+        let startedAt = Date(timeIntervalSince1970: 10)
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "u", text: "Go", at: startedAt)],
+            streaming: nil,
+            isRunning: true
+        )
+
+        XCTAssertEqual(items.count, 2)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected live work") }
+        XCTAssertEqual(block.id, "work:waiting:u")
+        XCTAssertTrue(block.isActive)
+        XCTAssertTrue(block.entries.isEmpty)
+        XCTAssertEqual(block.startedAt, startedAt)
+    }
+
+    func testEmptyRunningThreadShowsStableWorkWhileEmptyIdleThreadDoesNot() throws {
+        let running = TranscriptPresenter.items(messages: [], streaming: nil, isRunning: true)
+        XCTAssertEqual(running.count, 1)
+        guard case let .work(block) = running[0] else { return XCTFail("Expected live work") }
+        XCTAssertEqual(block.id, "work:waiting:active-thread")
+        XCTAssertTrue(block.isActive)
+        XCTAssertTrue(block.entries.isEmpty)
+
+        XCTAssertTrue(
+            TranscriptPresenter.items(messages: [], streaming: nil, isRunning: false).isEmpty
+        )
+    }
+
+    func testTextProgressWithToolUseStopReasonStaysInsideActiveWork() throws {
+        var progress = assistant(id: "progress", blocks: [text("Inspecting the files")])
+        progress.stopReason = "toolUse"
+        let items = TranscriptPresenter.items(
+            messages: [user(id: "u", text: "Go", at: nil), progress],
+            streaming: nil,
+            isRunning: true
+        )
+
+        XCTAssertEqual(items.count, 2)
+        guard case let .work(block) = items[1] else { return XCTFail("Expected active work") }
+        XCTAssertTrue(block.isActive)
+        guard case let .note(note) = block.entries.first else { return XCTFail("Expected progress note") }
+        XCTAssertEqual(note.textContent, "Inspecting the files")
+    }
+
+    @MainActor
+    func testProjectionCacheKeepsWaitingRowIdentityWhenFirstWorkArrives() throws {
+        let cache = TranscriptProjectionCache()
+        let waiting = cache.items(
+            revision: 1,
+            messages: [user(id: "u", text: "Go", at: nil)],
+            streaming: nil,
+            isRunning: true
+        )
+        let started = cache.items(
+            revision: 2,
+            messages: [
+                user(id: "u", text: "Go", at: nil),
+                assistant(id: "thought", blocks: [thinking("Inspecting")])
+            ],
+            streaming: nil,
+            isRunning: true
+        )
+
+        XCTAssertEqual(waiting.last?.id, started.last?.id)
+    }
+
     func testLiveTurnStaysActiveAndReportsProgress() throws {
         let messages = [
             user(id: "u", text: "Run it", at: Date(timeIntervalSince1970: 10)),
@@ -438,7 +519,7 @@ final class TranscriptPresenterTests: XCTestCase {
         guard case let .work(block) = items[1] else { return XCTFail("Expected a work block") }
         XCTAssertFalse(block.hasFailure, "No individual step failed")
         XCTAssertTrue(block.answerFailed, "The turn's own answer failed")
-        XCTAssertEqual(block.latestStatusText, "Pi error: Something went wrong.")
+        XCTAssertEqual(block.latestStatusText, "Agent error: Something went wrong.")
         guard case let .note(error) = block.entries.last else { return XCTFail("Expected the error in the work log") }
         XCTAssertTrue(error.isError)
     }
@@ -679,7 +760,7 @@ final class TranscriptPresenterTests: XCTestCase {
             isRunning: true
         )
         guard case let .work(errorBlock) = beforeCompaction[1] else { return XCTFail("Expected live work") }
-        XCTAssertEqual(errorBlock.latestStatusText, "Pi error: Server overloaded.")
+        XCTAssertEqual(errorBlock.latestStatusText, "Agent error: Server overloaded.")
 
         let afterCompaction = TranscriptPresenter.items(
             messages: [userMessage, thought, error, compaction],

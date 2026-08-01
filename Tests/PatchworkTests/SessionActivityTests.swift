@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import PatchworkKit
 import XCTest
 @testable import Patchwork
 
@@ -51,9 +52,9 @@ final class SessionActivityClassifierTests: XCTestCase {
         )
     }
 
-    func testAnyNonTerminalEntryWrittenSecondsAgoMeansRunning() {
+    func testFreshMeaningfulEntryMeansRunningButMissingEntryIsUnknown() {
         XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: message(role: "assistant", stopReason: "toolUse"), age: 1), .running)
-        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: nil, age: 0), .running)
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: nil, age: 0), .unknown)
     }
 
     // MARK: Idle
@@ -163,6 +164,86 @@ final class SessionActivityClassifierTests: XCTestCase {
         XCTAssertEqual(entry?["id"]?.stringValue, "1", "A torn write must not hide the real last entry")
     }
 
+    func testNewerIncompleteRecordTemporarilyWinsOverPreviousTerminalEntry() throws {
+        let tail = Data("""
+        {"type":"message","id":"done","message":{"role":"assistant","stopReason":"stop"}}
+        {"type":"message","id":"next","message":{"role":"user"
+        """.utf8)
+        let evidence = SessionActivityClassifier.tailEvidence(inTail: tail)
+        XCTAssertEqual(evidence.lastEntry?["id"]?.stringValue, "done")
+        XCTAssertTrue(evidence.hasNewerIncompleteRecord)
+        XCTAssertEqual(
+            SessionActivityClassifier.classify(
+                lastEntry: evidence.lastEntry,
+                age: freshAge,
+                hasNewerIncompleteRecord: evidence.hasNewerIncompleteRecord
+            ),
+            .running
+        )
+        XCTAssertEqual(
+            SessionActivityClassifier.classify(
+                lastEntry: evidence.lastEntry,
+                age: midAge,
+                hasNewerIncompleteRecord: evidence.hasNewerIncompleteRecord
+            ),
+            .idle,
+            "A malformed suffix must stop overriding the prior terminal after the append window"
+        )
+    }
+
+    func testCompleteMetadataOnlyTailIsNotTreatedAsAnIncompleteWrite() {
+        let tail = Data("""
+        {"type":"session","version":3,"id":"new","cwd":"/tmp"}
+        """.utf8)
+        let evidence = SessionActivityClassifier.tailEvidence(inTail: tail)
+        XCTAssertNil(evidence.lastEntry)
+        XCTAssertFalse(evidence.hasNewerIncompleteRecord)
+        XCTAssertEqual(
+            SessionActivityClassifier.classify(
+                lastEntry: evidence.lastEntry,
+                age: freshAge,
+                hasNewerIncompleteRecord: evidence.hasNewerIncompleteRecord
+            ),
+            .unknown
+        )
+    }
+
+    func testOlderTruncatedTailFragmentCannotOverrideANewerTerminalEntry() {
+        let tail = Data("""
+        fragment from an older oversized record"}}
+        {"type":"message","id":"done","message":{"role":"assistant","stopReason":"stop"}}
+        """.utf8)
+        let evidence = SessionActivityClassifier.tailEvidence(inTail: tail)
+        XCTAssertEqual(evidence.lastEntry?["id"]?.stringValue, "done")
+        XCTAssertFalse(evidence.hasNewerIncompleteRecord)
+        XCTAssertEqual(
+            SessionActivityClassifier.classify(
+                lastEntry: evidence.lastEntry,
+                age: freshAge,
+                hasNewerIncompleteRecord: evidence.hasNewerIncompleteRecord
+            ),
+            .idle
+        )
+    }
+
+    func testOlderTruncatedFragmentBeforeNewerMetadataDoesNotSignalIncomplete() {
+        let tail = Data("""
+        fragment from an older oversized record"}}
+        {"type":"session_info","name":"renamed"}
+        """.utf8)
+        let evidence = SessionActivityClassifier.tailEvidence(inTail: tail)
+        XCTAssertNil(evidence.lastEntry)
+        XCTAssertFalse(evidence.hasNewerIncompleteRecord)
+        XCTAssertEqual(
+            SessionActivityClassifier.classify(
+                lastEntry: evidence.lastEntry,
+                age: freshAge,
+                hasNewerIncompleteRecord: evidence.hasNewerIncompleteRecord
+            ),
+            .unknown
+        )
+    }
+
     func testTruncatedLeadingLineIsIgnored() {
         // A 256 KB tail normally starts mid-record; that fragment must never be parsed.
         let tail = Data("""
@@ -180,6 +261,75 @@ final class SessionActivityClassifierTests: XCTestCase {
     func testCRLFTerminatedRecordStillDecodes() {
         let tail = Data("{\"type\":\"message\",\"id\":\"7\",\"message\":{\"role\":\"user\"}}\r\n".utf8)
         XCTAssertEqual(SessionActivityClassifier.lastEntry(inTail: tail)?["id"]?.stringValue, "7")
+    }
+
+    func testCodexBookkeepingCannotMaskACompletedTurn() throws {
+        let tail = Data("""
+        {"type":"response_item","payload":{"id":"answer","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}}
+        {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1}}}}
+        {"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
+        """.utf8)
+        let entry = try XCTUnwrap(SessionActivityClassifier.lastEntry(
+            inTail: tail, transcoder: .make(for: .codex)
+        ))
+        XCTAssertEqual(entry["message"]?["stopReason"]?.stringValue, "stop")
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: entry, age: 0), .idle)
+    }
+
+    func testCodexLifecycleMarkersExposeQuietStartsAndAborts() throws {
+        let started = Data("""
+        {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+        {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1}}}}
+        """.utf8)
+        let active = try XCTUnwrap(SessionActivityClassifier.lastEntry(
+            inTail: started, transcoder: .make(for: .codex)
+        ))
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: active, age: 10), .running)
+
+        let aborted = Data("""
+        {"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1"}}
+        """.utf8)
+        let terminal = try XCTUnwrap(SessionActivityClassifier.lastEntry(
+            inTail: aborted, transcoder: .make(for: .codex)
+        ))
+        XCTAssertEqual(terminal["message"]?["stopReason"]?.stringValue, "aborted")
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: terminal, age: 0), .idle)
+    }
+
+    func testCodexProgressKeepsARestartedLongTurnRunningAfterStartScrollsAway() throws {
+        var lines = [
+            #"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-long"}}"#
+        ]
+        for index in 0..<(SessionFileActivityClassifier.codexLifecycleScanLines + 32) {
+            lines.append(
+                #"{"type":"event_msg","payload":{"type":"agent_reasoning","id":"progress-\#(index)"}}"#
+            )
+        }
+        let tail = Data((lines.joined(separator: "\n") + "\n").utf8)
+        let entry = try XCTUnwrap(SessionActivityClassifier.lastEntry(
+            inTail: tail, transcoder: .make(for: .codex)
+        ))
+
+        XCTAssertEqual(entry["message"]?["role"]?.stringValue, "user")
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: entry, age: midAge), .running)
+    }
+
+    func testCodexTerminalMarkerWinsOverFreshPostCompletionBookkeeping() throws {
+        var lines = [
+            #"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-done"}}"#
+        ]
+        for index in 0..<8 {
+            lines.append(
+                #"{"type":"event_msg","payload":{"type":"token_count","id":"after-\#(index)"}}"#
+            )
+        }
+        let tail = Data((lines.joined(separator: "\n") + "\n").utf8)
+        let entry = try XCTUnwrap(SessionActivityClassifier.lastEntry(
+            inTail: tail, transcoder: .make(for: .codex)
+        ))
+
+        XCTAssertEqual(entry["message"]?["stopReason"]?.stringValue, "stop")
+        XCTAssertEqual(SessionActivityClassifier.classify(lastEntry: entry, age: freshAge), .idle)
     }
 
     // MARK: End-to-end on a real file
@@ -232,6 +382,21 @@ final class SessionActivityClassifierTests: XCTestCase {
         XCTAssertEqual(activity.state, .idle)
         XCTAssertEqual(activity.latestCompletedEntryID, "1")
         XCTAssertNil(activity.runningSince)
+    }
+
+    func testFreshTornFileIsRunningButFreshMetadataOnlyFileIsUnknown() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiActivity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let torn = directory.appendingPathComponent("torn.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"next\",\"message\":{\"role\":\"user\"".utf8).write(to: torn)
+        XCTAssertEqual(SessionActivityClassifier.classifyFile(at: torn)?.state, .running)
+
+        let metadata = directory.appendingPathComponent("metadata.jsonl")
+        try Data("{\"type\":\"session\",\"version\":3,\"id\":\"new\",\"cwd\":\"/tmp\"}\n".utf8).write(to: metadata)
+        XCTAssertEqual(SessionActivityClassifier.classifyFile(at: metadata)?.state, .unknown)
     }
 
     func testMissingFileHasNoActivity() {
@@ -395,6 +560,23 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
         XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-2")
     }
 
+    func testScanSeesInPlaceHeartbeatUpdatesWithoutADirectoryChange() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("a.json")
+        try write(
+            """
+            {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"running","updatedAt":"2024-01-01T00:00:00.000Z"}
+            """, name: file.lastPathComponent, in: directory
+        )
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.state, "running")
+
+        try Data("""
+        {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:01.000Z"}
+        """.utf8).write(to: file)
+        XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.state, "idle")
+    }
+
     func testSymlinkedHeartbeatInvalidatesWhenItsTargetIsReplaced() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -404,6 +586,8 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
         try Data("""
         {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-1"}
         """.utf8).write(to: target)
+        let fixedMtime = Date(timeIntervalSince1970: 1_000)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: target.path)
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
         XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-1")
 
@@ -411,14 +595,120 @@ final class ActivityHeartbeatStoreTests: XCTestCase {
         try Data("""
         {"sessionId":"a","sessionFile":"/tmp/a.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z","completionId":"answer-2"}
         """.utf8).write(to: replacement)
+        try FileManager.default.setAttributes([.modificationDate: fixedMtime], ofItemAtPath: replacement.path)
         try FileManager.default.removeItem(at: target)
         try FileManager.default.moveItem(at: replacement, to: target)
         XCTAssertEqual(ActivityHeartbeatStore.scan(directory: directory)["/tmp/a.jsonl"]?.first?.completionId, "answer-2")
     }
 
+    func testScanBoundsMoreThanFiveHundredFilesAndRetainsTheNewest() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let oldMtime = Date(timeIntervalSince1970: 1_000)
+
+        for index in 0...ActivityHeartbeatStore.maxFilesPerScan {
+            let name = String(format: "stale-%04d.json", index)
+            let file = directory.appendingPathComponent(name)
+            try Data("""
+            {"sessionId":"stale-\(index)","sessionFile":"/tmp/stale-\(index).jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z"}
+            """.utf8).write(to: file)
+            try FileManager.default.setAttributes([.modificationDate: oldMtime], ofItemAtPath: file.path)
+        }
+
+        let newest = directory.appendingPathComponent("newest.json")
+        try Data("""
+        {"sessionId":"newest","sessionFile":"/tmp/newest.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z"}
+        """.utf8).write(to: newest)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 2_000)], ofItemAtPath: newest.path
+        )
+
+        let result = ActivityHeartbeatStore.scan(directory: directory)
+        XCTAssertEqual(result.count, ActivityHeartbeatStore.maxFilesPerScan)
+        XCTAssertNotNil(result["/tmp/newest.jsonl"])
+        XCTAssertNil(result["/tmp/stale-500.jsonl"])
+        XCTAssertEqual(Set(ActivityHeartbeatStore.scan(directory: directory).keys), Set(result.keys))
+    }
+
+    func testOversizedHeartbeatIsSkippedBeforeTheBoundedDecode() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(repeating: 0x20, count: ActivityHeartbeatStore.maxFileBytes + 1)
+            .write(to: directory.appendingPathComponent("oversized.json"))
+        try write(
+            """
+            {"sessionId":"valid","sessionFile":"/tmp/valid.jsonl","pid":1,"state":"idle","updatedAt":"2024-01-01T00:00:00.000Z"}
+            """, name: "valid.json", in: directory
+        )
+
+        let result = ActivityHeartbeatStore.scan(directory: directory)
+        XCTAssertEqual(Array(result.keys), ["/tmp/valid.jsonl"])
+    }
+
     func testScanOfAMissingDirectoryIsEmptyNotAnError() {
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent("PiHeartbeats-missing-\(UUID().uuidString)")
         XCTAssertTrue(ActivityHeartbeatStore.scan(directory: missing).isEmpty)
+    }
+}
+
+private final class SessionActivityTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) { self.value = value }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock()
+        value = value.addingTimeInterval(interval)
+        lock.unlock()
+    }
+}
+
+private final class GatedSessionActivityTestClock: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var shouldBlockNextRead = false
+    private var blocked = false
+    private let value: Date
+
+    init(_ value: Date) { self.value = value }
+
+    func arm() {
+        condition.lock()
+        shouldBlockNextRead = true
+        blocked = false
+        condition.unlock()
+    }
+
+    func now() -> Date {
+        condition.lock()
+        if shouldBlockNextRead {
+            blocked = true
+            condition.broadcast()
+            while shouldBlockNextRead { condition.wait() }
+        }
+        condition.unlock()
+        return value
+    }
+
+    func isBlocked() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return blocked
+    }
+
+    func release() {
+        condition.lock()
+        shouldBlockNextRead = false
+        condition.broadcast()
+        condition.unlock()
     }
 }
 
@@ -698,11 +988,77 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertEqual(monitor.activity(forPath: file.path)?.state, .running, "No heartbeat: the file heuristic alone decides")
     }
 
+    func testIncompleteAppendVerdictExpiresAtTheRecentWriteBoundary() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let start = Date(timeIntervalSince1970: 2_000_000_000)
+        let clock = SessionActivityTestClock(start)
+        let file = directory.appendingPathComponent("terminal-then-torn.jsonl")
+        try Data("""
+        {"type":"message","id":"done","message":{"role":"assistant","stopReason":"stop"}}
+        {"type":"message","id":"next","message":{"role":"user"
+        """.utf8).write(to: file)
+        try FileManager.default.setAttributes([.modificationDate: start], ofItemAtPath: file.path)
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: emptyHeartbeatDirectory(),
+            now: { clock.now() }
+        )
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .running }
+
+        clock.advance(by: SessionActivityClassifier.recentWriteWindow + 1)
+        monitor.tickNow()
+        try await waitUntil { monitor.activity(forPath: file.path)?.state == .idle }
+    }
+
+    func testIncompleteAppendRetryStaysAheadOfALargeCatalogRotation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let start = Date(timeIntervalSince1970: 2_000_000_000)
+        let clock = SessionActivityTestClock(start)
+        var paths: [String] = []
+        for index in 0..<(SessionActivityMonitor.fallbackStatsPerTick * 2) {
+            let file = directory.appendingPathComponent("\(index).jsonl")
+            let data = index == 0
+                ? Data("""
+                  {"type":"message","id":"done","message":{"role":"assistant","stopReason":"stop"}}
+                  {"type":"message","id":"next","message":{"role":"user"
+                  """.utf8)
+                : Data("{\"type\":\"message\",\"id\":\"done-\(index)\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            try data.write(to: file)
+            try FileManager.default.setAttributes([.modificationDate: start], ofItemAtPath: file.path)
+            paths.append(file.path)
+        }
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: emptyHeartbeatDirectory(),
+            now: { clock.now() }
+        )
+        monitor.setTrackedPaths(paths)
+        try await waitUntil { monitor.activity(forPath: paths[0])?.state == .running }
+
+        clock.advance(by: SessionActivityClassifier.recentWriteWindow + 1)
+        monitor.tickNow()
+        try await waitUntil {
+            monitor.activity(forPath: paths[0])?.state == .idle
+        }
+    }
+
     func testPollingTaskDoesNotRetainTheMonitor() async throws {
         var monitor: SessionActivityMonitor? = SessionActivityMonitor(
             isActiveOverride: false, heartbeatDirectory: emptyHeartbeatDirectory()
         )
-        weak var released = monitor
+        weak var released: SessionActivityMonitor?
+        released = monitor
         monitor?.start()
         monitor = nil
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -793,6 +1149,288 @@ final class SessionActivityMonitorTests: XCTestCase {
         XCTAssertTrue(first.paths.contains("session-199"))
         XCTAssertTrue(second.paths.contains("session-199"))
         XCTAssertTrue(Set(first.paths).intersection(second.paths).subtracting(heartbeat).isEmpty)
+    }
+
+    func testPriorityPathIsIncludedInEveryBoundedFallbackSelection() {
+        let paths = (0..<200).map { "session-\($0)" }
+        let priority = Set(["session-199"])
+        let first = SessionActivityMonitor.pollSelection(
+            paths: paths, heartbeatPaths: [], priorityPaths: priority, fallbackCursor: 0
+        )
+        let second = SessionActivityMonitor.pollSelection(
+            paths: paths, heartbeatPaths: [], priorityPaths: priority, fallbackCursor: first.nextCursor
+        )
+
+        XCTAssertEqual(first.paths.count, SessionActivityMonitor.fallbackStatsPerTick)
+        XCTAssertEqual(second.paths.count, SessionActivityMonitor.fallbackStatsPerTick)
+        XCTAssertTrue(first.paths.contains("session-199"))
+        XCTAssertTrue(second.paths.contains("session-199"))
+        XCTAssertEqual(Set(first.paths).intersection(second.paths), priority)
+    }
+
+    func testFocusedPathOrdersAheadOfFullUrgentAndIncompleteBatches() {
+        let urgent = Set((0..<SessionActivityMonitor.tailReadsPerTick).map { "urgent-\($0)" })
+        let incomplete = Set((0..<SessionActivityMonitor.tailReadsPerTick).map { "incomplete-\($0)" })
+        let focus = "focused"
+        let paths = Array(urgent).sorted() + Array(incomplete).sorted() + [focus, "ordinary"]
+
+        let ordered = SessionActivityMonitor.orderedPollPaths(
+            paths,
+            focusedPath: focus,
+            urgentPaths: urgent,
+            incompletePaths: incomplete
+        )
+
+        XCTAssertEqual(ordered.first, focus)
+        XCTAssertEqual(Set(ordered.prefix(1 + urgent.count).dropFirst()), urgent)
+        XCTAssertEqual(Set(ordered), Set(paths))
+        XCTAssertEqual(ordered.count, paths.count)
+    }
+
+    func testIncompleteTailRetryQueueExposesOneBatchAndExpiresEveryVerdict() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let timestamp = Date()
+        let clock = SessionActivityTestClock(timestamp)
+        var paths: [String] = []
+        for index in 0..<(SessionActivityMonitor.tailReadsPerTick * 2) {
+            let file = directory.appendingPathComponent("session-\(index).jsonl")
+            try Data("{\"type\":\"message\",\"id\":\"done-\(index)\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+                .write(to: file)
+            try FileManager.default.setAttributes(
+                [.modificationDate: timestamp], ofItemAtPath: file.path
+            )
+            paths.append(file.path)
+        }
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: emptyHeartbeatDirectory(),
+            now: { clock.now() }
+        )
+        monitor.setTrackedPaths(paths)
+        try await waitUntil { monitor.activities.count == paths.count }
+
+        func appendTornPrompt(to path: String) throws {
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"next\",\"message\":{\"role\":\"user\"".utf8))
+            try handle.close()
+            try FileManager.default.setAttributes(
+                [.modificationDate: timestamp], ofItemAtPath: path
+            )
+        }
+        let firstBatch = Set(paths.prefix(SessionActivityMonitor.tailReadsPerTick))
+        for path in firstBatch { try appendTornPrompt(to: path) }
+        monitor.prioritize(paths: firstBatch)
+        try await waitUntil {
+            firstBatch.allSatisfy { monitor.activity(forPath: $0)?.state == .running }
+        }
+        XCTAssertEqual(
+            monitor.incompleteTailPathCountForTesting,
+            SessionActivityMonitor.tailReadsPerTick
+        )
+
+        let secondBatch = Set(paths.dropFirst(SessionActivityMonitor.tailReadsPerTick))
+        for path in secondBatch { try appendTornPrompt(to: path) }
+        monitor.prioritize(paths: secondBatch)
+        try await waitUntil {
+            secondBatch.allSatisfy { monitor.activity(forPath: $0)?.state == .running }
+        }
+        XCTAssertEqual(
+            monitor.incompleteTailPathCountForTesting,
+            SessionActivityMonitor.tailReadsPerTick * 2
+        )
+        let retryAt = Dictionary(uniqueKeysWithValues: paths.map {
+            ($0, timestamp.addingTimeInterval(SessionActivityClassifier.recentWriteWindow))
+        })
+        XCTAssertTrue(SessionActivityMonitor.dueIncompleteTailPaths(
+            paths: paths, retryAtByPath: retryAt, now: timestamp
+        ).isEmpty)
+
+        clock.advance(by: SessionActivityClassifier.recentWriteWindow + 1)
+        XCTAssertEqual(
+            SessionActivityMonitor.dueIncompleteTailPaths(
+                paths: paths, retryAtByPath: retryAt, now: clock.now()
+            ).count,
+            SessionActivityMonitor.tailReadsPerTick
+        )
+        monitor.tickNow()
+        try await waitUntil(timeout: 1) {
+            paths.allSatisfy { monitor.activity(forPath: $0)?.state == .idle }
+        }
+        XCTAssertEqual(monitor.incompleteTailPathCountForTesting, 0)
+    }
+
+    func testUrgentPathSurvivesAConfigurationRevisionDuringDetachedPolling() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let timestamp = Date()
+        let clock = GatedSessionActivityTestClock(timestamp)
+        var paths: [String] = []
+        for index in 0..<200 {
+            let file = directory.appendingPathComponent("session-\(index).jsonl")
+            try Data("{\"type\":\"message\",\"id\":\"done-\(index)\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+                .write(to: file)
+            paths.append(file.path)
+        }
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: true,
+            heartbeatDirectory: emptyHeartbeatDirectory(),
+            now: { clock.now() }
+        )
+        monitor.setTrackedPaths(paths)
+        try await waitUntil {
+            monitor.activities.count == SessionActivityMonitor.fallbackStatsPerTick
+        }
+
+        let urgentPath = paths[199]
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: urgentPath))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"prompt\",\"message\":{\"role\":\"user\"}}\n".utf8))
+        try handle.close()
+        let extra = directory.appendingPathComponent("extra.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"done-extra\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: extra)
+
+        clock.arm()
+        defer { clock.release() }
+        monitor.prioritize(paths: [urgentPath])
+        try await waitUntil { clock.isBlocked() }
+        monitor.setTrackedPaths(paths + [extra.path])
+        clock.release()
+
+        try await waitUntil(timeout: 1) {
+            monitor.activity(forPath: urgentPath)?.state == .running
+        }
+    }
+
+    func testPriorityTransitionReadsATranscriptNewerThanAnIdleHeartbeat() async throws {
+        try await assertPriorityTransition(completionIDs: ["a1"])
+    }
+
+    func testPriorityTransitionReadsAfterAnIdleHeartbeatWithoutACompletionID() async throws {
+        try await assertPriorityTransition(completionIDs: [])
+    }
+
+    func testPriorityTransitionReadsAfterIdleHeartbeatsWithConflictingCompletions() async throws {
+        try await assertPriorityTransition(completionIDs: ["a0", "a1"])
+    }
+
+    private func assertPriorityTransition(completionIDs: [String]) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let now = Date()
+        let file = directory.appendingPathComponent("background.jsonl")
+        try Data("""
+        {"type":"message","id":"a1","message":{"role":"assistant","stopReason":"stop"}}
+        {"type":"message","id":"u2","message":{"role":"user","content":"continue"}}
+        """.utf8).write(to: file)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-1)], ofItemAtPath: file.path
+        )
+        let values: [String?] = completionIDs.isEmpty ? [nil] : completionIDs.map(Optional.some)
+        for (index, completionID) in values.enumerated() {
+            let completionField = completionID.map { ",\"completionId\":\"\($0)\"" } ?? ""
+            try Data("""
+            {"sessionId":"s","sessionFile":"\(file.path)","pid":\(index + 1),"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: now.addingTimeInterval(-5)))"\(completionField)}
+            """.utf8).write(to: heartbeats.appendingPathComponent("s-\(index).json"))
+        }
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: false,
+            heartbeatDirectory: heartbeats,
+            isProcessAlive: { _ in false }
+        )
+        monitor.setTrackedPaths([file.path])
+        try await waitUntil(timeout: 1) { monitor.activity(forPath: file.path)?.state == .idle }
+        if completionIDs == ["a1"] {
+            XCTAssertEqual(monitor.activity(forPath: file.path)?.latestCompletedEntryID, "a1")
+        }
+
+        // The background phase has already observed the newer transcript. Selecting it must
+        // still inspect that tail without requiring another write or heartbeat update.
+        monitor.setPriorityPath(file.path)
+        try await waitUntil(timeout: 1) { monitor.activity(forPath: file.path)?.state == .running }
+    }
+
+    func testSelectedFileWatcherOverridesAStaleIdleHeartbeatWithoutWaitingForBackgroundPoll() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        let heartbeats = directory.appendingPathComponent("heartbeats", isDirectory: true)
+        try FileManager.default.createDirectory(at: heartbeats, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("selected.jsonl")
+        try Data("{\"type\":\"message\",\"id\":\"a1\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: file)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try Data("""
+        {"sessionId":"s","sessionFile":"\(file.path)","pid":1,"state":"idle","updatedAt":"\(ISO8601DateFormatter.piShared.string(from: Date()))","completionId":"a1"}
+        """.utf8).write(to: heartbeats.appendingPathComponent("s.json"))
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: false,
+            heartbeatDirectory: heartbeats,
+            isProcessAlive: { _ in false }
+        )
+        monitor.setTrackedPaths([file.path])
+        monitor.setPriorityPath(file.path)
+        monitor.start()
+        defer { monitor.stop() }
+        try await waitUntil(timeout: 1) {
+            monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a1"
+        }
+
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"u2\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n".utf8))
+        try await waitUntil(timeout: 1) { monitor.activity(forPath: file.path)?.state == .running }
+
+        try handle.write(contentsOf: Data("{\"type\":\"message\",\"id\":\"a2\",\"message\":{\"role\":\"assistant\",\"content\":\"done\",\"stopReason\":\"stop\"}}\n".utf8))
+        try handle.close()
+        try await waitUntil(timeout: 1) {
+            monitor.activity(forPath: file.path)?.state == .idle
+                && monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a2"
+        }
+    }
+
+    func testSelectedWatcherAttachesWhenAProvisionalFileAppearsAndAfterReplacement() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiMonitor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("provisional.jsonl")
+
+        let monitor = SessionActivityMonitor(
+            isActiveOverride: false,
+            heartbeatDirectory: emptyHeartbeatDirectory()
+        )
+        monitor.setTrackedPaths([file.path])
+        monitor.setPriorityPath(file.path)
+        monitor.start()
+        defer { monitor.stop() }
+
+        try Data("{\"type\":\"message\",\"id\":\"u1\",\"message\":{\"role\":\"user\"}}\n".utf8)
+            .write(to: file)
+        try await waitUntil(timeout: 1) { monitor.activity(forPath: file.path)?.state == .running }
+
+        let replaced = directory.appendingPathComponent("old.jsonl")
+        try FileManager.default.moveItem(at: file, to: replaced)
+        try Data("{\"type\":\"message\",\"id\":\"a2\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\"}}\n".utf8)
+            .write(to: file)
+        try await waitUntil(timeout: 1) {
+            monitor.activity(forPath: file.path)?.latestCompletedEntryID == "a2"
+        }
     }
 
     /// The exact flicker the user reported: an ambiguous tail read (no heartbeat, and the file

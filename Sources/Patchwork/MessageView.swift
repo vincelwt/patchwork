@@ -134,7 +134,7 @@ struct MessageView: View, Equatable {
         VStack(alignment: .leading, spacing: PatchworkTheme.transcriptBlockSpacing) {
             if message.isError {
                 PatchworkGridRow(symbol: "exclamationmark.circle.fill", tint: Color.patchworkRed, symbolWeight: .medium) {
-                    Text("Pi error").font(PatchworkFont.caption).foregroundStyle(Color.patchworkRed)
+                    Text("Agent error").font(PatchworkFont.caption).foregroundStyle(Color.patchworkRed)
                 }
             }
             blockList(showThinking: true, isAnswer: true)
@@ -146,7 +146,7 @@ struct MessageView: View, Equatable {
         .frame(maxWidth: .infinity, alignment: .leading)
         .onHover { hovering = $0 }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Message from Pi")
+        .accessibilityLabel("Message from agent")
     }
 
     @ViewBuilder
@@ -202,7 +202,7 @@ struct MessageView: View, Equatable {
     }
 
     private var timestampHelp: String {
-        guard let date = message.timestamp else { return message.role == .user ? "You" : "Pi" }
+        guard let date = message.timestamp else { return message.role == .user ? "You" : "Agent" }
         return date.formatted(date: .abbreviated, time: .standard)
     }
 }
@@ -232,6 +232,20 @@ struct ThinkingBlockView: View {
 
 // MARK: - Turn work log
 
+struct WorkDisclosureState: Equatable {
+    var userChoice: Bool?
+
+    func isOpen(default defaultOpen: Bool) -> Bool { userChoice ?? defaultOpen }
+
+    mutating func toggle(default defaultOpen: Bool) {
+        userChoice = !isOpen(default: defaultOpen)
+    }
+
+    mutating func transition(from wasActive: Bool, to isActive: Bool) {
+        if wasActive, !isActive { userChoice = false }
+    }
+}
+
 /// One turn's work: live reasoning stays collapsed behind its latest thought unless the user
 /// opens it; settled details become one quiet “Worked for …” line while prominent output remains.
 struct TranscriptWorkView: View, Equatable {
@@ -244,7 +258,7 @@ struct TranscriptWorkView: View, Equatable {
     let questionnaireKey: String?
 
     /// `nil` until the user decides; the run's own state owns it until then.
-    @State private var userExpanded: Bool?
+    @State private var disclosure = WorkDisclosureState()
     @State private var hovering = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -252,38 +266,22 @@ struct TranscriptWorkView: View, Equatable {
             && lhs.questionnaireKey == rhs.questionnaireKey
     }
 
-    private var isOpen: Bool { userExpanded ?? block.shouldStartExpanded }
+    private var isOpen: Bool { disclosure.isOpen(default: block.shouldStartExpanded) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PatchworkTheme.transcriptEntrySpacing) {
-            Button { userExpanded = !isOpen } label: {
-                HStack(spacing: PatchworkTheme.gridGutter) {
-                    // The icon column is always reserved while live or settled, so the headline
-                    // starts at the same origin as every row inside the log below it.
-                    Group {
-                        if block.isActive { StatusDot(color: .patchworkGreen, pulsing: true) }
-                    }
-                    .frame(width: PatchworkTheme.gridIconColumn, alignment: .center)
-                    headline
-                    if block.answerFailed, !isOpen {
-                        Text("· failed").font(PatchworkFont.caption).foregroundStyle(Color.patchworkRed)
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: PatchworkIcon.micro, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        .rotationEffect(.degrees(isOpen ? 90 : 0))
-                        .opacity(hovering || isOpen ? 1 : 0.4)
-                    Spacer(minLength: 0)
+            if block.entries.isEmpty {
+                header(showsDisclosure: false)
+            } else {
+                Button { disclosure.toggle(default: block.shouldStartExpanded) } label: {
+                    header(showsDisclosure: true)
+                        .contentShape(Rectangle())
                 }
-                .frame(minHeight: 18)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
             }
-            .buttonStyle(.plain)
-            .onHover { hovering = $0 }
 
-            if isOpen {
-                PatchworkHairline()
-
+            if isOpen, !block.entries.isEmpty {
                 VStack(alignment: .leading, spacing: PatchworkTheme.transcriptEntrySpacing) {
                     ForEach(Array(block.entries.enumerated()), id: \.element.id) { index, entry in
                         Group {
@@ -323,9 +321,36 @@ struct TranscriptWorkView: View, Equatable {
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: block.entries.count)
         .animation(reduceMotion || reduceTransparency ? nil : .easeOut(duration: 0.18), value: block.latestStatusText)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: isOpen)
+        .onChange(of: block.isActive) { wasActive, isActive in
+            disclosure.transition(from: wasActive, to: isActive)
+        }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(block.isActive ? "Pi is working" : block.title)
-        .accessibilityValue(isOpen ? "work details expanded" : "work details collapsed")
+        .accessibilityLabel(block.isActive ? "Agent is working" : block.title)
+        .accessibilityValue(block.entries.isEmpty ? "" : (isOpen ? "work details expanded" : "work details collapsed"))
+    }
+
+    private func header(showsDisclosure: Bool) -> some View {
+        HStack(spacing: PatchworkTheme.gridGutter) {
+            // The icon column is always reserved while live or settled, so the headline
+            // starts at the same origin as every row inside the log below it.
+            Group {
+                if block.isActive { StatusDot(color: .patchworkGreen, pulsing: true) }
+            }
+            .frame(width: PatchworkTheme.gridIconColumn, alignment: .center)
+            headline
+            if block.answerFailed, !isOpen {
+                Text("· failed").font(PatchworkFont.caption).foregroundStyle(Color.patchworkRed)
+            }
+            if showsDisclosure {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: PatchworkIcon.micro, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isOpen ? 90 : 0))
+                    .opacity(hovering || isOpen ? 1 : 0.4)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 18)
     }
 
     private func entryOpacity(at index: Int) -> Double {
@@ -339,7 +364,8 @@ struct TranscriptWorkView: View, Equatable {
 
     private var headline: some View {
         HStack(spacing: PatchworkTheme.space6) {
-            Text(showsStatusHeadline ? (block.latestStatusText ?? block.title) : block.title)
+            Text(block.isActive ? (block.latestStatusText ?? "Thinking")
+                : (showsStatusHeadline ? (block.latestStatusText ?? block.title) : block.title))
                 .font(PatchworkFont.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -388,7 +414,7 @@ private struct WorkNoteView: View {
                 MarkdownBlockView(text: message.textContent)
                     .foregroundStyle(.secondary)
             }
-            .accessibilityLabel("Pi narration")
+            .accessibilityLabel("Agent narration")
         } else {
             MessageView(
                 message: message,
@@ -411,7 +437,6 @@ struct CompactionRowView: View {
         VStack(alignment: .leading, spacing: PatchworkTheme.transcriptRowSpacing) {
             Button { expanded.toggle() } label: {
                 HStack(spacing: PatchworkTheme.space8) {
-                    PatchworkHairline()
                     HStack(spacing: PatchworkTheme.space4) {
                         Image(systemName: "arrow.triangle.2.circlepath")
                             .font(.system(size: PatchworkIcon.micro, weight: .medium))
@@ -426,7 +451,6 @@ struct CompactionRowView: View {
                     }
                     .foregroundStyle(.secondary)
                     .fixedSize()
-                    PatchworkHairline()
                 }
                 .contentShape(Rectangle())
             }
@@ -948,7 +972,7 @@ private struct SystemMessageRow: View {
 private struct UnknownMessageRow: View {
     let message: ChatMessage
     var body: some View {
-        DisclosureRow(symbol: "sparkles", title: "New Pi entry") {
+        DisclosureRow(symbol: "sparkles", title: "New agent entry") {
             CodeBlockView(language: nil, code: message.raw.prettyPrinted(maxLength: PatchworkTheme.unknownPayloadLimit))
         }
     }

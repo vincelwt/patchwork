@@ -88,6 +88,29 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(binaryFile.linesUnavailable)
     }
 
+    func testSnapshotAndCommandOutputStayBoundedInVeryDirtyRepository() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PatchworkGitBounded-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try runGit(["init", "-q"], at: root)
+
+        for index in 0..<(GitSnapshot.maxRetainedFiles + 25) {
+            let name = String(format: "file-%04d.txt", index)
+            try Data("line\n".utf8).write(to: root.appendingPathComponent(name))
+        }
+
+        let snapshot = await GitService().snapshot(for: root)
+        XCTAssertEqual(snapshot.files.count, GitSnapshot.maxRetainedFiles)
+        XCTAssertTrue(snapshot.filesTruncated)
+
+        try runGit(["add", "."], at: root)
+        let output = GitService.run(["-C", root.path, "ls-files"], maxOutputBytes: 37)
+        XCTAssertEqual(output.status, 0)
+        XCTAssertLessThanOrEqual(output.output.utf8.count, 37)
+        XCTAssertTrue(output.truncated)
+    }
+
     func testConversationWorkspaceDetectorUsesExplicitToolLocations() {
         let base = URL(fileURLWithPath: "/tmp/project", isDirectory: true)
         let worktree = URL(fileURLWithPath: "/tmp/feature worktree", isDirectory: true)

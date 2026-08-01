@@ -19,7 +19,7 @@ vocabulary that each adapter translates into.
 | Branching history | yes | linear log | yes |
 | Model list | live query | live query | curated aliases |
 | Thinking level | live | next turn | next launch |
-| Composer ladder | `/mode` effort | model, weakest to strongest | model, weakest to strongest |
+| New chat preset | agent + model + thinking | agent + model + thinking | agent + model + thinking |
 | Compaction | yes | yes | `/compact` |
 | Mid-turn steering | yes | yes | yes |
 | Edit and resend | yes | linear, no branch | no |
@@ -42,6 +42,11 @@ transcripts and stops offering it for new conversations, without touching anythi
 owns. Codex and Claude Code can also be given a small `patchwork` skill from there, teaching
 them the `patchwork` CLI that is already on their PATH; Pi already learns it from the extension. A
 skill file with no recognisable version marker is treated as your own and never overwritten.
+
+Settings also has a **Presets** pane. Each preset combines one installed agent, one model from
+that agent, and one supported thinking level. The new-chat surface selects the whole preset at
+once, and Command-Shift-P cycles through the available presets. Once a conversation starts its
+agent stays fixed, while model and thinking remain independently adjustable from the status bar.
 
 Automations follow the agent too. A schedule against an existing conversation resolves its
 agent from that conversation every time it fires, so it never goes stale; a schedule that starts
@@ -82,8 +87,8 @@ agent is reported as not installed rather than silently falling back to another 
 - Run state and completed-answer IDs verified against a small Pi extension (`patchwork-activity`), so an idle RPC attachment cannot hide a terminal still working and unread/notification state advances only for a terminal assistant answer (`stop`, `length`, `error`, or `aborted`), never for mtime churn or `toolUse`
 - Transient provider failures keep retrying without replaying the original prompt. Desktop pauses Pi's retry budget while offline, resumes when connectivity returns, and after Pi exhausts its short built-in retries continues with exponential backoff from 15 seconds to one hour for as long as the app remains open. The installed helper keeps continuations hidden and context-only, with a visible plain continuation fallback if unavailable. If a continuation cannot be sent, the visible **Retry** button uses the same safe path; crashes before prompt acceptance still restore the exact draft.
 - App-owned accepted turns survive an app restart as durable recovery records. A heartbeat-verified provider-only interruption queues one continuation against the same Pi session on launch; unknown ownership or prompt delivery, a live writer, an active tool, or a previously interrupted recovery is surfaced for review instead of being replayed. Plain terminal `pi` sessions are never adopted.
-- Recent conversations and sidebar neighbours prefetch only their newest bounded page. Loading history keeps one focused older page visibly connected above the frozen latest page, omits only the older page’s work detail, and can reach the first active-branch message with bounded memory; Live returns directly to current work
-- Fast native search, app-local non-destructive archive/restore (also one hover click from any row; archiving the open conversation advances to the next active chat, and sending one restores it). When automations target a conversation, Archive confirms first and deletes them before moving the conversation. Rename works even while Pi is working, alongside HTML export, reveal, and compaction
+- Recent conversations and sidebar neighbours prefetch only their newest bounded page. Loading history keeps one detailed older page visibly connected above the frozen latest page, with the same collapsed work rows as live history, and can reach the first active-branch message with bounded memory; Live returns directly to current work
+- Fast native search, app-local non-destructive archive/restore (also one hover click from any row; archiving the open conversation advances to the next active chat, and sending one restores it). Archive intent persists across a service reconnect or app relaunch, and CLI-created or CLI-archived threads project into the sidebar immediately before the next catalog reconciliation. When automations target a conversation, Archive confirms first and deletes them before moving the conversation. Rename works even while Pi is working, alongside HTML export, reveal, and compaction
 - The archive reads as a flat list, most recently archived first, with each row's project as its hint — not the folder tree the active list uses. Archiving keeps the conversation's worktree so a restore still has it; 7 days after archiving, the conversation leaves the sidebar and its worktree is released. Removal is never forced, so a worktree with uncommitted work stays on disk, and Pi's own session file is never touched
 - When a conversation opens a pull or merge request, the toolbar carries a quick link to it (`#482`), pointing at the most recent one. Patchwork itself watches fresh GitHub PRs for up to 24 hours, without creating an automation or polling a provider; review findings wake the same conversation to address, test, and push fixes without ever merging
 - Pi automatically gives each new conversation a concise semantic name during its first turn instead of leaving the opening prompt as its title; explicit names are preserved
@@ -93,8 +98,9 @@ agent is reported as not installed rather than silently falling back to another 
 - Editing and resubmitting the latest user message creates a new branch inside the current Pi session, keeping the conversation and its alternate history together instead of creating another sidebar conversation
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. One Escape stops the current turn and preserves queued messages as follow-ups; double-Escape, ⌘., and the stop button fully stop the thread.
-- A status bar that stays quiet when idle and distinguishes provider queueing, waiting for the first response, and retry countdowns (with the provider error on hover). It also shows provider/model, thinking level, an always-available fast-priority toggle, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
-- One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
+- A status bar that stays quiet when idle and distinguishes provider queueing, waiting for the first response, and retry countdowns (with the provider error on hover). It also shows provider/model, thinking level, and a task-scoped fast-mode toggle. Pi uses its fast-priority extension, Codex uses the model's advertised fast service tier, and Claude Code uses a process-local fast setting while resuming the same task. Hovering the account chip renders the whole `/limits` report for every signed-in account and window with native controls.
+- New-chat presets for agent, model, and thinking, with Command-Shift-P cycling and exact
+  application before the first prompt
 - Typing `/` at the start of an empty composer opens the active agent's own commands: Pi's extension commands, Codex's skills, and Claude Code's slash commands, each with its description and source. Typing filters, Up/Down moves, Return runs the highlighted command, Escape closes, and a space (`/mode fast`) hands the line back to the composer to send as written. The list is fetched once per runtime with the same query-only prewarm as the model and thinking pickers, and agents that cannot enumerate their commands never show it.
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. An opened image opens fitted to the viewer (large screenshots scale down with their aspect ratio, small images stay at intrinsic size, zoom scrolls) and closes on Escape, Done, or a click outside the panel. It steps to the previous/next image of the same message with Left/Right (or the viewer's arrow buttons), stopping at the first and last. Multiple previews sit side by side in a horizontally scrolling strip instead of stacking down the transcript. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
@@ -130,9 +136,13 @@ The phone UI covers the daily loop, not just reading:
   outside it. Opening reads the newest messages directly from a bounded file tail instead of
   rescanning the whole session. While a run is in flight the open thread refreshes on its own,
   and an unchanged refresh leaves the transcript, its open disclosures, and scroll position alone.
-- **New threads open on their real session id.** A first message is queued only after Pi creates
-  the session, so the browser never routes to a `pending:` placeholder; the web client also
-  resolves placeholders from older daemons through their run id instead of showing “thread not found.”
+- **New threads open on their real session id.** Pi and Codex can create an idle thread, with the
+  Codex service supplying a non-empty fallback name when needed. Claude Code creates its transcript
+  with the first message, so it requires one protected by a durable client id. The browser never
+  routes to a `pending:` placeholder; it resolves placeholders from older daemons through their run
+  id instead of showing “thread not found.” Creation and its first message share one durable
+  submission id, so a lost response cannot create a duplicate thread; an unsent first message is
+  restored in the real thread.
 - **A thread can start in an existing checkout.** When the chosen folder is a repository with more
   than one checkout, a Checkout menu lists the main one and every existing worktree. The web remote
   only selects existing checkouts; it never creates or removes them.
@@ -145,8 +155,9 @@ The phone UI covers the daily loop, not just reading:
   short-lived idle attachment, and refuses rather than racing a runtime leased by the Mac app.
 - **Sending is optimistic and honest.** The composer clears immediately and the message shows as
   queued / working / steering / failed until Pi's own session file confirms it. A failed send
-  keeps its text with Retry, and a per-message submission id means a retry after a lost response
-  replays the original answer instead of prompting Pi twice.
+  keeps its text with Retry or Review. A per-message submission id means a retry after a lost
+  response replays the original answer instead of prompting Pi twice, including after a daemon
+  restart. A terminal run is retryable only when it stopped before prompt delivery.
 - **Steering and follow-ups are real.** The primary Send action steers whenever the thread is
   running. Steers and explicit follow-ups use Pi's own `steer` / `follow_up` command. A steer
   joins the turn in progress, a follow-up waits and runs as its own next turn, and the daemon
@@ -159,8 +170,10 @@ The phone UI covers the daily loop, not just reading:
 - **Assistant and tool screenshots render inline** as responsive thumbnails with a tap-to-open
   lightbox and download, fetched per image so a screenshot-heavy thread stays inside the relay's
   payload budget.
-- **The thread list mirrors the sidebar's folder tree**, read-only, with collapsible groups and
-  unread/running markers.
+- **The thread list mirrors the sidebar's complete folder tree and conversation visibility**, read-only,
+  with collapsible groups and unread/running markers. It follows every bounded list page rather
+  than stopping at the newest 50 conversations, respects the Mac's external-conversation and
+  disabled-agent settings, and keeps a conversation started remotely in both lists.
 
 By default the control service runs directly inside `Patchwork.app`: the Unix-socket API,
 scheduler, remote relay, and their Pi workers start and stop with the app, with no separate
@@ -181,8 +194,10 @@ swift build -c release --product patchworkd
 swift build -c release --product patchwork
 scripts/install-daemon.sh              # LaunchAgent, starts at login, restarts on crash
 patchwork                              # active threads plus help in one call
-patchwork threads new --cwd . --worktree --name "CLI task"
+patchwork threads new --cwd . --worktree --name "CLI task" --client-id cli_task_1
+patchwork threads new --cwd . --agent claude --message "Survey the repository"
 patchwork threads show <short-id>       # 8 dialogue messages; add --all for tool results
+patchwork threads send <short-id> "continue" --client-id cli_turn_1
 patchwork schedule add --name "Morning triage" --thread <short-id> \
     --prompt "Check overnight CI failures" --cron "0 9 * * 1-5"
 patchwork remote enable --port 7717      # optional legacy loopback/tunnel listener
@@ -282,7 +297,7 @@ While Pi is running, Send and **Steer current run** hand the message to Pi immed
 ## Architecture
 
 - **`FileSessionRepository` / `SessionSummaryCache`** — discovers direct project session files, excludes nested subagent sessions, and maintains a versioned atomic cache keyed by standardized path, file size, and modification time. Archive flags are applied after lookup; missing files are pruned.
-- **`SessionParser`** — bounded reverse JSONL paging over the final active parent chain. The newest page preserves full work detail; focused history pages count only user prompts, final assistant answers, and forward-compatible notes toward their 50-message target, discarding tool/thinking payloads as they scan. Pages finish at a user-turn or compaction boundary (with a 1,000-message pathological-turn ceiling), ignore an unterminated final line until its LF arrives, and cap each scan at 64 MiB / 20,000 records with a 32 MiB single-record ceiling. Legacy full parsing remains only for compatibility and diagnostics, not conversation opening.
+- **`SessionParser`**: bounded reverse JSONL paging over the final active parent chain. The newest and visible older pages preserve the same bounded work detail and finish at a user-turn or compaction boundary, with a 1,000-message pathological-turn ceiling. They ignore an unterminated final line until its LF arrives and cap each scan at 64 MiB / 20,000 records with a 32 MiB single-record ceiling. Legacy full parsing remains only for compatibility and diagnostics, not conversation opening.
 - **`TranscriptCache`** — a bounded (entry-count and byte-cost) in-memory LRU of projected page windows and their older cursors, warmed on launch and around the selected session, never persisted. Lock protection keeps a hit synchronous so selection can publish it in the same tick.
 - **`PiRuntimeProtocol` / `PiRPCClient`** — strict LF JSONL framing, correlated commands, same-folder idle-process session switching, and forward-compatible event delivery. A process exit rejects any pending command as outcome-unknown unless it was a read-only state query, so a crash mid-command is never assumed safe to blindly retry.
 - **`GitStatusProviding` / `GitService`** — branch, porcelain status, numstat, exact small untracked-text LOC classification, linked-worktree detection (`git rev-parse --git-dir` vs `--git-common-dir`), and bounded projection of explicit tool cwd/edit paths so the selected environment follows a conversation into its worktree.
@@ -314,7 +329,8 @@ Archiving never moves or edits a Pi JSONL file.
 ## Performance and memory
 
 - Warm scans do not reparse unchanged JSONL files; warm page hits publish synchronously.
-- Cold opens read the newest bounded turn-aligned page. History keeps one dialogue-focused older page above the frozen detailed latest page; Older/Newer replace only that older page, using a bounded 256-position cursor LRU and replaying from the latest page only on a miss. This keeps memory and rendered rows bounded without imposing a total-history cutoff. Live disk/RPC changes stay buffered while older history is visible and reconcile on return to Live.
+- Daemon activity polls reuse stable bounded heartbeat catalogs and re-stat known transcripts directly. In-place Codex and Claude Code writes remain visible without rebuilding every thread index, and multiple live heartbeat writers for one transcript collapse to one running row.
+- Cold opens read the newest bounded turn-aligned page. History keeps one detailed older page above the frozen detailed latest page; Older/Newer replace only that older page, using a bounded 256-position cursor LRU and replaying from the latest page only on a miss. This keeps memory and rendered rows bounded without imposing a total-history cutoff. Live disk/RPC changes stay buffered while older history is visible and reconcile on return to Live.
 - Rapid route changes cancel newest-page, older-page, and activity-projection work and reject stale publications.
 - Abandoned branches and raw/base64 trees are not retained. A torn final JSONL line is invisible until complete.
 - Session search folds one bounded key per summary and groups once per sidebar snapshot.
@@ -339,14 +355,26 @@ node --test docs/js-checks/*.test.mjs      # pure web-remote logic, no DOM, no n
 ./scripts/package-app.sh
 ```
 
-Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair, large payload limits, stable transcript identities, synchronous answer sizing, final-answer presentation/durability, path-unique routes, viewport geometry policy, page-cache eviction, lazy/reused/cross-folder runtimes, idle leases, replacement pipe generations, completion-ID migration/unread/notification deduplication, background monitoring, and the existing Git, draft, queue, image, extension, daemon, and scheduler behavior. The remote-parity work adds coverage for the wire's structured message blocks (order, tool-call identity, one shared bounded budget, and older payloads that carry none of them), the web transcript projection (narration folded into the work log while the answer stays top level, results attached by call id, live status, failed steps vs a failed answer, compaction, orphan results, and unknown roles), optimistic pending-message reconciliation and its eviction rules (only server-accepted bubbles are evictable, and a run event that beat its own response is replayed), submission replay protection (in-flight claims are never evicted; the 257th concurrent submission is refused with `503` instead), the live-session settlement boundary (steer-joins-this-turn vs follow-up-owns-the-next, in-flight deliveries crossing the boundary, late callers refused during it, concurrent credit bounds, and the bounded shutdown drain that keeps a timeout or an abort from killing Pi under a write in flight), bounded pipe writes against a child that never reads, folder-tree cycle/depth/legacy handling on both sides including the app's own depth boundary from top level and inside a project, inline-image projection with encoding validation and bounded retrieval, the bounded image cache and its in-flight bound, interaction loads that preserve the last good set and retry with backoff, the interaction registry's bounds, method-appropriate response validation and expiry-cancels-never-answers rule, `tool_execution_start` questionnaire parsing, live steer/follow-up delivery outcomes, concurrent stdin writes against a fake `pi`, bounded read-only worktree discovery (porcelain parsing, entry and output caps, a non-repository folder, a missing or non-directory `cwd`), and the archive restore boundary between the daemon's own flag and the app's. Set `PATCHWORK_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a provider.
+Tests cover JSONL framing, bounded active-branch pages, compaction traversal, torn-tail repair,
+large payload limits, stable transcript identities, synchronous answer sizing, final-answer
+presentation and durability, path-unique routes, viewport geometry policy, page-cache eviction,
+lazy and cross-folder runtimes, idle leases, replacement pipe generations, completion-ID
+migration, unread and notification deduplication, background monitoring, and the existing Git,
+draft, queue, image, extension, daemon, and scheduler behavior. Remote-parity coverage includes
+structured message blocks, transcript projection, optimistic pending-message reconciliation,
+terminal-success-only eviction, durable submission replay after restart, crash ambiguity that
+fails closed, live-session settlement, bounded pipe writes, folder-tree bounds, inline images,
+interaction retries and validation, live steer and follow-up outcomes, concurrent stdin writes,
+bounded worktree discovery, and app versus daemon archive ownership. Set
+`PATCHWORK_REAL_SESSION_SMOKE=1` for the opt-in installed-session scan; it never prompts a
+provider.
 
 ## Current limitations
 
-Claude Code cannot change reasoning effort mid-session (the app stores the choice and applies it on the next launch) and cannot rename a session. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces — the extension status footer, fast priority, `/limits`, and activity heartbeats — are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
+Claude Code cannot change reasoning effort mid-session, so the app stores the choice and applies it on the next launch. Its fast-mode toggle uses a process-local launch setting, so the task resumes without changing the global Claude configuration. Codex has no HTML export or fork-point listing, applies model and effort as per-turn overrides, and updates fast mode through the thread's service tier. Pi-only surfaces such as extension status, `/limits`, and activity heartbeats are disabled for the other two, which have no equivalent extension host. Their run state falls back to file-modification detection, so live CPU and memory are unavailable.
 
 The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 
 Patchwork keeps separate RPC subprocesses only for conversations with protected live work; one clean idle process may remain leased for 120 seconds for same-folder reuse. One displayed detailed transcript page retains at most 1,000 messages, but dialogue-focused page replacement can navigate through the entire active branch; a page scan reports an explicit unreadable-history state if a record exceeds 32 MiB or no continuation can be produced. Without the heartbeat extension, completion fallback sees only the final 256 KiB. The inspector still hides at narrow detail widths, and passive Git rows use cached snapshots rather than continuous polling.
 
-On the web remote: the transcript is polled while a thread runs (SSE carries no message bodies), so a long turn advances in ~2.5s steps rather than token by token, and unlike the Mac app there is no streaming answer. Work-row disclosures are open per screen and are not restored after a reload. Steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited because Pi's dialog bridge is sequential, so there is no Back. Unconfirmed messages live with the open screen and are not restored after a reload. Replay protection for a send is in-memory and bounded to 256 submissions for 30 minutes, so a retry that spans a daemon restart can still duplicate; while all 256 are still running, a new send is refused with `503 submissions_busy` rather than losing one submission's protection. Message attachments are rejected rather than forwarded. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone. The web remote can select worktrees but not create or remove them. Archiving from the web is the daemon's own flag: a thread archived in the Mac app still shows under Archived, but restoring it answers `409 archived_in_app` and has to be done in the app, because the daemon never writes the app's `state.json`.
+On the web remote: the transcript is polled while a thread runs (SSE carries no message bodies), so a long turn advances in ~2.5s steps rather than token by token, and unlike the Mac app there is no streaming answer. Work-row disclosures are open per screen and are not restored after a reload. Steering only reaches a turn the *daemon* is running, since a conversation open in the app belongs to the app's own runtime (the API returns `409 thread_leased`). A questionnaire can be answered forward but not revisited because Pi's dialog bridge is sequential, so there is no Back. Drafts, creation intent, and unconfirmed messages survive a full reload in bounded local storage. Replay protection is durable and bounded to 256 submissions for 30 minutes. A completed response replays across a daemon restart; an in-flight claim left by a crash is marked outcome-unknown and requires review rather than risking a duplicate. While all 256 are still protected, a new send is refused with `503 submissions_busy`. Message attachments are rejected rather than forwarded. Images over 1 MB decoded are shown as placeholders rather than downscaled; the daemon does no image processing. Folders are read-only from a phone. The web remote can select worktrees but not create or remove them. Archiving from the web is the daemon's own flag: a thread archived in the Mac app still shows under Archived, but restoring it answers `409 archived_in_app` and has to be done in the app, because the daemon never writes the app's `state.json`.

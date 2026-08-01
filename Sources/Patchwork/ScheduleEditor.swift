@@ -1,3 +1,4 @@
+import PatchworkKit
 import SwiftUI
 
 /// One sheet for creating and editing an automation. Every trigger kind the control plane
@@ -11,8 +12,12 @@ struct ScheduleEditor: View {
     @State private var onceDate: Date
     @State private var everyMinutes: Int
     @State private var cronExpression: String
+    @State private var isSaving = false
+    @State private var saveError: String?
+    @State private var creationNeedsReview = false
     private let isNew: Bool
-    private let onSave: (ScheduleEntry) -> Void
+    private let onSave: (ScheduleEntry) async -> ScheduleSaveResult
+    private let onReviewCreation: () async -> Bool
 
     enum TriggerKind: String, CaseIterable, Identifiable {
         case once, every, cron, idle
@@ -27,10 +32,15 @@ struct ScheduleEditor: View {
         }
     }
 
-    init(draft: ScheduleDraft, onSave: @escaping (ScheduleEntry) -> Void) {
+    init(
+        draft: ScheduleDraft,
+        onSave: @escaping (ScheduleEntry) async -> ScheduleSaveResult,
+        onReviewCreation: @escaping () async -> Bool
+    ) {
         _entry = State(initialValue: draft.entry)
         isNew = draft.isNew
         self.onSave = onSave
+        self.onReviewCreation = onReviewCreation
         switch draft.entry.trigger {
         case let .once(at):
             _kind = State(initialValue: .once)
@@ -98,6 +108,11 @@ struct ScheduleEditor: View {
                             .font(PatchworkFont.caption)
                             .foregroundStyle(Color.patchworkOrange)
                     }
+                    if let saveError {
+                        Label(saveError, systemImage: "exclamationmark.circle")
+                            .font(PatchworkFont.caption)
+                            .foregroundStyle(creationNeedsReview ? Color.patchworkOrange : Color.patchworkRed)
+                    }
                 }
                 .padding(PatchworkTheme.space16)
             }
@@ -106,17 +121,49 @@ struct ScheduleEditor: View {
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button(isNew ? "Create" : "Save") {
-                    onSave(composed)
-                    dismiss()
+                if creationNeedsReview {
+                    Button("Refresh and Review", action: reviewCreation)
+                    .disabled(isSaving)
                 }
+                Button(isNew ? "Create" : "Save", action: submit)
                 .keyboardShortcut(.defaultAction)
-                .disabled(ScheduleValidation.problem(with: composed) != nil)
+                .disabled(
+                    ScheduleValidation.problem(with: composed) != nil
+                        || isSaving || creationNeedsReview
+                )
             }
             .padding(PatchworkTheme.space12)
         }
         .frame(width: 520, height: 560)
         .background(Color.patchworkTranscript)
+    }
+
+    private func submit() {
+        guard !isSaving else { return }
+        let value = composed
+        isSaving = true
+        saveError = nil
+        Task {
+            switch await onSave(value) {
+            case .saved:
+                dismiss()
+            case let .failed(message):
+                saveError = message
+            case let .needsReview(message):
+                creationNeedsReview = true
+                saveError = message
+            }
+            isSaving = false
+        }
+    }
+
+    private func reviewCreation() {
+        guard !isSaving else { return }
+        isSaving = true
+        Task {
+            if await onReviewCreation() { dismiss() }
+            isSaving = false
+        }
     }
 
     /// The entry as the form currently describes it, so validation and saving always agree.
@@ -143,21 +190,29 @@ struct ScheduleEditor: View {
 
             if case .existingThread = entry.target {
                 Picker("", selection: threadSelection) {
-                    ForEach(store.sessions.filter { !$0.isArchived }.prefix(50)) { session in
+                    ForEach(store.sessions.filter { !$0.isArchived }.prefix(50), id: \.instanceID) { session in
                         Text(session.displayName).tag(session.id)
                     }
                 }
                 .labelsHidden()
                 .frame(maxWidth: 320)
             } else if case let .newThread(cwd, _) = entry.target {
-                HStack(spacing: PatchworkTheme.space6) {
-                    Text(cwd.isEmpty ? "No folder chosen" : cwd)
-                        .font(PatchworkFont.micro)
-                        .foregroundStyle(cwd.isEmpty ? .tertiary : .secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Button("Choose…") { chooseFolder() }
-                        .font(PatchworkFont.caption)
+                VStack(alignment: .leading, spacing: PatchworkTheme.space8) {
+                    HStack(spacing: PatchworkTheme.space6) {
+                        Text(cwd.isEmpty ? "No folder chosen" : cwd)
+                            .font(PatchworkFont.micro)
+                            .foregroundStyle(cwd.isEmpty ? .tertiary : .secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button("Choose…") { chooseFolder() }
+                            .font(PatchworkFont.caption)
+                    }
+                    Picker("Agent", selection: agentSelection) {
+                        ForEach(scheduleAgentChoices, id: \.self) { agent in
+                            Text(agent.displayName).tag(agent)
+                        }
+                    }
+                    .frame(maxWidth: 320)
                 }
             }
         }
@@ -207,9 +262,16 @@ struct ScheduleEditor: View {
             get: { if case .existingThread = entry.target { return true } else { return false } },
             set: { isExisting in
                 if isExisting {
-                    entry.target = .existingThread(threadID: store.selectedSession?.id ?? store.sessions.first?.id ?? "")
+                    let id = store.selectedSession?.id ?? store.sessions.first?.id ?? ""
+                    entry.target = .existingThread(threadID: id)
+                    entry.agent = nil
+                    if store.sessions.first(where: { $0.id == id })?.agent != .pi {
+                        entry.mode = nil
+                    }
                 } else {
                     entry.target = .newThread(cwd: store.selectedFolder?.path ?? "", namePattern: nil)
+                    entry.agent = entry.agent ?? store.newChatAgent
+                    if (entry.agent ?? .pi) != .pi { entry.mode = nil }
                 }
             }
         )
@@ -218,7 +280,31 @@ struct ScheduleEditor: View {
     private var threadSelection: Binding<String> {
         Binding(
             get: { if case let .existingThread(id) = entry.target { return id } else { return "" } },
-            set: { entry.target = .existingThread(threadID: $0) }
+            set: { id in
+                entry.target = .existingThread(threadID: id)
+                entry.agent = nil
+                if store.sessions.first(where: { $0.id == id })?.agent != .pi {
+                    entry.mode = nil
+                }
+            }
+        )
+    }
+
+    private var scheduleAgentChoices: [AgentKind] {
+        let selected = entry.agent ?? .pi
+        var choices = store.installedAgents
+        if !choices.contains(selected) { choices.append(selected) }
+        if choices.isEmpty { choices = [.pi] }
+        return choices
+    }
+
+    private var agentSelection: Binding<AgentKind> {
+        Binding(
+            get: { entry.agent ?? .pi },
+            set: { agent in
+                entry.agent = agent
+                if agent != .pi { entry.mode = nil }
+            }
         )
     }
 

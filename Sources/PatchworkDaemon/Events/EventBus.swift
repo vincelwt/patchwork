@@ -11,16 +11,25 @@ final class EventBus: @unchecked Sendable {
         let deliver: (String, Data) -> Void
         private let lock = NSLock()
         private var pending = 0
+        private var overflowed = false
         private let maxPending: Int
+        private let onOverflow: () -> Void
 
-        init(maxPending: Int, deliver: @escaping (String, Data) -> Void) {
+        init(maxPending: Int, onOverflow: @escaping () -> Void, deliver: @escaping (String, Data) -> Void) {
             self.maxPending = maxPending
+            self.onOverflow = onOverflow
             self.deliver = deliver
         }
 
         func enqueue(name: String, payload: Data) {
             lock.lock()
-            guard pending < maxPending else { lock.unlock(); return }
+            guard !overflowed else { lock.unlock(); return }
+            guard pending < maxPending else {
+                overflowed = true
+                lock.unlock()
+                onOverflow()
+                return
+            }
             pending += 1
             lock.unlock()
             queue.async { [weak self] in
@@ -42,10 +51,22 @@ final class EventBus: @unchecked Sendable {
     }
 
     @discardableResult
-    func subscribe(_ deliver: @escaping (String, Data) -> Void) -> UUID {
+    func subscribe(
+        initialName: String? = nil,
+        initialPayload: Data = Data(),
+        onOverflow: @escaping () -> Void = {},
+        _ deliver: @escaping (String, Data) -> Void
+    ) -> UUID {
         let id = UUID()
-        let subscription = Subscription(maxPending: maxPendingPerSubscriber, deliver: deliver)
-        lock.lock(); subscriptions[id] = subscription; lock.unlock()
+        let subscription = Subscription(
+            maxPending: maxPendingPerSubscriber,
+            onOverflow: onOverflow,
+            deliver: deliver
+        )
+        lock.lock()
+        subscriptions[id] = subscription
+        if let initialName { subscription.enqueue(name: initialName, payload: initialPayload) }
+        lock.unlock()
         return id
     }
 

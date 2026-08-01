@@ -350,17 +350,6 @@ final class ComposerInlineImageTests: XCTestCase {
         }
     }
 
-    func testModeLabelKeepsItsIntrinsicWidth() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/Patchwork/ComposerView.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        XCTAssertTrue(source.contains(".lineLimit(1)\n                    .fixedSize(horizontal: true, vertical: false)"))
-        XCTAssertFalse(source.contains(".frame(width: 34, alignment: .trailing)"))
-    }
-
     // MARK: - Budgets
 
     func testCountBudgetIsAppliedToInlineInsertion() throws {

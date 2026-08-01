@@ -23,6 +23,11 @@ enum ScheduleEngine {
     }
 
     static let defaultTimeoutSeconds = 3_600
+    static let maximumTimeoutSeconds = 366 * 86_400
+
+    static func boundedTimeoutSeconds(_ seconds: Int) -> Int {
+        min(max(1, seconds), maximumTimeoutSeconds)
+    }
 
     /// `nil` means "nothing to do for this schedule right now": disabled, not yet due, or an
     /// unresolvable trigger kind (rejected at creation time; this is defense in depth).

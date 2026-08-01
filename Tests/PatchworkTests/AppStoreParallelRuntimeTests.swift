@@ -21,6 +21,7 @@ private final class ParallelFakeRuntime: AgentRuntimeProtocol {
     }
 
     func start(cwd: URL, sessionPath: URL?) throws {
+        if let sessionPath { sessionFile = sessionPath.standardizedFileURL.path }
         isRunning = true
         startCount += 1
     }
@@ -163,6 +164,33 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
         store.selectSession(sessionA)
         XCTAssertEqual(store.streamingMessage?.textContent, "update 99")
+    }
+
+    func testCancelledOldRoutePublishCannotConsumeTheNewRouteDelta() async throws {
+        let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
+        store.selectSession(sessionA)
+        store.draft = "task A"
+        store.submitDraft()
+        runtimeA.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": assistantMessage("A first")
+        ]))
+        runtimeA.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": assistantMessage("A trailing")
+        ]))
+
+        store.selectSession(sessionB)
+        store.draft = "task B"
+        store.submitDraft()
+        runtimeB.onEvent?(.object([
+            "type": .string("message_update"),
+            "message": assistantMessage("B visible")
+        ]))
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(store.streamingMessage?.textContent, "B visible")
+        XCTAssertEqual(store.selectedSession?.id, sessionB.id)
     }
 
     func testVisibleStreamingUpdatesInvalidateOnlyTheTranscriptScope() async throws {
@@ -412,6 +440,35 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertNil(store.runtimeState.sessionName, "A background rename must not alter B's runtime state")
     }
 
+    func testCopiedSessionIDsKeepRenameResponsesAndEventsPathScoped() {
+        let (store, runtimeA, _, original, _) = makeStore()
+        let copied = summary(id: original.id, file: "copied-a.jsonl")
+        store.sessions = [original, copied]
+
+        store.selectSession(copied)
+        store.renameSession(copied, to: "Copied response")
+
+        XCTAssertEqual(store.sessions.first { $0.instanceID == original.instanceID }?.displayName, original.displayName)
+        XCTAssertEqual(store.sessions.first { $0.instanceID == copied.instanceID }?.displayName, "Copied response")
+
+        runtimeA.onEvent?(.object([
+            "type": .string("session_info_changed"),
+            "name": .string("Copied event")
+        ]))
+
+        XCTAssertEqual(store.sessions.first { $0.instanceID == original.instanceID }?.displayName, original.displayName)
+        XCTAssertEqual(store.sessions.first { $0.instanceID == copied.instanceID }?.displayName, "Copied event")
+    }
+
+    func testCopiedSessionIDsExposeDistinctPhysicalViewIdentities() {
+        let original = summary(id: "shared", file: "original.jsonl")
+        let copied = summary(id: "shared", file: "copied.jsonl")
+
+        XCTAssertEqual(original.id, copied.id)
+        XCTAssertNotEqual(original.instanceID, copied.instanceID)
+        XCTAssertEqual(Set([original.instanceID, copied.instanceID]).count, 2)
+    }
+
     func testSettledBackgroundRuntimeIsRetiredWithoutStoppingTheSelectedRun() {
         let (store, runtimeA, runtimeB, sessionA, sessionB) = makeStore()
 
@@ -536,6 +593,40 @@ final class AppStoreParallelRuntimeTests: XCTestCase {
         XCTAssertEqual(newRuntime.commandCount("prompt"), 1)
         XCTAssertEqual(store.route, .session(newSessionFile.standardizedFileURL.path))
         XCTAssertTrue(store.sessions.contains { $0.id == "new-session" })
+    }
+
+    func testParallelRuntimeLimitRefusesANewStartWithoutKillingExistingWork() {
+        let sessions = (0...AppStore.maximumConcurrentRuntimes).map { index in
+            summary(id: "session-\(index)", file: "session-\(index).jsonl")
+        }
+        let runtimes = sessions.map {
+            ParallelFakeRuntime(sessionFile: $0.fileURL.path, sessionID: $0.id)
+        }
+        var spares = Array(runtimes.dropFirst())
+        let store = AppStore(
+            repository: ParallelFakeRepository(rootURL: directory),
+            gitService: ParallelFakeGitService(),
+            runtime: runtimes[0],
+            runtimeFactory: { _ in spares.removeFirst() },
+            persistence: AppPersistence(baseURL: directory),
+            activityPresenter: ActivityPresenter(),
+            isActiveOverride: true
+        )
+        store.sessions = sessions
+
+        for index in 0..<AppStore.maximumConcurrentRuntimes {
+            store.selectSession(sessions[index])
+            store.draft = "task \(index)"
+            store.submitDraft()
+        }
+        store.selectSession(sessions[AppStore.maximumConcurrentRuntimes])
+        store.draft = "must remain retryable"
+        store.submitDraft()
+
+        XCTAssertEqual(runtimes.last?.startCount, 0)
+        XCTAssertEqual(store.draft, "must remain retryable")
+        XCTAssertTrue(store.toast?.text.contains("already active") == true)
+        XCTAssertTrue(runtimes.prefix(AppStore.maximumConcurrentRuntimes).allSatisfy { $0.stopCount == 0 })
     }
 
     private func makeStore(

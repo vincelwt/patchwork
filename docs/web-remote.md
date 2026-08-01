@@ -130,8 +130,15 @@ full response with `Cache-Control: no-store`. Local mode uses HTTP + authenticat
 swaps only the transport for the encrypted relay WebSocket. The views and `/v1` response contract
 are shared.
 
+Every local `ready` event and every hosted offline-to-online transition starts a generation-fenced
+reload of threads, schedules, folders, activity, and the detail currently open. A point event that
+arrives during a list request invalidates that snapshot and causes one newer snapshot to replace it.
+This keeps reconnect and bounded-queue recovery authoritative without letting a slow response roll
+back newer state.
+
 Pure logic lives in `.mjs` modules with no DOM (`markdown`, `time`, `trigger`, `relayCrypto`,
-`pending`, `folders`, `transcript`) and is tested directly with `node --test docs/js-checks/*.test.mjs`.
+`pending`, `folders`, `transcript`, `creationIntent`, `history`, `threadState`, `liveSync`) and is tested directly with
+`node --test docs/js-checks/*.test.mjs`.
 The `.js` view files are the only ones that touch the DOM.
 
 ## Reading a conversation
@@ -162,6 +169,10 @@ records backward from EOF. Latency therefore follows the visible tail rather tha
 size; if a pathological tail exceeds the bounded reverse window, the daemon falls back to its full
 scanner rather than hiding history.
 
+The browser paints the newest 200 threads first and requests more only when **Load more** is pressed.
+Every additional page belongs to one coherent server snapshot. If its cursor expires, the browser
+restarts from page one; it never joins pages from two catalog versions or renders an unbounded list.
+
 ## Live updates
 
 While a thread is running — a message sent from here, or a run the Mac app or a terminal started —
@@ -176,11 +187,31 @@ to the bottom. The elapsed clock updates as text, without repainting the turn.
 
 ## Creating a thread
 
-A first message never becomes a fake thread route. Current daemons resolve the real Pi session
-before returning and then queue the prompt against it. When paired with an older daemon that still
-returns `pending:<run>`, the browser follows `GET /v1/runs/{runId}` and opens the conversation only
-once that run reports the real session id; a dropped connection keeps resolving the accepted run
-instead of inviting a duplicate first prompt.
+Pi and Codex can create a real idle session without a message. The Codex service gives an idle
+conversation a non-empty requested or fallback name so its rollout is materialized before the
+browser opens it. Claude Code creates its transcript with the first message, so its form requires a
+non-empty message and sends the browser's retained `clientId`. The daemon keeps that runtime alive
+until the transcript is openable. A first message therefore never becomes a fake thread route.
+When paired with an older daemon that still returns `pending:<run>`, the browser follows
+`GET /v1/runs/{runId}` and opens the conversation only once that run reports the real session id; a
+dropped connection keeps resolving the accepted run instead of inviting a duplicate first prompt.
+
+Before the request leaves the browser, its canonical fields and one `clientId` are saved in a
+bounded local record. A reload or transport retry reuses that exact request. A different create is
+blocked until the retained request completes or the user reviews the thread list and explicitly
+discards it. If the thread was created but its first message could not be admitted, the browser
+opens the real thread and restores the unsent text instead of creating another thread.
+`create_retryable` and `creation_pending` keep that same request eligible for a protected retry;
+`creation_outcome_unknown` requires a refreshed thread-list review.
+Creation claims and message reservations use a browser-wide lock plus fresh durable reads, so two
+tabs cannot overwrite each other's retry identifiers. A browser without the required durable
+storage and lock support fails closed before sending.
+
+Schedule creation and manual runs use the same durable-before-send rule. Another tab sees an
+active attempt and cannot submit or discard it. If a protected attempt loses its response, the
+same id becomes retryable after the short attempt lease; an unprotected or outcome-unknown attempt
+requires an authoritative schedule or run-history refresh and a second explicit acknowledgement
+before its saved recovery record can be discarded.
 
 The working directory is picked from the `cwd` of threads already known, or typed. When that folder
 is a git repository with more than one checkout, a **Checkout** menu appears listing the main
@@ -220,25 +251,28 @@ two processes against one session. Older daemons without these endpoints simply 
 
 A send is optimistic. `POST /v1/threads/{id}/messages` only *accepts* the text; Pi appends the
 user entry to its session file seconds later. The composer therefore clears immediately and the
-text moves into a pending bubble carrying an honest status — sending, queued, working, steering,
-or failed — which is removed only when the real parsed message appears in a refetch, or when the
-message's run finishes successfully. A failed send keeps its text with **Retry** and **Dismiss**;
+text moves into a pending bubble carrying an honest status: sending, queued, working, steering,
+or failed. It is removed only when the real parsed message appears in a refetch, or when the
+message's run finishes successfully. A failed send keeps its text with **Retry** or **Review**,
+plus **Dismiss**;
 nothing is silently lost, and a duplicate bubble is impossible because each pending entry is
 reconciled against a count of identical user messages recorded when it was submitted. Status
 changes are announced through one persistent live region rather than from the bubbles themselves,
 which are replaced on every repaint and would announce unreliably.
 
-**Retry never prompts Pi twice.** Each bubble generates a `clientId` once and reuses it verbatim on
-retry, so a send whose response was lost replays the original answer instead of starting a second
-turn. Retry also re-sends the delivery that was originally *requested*, so retrying a steer that
-the daemon had to downgrade still asks to steer.
+**Retry never prompts Pi twice.** Each bubble generates a `clientId` once. A transport retry reuses
+it verbatim, so a send whose response was lost replays the original answer instead of starting a
+second turn. A terminal run gets one-click Retry only when the daemon reports that prompt delivery
+never started; that retry uses a fresh id because the old id correctly replays the terminal run.
+Accepted or ambiguous terminal failures offer Review, which restores the text to the composer for
+inspection instead of resending it. Retry also uses the delivery originally requested.
 
-At most eight unconfirmed messages are held, and they are scoped to the open screen rather than
-persisted. When that bound is reached the oldest message the daemon has *explicitly accepted* is
-dropped — its text is already on its way into the transcript. A bubble still waiting for its
-response (including one told `submission_in_flight`, whose original attempt can still fail) is
-never evicted: it holds the only copy of that text. If all eight are unresolved or failed, the
-ninth send is refused and its text goes back into the composer.
+At most eight unconfirmed messages are held per thread. Drafts and pending bubbles survive both
+in-app navigation and a full browser reload in a bounded 64-thread, 16 MiB local store. If durable
+browser storage is unavailable or corrupt, a new send is blocked rather than losing its retry id.
+When the per-thread bound is reached, only a run already proven successful may be dropped. A
+bubble still waiting for its response, accepted but not completed, or failed is never evicted. If
+all eight remain unresolved, the ninth send is refused and its text goes back into the composer.
 
 A run event can also outrun the response that names its run. The screen keeps the latest state of
 the last sixteen runs and applies the matching one the moment a bubble learns its `runId`, so a

@@ -49,7 +49,7 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     /// it costs nothing to store and never disagrees with where the transcript came from.
     var agent: AgentKind = .pi
     let createdAt: Date
-    let modifiedAt: Date
+    var modifiedAt: Date
     var name: String
     var preview: String
     var messageCount: Int
@@ -71,6 +71,11 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
 
     var capabilities: AgentCapabilities { agent.capabilities }
 
+    /// Stable identity for one physical transcript. Agent session ids can collide after a
+    /// history is copied, while the standardized path is also the load, archive, and runtime
+    /// identity everywhere else in the app.
+    var instanceID: String { fileURL.standardizedFileURL.path }
+
     var folderName: String {
         let value = cwd.lastPathComponent
         return value.isEmpty ? cwd.path : value
@@ -84,8 +89,8 @@ struct SessionSummary: Identifiable, Hashable, Codable, Sendable {
     /// Adopts the agent's own name for this conversation when it keeps one outside the
     /// transcript. Only replaces a name this app derived itself, so an explicit in-session name
     /// still wins, and it re-folds the search key so search matches what the sidebar shows.
-    mutating func applyExternalName() {
-        guard let external = agent.externalName(forSessionPath: fileURL.path)?
+    mutating func applyExternalName(from titles: [String: String]) {
+        guard let external = agent.externalName(forSessionPath: fileURL.path, titles: titles)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !external.isEmpty else { return }
         name = external
         prepareSearchKey()
@@ -379,6 +384,8 @@ struct RuntimeState: Hashable, Sendable {
     var modelName: String?
     var provider: String?
     var thinkingLevel: String?
+    var fastModeEnabled = false
+    var fastModeAvailable = false
     var sessionFile: String?
     var sessionID: String?
     var sessionName: String?
@@ -404,6 +411,13 @@ struct RuntimeState: Hashable, Sendable {
     }
 }
 
+struct FastModePresentation: Hashable, Sendable {
+    let isActive: Bool
+    let isAvailable: Bool
+    let isLive: Bool
+    let help: String
+}
+
 struct GitFileChange: Identifiable, Hashable, Sendable {
     var id: String { path }
     let path: String
@@ -417,10 +431,14 @@ struct GitFileChange: Identifiable, Hashable, Sendable {
 }
 
 struct GitSnapshot: Hashable, Sendable {
+    static let maxRetainedFiles = 400
+
     var isRepository = false
     var branch: String?
     var isDetached = false
     var files: [GitFileChange] = []
+    /// The repository has more changed files than the bounded list retained for rendering.
+    var filesTruncated = false
     var statusHint: String?
     var error: String?
 
@@ -529,9 +547,19 @@ struct ManagedTurnRecovery: Codable, Equatable {
 
 struct PersistedAppState: Codable {
     var archivedSessionIDs: Set<String> = []
+    /// Exact transcript paths for archives created by current builds. Legacy ids remain only
+    /// until the first touch migrates every discovered copy independently.
+    var archivedSessionPaths: Set<String> = []
+    /// Exact paths restored independently while a legacy id archive still applies to copies that
+    /// may not currently be discoverable (for example, a disabled agent root).
+    var archiveExemptSessionPaths: Set<String> = []
     /// When each archive happened, so retention can expire an archived conversation (and the
     /// worktree it ran in) without ever touching Pi's own session file.
     var archivedAt: [String: Date] = [:]
+    var archivedAtBySessionPath: [String: Date] = [:]
+    /// Archive changes the background service has not acknowledged yet. Both true and false are
+    /// meaningful, and the path-scoped intent wins presentation until the exact value is acked.
+    var pendingDaemonArchiveIntentBySessionPath: [String: Bool] = [:]
     var recentFolders: [String] = []
     /// Real project folders the user explicitly imported. Kept separately from recency so an
     /// older import does not disappear merely because other projects were opened afterward.
@@ -542,6 +570,11 @@ struct PersistedAppState: Codable {
     /// The agent the last new chat used, as an `AgentKind` raw value. Stored as a string so an
     /// agent this build does not know about round-trips instead of failing the whole state file.
     var lastAgent: String?
+    /// App-owned launch presets. These configure a new agent session without touching any
+    /// agent-owned transcript or settings file.
+    var presets: [AgentPreset] = []
+    /// The preset last chosen on the new-chat surface.
+    var lastPresetID: UUID?
     /// Per-agent operating mode (Pi `/mode`, Codex sandbox, Claude permission mode), keyed by
     /// agent raw value, so switching agents restores each one's last choice.
     var agentModes: [String: String] = [:]
@@ -584,6 +617,9 @@ struct PersistedAppState: Codable {
     /// App-owned turns that had not settled when the process last wrote state. External terminal
     /// sessions never appear here, so relaunch recovery cannot take over work it does not own.
     var managedTurnRecoveries: [String: ManagedTurnRecovery] = [:]
+    /// Bounded, app-owned stable ids for schedule creation and manual-run recovery. These are
+    /// written before the daemon request so a relaunch cannot mint duplicate work.
+    var scheduleMutationIntents: [String: ScheduleMutationIntent] = [:]
 
     init() {}
 
@@ -591,8 +627,34 @@ struct PersistedAppState: Codable {
     /// existing `state.json` (and with it the user's archive flags).
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
-        archivedAt = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
+        archivedSessionIDs = ArchiveStateBounds.legacyIDs(try container.decodeIfPresent(
+            Set<String>.self, forKey: .archivedSessionIDs
+        ) ?? [])
+        archivedSessionPaths = ArchiveStateBounds.standardizedPaths(try container.decodeIfPresent(
+            Set<String>.self, forKey: .archivedSessionPaths
+        ) ?? [])
+        archiveExemptSessionPaths = ArchiveStateBounds.standardizedPaths(try container.decodeIfPresent(
+            Set<String>.self, forKey: .archiveExemptSessionPaths
+        ) ?? [])
+        let legacyDates = try container.decodeIfPresent([String: Date].self, forKey: .archivedAt) ?? [:]
+        archivedAt = Dictionary(uniqueKeysWithValues: legacyDates
+            .filter { archivedSessionIDs.contains($0.key) }
+            .sorted { $0.value < $1.value }
+            .suffix(ArchiveStateBounds.itemLimit))
+        let pathDates = try container.decodeIfPresent([String: Date].self, forKey: .archivedAtBySessionPath) ?? [:]
+        archivedAtBySessionPath = Dictionary(pathDates
+            .map { (key: URL(fileURLWithPath: $0.key).standardizedFileURL.path, value: $0.value) }
+            .sorted { $0.value < $1.value }
+            .suffix(10_000), uniquingKeysWith: { _, newer in newer })
+        let pendingArchiveIntents = try container.decodeIfPresent(
+            [String: Bool].self, forKey: .pendingDaemonArchiveIntentBySessionPath
+        ) ?? [:]
+        pendingDaemonArchiveIntentBySessionPath = Dictionary(uniqueKeysWithValues:
+            pendingArchiveIntents
+                .map { (URL(fileURLWithPath: $0.key).standardizedFileURL.path, $0.value) }
+                .sorted { $0.0 < $1.0 }
+                .suffix(ArchiveStateBounds.itemLimit)
+        )
         recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders) ?? []
         let decodedImports = try container.decodeIfPresent([String].self, forKey: .importedFolders) ?? []
         importedFolders = Array(decodedImports.prefix(Self.maxImportedFolders))
@@ -601,6 +663,11 @@ struct PersistedAppState: Codable {
         // property added without a line below is written to disk and silently read back as its
         // default on the next launch.
         lastAgent = try container.decodeIfPresent(String.self, forKey: .lastAgent)
+        presets = Array(
+            (try container.decodeIfPresent([AgentPreset].self, forKey: .presets) ?? [])
+                .prefix(AgentPreset.maximumCount)
+        )
+        lastPresetID = try container.decodeIfPresent(UUID.self, forKey: .lastPresetID)
         agentModes = try container.decodeIfPresent([String: String].self, forKey: .agentModes) ?? [:]
         disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
         appStartedSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .appStartedSessionPaths) ?? []
@@ -609,8 +676,38 @@ struct PersistedAppState: Codable {
         expandedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .expandedFolders) ?? []
         collapsedFolders = try container.decodeIfPresent(Set<String>.self, forKey: .collapsedFolders) ?? []
         cachedExtensionStatuses = try container.decodeIfPresent([String: String].self, forKey: .cachedExtensionStatuses) ?? [:]
-        virtualFolders = try container.decodeIfPresent([VirtualFolder].self, forKey: .virtualFolders) ?? []
-        virtualFolderAssignments = try container.decodeIfPresent([String: String].self, forKey: .virtualFolderAssignments) ?? [:]
+        let decodedVirtualFolders = try container.decodeIfPresent(
+            [VirtualFolder].self, forKey: .virtualFolders
+        ) ?? []
+        var retainedFolders: [VirtualFolder] = []
+        var retainedFolderIDs: Set<String> = []
+        for folder in decodedVirtualFolders {
+            guard retainedFolders.count < Self.maxVirtualFolders else { break }
+            guard Self.isValidVirtualFolderID(folder.id),
+                  retainedFolderIDs.insert(folder.id).inserted,
+                  let name = WorkspaceOrganization.cleanedName(folder.name) else { continue }
+            let parentID = folder.parentID.flatMap {
+                $0.utf8.count <= Self.maxOrganizationPathBytes ? $0 : nil
+            }
+            retainedFolders.append(VirtualFolder(
+                id: folder.id, name: name, createdAt: folder.createdAt, parentID: parentID
+            ))
+        }
+        virtualFolders = retainedFolders
+        let validFolderIDs = Set(retainedFolders.map(\.id))
+        let decodedFolderAssignments = try container.decodeIfPresent(
+            [String: String].self, forKey: .virtualFolderAssignments
+        ) ?? [:]
+        virtualFolderAssignments = Dictionary(
+            decodedFolderAssignments
+                .filter { validFolderIDs.contains($0.value) }
+                .map {
+                    (URL(fileURLWithPath: $0.key).standardizedFileURL.path, $0.value)
+                }
+                .sorted { $0.0 < $1.0 }
+                .suffix(Self.maxVirtualFolderAssignments),
+            uniquingKeysWith: { _, newer in newer }
+        )
         let projectAssignments = try container.decodeIfPresent([String: String].self, forKey: .projectFolderAssignments) ?? [:]
         projectFolderAssignments = Dictionary(uniqueKeysWithValues: projectAssignments
             .sorted { $0.key < $1.key }
@@ -635,13 +732,51 @@ struct PersistedAppState: Codable {
             .sorted { $0.startedAt < $1.startedAt }
             .suffix(Self.maxManagedTurnRecoveries)
             .map { ($0.sessionPath, $0) })
+        let scheduleIntents = (try? container.decodeIfPresent(
+            [String: ScheduleMutationIntent].self, forKey: .scheduleMutationIntents
+        )) ?? [:]
+        scheduleMutationIntents = ScheduleMutationIntent.boundedDecoded(scheduleIntents)
     }
 
     static let maxRetainedCompletionSessions = 2_000
     static let maxManagedTurnRecoveries = 32
     static let maxImportedFolders = 256
+    static let maxVirtualFolders = WorkspaceOrganization.maxVirtualFolders
+    static let maxVirtualFolderAssignments = 10_000
     static let maxProjectFolderAssignments = 2_000
     static let maxManagedWorktreeProjects = 2_000
+    private static let maxOrganizationPathBytes = 4_096
+
+    private static func isValidVirtualFolderID(_ id: String) -> Bool {
+        let bytes = id.utf8
+        return !bytes.isEmpty && bytes.count <= 128 && bytes.allSatisfy { byte in
+            (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90)
+                || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45
+        }
+    }
+
+    mutating func setVirtualFolderAssignment(sessionPath rawPath: String, folderID: String?) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        if let folderID { virtualFolderAssignments[path] = folderID }
+        else { virtualFolderAssignments.removeValue(forKey: path) }
+        let overflow = virtualFolderAssignments.count - Self.maxVirtualFolderAssignments
+        guard overflow > 0 else { return }
+        for key in virtualFolderAssignments.keys
+            .filter({ $0 != path }).sorted().prefix(overflow) {
+            virtualFolderAssignments.removeValue(forKey: key)
+        }
+    }
+
+    mutating func setPendingDaemonArchiveIntent(path rawPath: String, archived: Bool) {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        pendingDaemonArchiveIntentBySessionPath[path] = archived
+        let overflow = pendingDaemonArchiveIntentBySessionPath.count - ArchiveStateBounds.itemLimit
+        guard overflow > 0 else { return }
+        for stale in pendingDaemonArchiveIntentBySessionPath.keys
+            .filter({ $0 != path }).sorted().prefix(overflow) {
+            pendingDaemonArchiveIntentBySessionPath.removeValue(forKey: stale)
+        }
+    }
 
     mutating func rememberImportedFolder(path: String) {
         importedFolders.removeAll { $0 == path }

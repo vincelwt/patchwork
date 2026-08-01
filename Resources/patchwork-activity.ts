@@ -1,4 +1,4 @@
-// patchwork-activity-version: 20
+// patchwork-activity-version: 21
 //
 // Maintained by Patchwork. Safe to delete at any time — it reports whether a session is
 // active, lets Pi name new conversations, and routes thread-created schedules into Patchwork's
@@ -536,12 +536,12 @@ export default function patchworkActivity(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "set_conversation_name",
+    name: "pi_desktop_set_conversation_name",
     label: "Name Conversation",
     description: "Set a concise display name for the current conversation when it does not already have one.",
     promptSnippet: "Set a concise semantic name for a new conversation",
     promptGuidelines: [
-      "After understanding the first user message in a new conversation, call set_conversation_name once with a concise 3-7 word title that describes the goal instead of copying the opening text. Do not rename an already named conversation.",
+      "After understanding the first user message in a new conversation, call pi_desktop_set_conversation_name once with a concise 3-7 word title that describes the goal instead of copying the opening text. Do not rename an already named conversation.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Concise 3-7 word conversation title." }),
@@ -565,12 +565,12 @@ export default function patchworkActivity(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "schedule_automation",
+    name: "pi_desktop_schedule_automation",
     label: "Schedule Automation",
     description: "Create a durable scheduled prompt for the current conversation. It appears in Patchwork's Automations page and runs through the background service even after this Pi process exits.",
     promptSnippet: "Create durable scheduled prompts managed by Patchwork",
     promptGuidelines: [
-      "Use schedule_automation instead of Agent's schedule parameter whenever the user explicitly asks for scheduled, recurring, or delayed work in the current conversation.",
+      "Use pi_desktop_schedule_automation instead of Agent's schedule parameter whenever the user explicitly asks for scheduled, recurring, or delayed work in the current conversation.",
       "For current-conversation automations, rely on durable thread history. Keep the scheduled prompt concise: state the recurring action and critical safety constraints, but do not restate the schedule or turn prior discussion into a self-contained runbook.",
     ],
     parameters: Type.Object({
@@ -599,7 +599,7 @@ export default function patchworkActivity(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName.toLowerCase() !== "agent" || !pi.getActiveTools().includes("schedule_automation")) return;
+    if (event.toolName.toLowerCase() !== "agent" || !pi.getActiveTools().includes("pi_desktop_schedule_automation")) return;
     const input = event.input as Record<string, unknown>;
     if (typeof input.schedule !== "string" || !canRedirectAgentSchedule(input)) return;
     let trigger: AutomationTrigger;
@@ -612,7 +612,7 @@ export default function patchworkActivity(pi: ExtensionAPI) {
     const name = typeof input.description === "string" ? input.description : "Scheduled automation";
     return {
       block: true,
-      reason: `Use schedule_automation for durable scheduled work: name=${JSON.stringify(name)}, `
+      reason: `Use pi_desktop_schedule_automation for durable scheduled work: name=${JSON.stringify(name)}, `
         + `schedule=${JSON.stringify(normalizedSchedule(trigger))}, and the same prompt. `
         + "No Agent schedule was created.",
     };

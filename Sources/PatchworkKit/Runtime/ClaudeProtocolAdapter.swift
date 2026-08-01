@@ -31,6 +31,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         static let queue = 20
         static let commands = 200
         static let summary = 2_000
+        static let metadata = 500
     }
 
     /// Claude's `--effort` ladder, in the app's thinking-level vocabulary.
@@ -52,19 +53,27 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     private var modelName: String?
     private var effort: String?
     private var permissionMode: String?
+    private var initialSessionID: String?
+    private var initialSessionName: String?
+    private var fastModeEnabled = false
 
     // MARK: - Session state (cleared by `reset`)
 
     private var cwd = FileManager.default.homeDirectoryForCurrentUser
     private var sessionID: String?
     private var sessionPath: String?
+    private var sessionName: String?
     private var slashCommands: [String] = []
     private var isTurnActive = false
     private var isCompacting = false
     private var steeredPrompts: [String] = []
+    private var followUps: [QueuedFollowUp] = []
+    private var dispatchedFollowUpIsStarting = false
+    private var preservesExplicitResumePath = false
     private var stats = Stats()
     private var stream = StreamAccumulator()
     private var startedMessageID: String?
+    private var fastModeAvailable = ProcessInfo.processInfo.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] != "1"
 
     /// Correlation ids waiting for their replayed user line, oldest first.
     private var promptAcks: [String] = []
@@ -75,6 +84,11 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     /// Lines produced while decoding (permission overflow denials).
     private var writeback: [Data] = []
 
+    private struct QueuedFollowUp {
+        let summary: String
+        let line: Data
+    }
+
     private struct Stats {
         var input = 0
         var output = 0
@@ -84,6 +98,24 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     // MARK: - Launch
+
+    public func prepareNewSession(id: String?, name: String?) {
+        initialSessionID = id
+        guard let clean = name?.trimmingCharacters(in: .whitespacesAndNewlines), !clean.isEmpty else {
+            initialSessionName = nil
+            return
+        }
+        initialSessionName = String(clean.prefix(256))
+    }
+
+    public func configureLaunch(modelID: String?, thinkingLevel: String?) {
+        if let modelID, !modelID.isEmpty { self.modelID = modelID }
+        if let thinkingLevel, Self.effortLevels.contains(thinkingLevel) { effort = thinkingLevel }
+    }
+
+    public func configureFastMode(_ enabled: Bool) {
+        fastModeEnabled = enabled
+    }
 
     public func launchArguments(sessionPath: URL?, cwd: URL) -> [String] {
         self.cwd = cwd
@@ -104,11 +136,12 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             if !id.isEmpty {
                 sessionID = id
                 self.sessionPath = sessionPath.standardizedFileURL.path
+                preservesExplicitResumePath = true
                 arguments += ["--resume", id]
             }
         }
         if sessionID == nil {
-            let id = UUID().uuidString.lowercased()
+            let id = initialSessionID ?? UUID().uuidString.lowercased()
             sessionID = id
             self.sessionPath = Self.transcriptPath(sessionID: id, cwd: cwd)
             arguments += ["--session-id", id]
@@ -117,14 +150,18 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         if let modelID, modelID != "default" { arguments += ["--model", modelID] }
         if let effort, Self.effortLevels.contains(effort) { arguments += ["--effort", effort] }
         if let permissionMode { arguments += ["--permission-mode", permissionMode] }
+        if let initialSessionName, sessionPath == nil {
+            sessionName = initialSessionName
+            arguments += ["--name", initialSessionName]
+        }
+        arguments += ["--settings", fastModeEnabled ? #"{"fastMode":true}"# : #"{"fastMode":false}"#]
         return arguments
     }
 
-    /// `~/.claude/projects/<cwd with "/" and "." replaced by "-">/<sessionId>.jsonl`.
+    /// `~/.claude/projects/<cwd with punctuation replaced by "-">/<sessionId>.jsonl`.
     public static func transcriptPath(sessionID: String, cwd: URL) -> String {
         let slug = cwd.standardizedFileURL.path
-            .replacingOccurrences(of: ".", with: "-")
-            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "-", options: .regularExpression)
         return AgentCatalog.sessionRoot(for: .claude)
             .appendingPathComponent(slug, isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
@@ -134,17 +171,24 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     public func reset() {
         sessionID = nil
         sessionPath = nil
+        sessionName = nil
         slashCommands = []
         isTurnActive = false
         isCompacting = false
         steeredPrompts = []
+        followUps = []
+        dispatchedFollowUpIsStarting = false
+        preservesExplicitResumePath = false
         stats = Stats()
         stream = StreamAccumulator()
         startedMessageID = nil
+        fastModeAvailable = ProcessInfo.processInfo.environment["CLAUDE_CODE_DISABLE_FAST_MODE"] != "1"
         promptAcks = []
         controlRequests = []
         permissions = []
         writeback = []
+        initialSessionID = nil
+        initialSessionName = nil
     }
 
     public func drainPendingWrites() -> [Data] {
@@ -156,11 +200,17 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
 
     public func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
         switch command {
-        // Claude Code takes a user message sent mid-turn into the turn already running (its own
-        // wording: "send messages to Claude while it works to steer Claude in real-time"), so
-        // steering, follow-up, and a first prompt are all the same wire message. What differs is
-        // only what the app shows as outstanding until each one is echoed back.
-        case "prompt", "steer", "follow_up":
+        // Claude takes a message written mid-turn into that turn. Prompts and steering therefore
+        // go straight to the wire, while a follow-up must wait for `result` so it owns a distinct
+        // later turn and matches the daemon's turn-credit accounting.
+        case "prompt", "steer":
+            return userTurn(text: payload["message"]?.stringValue ?? "", images: payload["images"], id: id)
+        case "follow_up":
+            if isTurnActive || dispatchedFollowUpIsStarting || !promptAcks.isEmpty || !followUps.isEmpty {
+                return queueFollowUp(
+                    text: payload["message"]?.stringValue ?? "", images: payload["images"]
+                )
+            }
             return userTurn(text: payload["message"]?.stringValue ?? "", images: payload["images"], id: id)
         case "compact":
             isCompacting = true
@@ -202,7 +252,16 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
                 "cost": stats.cost
             ]))
         case "set_session_name":
-            return .unsupported("renaming a conversation")
+            guard let rawName = payload["name"]?.stringValue else {
+                return .unsupported("an empty conversation name")
+            }
+            let clean = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { return .unsupported("an empty conversation name") }
+            let name = String(clean.prefix(256))
+            return controlRequest(
+                id: id, command: command, value: name,
+                request: ["subtype": "rename_session", "title": name]
+            )
         case "export_html":
             return .unsupported("HTML export")
         case "get_fork_messages", "get_entries":
@@ -211,6 +270,18 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             return .unsupported("cycling through options")
         default:
             return .unsupported("the \(command) command")
+        }
+    }
+
+    public func rollbackRejectedEncoding(
+        command: String, id: String, payload: [String: PiJSONValue]
+    ) {
+        promptAcks.removeAll { $0 == id }
+        controlRequests.removeAll { $0.id == id }
+        if command == "compact" { isCompacting = false }
+        if isTurnActive, let text = payload["message"]?.stringValue, !text.isEmpty,
+           let index = steeredPrompts.lastIndex(of: bounded(text, max: 1_000)) {
+            steeredPrompts.remove(at: index)
         }
     }
 
@@ -226,6 +297,33 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     private func userTurn(text: String, images: PiJSONValue?, id: String) -> AdapterOutbound {
+        guard promptAcks.count < Limit.promptAcks else {
+            return .unsupported("accepting more outstanding messages right now")
+        }
+        guard let line = userLine(text: text, images: images) else { return .write([]) }
+
+        // Claude acknowledges nothing but the replay, so every accepted correlation has to stay
+        // in FIFO order until its own message comes back.
+        promptAcks.append(id)
+        if isTurnActive, !text.isEmpty {
+            steeredPrompts.append(bounded(text, max: 1_000))
+            if steeredPrompts.count > Limit.queue { steeredPrompts.removeFirst() }
+        }
+        return .write([line])
+    }
+
+    private func queueFollowUp(text: String, images: PiJSONValue?) -> AdapterOutbound {
+        guard followUps.count < Limit.queue else {
+            return .unsupported("accepting more queued follow-up messages right now")
+        }
+        guard let line = userLine(text: text, images: images) else {
+            return .unsupported("an empty follow-up message")
+        }
+        followUps.append(QueuedFollowUp(summary: bounded(text, max: 1_000), line: line))
+        return .immediateWithEvents(.object([:]), [queueUpdateValue()])
+    }
+
+    private func userLine(text: String, images: PiJSONValue?) -> Data? {
         var content: [[String: Any]] = text.isEmpty ? [] : [["type": "text", "text": text]]
         for image in images?.arrayValue ?? [] {
             guard let data = image["data"]?.stringValue, !data.isEmpty else { continue }
@@ -238,25 +336,13 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
                 ]
             ])
         }
-        guard !content.isEmpty, let line = AdapterEncoding.line([
+        guard !content.isEmpty else { return nil }
+        return AdapterEncoding.line([
             "type": "user",
             "message": ["role": "user", "content": content],
             "parent_tool_use_id": NSNull(),
             "session_id": sessionID ?? ""
-        ]) else { return .write([]) }
-
-        // Claude acknowledges nothing but the replay, so the caller is resolved when its own
-        // message comes back. A stale head is dropped rather than growing without bound; the
-        // transport still completes it on timeout.
-        promptAcks.append(id)
-        if promptAcks.count > Limit.promptAcks { promptAcks.removeFirst() }
-        // Tracked as steering rather than as a follow-up queue: it joins the running turn, it
-        // does not wait behind it.
-        if isTurnActive, !text.isEmpty {
-            steeredPrompts.append(bounded(text, max: 1_000))
-            if steeredPrompts.count > Limit.queue { steeredPrompts.removeFirst() }
-        }
-        return .write([line])
+        ])
     }
 
     private func controlRequest(
@@ -265,11 +351,13 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         value: String? = nil,
         request: [String: Any]
     ) -> AdapterOutbound {
+        guard controlRequests.count < Limit.controlRequests else {
+            return .unsupported("accepting more outstanding controls right now")
+        }
         guard let line = AdapterEncoding.line([
             "type": "control_request", "request_id": id, "request": request
         ]) else { return .write([]) }
         controlRequests.append((id: id, command: command, value: value))
-        if controlRequests.count > Limit.controlRequests { controlRequests.removeFirst() }
         return .write([line])
     }
 
@@ -292,7 +380,9 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             "steeringMode": "all",
             "followUpMode": "all",
             "steeringQueue": steeredPrompts,
-            "followUpQueue": [],
+            "followUpQueue": followUps.map(\.summary),
+            "fastModeEnabled": fastModeEnabled,
+            "fastModeAvailable": fastModeAvailable,
             "model": [
                 "id": modelID ?? "default",
                 "name": modelName ?? modelID ?? "Default",
@@ -302,6 +392,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         if let effort { state["thinkingLevel"] = effort }
         if let sessionID { state["sessionId"] = sessionID }
         if let sessionPath { state["sessionFile"] = sessionPath }
+        if let sessionName { state["sessionName"] = sessionName }
         return state
     }
 
@@ -337,8 +428,9 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         case "control_request": return permissionRequest(record)
         case "control_response": return controlResponse(record)
         case "control_cancel_request":
-            if let id = record["request_id"] as? String { permissions.removeAll { $0.id == id } }
-            return []
+            guard let id = record["request_id"] as? String else { return [] }
+            permissions.removeAll { $0.id == id }
+            return [event("extension_ui_cancel", ["id": id])]
         default:
             // keep_alive, hook events, prompt suggestions, and anything a newer Claude adds.
             return []
@@ -346,11 +438,20 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     private func system(_ record: [String: Any]) -> [AdapterInbound] {
+        if let enabled = Self.fastModeState(in: record) { fastModeEnabled = enabled }
+        if let reason = record["fast_mode_disabled_reason"] as? String, !reason.isEmpty {
+            fastModeAvailable = false
+        }
         switch record["subtype"] as? String {
         case "init":
             if let id = record["session_id"] as? String, !id.isEmpty {
-                // A forked or newly created session renames the transcript, so the path follows.
-                if id != sessionID { sessionPath = Self.transcriptPath(sessionID: id, cwd: cwd) }
+                // A forked or newly created session owns the canonical cwd-derived path. An
+                // explicit resume may intentionally launch from another cwd, so its known path
+                // stays authoritative while its id is unchanged.
+                if id != sessionID || !preservesExplicitResumePath {
+                    sessionPath = Self.transcriptPath(sessionID: id, cwd: cwd)
+                    preservesExplicitResumePath = false
+                }
                 sessionID = id
             }
             if let model = record["model"] as? String, !model.isEmpty {
@@ -374,6 +475,20 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         }
     }
 
+    private static func fastModeState(in record: [String: Any]) -> Bool? {
+        for key in ["fastModeEnabled", "fast_mode_enabled", "fastMode", "fast_mode_state"] {
+            if let enabled = record[key] as? Bool { return enabled }
+            if let state = record[key] as? String {
+                if ["on", "enabled", "active", "fast"].contains(state.lowercased()) { return true }
+                if ["off", "disabled", "inactive", "standard"].contains(state.lowercased()) { return false }
+            }
+            if let state = record[key] as? [String: Any], let enabled = state["enabled"] as? Bool {
+                return enabled
+            }
+        }
+        return nil
+    }
+
     private func assistant(_ record: [String: Any]) -> [AdapterInbound] {
         // Subagent output rides the same stream under a parent tool id. The transcript projection
         // drops those sidechains, so the live view drops them too and the two agree.
@@ -382,20 +497,33 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         var out: [AdapterInbound] = []
         startTurn(&out)
 
-        let id = message["id"] as? String
+        let blocks = Self.contentBlocks(message["content"])
+        let resolvedStopReason = Self.stopReason(message["stop_reason"] as? String, blocks: blocks)
+        let providerID = message["id"] as? String
+        let recordID = record["uuid"] as? String
+        let preferredID = ClaudeMessageIdentity.preferredID(
+            providerID: providerID,
+            recordID: recordID,
+            stopReason: resolvedStopReason,
+            blocks: blocks
+        )
+        let id = preferredID.map { Self.clampedText($0, max: Limit.metadata) }
         if startedMessageID != id {
-            out.append(event("message_start", ["message": ["role": "assistant"]]))
+            var started: [String: Any] = ["role": "assistant"]
+            if let id { started["id"] = id }
+            out.append(event("message_start", ["message": started]))
         }
         startedMessageID = nil
         stream = StreamAccumulator()
 
-        let blocks = Self.contentBlocks(message["content"])
         var projected: [String: Any] = [
             "role": "assistant",
             "content": blocks,
             "provider": "anthropic",
-            "stopReason": Self.stopReason(message["stop_reason"] as? String, blocks: blocks)
+            "stopReason": resolvedStopReason
         ]
+        if let id { projected["id"] = id }
+        if let timestamp = record["timestamp"] { projected["timestamp"] = timestamp }
         if let model = message["model"] as? String { projected["model"] = model }
         if let usage = Self.usage(message["usage"] as? [String: Any]) { projected["usage"] = usage }
         out.append(event("message_end", ["message": projected]))
@@ -424,24 +552,40 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             if !promptAcks.isEmpty {
                 let id = promptAcks.removeFirst()
                 out.append(.response(id: id, value: AdapterEncoding.response(id: id, data: .object([:]))))
+            } else if dispatchedFollowUpIsStarting {
+                dispatchedFollowUpIsStarting = false
             }
             if !steeredPrompts.isEmpty { out.append(queueUpdate()) }
             return out
         }
 
-        for part in results {
+        var combinedBlocks: [[String: Any]] = []
+        var firstCallID: String?
+        var anyError = false
+        for part in results.prefix(Limit.blocks) {
             guard let callID = part["tool_use_id"] as? String else { continue }
             let isError = part["is_error"] as? Bool == true
             let blocks = Self.resultBlocks(part["content"])
+            firstCallID = firstCallID ?? callID
+            anyError = anyError || isError
+            combinedBlocks.append(contentsOf: blocks.prefix(max(0, Limit.blocks - combinedBlocks.count)))
             out.append(event("tool_execution_end", [
                 "toolCallId": callID,
                 "result": ["content": blocks],
                 "isError": isError
             ]))
+        }
+        if let firstCallID, !combinedBlocks.isEmpty, let recordID = record["uuid"] as? String {
             var projected: [String: Any] = [
-                "role": "toolResult", "content": blocks, "toolCallId": callID
+                "id": Self.clampedText(recordID, max: Limit.metadata),
+                "role": "toolResult",
+                "content": combinedBlocks,
+                "toolCallId": firstCallID
             ]
-            if isError { projected["isError"] = true }
+            if anyError { projected["isError"] = true }
+            if let timestamp = record["timestamp"] as? String {
+                projected["timestamp"] = Self.clampedText(timestamp, max: Limit.metadata)
+            }
             out.append(event("message_end", ["message": projected]))
         }
         return out
@@ -459,9 +603,16 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         case "message_start":
             stream = StreamAccumulator()
             let message = inner["message"] as? [String: Any]
-            startedMessageID = message?["id"] as? String
-            stream.model = message?["model"] as? String
-            out.append(event("message_start", ["message": ["role": "assistant"]]))
+            startedMessageID = (message?["id"] as? String).map {
+                Self.clampedText($0, max: Limit.metadata)
+            }
+            stream.messageID = startedMessageID
+            stream.model = (message?["model"] as? String).map {
+                Self.clampedText($0, max: Limit.metadata)
+            }
+            var projected: [String: Any] = ["role": "assistant"]
+            if let startedMessageID { projected["id"] = startedMessageID }
+            out.append(event("message_start", ["message": projected]))
         case "content_block_start":
             guard let index = inner["index"] as? Int else { break }
             stream.start(index: index, block: inner["content_block"] as? [String: Any])
@@ -494,24 +645,39 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         // one rather than disappearing into a silent settle.
         if record["is_error"] as? Bool == true {
             let text = bounded(record["result"] as? String ?? "Claude Code ended the turn with an error.")
-            out.append(event("message_end", ["message": [
+            let errorID = record["uuid"] as? String
+                ?? "claude-turn-error-\(record["session_id"] as? String ?? "session")-\(record["num_turns"] as? Int ?? 0)"
+            var message: [String: Any] = [
+                "id": Self.clampedText(errorID, max: Limit.metadata),
                 "role": "assistant",
                 "content": [["type": "text", "text": text]],
                 "provider": "anthropic",
                 "stopReason": "error",
                 "isError": true,
                 "errorMessage": text
-            ]]))
+            ]
+            if let timestamp = record["timestamp"] as? String {
+                message["timestamp"] = Self.clampedText(timestamp, max: Limit.metadata)
+            }
+            out.append(event("message_end", ["message": message]))
         }
 
         isTurnActive = false
         isCompacting = false
         startedMessageID = nil
         stream = StreamAccumulator()
+        let hadVisibleQueue = !steeredPrompts.isEmpty || !followUps.isEmpty
         if !steeredPrompts.isEmpty {
             steeredPrompts.removeAll()
-            out.append(queueUpdate())
         }
+        if !followUps.isEmpty {
+            let next = followUps.removeFirst()
+            writeback.append(next.line)
+            dispatchedFollowUpIsStarting = true
+        } else {
+            dispatchedFollowUpIsStarting = false
+        }
+        if hadVisibleQueue { out.append(queueUpdate()) }
         out.append(event("turn_end"))
         out.append(event("agent_settled"))
         return out
@@ -522,17 +688,18 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
               request["subtype"] as? String == "can_use_tool",
               let requestID = record["request_id"] as? String else { return [] }
 
-        // Never leave Claude blocked on a request this adapter can no longer track: the oldest
-        // is denied on the wire instead of being silently forgotten.
-        while permissions.count >= Limit.permissions {
-            let stale = permissions.removeFirst()
-            if let line = permissionReply(requestID: stale.id, allow: false, input: stale.input) {
+        // Preserve every dialog already visible in the outer queue. A newer request beyond the
+        // shared bound is denied immediately and never surfaced, so no visible row can become an
+        // unanswerable orphan.
+        let input = request["input"] as? [String: Any] ?? [:]
+        guard permissions.count < Limit.permissions else {
+            if let line = permissionReply(requestID: requestID, allow: false, input: input) {
                 writeback.append(line)
             }
+            return []
         }
         // `updatedInput` has to be the tool's own argument object, so a missing or oddly shaped
         // input degrades to an empty object rather than to something Claude will reject.
-        let input = request["input"] as? [String: Any] ?? [:]
         permissions.append((id: requestID, input: input))
 
         let toolName = request["tool_name"] as? String ?? "tool"
@@ -564,6 +731,7 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         }
 
         var data: [String: Any] = [:]
+        var emitted: [AdapterInbound] = []
         switch pending.command {
         case "set_model":
             modelID = pending.value
@@ -571,10 +739,23 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             data = ["id": modelID ?? "default", "name": modelName ?? "Default", "provider": "anthropic"]
         case "set_mode":
             permissionMode = pending.value
+        case "set_session_name":
+            sessionName = pending.value
+            if let sessionName {
+                data = ["name": sessionName]
+                emitted.append(event("session_info_changed", ["name": sessionName]))
+            }
         default:
             break
         }
-        return [.response(id: requestID, value: AdapterEncoding.response(id: requestID, data: PiJSONValue(any: data)))]
+        emitted.insert(
+            .response(
+                id: requestID,
+                value: AdapterEncoding.response(id: requestID, data: PiJSONValue(any: data))
+            ),
+            at: 0
+        )
+        return emitted
     }
 
     // MARK: - Turn bookkeeping
@@ -589,7 +770,16 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
     }
 
     private func queueUpdate() -> AdapterInbound {
-        event("queue_update", ["steering": steeredPrompts, "followUp": []])
+        .event(queueUpdateValue())
+    }
+
+    private func queueUpdateValue() -> PiJSONValue {
+        let object: [String: PiJSONValue] = [
+            "type": .string("queue_update"),
+            "steering": .array(steeredPrompts.map(PiJSONValue.string)),
+            "followUp": .array(followUps.map { .string($0.summary) })
+        ]
+        return .object(object)
     }
 
     private func event(_ type: String, _ fields: [String: Any] = [:]) -> AdapterInbound {
@@ -665,7 +855,9 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         case "refusal": return "error"
         case let value?: return value
         case nil:
-            return blocks.contains { ($0["type"] as? String) == "toolCall" } ? "toolUse" : "stop"
+            // Claude writes progressive narration records without a stop reason. Only a later
+            // explicit terminal record ends the turn, so nil must remain nonterminal.
+            return "toolUse"
         }
     }
 
@@ -695,6 +887,10 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         text.count <= max ? text : String(text.prefix(max)) + "\n… truncated"
     }
 
+    private static func clampedText(_ text: String, max: Int) -> String {
+        text.count <= max ? text : String(text.prefix(max))
+    }
+
     // MARK: - Streaming accumulator
 
     /// Rebuilds the in-flight assistant message from `content_block_*` deltas. Bounded by block
@@ -703,12 +899,15 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
         struct Block {
             var kind = "text"
             var text = ""
+            var textCount = 0
             var id = ""
             var name = ""
             var partialJSON = ""
+            var partialJSONCount = 0
         }
 
         var model: String?
+        var messageID: String?
         private var blocks: [Int: Block] = [:]
 
         mutating func start(index: Int, block: [String: Any]?) {
@@ -717,14 +916,24 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             switch block?["type"] as? String {
             case "thinking":
                 value.kind = "thinking"
-                value.text = block?["thinking"] as? String ?? ""
+                value.text = ClaudeProtocolAdapter.clampedText(
+                    block?["thinking"] as? String ?? "", max: Limit.blockText
+                )
+                value.textCount = value.text.count
             case "tool_use":
                 value.kind = "toolCall"
-                value.id = block?["id"] as? String ?? "tool"
-                value.name = block?["name"] as? String ?? "tool"
+                value.id = ClaudeProtocolAdapter.clampedText(
+                    block?["id"] as? String ?? "tool", max: Limit.metadata
+                )
+                value.name = ClaudeProtocolAdapter.clampedText(
+                    block?["name"] as? String ?? "tool", max: Limit.metadata
+                )
             default:
                 value.kind = "text"
-                value.text = block?["text"] as? String ?? ""
+                value.text = ClaudeProtocolAdapter.clampedText(
+                    block?["text"] as? String ?? "", max: Limit.blockText
+                )
+                value.textCount = value.text.count
             }
             blocks[index] = value
         }
@@ -735,13 +944,16 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             var block = blocks[index] ?? Block()
             switch delta["type"] as? String {
             case "text_delta":
-                block.text = append(block.text, delta["text"] as? String)
+                append(&block.text, count: &block.textCount, delta["text"] as? String)
             case "thinking_delta":
                 block.kind = "thinking"
-                block.text = append(block.text, delta["thinking"] as? String)
+                append(&block.text, count: &block.textCount, delta["thinking"] as? String)
             case "input_json_delta":
                 block.kind = "toolCall"
-                block.partialJSON = append(block.partialJSON, delta["partial_json"] as? String, max: 20_000)
+                append(
+                    &block.partialJSON, count: &block.partialJSONCount,
+                    delta["partial_json"] as? String, max: 20_000
+                )
             default:
                 // signature_delta and anything newer carry nothing renderable.
                 return false
@@ -769,13 +981,21 @@ public final class ClaudeProtocolAdapter: AgentProtocolAdapter, AdapterWriteback
             var message: [String: Any] = [
                 "role": "assistant", "content": content, "provider": "anthropic"
             ]
+            if let messageID { message["id"] = messageID }
             if let model { message["model"] = model }
             return message
         }
 
-        private func append(_ existing: String, _ addition: String?, max: Int = Limit.blockText) -> String {
-            guard let addition, !addition.isEmpty, existing.count < max else { return existing }
-            return existing + addition
+        private func append(
+            _ existing: inout String,
+            count: inout Int,
+            _ addition: String?,
+            max: Int = Limit.blockText
+        ) {
+            guard let addition, !addition.isEmpty, count < max else { return }
+            let retained = String(addition.prefix(max - count))
+            existing += retained
+            count += retained.count
         }
     }
 

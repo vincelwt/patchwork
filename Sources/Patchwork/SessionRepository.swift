@@ -1,19 +1,40 @@
 import Foundation
 import PatchworkKit
 
+struct SessionObservationRoot: Hashable, Sendable {
+    let agent: AgentKind
+    let url: URL
+    /// A custom-root transcript is watched through its parent directory, but only this exact file
+    /// may become a catalog candidate. Siblings remain outside discovery.
+    let exactFilePath: String?
+
+    init(agent: AgentKind, url: URL, exactFilePath: String? = nil) {
+        self.agent = agent
+        self.url = url
+        self.exactFilePath = exactFilePath
+    }
+}
+
 protocol SessionRepositoryProtocol {
     var rootURL: URL { get }
     /// Discovery narrowed to the agents the user has switched on. Declared here rather than only
     /// in the extension below: an extension member dispatches statically through a protocol
     /// existential, so the file repository's root-skipping override would never have run.
     func discoverSessions(archivedIDs: Set<String>, agents: Set<AgentKind>?) async throws -> [SessionSummary]
+    /// Exact app-owned or daemon-owned paths outside static agent roots. Pi can choose one through
+    /// cwd-specific settings, so catalog refreshes must retain these without scanning arbitrary
+    /// parent trees.
+    func discoverSessions(
+        archivedIDs: Set<String>,
+        agents: Set<AgentKind>?,
+        supplementalPaths: Set<String>
+    ) async throws -> [SessionSummary]
     /// Which agent wrote a transcript, decided by the session root it lives under.
     func agent(for fileURL: URL) -> AgentKind
     func discoverSessions(archivedIDs: Set<String>) async throws -> [SessionSummary]
     func loadConversation(from fileURL: URL) async throws -> SessionConversation
     func loadNewestConversationPage(from fileURL: URL) async throws -> ConversationPage
     func loadOlderConversationPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage
-    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage
     func refreshSummary(at fileURL: URL, archivedIDs: Set<String>) async throws -> SessionSummary
     /// Sidebar hydration: everything the persisted summary cache already knows, with no disk
     /// scan and no JSONL parsing, so the first paint is immediate.
@@ -22,6 +43,12 @@ protocol SessionRepositoryProtocol {
     /// `limit` renderable messages, read backward from EOF so latency does not scale with total
     /// file size. `isComplete` reports whether this already *is* the whole conversation.
     func loadConversationTail(from fileURL: URL, limit: Int) async throws -> SessionParser.TailScan
+    /// Recursive roots whose topology can add or remove sidebar conversations. Fakes default to
+    /// none so tests never install filesystem streams accidentally.
+    func observationRoots(agents: Set<AgentKind>?) -> [SessionObservationRoot]
+    func observationRoots(
+        agents: Set<AgentKind>?, supplementalPaths: Set<String>
+    ) -> [SessionObservationRoot]
 }
 
 extension SessionRepositoryProtocol {
@@ -34,10 +61,44 @@ extension SessionRepositoryProtocol {
         return all.filter { agents.contains($0.agent) }
     }
 
+    func discoverSessions(
+        archivedIDs: Set<String>,
+        agents: Set<AgentKind>?,
+        supplementalPaths: Set<String>
+    ) async throws -> [SessionSummary] {
+        var discovered = try await discoverSessions(archivedIDs: archivedIDs, agents: agents)
+        var seen = Set(discovered.map { $0.fileURL.standardizedFileURL.path })
+        for rawPath in supplementalPaths.sorted().suffix(SessionScanner.supplementalPathLimit) {
+            try Task.checkCancellation()
+            let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+            guard url.pathExtension.lowercased() == "jsonl",
+                  seen.insert(url.path).inserted,
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+            let pathAgent = agent(for: url)
+            guard agents?.contains(pathAgent) ?? true,
+                  var summary = try? await refreshSummary(at: url, archivedIDs: archivedIDs),
+                  !summary.isSubsession else { continue }
+            summary.agent = pathAgent
+            discovered.append(summary)
+        }
+        return discovered.sorted { lhs, rhs in
+            lhs.modifiedAt == rhs.modifiedAt
+                ? lhs.displayName < rhs.displayName
+                : lhs.modifiedAt > rhs.modifiedAt
+        }
+    }
+
     /// Fakes and legacy repositories only ever hold Pi sessions.
     func agent(for fileURL: URL) -> AgentKind { .pi }
 
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary] { [] }
+    func observationRoots(agents: Set<AgentKind>?) -> [SessionObservationRoot] { [] }
+    func observationRoots(
+        agents: Set<AgentKind>?, supplementalPaths: Set<String>
+    ) -> [SessionObservationRoot] {
+        observationRoots(agents: agents)
+    }
     /// Defaulted to a full load reported as already-complete: fakes/tests that never override
     /// this behave exactly as if every selection were a full-file parse in one step, which is
     /// what they already exercise today.
@@ -65,9 +126,6 @@ extension SessionRepositoryProtocol {
         throw ConversationPagingError.unsupported
     }
 
-    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
-        try await loadOlderConversationPage(from: fileURL, cursor: cursor)
-    }
 }
 
 struct FileSessionRepository: SessionRepositoryProtocol {
@@ -77,16 +135,21 @@ struct FileSessionRepository: SessionRepositoryProtocol {
     /// Every agent whose session tree exists on this machine, with the root to scan for it.
     let roots: [(agent: AgentKind, url: URL)]
     let summaryCache: SessionSummaryCache
+    private let externalTitleSnapshot: @Sendable () -> [String: String]
 
     init(
         rootURL: URL = FileSessionRepository.defaultRootURL(),
         roots: [(agent: AgentKind, url: URL)]? = nil,
-        summaryCache: SessionSummaryCache? = nil
+        summaryCache: SessionSummaryCache? = nil,
+        externalTitleSnapshot: @escaping @Sendable () -> [String: String] = {
+            CodexThreadTitles.shared.snapshot()
+        }
     ) {
         self.rootURL = rootURL
         // Pinning Pi's root to a fixture tree pins all of them; see `SessionScanner.roots`.
         self.roots = roots ?? SessionScanner.roots(piRootURL: rootURL)
         self.summaryCache = summaryCache ?? SessionSummaryCache()
+        self.externalTitleSnapshot = externalTitleSnapshot
     }
 
     static func defaultRootURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
@@ -108,11 +171,69 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         try await discoverSessions(archivedIDs: archivedIDs, agents: nil)
     }
 
+    func observationRoots(agents: Set<AgentKind>?) -> [SessionObservationRoot] {
+        roots.compactMap { root in
+            guard agents?.contains(root.agent) ?? true else { return nil }
+            return SessionObservationRoot(agent: root.agent, url: root.url.standardizedFileURL)
+        }
+    }
+
+    func observationRoots(
+        agents: Set<AgentKind>?, supplementalPaths: Set<String>
+    ) -> [SessionObservationRoot] {
+        let staticRoots = observationRoots(agents: agents)
+        let rootPaths = staticRoots.map { $0.url.standardizedFileURL.path }
+        var seen = Set(staticRoots)
+        var result = staticRoots
+        for rawPath in supplementalPaths.sorted().suffix(SessionScanner.supplementalPathLimit) {
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard path.lowercased().hasSuffix(".jsonl"),
+                  !rootPaths.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+                continue
+            }
+            let agent = self.agent(for: URL(fileURLWithPath: path))
+            guard agents?.contains(agent) ?? true else { continue }
+            let observation = SessionObservationRoot(
+                agent: agent,
+                url: URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL,
+                exactFilePath: path
+            )
+            if seen.insert(observation).inserted { result.append(observation) }
+        }
+        return result
+    }
+
     func discoverSessions(archivedIDs: Set<String>, agents: Set<AgentKind>?) async throws -> [SessionSummary] {
-        let roots = roots.filter { agents?.contains($0.agent) ?? true }
+        try await discoverSessions(
+            archivedIDs: archivedIDs,
+            agents: agents,
+            supplementalPaths: []
+        )
+    }
+
+    func discoverSessions(
+        archivedIDs: Set<String>,
+        agents: Set<AgentKind>?,
+        supplementalPaths: Set<String>
+    ) async throws -> [SessionSummary] {
+        let enabledRoots = roots
+            .filter { agents?.contains($0.agent) ?? true }
+            .sorted {
+                $0.url.standardizedFileURL.path.count > $1.url.standardizedFileURL.path.count
+            }
+        let classificationRoots = roots
         let candidates = try await Self.detached(priority: .utility) {
-            try roots.flatMap { root in
+            let rooted = try enabledRoots.flatMap { root in
                 try Self.sessionCandidates(agent: root.agent, rootURL: root.url)
+            }
+            let supplemental = Self.supplementalCandidates(
+                paths: supplementalPaths,
+                roots: classificationRoots,
+                agents: agents
+            )
+            var seen: Set<String> = []
+            return (rooted + supplemental).filter {
+                seen.insert($0.url.standardizedFileURL.path).inserted
             }
         }
         try Task.checkCancellation()
@@ -121,7 +242,11 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         var misses: [Candidate] = []
         summaries.reserveCapacity(candidates.count)
         for candidate in candidates {
-            if let cached = await summaryCache.summary(for: candidate.fingerprint, archivedIDs: archivedIDs) {
+            if let cached = await summaryCache.summary(
+                for: candidate.fingerprint,
+                archivedIDs: archivedIDs,
+                expectedAgent: candidate.agent
+            ) {
                 summaries.append(cached)
             } else {
                 misses.append(candidate)
@@ -151,6 +276,9 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         _ = await summaryCache.pruneMissingFiles()
         try? await summaryCache.persist()
 
+        let titles = await currentExternalTitles(ifNeededFor: summaries)
+        for index in summaries.indices { summaries[index].applyExternalName(from: titles) }
+
         // Subagent transcripts are parsed and cached like anything else, but never listed: they
         // are a tool's working notes, not one of the user's conversations.
         return summaries.filter { !$0.isSubsession }.sorted { lhs, rhs in
@@ -170,13 +298,14 @@ struct FileSessionRepository: SessionRepositoryProtocol {
             transcoder: .make(for: candidate.agent)
         )
         summary.agent = candidate.agent
-        summary.applyExternalName()
         return (summary, candidate.fingerprint)
     }
 
     func cachedSessions(archivedIDs: Set<String>) async -> [SessionSummary] {
-        await summaryCache.liveSummaries(archivedIDs: archivedIDs)
-            .filter { !$0.isSubsession }
+        var summaries = await summaryCache.liveSummaries(archivedIDs: archivedIDs)
+        let titles = await currentExternalTitles(ifNeededFor: summaries)
+        for index in summaries.indices { summaries[index].applyExternalName(from: titles) }
+        return summaries.filter { !$0.isSubsession }
             .sorted { lhs, rhs in
                 if lhs.modifiedAt == rhs.modifiedAt { return lhs.displayName < rhs.displayName }
                 return lhs.modifiedAt > rhs.modifiedAt
@@ -188,16 +317,31 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         let fresh = URL(fileURLWithPath: fileURL.path)
         let values = try fresh.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let fingerprint = SessionFileFingerprint(url: fresh, values: values)
-        if let cached = await summaryCache.summary(for: fingerprint, archivedIDs: archivedIDs) { return cached }
         let agent = agent(for: fresh)
+        if var cached = await summaryCache.summary(
+            for: fingerprint,
+            archivedIDs: archivedIDs,
+            expectedAgent: agent
+        ) {
+            let titles = await currentExternalTitles(ifNeededFor: [cached])
+            cached.applyExternalName(from: titles)
+            return cached
+        }
         var summary = try await Self.detached(priority: .utility) {
             try SessionParser.summary(at: fresh, archivedIDs: archivedIDs, transcoder: .make(for: agent))
         }
         summary.agent = agent
-        summary.applyExternalName()
         await summaryCache.store(summary, fingerprint: fingerprint)
-        try? await summaryCache.persist()
-        return summary
+        var presented = summary
+        let titles = await currentExternalTitles(ifNeededFor: [presented])
+        presented.applyExternalName(from: titles)
+        return presented
+    }
+
+    private func currentExternalTitles(ifNeededFor summaries: [SessionSummary]) async -> [String: String] {
+        guard summaries.contains(where: { $0.agent == .codex }) else { return [:] }
+        let snapshot = externalTitleSnapshot
+        return await Task.detached(priority: .utility) { snapshot() }.value
     }
 
     func loadConversation(from fileURL: URL) async throws -> SessionConversation {
@@ -227,15 +371,6 @@ struct FileSessionRepository: SessionRepositoryProtocol {
         let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
         return try await Self.detached(priority: .userInitiated) {
             try SessionParser.conversationPage(at: fileURL, cursor: cursor, transcoder: transcoder)
-        }
-    }
-
-    func loadFocusedHistoryPage(from fileURL: URL, cursor: ConversationPageCursor) async throws -> ConversationPage {
-        let transcoder = AgentSessionTranscoder.make(for: agent(for: fileURL))
-        return try await Self.detached(priority: .userInitiated) {
-            try SessionParser.conversationPage(
-                at: fileURL, cursor: cursor, projection: .focusedHistory, transcoder: transcoder
-            )
         }
     }
 
@@ -310,12 +445,46 @@ struct FileSessionRepository: SessionRepositoryProtocol {
             )
         }
     }
+
+    private static func supplementalCandidates(
+        paths: Set<String>,
+        roots: [(agent: AgentKind, url: URL)],
+        agents: Set<AgentKind>?
+    ) -> [Candidate] {
+        let orderedRoots = roots.sorted {
+            $0.url.standardizedFileURL.path.count > $1.url.standardizedFileURL.path.count
+        }
+        return paths.sorted().suffix(SessionScanner.supplementalPathLimit).compactMap { rawPath in
+            let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+            guard url.pathExtension.lowercased() == "jsonl",
+                  let values = try? url.resourceValues(forKeys: resourceKeys),
+                  values.isRegularFile == true else { return nil }
+            let pathAgent = orderedRoots.first { root in
+                let rootPath = root.url.standardizedFileURL.path
+                return url.path == rootPath || url.path.hasPrefix(rootPath + "/")
+            }?.agent ?? .pi
+            guard agents?.contains(pathAgent) ?? true else { return nil }
+            return Candidate(
+                agent: pathAgent,
+                url: url,
+                fingerprint: SessionFileFingerprint(url: url, values: values)
+            )
+        }
+    }
 }
 
 @MainActor
 final class AppPersistence {
+    struct DaemonReadUpdate {
+        var path: String
+        var unread: Bool
+        var markedAt: Date
+        var completionID: String?
+    }
+
     private let fileURL: URL
     private(set) var state: PersistedAppState
+    static let maxStateBytes = ArchiveStateBounds.appStateByteLimit
 
     init(baseURL: URL? = nil) {
         let manager = FileManager.default
@@ -323,7 +492,9 @@ final class AppPersistence {
         try? manager.createDirectory(at: directory, withIntermediateDirectories: true)
         fileURL = directory.appendingPathComponent("state.json")
 
-        if let data = try? Data(contentsOf: fileURL),
+        let fileSize = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+        if let fileSize, fileSize <= Self.maxStateBytes,
+           let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
            let decoded = try? JSONDecoder().decode(PersistedAppState.self, from: data) {
             state = decoded
         } else {
@@ -337,16 +508,36 @@ final class AppPersistence {
     /// look foreign again.
     static let maxAppStartedPaths = 5_000
 
-    func recordAppStarted(sessionPath: String) {
+    @discardableResult
+    func recordAppStarted(sessionPath: String) -> Bool {
         let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
-        guard !path.isEmpty, !state.appStartedSessionPaths.contains(path) else { return }
+        guard !path.isEmpty else { return false }
+        guard !state.appStartedSessionPaths.contains(path) else { return true }
+        let previous = state.appStartedSessionPaths
         state.appStartedSessionPaths.insert(path)
         if state.appStartedSessionPaths.count > Self.maxAppStartedPaths {
-            state.appStartedSessionPaths = Set(
-                state.appStartedSessionPaths.sorted().suffix(Self.maxAppStartedPaths)
-            )
+            let overflow = state.appStartedSessionPaths.count - Self.maxAppStartedPaths
+            for stale in state.appStartedSessionPaths
+                .filter({ $0 != path }).sorted().prefix(overflow) {
+                state.appStartedSessionPaths.remove(stale)
+            }
         }
-        save()
+        guard save() else {
+            state.appStartedSessionPaths = previous
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    func discardAppStarted(sessionPath: String) -> Bool {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        guard state.appStartedSessionPaths.remove(path) != nil else { return true }
+        guard save() else {
+            state.appStartedSessionPaths.insert(path)
+            return false
+        }
+        return true
     }
 
     func setShowsForeignConversations(_ shows: Bool) {
@@ -355,15 +546,90 @@ final class AppPersistence {
         save()
     }
 
-    func setArchived(_ archived: Bool, sessionID: String, now: Date = Date()) {
+    func isArchived(sessionID: String, sessionPath: String) -> Bool {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        return state.archivedSessionPaths.contains(path)
+            || (state.archivedSessionIDs.contains(sessionID)
+                && !state.archiveExemptSessionPaths.contains(path))
+    }
+
+    func archivedDate(sessionID: String, sessionPath: String) -> Date? {
+        state.archivedAtBySessionPath[URL(fileURLWithPath: sessionPath).standardizedFileURL.path]
+            ?? state.archivedAt[sessionID]
+    }
+
+    func noteArchivePresentation(_ archived: Bool, sessionPath: String, now: Date = Date()) {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
         if archived {
-            state.archivedSessionIDs.insert(sessionID)
-            state.archivedAt[sessionID] = now
+            guard state.archivedAtBySessionPath[path] == nil else { return }
+            state.archivedAtBySessionPath[path] = now
         } else {
-            state.archivedSessionIDs.remove(sessionID)
-            state.archivedAt.removeValue(forKey: sessionID)
+            guard state.archivedAtBySessionPath.removeValue(forKey: path) != nil else { return }
         }
         save()
+    }
+
+    func setArchived(
+        _ archived: Bool,
+        sessionID: String,
+        sessionPath: String,
+        now: Date = Date(),
+        queueDaemonSync: Bool = false
+    ) {
+        let path = URL(fileURLWithPath: sessionPath).standardizedFileURL.path
+        if archived {
+            state.archiveExemptSessionPaths.remove(path)
+            state.archivedSessionPaths.insert(path)
+            state.archivedAtBySessionPath[path] = now
+        } else {
+            state.archivedSessionPaths.remove(path)
+            state.archivedAtBySessionPath.removeValue(forKey: path)
+            if state.archivedSessionIDs.contains(sessionID) {
+                state.archiveExemptSessionPaths.insert(path)
+            } else {
+                state.archiveExemptSessionPaths.remove(path)
+            }
+        }
+        if state.archivedSessionPaths.count > 10_000 {
+            let overflow = state.archivedSessionPaths.count - 10_000
+            let oldest = state.archivedSessionPaths.sorted {
+                (state.archivedAtBySessionPath[$0] ?? .distantPast)
+                    < (state.archivedAtBySessionPath[$1] ?? .distantPast)
+            }.prefix(overflow)
+            for stale in oldest {
+                state.archivedSessionPaths.remove(stale)
+                state.archivedAtBySessionPath.removeValue(forKey: stale)
+            }
+        }
+        if state.archivedAtBySessionPath.count > 10_000 {
+            state.archivedAtBySessionPath = Dictionary(uniqueKeysWithValues:
+                state.archivedAtBySessionPath
+                    .sorted { $0.value < $1.value }
+                    .suffix(10_000)
+            )
+        }
+        if state.archiveExemptSessionPaths.count > 10_000 {
+            let overflow = state.archiveExemptSessionPaths.count - 10_000
+            for stale in state.archiveExemptSessionPaths
+                .filter({ $0 != path }).sorted().prefix(overflow) {
+                state.archiveExemptSessionPaths.remove(stale)
+            }
+        }
+        if queueDaemonSync {
+            state.setPendingDaemonArchiveIntent(path: path, archived: archived)
+        }
+        save()
+    }
+
+    /// Clears only the value that the daemon actually acknowledged. A late restore response must
+    /// not erase a newer archive intent for the same conversation.
+    @discardableResult
+    func acknowledgeArchiveSync(path rawPath: String, expected: Bool) -> Bool {
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        guard state.pendingDaemonArchiveIntentBySessionPath[path] == expected else { return false }
+        state.pendingDaemonArchiveIntentBySessionPath.removeValue(forKey: path)
+        save()
+        return true
     }
 
     /// Records an explicit sidebar expansion choice. `nil` restores the recency default.
@@ -420,13 +686,85 @@ final class AppPersistence {
         if changed { save() }
     }
 
+    /// Applies one daemon snapshot in one state-file write. A timestamp bridges the short window
+    /// before the activity monitor has learned the latest completion id, so a remotely read
+    /// conversation does not flash unread again when that heartbeat arrives.
+    func applyDaemonReadUpdates(_ updates: [DaemonReadUpdate]) {
+        guard !updates.isEmpty else { return }
+        var changed = false
+        for update in updates {
+            let path = URL(fileURLWithPath: update.path).standardizedFileURL.path
+            if update.unread {
+                if state.manuallyUnreadSessionPaths.insert(path).inserted { changed = true }
+                if state.lastReadAt.removeValue(forKey: path) != nil { changed = true }
+            } else {
+                if state.manuallyUnreadSessionPaths.remove(path) != nil { changed = true }
+                if let completionID = update.completionID {
+                    if state.latestCompletedEntryIDBySessionPath[path] != completionID {
+                        state.latestCompletedEntryIDBySessionPath[path] = completionID
+                        changed = true
+                    }
+                    if state.lastSeenCompletedEntryIDBySessionPath[path] != completionID {
+                        state.lastSeenCompletedEntryIDBySessionPath[path] = completionID
+                        changed = true
+                    }
+                    if state.lastReadAt.removeValue(forKey: path) != nil { changed = true }
+                } else {
+                    if update.markedAt > (state.lastReadAt[path] ?? .distantPast) {
+                        state.lastReadAt[path] = update.markedAt
+                        changed = true
+                    }
+                }
+            }
+        }
+        guard changed else { return }
+        state.pruneCompletionState(preferredPath: updates.last.map {
+            URL(fileURLWithPath: $0.path).standardizedFileURL.path
+        })
+        save()
+    }
+
     func updateState(_ update: (inout PersistedAppState) -> Void) {
         update(&state)
         save()
     }
 
-    private func save() {
-        guard let data = try? JSONEncoder().encode(state) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+    @discardableResult
+    func updateStateIfChanged(_ update: (inout PersistedAppState) -> Bool) -> Bool {
+        guard update(&state) else { return false }
+        save()
+        return true
+    }
+
+    @discardableResult
+    private func save() -> Bool {
+        guard let data = try? JSONEncoder().encode(state), data.count <= Self.maxStateBytes else {
+            return false
+        }
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+@MainActor
+extension AppPersistence: ScheduleMutationIntentPersisting {
+    var scheduleMutationIntents: [String: ScheduleMutationIntent] {
+        state.scheduleMutationIntents
+    }
+
+    @discardableResult
+    func replaceScheduleMutationIntents(_ values: [String: ScheduleMutationIntent]) -> Bool {
+        guard ScheduleMutationIntent.isWithinNormalBounds(values) else { return false }
+        let previous = state.scheduleMutationIntents
+        state.scheduleMutationIntents = values
+        guard save() else {
+            state.scheduleMutationIntents = previous
+            return false
+        }
+        return true
     }
 }

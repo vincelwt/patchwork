@@ -2,6 +2,12 @@ import Foundation
 import PatchworkKit
 import SwiftUI
 
+enum SettingsPane: Hashable {
+    case service
+    case agents
+    case presets
+}
+
 @main
 struct PatchworkApp: App {
     /// The probe factory is supplied only here for the explicit refresh command.
@@ -21,7 +27,8 @@ struct PatchworkApp: App {
             // The status probe reads Pi's extension host, which is a Pi-only concept, so it always
             // attaches to Pi regardless of which agent the current conversation uses.
             probeRuntimeFactory: { AgentRuntimeClient(adapter: PiProtocolAdapter(), additionalArguments: ["--no-session"]) },
-            sleepPrevention: SleepPreventionController.liveHandler()
+            sleepPrevention: SleepPreventionController.liveHandler(),
+            daemonClient: .unixSocket()
         ))
         // LaunchServices starts GUI apps with cwd="/". Keep the host process on a readable,
         // ordinary directory before any SwiftUI task launches Pi or a Git subprocess.
@@ -49,6 +56,9 @@ struct PatchworkApp: App {
             CommandMenu("Conversation") {
                 Button("Quick Switch…") { store.quickSwitchPresented = true }
                     .keyboardShortcut("k", modifiers: .command)
+                Button("Cycle New Chat Preset") { store.cyclePreset() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(store.route != .newChat || store.availablePresets.count < 2)
                 Button("Refresh") {
                     Task { await store.refreshSessions(); await store.refreshScheduledThreads() }
                 }
@@ -59,7 +69,7 @@ struct PatchworkApp: App {
                     .disabled(store.selectedSession == nil)
                 Button("Rename…") { store.renameRequested = true }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(store.selectedSession == nil)
+                    .disabled(!store.canRenameSelectedSession)
                 Button("Mark as Unread") { store.markSelectedUnread() }
                     .keyboardShortcut("u", modifiers: [.command, .option])
                     .disabled(store.selectedSession == nil)
@@ -82,9 +92,10 @@ struct PatchworkApp: App {
                     }
                 }
                 .disabled(store.availableModes.isEmpty)
-                // Fast priority, limits, and extension statuses all come from Pi extensions.
+                Button("Toggle Fast Mode") { store.toggleFastMode() }
+                    .disabled(store.activeCapabilities.fastMode == .unsupported)
+                // Limits and extension statuses come from Pi extensions.
                 Group {
-                    Button("Toggle Fast Priority") { store.toggleFastPriority() }
                     Button("Show Limits…") { store.showLimits() }
                     Divider()
                     Button("Refresh Extension Statuses") { store.refreshExtensionStatuses() }
@@ -104,15 +115,21 @@ struct PatchworkApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            TabView {
+            TabView(selection: $store.settingsPane) {
                 DaemonSettingsView()
                     .environmentObject(appDelegate.daemonSupervisor)
                     .padding(PatchworkTheme.space20)
                     .tabItem { Label("Service", systemImage: "bolt.horizontal") }
+                    .tag(SettingsPane.service)
                 AgentSettingsView()
                     .environmentObject(store)
                     .padding(PatchworkTheme.space20)
                     .tabItem { Label("Agents", systemImage: "square.stack.3d.up") }
+                    .tag(SettingsPane.agents)
+                PresetSettingsView()
+                    .environmentObject(store)
+                    .tabItem { Label("Presets", systemImage: "slider.horizontal.3") }
+                    .tag(SettingsPane.presets)
             }
             .font(PatchworkFont.body)
             .frame(width: PatchworkTheme.settingsWidth, alignment: .topLeading)
@@ -260,7 +277,7 @@ struct RootView: View {
     @ViewBuilder
     private var detail: some View {
         if store.schedulesPresented {
-            SchedulesView(service: store.scheduleService)
+            SchedulesView(service: store.scheduleService, persistence: store.persistence)
         } else {
             switch store.route {
             case .newChat: NewChatView()

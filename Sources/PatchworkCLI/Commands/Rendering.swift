@@ -74,11 +74,25 @@ enum Rendering {
     static func scheduleRow(_ schedule: WireSchedule, colorEnabled: Bool) -> [String] {
         [
             schedule.id,
+            scheduleAgent(schedule),
             truncated(schedule.name ?? "(unnamed)", max: nameWidth),
             scheduleStatus(schedule, colorEnabled: colorEnabled),
             triggerSummary(schedule.trigger),
             FlexibleDate.displayLocal(schedule.nextRunAt)
         ]
+    }
+
+    static func scheduleAgent(_ schedule: WireSchedule) -> String {
+        schedule.target?.kind == "existingThread" ? "thread" : truncated(schedule.agent ?? "pi", max: 12)
+    }
+
+    static func scheduleTarget(_ target: WireScheduleTarget?) -> String {
+        guard let target else { return "-" }
+        switch target.kind {
+        case "existingThread": return "thread \(target.threadId ?? "-")"
+        case "newThread": return "new thread in \(target.cwd ?? "-")"
+        default: return target.kind
+        }
     }
 
     static func runRow(_ run: WireRun, colorEnabled: Bool) -> [String] {

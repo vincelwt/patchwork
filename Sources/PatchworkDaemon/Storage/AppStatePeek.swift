@@ -15,6 +15,11 @@ import PatchworkKit
 enum AppStatePeek {
     struct Snapshot: Decodable, Sendable {
         var archivedSessionIDs: Set<String> = []
+        var archivedSessionPaths: Set<String> = []
+        var archiveExemptSessionPaths: Set<String> = []
+        /// Exact paths the app owns. These also act as bounded discovery seeds when Pi writes a
+        /// conversation outside its default root through a cwd-specific `sessionDir` setting.
+        var appStartedSessionPaths: Set<String> = []
         var manuallyUnreadSessionPaths: Set<String> = []
         var latestCompletedEntryIDBySessionPath: [String: String] = [:]
         var lastSeenCompletedEntryIDBySessionPath: [String: String] = [:]
@@ -25,19 +30,35 @@ enum AppStatePeek {
         var virtualFolderAssignments: [String: String] = [:]
         var projectFolderAssignments: [String: String] = [:]
         var managedWorktreeProjects: [String: String] = [:]
+        var showsForeignConversations = false
+        var disabledAgents: Set<String> = []
 
         private enum CodingKeys: String, CodingKey {
-            case archivedSessionIDs, manuallyUnreadSessionPaths
+            case archivedSessionIDs, archivedSessionPaths, archiveExemptSessionPaths
+            case appStartedSessionPaths
+            case manuallyUnreadSessionPaths
             case latestCompletedEntryIDBySessionPath, lastSeenCompletedEntryIDBySessionPath, lastReadAt
             case virtualFolders, virtualFolderAssignments, projectFolderAssignments
             case managedWorktreeProjects
+            case showsForeignConversations, disabledAgents
         }
 
         init() {}
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            archivedSessionIDs = try container.decodeIfPresent(Set<String>.self, forKey: .archivedSessionIDs) ?? []
+            archivedSessionIDs = ArchiveStateBounds.legacyIDs(try container.decodeIfPresent(
+                Set<String>.self, forKey: .archivedSessionIDs
+            ) ?? [])
+            archivedSessionPaths = ArchiveStateBounds.standardizedPaths(try container.decodeIfPresent(
+                Set<String>.self, forKey: .archivedSessionPaths
+            ) ?? [])
+            archiveExemptSessionPaths = ArchiveStateBounds.standardizedPaths(try container.decodeIfPresent(
+                Set<String>.self, forKey: .archiveExemptSessionPaths
+            ) ?? [])
+            appStartedSessionPaths = ArchiveStateBounds.standardizedPaths(try container.decodeIfPresent(
+                Set<String>.self, forKey: .appStartedSessionPaths
+            ) ?? [])
             manuallyUnreadSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .manuallyUnreadSessionPaths) ?? []
             latestCompletedEntryIDBySessionPath = try container.decodeIfPresent(
                 [String: String].self, forKey: .latestCompletedEntryIDBySessionPath
@@ -60,6 +81,10 @@ enum AppStatePeek {
                 managedWorktreeProjects[URL(fileURLWithPath: worktree).standardizedFileURL.path] =
                     URL(fileURLWithPath: project).standardizedFileURL.path
             }
+            showsForeignConversations = try container.decodeIfPresent(
+                Bool.self, forKey: .showsForeignConversations
+            ) ?? false
+            disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
         }
 
         /// The cycle-safe, depth-capped projection `GET /v1/folders` returns. Assignment keys are
@@ -77,7 +102,21 @@ enum AppStatePeek {
             )
         }
 
-        func isArchived(sessionID: String) -> Bool { archivedSessionIDs.contains(sessionID) }
+        func isArchived(sessionID: String, path: String) -> Bool {
+            let path = URL(fileURLWithPath: path).standardizedFileURL.path
+            return archivedSessionPaths.contains(path)
+                || (archivedSessionIDs.contains(sessionID)
+                    && !archiveExemptSessionPaths.contains(path))
+        }
+
+        func sidebarVisibility(desktopStartedThreadPaths: Set<String>) -> SidebarVisibility {
+            SidebarVisibility(
+                showsForeignConversations: showsForeignConversations,
+                appStartedSessionPaths: appStartedSessionPaths,
+                desktopStartedThreadPaths: desktopStartedThreadPaths,
+                disabledAgents: Set(disabledAgents.compactMap(AgentKind.init(rawValue:)))
+            )
+        }
 
         func isUnread(path: String, latestCompletionID: String?, modifiedAt: Date) -> Bool {
             if manuallyUnreadSessionPaths.contains(path) { return true }
@@ -92,7 +131,7 @@ enum AppStatePeek {
     /// The app's own `state.json` is a few hundred KB at worst. Reading it is unavoidable, but
     /// reading an arbitrarily large one is not: past this the daemon reports "no state" rather
     /// than pulling a corrupted or hostile file into memory on every folder request.
-    static let maxStateBytes = 8 * 1_024 * 1_024
+    static let maxStateBytes = ArchiveStateBounds.appStateByteLimit
 
     static func load(from url: URL = AppStatePeek.defaultURL()) -> Snapshot {
         guard let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,

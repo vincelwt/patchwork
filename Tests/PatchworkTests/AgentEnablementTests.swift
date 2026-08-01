@@ -127,6 +127,12 @@ final class PersistedAppStateRoundTripTests: XCTestCase {
         state.agentModes = ["pi": "ultra", "codex": "workspace-write"]
         state.disabledAgents = ["codex"]
         state.lastFolder = "/tmp/project"
+        let preset = AgentPreset(
+            name: "Deep work", agent: .pi, provider: "openai", modelID: "gpt-test",
+            modelName: "GPT Test", thinkingLevel: "xhigh"
+        )
+        state.presets = [preset]
+        state.lastPresetID = preset.id
 
         let decoded = try JSONDecoder().decode(
             PersistedAppState.self, from: try JSONEncoder().encode(state)
@@ -135,6 +141,8 @@ final class PersistedAppStateRoundTripTests: XCTestCase {
         XCTAssertEqual(decoded.agentModes, ["pi": "ultra", "codex": "workspace-write"])
         XCTAssertEqual(decoded.disabledAgents, ["codex"])
         XCTAssertEqual(decoded.lastFolder, "/tmp/project")
+        XCTAssertEqual(decoded.presets, [preset])
+        XCTAssertEqual(decoded.lastPresetID, preset.id)
     }
 
     /// A preferences file written before these fields existed still decodes.
@@ -145,5 +153,7 @@ final class PersistedAppStateRoundTripTests: XCTestCase {
         XCTAssertNil(decoded.lastAgent)
         XCTAssertTrue(decoded.agentModes.isEmpty)
         XCTAssertTrue(decoded.disabledAgents.isEmpty)
+        XCTAssertTrue(decoded.presets.isEmpty)
+        XCTAssertNil(decoded.lastPresetID)
     }
 }

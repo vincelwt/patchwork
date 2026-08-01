@@ -55,11 +55,11 @@ actor FaviconService {
         let task = Task<Data?, Never> { [fetcher] in
             await self.acquireFetchSlot()
             guard !Task.isCancelled else {
-                await self.releaseFetchSlot()
+                self.releaseFetchSlot()
                 return nil
             }
             let result = await fetcher.fetchFavicon(host: host, maxBytes: Self.maxDiskBytes)
-            await self.releaseFetchSlot()
+            self.releaseFetchSlot()
             return result
         }
         inFlight[host] = task

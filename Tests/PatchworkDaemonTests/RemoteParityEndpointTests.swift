@@ -13,6 +13,10 @@ final class RemoteParityEndpointTests: XCTestCase {
     private var interactions: InteractionRegistry!
     private var liveSessions: LiveSessionRegistry!
 
+    private var primaryThreadKey: ThreadInstanceKey {
+        ThreadInstanceKey(path: directory.appendingPathComponent("sessions/sess-1.jsonl").path)
+    }
+
     override func setUp() {
         super.setUp()
         directory = TestSupport.tempDirectory()
@@ -60,7 +64,7 @@ final class RemoteParityEndpointTests: XCTestCase {
     func testSteerGoesToTheLiveTurnAndIsNeverQueuedBehindIt() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"stop that","delivery":"steer"}"#)
         XCTAssertEqual(response.status, 200)
@@ -80,11 +84,26 @@ final class RemoteParityEndpointTests: XCTestCase {
     func testFollowUpUsesPisOwnFollowUpCommandWhenALiveTurnExists() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"and also","delivery":"followUp"}"#)
         XCTAssertEqual(try decode(SendMessageResponse.self, response).delivery, .followUp)
         XCTAssertEqual(runtime.delivered.map(\.command), ["follow_up"])
+    }
+
+    func testOversizedLiveSteerIsRejectedBeforeWritingToTheRuntime() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let runtime = FakeLiveRuntime()
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
+        let text = String(repeating: "x", count: RunQueue.defaultMaxPromptBytes + 1)
+        let body = try String(decoding: PatchworkJSON.encoder.encode(
+            SendMessageRequest(text: text, delivery: .steer, clientId: "oversized-live")
+        ), as: UTF8.self)
+
+        let response = await send("POST", "/v1/threads/sess-1/messages", body: body)
+
+        XCTAssertEqual(response.status, 413)
+        XCTAssertTrue(runtime.delivered.isEmpty)
     }
 
     func testSteerWithNoLiveTurnIsReportedAsAnOrdinaryPromptNotAsSteering() async throws {
@@ -101,7 +120,7 @@ final class RemoteParityEndpointTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
         runtime.result = .rejected("Nothing to steer.")
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","delivery":"steer"}"#)
         XCTAssertEqual(response.status, 409)
@@ -113,7 +132,7 @@ final class RemoteParityEndpointTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
         runtime.result = .unacknowledged
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","delivery":"steer"}"#)
         XCTAssertEqual(response.status, 200)
@@ -126,7 +145,7 @@ final class RemoteParityEndpointTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
         runtime.throwsWriteFailure = true
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","delivery":"steer"}"#)
         XCTAssertEqual(try decode(SendMessageResponse.self, response).delivery, .auto)
@@ -135,7 +154,7 @@ final class RemoteParityEndpointTests: XCTestCase {
     func testAMessageWithNoDeliveryNeverTouchesTheLiveSession() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         _ = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"plain"}"#)
         XCTAssertTrue(runtime.delivered.isEmpty, "an ordinary prompt still queues, exactly as before")
@@ -159,7 +178,7 @@ final class RemoteParityEndpointTests: XCTestCase {
 
         let response = await send(
             "POST", "/v1/threads",
-            body: #"{"cwd":"\#(directory.path)","name":"Web thread","message":"hello","mode":"smart"}"#
+            body: #"{"cwd":"\#(directory.path)","name":"Web thread","message":"hello","mode":"smart","clientId":"create-pi"}"#
         )
         XCTAssertEqual(response.status, 202)
         let decoded = try decode(CreateThreadResponse.self, response)
@@ -177,6 +196,452 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(cwd, directory.path)
         XCTAssertEqual(job.prompt, "hello")
         XCTAssertEqual(job.mode, "smart")
+    }
+
+    func testCreateReportsUnknownAndNeverDuplicatesWhenOwnershipCannotPersist() async throws {
+        let file = TestSupport.writeSessionFile(
+            in: directory, id: "ownership-unknown", cwd: directory.path
+        )
+        let created = PatchworkThread(
+            id: "ownership-unknown", path: file.path, name: "Ownership unknown",
+            cwd: directory.path, folder: directory.lastPathComponent,
+            createdAt: Date(), updatedAt: Date()
+        )
+        let overlayURL = directory.appendingPathComponent("overlay.json")
+        try Data("{}".utf8).write(to: overlayURL)
+        try FileManager.default.setAttributes(
+            [.immutable: true], ofItemAtPath: overlayURL.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.immutable: false], ofItemAtPath: overlayURL.path
+            )
+        }
+        let threadRPC = FakeThreadRPCService(thread: created)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(directory.path)","name":"Ownership unknown","clientId":"ownership-failure"}"#
+
+        let first = await send("POST", "/v1/threads", body: body)
+        let replay = await send("POST", "/v1/threads", body: body)
+
+        XCTAssertEqual(first.status, 409)
+        XCTAssertTrue(
+            String(decoding: first.body, as: UTF8.self).contains("creation_outcome_unknown")
+        )
+        XCTAssertEqual(replay.status, 409)
+        XCTAssertEqual(threadRPC.created, 1)
+        XCTAssertTrue(executor.executedJobs.isEmpty)
+    }
+
+    func testEveryMessageBackedCreateRequiresAClientIDBeforeSideEffects() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "unused-create", cwd: directory.path)
+        let thread = PatchworkThread(
+            id: "unused-create", path: file.path, name: "Unused", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let threadRPC = FakeThreadRPCService(thread: thread)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        for agent in ["pi", "codex", "claude"] {
+            let response = await send(
+                "POST", "/v1/threads",
+                body: #"{"cwd":"\#(directory.path)","agent":"\#(agent)","message":"hello","worktree":true}"#
+            )
+            XCTAssertEqual(response.status, 400, agent)
+            XCTAssertTrue(
+                String(decoding: response.body, as: UTF8.self).contains("client_id_required"),
+                agent
+            )
+        }
+
+        XCTAssertEqual(threadRPC.created, 0)
+        XCTAssertTrue(executor.executedJobs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: core.worktreeRootURL.path))
+        let queued = await core.runQueue.queuedCount()
+        let active = await core.runQueue.activeCount()
+        XCTAssertEqual(queued, 0)
+        XCTAssertEqual(active, 0)
+    }
+
+    func testAgentThatDoesNotPersistIdleRejectsBeforeAnyCreationSideEffect() async throws {
+        let fakeThread = PatchworkThread(
+            id: "unused", path: directory.appendingPathComponent("unused.jsonl").path,
+            name: "unused", cwd: directory.path, folder: directory.lastPathComponent,
+            createdAt: Date(), updatedAt: Date(), agent: .claude
+        )
+        let threadRPC = FakeThreadRPCService(thread: fakeThread)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","agent":"claude","message":"   ","worktree":true,"clientId":"idle-claude"}"#
+        )
+
+        XCTAssertEqual(response.status, 400)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("first_message_required"))
+        XCTAssertEqual(threadRPC.created, 0)
+        XCTAssertTrue(executor.executedJobs.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: core.worktreeRootURL.path))
+    }
+
+    func testPromptBackedCreatePublishesOnlyARealImmediatelyOpenableThread() async throws {
+        let claudeRoot = directory.appendingPathComponent("claude", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeRoot, withIntermediateDirectories: true)
+        let transcript = claudeRoot.appendingPathComponent("project/claude-created.jsonl")
+        let cwd = directory.path
+        let readyObservation = ReadyCallbackObservation()
+        let fakeThread = PatchworkThread(
+            id: "unused", path: directory.appendingPathComponent("unused.jsonl").path,
+            name: "unused", cwd: directory.path, folder: directory.lastPathComponent,
+            createdAt: Date(), updatedAt: Date(), agent: .claude
+        )
+        let threadRPC = FakeThreadRPCService(thread: fakeThread)
+        executor = FakeRunExecutor()
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC,
+            extraSessionRoots: [(.claude, claudeRoot)]
+        )
+        let threadStore = core.threadStore
+        executor.behavior = { job in
+            let writer = Task {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                _ = TestSupport.writeClaudeTranscript(
+                    in: claudeRoot, id: "claude-created", cwd: cwd,
+                    message: "hello", name: "Claude thread"
+                )
+            }
+            await job.onThreadReady?("claude-created", transcript.path)
+            await readyObservation.record(
+                await threadStore.thread(idOrPath: transcript.path) != nil
+            )
+            await writer.value
+            return RunOutcome(
+                status: .ok, error: nil, summary: "done",
+                resolvedThreadId: "claude-created", resolvedThreadPath: transcript.path,
+                promptStartedAt: Date(), promptAcceptedAt: Date()
+            )
+        }
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","agent":"claude","name":"Claude thread","message":"hello","clientId":"create-claude","desktopManaged":true}"#
+        )
+        XCTAssertEqual(response.status, 202)
+        let created = try decode(CreateThreadResponse.self, response)
+        XCTAssertEqual(created.thread.id, "claude-created")
+        XCTAssertEqual(created.thread.path, transcript.path)
+        XCTAssertEqual(created.thread.agent, .claude)
+        XCTAssertEqual(created.runId, executor.executedJobs.first?.id)
+        XCTAssertEqual(threadRPC.created, 0)
+        let visibleWhenReadyReturned = await readyObservation.waitForValue()
+        XCTAssertEqual(visibleWhenReadyReturned, true)
+
+        let detail = await send("GET", "/v1/threads/\(created.thread.id)")
+        XCTAssertEqual(detail.status, 200, "the response must never point at a not-yet-visible transcript")
+        XCTAssertEqual(try decode(ThreadDetailResponse.self, detail).thread.path, transcript.path)
+        guard case let .newThread(cwd, name, agent) = executor.executedJobs.first?.target else {
+            return XCTFail("the first message must own the fresh runtime")
+        }
+        XCTAssertEqual(cwd, directory.path)
+        XCTAssertEqual(name, "Claude thread")
+        XCTAssertEqual(agent, .claude)
+        let snapshot = DaemonWorktreeProjects.loadSnapshot(
+            from: directory.appendingPathComponent("overlay.json")
+        )
+        XCTAssertTrue(snapshot.managedThreadPaths.contains(transcript.path))
+        XCTAssertTrue(snapshot.desktopStartedThreadPaths.contains(transcript.path))
+    }
+
+    func testPromptBackedCompletionRecoveryPublishesAnIdleThread() async throws {
+        let claudeRoot = directory.appendingPathComponent("claude", isDirectory: true)
+        let transcript = TestSupport.writeClaudeTranscript(
+            in: claudeRoot, id: "claude-complete", cwd: directory.path, message: "hello"
+        )
+        executor = FakeRunExecutor { _ in
+            RunOutcome(
+                status: .ok, error: nil, summary: "done",
+                resolvedThreadId: "claude-complete", resolvedThreadPath: transcript.path,
+                promptStartedAt: Date(), promptAcceptedAt: Date()
+            )
+        }
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, extraSessionRoots: [(.claude, claudeRoot)]
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","agent":"claude","message":"hello","clientId":"complete-claude"}"#
+        )
+
+        XCTAssertEqual(response.status, 202)
+        let created = try decode(CreateThreadResponse.self, response)
+        XCTAssertEqual(created.thread.id, "claude-complete")
+        XCTAssertFalse(created.thread.running)
+        let detail = try decode(
+            ThreadDetailResponse.self, await send("GET", "/v1/threads/claude-complete")
+        )
+        XCTAssertFalse(detail.thread.running)
+    }
+
+    func testPromptBackedCreateFailureBeforeDispatchCanRetryTheSameClientID() async throws {
+        let claudeRoot = directory.appendingPathComponent("claude", isDirectory: true)
+        try FileManager.default.createDirectory(at: claudeRoot, withIntermediateDirectories: true)
+        let transcript = TestSupport.writeClaudeTranscript(
+            in: claudeRoot, id: "claude-retry", cwd: directory.path
+        )
+        executor = FakeRunExecutor { _ in
+            RunOutcome.failed("agent unavailable", retryable: true)
+        }
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, extraSessionRoots: [(.claude, claudeRoot)]
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(directory.path)","agent":"claude","message":"hello","clientId":"retry-claude"}"#
+
+        let failed = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(failed.status, 503)
+        executor.behavior = { job in
+            await job.onThreadReady?("claude-retry", transcript.path)
+            return RunOutcome(
+                status: .ok, error: nil, summary: nil,
+                resolvedThreadId: "claude-retry", resolvedThreadPath: transcript.path,
+                promptStartedAt: Date(), promptAcceptedAt: Date()
+            )
+        }
+
+        let retried = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(retried.status, 202)
+        XCTAssertEqual(try decode(CreateThreadResponse.self, retried).thread.id, "claude-retry")
+        XCTAssertEqual(executor.executedJobs.count, 2)
+    }
+
+    func testPromptBackedAmbiguityRequiresReviewAndNeverRunsAgain() async throws {
+        executor = FakeRunExecutor { _ in
+            RunOutcome(
+                status: .interrupted, error: "ack lost", summary: nil,
+                promptStartedAt: Date()
+            )
+        }
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(directory.path)","agent":"claude","message":"hello","clientId":"unknown-claude"}"#
+
+        let first = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(first.status, 409)
+        XCTAssertTrue(String(decoding: first.body, as: UTF8.self).contains("creation_outcome_unknown"))
+        let replay = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(replay.status, 409)
+        XCTAssertTrue(String(decoding: replay.body, as: UTF8.self).contains("creation_outcome_unknown"))
+        XCTAssertEqual(executor.executedJobs.count, 1)
+    }
+
+    func testIdleCreationAmbiguityRetainsReplayProtectionAndItsWorktree() async throws {
+        let project = directory.appendingPathComponent("ambiguous-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        XCTAssertEqual(git(["-C", project.path, "init", "-q"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "config", "user.email", "test@example.invalid"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "config", "user.name", "Test"]), 0)
+        try Data("one\n".utf8).write(to: project.appendingPathComponent("sample.txt"))
+        XCTAssertEqual(git(["-C", project.path, "add", "sample.txt"]), 0)
+        XCTAssertEqual(git(["-C", project.path, "commit", "-q", "-m", "initial"]), 0)
+
+        let threadRPC = AmbiguousThreadRPCService()
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(project.path)","agent":"codex","message":"hello","worktree":true,"clientId":"unknown-name-ack"}"#
+
+        let first = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(first.status, 409)
+        XCTAssertTrue(String(decoding: first.body, as: UTF8.self).contains("creation_outcome_unknown"))
+        let createdCwds = await threadRPC.createdCwds()
+        let worktree = try XCTUnwrap(createdCwds.first)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path))
+        XCTAssertEqual(
+            DaemonWorktreeProjects.load(
+                from: directory.appendingPathComponent("overlay.json")
+            )[worktree.standardizedFileURL.path],
+            project.standardizedFileURL.path
+        )
+
+        let replay = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(replay.status, 409)
+        XCTAssertTrue(String(decoding: replay.body, as: UTF8.self).contains("creation_outcome_unknown"))
+        let createCount = await threadRPC.createCount()
+        let queued = await core.runQueue.queuedCount()
+        XCTAssertEqual(createCount, 1)
+        XCTAssertTrue(executor.executedJobs.isEmpty)
+        XCTAssertEqual(queued, 0)
+    }
+
+    func testCreateReturnsTheRealThreadWhenShutdownRejectsItsFirstMessage() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "created-during-shutdown", cwd: directory.path)
+        let created = PatchworkThread(
+            id: "created-during-shutdown", path: file.path, name: "Kept thread",
+            cwd: directory.path, folder: directory.lastPathComponent,
+            createdAt: Date(), updatedAt: Date()
+        )
+        let barrier = CreateBarrier()
+        let threadRPC = FakeThreadRPCService(thread: created) {
+            await barrier.enterAndWait()
+        }
+        executor = FakeRunExecutor()
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let request = Task {
+            await self.send(
+                "POST", "/v1/threads",
+                body: #"{"cwd":"\#(directory.path)","message":"keep this message","clientId":"shutdown-create"}"#
+            )
+        }
+        await barrier.waitUntilEntered()
+        await core.runQueue.shutdown(graceSeconds: 0)
+        await barrier.release()
+        let response = await request.value
+        let decoded = try decode(CreateThreadResponse.self, response)
+
+        XCTAssertEqual(response.status, 201)
+        XCTAssertEqual(decoded.thread.id, "created-during-shutdown")
+        XCTAssertNil(decoded.runId)
+        XCTAssertNotNil(decoded.firstMessageError)
+        XCTAssertEqual(threadRPC.created, 1)
+        XCTAssertTrue(executor.executedJobs.isEmpty)
+    }
+
+    func testRepeatingCreateAfterRestartReplaysWithoutCreatingOrPromptingAgain() async throws {
+        let file = TestSupport.writeSessionFile(
+            in: directory, id: "created-replay", cwd: directory.path
+        )
+        let created = PatchworkThread(
+            id: "created-replay", path: file.path, name: "Replay", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let firstRPC = FakeThreadRPCService(thread: created)
+        executor = FakeRunExecutor()
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: firstRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(directory.path)","name":"Replay","message":"hello","clientId":"create-restart"}"#
+
+        let firstResponse = await send("POST", "/v1/threads", body: body)
+        let first = try decode(CreateThreadResponse.self, firstResponse)
+        XCTAssertEqual(firstResponse.status, 202)
+        try await settle()
+        XCTAssertEqual(firstRPC.created, 1)
+        XCTAssertEqual(executor.executedJobs.count, 1)
+
+        let restartedRPC = FakeThreadRPCService(thread: created)
+        let restartedExecutor = FakeRunExecutor()
+        executor = restartedExecutor
+        core = TestSupport.makeCore(
+            in: directory, executor: restartedExecutor,
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry(),
+            threadRPC: restartedRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let replayResponse = await send("POST", "/v1/threads", body: body)
+        let replay = try decode(CreateThreadResponse.self, replayResponse)
+        XCTAssertEqual(replayResponse.status, firstResponse.status)
+        XCTAssertEqual(replay, first)
+        try await settle()
+        XCTAssertEqual(restartedRPC.created, 0)
+        XCTAssertTrue(restartedExecutor.executedJobs.isEmpty)
+    }
+
+    func testCompletedCreateReplaysAfterItsWorkingDirectoryDisappears() async throws {
+        let project = directory.appendingPathComponent("temporary-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let file = TestSupport.writeSessionFile(
+            in: directory, id: "created-gone-cwd", cwd: project.path
+        )
+        let created = PatchworkThread(
+            id: "created-gone-cwd", path: file.path, name: "Replay", cwd: project.path,
+            folder: project.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let firstRPC = FakeThreadRPCService(thread: created)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: firstRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+        let body = #"{"cwd":"\#(project.path)","name":"Replay","clientId":"create-gone-cwd"}"#
+
+        let firstResponse = await send("POST", "/v1/threads", body: body)
+        let first = try decode(CreateThreadResponse.self, firstResponse)
+        XCTAssertEqual(firstResponse.status, 201)
+        XCTAssertEqual(firstRPC.created, 1)
+
+        try FileManager.default.removeItem(at: project)
+        let restartedRPC = FakeThreadRPCService(thread: created)
+        core = TestSupport.makeCore(
+            in: directory, executor: FakeRunExecutor(),
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry(),
+            threadRPC: restartedRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let replayResponse = await send("POST", "/v1/threads", body: body)
+        XCTAssertEqual(replayResponse.status, firstResponse.status)
+        XCTAssertEqual(try decode(CreateThreadResponse.self, replayResponse), first)
+        XCTAssertEqual(restartedRPC.created, 0)
+    }
+
+    func testCreateClientIDCannotBeReusedForDifferentInput() async throws {
+        let file = TestSupport.writeSessionFile(
+            in: directory, id: "created-conflict", cwd: directory.path
+        )
+        let created = PatchworkThread(
+            id: "created-conflict", path: file.path, name: "One", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        let threadRPC = FakeThreadRPCService(thread: created)
+        core = TestSupport.makeCore(
+            in: directory, executor: executor, interactions: interactions,
+            liveSessions: liveSessions, threadRPC: threadRPC
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let first = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","name":"One","clientId":"create-conflict"}"#
+        )
+        XCTAssertEqual(first.status, 201)
+        let conflict = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","name":"One","clientId":"create-conflict","desktopManaged":true}"#
+        )
+        XCTAssertEqual(conflict.status, 409)
+        XCTAssertTrue(String(decoding: conflict.body, as: UTF8.self).contains("creation_id_conflict"))
+        XCTAssertEqual(threadRPC.created, 1)
     }
 
     func testCreateWithWorktreeUsesDesktopFlowAndPersistsTheSourceProject() async throws {
@@ -224,7 +689,7 @@ final class RemoteParityEndpointTests: XCTestCase {
     func testRuntimeControlsUseTheAlreadyLivePiSession() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
 
         let loaded = try decode(
             ThreadRuntimeResponse.self,
@@ -272,13 +737,13 @@ final class RemoteParityEndpointTests: XCTestCase {
         )
         XCTAssertEqual(changed.status, 200)
         XCTAssertEqual(threadRPC.thinkingSets, ["high"])
-        let stillBusy = await core.runQueue.isThreadBusy("sess-idle")
+        let stillBusy = await core.runQueue.isThreadBusy(ThreadInstanceKey(path: file.path))
         XCTAssertFalse(stillBusy, "the short-lived reservation is always released")
     }
 
     func testRuntimeControlsRespectTheNativeAppsLease() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
-        _ = await core.leaseStore.acquire(threadId: "sess-1", owner: "app", ttlSeconds: 60)
+        _ = await core.leaseStore.acquire(thread: primaryThreadKey, owner: "app", ttlSeconds: 60)
         let response = await send("GET", "/v1/threads/sess-1/runtime")
         XCTAssertEqual(response.status, 409)
         XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("thread_leased"))
@@ -286,14 +751,16 @@ final class RemoteParityEndpointTests: XCTestCase {
 
     func testNativeLeaseCannotStealAWebRuntimeLease() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
-        _ = await core.leaseStore.acquire(threadId: "sess-1", owner: "web-runtime", ttlSeconds: 60)
+        _ = await core.leaseStore.acquire(
+            thread: primaryThreadKey, owner: "web-runtime", ttlSeconds: 60
+        )
 
         let response = await send(
             "POST", "/v1/threads/sess-1/lease",
             body: #"{"owner":"app","ttlSeconds":60}"#
         )
         XCTAssertEqual(response.status, 409)
-        let current = await core.leaseStore.current(threadId: "sess-1")
+        let current = await core.leaseStore.current(thread: primaryThreadKey)
         XCTAssertEqual(current?.owner, "web-runtime")
     }
 
@@ -308,6 +775,178 @@ final class RemoteParityEndpointTests: XCTestCase {
 
         XCTAssertEqual(first.runId, second.runId, "the retry gets the original answer")
         XCTAssertEqual(first, second)
+    }
+
+    func testRepeatingASubmissionAfterRestartNeverReachesASecondRunner() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let body = #"{"text":"hello","clientId":"web-restart"}"#
+
+        let first = try decode(
+            SendMessageResponse.self,
+            await send("POST", "/v1/threads/sess-1/messages", body: body)
+        )
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 1)
+
+        let restartedExecutor = FakeRunExecutor()
+        executor = restartedExecutor
+        core = TestSupport.makeCore(
+            in: directory, executor: restartedExecutor,
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry()
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let replay = try decode(
+            SendMessageResponse.self,
+            await send("POST", "/v1/threads/sess-1/messages", body: body)
+        )
+        XCTAssertEqual(replay, first)
+        try await settle()
+        XCTAssertTrue(restartedExecutor.executedJobs.isEmpty, "the restarted service replays the durable answer")
+    }
+
+    func testCompletedSubmissionReplaysAfterTranscriptRemovalAndRestart() async throws {
+        let transcript = TestSupport.writeSessionFile(
+            in: directory, id: "sess-1", cwd: directory.path
+        )
+        let body = #"{"text":"hello","clientId":"removed-replay"}"#
+        let first = try decode(
+            SendMessageResponse.self,
+            await send("POST", "/v1/threads/sess-1/messages", body: body)
+        )
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 1)
+        try FileManager.default.removeItem(at: transcript)
+
+        let restartedExecutor = FakeRunExecutor()
+        executor = restartedExecutor
+        core = TestSupport.makeCore(
+            in: directory, executor: restartedExecutor,
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry()
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let replay = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(replay.status, 200)
+        XCTAssertEqual(try decode(SendMessageResponse.self, replay), first)
+        let changed = await send(
+            "POST", "/v1/threads/sess-1/messages",
+            body: #"{"text":"different","clientId":"removed-replay"}"#
+        )
+        XCTAssertEqual(changed.status, 409)
+        XCTAssertTrue(String(decoding: changed.body, as: UTF8.self).contains("submission_id_conflict"))
+        try await settle()
+        XCTAssertTrue(restartedExecutor.executedJobs.isEmpty)
+    }
+
+    func testCompletedSubmissionReplaysWhenItsIDLaterBecomesAmbiguous() async throws {
+        let transcript = TestSupport.writeSessionFile(
+            in: directory, id: "sess-1", cwd: directory.path
+        )
+        let body = #"{"text":"hello","clientId":"ambiguous-replay"}"#
+        let first = try decode(
+            SendMessageResponse.self,
+            await send("POST", "/v1/threads/sess-1/messages", body: body)
+        )
+        try await settle()
+        let copy = transcript.deletingLastPathComponent()
+            .appendingPathComponent("sess-1-history.jsonl")
+        try FileManager.default.copyItem(at: transcript, to: copy)
+
+        let restartedExecutor = FakeRunExecutor()
+        executor = restartedExecutor
+        core = TestSupport.makeCore(
+            in: directory, executor: restartedExecutor,
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry()
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let replay = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(replay.status, 200)
+        XCTAssertEqual(try decode(SendMessageResponse.self, replay), first)
+        try await settle()
+        XCTAssertTrue(restartedExecutor.executedJobs.isEmpty)
+    }
+
+    func testSubmissionClientIDCannotBeReusedForDifferentTextOrDelivery() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let first = await send(
+            "POST", "/v1/threads/sess-1/messages",
+            body: #"{"text":"hello","clientId":"message-conflict"}"#
+        )
+        XCTAssertEqual(first.status, 200)
+
+        for body in [
+            #"{"text":"different","clientId":"message-conflict"}"#,
+            #"{"text":"hello","delivery":"followUp","clientId":"message-conflict"}"#
+        ] {
+            let conflict = await send(
+                "POST", "/v1/threads/sess-1/messages", body: body
+            )
+            XCTAssertEqual(conflict.status, 409)
+            XCTAssertTrue(String(decoding: conflict.body, as: UTF8.self).contains("submission_id_conflict"))
+        }
+        try await settle()
+        XCTAssertEqual(executor.executedJobs.count, 1)
+    }
+
+    func testCompletedSubmissionReplaysEvenWhenTheThreadIsNowLeased() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let body = #"{"text":"hello","clientId":"replay-under-lease"}"#
+        let first = try decode(
+            SendMessageResponse.self,
+            await send("POST", "/v1/threads/sess-1/messages", body: body)
+        )
+        _ = await core.leaseStore.acquire(thread: primaryThreadKey, owner: "app", ttlSeconds: 60)
+
+        let replayResponse = await send("POST", "/v1/threads/sess-1/messages", body: body)
+        XCTAssertEqual(replayResponse.status, 200)
+        XCTAssertEqual(try decode(SendMessageResponse.self, replayResponse), first)
+    }
+
+    func testRestartRefusesAnAmbiguousSubmissionWithoutReachingTheRunner() async throws {
+        _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
+        let fingerprint = SubmissionRegistry.fingerprint(parts: ["message", "hello", "auto"])
+        let claim = await core.submissions.claim(
+            thread: primaryThreadKey, clientID: "web-ambiguous",
+            requestFingerprint: fingerprint
+        )
+        XCTAssertNotNil(claim.ownership)
+
+        let restartedExecutor = FakeRunExecutor()
+        executor = restartedExecutor
+        core = TestSupport.makeCore(
+            in: directory, executor: restartedExecutor,
+            interactions: InteractionRegistry(), liveSessions: LiveSessionRegistry()
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads/sess-1/messages",
+            body: #"{"text":"hello","clientId":"web-ambiguous"}"#
+        )
+        XCTAssertEqual(response.status, 409)
+        XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("submission_outcome_unknown"))
+        XCTAssertTrue(restartedExecutor.executedJobs.isEmpty)
+    }
+
+    func testAnInFlightRetryWaitsForAndReplaysTheOriginalAnswer() async throws {
+        let registry = SubmissionRegistry()
+        let claim = await registry.claim(threadID: "thread", clientID: "same")
+        let ownership = try XCTUnwrap(claim.ownership)
+        let waiter = Task {
+            await registry.waitForCompletion(threadID: "thread", clientID: "same")
+        }
+        await Task.yield()
+        let response = SendMessageResponse(
+            runId: "run_original", queued: false, delivery: .auto
+        )
+        await registry.complete(
+            threadID: "thread", clientID: "same", ownership: ownership, response: response
+        )
+
+        let replay = await waiter.value
+        XCTAssertEqual(replay, response)
     }
 
     /// The property that actually matters: a repeat never reaches the runner. Asserted against the
@@ -329,8 +968,10 @@ final class RemoteParityEndpointTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         // Every slot held by a send that has not finished. Making room by evicting one would let
         // its retry through as a second prompt, so the *new* submission is the one refused.
+        var owners: [SubmissionRegistry.Ownership] = []
         for index in 0..<SubmissionRegistry.maxEntries {
-            _ = await core.submissions.claim(threadID: "sess-1", clientID: "c\(index)")
+            let claim = await core.submissions.claim(threadID: "sess-1", clientID: "c\(index)")
+            owners.append(try XCTUnwrap(claim.ownership))
         }
 
         let response = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello","clientId":"one-too-many"}"#)
@@ -339,8 +980,17 @@ final class RemoteParityEndpointTests: XCTestCase {
         try await settle()
         XCTAssertTrue(executor.executedJobs.isEmpty, "a refused send never becomes a run")
 
-        // It is a capacity answer, not a verdict on the message: once a slot frees, it goes.
-        await core.submissions.complete(threadID: "sess-1", clientID: "c0", response: SendMessageResponse(runId: "run_0", queued: false, delivery: .auto))
+        // Completion still protects a possibly lost response, so only a definitely failed claim
+        // frees capacity before the replay TTL.
+        await core.submissions.complete(
+            threadID: "sess-1", clientID: "c0", ownership: owners[0],
+            response: SendMessageResponse(runId: "run_0", queued: false, delivery: .auto)
+        )
+        let stillFull = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello","clientId":"one-too-many"}"#)
+        XCTAssertEqual(stillFull.status, 503)
+        await core.submissions.abandon(
+            threadID: "sess-1", clientID: "c1", ownership: owners[1]
+        )
         let retry = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"hello","clientId":"one-too-many"}"#)
         XCTAssertEqual(retry.status, 200)
     }
@@ -357,7 +1007,7 @@ final class RemoteParityEndpointTests: XCTestCase {
     func testARepeatedSteerIsNotDeliveredIntoTheLiveTurnASecondTime() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
         let body = #"{"text":"stop","delivery":"steer","clientId":"web-steer1"}"#
 
         let first = try decode(SendMessageResponse.self, await send("POST", "/v1/threads/sess-1/messages", body: body))
@@ -387,14 +1037,14 @@ final class RemoteParityEndpointTests: XCTestCase {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-1", cwd: directory.path)
         let runtime = FakeLiveRuntime()
         runtime.result = .rejected("Nothing to steer.")
-        liveSessions.register(threadID: "sess-1", runID: "run_live", handle: runtime)
+        liveSessions.register(thread: primaryThreadKey, runID: "run_live", handle: runtime)
         let body = #"{"text":"x","delivery":"steer","clientId":"web-retry"}"#
 
         let rejected = await send("POST", "/v1/threads/sess-1/messages", body: body)
         XCTAssertEqual(rejected.status, 409)
 
         // Pi refused, so nothing happened and the same submission must be allowed to try again.
-        liveSessions.unregister(threadID: "sess-1", runID: "run_live")
+        liveSessions.unregister(thread: primaryThreadKey, runID: "run_live")
         let retry = await send("POST", "/v1/threads/sess-1/messages", body: body)
         XCTAssertEqual(retry.status, 200)
     }
@@ -407,6 +1057,11 @@ final class RemoteParityEndpointTests: XCTestCase {
         let long = String(repeating: "a", count: 129)
         let tooLong = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","clientId":"\#(long)"}"#)
         XCTAssertEqual(tooLong.status, 400)
+
+        let empty = await send("POST", "/v1/threads/sess-1/messages", body: #"{"text":"x","clientId":""}"#)
+        XCTAssertEqual(empty.status, 400)
+        try await settle()
+        XCTAssertTrue(executor.executedJobs.isEmpty)
     }
 
     // MARK: - Attachments
@@ -453,6 +1108,82 @@ final class RemoteParityEndpointTests: XCTestCase {
         XCTAssertEqual(unknownBlock.status, 404)
         let unknownThread = await send("GET", "/v1/threads/nope/images/0-c0")
         XCTAssertEqual(unknownThread.status, 404)
+    }
+
+    // MARK: - Sidebar visibility
+
+    func testSidebarThreadListUsesTheAppsOwnershipAndAgentSettings() async throws {
+        let ours = TestSupport.writeSessionFile(in: directory, id: "ours", cwd: directory.path)
+        _ = TestSupport.writeSessionFile(in: directory, id: "foreign", cwd: directory.path)
+        TestSupport.writeAppState(in: directory, appStartedSessionPaths: [ours.path])
+
+        let sidebar = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(sidebar.threads.map(\.id), ["ours"])
+
+        let unfiltered = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["limit": "200"])
+        )
+        XCTAssertEqual(Set(unfiltered.threads.map(\.id)), ["ours", "foreign"])
+
+        TestSupport.writeAppState(
+            in: directory,
+            appStartedSessionPaths: [ours.path],
+            showsForeignConversations: true
+        )
+        let showingForeign = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(Set(showingForeign.threads.map(\.id)), ["ours", "foreign"])
+
+        TestSupport.writeAppState(
+            in: directory,
+            appStartedSessionPaths: [ours.path],
+            showsForeignConversations: true,
+            disabledAgents: ["pi"]
+        )
+        let disabled = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertTrue(disabled.threads.isEmpty)
+    }
+
+    func testDesktopManagedCreateStaysInBothSidebarProjections() async throws {
+        let file = TestSupport.writeSessionFile(in: directory, id: "remote-created", cwd: directory.path)
+        let created = PatchworkThread(
+            id: "remote-created", path: file.path, name: "Remote", cwd: directory.path,
+            folder: directory.lastPathComponent, createdAt: Date(), updatedAt: Date()
+        )
+        core = TestSupport.makeCore(
+            in: directory,
+            executor: executor,
+            interactions: interactions,
+            liveSessions: liveSessions,
+            threadRPC: FakeThreadRPCService(thread: created)
+        )
+        router = DaemonRouter(routes: Routes.all(core))
+
+        let response = await send(
+            "POST", "/v1/threads",
+            body: #"{"cwd":"\#(directory.path)","desktopManaged":true}"#
+        )
+        XCTAssertEqual(response.status, 201)
+
+        let sidebar = try decode(
+            ThreadListResponse.self,
+            await send("GET", "/v1/threads", query: ["sidebar": "true", "limit": "200"])
+        )
+        XCTAssertEqual(sidebar.threads.map(\.id), ["remote-created"])
+        XCTAssertEqual(
+            DaemonThreadOverlay.load(from: directory.appendingPathComponent("overlay.json"))
+                .desktopStartedThreadPaths,
+            Set([file.standardizedFileURL.path])
+        )
     }
 
     // MARK: - Folders
@@ -506,6 +1237,28 @@ final class RemoteParityEndpointTests: XCTestCase {
         let response = await send("GET", "/v1/folders")
         XCTAssertEqual(response.status, 200)
         XCTAssertTrue(try decode(FolderTreeResponse.self, response).folders.isEmpty)
+    }
+
+    func testDaemonStateReadLimitMatchesTheNativeWriterLimit() {
+        XCTAssertEqual(AppStatePeek.maxStateBytes, ArchiveStateBounds.appStateByteLimit)
+        XCTAssertEqual(AppStatePeek.maxStateBytes, 32 * 1_024 * 1_024)
+    }
+
+    func testAppStatePeekBoundsAndStandardizesOwnedCustomPaths() throws {
+        let paths = Set((0...(ArchiveStateBounds.itemLimit + 25)).map {
+            "/tmp/custom/../custom/thread-\($0).jsonl"
+        })
+        let url = directory.appendingPathComponent("state.json")
+        try JSONSerialization.data(withJSONObject: [
+            "appStartedSessionPaths": Array(paths)
+        ]).write(to: url)
+
+        let snapshot = AppStatePeek.load(from: url)
+
+        XCTAssertEqual(snapshot.appStartedSessionPaths.count, ArchiveStateBounds.itemLimit)
+        XCTAssertTrue(snapshot.appStartedSessionPaths.allSatisfy {
+            !$0.contains("/../") && $0.hasPrefix("/tmp/custom/")
+        })
     }
 
     func testFoldersEndpointSurvivesAMalformedStateFile() async throws {
@@ -592,11 +1345,21 @@ final class RemoteParityEndpointTests: XCTestCase {
     /// must not be reported as if it had.
     func testUnarchivingAThreadTheAppArchivedIsAConflictRatherThanAFakeSuccess() async throws {
         _ = TestSupport.writeSessionFile(in: directory, id: "sess-app-archived", cwd: directory.path)
+        let daemonArchive = await send(
+            "POST", "/v1/threads/sess-app-archived/archive", body: #"{"archived":true}"#
+        )
+        XCTAssertEqual(daemonArchive.status, 200)
         TestSupport.writeAppState(in: directory, archivedSessionIDs: ["sess-app-archived"])
 
         let restore = await send("POST", "/v1/threads/sess-app-archived/archive", body: #"{"archived":false}"#)
         XCTAssertEqual(restore.status, 409)
         XCTAssertTrue(String(decoding: restore.body, as: UTF8.self).contains("archived_in_app"))
+        TestSupport.writeAppState(in: directory)
+        let detail = try decode(
+            ThreadDetailResponse.self,
+            await send("GET", "/v1/threads/sess-app-archived")
+        )
+        XCTAssertTrue(detail.thread.archived, "a rejected restore must not clear the daemon archive")
 
         // A web-archived thread still restores here, so the conflict is specific rather than a
         // blanket refusal to unarchive anything.
@@ -736,6 +1499,83 @@ final class RemoteParityEndpointTests: XCTestCase {
         let second = await send("POST", "/v1/interactions/d1/respond", body: #"{"cancelled":true}"#)
         XCTAssertEqual(second.status, 404)
     }
+}
+
+private actor CreateBarrier {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async {
+        entered = true
+        for waiter in entryWaiters { waiter.resume() }
+        entryWaiters.removeAll()
+        if released { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        for waiter in releaseWaiters { waiter.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
+private actor ReadyCallbackObservation {
+    private var visible: Bool?
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+    func record(_ value: Bool) {
+        visible = value
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume(returning: value) }
+    }
+
+    func waitForValue() async -> Bool {
+        if let visible { return visible }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+private actor AmbiguousThreadRPCService: ThreadRPCServing {
+    private var cwds: [URL] = []
+
+    func createIdle(agent: AgentKind, cwd: URL, name: String?) async throws -> PatchworkThread {
+        cwds.append(cwd.standardizedFileURL)
+        throw ThreadCreationError.outcomeUnknown(
+            agent: agent, sessionReference: "019f0000-0000-7000-8000-000000000099"
+        )
+    }
+
+    func rename(agent: AgentKind, cwd: URL, sessionPath: URL, name: String) async throws {}
+
+    func runtimeSnapshot(
+        agent: AgentKind, cwd: URL, sessionPath: URL
+    ) async throws -> ThreadRuntimeState {
+        ThreadRuntimeState()
+    }
+
+    func setModel(
+        agent: AgentKind, cwd: URL, sessionPath: URL, provider: String, modelId: String
+    ) async throws -> ThreadRuntimeState {
+        ThreadRuntimeState(provider: provider, modelId: modelId)
+    }
+
+    func setThinkingLevel(
+        agent: AgentKind, cwd: URL, sessionPath: URL, level: String
+    ) async throws -> ThreadRuntimeState {
+        ThreadRuntimeState(thinkingLevel: level)
+    }
+
+    func createdCwds() -> [URL] { cwds }
+    func createCount() -> Int { cwds.count }
 }
 
 /// Captures what the daemon would have written back to Pi.

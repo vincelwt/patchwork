@@ -40,14 +40,17 @@ final class TranscriptProjectionCache {
 
     private func preservingWorkIDs(in projected: [TranscriptItem]) -> [TranscriptItem] {
         var previousIDByEntry: [String: String] = [:]
+        var waitingID: String?
         for case let .work(block) in cached {
+            if block.isActive, block.entries.isEmpty { waitingID = block.id }
             for entry in block.entries { previousIDByEntry[entry.id] = block.id }
         }
         var used: Set<String> = []
         return projected.map { item in
-            guard case var .work(block) = item,
-                  let priorID = block.entries.lazy.compactMap({ previousIDByEntry[$0.id] }).first,
-                  used.insert(priorID).inserted else { return item }
+            guard case var .work(block) = item else { return item }
+            let priorID = block.entries.lazy.compactMap({ previousIDByEntry[$0.id] }).first
+                ?? (block.isActive ? waitingID : nil)
+            guard let priorID, used.insert(priorID).inserted else { return item }
             block.id = priorID
             return .work(block)
         }
@@ -101,6 +104,10 @@ struct ConversationView: View {
         .onChange(of: store.route) { _, _ in composerFocusTick += 1 }
         .onChange(of: store.renameRequested) { _, requested in
             guard requested else { return }
+            guard store.canRenameSelectedSession else {
+                store.renameRequested = false
+                return
+            }
             renameValue = store.selectedSession?.displayName ?? ""
             renamePresented = true
             store.renameRequested = false
@@ -204,9 +211,11 @@ struct ConversationView: View {
                     .help(breadcrumb)
                     .accessibilityLabel(breadcrumb)
                 Menu {
-                    Button("Rename…") {
-                        renameValue = store.selectedSession?.displayName ?? ""
-                        renamePresented = true
+                    if store.canRenameSelectedSession {
+                        Button("Rename…") {
+                            renameValue = store.selectedSession?.displayName ?? ""
+                            renamePresented = true
+                        }
                     }
                     if let session = store.selectedSession {
                         // The ⌘⇧A key equivalent is owned by the Conversation menu so it is
@@ -275,7 +284,8 @@ struct ConversationView: View {
             ) {
                 Button("Try Again", action: store.retryConversationLoad)
             }
-        } else if store.messages.isEmpty && store.streamingMessage == nil && !store.isBrowsingEarlierHistory {
+        } else if store.messages.isEmpty && store.streamingMessage == nil
+                    && !store.isBrowsingEarlierHistory && !conversationIsRunning {
             VStack(spacing: PatchworkTheme.space6) {
                 Text("Ready for a new turn")
                     .font(PatchworkFont.title)
@@ -408,6 +418,7 @@ struct MessageScrollView: View {
                         ConversationPerformance.mark(
                             "Conversation first text paint",
                             path: store.selectedSession?.fileURL.path ?? "new-chat",
+                            agent: store.selectedSession?.agent ?? store.activeAgent,
                             count: items.count
                         )
                     }
@@ -491,12 +502,9 @@ struct MessageScrollView: View {
 
     private var historyNavigationBar: some View {
         HStack(spacing: PatchworkTheme.space8) {
-            Text("Earlier history · work omitted")
+            Text("Earlier history")
                 .foregroundStyle(.tertiary)
-                .accessibilityLabel("Earlier conversation history. Work details are omitted from this page.")
-            Divider()
-                .frame(height: PatchworkTheme.space16)
-                .accessibilityHidden(true)
+                .accessibilityLabel("Earlier conversation history")
             historyButton(
                 "Older", systemImage: "chevron.up",
                 isLoading: store.isLoadingEarlierMessages,

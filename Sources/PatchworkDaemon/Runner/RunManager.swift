@@ -11,11 +11,13 @@ struct RunManager: Sendable {
     let executor: RunExecuting
 
     func run(_ job: RunJob) async -> RunOutcome {
-        await withTaskGroup(of: RunOutcome?.self) { group in
-            group.addTask { await executor.execute(job) }
+        var boundedJob = job
+        boundedJob.timeoutSeconds = ScheduleEngine.boundedTimeoutSeconds(job.timeoutSeconds)
+        let timeoutSeconds = boundedJob.timeoutSeconds
+        return await withTaskGroup(of: RunOutcome?.self) { group in
+            group.addTask { await executor.execute(boundedJob) }
             group.addTask {
-                let seconds = max(1, job.timeoutSeconds)
-                try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
                 return nil // sentinel: the deadline won the race
             }
             defer { group.cancelAll() }
@@ -24,12 +26,25 @@ struct RunManager: Sendable {
                 return .failed("The run produced no outcome.")
             }
             if let outcome = first { return outcome }
-            // If the scheduler's durable occurrence still says prompt delivery never began,
-            // this is definite non-delivery and may be retried. Dispatching/accepted state always
-            // wins over this hint and suppresses a resend.
+            group.cancelAll()
+            var cancelledOutcome: RunOutcome?
+            while let next = await group.next() {
+                if let next {
+                    cancelledOutcome = next
+                    break
+                }
+            }
+            // The executor owns the delivery boundary. Preserve what it learned while unwinding
+            // so a timeout after dispatch can never masquerade as a definitely unsent prompt.
+            let resolved = cancelledOutcome
             return RunOutcome(
-                status: .timeout, error: "Run exceeded its \(job.timeoutSeconds)s timeout.",
-                summary: nil, retryable: true
+                status: .timeout, error: "Run exceeded its \(timeoutSeconds)s timeout.",
+                summary: resolved?.summary,
+                resolvedThreadId: resolved?.resolvedThreadId,
+                resolvedThreadPath: resolved?.resolvedThreadPath,
+                retryable: resolved?.retryable == true && resolved?.promptStartedAt == nil,
+                promptStartedAt: resolved?.promptStartedAt,
+                promptAcceptedAt: resolved?.promptAcceptedAt
             )
         }
     }

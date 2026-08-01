@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Timeout policy per RPC command.
@@ -25,7 +26,9 @@ public enum RPCTimeoutPolicy {
         "get_session_stats",
         "get_fork_messages",
         "get_entries",
-        "get_commands"
+        "get_commands",
+        "get_available_models",
+        "get_available_thinking_levels"
     ]
 
     public static func outcome(for command: String) -> Outcome {
@@ -82,6 +85,43 @@ public final class RuntimeGeneration: @unchecked Sendable {
     }
 }
 
+/// Delivers a callback exactly once even when a runtime retires after its response has already
+/// been removed from the pending registry but before the main queue runs the callback.
+enum RuntimeCompletionDelivery {
+    static func resolvedResult(
+        _ requested: Result<PiJSONValue, Error>,
+        command: String,
+        generation: RuntimeGeneration,
+        agent: AgentKind
+    ) -> Result<PiJSONValue, Error> {
+        guard !generation.isValid else { return requested }
+        let error: Error = RPCTimeoutPolicy.stateQueries.contains(command)
+            ? AgentRuntimeError.processExited("\(agent.displayName) exited before the response was delivered.")
+            : AgentRuntimeError.outcomeUnknown(command)
+        return .failure(error)
+    }
+
+    static func enqueue(
+        _ requested: Result<PiJSONValue, Error>,
+        command: String,
+        generation: RuntimeGeneration,
+        agent: AgentKind,
+        events: [PiJSONValue] = [],
+        eventHandler: ((PiJSONValue) -> Void)? = nil,
+        callback: @escaping RPCPendingRegistry.Callback
+    ) {
+        DispatchQueue.main.async {
+            let result = resolvedResult(
+                requested, command: command, generation: generation, agent: agent
+            )
+            if case .success = result {
+                for event in events { eventHandler?(event) }
+            }
+            callback(result)
+        }
+    }
+}
+
 /// Generation-scoped pending-response registry.
 ///
 /// Extracted from `AgentRuntimeClient` so the race that matters (a late response or a queued
@@ -97,9 +137,19 @@ public final class RPCPendingRegistry {
     }
 
     private var entries: [String: Entry] = [:]
+    public let maximumCount: Int
 
-    public func register(id: String, command: String, generation: RuntimeGeneration, callback: @escaping Callback) {
+    public init(maximumCount: Int = 192) {
+        self.maximumCount = max(1, maximumCount)
+    }
+
+    public var hasCapacity: Bool { entries.count < maximumCount }
+
+    @discardableResult
+    public func register(id: String, command: String, generation: RuntimeGeneration, callback: @escaping Callback) -> Bool {
+        guard entries[id] != nil || hasCapacity else { return false }
         entries[id] = Entry(generation: generation, command: command, callback: callback)
+        return true
     }
 
     public var count: Int { entries.count }
@@ -109,14 +159,16 @@ public final class RPCPendingRegistry {
     /// Removes a pending entry for delivery of a *successful* response. Returns nil when the
     /// entry is unknown or belongs to a superseded generation, in which case the response is
     /// dropped instead of published.
-    public func takeForDelivery(id: String, currentGeneration: RuntimeGeneration) -> Callback? {
+    public func takeForDelivery(
+        id: String, currentGeneration: RuntimeGeneration
+    ) -> (command: String, callback: Callback)? {
         guard let entry = entries[id] else { return nil }
         guard entry.generation === currentGeneration, entry.generation.isValid else {
             entries.removeValue(forKey: id)
             return nil
         }
         entries.removeValue(forKey: id)
-        return entry.callback
+        return (entry.command, entry.callback)
     }
 
     /// Removes an entry for timeout handling only if it still belongs to the given generation.
@@ -146,6 +198,25 @@ public final class RPCPendingRegistry {
 public enum PiProcessReaper {
     public static let queue = DispatchQueue(label: "app.patchwork.desktop.reaper", qos: .utility)
     public static let gracefulDeadline: TimeInterval = 2.0
+    public static let forcedDeadline: TimeInterval = 2.0
+
+    /// Stops a child within a strict wall-clock bound. `Process` observes and reaps its child
+    /// asynchronously; calling `waitUntilExit()` after that observation can itself wedge inside
+    /// Foundation, which would permanently block the serial reaper queue.
+    @discardableResult
+    public static func terminateAndWait(
+        _ process: Process,
+        gracefulDeadline: TimeInterval = PiProcessReaper.gracefulDeadline,
+        forcedDeadline: TimeInterval = PiProcessReaper.forcedDeadline
+    ) -> Bool {
+        guard process.isRunning else { return true }
+        process.terminate()
+        return finishTermination(
+            process,
+            gracefulDeadline: gracefulDeadline,
+            forcedDeadline: forcedDeadline
+        )
+    }
 
     /// `terminate()` is sent synchronously by the caller (already off main) so the old
     /// runtime is signalled before a replacement is spawned; waiting/escalation is handed
@@ -161,15 +232,28 @@ public enum PiProcessReaper {
         }
         process.terminate()
         queue.async {
-            let deadline = Date().addingTimeInterval(gracefulDeadline)
-            while process.isRunning, Date() < deadline {
-                usleep(40_000)
-            }
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-            }
-            process.waitUntilExit()
+            _ = finishTermination(
+                process,
+                gracefulDeadline: gracefulDeadline,
+                forcedDeadline: forcedDeadline
+            )
             completion?()
         }
+    }
+
+    private static func finishTermination(
+        _ process: Process,
+        gracefulDeadline: TimeInterval,
+        forcedDeadline: TimeInterval
+    ) -> Bool {
+        waitWhileRunning(process, timeout: gracefulDeadline)
+        if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+        waitWhileRunning(process, timeout: forcedDeadline)
+        return !process.isRunning
+    }
+
+    private static func waitWhileRunning(_ process: Process, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while process.isRunning, Date() < deadline { usleep(40_000) }
     }
 }

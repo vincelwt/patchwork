@@ -30,6 +30,42 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(afterInitialize[1]["params"]?["cwd"]?.stringValue, cwd.path)
     }
 
+    func testFinalHandshakeFailuresRejectEveryQueuedCommandImmediately() throws {
+        let adapter = CodexProtocolAdapter()
+        let initialize = try XCTUnwrap(adapter.startupLines(sessionPath: nil, cwd: cwd).first.map(object))
+        let initializeID = try XCTUnwrap(initialize["id"]?.intValue)
+        guard case .deferred = adapter.encode(
+            command: "prompt", id: "queued-prompt", payload: ["message": .string("hello")]
+        ) else { return XCTFail("prompt should wait for initialization") }
+        guard case .deferred = adapter.encode(command: "get_state", id: "queued-state", payload: [:])
+        else { return XCTFail("state should wait for initialization") }
+
+        let failed = adapter.decode(line: errorResponse(id: initializeID, message: "startup failed"))
+
+        XCTAssertEqual(Set(responseIDs(failed)), ["queued-prompt", "queued-state"])
+        let values = failed.compactMap(responseValue)
+        XCTAssertTrue(values.allSatisfy { $0["success"]?.boolValue == false })
+    }
+
+    func testMalformedThreadStartResponseRejectsAQueuedPrompt() throws {
+        let adapter = CodexProtocolAdapter()
+        let initialize = try XCTUnwrap(adapter.startupLines(sessionPath: nil, cwd: cwd).first.map(object))
+        guard case .deferred = adapter.encode(
+            command: "prompt", id: "queued-prompt", payload: ["message": .string("hello")]
+        ) else { return XCTFail("prompt should wait for initialization") }
+        _ = adapter.decode(line: response(id: try XCTUnwrap(initialize["id"]?.intValue), result: [:]))
+        let threadStart = try XCTUnwrap(try adapter.drainPendingWrites().map(object)
+            .first { $0["method"]?.stringValue == "thread/start" })
+
+        let failed = adapter.decode(line: response(
+            id: try XCTUnwrap(threadStart["id"]?.intValue),
+            result: ["thread": [:]]
+        ))
+
+        XCTAssertEqual(responseIDs(failed), ["queued-prompt"])
+        XCTAssertEqual(failed.compactMap(responseValue).first?["success"]?.boolValue, false)
+    }
+
     func testRolloutPathResumesByThreadIdInsteadOfStartingANewThread() throws {
         let threadID = "0199c0de-1111-7222-8333-444455556666"
         let session = URL(fileURLWithPath: "/tmp/sessions/rollout-2026-07-31T00-11-22-\(threadID).jsonl")
@@ -100,6 +136,76 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertTrue(repeated.isEmpty, "agent_settled must fire exactly once per turn")
     }
 
+    func testTurnStartResponseBeforeNotificationEmitsLifecycleExactlyOnce() throws {
+        let adapter = try started()
+        guard case let .write(lines) = adapter.encode(
+            command: "prompt", id: "prompt-1", payload: ["message": .string("hello")]
+        ) else { return XCTFail("prompt should reach app-server") }
+        let requestID = try XCTUnwrap(try object(lines[0])["id"]?.intValue)
+
+        let accepted = adapter.decode(line: response(id: requestID, result: [
+            "turn": ["id": "turn-order", "status": "inProgress", "items": []]
+        ]))
+        XCTAssertEqual(responseIDs(accepted), ["prompt-1"])
+        XCTAssertEqual(eventTypes(accepted), ["agent_start", "turn_start"])
+
+        let notification = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-order", "status": "inProgress", "items": []]
+        ]))
+        XCTAssertTrue(notification.isEmpty)
+    }
+
+    func testLateTurnStartResponseCannotResurrectACompletedTurn() throws {
+        let adapter = try started()
+        guard case let .write(lines) = adapter.encode(
+            command: "prompt", id: "prompt-late", payload: ["message": .string("hello")]
+        ) else { return XCTFail("prompt should reach app-server") }
+        let requestID = try XCTUnwrap(try object(lines[0])["id"]?.intValue)
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-late", "status": "inProgress", "items": []]
+        ]))
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-late", "status": "completed", "items": []]
+        ]))
+
+        let late = adapter.decode(line: response(id: requestID, result: [
+            "turn": ["id": "turn-late", "status": "completed", "items": []]
+        ]))
+        XCTAssertEqual(responseIDs(late), ["prompt-late"])
+        XCTAssertTrue(eventTypes(late).isEmpty)
+        guard case let .immediate(state) = adapter.encode(command: "get_state", id: "state", payload: [:])
+        else { return XCTFail("state should be immediate") }
+        XCTAssertEqual(state["isStreaming"]?.boolValue, false)
+    }
+
+    func testLateOlderTurnCannotReplaceOrSettleTheCurrentTurn() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-a", "status": "inProgress", "items": []]
+        ]))
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-a", "status": "completed", "items": []]
+        ]))
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-b", "status": "inProgress", "items": []]
+        ]))
+
+        XCTAssertTrue(adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-a", "status": "inProgress", "items": []]
+        ])).isEmpty)
+        XCTAssertTrue(adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-a", "status": "completed", "items": []]
+        ])).isEmpty)
+        guard case let .immediate(state) = adapter.encode(command: "get_state", id: "state", payload: [:])
+        else { return XCTFail("state should be immediate") }
+        XCTAssertEqual(state["isStreaming"]?.boolValue, true)
+
+        let settled = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-b", "status": "completed", "items": []]
+        ]))
+        XCTAssertEqual(eventTypes(settled), ["turn_end", "agent_settled"])
+    }
+
     func testFailedTurnReportsTheErrorAndStillSettles() throws {
         let adapter = try started()
         _ = adapter.decode(line: notification("turn/started", [
@@ -142,14 +248,16 @@ final class CodexProtocolAdapterTests: XCTestCase {
         let adapter = try started()
         let start = adapter.decode(line: notification("item/started", [
             "threadId": "thread-1", "turnId": "turn-1", "startedAtMs": 1,
-            "item": ["type": "agentMessage", "id": "msg-1", "text": ""]
+            "item": ["type": "agentMessage", "id": "msg-1", "phase": "final_answer", "text": ""]
         ]))
         XCTAssertEqual(eventTypes(start), ["message_start"])
+        XCTAssertEqual(start.compactMap(event).first?["message"]?["id"]?.stringValue, "msg-1")
 
         let first = adapter.decode(line: notification("item/agentMessage/delta", [
             "threadId": "thread-1", "turnId": "turn-1", "itemId": "msg-1", "delta": "Hello"
         ])).compactMap(event)
         XCTAssertEqual(first.first?["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue, "Hello")
+        XCTAssertEqual(first.first?["message"]?["id"]?.stringValue, "msg-1")
 
         let second = adapter.decode(line: notification("item/agentMessage/delta", [
             "threadId": "thread-1", "turnId": "turn-1", "itemId": "msg-1", "delta": " there"
@@ -162,16 +270,58 @@ final class CodexProtocolAdapterTests: XCTestCase {
 
         let end = adapter.decode(line: notification("item/completed", [
             "threadId": "thread-1", "turnId": "turn-1", "completedAtMs": 2,
-            "item": ["type": "agentMessage", "id": "msg-1", "text": "Hello there."]
+            "item": [
+                "type": "agentMessage", "id": "msg-1", "phase": "final_answer", "text": "Hello there."
+            ]
         ])).compactMap(event)
         XCTAssertEqual(end.map { $0["type"]?.stringValue }, ["message_end"])
         XCTAssertEqual(end[0]["message"]?["role"]?.stringValue, "assistant")
         XCTAssertEqual(end[0]["message"]?["stopReason"]?.stringValue, "stop")
         XCTAssertEqual(end[0]["message"]?["provider"]?.stringValue, "openai")
+        XCTAssertEqual(end[0]["message"]?["id"]?.stringValue, "msg-1")
         XCTAssertEqual(
             end[0]["message"]?["content"]?.arrayValue?.first?["text"]?.stringValue,
             "Hello there."
         )
+    }
+
+    func testCommentaryAgentMessageRemainsWorkInsteadOfBecomingTheAnswer() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("item/started", [
+            "item": ["type": "agentMessage", "id": "comment-1", "phase": "commentary", "text": ""]
+        ]))
+        let update = adapter.decode(line: notification("item/agentMessage/delta", [
+            "itemId": "comment-1", "delta": "I am checking"
+        ])).compactMap(event)
+        XCTAssertEqual(update.first?["message"]?["stopReason"]?.stringValue, "toolUse")
+
+        let end = adapter.decode(line: notification("item/completed", [
+            "item": [
+                "type": "agentMessage", "id": "comment-1", "phase": "commentary",
+                "text": "I am checking the files."
+            ]
+        ])).compactMap(event)
+        XCTAssertEqual(end.first?["message"]?["id"]?.stringValue, "comment-1")
+        XCTAssertEqual(end.first?["message"]?["stopReason"]?.stringValue, "toolUse")
+    }
+
+    func testInterruptedOpenMessageCannotBecomeAFinalAnswer() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-interrupted", "status": "inProgress", "items": []]
+        ]))
+        _ = adapter.decode(line: notification("item/started", [
+            "item": ["type": "agentMessage", "id": "comment-open", "phase": "commentary", "text": ""]
+        ]))
+        _ = adapter.decode(line: notification("item/agentMessage/delta", [
+            "itemId": "comment-open", "delta": "Still checking"
+        ]))
+        let completed = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-interrupted", "status": "interrupted", "items": []]
+        ])).compactMap(event)
+        let message = try XCTUnwrap(completed.first { $0["type"]?.stringValue == "message_end" })
+        XCTAssertEqual(message["message"]?["id"]?.stringValue, "comment-open")
+        XCTAssertEqual(message["message"]?["stopReason"]?.stringValue, "toolUse")
     }
 
     func testReasoningDeltasBecomeThinkingBlocks() throws {
@@ -250,6 +400,9 @@ final class CodexProtocolAdapterTests: XCTestCase {
             [
                 "id": "gpt-5.1-codex", "model": "gpt-5.1-codex", "displayName": "GPT-5.1 Codex",
                 "description": "", "hidden": false, "isDefault": true, "defaultReasoningEffort": "medium",
+                "serviceTiers": [
+                    ["id": "priority", "name": "Fast", "description": "Lower latency"]
+                ],
                 "supportedReasoningEfforts": [
                     ["reasoningEffort": "low", "description": ""],
                     ["reasoningEffort": "medium", "description": ""],
@@ -271,6 +424,8 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(model["id"]?.stringValue, "gpt-5.1-codex")
         XCTAssertEqual(model["name"]?.stringValue, "GPT-5.1 Codex")
         XCTAssertEqual(model["reasoning"]?.boolValue, true)
+        XCTAssertEqual(model["supportsFastMode"]?.boolValue, true)
+        XCTAssertEqual(models["fastModeAvailable"]?.boolValue, true)
 
         guard case let .immediate(levels) = adapter.encode(
             command: "get_available_thinking_levels", id: "l", payload: [:]
@@ -288,6 +443,37 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(state["sessionId"]?.stringValue, "thread-1")
         XCTAssertEqual(state["model"]?["id"]?.stringValue, "gpt-5.1-codex")
         XCTAssertEqual(state["isStreaming"]?.boolValue, false)
+        XCTAssertEqual(state["fastModeAvailable"]?.boolValue, true)
+        XCTAssertEqual(state["fastModeEnabled"]?.boolValue, false)
+    }
+
+    func testFastModeUsesTheAdvertisedPriorityServiceTierAndTracksThreadUpdates() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: response(id: 3, result: ["data": [[
+            "id": "gpt-5.1-codex", "displayName": "GPT-5.1 Codex",
+            "hidden": false, "isDefault": true,
+            "supportedReasoningEfforts": [],
+            "serviceTiers": [["id": "priority", "name": "Fast", "description": "Lower latency"]]
+        ]]]))
+
+        guard case let .write(lines) = adapter.encode(
+            command: "set_fast_mode", id: "fast-on", payload: ["enabled": .bool(true)]
+        ) else { return XCTFail("fast mode should update the live thread") }
+        let request = try object(try XCTUnwrap(lines.first))
+        XCTAssertEqual(request["method"]?.stringValue, "thread/settings/update")
+        XCTAssertEqual(request["params"]?["threadId"]?.stringValue, "thread-1")
+        XCTAssertEqual(request["params"]?["serviceTier"]?.stringValue, "priority")
+
+        let accepted = adapter.decode(line: response(id: 4, result: [:]))
+        let data = try XCTUnwrap(accepted.compactMap(responseValue).first?["data"])
+        XCTAssertEqual(data["enabled"]?.boolValue, true)
+        XCTAssertEqual(data["available"]?.boolValue, true)
+
+        let changed = adapter.decode(line: notification("thread/settings/updated", [
+            "threadId": "thread-1", "threadSettings": ["serviceTier": NSNull()]
+        ]))
+        XCTAssertEqual(eventTypes(changed), ["fast_mode_changed"])
+        XCTAssertEqual(changed.compactMap(event).first?["enabled"]?.boolValue, false)
     }
 
     func testThinkingLevelRoundTripsThroughCodexEffortNames() throws {
@@ -340,6 +526,265 @@ final class CodexProtocolAdapterTests: XCTestCase {
         else { return XCTFail("aborting an idle session is a no-op, not an error") }
     }
 
+    func testSteerWaitsForConfirmedActivationThenUsesTheExpectedTurn() throws {
+        let adapter = try started()
+        guard case let .write(startLines) = adapter.encode(
+            command: "prompt", id: "start", payload: ["message": .string("first")]
+        ) else { return XCTFail("prompt should start") }
+        let startRequestID = try XCTUnwrap(try object(startLines[0])["id"]?.intValue)
+
+        guard case .deferred = adapter.encode(
+            command: "steer", id: "steer", payload: ["message": .string("adjust")]
+        ) else { return XCTFail("steer should wait for active confirmation") }
+        let accepted = adapter.decode(line: response(id: startRequestID, result: [
+            "turn": ["id": "turn-confirm", "status": "inProgress", "items": []]
+        ]))
+        XCTAssertEqual(responseIDs(accepted), ["start"])
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
+
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-confirm", "status": "inProgress", "items": []]
+        ]))
+        let writes = try adapter.drainPendingWrites().map(object)
+        XCTAssertEqual(writes.map { $0["method"]?.stringValue }, ["turn/steer"])
+        XCTAssertEqual(writes.first?["params"]?["expectedTurnId"]?.stringValue, "turn-confirm")
+        XCTAssertEqual(writes.first?["params"]?["clientUserMessageId"]?.stringValue, "steer")
+    }
+
+    func testActiveFollowUpStartsOnlyAfterTheCurrentTurnCompletes() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-current", "status": "inProgress", "items": []]
+        ]))
+        guard case .immediateWithEvents = adapter.encode(
+            command: "follow_up", id: "next-message", payload: ["message": .string("next")]
+        ) else { return XCTFail("active follow-up should queue immediately") }
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
+
+        let completed = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-current", "status": "completed", "items": []]
+        ]))
+        XCTAssertEqual(eventTypes(completed), ["turn_end", "agent_settled", "queue_update"])
+        let writes = try adapter.drainPendingWrites().map(object)
+        XCTAssertEqual(writes.map { $0["method"]?.stringValue }, ["turn/start"])
+        XCTAssertEqual(writes.first?["params"]?["input"]?.arrayValue?.first?["text"]?.stringValue, "next")
+        XCTAssertEqual(writes.first?["params"]?["clientUserMessageId"]?.stringValue, "next-message")
+    }
+
+    func testLateStartFailureCannotClearTheNextPendingTurn() throws {
+        let adapter = try started()
+        guard case let .write(firstLines) = adapter.encode(
+            command: "prompt", id: "first", payload: ["message": .string("first")]
+        ) else { return XCTFail("first prompt should start") }
+        let firstRequestID = try XCTUnwrap(try object(firstLines[0])["id"]?.intValue)
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-a", "status": "inProgress", "items": []]
+        ]))
+        guard case .immediateWithEvents = adapter.encode(
+            command: "follow_up", id: "second", payload: ["message": .string("second")]
+        ) else { return XCTFail("follow-up should queue") }
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-a", "status": "completed", "items": []]
+        ]))
+        let secondStart = try adapter.drainPendingWrites().map(object)
+        XCTAssertEqual(secondStart.map { $0["method"]?.stringValue }, ["turn/start"])
+
+        let late = adapter.decode(line: errorResponse(id: firstRequestID, message: "late failure"))
+        XCTAssertEqual(responseIDs(late), ["first"], "the already observed first turn was accepted")
+        guard case .deferred = adapter.encode(
+            command: "steer", id: "third", payload: ["message": .string("third")]
+        ) else { return XCTFail("the second start must still own the pending slot") }
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
+
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-b", "status": "inProgress", "items": []]
+        ]))
+        let flushed = try adapter.drainPendingWrites().map(object)
+        XCTAssertEqual(flushed.map { $0["method"]?.stringValue }, ["turn/steer"])
+        XCTAssertEqual(flushed.first?["params"]?["clientUserMessageId"]?.stringValue, "third")
+    }
+
+    func testFailedFollowUpStartRetriesOnceThenRestoresTheQueue() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-current", "status": "inProgress", "items": []]
+        ]))
+        guard case let .immediateWithEvents(_, queuedEvents) = adapter.encode(
+            command: "follow_up", id: "next", payload: ["message": .string("do next")]
+        ) else { return XCTFail("follow-up should queue") }
+        XCTAssertEqual(queuedEvents.compactMap { $0["type"]?.stringValue }, ["queue_update"])
+        XCTAssertEqual(
+            queuedEvents.first?["followUp"]?.arrayValue?.compactMap(\.stringValue),
+            ["do next"]
+        )
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-current", "status": "completed", "items": []]
+        ]))
+        let first = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let firstID = try XCTUnwrap(try object(first)["id"]?.intValue)
+
+        XCTAssertTrue(adapter.decode(line: errorResponse(id: firstID, message: "busy")).isEmpty)
+        let retry = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let retryObject = try object(retry)
+        let retryID = try XCTUnwrap(retryObject["id"]?.intValue)
+        XCTAssertEqual(retryObject["params"]?["clientUserMessageId"]?.stringValue, "next")
+
+        let failed = adapter.decode(line: errorResponse(id: retryID, message: "still busy"))
+        XCTAssertEqual(eventTypes(failed), ["message_end", "turn_end", "agent_settled"])
+        guard case let .immediate(state) = adapter.encode(command: "get_state", id: "state", payload: [:])
+        else { return XCTFail("state should be immediate") }
+        XCTAssertTrue(state["followUpQueue"]?.arrayValue?.isEmpty == true)
+    }
+
+    func testFailedFollowUpStartAdvancesToTheNextQueuedMessageWithoutAnotherPrompt() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-current", "status": "inProgress", "items": []]
+        ]))
+        for (id, text) in [("first-next", "one"), ("second-next", "two")] {
+            guard case .immediateWithEvents = adapter.encode(
+                command: "follow_up", id: id, payload: ["message": .string(text)]
+            ) else { return XCTFail("follow-up should queue") }
+        }
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-current", "status": "completed", "items": []]
+        ]))
+        let first = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let firstID = try XCTUnwrap(try object(first)["id"]?.intValue)
+        _ = adapter.decode(line: errorResponse(id: firstID, message: "busy"))
+        let retry = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let retryID = try XCTUnwrap(try object(retry)["id"]?.intValue)
+
+        let failed = adapter.decode(line: errorResponse(id: retryID, message: "still busy"))
+        XCTAssertEqual(eventTypes(failed), ["message_end", "turn_end", "agent_settled", "queue_update"])
+        let next = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(next["method"]?.stringValue, "turn/start")
+        XCTAssertEqual(next["params"]?["clientUserMessageId"]?.stringValue, "second-next")
+    }
+
+    func testPendingSteerAndAbortSurviveAnInternalStartRetry() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-current", "status": "inProgress", "items": []]
+        ]))
+        guard case .immediateWithEvents = adapter.encode(
+            command: "follow_up", id: "next", payload: ["message": .string("do next")]
+        ) else { return XCTFail("follow-up should queue") }
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-current", "status": "completed", "items": []]
+        ]))
+        let first = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let firstID = try XCTUnwrap(try object(first)["id"]?.intValue)
+        guard case .deferred = adapter.encode(
+            command: "steer", id: "adjust", payload: ["message": .string("adjust it")]
+        ) else { return XCTFail("steer should wait for activation") }
+        guard case .deferred = adapter.encode(command: "abort", id: "stop", payload: [:])
+        else { return XCTFail("abort should wait for activation") }
+
+        XCTAssertTrue(adapter.decode(line: errorResponse(id: firstID, message: "busy")).isEmpty)
+        let retry = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(retry["method"]?.stringValue, "turn/start")
+
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-retry", "status": "inProgress", "items": []]
+        ]))
+        let writes = try adapter.drainPendingWrites().map(object)
+        XCTAssertEqual(writes.map { $0["method"]?.stringValue }, ["turn/steer", "turn/interrupt"])
+        XCTAssertEqual(writes[0]["params"]?["clientUserMessageId"]?.stringValue, "adjust")
+        XCTAssertEqual(writes[1]["params"]?["turnId"]?.stringValue, "turn-retry")
+    }
+
+    func testAbortWaitsForConfirmedActivation() throws {
+        let adapter = try started()
+        guard case let .write(startLines) = adapter.encode(
+            command: "prompt", id: "start", payload: ["message": .string("work")]
+        ) else { return XCTFail("prompt should start") }
+        let startID = try XCTUnwrap(try object(startLines[0])["id"]?.intValue)
+        guard case .deferred = adapter.encode(command: "abort", id: "stop", payload: [:])
+        else { return XCTFail("stop must wait for a confirmed turn id") }
+
+        _ = adapter.decode(line: response(id: startID, result: [
+            "turn": ["id": "turn-stop", "status": "inProgress", "items": []]
+        ]))
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-stop", "status": "inProgress", "items": []]
+        ]))
+        let interrupt = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(interrupt["method"]?.stringValue, "turn/interrupt")
+        XCTAssertEqual(interrupt["params"]?["turnId"]?.stringValue, "turn-stop")
+    }
+
+    func testRecoverableSteerRaceRetriesThenQueuesWithoutRejectingTheMessage() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-race", "status": "inProgress", "items": []]
+        ]))
+        guard case let .write(lines) = adapter.encode(
+            command: "steer", id: "adjust", payload: ["message": .string("adjust this")]
+        ) else { return XCTFail("steer should reach the active turn") }
+        let firstID = try XCTUnwrap(try object(lines[0])["id"]?.intValue)
+
+        XCTAssertTrue(adapter.decode(line: errorResponse(id: firstID, message: "no active turn")).isEmpty)
+        let retry = try XCTUnwrap(adapter.drainPendingWrites().first)
+        let retryID = try XCTUnwrap(try object(retry)["id"]?.intValue)
+        let recovered = adapter.decode(line: errorResponse(
+            id: retryID, message: "expected turn does not match"
+        ))
+        XCTAssertEqual(responseIDs(recovered), ["adjust"])
+        XCTAssertEqual(eventTypes(recovered), ["queue_update"])
+
+        _ = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-race", "status": "completed", "items": []]
+        ]))
+        let next = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(next["method"]?.stringValue, "turn/start")
+        XCTAssertEqual(next["params"]?["clientUserMessageId"]?.stringValue, "adjust")
+    }
+
+    func testCompletionBeforeActivationPromotesThePendingSteerToTheNextTurn() throws {
+        let adapter = try started()
+        guard case let .write(lines) = adapter.encode(
+            command: "prompt", id: "first", payload: ["message": .string("first")]
+        ) else { return XCTFail("prompt should start") }
+        let requestID = try XCTUnwrap(try object(lines[0])["id"]?.intValue)
+        _ = adapter.decode(line: response(id: requestID, result: [
+            "turn": ["id": "turn-race", "status": "inProgress", "items": []]
+        ]))
+        guard case .deferred = adapter.encode(
+            command: "steer", id: "second", payload: ["message": .string("keep this")]
+        ) else { return XCTFail("steer should wait for activation") }
+        guard case .deferred = adapter.encode(
+            command: "steer", id: "third", payload: ["message": .string("then this")]
+        ) else { return XCTFail("later steer should preserve FIFO") }
+
+        let completed = adapter.decode(line: notification("turn/completed", [
+            "turn": ["id": "turn-race", "status": "completed", "items": []]
+        ]))
+
+        XCTAssertTrue(responseIDs(completed).isEmpty)
+        XCTAssertEqual(eventTypes(completed), ["turn_end", "agent_settled"])
+        let next = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(next["method"]?.stringValue, "turn/start")
+        XCTAssertEqual(next["params"]?["clientUserMessageId"]?.stringValue, "second")
+        XCTAssertEqual(next["params"]?["input"]?.arrayValue?.first?["text"]?.stringValue, "keep this")
+
+        let nextRequestID = try XCTUnwrap(next["id"]?.intValue)
+        let accepted = adapter.decode(line: response(id: nextRequestID, result: [
+            "turn": ["id": "turn-next", "status": "inProgress", "items": []]
+        ]))
+        XCTAssertEqual(responseIDs(accepted), ["second"])
+        XCTAssertEqual(eventTypes(accepted), ["agent_start", "turn_start"])
+        XCTAssertTrue(adapter.drainPendingWrites().isEmpty)
+
+        _ = adapter.decode(line: notification("turn/started", [
+            "turn": ["id": "turn-next", "status": "inProgress", "items": []]
+        ]))
+        let remaining = try XCTUnwrap(adapter.drainPendingWrites().first.map(object))
+        XCTAssertEqual(remaining["method"]?.stringValue, "turn/steer")
+        XCTAssertEqual(remaining["params"]?["clientUserMessageId"]?.stringValue, "third")
+    }
+
     func testPromptImagesBecomeCodexImageInput() throws {
         let adapter = try started()
         guard case let .write(lines) = adapter.encode(command: "prompt", id: "p", payload: [
@@ -383,6 +828,70 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertTrue(adapter.encodeUncorrelated(.object([
             "type": .string("extension_ui_response"), "id": .string(dialogID), "value": .string("Approve")
         ])).isEmpty)
+    }
+
+    func testApprovalCapacityPreservesVisibleDialogsAndDeclinesOnlyTheNewestRequest() throws {
+        let adapter = try started()
+        var dialogIDs: [String] = []
+        for index in 1...17 {
+            let events = adapter.decode(line: serverRequest(
+                id: index,
+                method: "item/commandExecution/requestApproval",
+                params: ["command": "echo \(index)"]
+            )).compactMap(event)
+            dialogIDs.append(contentsOf: events.compactMap { $0["id"]?.stringValue })
+        }
+
+        XCTAssertEqual(dialogIDs.count, 16)
+        let overflowReply = try XCTUnwrap(adapter.drainPendingWrites().last.map(object))
+        XCTAssertEqual(overflowReply["id"]?.intValue, 17)
+        XCTAssertEqual(overflowReply["result"]?["decision"]?.stringValue, "decline")
+
+        let firstReply = adapter.encodeUncorrelated(.object([
+            "type": .string("extension_ui_response"),
+            "id": .string(try XCTUnwrap(dialogIDs.first)),
+            "value": .string("Approve")
+        ]))
+        XCTAssertEqual(try XCTUnwrap(firstReply.first.map(object))["id"]?.intValue, 1)
+    }
+
+    func testMultipleUserInputQuestionsArePresentedAndAnsweredAsOneResponse() throws {
+        let adapter = try started()
+        let dialogs = adapter.decode(line: serverRequest(
+            id: 77,
+            method: "item/tool/requestUserInput",
+            params: ["questions": [
+                [
+                    "id": "scope", "header": "Scope", "question": "Which scope?",
+                    "options": [
+                        ["label": "Focused", "description": "Only this file"],
+                        ["label": "Broad", "description": "The whole project"]
+                    ]
+                ],
+                ["id": "note", "header": "Note", "question": "Anything else?", "options": []]
+            ]]
+        )).compactMap(event)
+
+        XCTAssertEqual(dialogs.count, 2)
+        XCTAssertEqual(dialogs.map { $0["method"]?.stringValue }, ["select", "input"])
+        XCTAssertTrue(dialogs[0]["message"]?.stringValue?.contains("Focused: Only this file") == true)
+        let firstID = try XCTUnwrap(dialogs[0]["id"]?.stringValue)
+        let secondID = try XCTUnwrap(dialogs[1]["id"]?.stringValue)
+
+        XCTAssertTrue(adapter.encodeUncorrelated(.object([
+            "type": .string("extension_ui_response"),
+            "id": .string(firstID),
+            "value": .string("Focused")
+        ])).isEmpty)
+        let reply = try object(try XCTUnwrap(adapter.encodeUncorrelated(.object([
+            "type": .string("extension_ui_response"),
+            "id": .string(secondID),
+            "value": .string("Keep the tests fast")
+        ])).first))
+
+        XCTAssertEqual(reply["id"]?.intValue, 77)
+        XCTAssertEqual(reply["result"]?["answers"]?["scope"]?["answers"]?.arrayValue?.first?.stringValue, "Focused")
+        XCTAssertEqual(reply["result"]?["answers"]?["note"]?["answers"]?.arrayValue?.first?.stringValue, "Keep the tests fast")
     }
 
     func testDeclinedFileChangeApprovalIsEncodedAsADecline() throws {
@@ -549,6 +1058,10 @@ final class CodexProtocolAdapterTests: XCTestCase {
 
     private func response(id: Int, result: [String: Any]) -> Data {
         line(["id": id, "result": result])
+    }
+
+    private func errorResponse(id: Int, message: String) -> Data {
+        line(["id": id, "error": ["code": -1, "message": message]])
     }
 
     private func notification(_ method: String, _ params: [String: Any]) -> Data {

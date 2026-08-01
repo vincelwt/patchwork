@@ -83,8 +83,7 @@ final class TranscriptRowMetricsTests: XCTestCase {
         XCTAssertTrue(theme.contains("if pulsing, !reduceMotion"), "The pulse honors Reduce Motion")
         XCTAssertTrue(theme.contains("CABasicAnimation"), "The pulse is a render-server layer animation, not a view-graph one")
         XCTAssertTrue(messages.contains("if block.isActive { StatusDot(color: .patchworkGreen, pulsing: true) }"))
-        XCTAssertTrue(messages.contains("if isOpen {\n                PatchworkHairline()"))
-        XCTAssertFalse(messages.contains("            PatchworkHairline()\n\n            if isOpen"))
+        XCTAssertFalse(messages.contains("PatchworkHairline()"), "Transcript disclosures use spacing, not separator lines")
     }
 }
 

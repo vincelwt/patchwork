@@ -5,7 +5,9 @@ import {
   compactionOf,
   durationSeconds,
   formatDuration,
-  projectTranscript
+  preserveWorkKeys,
+  projectTranscript,
+  settledDisclosureKeys
 } from "../../Sources/PatchworkWeb/Site/js/transcript.mjs";
 
 let seq = 0;
@@ -89,6 +91,76 @@ test("a live turn shows its latest thought and stays collapsible", () => {
   assert.equal(items.at(-1).kind, "work", "nothing is presented as an answer yet");
 });
 
+test("a running turn is visible before the first agent event", () => {
+  const prompt = user("start");
+  const items = projectTranscript([prompt], { running: true });
+
+  assert.deepEqual(kinds(items), ["message", "work"]);
+  const log = work(items);
+  assert.equal(log.active, true);
+  assert.equal(log.headline, "Thinking");
+  assert.equal(log.key, `work:waiting:${prompt.id}`);
+  assert.deepEqual(log.entries, []);
+});
+
+test("tool-use narration is active work and supplies the collapsed headline", () => {
+  const items = projectTranscript(
+    [user("inspect"), assistant([text("Inspecting files")], { stopReason: "toolUse" })],
+    { running: true }
+  );
+
+  assert.deepEqual(kinds(items), ["message", "work"]);
+  const log = work(items);
+  assert.equal(log.active, true);
+  assert.equal(log.headline, "Inspecting files");
+  assert.equal(log.entries[0].kind, "note");
+});
+
+test("work identity survives history prepends and first progress", () => {
+  const prompt = user("go");
+  const waiting = projectTranscript([prompt], { running: true });
+  const progressed = preserveWorkKeys(
+    waiting,
+    projectTranscript([prompt, assistant([thinking("Checking")])], { running: true })
+  );
+  assert.equal(work(progressed).key, work(waiting).key, "first progress keeps the waiting row identity");
+
+  const recent = projectTranscript([
+    prompt,
+    assistant([text("Reading"), call("c1", "read")]),
+    toolResult("c1", "ok")
+  ]);
+  const withOlderSeam = projectTranscript([
+    assistant([thinking("Earlier thought")]),
+    prompt,
+    assistant([text("Reading"), call("c1", "read")]),
+    toolResult("c1", "ok")
+  ]);
+  const preserved = preserveWorkKeys(recent, withOlderSeam);
+  const priorWork = work(recent);
+  const overlapping = preserved.find((item) =>
+    item.kind === "work" && item.entries.some((entry) => priorWork.entries.some((prior) => prior.key === entry.key))
+  );
+  assert.equal(overlapping.key, priorWork.key);
+});
+
+test("a live activity disclosure settles closed on completion", () => {
+  const prompt = user("run");
+  const live = projectTranscript(
+    [prompt, assistant([call("settling", "bash")])],
+    { running: true }
+  );
+  const settled = preserveWorkKeys(
+    live,
+    projectTranscript([prompt, assistant([call("settling", "bash")]), toolResult("settling", "ok")])
+  );
+  assert.deepEqual(
+    settledDisclosureKeys(live, settled),
+    [work(live).key, work(live).entries[0].key]
+  );
+  assert.deepEqual(settledDisclosureKeys(settled, settled), []);
+});
+
 test("a failed tool step does not flag the turn's answer as failed", () => {
   const items = projectTranscript([
     user("build"),
@@ -125,7 +197,7 @@ test("a turn whose answer failed says so", () => {
   const log = work(items);
   assert.equal(log.answerFailed, true);
   assert.equal(log.showsStatus, true);
-  assert.equal(log.headline, "Pi error: provider refused");
+  assert.equal(log.headline, "Agent error: provider refused");
 });
 
 test("compaction folds into the log and keeps its title", () => {

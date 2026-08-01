@@ -16,6 +16,10 @@ actor RunHistoryStore {
     private let maxFileBytes: Int
     /// Oldest first.
     private var recent: [Run] = []
+    /// Latest snapshots whose append failed. They remain queryable in-process and can be flushed
+    /// before a durable schedule occurrence is settled.
+    private var dirtyByID: [String: Run] = [:]
+    private var dirtyOrder: [String] = []
     private var writesSinceRotationCheck = 0
 
     init(fileURL: URL = PatchworkPaths.runHistory, logger: DaemonLogger, maxInMemory: Int = 5_000, maxFileBytes: Int = 8 * 1_024 * 1_024) {
@@ -26,14 +30,54 @@ actor RunHistoryStore {
         recent = Self.load(fileURL: fileURL, maxInMemory: maxInMemory, logger: logger)
     }
 
-    func record(_ run: Run) {
+    @discardableResult
+    func record(_ run: Run) -> Bool {
         if let index = recent.firstIndex(where: { $0.id == run.id }) {
             recent[index] = run
         } else {
             recent.append(run)
             if recent.count > maxInMemory { recent.removeFirst(recent.count - maxInMemory) }
         }
-        appendLine(run)
+        do {
+            try appendLine(run)
+            dirtyByID.removeValue(forKey: run.id)
+            dirtyOrder.removeAll { $0 == run.id }
+            return true
+        } catch {
+            if dirtyByID[run.id] == nil { dirtyOrder.append(run.id) }
+            dirtyByID[run.id] = run
+            while dirtyOrder.count > maxInMemory {
+                dirtyByID.removeValue(forKey: dirtyOrder.removeFirst())
+            }
+            logger.error("Could not persist run \(run.id): \(error)")
+            return false
+        }
+    }
+
+    @discardableResult
+    func flush(id: String) -> Bool {
+        guard let run = dirtyByID[id] else { return recent.contains { $0.id == id } }
+        do {
+            try appendLine(run)
+            dirtyByID.removeValue(forKey: id)
+            dirtyOrder.removeAll { $0 == id }
+            return true
+        } catch {
+            logger.error("Could not flush run \(id): \(error)")
+            return false
+        }
+    }
+
+    func isPersisted(id: String) -> Bool {
+        dirtyByID[id] == nil && recent.contains { $0.id == id }
+    }
+
+    /// Admission can fail because its first snapshot was not writable. Since no executor ever saw
+    /// that run, remove the process-local dirty projection instead of leaving a queued ghost.
+    func discardIfUnpersisted(id: String) {
+        guard dirtyByID.removeValue(forKey: id) != nil else { return }
+        dirtyOrder.removeAll { $0 == id }
+        recent.removeAll { $0.id == id }
     }
 
     func get(id: String) -> Run? { recent.last { $0.id == id } }
@@ -43,7 +87,7 @@ actor RunHistoryStore {
         matches.reserveCapacity(min(limit, recent.count))
         for run in recent.reversed() {
             if let scheduleId, run.scheduleId != scheduleId { continue }
-            if let threadId, run.threadId != threadId { continue }
+            if let threadId, run.threadPath != threadId, run.threadId != threadId { continue }
             matches.append(run)
             if matches.count >= limit { break }
         }
@@ -92,29 +136,33 @@ actor RunHistoryStore {
         return Array(ordered.suffix(maxInMemory))
     }
 
-    private func appendLine(_ run: Run) {
-        guard var line = try? PatchworkJSON.encoder.encode(run) else { return }
+    private func appendLine(_ run: Run) throws {
+        var line = try PatchworkJSON.encoder.encode(run)
         line.append(0x0A)
-        _ = try? PatchworkFile.ensureDirectory(fileURL.deletingLastPathComponent())
-        if let handle = try? FileHandle(forWritingTo: fileURL) {
+        try PatchworkFile.ensureDirectory(fileURL.deletingLastPathComponent())
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            let handle = try FileHandle(forWritingTo: fileURL)
             defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
+            _ = try handle.seekToEnd()
+            try handle.write(contentsOf: line)
         } else {
-            try? line.write(to: fileURL, options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            try line.write(to: fileURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: fileURL.path
+            )
         }
 
         writesSinceRotationCheck += 1
         if writesSinceRotationCheck >= 50 {
             writesSinceRotationCheck = 0
-            rotateIfNeeded()
+            do { try rotateIfNeeded() }
+            catch { logger.error("Could not rotate runs.jsonl: \(error)") }
         }
     }
 
     /// Keeps only the in-memory view's worth of history on disk once the file grows past the
     /// bound, so `runs.jsonl` cannot grow forever on a long-lived daemon.
-    private func rotateIfNeeded() {
+    private func rotateIfNeeded() throws {
         guard let size = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int, size > maxFileBytes else { return }
         var rewritten = Data()
         for run in recent {
@@ -122,7 +170,7 @@ actor RunHistoryStore {
             line.append(0x0A)
             rewritten.append(line)
         }
-        try? PatchworkFile.writeAtomic(rewritten, to: fileURL)
+        try PatchworkFile.writeAtomic(rewritten, to: fileURL)
         logger.info("Rotated runs.jsonl (was over \(maxFileBytes) bytes).")
     }
 }

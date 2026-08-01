@@ -14,16 +14,7 @@ struct SidebarView: View {
     @State private var mode: SidebarMode = .tree
 
     var body: some View {
-        let snapshot = SidebarSnapshot(
-            sessions: store.sessions,
-            query: store.searchText,
-            projectPaths: store.sidebarFolders.map(\.path),
-            virtualFolders: store.virtualFolders,
-            assignments: store.virtualFolderAssignments,
-            projectAssignments: store.projectFolderAssignments,
-            managedWorktreeProjects: store.managedWorktreeProjects,
-            archivedAt: store.archivedDate
-        )
+        let snapshot = store.sidebarSnapshot
         VStack(spacing: 0) {
             SidebarActionRow(title: "New chat", symbol: "square.and.pencil", shortcut: "⌘N", action: store.openNewChat)
             SidebarActionRow(
@@ -69,12 +60,20 @@ struct SidebarView: View {
             } else {
                 if mode == .status {
                     // Archived stay out of the sections here; they keep the pinned area below.
-                    StatusListView(sessions: snapshot.all)
+                    StatusListView(
+                        sessions: snapshot.all,
+                        moveDestinations: snapshot.moveDestinations
+                    )
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: PatchworkTheme.space2) {
                             ForEach(snapshot.activeGroups) { group in
-                                SessionFolderSection(group: group, forceExpanded: snapshot.isFiltering)
+                                SessionFolderSection(
+                                    group: group,
+                                    projectCWDPaths: snapshot.projectCWDPaths,
+                                    moveDestinations: snapshot.moveDestinations,
+                                    forceExpanded: snapshot.isFiltering
+                                )
                             }
                         }
                         .padding(.horizontal, PatchworkTheme.space6)
@@ -88,7 +87,10 @@ struct SidebarView: View {
                 // Disclosure now lives in the status bar; the list only exists while open.
                 if !snapshot.archivedSessions.isEmpty, archiveExpanded || snapshot.isFiltering {
                     PatchworkHairline()
-                    ArchiveSection(sessions: snapshot.archivedSessions)
+                    ArchiveSection(
+                        sessions: snapshot.archivedSessions,
+                        moveDestinations: snapshot.moveDestinations
+                    )
                         .padding(.horizontal, PatchworkTheme.space6)
                 }
             }
@@ -100,7 +102,7 @@ struct SidebarView: View {
 
             PatchworkHairline()
             SidebarFooter(
-                archivedCount: snapshot.all.filter(\.isArchived).count,
+                archivedCount: snapshot.archivedSessions.count,
                 archiveExpanded: $archiveExpanded,
                 archiveForcedOpen: snapshot.isFiltering
             )
@@ -188,7 +190,7 @@ private struct SidebarFooter: View {
     @Binding var archiveExpanded: Bool
     let archiveForcedOpen: Bool
     @State private var remoteAccessPresented = false
-    private var runningCount: Int { store.runningSessions.count }
+    private var runningCount: Int { store.runningSessionCount }
     private var resourceUsage: ThreadResourceUsage? { store.aggregateResourceUsage }
     private var archiveOpen: Bool { archiveExpanded || archiveForcedOpen }
 
@@ -277,11 +279,22 @@ private struct SidebarFooter: View {
 
 // MARK: - Grouping
 
+struct SidebarMoveDestinations {
+    let folderEntries: [WorkspaceOrganization.FolderTreeEntry]
+    let projectPaths: [String]
+}
+
 struct SidebarSnapshot {
     let all: [SessionSummary]
     let activeGroups: [SessionFolderGroup]
     /// Flat and sorted by archive recency, not grouped: see `ArchiveSection`.
     let archivedSessions: [SessionSummary]
+    /// All cwd paths belonging to each real project, including sessions filed into virtual
+    /// children. Project headers use this one-pass index instead of rescanning every session.
+    let projectCWDPaths: [String: [String]]
+    /// Cached with the tree projection so high-frequency activity updates do not rebuild every
+    /// row's context-menu candidates. Per-source cycle filtering still happens at the row.
+    let moveDestinations: SidebarMoveDestinations
     let isFiltering: Bool
 
     init(
@@ -297,6 +310,37 @@ struct SidebarSnapshot {
         let folded = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         isFiltering = !folded.isEmpty
         let validVirtualIDs = Set(virtualFolders.map(\.id))
+        var virtualNameByID: [String: String] = [:]
+        for folder in virtualFolders where virtualNameByID[folder.id] == nil {
+            virtualNameByID[folder.id] = folder.name.lowercased()
+        }
+        var projectCWDPaths: [String: [String]] = [:]
+        var seenCWDPaths: [String: Set<String>] = [:]
+        for session in sessions {
+            let project = WorkspaceOrganization.projectPath(
+                of: session, managedWorktreeProjects: managedWorktreeProjects
+            )
+            let cwd = session.cwd.standardizedFileURL.path
+            if seenCWDPaths[project, default: []].insert(cwd).inserted {
+                projectCWDPaths[project, default: []].append(cwd)
+            }
+        }
+        self.projectCWDPaths = projectCWDPaths
+        moveDestinations = SidebarMoveDestinations(
+            folderEntries: WorkspaceOrganization.allFolderEntries(
+                virtualFolders,
+                projectAssignments: projectAssignments
+            ),
+            projectPaths: projectCWDPaths.keys.filter {
+                !WorkspaceOrganization.isGlobalWorkingDirectory(
+                    URL(fileURLWithPath: $0, isDirectory: true)
+                )
+            }.sorted {
+                SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(
+                    SessionFolderGroup.projectName(forPath: $1)
+                ) == .orderedAscending
+            }
+        )
         all = folded.isEmpty ? sessions : sessions.filter { session in
             if session.searchKey.contains(folded) { return true }
             if WorkspaceOrganization.projectPath(
@@ -304,9 +348,8 @@ struct SidebarSnapshot {
                 managedWorktreeProjects: managedWorktreeProjects
             ).lowercased().contains(folded) { return true }
             let path = session.fileURL.standardizedFileURL.path
-            guard let id = assignments[path],
-                  let folder = virtualFolders.first(where: { $0.id == id }) else { return false }
-            return folder.name.lowercased().contains(folded)
+            guard let id = assignments[path], let name = virtualNameByID[id] else { return false }
+            return name.contains(folded)
         }
         let visibleProjectPaths = projectPaths.filter {
             folded.isEmpty || $0.lowercased().contains(folded)
@@ -466,6 +509,20 @@ struct SessionFolderGroup: Identifiable {
     }
 }
 
+enum SidebarProjectGit {
+    static func snapshot(
+        projectPath: String,
+        cwdPathsByProject: [String: [String]],
+        folderGit: [String: GitSnapshot]
+    ) -> GitSnapshot {
+        let snapshots = (cwdPathsByProject[projectPath] ?? []).compactMap { folderGit[$0] }
+        return snapshots.first(where: \.isDirty)
+            ?? snapshots.first(where: \.isRepository)
+            ?? folderGit[projectPath]
+            ?? .none
+    }
+}
+
 // MARK: - Status view
 
 /// The flat cross-project buckets. Declaration order is the *visible* order; the priority a
@@ -542,6 +599,7 @@ struct SidebarStatusGroup: Identifiable {
 private struct StatusListView: View {
     @EnvironmentObject private var store: AppStore
     let sessions: [SessionSummary]
+    let moveDestinations: SidebarMoveDestinations
     /// Which buckets are folded away is a way of looking at the same list, like `SidebarMode`:
     /// local state, everything open until this session says otherwise.
     @State private var collapsed: Set<SidebarStatusSection> = []
@@ -555,7 +613,14 @@ private struct StatusListView: View {
                         if expanded { collapsed.insert(group.section) } else { collapsed.remove(group.section) }
                     }
                     if expanded {
-                        ForEach(group.sessions) { SessionRow(session: $0, archived: false, hint: hint(for: $0)) }
+                        ForEach(group.sessions, id: \.instanceID) {
+                            SessionRow(
+                                session: $0,
+                                archived: false,
+                                moveDestinations: moveDestinations,
+                                hint: hint(for: $0)
+                            )
+                        }
                     }
                 }
             }
@@ -620,14 +685,16 @@ private let archiveExpandedMaxHeight: CGFloat = 220
 private struct ArchiveSection: View {
     @EnvironmentObject private var store: AppStore
     let sessions: [SessionSummary]
+    let moveDestinations: SidebarMoveDestinations
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: PatchworkTheme.space2) {
-                ForEach(sessions) {
+                ForEach(sessions, id: \.instanceID) {
                     SessionRow(
                         session: $0,
                         archived: true,
+                        moveDestinations: moveDestinations,
                         hint: SessionFolderGroup.projectName(forPath: store.projectFolder(for: $0).path)
                     )
                 }
@@ -641,6 +708,8 @@ private struct ArchiveSection: View {
 private struct SessionFolderSection: View {
     @EnvironmentObject private var store: AppStore
     let group: SessionFolderGroup
+    let projectCWDPaths: [String: [String]]
+    let moveDestinations: SidebarMoveDestinations
     var archived = false
     var forceExpanded = false
     var depth = 0
@@ -654,14 +723,11 @@ private struct SessionFolderSection: View {
     private var hasRunning: Bool { group.sessions.contains { store.isRunning($0) } }
     private var projectGit: GitSnapshot {
         guard !group.isVirtual, !group.isGlobal else { return .none }
-        let snapshots = store.sessions.compactMap { session -> GitSnapshot? in
-            guard store.projectFolder(for: session).standardizedFileURL.path == group.path else { return nil }
-            return store.folderGit[session.cwd.standardizedFileURL.path]
-        }
-        return snapshots.first(where: { $0.isDirty })
-            ?? snapshots.first(where: { $0.isRepository })
-            ?? store.folderGit[group.path]
-            ?? .none
+        return SidebarProjectGit.snapshot(
+            projectPath: group.path,
+            cwdPathsByProject: projectCWDPaths,
+            folderGit: store.folderGit
+        )
     }
     private var headerSymbol: String {
         if group.isGlobal { return isOpen ? "clock.fill" : "clock" }
@@ -767,9 +833,23 @@ private struct SessionFolderSection: View {
 
             if isOpen {
                 ForEach(group.children) { child in
-                    SessionFolderSection(group: child, archived: archived, forceExpanded: forceExpanded, depth: depth + 1)
+                    SessionFolderSection(
+                        group: child,
+                        projectCWDPaths: projectCWDPaths,
+                        moveDestinations: moveDestinations,
+                        archived: archived,
+                        forceExpanded: forceExpanded,
+                        depth: depth + 1
+                    )
                 }
-                ForEach(group.sessions) { SessionRow(session: $0, archived: archived, depth: depth + 1) }
+                ForEach(group.sessions, id: \.instanceID) {
+                    SessionRow(
+                        session: $0,
+                        archived: archived,
+                        moveDestinations: moveDestinations,
+                        depth: depth + 1
+                    )
+                }
             }
         }
         .padding(.top, PatchworkTheme.space6)
@@ -835,26 +915,19 @@ private struct SessionFolderSection: View {
 
     /// Known project paths that would not put this virtual folder under one of its descendants.
     private func projectDestinations(excluding id: String) -> [String] {
-        Set(store.sessions.map { store.projectFolder(for: $0).standardizedFileURL.path })
-            .filter { path in
-                !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
-                    && !WorkspaceOrganization.wouldCreateGroupCycle(
-                        moving: WorkspaceOrganization.groupID(forVirtualFolderID: id),
-                        into: path,
-                        folders: store.virtualFolders,
-                        projectAssignments: store.projectFolderAssignments
-                    )
-            }
-            .sorted {
-                SessionFolderGroup.projectName(forPath: $0).localizedCaseInsensitiveCompare(SessionFolderGroup.projectName(forPath: $1)) == .orderedAscending
-            }
+        moveDestinations.projectPaths.filter { path in
+            !WorkspaceOrganization.isGlobalWorkingDirectory(URL(fileURLWithPath: path, isDirectory: true))
+                && !WorkspaceOrganization.wouldCreateGroupCycle(
+                    moving: WorkspaceOrganization.groupID(forVirtualFolderID: id),
+                    into: path,
+                    folders: store.virtualFolders,
+                    projectAssignments: store.projectFolderAssignments
+                )
+        }
     }
 
     private func availableFolderDestinations(excluding id: String) -> [WorkspaceOrganization.FolderTreeEntry] {
-        WorkspaceOrganization.allFolderEntries(
-            store.virtualFolders,
-            projectAssignments: store.projectFolderAssignments
-        ).filter {
+        moveDestinations.folderEntries.filter {
             $0.folder.id != id && !WorkspaceOrganization.wouldCreateCycle(
                 moving: id,
                 into: $0.folder.id,
@@ -865,10 +938,7 @@ private struct SessionFolderSection: View {
     }
 
     private var availableProjectDestinations: [WorkspaceOrganization.FolderTreeEntry] {
-        WorkspaceOrganization.allFolderEntries(
-            store.virtualFolders,
-            projectAssignments: store.projectFolderAssignments
-        ).filter {
+        moveDestinations.folderEntries.filter {
             !WorkspaceOrganization.wouldCreateGroupCycle(
                 moving: group.path,
                 into: WorkspaceOrganization.groupID(forVirtualFolderID: $0.folder.id),
@@ -891,6 +961,7 @@ private struct SessionRow: View {
     @EnvironmentObject private var store: AppStore
     let session: SessionSummary
     let archived: Bool
+    let moveDestinations: SidebarMoveDestinations
     var depth = 0
     /// Quiet location line for cross-project lists (Status), where a row has no folder above it.
     /// Same single line and row height as everywhere else; only the tree passes nothing.
@@ -942,13 +1013,12 @@ private struct SessionRow: View {
         .onHover { hovering = $0 }
         .draggable(session.fileURL.standardizedFileURL.path)
         .contextMenu {
-            Button("Rename…") { renameValue = session.displayName; renaming = true }
+            if session.agent.capabilities.canRenameSession {
+                Button("Rename…") { renameValue = session.displayName; renaming = true }
+            }
             Menu("Move to…") {
                 Button("Project / Recents") { store.moveSession(session, toVirtualFolder: nil) }
-                let entries = WorkspaceOrganization.allFolderEntries(
-                    store.virtualFolders,
-                    projectAssignments: store.projectFolderAssignments
-                )
+                let entries = moveDestinations.folderEntries
                 if !entries.isEmpty { Divider() }
                 ForEach(entries) { entry in
                     Button(String(repeating: "  ", count: entry.depth) + entry.folder.name) {
@@ -1030,7 +1100,7 @@ private struct SessionRow: View {
             if waitingForQuestion {
                 StatusDot(color: .patchworkPurple).help("Waiting for your answer")
             } else if running {
-                StatusDot(color: .patchworkGreen, pulsing: true).help("Pi is working")
+                StatusDot(color: .patchworkGreen, pulsing: true).help("Agent is working")
             } else if unread {
                 StatusDot(color: .patchworkBlue).help("Unread")
             }

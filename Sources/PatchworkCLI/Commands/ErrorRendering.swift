@@ -32,6 +32,8 @@ private func failure(for error: ControlPlaneError) -> CLIFailure {
         return CLIFailure(exitCode: .requestFailed, message: "unexpected response from daemon: \(reason)")
     case let .transportFailure(reason):
         return CLIFailure(exitCode: .requestFailed, message: reason)
+    case let .outcomeUnknown(reason):
+        return CLIFailure(exitCode: .requestFailed, message: reason)
     }
 }
 

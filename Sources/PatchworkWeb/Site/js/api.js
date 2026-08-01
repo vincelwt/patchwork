@@ -121,7 +121,8 @@ export const api = {
   health: () => request("/v1/health"),
 
   threads: (params) => request(`/v1/threads${toQuery(params)}`),
-  thread: (id, messages) => request(`/v1/threads/${encodeURIComponent(id)}${toQuery({ messages })}`),
+  thread: (id, messages, offset = 0) =>
+    request(`/v1/threads/${encodeURIComponent(id)}${toQuery({ messages, offset })}`),
   createThread: (body) => post("/v1/threads", body),
   threadRuntime: (id) => request(`/v1/threads/${encodeURIComponent(id)}/runtime`),
   setThreadModel: (id, body) => post(`/v1/threads/${encodeURIComponent(id)}/runtime/model`, body),
@@ -156,7 +157,7 @@ export const api = {
   createSchedule: (body) => post("/v1/schedules", body),
   updateSchedule: (id, patch) => request(`/v1/schedules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteSchedule: (id) => request(`/v1/schedules/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  runScheduleNow: (id) => post(`/v1/schedules/${encodeURIComponent(id)}/run`),
+  runScheduleNow: (id, body) => post(`/v1/schedules/${encodeURIComponent(id)}/run`, body),
   pauseSchedule: (id, paused) => post(`/v1/schedules/${encodeURIComponent(id)}/pause`, { paused }),
 
   limits: () => request("/v1/limits")

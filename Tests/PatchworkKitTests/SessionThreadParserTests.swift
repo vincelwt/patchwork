@@ -75,6 +75,31 @@ final class SessionThreadParserTests: XCTestCase {
         XCTAssertEqual(thread.cost ?? 0, 0.75, accuracy: 0.0001)
     }
 
+    func testOversizedThreadSummaryReadsHeadAndTailWithoutClaimingPartialCost() throws {
+        let url = tempDirectory.appendingPathComponent("oversized.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.write(contentsOf: Data((
+            #"{"type":"session","id":"large","cwd":"/Users/x/large"}"# + "\n"
+                + messageLine(role: "user", text: "Keep this title", id: "user-head") + "\n"
+                + #"{"type":"ignored","payload":""#
+        ).utf8))
+        try handle.seek(toOffset: UInt64(SessionThreadParser.threadSummaryWindow.fullReadLimit + 1_024))
+        try handle.write(contentsOf: Data((
+            #""}"# + "\n"
+                + #"{"type":"message","id":"assistant-tail","message":{"role":"assistant","content":"Newest answer","usage":{"cost":{"total":99}}}}"#
+                + "\n"
+        ).utf8))
+        try handle.synchronize()
+
+        let thread = try SessionThreadParser.thread(at: url)
+        XCTAssertEqual(thread.id, "large")
+        XCTAssertEqual(thread.name, "Keep this title")
+        XCTAssertEqual(thread.preview, "Newest answer")
+        XCTAssertNil(thread.cost, "a sampled middle cannot produce an exact cost")
+    }
+
     func testMissingSessionEntryFallsBackToFilenameAndFileCwd() throws {
         let url = write([messageLine(role: "user", text: "hi", id: "e1")], name: "019f9dea-abc.jsonl")
         let thread = try SessionThreadParser.thread(at: url)

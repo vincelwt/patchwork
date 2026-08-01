@@ -49,6 +49,50 @@ final class ScheduleValidationTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ScheduleEntry.self, from: data)
         XCTAssertEqual(decoded, original)
     }
+
+    func testAgentRoundTripsAndRequestsStayScopedToNewConversations() {
+        let now = Date()
+        let wire = Schedule(
+            id: "s1", name: "Claude automation", target: .newThread(
+                cwd: "/tmp/project", namePattern: nil
+            ), prompt: "work", trigger: .interval(everySeconds: 3_600, startAt: nil),
+            agent: .claude, createdAt: now, updatedAt: now
+        )
+        let entry = ScheduleEntry(wire: wire)
+        XCTAssertEqual(entry.agent, .claude)
+        XCTAssertEqual(entry.createRequest.agent, .claude)
+        XCTAssertEqual(entry.updateRequest.agent, .claude)
+
+        var existing = entry
+        existing.target = .existingThread(threadID: "thread-1")
+        XCTAssertNil(existing.createRequest.agent)
+        XCTAssertNil(existing.updateRequest.agent)
+    }
+
+    func testUpdateRequestCanClearAHiddenModeAndValidationRejectsNonPiMode() {
+        var value = entry(target: .newThread(cwd: "/tmp/project", namePattern: nil))
+        value.agent = .codex
+        value.mode = "ultra"
+        XCTAssertNotNil(ScheduleValidation.problem(with: value))
+
+        value.mode = nil
+        XCTAssertEqual(value.updateRequest.mode, "")
+        XCTAssertNil(ScheduleValidation.problem(with: value))
+    }
+}
+
+@MainActor
+private final class MemoryScheduleIntentPersistence: ScheduleMutationIntentPersisting {
+    var scheduleMutationIntents: [String: ScheduleMutationIntent] = [:]
+    var failWrites = false
+    private(set) var writeCount = 0
+
+    func replaceScheduleMutationIntents(_ values: [String: ScheduleMutationIntent]) -> Bool {
+        writeCount += 1
+        guard !failWrites else { return false }
+        scheduleMutationIntents = values
+        return true
+    }
 }
 
 @MainActor
@@ -65,7 +109,7 @@ final class SchedulesModelTests: XCTestCase {
             prompt: "check CI",
             trigger: .interval(everySeconds: 3_600)
         )
-        await model.save(entry)
+        _ = await model.save(entry, isNew: true)
         XCTAssertEqual(model.entries.map(\.name), ["Nightly"])
 
         await model.setPaused(entry, paused: true)
@@ -99,6 +143,345 @@ final class SchedulesModelTests: XCTestCase {
         await model.reload()
         XCTAssertNotNil(model.error)
         XCTAssertTrue(model.entries.isEmpty)
+    }
+
+    func testReloadUsesOneScheduleRequest() async {
+        let service = InMemoryScheduleService()
+        let model = SchedulesModel(service: service)
+
+        await model.reload()
+
+        XCTAssertEqual(service.loadCount, 1)
+    }
+
+    func testFailedCreationKeepsItsIDAndUnknownCreationRequiresListReview() async {
+        let entry = ScheduleEntry(
+            name: "Nightly", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let replacement = ScheduleEntry(
+            name: "Replacement", target: .existingThread(threadID: "t2"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let service = InMemoryScheduleService()
+        let model = SchedulesModel(service: service)
+
+        service.failure = ScheduleServiceError.daemonUnavailable
+        guard case .failed = await model.save(entry, isNew: true) else {
+            return XCTFail("expected a retryable create failure")
+        }
+        model.beginNew(defaultEntry: replacement)
+        XCTAssertEqual(model.editing?.entry.id, entry.id)
+
+        service.failure = ScheduleServiceError.creationOutcomeUnknown
+        guard case .needsReview = await model.save(entry, isNew: true) else {
+            return XCTFail("expected an ambiguous create result")
+        }
+        XCTAssertTrue(model.creationNeedsReview)
+        let attemptsBeforeBlockedRetry = service.savedIDs.count
+        _ = await model.save(entry, isNew: true)
+        XCTAssertEqual(service.savedIDs.count, attemptsBeforeBlockedRetry)
+        model.editing = nil
+        model.beginNew(defaultEntry: replacement)
+        XCTAssertNil(model.editing)
+
+        service.failure = nil
+        let reviewed = await model.reviewCreationOutcome()
+        XCTAssertTrue(reviewed)
+        XCTAssertFalse(model.creationNeedsReview)
+        model.beginNew(defaultEntry: replacement)
+        XCTAssertEqual(model.editing?.entry.id, replacement.id)
+    }
+
+    func testCreationRecoveryIsDurableBeforeSendAndSurvivesRelaunch() async {
+        let entry = ScheduleEntry(
+            name: "Nightly", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let persistence = MemoryScheduleIntentPersistence()
+        let service = InMemoryScheduleService()
+        var observedIntent: ScheduleMutationIntent?
+        service.saveHandler = { candidate, _ in
+            observedIntent = persistence.scheduleMutationIntents[ScheduleMutationIntent.creationKey]
+            throw ScheduleServiceError.daemonUnavailable
+        }
+        let first = SchedulesModel(service: service, persistence: persistence)
+
+        guard case .failed = await first.save(entry, isNew: true) else {
+            return XCTFail("expected a retryable create failure")
+        }
+        XCTAssertEqual(observedIntent?.phase, .dispatching)
+        XCTAssertEqual(observedIntent?.clientID, entry.id)
+        XCTAssertEqual(
+            persistence.scheduleMutationIntents[ScheduleMutationIntent.creationKey]?.phase,
+            .retryable
+        )
+
+        service.saveHandler = nil
+        service.failure = nil
+        let relaunched = SchedulesModel(service: service, persistence: persistence)
+        guard case .saved = await relaunched.save(entry, isNew: true) else {
+            return XCTFail("expected the retained create to replay")
+        }
+        XCTAssertEqual(service.savedIDs, [entry.id, entry.id])
+        XCTAssertEqual(service.entries.map(\.id), [entry.id])
+        XCTAssertNil(persistence.scheduleMutationIntents[ScheduleMutationIntent.creationKey])
+    }
+
+    func testScheduleRecoveryRefusesToExceedItsRunBound() {
+        let now = Date()
+        let intents = Dictionary(uniqueKeysWithValues: (0...ScheduleMutationIntent.maximumRunCount).map { index in
+            let scheduleID = "schedule-\(index)"
+            return (
+                ScheduleMutationIntent.runKey(scheduleID),
+                ScheduleMutationIntent(
+                    kind: .manualRun, phase: .retryable, clientID: "run-\(index)",
+                    scheduleID: scheduleID, creationDraft: nil,
+                    startedAt: now.addingTimeInterval(TimeInterval(index))
+                )
+            )
+        })
+
+        XCTAssertFalse(ScheduleMutationIntent.isWithinNormalBounds(intents))
+        XCTAssertEqual(
+            ScheduleMutationIntent.boundedDecoded(intents).count,
+            ScheduleMutationIntent.maximumRunCount
+        )
+    }
+
+    func testRunNowSingleFlightsWhileAdmissionIsPending() async {
+        let entry = ScheduleEntry(
+            name: "Manual", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let service = InMemoryScheduleService(entries: [entry])
+        var continuation: CheckedContinuation<Void, Never>?
+        service.runHandler = { _, _ in
+            await withCheckedContinuation { continuation = $0 }
+        }
+        let model = SchedulesModel(service: service)
+
+        let first = Task { await model.runNow(entry) }
+        while service.runClientIDs.isEmpty { await Task.yield() }
+        let second = Task { await model.runNow(entry) }
+        await Task.yield()
+
+        XCTAssertEqual(service.runClientIDs.count, 1)
+        XCTAssertTrue(model.runningNowIDs.contains(entry.id))
+        continuation?.resume()
+        _ = await first.value
+        _ = await second.value
+        XCTAssertFalse(model.runningNowIDs.contains(entry.id))
+    }
+
+    func testRunNowReusesAnAmbiguousClientIDThenRotatesAfterSuccess() async {
+        let entry = ScheduleEntry(
+            name: "Manual", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let service = InMemoryScheduleService(entries: [entry])
+        let model = SchedulesModel(service: service)
+
+        service.failure = ScheduleServiceError.daemonUnavailable
+        await model.runNow(entry)
+        service.failure = nil
+        await model.runNow(entry)
+        await model.runNow(entry)
+
+        XCTAssertEqual(service.runClientIDs.count, 3)
+        XCTAssertEqual(service.runClientIDs[0], service.runClientIDs[1])
+        XCTAssertNotEqual(service.runClientIDs[1], service.runClientIDs[2])
+        XCTAssertFalse(model.runningNowIDs.contains(entry.id))
+    }
+
+    func testUnknownRunOutcomeRequiresHistoryReviewBeforeAnotherAttempt() async {
+        let entry = ScheduleEntry(
+            name: "Manual", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let service = InMemoryScheduleService(entries: [entry])
+        service.failure = ScheduleServiceError.outcomeUnknown
+        let model = SchedulesModel(service: service)
+
+        await model.runNow(entry)
+        XCTAssertTrue(model.runNeedsReviewIDs.contains(entry.id))
+        let ambiguousID = service.runClientIDs.last
+
+        await model.runNow(entry)
+        XCTAssertEqual(service.runClientIDs.count, 1, "review-only state blocks another admission")
+
+        model.reviewRunHistory(entry)
+        XCTAssertTrue(model.runNeedsReviewIDs.contains(entry.id), "opening history is not authoritative review")
+        XCTAssertEqual(model.history?.id, entry.id)
+
+        XCTAssertTrue(model.acknowledgeRunHistory(entry))
+        XCTAssertFalse(model.runNeedsReviewIDs.contains(entry.id))
+        XCTAssertNil(model.error)
+
+        service.failure = nil
+        await model.runNow(entry)
+        XCTAssertNotEqual(service.runClientIDs.last, ambiguousID)
+    }
+
+    func testExplicitDaemonUnknownRunCodeRequiresReview() {
+        let mapped = DaemonScheduleService.surfacedRun(PatchworkClientError.badRequest(
+            code: "schedule_run_outcome_unknown", message: "review runs"
+        ))
+        guard let error = mapped as? ScheduleServiceError,
+              case .outcomeUnknown = error else {
+            return XCTFail("expected the explicit daemon code to become review-only")
+        }
+    }
+
+    func testRunIDConflictAlsoRequiresReview() {
+        for source in [
+            PatchworkClientError.badRequest(code: "run_id_conflict", message: "different work"),
+            PatchworkClientError.server(status: 409, code: "run_id_conflict", message: "different work")
+        ] {
+            guard let mapped = DaemonScheduleService.surfacedRun(source) as? ScheduleServiceError,
+                  case .outcomeUnknown = mapped else {
+                return XCTFail("expected run_id_conflict to require review")
+            }
+        }
+    }
+
+    func testRecoveryIsDurableBeforeSendAndSurvivesRelaunch() async {
+        let entry = ScheduleEntry(
+            name: "Manual", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let persistence = MemoryScheduleIntentPersistence()
+        let service = InMemoryScheduleService(entries: [entry])
+        var observedIntent: ScheduleMutationIntent?
+        service.runHandler = { _, _ in
+            observedIntent = persistence.scheduleMutationIntents[
+                ScheduleMutationIntent.runKey(entry.id)
+            ]
+            throw ScheduleServiceError.daemonUnavailable
+        }
+        let first = SchedulesModel(
+            service: service, persistence: persistence,
+            runClientIDFactory: { "desktop-run-stable" }
+        )
+
+        await first.runNow(entry)
+        XCTAssertEqual(observedIntent?.phase, .dispatching)
+        XCTAssertEqual(observedIntent?.clientID, "desktop-run-stable")
+        XCTAssertEqual(
+            persistence.scheduleMutationIntents[ScheduleMutationIntent.runKey(entry.id)]?.phase,
+            .retryable
+        )
+
+        service.runHandler = nil
+        service.failure = nil
+        let relaunched = SchedulesModel(
+            service: service, persistence: persistence,
+            runClientIDFactory: { "must-not-be-used" }
+        )
+        await relaunched.runNow(entry)
+        XCTAssertEqual(service.runClientIDs, ["desktop-run-stable", "desktop-run-stable"])
+        XCTAssertNil(persistence.scheduleMutationIntents[ScheduleMutationIntent.runKey(entry.id)])
+    }
+
+    func testCrashDuringDispatchRestoresReviewOnlyState() async {
+        let entry = ScheduleEntry(
+            name: "Manual", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let persistence = MemoryScheduleIntentPersistence()
+        let key = ScheduleMutationIntent.runKey(entry.id)
+        persistence.scheduleMutationIntents[key] = ScheduleMutationIntent(
+            kind: .manualRun, phase: .dispatching, clientID: "desktop-run-crashed",
+            scheduleID: entry.id, creationDraft: nil, startedAt: Date()
+        )
+        let service = InMemoryScheduleService(entries: [entry])
+        let model = SchedulesModel(service: service, persistence: persistence)
+
+        XCTAssertTrue(model.runNeedsReviewIDs.contains(entry.id))
+        XCTAssertEqual(persistence.scheduleMutationIntents[key]?.phase, .needsReview)
+        await model.runNow(entry)
+        XCTAssertTrue(service.runClientIDs.isEmpty)
+        model.reviewRunHistory(entry)
+        XCTAssertTrue(model.runNeedsReviewIDs.contains(entry.id))
+    }
+
+    func testPersistenceFailurePreventsAnyMutationRequest() async {
+        let entry = ScheduleEntry(
+            name: "Nightly", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let persistence = MemoryScheduleIntentPersistence()
+        persistence.failWrites = true
+        let service = InMemoryScheduleService(entries: [entry])
+        let model = SchedulesModel(service: service, persistence: persistence)
+
+        guard case .failed = await model.save(entry, isNew: true) else {
+            return XCTFail("expected a local recovery write failure")
+        }
+        await model.runNow(entry)
+        XCTAssertTrue(service.savedIDs.isEmpty)
+        XCTAssertTrue(service.runClientIDs.isEmpty)
+    }
+
+    func testConcurrentSavesAndOutOfOrderReloadsPublishOnlyOneCurrentResult() async {
+        let older = ScheduleEntry(
+            id: "older", name: "Older", target: .existingThread(threadID: "t1"),
+            prompt: "work", trigger: .interval(everySeconds: 3_600)
+        )
+        let newer = ScheduleEntry(
+            id: "newer", name: "Newer", target: .existingThread(threadID: "t1"),
+            prompt: "work", trigger: .interval(everySeconds: 3_600)
+        )
+        let service = InMemoryScheduleService()
+        var loadContinuations: [CheckedContinuation<[ScheduleEntry], Error>] = []
+        service.loadHandler = {
+            try await withCheckedThrowingContinuation { loadContinuations.append($0) }
+        }
+        let model = SchedulesModel(service: service)
+        let firstReload = Task { await model.reload() }
+        while loadContinuations.count < 1 { await Task.yield() }
+        let secondReload = Task { await model.reload() }
+        while loadContinuations.count < 2 { await Task.yield() }
+        loadContinuations[1].resume(returning: [newer])
+        _ = await secondReload.value
+        XCTAssertEqual(model.entries.map(\.id), ["newer"])
+        XCTAssertTrue(model.isBusy)
+        loadContinuations[0].resume(returning: [older])
+        _ = await firstReload.value
+        XCTAssertEqual(model.entries.map(\.id), ["newer"])
+        XCTAssertFalse(model.isBusy)
+
+        service.loadHandler = nil
+        var saveContinuation: CheckedContinuation<ScheduleEntry, Error>?
+        service.saveHandler = { entry, _ in
+            try await withCheckedThrowingContinuation { saveContinuation = $0 }
+        }
+        let firstSave = Task { await model.save(newer, isNew: true) }
+        while saveContinuation == nil { await Task.yield() }
+        let secondSave = await model.save(newer, isNew: true)
+        guard case .failed = secondSave else { return XCTFail("second save must be refused") }
+        XCTAssertEqual(service.savedIDs.count, 1)
+        saveContinuation?.resume(returning: newer)
+        _ = await firstSave.value
+    }
+
+    func testAppPersistenceRoundTripsBoundedScheduleRecovery() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PiScheduleRecovery-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entry = ScheduleEntry(
+            name: "Nightly", target: .existingThread(threadID: "t1"), prompt: "work",
+            trigger: .interval(everySeconds: 3_600)
+        )
+        let intent = ScheduleMutationIntent(
+            kind: .creation, phase: .needsReview, clientID: entry.id,
+            scheduleID: nil, creationDraft: entry, startedAt: Date()
+        )
+        let first = AppPersistence(baseURL: directory)
+        XCTAssertTrue(first.replaceScheduleMutationIntents([ScheduleMutationIntent.creationKey: intent]))
+        let reopened = AppPersistence(baseURL: directory)
+        XCTAssertEqual(reopened.scheduleMutationIntents[ScheduleMutationIntent.creationKey], intent)
     }
 }
 
@@ -304,7 +687,9 @@ final class ScheduledThreadStoreTests: XCTestCase {
     func testARefreshMarksTargetedThreadsAndADaemonOutageKeepsTheLastKnownSet() async {
         let service = InMemoryScheduleService()
         store.cachedScheduleService = service
-        _ = try? await service.save(entry("Nightly", target: .existingThread(threadID: "t1")))
+        _ = try? await service.save(
+            entry("Nightly", target: .existingThread(threadID: "t1")), isNew: true
+        )
 
         let loaded = await store.refreshScheduledThreads()
         XCTAssertTrue(loaded)

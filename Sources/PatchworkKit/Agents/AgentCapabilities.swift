@@ -21,6 +21,17 @@ public enum ThinkingApplyStyle: String, Codable, Hashable, Sendable {
     case unsupported
 }
 
+/// How an agent applies its lower-latency, higher-cost execution option.
+public enum FastModeApplyStyle: String, Codable, Hashable, Sendable {
+    /// Pi's activity extension owns `/codex-fast` and publishes the authoritative status chip.
+    case extensionCommand
+    /// The native protocol updates a setting on the current thread without restarting it.
+    case threadSetting
+    /// The setting is launch-scoped, so the same conversation is resumed in a new process.
+    case relaunch
+    case unsupported
+}
+
 /// What the composer's left-to-right ladder actually changes for an agent.
 public enum AgentLadder: String, Codable, Hashable, Sendable {
     /// A fixed set of named operating modes the agent declares (Pi's `/mode`).
@@ -28,6 +39,15 @@ public enum AgentLadder: String, Codable, Hashable, Sendable {
     /// The agent's own model list, weakest to strongest. Agents that present models in a picker
     /// order them strongest-first, so the ladder is that list reversed.
     case models
+}
+
+/// How the control plane can make an empty conversation durable without sending a provider
+/// prompt. `sessionName` is still prompt-free, but the runtime's start acknowledgement alone is
+/// not enough: the name command is the write barrier that creates the transcript.
+public enum IdleThreadCreationStyle: String, Codable, Hashable, Sendable {
+    case processStart
+    case sessionName
+    case unavailable
 }
 
 /// The agent's analogue of Pi's `/mode` slider: a small ordered set of named operating modes.
@@ -52,6 +72,7 @@ public struct AgentMode: Codable, Hashable, Sendable, Identifiable {
 public struct AgentCapabilities: Codable, Hashable, Sendable {
     public var modelSelection: ModelSelectionStyle
     public var thinking: ThinkingApplyStyle
+    public var fastMode: FastModeApplyStyle
     /// Ordered modes for the composer control. Empty hides the control entirely.
     public var modes: [AgentMode]
     /// Which axis the composer ladder drives.
@@ -75,10 +96,17 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
     public var reportsPlan: Bool
     /// True when Patchwork's own activity extension can be installed for this agent.
     public var supportsActivityExtension: Bool
+    public var idleThreadCreation: IdleThreadCreationStyle
+
+    /// Kept as the product-level gate used by existing call sites. A true value means the control
+    /// plane has a prompt-free materialization sequence, not necessarily that process launch by
+    /// itself writes the transcript.
+    public var persistsSessionBeforeFirstPrompt: Bool { idleThreadCreation != .unavailable }
 
     public init(
         modelSelection: ModelSelectionStyle,
         thinking: ThinkingApplyStyle,
+        fastMode: FastModeApplyStyle,
         modes: [AgentMode],
         ladder: AgentLadder = .modes,
         modeControlTitle: String,
@@ -91,10 +119,12 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         listsCommands: Bool,
         requestsToolPermission: Bool,
         reportsPlan: Bool,
-        supportsActivityExtension: Bool
+        supportsActivityExtension: Bool,
+        idleThreadCreation: IdleThreadCreationStyle
     ) {
         self.modelSelection = modelSelection
         self.thinking = thinking
+        self.fastMode = fastMode
         self.modes = modes
         self.ladder = ladder
         self.modeControlTitle = modeControlTitle
@@ -108,6 +138,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
         self.requestsToolPermission = requestsToolPermission
         self.reportsPlan = reportsPlan
         self.supportsActivityExtension = supportsActivityExtension
+        self.idleThreadCreation = idleThreadCreation
     }
 }
 
@@ -144,6 +175,7 @@ public extension AgentKind {
             AgentCapabilities(
                 modelSelection: .queried,
                 thinking: .live,
+                fastMode: .extensionCommand,
                 modes: Self.piModes,
                 modeControlTitle: "Effort",
                 canCompact: true,
@@ -155,12 +187,14 @@ public extension AgentKind {
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: false,
-                supportsActivityExtension: true
+                supportsActivityExtension: true,
+                idleThreadCreation: .processStart
             )
         case .codex:
             AgentCapabilities(
                 modelSelection: .queried,
                 thinking: .nextTurn,
+                fastMode: .threadSetting,
                 modes: Self.codexModes,
                 ladder: .models,
                 modeControlTitle: "Model",
@@ -173,25 +207,28 @@ public extension AgentKind {
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: true,
-                supportsActivityExtension: false
+                supportsActivityExtension: false,
+                idleThreadCreation: .sessionName
             )
         case .claude:
             AgentCapabilities(
                 modelSelection: .aliases,
                 thinking: .relaunch,
+                fastMode: .relaunch,
                 modes: Self.claudeModes,
                 ladder: .models,
                 modeControlTitle: "Model",
                 canCompact: true,
                 canFork: false,
                 canExportHTML: false,
-                canRenameSession: false,
+                canRenameSession: true,
                 canSteerMidTurn: true,
                 reportsUsage: true,
                 listsCommands: true,
                 requestsToolPermission: true,
                 reportsPlan: true,
-                supportsActivityExtension: false
+                supportsActivityExtension: false,
+                idleThreadCreation: .unavailable
             )
         }
     }

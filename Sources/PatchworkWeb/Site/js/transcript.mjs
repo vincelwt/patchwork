@@ -73,6 +73,62 @@ export function projectTranscript(messages, { running = false } = {}) {
   return builder.finish();
 }
 
+/**
+ * Keeps a work row's identity when loading older history changes which entry happens to lead it.
+ * The native app applies the same overlap rule so an open disclosure does not snap shut at a
+ * pagination seam or when a waiting row receives its first durable progress entry.
+ */
+export function preserveWorkKeys(previous, projected) {
+  const priorItems = Array.isArray(previous) ? previous : [];
+  const nextItems = Array.isArray(projected) ? projected : [];
+  const ownerByEntryKey = new Map();
+  let waitingKey = null;
+
+  for (const item of priorItems) {
+    if (item?.kind !== "work") continue;
+    if (item.active === true && (!Array.isArray(item.entries) || item.entries.length === 0)) {
+      waitingKey = item.key;
+    }
+    for (const entry of Array.isArray(item.entries) ? item.entries : []) {
+      if (entry?.key) ownerByEntryKey.set(entry.key, item.key);
+    }
+  }
+
+  const used = new Set();
+  return nextItems.map((item) => {
+    if (item?.kind !== "work") return item;
+    const overlappingKey = (Array.isArray(item.entries) ? item.entries : [])
+      .map((entry) => ownerByEntryKey.get(entry?.key))
+      .find((key) => key && !used.has(key));
+    const preservedKey = overlappingKey || (item.active === true && waitingKey && !used.has(waitingKey) ? waitingKey : null);
+    if (!preservedKey) return item;
+    used.add(preservedKey);
+    return item.key === preservedKey ? item : { ...item, key: preservedKey };
+  });
+}
+
+/** Work and nested activity disclosures that were live and have now settled. */
+export function settledDisclosureKeys(previous, projected) {
+  const liveWorkKeys = new Set();
+  const liveKeys = new Set();
+  for (const item of Array.isArray(previous) ? previous : []) {
+    if (item?.kind !== "work") continue;
+    if (item.active === true) liveWorkKeys.add(item.key);
+    for (const entry of Array.isArray(item.entries) ? item.entries : []) {
+      if (entry?.kind === "activity" && entry.active === true) liveKeys.add(entry.key);
+    }
+  }
+  const settled = [];
+  for (const item of Array.isArray(projected) ? projected : []) {
+    if (item?.kind !== "work") continue;
+    if (item.active !== true && liveWorkKeys.has(item.key)) settled.push(item.key);
+    for (const entry of Array.isArray(item.entries) ? item.entries : []) {
+      if (entry?.kind === "activity" && entry.active !== true && liveKeys.has(entry.key)) settled.push(entry.key);
+    }
+  }
+  return settled;
+}
+
 class TurnBuilder {
   constructor(isLive) {
     this.isLive = isLive;
@@ -82,6 +138,7 @@ class TurnBuilder {
     this.trailing = []; // prose that is the answer unless more work follows it
     this.trailingIsAnswer = false;
     this.turnStart = null;
+    this.turnAnchorID = null;
     this.lastTimestamp = null;
     this.answerFailed = false;
   }
@@ -95,6 +152,7 @@ class TurnBuilder {
       this.closeTurn(false);
       this.lastTimestamp = message.at || null;
       this.turnStart = message.at || null;
+      this.turnAnchorID = message.id || null;
       this.result.push(messageItem(message, 0));
       return;
     }
@@ -183,6 +241,13 @@ class TurnBuilder {
         this.closeActivity();
         this.entries.push(noteEntry(final.message, final.index));
       }
+      return;
+    }
+
+    if (final && message.stopReason === "toolUse") {
+      this.demoteTrailing();
+      this.closeActivity();
+      this.entries.push(noteEntry(final.message, final.index));
       return;
     }
 
@@ -297,7 +362,17 @@ class TurnBuilder {
         active,
         startedAt: this.turnStart,
         endedAt: this.lastTimestamp,
-        answerFailed: this.answerFailed
+        answerFailed: this.answerFailed,
+        key: null
+      }));
+    } else if (active && this.trailing.length === 0) {
+      this.result.push(workItem({
+        entries: [],
+        active: true,
+        startedAt: this.turnStart,
+        endedAt: this.lastTimestamp,
+        answerFailed: false,
+        key: `work:waiting:${this.turnAnchorID || "active-thread"}`
       }));
     }
     this.result.push(...this.trailing);
@@ -340,12 +415,12 @@ export function compactionOf(message) {
   return null;
 }
 
-function workItem({ entries, active, startedAt, endedAt, answerFailed }) {
+function workItem({ entries, active, startedAt, endedAt, answerFailed, key }) {
   const steps = entries.filter((entry) => entry.kind === "activity").flatMap((entry) => entry.steps);
   const duration = durationSeconds(startedAt, endedAt);
   const item = {
     kind: "work",
-    key: `work:${entries[0].key}`,
+    key: key || `work:${entries[0].key}`,
     entries,
     active,
     startedAt: startedAt || null,
@@ -360,7 +435,7 @@ function workItem({ entries, active, startedAt, endedAt, answerFailed }) {
   };
   // A live turn, a failed answer, or a compaction shows what just happened instead of a count.
   item.showsStatus = item.active || item.answerFailed || endsWithCompaction(entries);
-  item.headline = (item.showsStatus && item.status) || item.title;
+  item.headline = (item.showsStatus && item.status) || (item.active ? "Thinking" : item.title);
   item.duration = duration;
   return item;
 }
@@ -395,9 +470,9 @@ function latestStatus(entries) {
     if (entry.kind === "thinking") return statusLine(entry.text, true);
     if (entry.kind !== "note") continue;
     if (entry.compaction) return entry.compaction.title;
-    if (entry.message.isError !== true) continue;
-    const detail = statusLine(entry.message.text, false);
-    return detail ? `Pi error: ${detail}` : "Pi error";
+    const detail = statusLine(entry.message.text, entry.message.isError !== true);
+    if (entry.message.isError === true) return detail ? `Agent error: ${detail}` : "Agent error";
+    if (detail) return detail;
   }
   return null;
 }

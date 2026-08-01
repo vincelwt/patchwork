@@ -234,8 +234,9 @@ struct ComposerView: View {
         case .direct:
             direct()
         case let .queue(delivery):
-            store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments)
-            model.content = .empty
+            if store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments) {
+                model.content = .empty
+            }
         }
     }
 }
@@ -262,10 +263,6 @@ private struct ComposerToolbar: View {
             }
 
             Spacer(minLength: PatchworkTheme.space8)
-
-            // The composer carries one control: how hard Pi should work. Model and thinking
-            // level are reported in the status bar.
-            ModeSlider()
 
             if store.canStopCurrentThread, let onAbort {
                 IconButton(symbol: "stop.fill", help: "Stop Thread (⌘.)", action: onAbort)
@@ -303,45 +300,6 @@ private struct ComposerToolbar: View {
         .padding(.horizontal, PatchworkTheme.space10)
         .padding(.bottom, PatchworkTheme.space8)
         .padding(.top, PatchworkTheme.space4)
-    }
-}
-
-/// The active agent's mode ladder as a continuous choice from most restrained to strongest. For
-/// Pi that is the `/mode` effort ladder (model, thinking level, subagents); for Codex the sandbox
-/// policy; for Claude Code the permission mode. One control, agent-specific stops. It disappears
-/// when the agent has not reported a mode on that ladder.
-struct ModeSlider: View {
-    @EnvironmentObject private var store: AppStore
-
-    private var modes: [AgentMode] { store.availableModes }
-    private var mode: AgentMode? { store.currentMode }
-    private var title: String { store.activeCapabilities.modeControlTitle }
-
-    @ViewBuilder
-    var body: some View {
-        if let mode, modes.count > 1 {
-            let rank = modes.firstIndex { $0.id == mode.id } ?? 0
-            HStack(spacing: PatchworkTheme.space6) {
-                Text(mode.title)
-                    .font(rank == modes.count - 1 ? PatchworkFont.captionEmphasis : PatchworkFont.caption)
-                    .foregroundStyle(PatchworkTheme.effortColor(rank: rank, of: modes.count))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-
-                // AppKit's slider cannot be restyled, so this gets its own calm-to-hot track.
-                PatchworkEffortTrack(modes: modes, mode: mode) { store.setAgentMode($0.id) }
-                    .frame(width: PatchworkTheme.effortTrackWidth, height: PatchworkTheme.effortUltraKnobDiameter)
-            }
-            .help("\(title) \(mode.title) · \(mode.detail)")
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(title)
-            .accessibilityValue("\(mode.title), \(mode.detail)")
-            .accessibilityAdjustableAction { direction in
-                let next = direction == .increment ? rank + 1 : rank - 1
-                guard modes.indices.contains(next) else { return }
-                store.setAgentMode(modes[next].id)
-            }
-        }
     }
 }
 

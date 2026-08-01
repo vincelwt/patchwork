@@ -34,6 +34,7 @@ struct VirtualFolder: Identifiable, Codable, Hashable, Sendable {
 
 /// Pure CRUD/move/tree rules shared by persistence and tests.
 enum WorkspaceOrganization {
+    static let maxVirtualFolders = 512
     /// Pi requires a cwd even for a conversation that is not tied to a project.
     static let globalWorkingDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Desktop", isDirectory: true)
@@ -166,7 +167,7 @@ enum WorkspaceOrganization {
     /// derived from live sessions, never persisted as entities), or another folder's group id
     /// (must already exist).
     static func create(named name: String, parentID: String? = nil, in folders: inout [VirtualFolder]) -> VirtualFolder? {
-        guard let clean = cleanedName(name) else { return nil }
+        guard folders.count < maxVirtualFolders, let clean = cleanedName(name) else { return nil }
         let parentID = parentID.map(normalizedGroupID)
         if let parentID, let parentFolderID = virtualFolderID(fromGroupID: parentID) {
             guard folders.contains(where: { $0.id == parentFolderID }) else { return nil }
@@ -521,14 +522,10 @@ extension AppPersistence {
 
     func moveSession(path: String, toVirtualFolder folderID: String?) {
         updateState { state in
-            var assignments = state.virtualFolderAssignments
-            WorkspaceOrganization.move(
-                sessionPath: path,
-                to: folderID,
-                folders: state.virtualFolders,
-                assignments: &assignments
-            )
-            state.virtualFolderAssignments = assignments
+            guard folderID == nil || state.virtualFolders.contains(where: { $0.id == folderID }) else {
+                return
+            }
+            state.setVirtualFolderAssignment(sessionPath: path, folderID: folderID)
         }
     }
 
@@ -571,20 +568,27 @@ extension AppPersistence {
 
     func markSessionRead(path: String, completionID: String?) {
         let key = URL(fileURLWithPath: path).standardizedFileURL.path
-        updateState { state in
-            state.lastReadAt.removeValue(forKey: key)
+        updateStateIfChanged { state in
+            var changed = state.lastReadAt.removeValue(forKey: key) != nil
             if let completionID {
-                state.latestCompletedEntryIDBySessionPath[key] = completionID
-                state.lastSeenCompletedEntryIDBySessionPath[key] = completionID
+                if state.latestCompletedEntryIDBySessionPath[key] != completionID {
+                    state.latestCompletedEntryIDBySessionPath[key] = completionID
+                    changed = true
+                }
+                if state.lastSeenCompletedEntryIDBySessionPath[key] != completionID {
+                    state.lastSeenCompletedEntryIDBySessionPath[key] = completionID
+                    changed = true
+                }
                 state.pruneCompletionState(preferredPath: key)
             }
-            state.manuallyUnreadSessionPaths.remove(key)
+            if state.manuallyUnreadSessionPaths.remove(key) != nil { changed = true }
+            return changed
         }
     }
 
     func markSessionUnread(path: String) {
         let key = URL(fileURLWithPath: path).standardizedFileURL.path
-        updateState { $0.manuallyUnreadSessionPaths.insert(key) }
+        updateStateIfChanged { $0.manuallyUnreadSessionPaths.insert(key).inserted }
     }
 
     func pruneCompletionState(retainingSessionPaths paths: [String]) {
@@ -602,7 +606,14 @@ extension AppPersistence {
 @MainActor
 extension AppStore {
     var virtualFolders: [VirtualFolder] { persistence.state.virtualFolders }
-    var virtualFolderAssignments: [String: String] { persistence.state.virtualFolderAssignments }
+    var virtualFolderAssignments: [String: String] {
+        guard !provisionalVirtualFolderAssignments.isEmpty else {
+            return persistence.state.virtualFolderAssignments
+        }
+        return persistence.state.virtualFolderAssignments.merging(provisionalVirtualFolderAssignments) {
+            _, provisional in provisional
+        }
+    }
     var projectFolderAssignments: [String: String] { persistence.state.projectFolderAssignments }
     var managedWorktreeProjects: [String: String] { persistence.state.managedWorktreeProjects }
 
@@ -618,7 +629,8 @@ extension AppStore {
 
     func virtualFolderID(for session: SessionSummary) -> String? {
         let path = session.fileURL.standardizedFileURL.path
-        let candidate = persistence.state.virtualFolderAssignments[path]
+        let candidate = provisionalVirtualFolderAssignments[path]
+            ?? persistence.state.virtualFolderAssignments[path]
         return virtualFolders.contains(where: { $0.id == candidate }) ? candidate : nil
     }
 
@@ -646,32 +658,39 @@ extension AppStore {
     @discardableResult
     func createVirtualFolder(named name: String, parentID: String? = nil) -> VirtualFolder? {
         guard let folder = persistence.createVirtualFolder(named: name, parentID: parentID) else { return nil }
+        invalidateSidebarProjection()
         objectWillChange.send()
         return folder
     }
 
     func renameVirtualFolder(id: String, to name: String) {
         guard persistence.renameVirtualFolder(id: id, to: name) else { return }
+        invalidateSidebarProjection()
         objectWillChange.send()
     }
 
     func reparentVirtualFolder(id: String, to parentID: String?) {
         guard persistence.reparentVirtualFolder(id: id, to: parentID) else { return }
+        invalidateSidebarProjection()
         objectWillChange.send()
     }
 
     func deleteVirtualFolder(id: String) {
         guard persistence.deleteVirtualFolder(id: id) else { return }
+        invalidateSidebarProjection()
         objectWillChange.send()
     }
 
     func moveSession(_ session: SessionSummary, toVirtualFolder folderID: String?) {
+        discardProvisionalVirtualFolderAssignment(path: session.fileURL.path)
         persistence.moveSession(path: session.fileURL.path, toVirtualFolder: folderID)
+        invalidateSidebarProjection()
         objectWillChange.send()
     }
 
     func moveProjectFolder(path: String, toVirtualFolder folderID: String?) {
         guard persistence.moveProject(path: path, toVirtualFolder: folderID) else { return }
+        invalidateSidebarProjection()
         objectWillChange.send()
     }
 
@@ -696,18 +715,21 @@ extension AppStore {
         let completionID = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
             ?? persistence.state.latestCompletedEntryIDBySessionPath[path]
         persistence.markSessionRead(path: path, completionID: completionID)
+        syncDaemonUnread(path: path, unread: false)
         objectWillChange.send()
     }
 
     func markUnread(_ session: SessionSummary) {
-        persistence.markSessionUnread(path: session.fileURL.path)
+        let path = session.fileURL.standardizedFileURL.path
+        persistence.markSessionUnread(path: path)
+        syncDaemonUnread(path: path, unread: true)
         objectWillChange.send()
     }
 
     func isUnread(_ session: SessionSummary) -> Bool {
         let path = session.fileURL.standardizedFileURL.path
         if persistence.state.manuallyUnreadSessionPaths.contains(path) { return true }
-        if selectedSession?.fileURL.standardizedFileURL.path == path { return false }
+        if route == .session(path) { return false }
         guard let latest = activityMonitor.activity(forPath: path)?.latestCompletedEntryID
                 ?? persistence.state.latestCompletedEntryIDBySessionPath[path] else { return false }
         return persistence.state.lastSeenCompletedEntryIDBySessionPath[path] != latest

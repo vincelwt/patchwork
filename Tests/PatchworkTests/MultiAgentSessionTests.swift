@@ -130,6 +130,56 @@ final class MultiAgentSessionTests: XCTestCase {
         XCTAssertEqual(sessions.map(\.id), ["cdx-1"])
     }
 
+    func testSupplementalCustomPiSessionSurvivesRepeatedDiscovery() async throws {
+        let custom = root.appendingPathComponent("custom/pi-thread.jsonl")
+        try write([
+            #"{"type":"session","id":"custom-pi","cwd":"/tmp/custom","timestamp":"2026-07-30T10:00:00.000Z"}"#,
+            #"{"type":"message","id":"u1","message":{"role":"user","content":"hello"}}"#,
+        ], to: custom)
+        let repository = makeRepository()
+
+        for _ in 0..<2 {
+            let sessions = try await repository.discoverSessions(
+                archivedIDs: [], agents: nil, supplementalPaths: [custom.path]
+            )
+            XCTAssertEqual(sessions.map(\.id), ["custom-pi"])
+            XCTAssertEqual(sessions.first?.agent, .pi)
+        }
+
+        let ordinary = try await repository.discoverSessions(archivedIDs: [])
+        XCTAssertTrue(ordinary.isEmpty)
+    }
+
+    func testDisabledAgentFiltersSupplementalPathsBeforeParsing() async throws {
+        let custom = root.appendingPathComponent("custom/pi-thread.jsonl")
+        try write([
+            #"{"type":"session","id":"disabled-pi","cwd":"/tmp/custom"}"#,
+        ], to: custom)
+
+        let sessions = try await makeRepository().discoverSessions(
+            archivedIDs: [],
+            agents: [.codex, .claude],
+            supplementalPaths: [custom.path]
+        )
+
+        XCTAssertTrue(sessions.isEmpty)
+    }
+
+    func testSupplementalPathUnderKnownRootKeepsItsAgent() async throws {
+        let customCodex = codexRoot.appendingPathComponent("custom.jsonl")
+        try write([
+            #"{"timestamp":"2026-07-30T10:00:00.000Z","type":"session_meta","payload":{"session_id":"custom-codex","cwd":"/tmp/codex-project","thread_source":"user"}}"#,
+            #"{"timestamp":"2026-07-30T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+        ], to: customCodex)
+
+        let sessions = try await makeRepository().discoverSessions(
+            archivedIDs: [], agents: nil, supplementalPaths: [customCodex.path]
+        )
+
+        XCTAssertEqual(sessions.map(\.id), ["custom-codex"])
+        XCTAssertEqual(sessions.first?.agent, .codex)
+    }
+
     // MARK: - Summaries
 
     func testCodexSummaryUsesTheFirstRealUserTurnNotTheHarnessContext() async throws {
@@ -166,6 +216,22 @@ final class MultiAgentSessionTests: XCTestCase {
     }
 
     // MARK: - Transcripts
+
+    func testOuterEntryTimestampReachesMessagesForEveryAgent() async throws {
+        let repository = makeRepository()
+        let fixtures = [
+            (try writePiSession(), "2026-07-30T10:00:01.000Z"),
+            (try writeCodexSession(), "2026-07-30T10:00:02.000Z"),
+            (try writeClaudeSession(), "2026-07-30T10:00:01.000Z")
+        ]
+        for (file, timestamp) in fixtures {
+            let conversation = try await repository.loadConversation(from: file)
+            XCTAssertEqual(
+                conversation.messages.first(where: { $0.role == .user })?.timestamp,
+                Date.piDate(timestamp)
+            )
+        }
+    }
 
     func testCodexLinearTranscriptRendersEveryTurnInOrder() async throws {
         let url = try writeCodexSession()
@@ -261,6 +327,7 @@ final class MultiAgentSessionTests: XCTestCase {
             )
         )
         let sessions = try await repository.discoverSessions(archivedIDs: [])
+        let clock = ContinuousClock()
         for agent in AgentKind.allCases {
             let owned = sessions.filter { $0.agent == agent }
             guard let newest = owned.first else { continue }
@@ -268,10 +335,28 @@ final class MultiAgentSessionTests: XCTestCase {
             XCTAssertFalse(newest.isSubsession, "a subsession must never be listed")
             let page = try await repository.loadNewestConversationPage(from: newest.fileURL)
             XCTAssertLessThanOrEqual(page.messages.count, ConversationPage.maximumMessageCount)
+            XCTAssertEqual(
+                Set(page.messages.map(\.id)).count, page.messages.count,
+                "\(agent): projected message ids must remain unique"
+            )
             let unknown = page.messages.filter { $0.role == .unknown }
             XCTAssertLessThanOrEqual(
                 Double(unknown.count), Double(max(1, page.messages.count)) * 0.2,
                 "\(agent): too many records fell through to the unknown fallback"
+            )
+            let largest = owned.map { summary in
+                (
+                    summary,
+                    (try? summary.fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                )
+            }.max { $0.1 < $1.1 } ?? (newest, 0)
+            let start = clock.now
+            let largestPage = try await repository.loadNewestConversationPage(from: largest.0.fileURL)
+            let duration = start.duration(to: clock.now)
+            XCTAssertLessThanOrEqual(largestPage.messages.count, ConversationPage.maximumMessageCount)
+            print(
+                "[perf] \(agent.rawValue) largest=\(largest.1 / 1_024)KB "
+                    + "page=\(duration) scanned=\(largestPage.scannedByteCount / 1_024)KB"
             )
         }
     }

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PatchworkKit
 
 /// One heartbeat file the `patchwork-activity` extension maintains at
 /// `~/.pi/agent/patchwork-activity/<sessionId>.json`. Decoding is all-or-nothing: a malformed or
@@ -61,19 +62,15 @@ enum ActivityHeartbeatClassifier {
 /// Reuses decoded heartbeats until their file fingerprint changes. A busy day can leave hundreds
 /// of idle writers in this directory; decoding all of them every two seconds is wasted CPU.
 private final class ActivityHeartbeatFileCache: @unchecked Sendable {
-    private struct Fingerprint: Equatable {
-        let inode: UInt64
-        let modifiedAt: TimeInterval
-        let size: Int64
-    }
     private struct Entry {
-        let fingerprint: Fingerprint
+        let fingerprint: BoundedJSONFile.Fingerprint
         let heartbeat: ActivityHeartbeat?
     }
 
     private let lock = NSLock()
     private var directoryPath: String?
     private var entries: [String: Entry] = [:]
+    private var catalog: BoundedJSONFiles.Catalog?
 
     func scan(directory: URL, limit: Int) -> [String: [ActivityHeartbeat]] {
         let path = directory.standardizedFileURL.path
@@ -82,32 +79,27 @@ private final class ActivityHeartbeatFileCache: @unchecked Sendable {
         if directoryPath != path {
             directoryPath = path
             entries.removeAll(keepingCapacity: false)
+            catalog = nil
         }
-        guard let listedFiles = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [:] }
-
-        let files = Array(listedFiles.prefix(limit).filter { $0.pathExtension == "json" })
-        let livePaths = Set(files.map { $0.standardizedFileURL.path })
+        let scan = BoundedJSONFiles.scan(
+            in: directory, limit: limit, maxBytes: ActivityHeartbeatStore.maxFileBytes,
+            previous: catalog
+        )
+        catalog = scan.catalog
+        let files = scan.catalog.files
+        let livePaths = Set(files.map(\.path))
         entries = entries.filter { livePaths.contains($0.key) }
         var result: [String: [ActivityHeartbeat]] = [:]
-        for url in files {
-            let filePath = url.standardizedFileURL.path
-            var info = stat()
-            guard fstatat(AT_FDCWD, filePath, &info, 0) == 0 else { continue }
-            let fingerprint = Fingerprint(
-                inode: UInt64(info.st_ino),
-                modifiedAt: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000,
-                size: Int64(info.st_size)
-            )
+        for file in files {
+            let filePath = file.path
             let heartbeat: ActivityHeartbeat?
-            if let cached = entries[filePath], cached.fingerprint == fingerprint {
+            if let cached = entries[filePath], cached.fingerprint == file.fingerprint {
                 heartbeat = cached.heartbeat
             } else {
-                heartbeat = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(ActivityHeartbeat.self, from: $0) }
-                entries[filePath] = Entry(fingerprint: fingerprint, heartbeat: heartbeat)
+                heartbeat = BoundedJSONFiles.read(
+                    file, maxBytes: ActivityHeartbeatStore.maxFileBytes
+                ).flatMap { try? JSONDecoder().decode(ActivityHeartbeat.self, from: $0) }
+                entries[filePath] = Entry(fingerprint: file.fingerprint, heartbeat: heartbeat)
             }
             if let heartbeat, let sessionPath = heartbeat.resolvedSessionPath {
                 result[sessionPath, default: []].append(heartbeat)
@@ -121,6 +113,7 @@ private final class ActivityHeartbeatFileCache: @unchecked Sendable {
 /// full directory scan every tick is cheap; still bounded defensively against a runaway count.
 enum ActivityHeartbeatStore {
     static let maxFilesPerScan = 500
+    static let maxFileBytes = 256 * 1_024
     private static let cache = ActivityHeartbeatFileCache()
 
     static func defaultDirectory() -> URL {

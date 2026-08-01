@@ -8,7 +8,8 @@ import Foundation
 final class TestUnixHTTPServer {
     let socketPath: String
     private var listenFd: Int32 = -1
-    private let queue = DispatchQueue(label: "app.patchwork.desktop.tests.unix-http-server")
+    private let stateLock = NSLock()
+    private let queue = DispatchQueue(label: "patchwork-test-unix-http-server")
 
     init() {
         // `sockaddr_un.sun_path` is only 104 bytes on Darwin. NSTemporaryDirectory can already
@@ -50,7 +51,20 @@ final class TestUnixHTTPServer {
                 handleOneRequest(clientFd, writeInChunks: writeInChunks, respond: respond)
                 close(clientFd)
             }
+            closeListener(fd)
         }
+    }
+
+    private func closeListener(_ fd: Int32) {
+        let shouldClose = stateLock.withLock { () -> Bool in
+            guard listenFd == fd else { return false }
+            listenFd = -1
+            return true
+        }
+        guard shouldClose else { return }
+        shutdown(fd, SHUT_RDWR)
+        close(fd)
+        try? FileManager.default.removeItem(atPath: socketPath)
     }
 
     private func handleOneRequest(_ clientFd: Int32, writeInChunks: Bool, respond: (String) -> Data) {
@@ -88,7 +102,15 @@ final class TestUnixHTTPServer {
     }
 
     func stop() {
-        if listenFd >= 0 { close(listenFd) }
+        let fd = stateLock.withLock { () -> Int32 in
+            let current = listenFd
+            listenFd = -1
+            return current
+        }
+        if fd >= 0 {
+            shutdown(fd, SHUT_RDWR)
+            close(fd)
+        }
         try? FileManager.default.removeItem(atPath: socketPath)
     }
 

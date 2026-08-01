@@ -14,6 +14,12 @@ public struct HealthStatus: Codable, Hashable, Sendable {
     public var schedulesEnabled: Bool
     /// True when `POST /v1/schedules` honors `idempotencyKey`.
     public var scheduleIdempotency: Bool
+    /// True when `POST /v1/threads` honors `clientId` for replay-safe creation.
+    public var threadCreationIdempotency: Bool
+    /// True when message submission honors `clientId` across daemon restarts.
+    public var messageSubmissionIdempotency: Bool
+    /// True when manual schedule runs honor `clientId` for replay-safe admission.
+    public var scheduleRunIdempotency: Bool
     /// True when `POST /v1/threads` accepts `worktree:true`.
     public var threadWorktrees: Bool
     public var issues: [HealthIssue]
@@ -28,6 +34,9 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         piVersion: String?,
         schedulesEnabled: Bool,
         scheduleIdempotency: Bool = true,
+        threadCreationIdempotency: Bool = true,
+        messageSubmissionIdempotency: Bool = true,
+        scheduleRunIdempotency: Bool = true,
         threadWorktrees: Bool = true,
         issues: [HealthIssue] = []
     ) {
@@ -40,6 +49,9 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         self.piVersion = piVersion
         self.schedulesEnabled = schedulesEnabled
         self.scheduleIdempotency = scheduleIdempotency
+        self.threadCreationIdempotency = threadCreationIdempotency
+        self.messageSubmissionIdempotency = messageSubmissionIdempotency
+        self.scheduleRunIdempotency = scheduleRunIdempotency
         self.threadWorktrees = threadWorktrees
         self.issues = issues
     }
@@ -55,6 +67,9 @@ public struct HealthStatus: Codable, Hashable, Sendable {
         piVersion = try container.decodeIfPresent(String.self, forKey: .piVersion)
         schedulesEnabled = try container.decodeIfPresent(Bool.self, forKey: .schedulesEnabled) ?? true
         scheduleIdempotency = try container.decodeIfPresent(Bool.self, forKey: .scheduleIdempotency) ?? false
+        threadCreationIdempotency = try container.decodeIfPresent(Bool.self, forKey: .threadCreationIdempotency) ?? false
+        messageSubmissionIdempotency = try container.decodeIfPresent(Bool.self, forKey: .messageSubmissionIdempotency) ?? false
+        scheduleRunIdempotency = try container.decodeIfPresent(Bool.self, forKey: .scheduleRunIdempotency) ?? false
         threadWorktrees = try container.decodeIfPresent(Bool.self, forKey: .threadWorktrees) ?? false
         issues = try container.decodeIfPresent([HealthIssue].self, forKey: .issues) ?? []
     }

@@ -39,9 +39,91 @@ final class PiRPCSessionTests: XCTestCase {
         let requestID = try session.send(type: "get_state")
         let response = try await session.receiveMatching(id: requestID, timeout: 1)
         XCTAssertEqual(response["id"]?.stringValue, requestID)
+        let cachedDuplicate = await session.awaitCachedResponse(id: requestID, timeout: 0.05)
+        XCTAssertNil(cachedDuplicate, "the ordinary matching reader consumes its cached duplicate")
 
         let event = try await session.receiveNext(timeout: 1)
         XCTAssertEqual(event?["type"]?.stringValue, "extension_ui_request")
+    }
+
+    func testAdapterWritebackFailureSurfacesImmediatelyAndBreaksTheSession() async throws {
+        let executable = directory.appendingPathComponent("writeback-pi")
+        try """
+        #!/bin/sh
+        printf '%s\n' '{"trigger":true}'
+        /bin/sleep 30
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let session = try PiRPCSession.start(
+            cwd: directory,
+            sessionPath: nil,
+            piExecutable: executable,
+            environment: ProcessInfo.processInfo.environment,
+            writeTimeout: 0.2,
+            adapter: LargeWritebackAdapter()
+        )
+        defer { session.stop() }
+
+        let started = Date()
+        do {
+            _ = try await session.receiveNext(timeout: 2)
+            XCTFail("expected the writeback to fail")
+        } catch let error as RunnerError {
+            guard case .ioFailure = error else { return XCTFail("expected ioFailure, got \(error)") }
+        } catch {
+            XCTFail("expected RunnerError.ioFailure, got \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        XCTAssertThrowsError(try session.send(type: "get_state"), "a torn stream must stay broken")
+    }
+
+    func testPartialGroupedDialogAnswerIsAcceptedWithoutWritingYet() throws {
+        let executable = directory.appendingPathComponent("waiting-agent")
+        try """
+        #!/bin/sh
+        /bin/sleep 30
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: executable,
+            environment: ProcessInfo.processInfo.environment,
+            adapter: AcceptedWithoutWriteAdapter()
+        )
+        defer { session.stop() }
+
+        XCTAssertNoThrow(try session.sendRaw([
+            "type": .string("extension_ui_response"), "id": .string("question-1")
+        ]))
+    }
+
+    func testResponseCacheEvictsByBytesAndKeepsTheNewestAcknowledgement() async throws {
+        let executable = directory.appendingPathComponent("large-response-pi")
+        try """
+        #!/bin/sh
+        printf '%s\n' '{"id":"one"}' '{"id":"two"}'
+        /bin/sleep 30
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let session = try PiRPCSession.start(
+            cwd: directory,
+            sessionPath: nil,
+            piExecutable: executable,
+            environment: ProcessInfo.processInfo.environment,
+            adapter: LargeResponseAdapter()
+        )
+        defer { session.stop() }
+
+        _ = try await session.receiveNext(timeout: 2)
+        _ = try await session.receiveNext(timeout: 2)
+        let usage = session.responseCacheUsageForTesting
+        XCTAssertEqual(usage.count, 1)
+        XCTAssertLessThanOrEqual(usage.bytes, PiRPCSession.responseCacheByteLimit)
+        let evicted = await session.awaitCachedResponse(id: "one", timeout: 0.05)
+        let newest = await session.awaitCachedResponse(id: "two", timeout: 0.05)
+        XCTAssertNil(evicted)
+        XCTAssertEqual(newest?["id"]?.stringValue, "two")
     }
 
     /// An echo `pi`: records every request line it receives and answers each one. Enough to prove
@@ -113,6 +195,56 @@ final class PiRPCSessionTests: XCTestCase {
         }
     }
 
+    func testCausalWritebackPrecedesAConcurrentOutboundCommand() async throws {
+        let transcript = directory.appendingPathComponent("causal-stdin.jsonl")
+        let executable = directory.appendingPathComponent("causal-agent")
+        try """
+        #!/bin/sh
+        while IFS= read -r line; do
+          printf '%s\n' "$line" >> "$PI_TEST_TRANSCRIPT"
+          case "$line" in
+            *'"kind":"prime"'*) printf '%s\n' '{"trigger":true}' ;;
+          esac
+        done
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        FileManager.default.createFile(atPath: transcript.path, contents: nil)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PI_TEST_TRANSCRIPT"] = transcript.path
+        let adapter = CausalWritebackAdapter()
+        let session = try PiRPCSession.start(
+            cwd: directory, sessionPath: nil, piExecutable: executable,
+            environment: environment, adapter: adapter
+        )
+        defer { session.stop() }
+
+        _ = try session.send(type: "prime")
+        let receive = Task { try await session.receiveNext(timeout: 3) }
+        XCTAssertEqual(adapter.decodeEntered.wait(timeout: .now() + 2), .success)
+        let sendAttempted = DispatchSemaphore(value: 0)
+        let newer = Task {
+            sendAttempted.signal()
+            return try session.send(type: "newer")
+        }
+        XCTAssertEqual(sendAttempted.wait(timeout: .now() + 2), .success)
+        adapter.releaseDecode.signal()
+        _ = try await receive.value
+        _ = try await newer.value
+
+        let deadline = Date().addingTimeInterval(2)
+        var kinds: [String] = []
+        while Date() < deadline {
+            kinds = ((try? String(contentsOf: transcript, encoding: .utf8)) ?? "")
+                .split(separator: "\n")
+                .compactMap { line in
+                    (try? PiJSONValue.decode(Data(line.utf8)))?["kind"]?.stringValue
+                }
+            if kinds.count == 3 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(kinds, ["prime", "writeback", "newer"])
+    }
+
     /// A steer delivered from an HTTP handler collects its acknowledgement from the cache the
     /// run's own drain loop fills, so the two never read the pipe at the same time.
     func testAnAcknowledgementIsReadableByANonDrainingCaller() async throws {
@@ -156,6 +288,84 @@ final class PiRPCSessionTests: XCTestCase {
         let id = try session.send(type: "steer", payload: ["message": .string("x")])
         let response = await session.awaitCachedResponse(id: id, timeout: 0.3)
         XCTAssertNil(response, "callers treat this as outcome-unknown, never as \"not delivered\"")
+    }
+}
+
+private final class LargeWritebackAdapter: AgentProtocolAdapter, AdapterWriteback {
+    let agent = AgentKind.pi
+    private var pending: [Data] = []
+
+    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] { [] }
+    func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
+        .write([AdapterEncoding.line(.object(["type": .string(command), "id": .string(id)]))])
+    }
+    func encodeUncorrelated(_ value: PiJSONValue) -> [Data] { [AdapterEncoding.line(value)] }
+    func decode(line: Data) -> [AdapterInbound] {
+        pending = [Data(repeating: 0x41, count: 2 * 1_024 * 1_024)]
+        return [.event(AdapterEncoding.event("trigger"))]
+    }
+    func drainPendingWrites() -> [Data] {
+        defer { pending.removeAll() }
+        return pending
+    }
+    func reset() { pending.removeAll() }
+}
+
+private final class AcceptedWithoutWriteAdapter: AgentProtocolAdapter {
+    let agent = AgentKind.codex
+    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] { [] }
+    func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
+        .unsupported(command)
+    }
+    func encodeUncorrelated(_ value: PiJSONValue) -> [Data] { [] }
+    func encodeUncorrelatedWithDisposition(
+        _ value: PiJSONValue
+    ) -> AdapterUncorrelatedOutbound {
+        .acceptedWithoutWrite
+    }
+    func decode(line: Data) -> [AdapterInbound] { [] }
+}
+
+private final class CausalWritebackAdapter: AgentProtocolAdapter, AdapterWriteback {
+    let agent = AgentKind.codex
+    let decodeEntered = DispatchSemaphore(value: 0)
+    let releaseDecode = DispatchSemaphore(value: 0)
+    private var pending: [Data] = []
+
+    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] { [] }
+    func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound {
+        .write([AdapterEncoding.line(.object([
+            "kind": .string(command), "id": .string(id)
+        ]))])
+    }
+    func encodeUncorrelated(_ value: PiJSONValue) -> [Data] { [] }
+    func decode(line: Data) -> [AdapterInbound] {
+        decodeEntered.signal()
+        _ = releaseDecode.wait(timeout: .now() + 3)
+        pending = [AdapterEncoding.line(.object(["kind": .string("writeback")]))]
+        return [.event(AdapterEncoding.event("trigger"))]
+    }
+    func drainPendingWrites() -> [Data] {
+        defer { pending.removeAll() }
+        return pending
+    }
+    func reset() { pending.removeAll() }
+}
+
+private final class LargeResponseAdapter: AgentProtocolAdapter {
+    let agent = AgentKind.pi
+    private let payload = String(repeating: "x", count: 9 * 1_024 * 1_024)
+
+    func launchArguments(sessionPath: URL?, cwd: URL) -> [String] { [] }
+    func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound { .unsupported(command) }
+    func encodeUncorrelated(_ value: PiJSONValue) -> [Data] { [] }
+    func decode(line: Data) -> [AdapterInbound] {
+        guard let marker = try? PiJSONValue.decode(line), let id = marker["id"]?.stringValue else { return [] }
+        return [.response(id: id, value: .object([
+            "type": .string("response"),
+            "id": .string(id),
+            "data": .object(["blob": .string(payload)])
+        ]))]
     }
 }
 
@@ -205,8 +415,9 @@ final class BlockingPipeWriteTests: XCTestCase {
         let payload = Data(repeating: 0x41, count: 8 * 1_024 * 1_024)
         let started = Date()
         XCTAssertThrowsError(try BlockingPipeIO.writeAll(fd: fd, data: payload, timeoutSeconds: 0.4)) { error in
-            guard case let RunnerError.ioFailure(message) = error else { return XCTFail("expected an I/O failure, got \(error)") }
-            XCTAssertTrue(message.contains("did not accept input"), message)
+            guard case BlockingPipeIOError.timedOut = error else {
+                return XCTFail("expected a bounded timeout, got \(error)")
+            }
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 5, "the whole point is that it returns")
     }
@@ -252,7 +463,12 @@ final class BlockingPipeWriteTests: XCTestCase {
             }
         }
         let thrown = try XCTUnwrap(failure, "a child that never reads must eventually fail a write")
-        XCTAssertTrue("\(thrown)".contains("did not accept input"), "\(thrown)")
+        guard let runnerError = thrown as? RunnerError else {
+            return XCTFail("expected RunnerError, got \(thrown)")
+        }
+        guard case .ioFailure = runnerError else {
+            return XCTFail("expected an I/O failure, got \(runnerError)")
+        }
 
         // The stream now holds a partial record that no later write can repair.
         XCTAssertThrowsError(try session.send(type: "get_state"), "later writes must fail fast, not append to a torn command")

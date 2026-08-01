@@ -13,6 +13,9 @@ public enum AdapterOutbound {
     /// Answer the caller immediately without touching the process. Used for facts the adapter
     /// already knows (the model list it cached at startup, the current session id).
     case immediate(PiJSONValue)
+    /// Answer immediately and publish adapter-owned state changes in the same ordered delivery.
+    /// Used when accepting a local queue operation changes UI state without a wire response.
+    case immediateWithEvents(PiJSONValue, [PiJSONValue])
     /// This agent cannot do this at all. The caller gets a clear reason instead of a timeout.
     case unsupported(String)
 }
@@ -23,6 +26,27 @@ public enum AdapterInbound {
     case response(id: String, value: PiJSONValue)
     /// A streaming event, shaped exactly like a Pi RPC event.
     case event(PiJSONValue)
+}
+
+/// Whether an uncorrelated UI answer was written, deliberately retained until more answers arrive,
+/// or did not match adapter state at all. The last two cases both contain no bytes, but callers
+/// such as the daemon must not report an accepted grouped answer as a delivery failure.
+public enum AdapterUncorrelatedOutbound {
+    case write([Data])
+    case acceptedWithoutWrite
+    case unmatched
+
+    public var lines: [Data] {
+        if case let .write(lines) = self { return lines }
+        return []
+    }
+
+    public var wasAccepted: Bool {
+        switch self {
+        case .write, .acceptedWithoutWrite: true
+        case .unmatched: false
+        }
+    }
 }
 
 /// Translates between Patchwork's internal command/event vocabulary and one agent's native
@@ -41,6 +65,22 @@ public protocol AgentProtocolAdapter: AnyObject {
     /// Process arguments for this launch. `sessionPath` is the transcript to resume, if any.
     func launchArguments(sessionPath: URL?, cwd: URL) -> [String]
 
+    /// Supplies the optional name for a fresh session before launch. Most agents name a session
+    /// through their live protocol and inherit the no-op implementation. An agent whose first
+    /// prompt creates the transcript can instead carry the name on its launch command.
+    func prepareNewSession(name: String?)
+    /// Supplies a preallocated identity when the agent can create or resume that exact session.
+    /// The default preserves adapters whose server owns identity allocation.
+    func prepareNewSession(id: String?, name: String?)
+
+    /// Supplies launch-scoped model and thinking choices before the process starts. Most agents
+    /// apply both over their live protocol, so the default implementation intentionally does
+    /// nothing. Adapters with launch-only options retain the values for `launchArguments`.
+    func configureLaunch(modelID: String?, thinkingLevel: String?)
+
+    /// Supplies an agent's launch-scoped fast-mode choice. Live-setting agents ignore this.
+    func configureFastMode(_ enabled: Bool)
+
     /// Extra environment for this launch, merged over the shared agent environment.
     var environmentOverrides: [String: String] { get }
 
@@ -50,8 +90,16 @@ public protocol AgentProtocolAdapter: AnyObject {
     /// Translates one app command. `id` is the correlation id the caller is waiting on.
     func encode(command: String, id: String, payload: [String: PiJSONValue]) -> AdapterOutbound
 
+    /// Reverts bookkeeping performed by `encode` when the transport refuses the bytes before any
+    /// write begins. Correlation FIFOs must not retain a command the process never received.
+    func rollbackRejectedEncoding(command: String, id: String, payload: [String: PiJSONValue])
+
     /// Translates one uncorrelated app message (dialog answers, questionnaire replies).
     func encodeUncorrelated(_ value: PiJSONValue) -> [Data]
+
+    /// Semantic variant used when the transport must distinguish a partial grouped answer from a
+    /// stale or unknown dialog id. Adapters without grouped answers inherit the ordinary mapping.
+    func encodeUncorrelatedWithDisposition(_ value: PiJSONValue) -> AdapterUncorrelatedOutbound
 
     /// Translates one inbound wire line into zero or more app-shaped messages.
     func decode(line: Data) -> [AdapterInbound]
@@ -61,8 +109,34 @@ public protocol AgentProtocolAdapter: AnyObject {
 }
 
 public extension AgentProtocolAdapter {
+    func prepareNewSession(name: String?) {}
+    func prepareNewSession(id: String?, name: String?) {
+        prepareNewSession(name: name)
+    }
+    func launchArguments(
+        sessionPath: URL?, cwd: URL, initialSessionName: String?
+    ) -> [String] {
+        launchArguments(
+            sessionPath: sessionPath, cwd: cwd,
+            initialSessionID: nil, initialSessionName: initialSessionName
+        )
+    }
+    func launchArguments(
+        sessionPath: URL?, cwd: URL,
+        initialSessionID: String?, initialSessionName: String?
+    ) -> [String] {
+        prepareNewSession(id: initialSessionID, name: initialSessionName)
+        return launchArguments(sessionPath: sessionPath, cwd: cwd)
+    }
     var environmentOverrides: [String: String] { [:] }
+    func configureLaunch(modelID: String?, thinkingLevel: String?) {}
+    func configureFastMode(_ enabled: Bool) {}
     func startupLines(sessionPath: URL?, cwd: URL) -> [Data] { [] }
+    func rollbackRejectedEncoding(command: String, id: String, payload: [String: PiJSONValue]) {}
+    func encodeUncorrelatedWithDisposition(_ value: PiJSONValue) -> AdapterUncorrelatedOutbound {
+        let lines = encodeUncorrelated(value)
+        return lines.isEmpty ? .unmatched : .write(lines)
+    }
     func reset() {}
 }
 

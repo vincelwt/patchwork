@@ -15,6 +15,7 @@ final class DaemonCore: @unchecked Sendable {
     let runQueue: RunQueue
     let scheduler: Scheduler
     let activityService: ActivityService
+    let activityPublisher: ActivityPublisher
     let limitsCache: LimitsCache
     let relay: RelayService
     let settings: DaemonSettings
@@ -24,7 +25,7 @@ final class DaemonCore: @unchecked Sendable {
     /// Threads with a daemon-owned Pi turn in flight, for `delivery: steer|followUp`.
     let liveSessions: LiveSessionRegistry
     /// Replay protection for `POST /v1/threads/{id}/messages`, keyed by the caller's own id.
-    let submissions = SubmissionRegistry()
+    let submissions: SubmissionRegistry
     /// Short-lived, query-only or setter-only Pi sessions for idle thread operations.
     let threadRPC: ThreadRPCServing
     let startedAt = Date()
@@ -35,6 +36,9 @@ final class DaemonCore: @unchecked Sendable {
     let appStateURL: URL
     /// Injectable so worktree creation tests never touch the user's `~/.pi/worktrees`.
     let worktreeRootURL: URL
+    /// Agent availability seam. Production resolves installed executables; tests inject a stable
+    /// catalog so route behavior never depends on the developer machine.
+    let isAgentInstalled: @Sendable (AgentKind) -> Bool
 
     init(
         settings: DaemonSettings,
@@ -48,6 +52,7 @@ final class DaemonCore: @unchecked Sendable {
         schedulesFileURL: URL = PatchworkPaths.schedules,
         runHistoryFileURL: URL = PatchworkPaths.runHistory,
         overlayFileURL: URL = PatchworkPaths.supportDirectory.appendingPathComponent("daemon-thread-overlay.json"),
+        submissionFileURL: URL? = PatchworkPaths.submissionReplays,
         relayIdentityFileURL: URL = PatchworkPaths.relayIdentity,
         relayWebSocketOrigin: String = RelayService.websocketOrigin,
         schedulerPollInterval: TimeInterval = 1,
@@ -58,16 +63,21 @@ final class DaemonCore: @unchecked Sendable {
         liveSessions: LiveSessionRegistry = LiveSessionRegistry(),
         threadRPC: ThreadRPCServing? = nil,
         appStateURL: URL = AppStatePeek.defaultURL(),
-        worktreeRootURL: URL = WorktreeService.root
+        worktreeRootURL: URL = WorktreeService.root,
+        isAgentInstalled: @escaping @Sendable (AgentKind) -> Bool = {
+            AgentCatalog.executable(for: $0) != nil
+        }
     ) {
         self.settings = settings
         self.logger = logger
         self.piVersion = piVersion
         self.interactions = interactions
         self.liveSessions = liveSessions
+        submissions = SubmissionRegistry(fileURL: submissionFileURL, logger: logger)
         self.threadRPC = threadRPC ?? ThreadCreationService(logger: logger)
         self.appStateURL = appStateURL
         self.worktreeRootURL = worktreeRootURL.standardizedFileURL
+        self.isAgentInstalled = isAgentInstalled
 
         let bus = EventBus(logger: logger)
         self.bus = bus
@@ -84,11 +94,17 @@ final class DaemonCore: @unchecked Sendable {
         let overlay = DaemonOverlayStore(fileURL: overlayFileURL)
         threadStore = ThreadStore(
             rootURL: sessionRootURL, roots: sessionRoots, activityDirectoryURL: activityDirectoryURL,
-            appStateURL: appStateURL, logger: logger, overlay: overlay
+            appStateURL: appStateURL, logger: logger, overlay: overlay,
+            indexFileURL: overlayFileURL.deletingLastPathComponent()
+                .appendingPathComponent("daemon-thread-index.json")
         )
         limitsCache = LimitsCache()
 
-        let queue = RunQueue(concurrencyLimit: settings.concurrency, executor: executor, historyStore: runHistoryStore, bus: bus, logger: logger)
+        let queue = RunQueue(
+            concurrencyLimit: settings.concurrency, executor: executor,
+            historyStore: runHistoryStore, bus: bus, logger: logger,
+            leaseStore: leaseStore
+        )
         runQueue = queue
         scheduler = Scheduler(
             scheduleStore: scheduleStore, runHistoryStore: runHistoryStore,
@@ -96,14 +112,17 @@ final class DaemonCore: @unchecked Sendable {
             bus: bus, logger: logger, pollInterval: schedulerPollInterval,
             retryDelays: schedulerRetryDelays, networkAvailable: networkAvailable
         )
-        activityService = ActivityService(
+        let activityService = ActivityService(
             logger: logger, threadStore: threadStore, leaseStore: leaseStore, activityDirectoryURL: activityDirectoryURL,
-            daemonActiveThreadIDs: { await queue.activeThreadIDs() }
+            daemonActiveThreadKeys: { await queue.activeThreadKeys() }
         )
+        self.activityService = activityService
+        activityPublisher = ActivityPublisher(bus: bus) { await activityService.snapshot() }
     }
 
     func start() async {
         await scheduler.start()
+        await activityPublisher.start()
     }
 
     func startRelay(router: DaemonRouter) async {
@@ -115,6 +134,7 @@ final class DaemonCore: @unchecked Sendable {
     /// "Shutdown" section for the full contract. The scheduler stops first so nothing new can
     /// start while the queue is draining.
     func stop(graceSeconds: TimeInterval = 10) async {
+        await activityPublisher.stop()
         await relay.stop()
         await scheduler.stop()
         let running = await runQueue.activeCount()
@@ -136,6 +156,10 @@ final class DaemonCore: @unchecked Sendable {
             queuedRuns: queuedRuns,
             piVersion: piVersion,
             schedulesEnabled: await scheduler.enabled,
+            scheduleIdempotency: true,
+            threadCreationIdempotency: true,
+            messageSubmissionIdempotency: true,
+            scheduleRunIdempotency: true,
             issues: quarantine
         )
     }

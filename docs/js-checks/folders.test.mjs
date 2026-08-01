@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import {
   applyThreadUpdate,
   buildThreadTree,
+  findThreadByReference,
   flattenTree,
   folderIdFromGroupId,
   groupIdForFolder,
-  isFlatList
+  isFlatList,
+  threadIdentity
 } from "../../Sources/PatchworkWeb/Site/js/folders.mjs";
 
 const thread = (id, cwd, extra = {}) => ({
@@ -243,10 +245,50 @@ test("an update for the list on screen merges in place, and an unknown thread jo
 
   const added = applyThreadUpdate(list, thread("c", "/Users/x/code"), false);
   assert.deepEqual(added.map((t) => t.id), ["c", "a", "b"]);
+  assert.equal(
+    applyThreadUpdate(renamed, { id: "b", name: "renamed" }, false),
+    renamed,
+    "a duplicate point event preserves list identity"
+  );
+});
+
+test("metadata point events cannot rewind run-owned live state", () => {
+  const running = [thread("a", "/Users/x/code", { running: true })];
+  const stale = applyThreadUpdate(
+    running,
+    { id: "a", path: "/s/a.jsonl", running: false, name: "renamed", archived: false },
+    false
+  );
+  assert.equal(stale[0].running, true);
+  assert.equal(stale[0].name, "renamed");
 });
 
 test("an update with no id is ignored rather than added as a blank row", () => {
   const list = [thread("a", "/Users/x/code")];
   assert.equal(applyThreadUpdate(list, {}, false), list);
   assert.equal(applyThreadUpdate(list, null, false), list);
+});
+
+test("copied public ids retain separate path identities and route resolution", () => {
+  const original = thread("shared", "/Users/x/code", { path: "/s/original.jsonl", name: "original" });
+  const copied = thread("shared", "/Users/x/code", { path: "/s/copied.jsonl", name: "copied" });
+  const list = [original, copied];
+
+  assert.equal(threadIdentity(original), "/s/original.jsonl");
+  assert.equal(threadIdentity(copied), "/s/copied.jsonl");
+  assert.equal(findThreadByReference(list, "/s/copied.jsonl"), copied);
+  assert.equal(findThreadByReference(list, "shared"), null, "a duplicated public id is ambiguous");
+});
+
+test("path-scoped events update and remove only the intended copied history", () => {
+  const original = thread("shared", "/Users/x/code", { path: "/s/original.jsonl", name: "original" });
+  const copied = thread("shared", "/Users/x/code", { path: "/s/copied.jsonl", name: "copied" });
+  const list = [original, copied];
+
+  const updated = applyThreadUpdate(list, { id: "shared", path: copied.path, name: "renamed", archived: false }, false);
+  assert.deepEqual(updated.map((entry) => entry.name), ["original", "renamed"]);
+
+  const archived = applyThreadUpdate(updated, { id: "shared", path: copied.path, archived: true }, false);
+  assert.deepEqual(archived.map((entry) => entry.path), [original.path]);
+  assert.equal(applyThreadUpdate(list, { id: "shared", name: "unsafe", archived: false }, false), list);
 });

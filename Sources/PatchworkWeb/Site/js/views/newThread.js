@@ -1,8 +1,18 @@
 import { h, mount } from "../dom.js";
-import { describeError } from "../api.js";
+import { api, describeError } from "../api.js";
 import { AGENTS } from "../agents.mjs";
+import { createCreationIntentStore } from "../creationIntent.mjs";
+import { threadIdentity } from "../folders.mjs";
+import { protectedMutationDisposition } from "../liveSync.mjs";
+import {
+  PROTECTED_CREATION_REQUIRED_ERROR,
+  firstMessagePresentation,
+  firstMessageValidationError,
+  supportsProtectedThreadCreation
+} from "../newThreadContract.mjs";
 
 const MODES = ["xfast", "fast", "smart", "ultra"];
+const creationIntent = createCreationIntentStore();
 
 /**
  * There is no "list recent folders" endpoint in docs/daemon-api.md, so "recent working
@@ -29,6 +39,7 @@ function folderName(cwd) {
 }
 
 export function renderNewThread(state, actions) {
+  const retainedIntent = creationIntent.pending();
   const cwdInput = h("input", {
     type: "text",
     name: "cwd",
@@ -37,6 +48,7 @@ export function renderNewThread(state, actions) {
     placeholder: "/Users/you/code/project",
     "aria-describedby": "new-cwd-hint"
   });
+  if (retainedIntent?.body.cwd) cwdInput.value = retainedIntent.body.cwd;
   // A dedicated wrapper (not the chips themselves) so `paintChips` can freely replace its
   // contents — including going from "no chips yet" to populated once threads finish loading,
   // which happens on a direct/deep-link visit to this route before the list view has ever run.
@@ -151,42 +163,205 @@ export function renderNewThread(state, actions) {
     { id: "new-agent" },
     AGENTS.map((agent) => h("option", { value: agent.id }, agent.label))
   );
-
+  const modeField = h(
+    "div",
+    { class: "field" },
+    h("label", null, "Mode (optional)"),
+    h("div", { class: "segmented", role: "group", "aria-label": "Mode" }, modeButtons)
+  );
+  function syncModeVisibility() {
+    const supported = agentSelect.value === "pi";
+    modeField.hidden = !supported;
+    if (!supported) {
+      modeButtons.forEach((button) => button.setAttribute("aria-pressed", "false"));
+    }
+  }
   const nameInput = h("input", { id: "new-name", type: "text", name: "name", placeholder: "Untitled", autocomplete: "off" });
-  const messageInput = h("textarea", { id: "new-message", name: "message", rows: "3", placeholder: "Leave blank to create an idle thread" });
+  const messageInput = h("textarea", {
+    id: "new-message",
+    name: "message",
+    rows: "3",
+    "aria-describedby": "new-message-hint"
+  });
+  const messageLabel = h("label", { for: "new-message" });
+  const messageHint = h("div", { class: "field-hint", id: "new-message-hint" });
+  function syncFirstMessageRequirement() {
+    const presentation = firstMessagePresentation(agentSelect.value);
+    messageLabel.textContent = presentation.label;
+    messageHint.textContent = presentation.hint;
+    messageInput.placeholder = presentation.placeholder;
+    messageInput.toggleAttribute("required", presentation.required);
+    messageInput.setAttribute("aria-required", String(presentation.required));
+    if (!presentation.required) messageInput.removeAttribute("aria-invalid");
+  }
+  agentSelect.addEventListener("change", () => {
+    syncModeVisibility();
+    syncFirstMessageRequirement();
+  });
+  nameInput.value = retainedIntent?.body.name || "";
+  messageInput.value = retainedIntent?.body.message || "";
+  agentSelect.value = retainedIntent?.body.agent || "pi";
+  if (retainedIntent?.body.mode) {
+    modeButtons.forEach((button) => button.setAttribute(
+      "aria-pressed", String(button.dataset.mode === retainedIntent.body.mode)
+    ));
+  }
+  syncModeVisibility();
+  syncFirstMessageRequirement();
+  if (retainedIntent?.body.cwd) loadWorktrees();
   const errorBox = h("div", { class: "inline-error", role: "alert", hidden: true });
+  function showFirstMessageError(message) {
+    errorBox.hidden = false;
+    errorBox.dataset.validation = "first-message";
+    errorBox.textContent = message;
+    messageInput.setAttribute("aria-invalid", "true");
+    messageInput.focus();
+  }
+  function clearFirstMessageErrorIfResolved() {
+    if (firstMessageValidationError(agentSelect.value, messageInput.value)) return;
+    messageInput.removeAttribute("aria-invalid");
+    if (errorBox.dataset.validation === "first-message") {
+      delete errorBox.dataset.validation;
+      errorBox.hidden = true;
+      errorBox.textContent = "";
+    }
+  }
+  messageInput.addEventListener("input", clearFirstMessageErrorIfResolved);
+  agentSelect.addEventListener("change", clearFirstMessageErrorIfResolved);
+  messageInput.addEventListener("invalid", (event) => {
+    const validationError = firstMessageValidationError(agentSelect.value, messageInput.value);
+    if (!validationError) return;
+    event.preventDefault();
+    showFirstMessageError(validationError);
+  });
+  const reviewIntent = h("button", {
+    class: "btn", type: "button", hidden: true,
+    onclick: async () => {
+      await actions.refreshThreads?.();
+      actions.navigate("/");
+    }
+  }, "Review threads");
+  const resetIntent = h("button", {
+    class: "btn", type: "button", hidden: true,
+    onclick: async () => {
+      if (await creationIntent.abandon()) {
+        syncRecoveryControls(null);
+        errorBox.hidden = true;
+      }
+    }
+  }, "Reset after review");
+  const openCreatedThread = h("button", {
+    class: "btn", type: "button", hidden: true
+  }, "Open created thread");
   const submit = h("button", { class: "btn btn-primary btn-block", type: "submit" }, "Create thread");
+
+  function syncRecoveryControls(pendingIntent = creationIntent.pending()) {
+    const reviewOnly = pendingIntent?.expired || pendingIntent?.disposition === "review";
+    const attempting = pendingIntent?.disposition === "attempting";
+    reviewIntent.hidden = !reviewOnly;
+    resetIntent.hidden = !reviewOnly;
+    submit.disabled = Boolean(reviewOnly || attempting);
+  }
+
+  if (retainedIntent) {
+    errorBox.hidden = false;
+    errorBox.textContent = retainedIntent.disposition === "attempting"
+      ? "This thread creation request is still being attempted in another tab."
+      : retainedIntent.expired || retainedIntent.disposition === "review"
+      ? "This unresolved request is review-only. Review the thread list, then reset it before creating another thread."
+      : "An unresolved thread request was restored. Retrying unchanged uses the same protected request.";
+  }
+  syncRecoveryControls(retainedIntent);
 
   const form = h(
     "form",
     {
       class: "content-pad",
-      onsubmit: (event) => {
+      onsubmit: async (event) => {
         event.preventDefault();
         // The selected checkout *is* the working directory Pi runs in, so the daemon needs no
         // separate field: it already validates that `cwd` exists.
         const cwd = (worktreeField.hidden ? "" : worktreeSelect.value) || cwdInput.value.trim();
         if (!cwd) return;
         const mode = modeButtons.find((btn) => btn.getAttribute("aria-pressed") === "true");
+        const message = messageInput.value.trim();
+        const validationError = firstMessageValidationError(agentSelect.value, message);
+        if (validationError) {
+          showFirstMessageError(validationError);
+          return;
+        }
+        messageInput.removeAttribute("aria-invalid");
+        delete errorBox.dataset.validation;
         errorBox.hidden = true;
         submit.disabled = true;
         submit.textContent = "Creating\u2026";
-        actions
-          .createThread({
-            cwd,
-            name: nameInput.value.trim() || undefined,
-            message: messageInput.value.trim() || undefined,
-            mode: mode ? mode.dataset.mode : undefined,
-            agent: agentSelect.value || undefined
-          })
-          .catch((err) => {
+        let intent;
+        const replayProtected = true;
+        try {
+          const health = await api.health();
+          if (!supportsProtectedThreadCreation(health)) {
             errorBox.hidden = false;
-            errorBox.textContent = describeError(err);
-          })
-          .finally(() => {
-            submit.disabled = false;
+            errorBox.textContent = PROTECTED_CREATION_REQUIRED_ERROR;
+            syncRecoveryControls();
             submit.textContent = "Create thread";
+            return;
+          }
+          intent = await creationIntent.begin({
+              cwd,
+              name: nameInput.value.trim() || undefined,
+              message: message || undefined,
+              mode: mode ? mode.dataset.mode : undefined,
+              agent: agentSelect.value || undefined,
+              desktopManaged: true
+            }, { replayProtected: true });
+        } catch (err) {
+          errorBox.hidden = false;
+          errorBox.textContent = `${describeError(err)} Thread creation was not attempted.`;
+          syncRecoveryControls();
+          submit.textContent = "Create thread";
+          return;
+        }
+        if (!intent) {
+          errorBox.hidden = false;
+          errorBox.textContent = creationIntent.error
+            || "This thread request could not be saved safely. Free browser storage and try again.";
+          syncRecoveryControls();
+          submit.textContent = "Create thread";
+          return;
+        }
+        try {
+          const created = await actions.createThread(intent.body);
+          await creationIntent.complete(intent.clientId);
+          syncRecoveryControls(null);
+          if (created?.firstMessageRecoveryError) {
+            errorBox.hidden = false;
+            errorBox.textContent = created.firstMessageRecoveryError;
+            openCreatedThread.hidden = false;
+            openCreatedThread.onclick = () => actions.navigate(
+              `/thread/${encodeURIComponent(threadIdentity(created))}`
+            );
+          }
+        } catch (err) {
+          errorBox.hidden = false;
+          const disposition = protectedMutationDisposition(err, {
+            replaySafe: replayProtected,
+            reviewCodes: ["creation_outcome_unknown", "creation_id_conflict"]
           });
+          if (disposition === "review") {
+            await creationIntent.markReview(intent.clientId);
+            errorBox.textContent = `${describeError(err)} Review the thread list before creating another thread.`;
+          } else if (disposition === "reset") {
+            await creationIntent.complete(intent.clientId);
+            errorBox.textContent = describeError(err);
+          } else {
+            await creationIntent.markReplayable(intent.clientId);
+            errorBox.textContent = `${describeError(err)} Retry uses the same protected creation request.`;
+          }
+          syncRecoveryControls();
+        } finally {
+          syncRecoveryControls();
+          submit.textContent = "Create thread";
+        }
       }
     },
     h(
@@ -200,14 +375,10 @@ export function renderNewThread(state, actions) {
     worktreeField,
     h("div", { class: "field" }, h("label", { for: "new-agent" }, "Agent"), agentSelect),
     h("div", { class: "field" }, h("label", { for: "new-name" }, "Name (optional)"), nameInput),
-    h(
-      "div",
-      { class: "field" },
-      h("label", null, "Mode (optional)"),
-      h("div", { class: "segmented", role: "group", "aria-label": "Mode" }, modeButtons)
-    ),
-    h("div", { class: "field" }, h("label", { for: "new-message" }, "First message (optional)"), messageInput),
+    modeField,
+    h("div", { class: "field" }, messageLabel, messageInput, messageHint),
     errorBox,
+    h("div", { class: "form-actions" }, reviewIntent, resetIntent, openCreatedThread),
     submit
   );
 
@@ -223,5 +394,10 @@ export function renderNewThread(state, actions) {
     h("div", { class: "scroll" }, form)
   );
 
-  return { node, onStateChange: (next) => paintChips(next.threads) };
+  const unsubscribeIntent = creationIntent.subscribe(() => syncRecoveryControls());
+  return {
+    node,
+    dispose: unsubscribeIntent,
+    onStateChange: (next) => paintChips(next.threads)
+  };
 }

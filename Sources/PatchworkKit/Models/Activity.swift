@@ -15,11 +15,14 @@ public struct ActivitySource: TolerantRawRepresentable {
 
 public struct RunningThread: Codable, Hashable, Sendable {
     public var threadId: String
+    /// Physical transcript identity when the heartbeat or catalog supplied one.
+    public var threadPath: String?
     public var since: Date
     public var source: ActivitySource
 
-    public init(threadId: String, since: Date, source: ActivitySource) {
+    public init(threadId: String, threadPath: String? = nil, since: Date, source: ActivitySource) {
         self.threadId = threadId
+        self.threadPath = threadPath
         self.since = since
         self.source = source
     }
@@ -27,6 +30,7 @@ public struct RunningThread: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         threadId = try container.decode(String.self, forKey: .threadId)
+        threadPath = try container.decodeIfPresent(String.self, forKey: .threadPath)
         since = try container.decodeIfPresent(Date.self, forKey: .since) ?? .distantPast
         source = try container.decodeIfPresent(ActivitySource.self, forKey: .source) ?? .other("unknown")
     }

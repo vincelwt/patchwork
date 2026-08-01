@@ -3,6 +3,59 @@ import XCTest
 @testable import Patchwork
 
 final class SessionSummaryCacheTests: XCTestCase {
+    func testCacheRetentionAndPersistedPayloadAreBounded() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PatchworkCacheBounds-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let template = root.appendingPathComponent("template.jsonl")
+        try Data().write(to: template)
+        let values = try template.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let cacheURL = root.appendingPathComponent("cache.json")
+        let cache = SessionSummaryCache(fileURL: cacheURL)
+        let inserted = SessionSummaryCache.maximumRetainedEntries + 257
+
+        for index in 0..<inserted {
+            let file = root.appendingPathComponent("session-\(index).jsonl")
+            let timestamp = Date(timeIntervalSince1970: TimeInterval(index))
+            var summary = SessionSummary(
+                id: "session-\(index)", fileURL: file, cwd: root,
+                createdAt: timestamp, modifiedAt: timestamp, name: "Session \(index)",
+                preview: "Preview", messageCount: 1, metrics: TokenMetrics()
+            )
+            summary.prepareSearchKey()
+            await cache.store(
+                summary, fingerprint: SessionFileFingerprint(url: file, values: values)
+            )
+        }
+
+        let retainedCount = await cache.count()
+        let containsOldest = await cache.contains(path: root.appendingPathComponent("session-0.jsonl").path)
+        let containsNewest = await cache.contains(path: root.appendingPathComponent("session-\(inserted - 1).jsonl").path)
+        XCTAssertEqual(retainedCount, SessionSummaryCache.maximumRetainedEntries)
+        XCTAssertFalse(containsOldest)
+        XCTAssertTrue(containsNewest)
+        try await cache.persist()
+        let persistedSize = try cacheURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        XCTAssertLessThanOrEqual(persistedSize, SessionSummaryCache.maximumPayloadBytes)
+        let reloadedCount = await SessionSummaryCache(fileURL: cacheURL).count()
+        XCTAssertEqual(reloadedCount, SessionSummaryCache.maximumRetainedEntries)
+    }
+
+    func testOversizedCacheFileIsIgnoredBeforeDecode() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PatchworkOversizedCache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cacheURL = root.appendingPathComponent("cache.json")
+        try Data(repeating: 0x20, count: SessionSummaryCache.maximumPayloadBytes + 1)
+            .write(to: cacheURL)
+
+        let cache = SessionSummaryCache(fileURL: cacheURL)
+        let retainedCount = await cache.count()
+        XCTAssertEqual(retainedCount, 0)
+    }
+
     func testWarmHitInvalidationAndPruning() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PatchworkCache-\(UUID().uuidString)", isDirectory: true)
@@ -65,14 +118,14 @@ final class SessionSummaryCacheTests: XCTestCase {
         let fingerprint = SessionFileFingerprint(url: file, values: values)
         var summary = try SessionParser.summary(at: file)
         let legacy = LegacyEnvelope(
-            version: 5,
+            version: 6,
             entries: [file.standardizedFileURL.path: LegacyEntry(fingerprint: fingerprint, summary: summary)]
         )
         try JSONEncoder().encode(legacy).write(
-            to: root.appendingPathComponent("session-summaries-v5.json"), options: .atomic
+            to: root.appendingPathComponent("session-summaries-v6.json"), options: .atomic
         )
 
-        let currentURL = root.appendingPathComponent("session-summaries-v6.json")
+        let currentURL = root.appendingPathComponent("session-summaries-v7.json")
         let cache = SessionSummaryCache(fileURL: currentURL)
         let hydrated = await cache.liveSummaries(archivedIDs: [])
         let staleLookup = await cache.summary(for: fingerprint, archivedIDs: [])

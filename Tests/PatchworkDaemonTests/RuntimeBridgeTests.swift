@@ -182,6 +182,117 @@ final class InteractionRegistryTests: XCTestCase {
         XCTAssertEqual(sent().count, 1, "Pi is answered exactly once")
     }
 
+    func testFailedDeliveryCanBeRetriedAgainstTheSamePendingDialog() {
+        let registry = InteractionRegistry()
+        let responder = RetryResponder()
+        XCTAssertTrue(registry.register(interaction(), responder: responder.respond))
+
+        guard case .writeFailed = registry.respond(
+            id: "d1", value: "Alpha", confirmed: nil, cancelled: false
+        ) else { return XCTFail("the first write should fail") }
+        XCTAssertEqual(registry.pending().map(\.id), ["d1"])
+        XCTAssertEqual(
+            registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false),
+            .answered
+        )
+        XCTAssertEqual(responder.sent.map { $0["value"]?.stringValue }, ["Beta"])
+        XCTAssertTrue(registry.pending().isEmpty)
+    }
+
+    func testResolvingDialogStaysPendingAndRejectsConcurrentAnswersAndRegistration() {
+        let registry = InteractionRegistry()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let result = RespondResultBox()
+        let (record, sent) = collect()
+        XCTAssertTrue(registry.register(interaction(), responder: { response in
+            entered.signal()
+            _ = release.wait(timeout: .now() + 3)
+            record(response)
+        }))
+
+        DispatchQueue.global().async {
+            result.value = registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false)
+            finished.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+
+        XCTAssertEqual(registry.pending().map(\.id), ["d1"])
+        XCTAssertFalse(registry.register(self.interaction(), responder: record))
+        XCTAssertEqual(
+            registry.respond(id: "d1", value: "Beta", confirmed: nil, cancelled: false),
+            .inFlight
+        )
+
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(result.value, .answered)
+        XCTAssertEqual(sent().count, 1)
+        XCTAssertTrue(registry.pending().isEmpty)
+    }
+
+    func testRunEndingAtomicallyRetiresAnAnswerThatFailsWhileInFlight() {
+        let registry = InteractionRegistry()
+        let responder = BlockingFirstFailureResponder()
+        let finished = DispatchSemaphore(value: 0)
+        XCTAssertTrue(registry.register(interaction(), responder: responder.respond))
+
+        DispatchQueue.global().async {
+            _ = registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false)
+            finished.signal()
+        }
+        XCTAssertEqual(responder.entered.wait(timeout: .now() + 2), .success)
+        registry.cancelAll(runID: "run_1")
+        responder.release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+
+        XCTAssertTrue(registry.pending().isEmpty)
+        XCTAssertEqual(responder.attemptCount, 1, "a finished run retires instead of writing again")
+    }
+
+    func testExpiryRetriesCancellationAfterAnInFlightAnswerFails() {
+        let registry = InteractionRegistry()
+        let responder = BlockingFirstFailureResponder()
+        let finished = DispatchSemaphore(value: 0)
+        XCTAssertTrue(registry.register(
+            interaction(expiresIn: 0.01), responder: responder.respond
+        ))
+
+        DispatchQueue.global().async {
+            _ = registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false)
+            finished.signal()
+        }
+        XCTAssertEqual(responder.entered.wait(timeout: .now() + 2), .success)
+        let expired = expectation(description: "expiry marked the in-flight answer")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.3) { expired.fulfill() }
+        wait(for: [expired], timeout: 3)
+        responder.release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+
+        XCTAssertTrue(registry.pending().isEmpty)
+        XCTAssertEqual(responder.attemptCount, 2)
+        XCTAssertEqual(responder.sent.last?["cancelled"]?.boolValue, true)
+    }
+
+    func testAnOldExpiryTimerCannotCancelAReusedInteractionID() {
+        let registry = InteractionRegistry()
+        let (record, _) = collect()
+        XCTAssertTrue(registry.register(interaction(expiresIn: 0.01), responder: record))
+        XCTAssertEqual(
+            registry.respond(id: "d1", value: "Alpha", confirmed: nil, cancelled: false),
+            .answered
+        )
+        XCTAssertTrue(registry.register(interaction(expiresIn: 600), responder: record))
+
+        let oldTimerFired = expectation(description: "old timer fired")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.3) { oldTimerFired.fulfill() }
+        wait(for: [oldTimerFired], timeout: 3)
+
+        XCTAssertEqual(registry.pending().map(\.id), ["d1"])
+        registry.cancelAll(runID: "run_1")
+    }
+
     func testPendingDialogsAreBoundedAndTheOverflowIsRefusedNotSwallowed() {
         let registry = InteractionRegistry()
         let (record, _) = collect()
@@ -258,5 +369,58 @@ final class InteractionRegistryTests: XCTestCase {
         private var storage: [String] = []
         func append(_ value: String) { lock.lock(); storage.append(value); lock.unlock() }
         var all: [String] { lock.lock(); defer { lock.unlock() }; return storage }
+    }
+
+    private final class RetryResponder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var attempts = 0
+        private var storage: [[String: PiJSONValue]] = []
+        var respond: InteractionRegistry.Responder {
+            { [weak self] response in
+                guard let self else { return }
+                try self.lock.withLock {
+                    self.attempts += 1
+                    if self.attempts == 1 { throw RunnerError.ioFailure("stdin closed") }
+                    self.storage.append(response)
+                }
+            }
+        }
+        var sent: [[String: PiJSONValue]] { lock.withLock { storage } }
+    }
+
+    private final class BlockingFirstFailureResponder: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var attempts = 0
+        private var storage: [[String: PiJSONValue]] = []
+
+        var respond: InteractionRegistry.Responder {
+            { [weak self] response in
+                guard let self else { return }
+                let attempt = self.lock.withLock {
+                    self.attempts += 1
+                    return self.attempts
+                }
+                if attempt == 1 {
+                    self.entered.signal()
+                    _ = self.release.wait(timeout: .now() + 3)
+                    throw RunnerError.ioFailure("stdin closed")
+                }
+                self.lock.withLock { self.storage.append(response) }
+            }
+        }
+
+        var attemptCount: Int { lock.withLock { attempts } }
+        var sent: [[String: PiJSONValue]] { lock.withLock { storage } }
+    }
+
+    private final class RespondResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: InteractionRegistry.RespondResult?
+        var value: InteractionRegistry.RespondResult? {
+            get { lock.withLock { storage } }
+            set { lock.withLock { storage = newValue } }
+        }
     }
 }

@@ -36,6 +36,11 @@ enum InteractionHandlers {
                     return .json(InteractionRespondResponse(accepted: true))
                 case .notFound:
                     throw DaemonHTTPError.notFound("Interaction \(id)")
+                case .inFlight:
+                    throw DaemonHTTPError.conflict(
+                        code: "response_in_flight",
+                        message: "Another response to this interaction is still being delivered."
+                    )
                 case let .writeFailed(reason):
                     // Pi never received the answer, so reporting success would strand the run and
                     // leave the reader believing they answered it. The dialog is still pending.

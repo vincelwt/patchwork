@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PatchworkKit
 
 /// Where to connect: the control socket (default) or the loopback TCP remote (`--url`).
 /// `Foundation`/`URLSession` has no client API for Unix domain sockets on Darwin, so both paths
@@ -34,6 +35,12 @@ private final class RawSocket {
     private func connectUnix(path: String, timeout: TimeInterval) throws {
         let newFd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard newFd >= 0 else { throw RawSocketError.connectFailed(errnoMessage()) }
+        do {
+            try PatchworkKit.RawSocket.suppressBrokenPipeSignal(fd: newFd)
+        } catch {
+            Darwin.close(newFd)
+            throw RawSocketError.connectFailed(error.localizedDescription)
+        }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -83,6 +90,12 @@ private final class RawSocket {
         while let info = candidate {
             let newFd = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
             if newFd >= 0 {
+                do {
+                    try PatchworkKit.RawSocket.suppressBrokenPipeSignal(fd: newFd)
+                } catch {
+                    Darwin.close(newFd)
+                    throw RawSocketError.connectFailed(error.localizedDescription)
+                }
                 if Darwin.connect(newFd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
                     setTimeouts(newFd, timeout)
                     fd = newFd
@@ -107,7 +120,15 @@ private final class RawSocket {
 
     private func setTimeouts(_ fd: Int32, _ seconds: TimeInterval) {
         guard fd >= 0 else { return }
-        var tv = timeval(tv_sec: Int(seconds), tv_usec: Int32((seconds - Double(Int(seconds))) * 1_000_000))
+        let bounded: TimeInterval
+        if seconds.isNaN || seconds <= 0 { bounded = 0 }
+        else if !seconds.isFinite { bounded = TimeInterval(Int32.max) }
+        else { bounded = min(seconds, TimeInterval(Int32.max)) }
+        let wholeSeconds = Int(bounded)
+        var tv = timeval(
+            tv_sec: wholeSeconds,
+            tv_usec: Int32((bounded - Double(wholeSeconds)) * 1_000_000)
+        )
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
@@ -164,6 +185,7 @@ private func mapConnectError(_ error: Error) -> Error {
 }
 
 private func mapIOError(_ error: Error) -> Error {
+    if let error = error as? ControlPlaneError { return error }
     switch error {
     case RawSocketError.timedOut: return ControlPlaneError.timedOut("the daemon stopped responding")
     case let RawSocketError.ioFailed(reason): return ControlPlaneError.transportFailure(reason)
@@ -226,7 +248,7 @@ final class RawHTTPClient: @unchecked Sendable {
     func streamLines(path: String, headers: [String: String]) -> AsyncThrowingStream<String, Error> {
         let target = target
         let hostHeader = hostHeader()
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
             let task = Task.detached(priority: .userInitiated) {
                 let socket = RawSocket()
                 do {
@@ -261,7 +283,19 @@ final class RawHTTPClient: @unchecked Sendable {
                         var line = String(decoding: buffer[..<newlineRange.lowerBound], as: UTF8.self)
                         if line.hasSuffix("\r") { line.removeLast() }
                         buffer.removeSubrange(..<newlineRange.upperBound)
-                        continuation.yield(line)
+                        switch continuation.yield(line) {
+                        case .enqueued:
+                            break
+                        case .dropped:
+                            continuation.finish(throwing: ControlPlaneError.transportFailure(
+                                "event consumer fell behind"
+                            ))
+                            return
+                        case .terminated:
+                            return
+                        @unknown default:
+                            return
+                        }
                     }
                     if buffer.count >= maxLineBytes {
                         continuation.finish(throwing: ControlPlaneError.transportFailure("event line exceeded \(maxLineBytes) bytes"))
@@ -270,7 +304,9 @@ final class RawHTTPClient: @unchecked Sendable {
                     do {
                         let chunk = try socket.receiveChunk()
                         if chunk.isEmpty {
-                            continuation.finish()
+                            continuation.finish(throwing: ControlPlaneError.transportFailure(
+                                "event stream connection closed"
+                            ))
                             return
                         }
                         buffer.append(chunk)
@@ -327,10 +363,14 @@ final class RawHTTPClient: @unchecked Sendable {
             var body = leftover
             while body.count < length {
                 let chunk = try socket.receiveChunk()
-                if chunk.isEmpty { break }
+                guard !chunk.isEmpty else {
+                    throw ControlPlaneError.malformedResponse(
+                        "connection closed after \(body.count) of \(length) response bytes"
+                    )
+                }
                 body.append(chunk)
             }
-            return body.prefix(length)
+            return Data(body.prefix(length))
         }
         if headers["transfer-encoding"]?.lowercased() == "chunked" {
             return try readChunkedBody(socket: socket, leftover: leftover, maxBytes: maxBytes)

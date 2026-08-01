@@ -75,11 +75,28 @@ final class HTTPControlPlane: ControlPlane {
     }
 
     func createThread(_ request: WireCreateThreadRequest) async throws -> WireCreateThreadResponse {
-        try await self.request("POST", "/v1/threads", body: request)
+        guard request.clientId != nil else {
+            return try await self.request("POST", "/v1/threads", body: request)
+        }
+        return try await retryingProtectedMutation(
+            capability: \.threadCreationIdempotency,
+            isRetryable: Self.isRetryableCreationError
+        ) {
+            try await self.request("POST", "/v1/threads", body: request)
+        }
     }
 
     func sendMessage(threadId: String, request: WireSendMessageRequest) async throws -> WireSendMessageResponse {
-        try await self.request("POST", "/v1/threads/\(encodePathComponent(threadId))/messages", body: request)
+        let path = "/v1/threads/\(encodePathComponent(threadId))/messages"
+        guard request.clientId != nil else {
+            return try await self.request("POST", path, body: request)
+        }
+        return try await retryingProtectedMutation(
+            capability: \.messageSubmissionIdempotency,
+            isRetryable: Self.isRetryableSubmissionError
+        ) {
+            try await self.request("POST", path, body: request)
+        }
     }
 
     func abortThread(id: String) async throws -> WireAbortResponse {
@@ -99,7 +116,15 @@ final class HTTPControlPlane: ControlPlane {
     }
 
     func createSchedule(_ request: WireScheduleCreateRequest) async throws -> WireScheduleResponse {
-        try await self.request("POST", "/v1/schedules", body: request)
+        guard request.idempotencyKey != nil else {
+            return try await self.request("POST", "/v1/schedules", body: request)
+        }
+        return try await retryingProtectedMutation(
+            capability: \.scheduleIdempotency,
+            isRetryable: Self.isRetryableProtectedMutationError
+        ) {
+            try await self.request("POST", "/v1/schedules", body: request)
+        }
     }
 
     func showSchedule(id: String) async throws -> WireScheduleDetailResponse {
@@ -114,8 +139,24 @@ final class HTTPControlPlane: ControlPlane {
         try await request("DELETE", "/v1/schedules/\(encodePathComponent(id))", body: EmptyBody())
     }
 
-    func runSchedule(id: String) async throws -> WireScheduleRunResponse {
-        try await request("POST", "/v1/schedules/\(encodePathComponent(id))/run", body: EmptyBody())
+    func runSchedule(id: String, request: WireScheduleRunRequest) async throws -> WireScheduleRunResponse {
+        guard request.clientId != nil else {
+            return try await self.request(
+                "POST", "/v1/schedules/\(self.encodePathComponent(id))/run", body: request
+            )
+        }
+        return try await retryingProtectedMutation(
+            capability: \.scheduleRunIdempotency,
+            isRetryable: Self.isRetryableProtectedMutationError
+        ) {
+            try await self.request(
+                "POST", "/v1/schedules/\(self.encodePathComponent(id))/run", body: request
+            )
+        }
+    }
+
+    func showRun(id: String) async throws -> WireRunResponse {
+        try await requestNoBody("GET", "/v1/runs/\(encodePathComponent(id))")
     }
 
     func limits() async throws -> WireLimits {
@@ -124,14 +165,30 @@ final class HTTPControlPlane: ControlPlane {
 
     func events() -> AsyncThrowingStream<ControlPlaneEvent, Error> {
         let lines = client.streamLines(path: "/v1/events", headers: authHeader)
-        return AsyncThrowingStream { continuation in
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(256)) { continuation in
             let task = Task {
                 var parser = SSEParser()
                 do {
                     for try await line in lines {
-                        if let event = parser.feed(line) { continuation.yield(event) }
+                        if let event = parser.feed(line) {
+                            switch continuation.yield(event) {
+                            case .enqueued:
+                                break
+                            case .dropped:
+                                continuation.finish(throwing: ControlPlaneError.transportFailure(
+                                    "event consumer fell behind"
+                                ))
+                                return
+                            case .terminated:
+                                return
+                            @unknown default:
+                                return
+                            }
+                        }
                     }
-                    continuation.finish()
+                    continuation.finish(throwing: ControlPlaneError.transportFailure(
+                        "event stream ended"
+                    ))
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -148,7 +205,117 @@ final class HTTPControlPlane: ControlPlane {
     }
 
     private func encodePathComponent(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#%")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func isRetryableSubmissionError(_ error: ControlPlaneError) -> Bool {
+        switch error {
+        case .unreachable, .timedOut, .transportFailure, .malformedResponse:
+            true
+        case let .apiError(_, code, _):
+            code == "submission_in_flight"
+        case .outcomeUnknown:
+            false
+        }
+    }
+
+    private static func isRetryableCreationError(_ error: ControlPlaneError) -> Bool {
+        switch error {
+        case .unreachable, .timedOut, .transportFailure, .malformedResponse:
+            true
+        case let .apiError(_, code, _):
+            code == "creation_in_flight" || code == "creations_busy"
+                || code == "create_retryable" || code == "creation_pending"
+                || code == "submission_ledger_unavailable"
+        case .outcomeUnknown:
+            false
+        }
+    }
+
+    private func retryingProtectedMutation<Response>(
+        capability: KeyPath<WireHealth, Bool?>,
+        isRetryable: (ControlPlaneError) -> Bool,
+        _ operation: () async throws -> Response
+    ) async throws -> Response {
+        guard await supports(capability) else {
+            do {
+                return try await operation()
+            } catch let error as ControlPlaneError where isRetryable(error) {
+                guard Self.mutationOutcomeMayBeUnknown(error) else { throw error }
+                throw ControlPlaneError.outcomeUnknown(Self.outcomeUnknownMessage(for: error))
+            }
+        }
+        var lastError: Error?
+        var lastPotentiallyAmbiguousError: ControlPlaneError?
+        var anAttemptMayHaveReachedDaemon = false
+        for attempt in 0..<4 {
+            do {
+                return try await operation()
+            } catch let error as ControlPlaneError where isRetryable(error) {
+                lastError = error
+                if Self.mutationOutcomeMayBeUnknown(error) {
+                    lastPotentiallyAmbiguousError = error
+                }
+                anAttemptMayHaveReachedDaemon = anAttemptMayHaveReachedDaemon
+                    || Self.mutationOutcomeMayBeUnknown(error)
+                guard attempt < 3 else { break }
+                guard await supports(capability) else {
+                    guard anAttemptMayHaveReachedDaemon else { throw error }
+                    throw ControlPlaneError.outcomeUnknown(Self.outcomeUnknownMessage(for: error))
+                }
+                try await Task.sleep(nanoseconds: UInt64(50_000_000 * (attempt + 1)))
+            }
+        }
+        // A final connect refusal proves only that the final attempt was not sent. It cannot
+        // erase an earlier response-loss attempt that may already have crossed the daemon
+        // boundary. Preserve that earlier ambiguity so callers keep the same protected id.
+        if let lastPotentiallyAmbiguousError { throw lastPotentiallyAmbiguousError }
+        throw lastError ?? ControlPlaneError.transportFailure("protected mutation did not complete")
+    }
+
+    private func supports(_ capability: KeyPath<WireHealth, Bool?>) async -> Bool {
+        guard let status = try? await health() else { return false }
+        return status[keyPath: capability] == true
+    }
+
+    private static func outcomeUnknownMessage(for error: ControlPlaneError) -> String {
+        let detail: String
+        switch error {
+        case let .unreachable(reason), let .timedOut(reason), let .malformedResponse(reason),
+             let .transportFailure(reason), let .outcomeUnknown(reason):
+            detail = reason
+        case let .apiError(_, code, message):
+            detail = "\(code): \(message)"
+        }
+        return "The mutation result could not be confirmed and this daemon did not advertise replay protection: \(detail)"
+    }
+
+    private static func isRetryableProtectedMutationError(_ error: ControlPlaneError) -> Bool {
+        switch error {
+        case .unreachable, .timedOut, .transportFailure, .malformedResponse:
+            true
+        case let .apiError(_, code, _):
+            code == "schedule_run_in_flight" || code == "submissions_busy"
+                || code == "submission_ledger_unavailable"
+        case .outcomeUnknown:
+            false
+        }
+    }
+
+    /// A refusal before connect is certainly unsent. Once request bytes or a daemon response are
+    /// involved, a dropped response can leave the mutation result unknown.
+    private static func mutationOutcomeMayBeUnknown(_ error: ControlPlaneError) -> Bool {
+        switch error {
+        case .unreachable:
+            false
+        case .timedOut, .transportFailure, .malformedResponse, .outcomeUnknown:
+            true
+        case let .apiError(_, code, _):
+            code == "submission_in_flight" || code == "creation_in_flight"
+                || code == "schedule_run_in_flight"
+        }
     }
 }
 
