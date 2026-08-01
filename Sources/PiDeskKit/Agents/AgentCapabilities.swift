@@ -21,6 +21,17 @@ public enum ThinkingApplyStyle: String, Codable, Hashable, Sendable {
     case unsupported
 }
 
+/// How an agent applies its lower-latency, higher-cost execution option.
+public enum FastModeApplyStyle: String, Codable, Hashable, Sendable {
+    /// Pi's activity extension owns `/codex-fast` and publishes the authoritative status chip.
+    case extensionCommand
+    /// The native protocol updates a setting on the current thread without restarting it.
+    case threadSetting
+    /// The setting is launch-scoped, so the same conversation is resumed in a new process.
+    case relaunch
+    case unsupported
+}
+
 /// What the composer's left-to-right ladder actually changes for an agent.
 public enum AgentLadder: String, Codable, Hashable, Sendable {
     /// A fixed set of named operating modes the agent declares (Pi's `/mode`).
@@ -61,6 +72,7 @@ public struct AgentMode: Codable, Hashable, Sendable, Identifiable {
 public struct AgentCapabilities: Codable, Hashable, Sendable {
     public var modelSelection: ModelSelectionStyle
     public var thinking: ThinkingApplyStyle
+    public var fastMode: FastModeApplyStyle
     /// Ordered modes for the composer control. Empty hides the control entirely.
     public var modes: [AgentMode]
     /// Which axis the composer ladder drives.
@@ -94,6 +106,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
     public init(
         modelSelection: ModelSelectionStyle,
         thinking: ThinkingApplyStyle,
+        fastMode: FastModeApplyStyle,
         modes: [AgentMode],
         ladder: AgentLadder = .modes,
         modeControlTitle: String,
@@ -111,6 +124,7 @@ public struct AgentCapabilities: Codable, Hashable, Sendable {
     ) {
         self.modelSelection = modelSelection
         self.thinking = thinking
+        self.fastMode = fastMode
         self.modes = modes
         self.ladder = ladder
         self.modeControlTitle = modeControlTitle
@@ -161,6 +175,7 @@ public extension AgentKind {
             AgentCapabilities(
                 modelSelection: .queried,
                 thinking: .live,
+                fastMode: .extensionCommand,
                 modes: Self.piModes,
                 modeControlTitle: "Effort",
                 canCompact: true,
@@ -179,6 +194,7 @@ public extension AgentKind {
             AgentCapabilities(
                 modelSelection: .queried,
                 thinking: .nextTurn,
+                fastMode: .threadSetting,
                 modes: Self.codexModes,
                 ladder: .models,
                 modeControlTitle: "Model",
@@ -197,7 +213,8 @@ public extension AgentKind {
         case .claude:
             AgentCapabilities(
                 modelSelection: .aliases,
-                thinking: .unsupported,
+                thinking: .relaunch,
+                fastMode: .relaunch,
                 modes: Self.claudeModes,
                 ladder: .models,
                 modeControlTitle: "Model",

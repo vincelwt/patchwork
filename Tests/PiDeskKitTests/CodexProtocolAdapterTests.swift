@@ -400,6 +400,9 @@ final class CodexProtocolAdapterTests: XCTestCase {
             [
                 "id": "gpt-5.1-codex", "model": "gpt-5.1-codex", "displayName": "GPT-5.1 Codex",
                 "description": "", "hidden": false, "isDefault": true, "defaultReasoningEffort": "medium",
+                "serviceTiers": [
+                    ["id": "priority", "name": "Fast", "description": "Lower latency"]
+                ],
                 "supportedReasoningEfforts": [
                     ["reasoningEffort": "low", "description": ""],
                     ["reasoningEffort": "medium", "description": ""],
@@ -421,6 +424,8 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(model["id"]?.stringValue, "gpt-5.1-codex")
         XCTAssertEqual(model["name"]?.stringValue, "GPT-5.1 Codex")
         XCTAssertEqual(model["reasoning"]?.boolValue, true)
+        XCTAssertEqual(model["supportsFastMode"]?.boolValue, true)
+        XCTAssertEqual(models["fastModeAvailable"]?.boolValue, true)
 
         guard case let .immediate(levels) = adapter.encode(
             command: "get_available_thinking_levels", id: "l", payload: [:]
@@ -438,6 +443,37 @@ final class CodexProtocolAdapterTests: XCTestCase {
         XCTAssertEqual(state["sessionId"]?.stringValue, "thread-1")
         XCTAssertEqual(state["model"]?["id"]?.stringValue, "gpt-5.1-codex")
         XCTAssertEqual(state["isStreaming"]?.boolValue, false)
+        XCTAssertEqual(state["fastModeAvailable"]?.boolValue, true)
+        XCTAssertEqual(state["fastModeEnabled"]?.boolValue, false)
+    }
+
+    func testFastModeUsesTheAdvertisedPriorityServiceTierAndTracksThreadUpdates() throws {
+        let adapter = try started()
+        _ = adapter.decode(line: response(id: 3, result: ["data": [[
+            "id": "gpt-5.1-codex", "displayName": "GPT-5.1 Codex",
+            "hidden": false, "isDefault": true,
+            "supportedReasoningEfforts": [],
+            "serviceTiers": [["id": "priority", "name": "Fast", "description": "Lower latency"]]
+        ]]]))
+
+        guard case let .write(lines) = adapter.encode(
+            command: "set_fast_mode", id: "fast-on", payload: ["enabled": .bool(true)]
+        ) else { return XCTFail("fast mode should update the live thread") }
+        let request = try object(try XCTUnwrap(lines.first))
+        XCTAssertEqual(request["method"]?.stringValue, "thread/settings/update")
+        XCTAssertEqual(request["params"]?["threadId"]?.stringValue, "thread-1")
+        XCTAssertEqual(request["params"]?["serviceTier"]?.stringValue, "priority")
+
+        let accepted = adapter.decode(line: response(id: 4, result: [:]))
+        let data = try XCTUnwrap(accepted.compactMap(responseValue).first?["data"])
+        XCTAssertEqual(data["enabled"]?.boolValue, true)
+        XCTAssertEqual(data["available"]?.boolValue, true)
+
+        let changed = adapter.decode(line: notification("thread/settings/updated", [
+            "threadId": "thread-1", "threadSettings": ["serviceTier": NSNull()]
+        ]))
+        XCTAssertEqual(eventTypes(changed), ["fast_mode_changed"])
+        XCTAssertEqual(changed.compactMap(event).first?["enabled"]?.boolValue, false)
     }
 
     func testThinkingLevelRoundTripsThroughCodexEffortNames() throws {

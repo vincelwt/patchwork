@@ -8,6 +8,8 @@ public protocol AgentRuntimeProtocol: AnyObject {
     /// Which agent this runtime drives. The store gates affordances on its capabilities.
     var agent: AgentKind { get }
 
+    func configureLaunch(modelID: String?, thinkingLevel: String?)
+    func configureFastMode(_ enabled: Bool)
     func start(cwd: URL, sessionPath: URL?) throws
     func stop()
     func send(type: String, payload: [String: PiJSONValue], completion: ((Result<PiJSONValue, Error>) -> Void)?)
@@ -16,6 +18,8 @@ public protocol AgentRuntimeProtocol: AnyObject {
 
 public extension AgentRuntimeProtocol {
     var agent: AgentKind { .pi }
+    func configureLaunch(modelID: String?, thinkingLevel: String?) {}
+    func configureFastMode(_ enabled: Bool) {}
 }
 
 public enum AgentRuntimeError: LocalizedError {
@@ -156,6 +160,14 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol, @unchecked Sendable
         runningLock.withLock {
             if runningGeneration === retired { runningGeneration = nil }
         }
+    }
+
+    public func configureLaunch(modelID: String?, thinkingLevel: String?) {
+        ioQueue.sync { adapter.configureLaunch(modelID: modelID, thinkingLevel: thinkingLevel) }
+    }
+
+    public func configureFastMode(_ enabled: Bool) {
+        ioQueue.sync { adapter.configureFastMode(enabled) }
     }
 
     public func start(cwd: URL, sessionPath: URL? = nil) throws {

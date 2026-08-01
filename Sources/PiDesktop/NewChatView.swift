@@ -12,7 +12,7 @@ struct NewChatView: View {
                 Text(emptyStateDetail)
                     .font(PiFont.body)
                     .foregroundStyle(.secondary)
-                AgentPicker()
+                PresetPicker()
                     .padding(.top, PiTheme.space8)
                 Spacer()
             } else {
@@ -62,8 +62,8 @@ struct NewChatView: View {
     /// Says which agent will run when there is a choice to make, and stays out of the way when
     /// there is only one installed.
     private var emptyStateDetail: String {
-        store.installedAgents.count > 1
-            ? "Pick an agent, then start globally or choose a project folder."
+        store.availablePresets.count > 1
+            ? "Pick a preset, then start globally or choose a project folder."
             : "Start globally, or choose a project folder."
     }
 

@@ -26,7 +26,9 @@ public enum RPCTimeoutPolicy {
         "get_session_stats",
         "get_fork_messages",
         "get_entries",
-        "get_commands"
+        "get_commands",
+        "get_available_models",
+        "get_available_thinking_levels"
     ]
 
     public static func outcome(for command: String) -> Outcome {

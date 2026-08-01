@@ -519,6 +519,51 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
         XCTAssertEqual(runtime.count("prompt"), 1)
     }
 
+    func testNewChatPresetIsAppliedBeforeTheFirstPrompt() throws {
+        let runtime = IntentRuntime()
+        let store = makeStore(runtime: runtime)
+        store.selectedFolder = root
+        let preset = AgentPreset(
+            name: "Focused",
+            agent: .pi,
+            provider: "openai",
+            modelID: "gpt-test",
+            modelName: "GPT Test",
+            thinkingLevel: "xhigh"
+        )
+        store.savePreset(preset)
+        store.draft = "Use the preset"
+
+        store.submitDraft()
+
+        let commands = runtime.sent.map(\.0)
+        let modelIndex = try XCTUnwrap(commands.firstIndex(of: "set_model"))
+        let thinkingIndex = try XCTUnwrap(commands.firstIndex(of: "set_thinking_level"))
+        let promptIndex = try XCTUnwrap(commands.firstIndex(of: "prompt"))
+        XCTAssertLessThan(modelIndex, thinkingIndex)
+        XCTAssertLessThan(thinkingIndex, promptIndex)
+        XCTAssertEqual(runtime.sent[modelIndex].1["modelId"]?.stringValue, "gpt-test")
+        XCTAssertEqual(runtime.sent[thinkingIndex].1["level"]?.stringValue, "xhigh")
+    }
+
+    func testPresetShortcutCyclesInSavedOrderOnlyOnNewChat() {
+        let runtime = IntentRuntime()
+        let store = makeStore(runtime: runtime)
+        let first = AgentPreset(
+            name: "One", agent: .pi, provider: "p", modelID: "one", modelName: "One", thinkingLevel: "high"
+        )
+        let second = AgentPreset(
+            name: "Two", agent: .pi, provider: "p", modelID: "two", modelName: "Two", thinkingLevel: "xhigh"
+        )
+        store.savePreset(first)
+        store.savePreset(second)
+        XCTAssertEqual(store.selectedPresetID, first.id)
+
+        store.cyclePreset()
+
+        XCTAssertEqual(store.selectedPresetID, second.id)
+    }
+
     func testImageAttachmentsStayVisibleOnTheUserMessage() throws {
         let runtime = IntentRuntime()
         let store = makeStore(runtime: runtime)
@@ -851,6 +896,7 @@ final class AppStoreRuntimeIntentTests: XCTestCase {
             gitService: IntentGitService(),
             runtime: runtime,
             runtimeFactory: factory,
+            installedAgentProvider: { [.pi] },
             persistence: AppPersistence(baseURL: root.appendingPathComponent(UUID().uuidString)),
             activityPresenter: ActivityPresenter(),
             probeRuntimeFactory: probe.map { value in { value } },

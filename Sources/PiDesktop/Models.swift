@@ -384,6 +384,8 @@ struct RuntimeState: Hashable, Sendable {
     var modelName: String?
     var provider: String?
     var thinkingLevel: String?
+    var fastModeEnabled = false
+    var fastModeAvailable = false
     var sessionFile: String?
     var sessionID: String?
     var sessionName: String?
@@ -407,6 +409,13 @@ struct RuntimeState: Hashable, Sendable {
         retryStartedAt = nil
         retryErrorMessage = nil
     }
+}
+
+struct FastModePresentation: Hashable, Sendable {
+    let isActive: Bool
+    let isAvailable: Bool
+    let isLive: Bool
+    let help: String
 }
 
 struct GitFileChange: Identifiable, Hashable, Sendable {
@@ -558,6 +567,11 @@ struct PersistedAppState: Codable {
     /// The agent the last new chat used, as an `AgentKind` raw value. Stored as a string so an
     /// agent this build does not know about round-trips instead of failing the whole state file.
     var lastAgent: String?
+    /// App-owned launch presets. These configure a new agent session without touching any
+    /// agent-owned transcript or settings file.
+    var presets: [AgentPreset] = []
+    /// The preset last chosen on the new-chat surface.
+    var lastPresetID: UUID?
     /// Per-agent operating mode (Pi `/mode`, Codex sandbox, Claude permission mode), keyed by
     /// agent raw value, so switching agents restores each one's last choice.
     var agentModes: [String: String] = [:]
@@ -644,6 +658,11 @@ struct PersistedAppState: Codable {
         // property added without a line below is written to disk and silently read back as its
         // default on the next launch.
         lastAgent = try container.decodeIfPresent(String.self, forKey: .lastAgent)
+        presets = Array(
+            (try container.decodeIfPresent([AgentPreset].self, forKey: .presets) ?? [])
+                .prefix(AgentPreset.maximumCount)
+        )
+        lastPresetID = try container.decodeIfPresent(UUID.self, forKey: .lastPresetID)
         agentModes = try container.decodeIfPresent([String: String].self, forKey: .agentModes) ?? [:]
         disabledAgents = try container.decodeIfPresent(Set<String>.self, forKey: .disabledAgents) ?? []
         appStartedSessionPaths = try container.decodeIfPresent(Set<String>.self, forKey: .appStartedSessionPaths) ?? []

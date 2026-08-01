@@ -19,7 +19,7 @@ vocabulary that each adapter translates into.
 | Branching history | yes | linear log | yes |
 | Model list | live query | live query | curated aliases |
 | Thinking level | live | next turn | next launch |
-| Composer ladder | `/mode` effort | model, weakest to strongest | model, weakest to strongest |
+| New chat preset | agent + model + thinking | agent + model + thinking | agent + model + thinking |
 | Compaction | yes | yes | `/compact` |
 | Mid-turn steering | yes | yes | yes |
 | Edit and resend | yes | linear, no branch | no |
@@ -42,6 +42,11 @@ transcripts and stops offering it for new conversations, without touching anythi
 owns. Codex and Claude Code can also be given a small `pi-desktop` skill from there, teaching
 them the `pidesk` CLI that is already on their PATH; Pi already learns it from the extension. A
 skill file with no recognisable version marker is treated as your own and never overwritten.
+
+Settings also has a **Presets** pane. Each preset combines one installed agent, one model from
+that agent, and one supported thinking level. The new-chat surface selects the whole preset at
+once, and Command-Shift-P cycles through the available presets. Once a conversation starts its
+agent stays fixed, while model and thinking remain independently adjustable from the status bar.
 
 Automations follow the agent too. A schedule against an existing conversation resolves its
 agent from that conversation every time it fires, so it never goes stale; a schedule that starts
@@ -93,8 +98,9 @@ agent is reported as not installed rather than silently falling back to another 
 - Editing and resubmitting the latest user message creates a new branch inside the current Pi session, keeping the conversation and its alternate history together instead of creating another sidebar conversation
 - Pi RPC streaming, final `agent_settled` handling, retry/compaction state, abort, and exact model/thinking choices from both the composer and the status bar (falling back to the cycle commands only when Pi reports no list)
 - Full steering/follow-up queue text, explicit delivery choice, and `all` / `one-at-a-time` queue modes. One Escape stops the current turn and preserves queued messages as follow-ups; double-Escape, ⌘., and the stop button fully stop the thread.
-- A status bar that stays quiet when idle and distinguishes provider queueing, waiting for the first response, and retry countdowns (with the provider error on hover). It also shows provider/model, thinking level, an always-available fast-priority toggle, and extension status. Hovering the account chip renders the whole `/limits` report — every signed-in account and window — with native controls.
-- One composer control: an effort slider across the `mode` extension's `xfast → ultra` range
+- A status bar that stays quiet when idle and distinguishes provider queueing, waiting for the first response, and retry countdowns (with the provider error on hover). It also shows provider/model, thinking level, and a task-scoped fast-mode toggle. Pi uses its fast-priority extension, Codex uses the model's advertised fast service tier, and Claude Code uses a process-local fast setting while resuming the same task. Hovering the account chip renders the whole `/limits` report for every signed-in account and window with native controls.
+- New-chat presets for agent, model, and thinking, with Command-Shift-P cycling and exact
+  application before the first prompt
 - Typing `/` at the start of an empty composer opens the active agent's own commands: Pi's extension commands, Codex's skills, and Claude Code's slash commands, each with its description and source. Typing filters, Up/Down moves, Return runs the highlighted command, Escape closes, and a space (`/mode fast`) hands the line back to the composer to send as written. The list is fetched once per runtime with the same query-only prewarm as the model and thinking pickers, and agents that cannot enumerate their commands never show it.
 - Selectable text plus restrained thinking, tool, result, custom, system, and bounded unknown-event disclosures
 - Paste, full-conversation drop, file attach, preview, remove, open, zoom, and save for images. An opened image opens fitted to the viewer (large screenshots scale down with their aspect ratio, small images stay at intrinsic size, zoom scrolls) and closes on Escape, Done, or a click outside the panel. It steps to the previous/next image of the same message with Left/Right (or the viewer's arrow buttons), stopping at the first and last. Multiple previews sit side by side in a horizontally scrolling strip instead of stacking down the transcript. The composer grows around inline image previews so its text stays visible. Composer images stay visible in the sent user message and are sent to Pi as both image input and local file paths, so tools and subagents can reuse them directly. Tool-generated images and screenshots stay visible outside collapsed work details.
@@ -365,7 +371,7 @@ provider.
 
 ## Current limitations
 
-Claude Code cannot change reasoning effort mid-session, so the app stores the choice and applies it on the next launch. Codex has no HTML export, no fork-point listing, and applies model and effort as per-turn overrides. Pi-only surfaces such as the extension status footer, fast priority, `/limits`, and activity heartbeats are disabled for the other two, which have no equivalent extension host; their run state falls back to file-modification detection, so live CPU and memory are unavailable.
+Claude Code cannot change reasoning effort mid-session, so the app stores the choice and applies it on the next launch. Its fast-mode toggle uses a process-local launch setting, so the task resumes without changing the global Claude configuration. Codex has no HTML export or fork-point listing, applies model and effort as per-turn overrides, and updates fast mode through the thread's service tier. Pi-only surfaces such as extension status, `/limits`, and activity heartbeats are disabled for the other two, which have no equivalent extension host. Their run state falls back to file-modification detection, so live CPU and memory are unavailable.
 
 The first scan after upgrading reparses every conversation, because summaries now record their agent. That is a bounded background pass and the sidebar paints from the previous cache meanwhile, but on a very large Codex history it is minutes rather than seconds: a 7.7 GB corpus of 229 rollouts takes about five minutes once, then stays cached. Records that contribute nothing (a compaction's embedded replaced history, image-generation and MCP result events) are skipped from a short byte prefix without being parsed, which is 41-95% of the bytes in the largest rollouts.
 

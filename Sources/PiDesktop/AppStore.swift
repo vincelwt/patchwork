@@ -303,6 +303,8 @@ private final class RuntimeSlot {
     var commandsLoading = false
     var optionsLoading = false
     var optionsPrepared = false
+    /// The exact preset already applied to this pending new-chat runtime.
+    var appliedPresetFingerprint: String?
     var capability: ToolCapability?
     var questionnaire: QuestionnaireSession?
     var statuses: [String: String] = [:]
@@ -553,6 +555,9 @@ final class AppStore: ObservableObject {
     /// Agents the user switched off. Their conversations stop being scanned and they stop being
     /// offered for a new chat; nothing about their history is touched.
     @Published private(set) var disabledAgents: Set<AgentKind> = []
+    /// Bounded app-owned launch configurations, in the order used by keyboard cycling.
+    @Published private(set) var presets: [AgentPreset] = []
+    @Published private(set) var selectedPresetID: UUID?
     /// The agent a new conversation will use. Persisted so the choice survives relaunch.
     @Published var newChatAgent: AgentKind = .pi {
         didSet {
@@ -602,6 +607,7 @@ final class AppStore: ObservableObject {
     /// Shared request surface: sidebar and application menu present the same creation alert.
     @Published var newVirtualFolderRequested = false
     @Published var schedulesPresented = false
+    @Published var settingsPane: SettingsPane = .service
     /// Messages the user queued while Pi was working, still editable until they are flushed to
     /// Pi at the boundary Pi would have delivered them anyway. See `Outbox.swift`.
     @Published var outbox: [OutboxEntry] = []
@@ -630,6 +636,58 @@ final class AppStore: ObservableObject {
     }
 
     var activeCapabilities: AgentCapabilities { activeAgent.capabilities }
+
+    var fastModePresentation: FastModePresentation {
+        switch activeCapabilities.fastMode {
+        case .extensionCommand:
+            let status = statusModel.fastPriority
+            return FastModePresentation(
+                isActive: status.isActive,
+                isAvailable: true,
+                isLive: statusModel.isLive,
+                help: status.isActive
+                    ? "Fast priority is active. Click to turn it off."
+                    : "Fast priority is inactive. Click to turn it on."
+            )
+        case .threadSetting:
+            let attached = runtimeMatchesCurrentRoute && activeRuntimeSlot.agent == activeAgent
+            let available = attached ? runtimeState.fastModeAvailable : true
+            return FastModePresentation(
+                isActive: attached && runtimeState.fastModeEnabled,
+                isAvailable: available,
+                isLive: attached && runtimeState.isConnected,
+                help: available
+                    ? "Fast service tier for this task. Click to toggle it."
+                    : "The selected model does not advertise a fast service tier."
+            )
+        case .relaunch:
+            let attached = runtimeMatchesCurrentRoute && activeRuntimeSlot.agent == activeAgent
+            let available = attached ? runtimeState.fastModeAvailable : true
+            return FastModePresentation(
+                isActive: attached && runtimeState.fastModeEnabled,
+                isAvailable: available,
+                isLive: attached && runtimeState.isConnected,
+                help: available
+                    ? "Fast mode for this task. It lowers latency at a higher token price."
+                    : "Fast mode is unavailable for this Claude account or environment."
+            )
+        case .unsupported:
+            return FastModePresentation(
+                isActive: false,
+                isAvailable: false,
+                isLive: false,
+                help: "This agent does not support fast mode."
+            )
+        }
+    }
+
+    var selectedPreset: AgentPreset? {
+        selectedPresetID.flatMap { id in presets.first { $0.id == id } }
+    }
+
+    var availablePresets: [AgentPreset] {
+        presets.filter { installedAgents.contains($0.agent) }
+    }
 
     /// True while the slash-command palette has no authoritative answer yet: the route's runtime
     /// is still attaching, or `get_commands` is in flight. Lets the palette say "Loading…"
@@ -709,10 +767,79 @@ final class AppStore: ObservableObject {
         if disabledAgents.contains(newChatAgent) {
             newChatAgent = installedAgents.first ?? .pi
         }
+        repairSelectedPreset()
         // The repository's roots are fixed at construction, so the sidebar is refiltered here and
         // the next full scan picks up the narrower root list.
         restartSessionCatalogMonitor()
         Task { await refreshSessions() }
+    }
+
+    func savePreset(_ preset: AgentPreset) {
+        guard preset.isValid else { return }
+        if let index = presets.firstIndex(where: { $0.id == preset.id }) {
+            presets[index] = preset
+        } else {
+            guard presets.count < AgentPreset.maximumCount else {
+                showToast("You can keep up to \(AgentPreset.maximumCount) presets.", style: .warning)
+                return
+            }
+            presets.append(preset)
+        }
+        persistPresets()
+        if selectedPresetID == preset.id || selectedPresetID == nil {
+            selectPreset(preset.id)
+        }
+    }
+
+    func deletePreset(id: UUID) {
+        guard let index = presets.firstIndex(where: { $0.id == id }) else { return }
+        presets.remove(at: index)
+        persistPresets()
+        if selectedPresetID == id { repairSelectedPreset(preferredIndex: index) }
+    }
+
+    func movePreset(id: UUID, offset: Int) {
+        guard let source = presets.firstIndex(where: { $0.id == id }) else { return }
+        let destination = source + offset
+        guard presets.indices.contains(destination) else { return }
+        presets.swapAt(source, destination)
+        persistPresets()
+    }
+
+    func selectPreset(_ id: UUID) {
+        guard let preset = presets.first(where: { $0.id == id }),
+              installedAgents.contains(preset.agent) else { return }
+        selectedPresetID = id
+        persistence.updateState { $0.lastPresetID = id }
+        newChatAgent = preset.agent
+        guard route == .newChat else { return }
+        prepareComposerOptions()
+        if let slot = currentRouteRuntimeSlot, slot.startedForNewChat {
+            applySelectedPreset(to: slot) { _ in }
+        }
+    }
+
+    func cyclePreset() {
+        guard route == .newChat, !availablePresets.isEmpty else { return }
+        let currentIndex = selectedPresetID.flatMap { id in availablePresets.firstIndex { $0.id == id } }
+        let nextIndex = currentIndex.map { ($0 + 1) % availablePresets.count } ?? 0
+        selectPreset(availablePresets[nextIndex].id)
+    }
+
+    private func persistPresets() {
+        persistence.updateState { $0.presets = Array(presets.prefix(AgentPreset.maximumCount)) }
+    }
+
+    private func repairSelectedPreset(preferredIndex: Int = 0) {
+        let choices = availablePresets
+        if let selectedPresetID, choices.contains(where: { $0.id == selectedPresetID }) { return }
+        let index = min(max(0, preferredIndex), max(0, choices.count - 1))
+        if choices.indices.contains(index) {
+            selectPreset(choices[index].id)
+        } else {
+            selectedPresetID = nil
+            persistence.updateState { $0.lastPresetID = nil }
+        }
     }
 
     /// Whether sidebar rows should carry an agent glyph. On a machine with one agent it is noise
@@ -913,6 +1040,7 @@ final class AppStore: ObservableObject {
         pullRequestStateProvider: PullRequestStateProviding = GitHubPullRequestStateService(),
         runtime: AgentRuntimeProtocol = AgentRuntimeClient(),
         runtimeFactory: @escaping (AgentKind) -> AgentRuntimeProtocol = { AgentRuntimeClient.make(for: $0) },
+        installedAgentProvider: () -> [AgentKind] = { AgentCatalog.installed() },
         persistence: AppPersistence? = nil,
         activityPresenter: ActivityPresenting = ActivityPresenter(),
         activityMonitor: SessionActivityMonitor? = nil,
@@ -1027,15 +1155,21 @@ final class AppStore: ObservableObject {
 
         // Detection is a filesystem check, cheap enough to do once at launch and honest enough
         // that an uninstalled agent never appears as a choice that would fail at spawn time.
-        detectedAgents = AgentCatalog.installed()
+        detectedAgents = installedAgentProvider()
         disabledAgents = Set(self.persistence.state.disabledAgents.compactMap(AgentKind.init(rawValue:)))
         showsForeignConversations = self.persistence.state.showsForeignConversations
         let installed = detectedAgents.filter { !disabledAgents.contains($0) }
         installedAgents = installed
+        presets = AgentPreset.normalized(self.persistence.state.presets)
         let remembered = self.persistence.state.lastAgent.flatMap(AgentKind.init(rawValue:))
         // Fall back through: remembered choice, first installed agent, then Pi. Never offer an
         // agent that is not there.
         newChatAgent = remembered.flatMap { installed.contains($0) ? $0 : nil } ?? installed.first ?? .pi
+        let rememberedPreset = self.persistence.state.lastPresetID
+            .flatMap { id in presets.first { $0.id == id && installed.contains($0.agent) } }
+        let initialPreset = rememberedPreset ?? presets.first { installed.contains($0.agent) }
+        selectedPresetID = initialPreset?.id
+        if let initialPreset { newChatAgent = initialPreset.agent }
         runtimeMode = self.persistence.state.agentModes[newChatAgent.rawValue]
 
         bindRuntime(activeRuntimeSlot)
@@ -4021,23 +4155,44 @@ final class AppStore: ObservableObject {
         attachments = []
         var completedSynchronously = false
         weak var startupSlot: RuntimeSlot?
+        let failSubmission: (Error) -> Void = { [weak self] error in
+            guard let self else { return }
+            if case .newChat = self.route,
+               self.newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
+                self.newChatWorktreeSubmitted = false
+            }
+            if let optimisticID { self.removeOptimisticMessage(optimisticID, origin: origin) }
+            let restored = self.restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
+            self.showToast(
+                self.failureMessage(error.localizedDescription, restored: restored, origin: origin),
+                style: .error
+            )
+        }
         ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
             completedSynchronously = true
             if let startupSlot { startupSlot.pendingStartupPrompts = max(0, startupSlot.pendingStartupPrompts - 1) }
             guard let self else { return }
             switch result {
             case let .success(slot):
-                dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
-                                delivery: dispatchDelivery, cwd: cwd, optimisticID: optimisticID,
-                                submissionOrigin: origin, slot: slot)
-            case let .failure(error):
-                if case .newChat = route,
-                   newChatWorktree?.standardizedFileURL.path == cwd.standardizedFileURL.path {
-                    newChatWorktreeSubmitted = false
+                guard sessionPath == nil else {
+                    dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
+                                    delivery: dispatchDelivery, cwd: cwd, optimisticID: optimisticID,
+                                    submissionOrigin: origin, slot: slot)
+                    return
                 }
-                if let optimisticID { removeOptimisticMessage(optimisticID, origin: origin) }
-                let restored = restoreDraft(text: sentText, attachments: sentAttachments, origin: origin)
-                showToast(failureMessage(error.localizedDescription, restored: restored, origin: origin), style: .error)
+                applySelectedPreset(to: slot) { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case .success:
+                        dispatchMessage(text, originalDraft: sentText, attachments: sentAttachments,
+                                        delivery: dispatchDelivery, cwd: cwd, optimisticID: optimisticID,
+                                        submissionOrigin: origin, slot: slot)
+                    case let .failure(error):
+                        failSubmission(error)
+                    }
+                }
+            case let .failure(error):
+                failSubmission(error)
             }
         }
         if !completedSynchronously, let slot = currentRouteRuntimeSlot {
@@ -4269,8 +4424,66 @@ final class AppStore: ObservableObject {
         runExtensionCommand("/mode \(mode.rawValue)", successToast: "Mode set to \(mode.label)")
     }
 
+    func toggleFastMode() {
+        switch activeCapabilities.fastMode {
+        case .extensionCommand:
+            runExtensionCommand("/codex-fast")
+        case .threadSetting, .relaunch:
+            guard let cwd = selectedExecutionFolder else {
+                showToast("Choose a working folder first", style: .warning)
+                return
+            }
+            let sessionPath = selectedSession?.fileURL
+            ensureRuntime(cwd: cwd, sessionPath: sessionPath) { [weak self] result in
+                guard let self else { return }
+                guard case let .success(slot) = result,
+                      slot === activeRuntimeSlot,
+                      runtimeMatchesCurrentRoute else {
+                    if case let .failure(error) = result {
+                        showToast(error.localizedDescription, style: .error)
+                    }
+                    return
+                }
+                let enabled = !state(for: slot).fastModeEnabled
+                switch slot.capabilities.fastMode {
+                case .threadSetting:
+                    setThreadFastMode(enabled, slot: slot)
+                case .relaunch:
+                    guard !state(for: slot).isBusy else {
+                        showToast("Wait for \(slot.agent.displayName) to finish before changing fast mode.", style: .warning)
+                        return
+                    }
+                    relaunchRuntime(slot, fastMode: enabled)
+                case .extensionCommand, .unsupported:
+                    break
+                }
+            }
+        case .unsupported:
+            showToast("\(activeAgent.displayName) does not support fast mode.", style: .warning)
+        }
+    }
+
+    // Kept for callers compiled against the former Pi-only name.
     func toggleFastPriority() {
-        runExtensionCommand("/codex-fast")
+        toggleFastMode()
+    }
+
+    private func setThreadFastMode(_ enabled: Bool, slot: RuntimeSlot) {
+        slot.runtime.send(type: "set_fast_mode", payload: ["enabled": .bool(enabled)]) { [weak self, weak slot] result in
+            guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                let data = response["data"]
+                updateState(for: slot) { state in
+                    state.fastModeEnabled = data?["enabled"]?.boolValue ?? enabled
+                    state.fastModeAvailable = data?["available"]?.boolValue ?? state.fastModeAvailable
+                }
+            case let .success(response):
+                showToast(responseError(response) ?? "Fast mode could not be changed.", style: .error)
+            case let .failure(error):
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
     }
 
     /// `/limits` renders its report through the existing extension editor dialog bridge.
@@ -4571,11 +4784,134 @@ final class AppStore: ObservableObject {
         }
     }
 
+    /// Applies a pending new chat's exact model and thinking choice before its first prompt.
+    /// Model goes first because some agents reset reasoning to that model's default.
+    private func applySelectedPreset(
+        to slot: RuntimeSlot,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard slot.startedForNewChat, let preset = selectedPreset, preset.agent == slot.agent else {
+            completion(.success(()))
+            return
+        }
+        let fingerprint = preset.fingerprint
+        guard slot.appliedPresetFingerprint != fingerprint else {
+            completion(.success(()))
+            return
+        }
+
+        if slot.capabilities.thinking == .relaunch {
+            if presetMatchesRuntimeState(preset, slot: slot) {
+                slot.appliedPresetFingerprint = fingerprint
+                completion(.success(()))
+            } else {
+                relaunchNewChatRuntime(slot, with: preset, completion: completion)
+            }
+            return
+        }
+
+        slot.runtime.send(type: "set_model", payload: [
+            "provider": .string(preset.provider),
+            "modelId": .string(preset.modelID)
+        ]) { [weak self, weak slot] result in
+            guard let self, let slot, !slot.isSuperseded else { return }
+            guard selectedPreset?.fingerprint == fingerprint else {
+                applySelectedPreset(to: slot, completion: completion)
+                return
+            }
+            switch result {
+            case let .success(response) where responseError(response) == nil:
+                slot.runtime.send(
+                    type: "set_thinking_level",
+                    payload: ["level": .string(preset.thinkingLevel)]
+                ) { [weak self, weak slot] result in
+                    guard let self, let slot, !slot.isSuperseded else { return }
+                    guard selectedPreset?.fingerprint == fingerprint else {
+                        applySelectedPreset(to: slot, completion: completion)
+                        return
+                    }
+                    switch result {
+                    case let .success(response) where responseError(response) == nil:
+                        updateState(for: slot) { state in
+                            state.provider = preset.provider
+                            state.modelID = preset.modelID
+                            state.modelName = preset.modelName
+                            state.thinkingLevel = preset.thinkingLevel
+                        }
+                        slot.appliedPresetFingerprint = fingerprint
+                        completion(.success(()))
+                    case let .success(response):
+                        completion(.failure(AgentRuntimeError.processExited(
+                            responseError(response) ?? "\(slot.agent.displayName) rejected the thinking level."
+                        )))
+                    case let .failure(error):
+                        completion(.failure(error))
+                    }
+                }
+            case let .success(response):
+                completion(.failure(AgentRuntimeError.processExited(
+                    responseError(response) ?? "\(slot.agent.displayName) rejected the model."
+                )))
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func presetMatchesRuntimeState(_ preset: AgentPreset, slot: RuntimeSlot) -> Bool {
+        let state = state(for: slot)
+        return state.provider == preset.provider
+            && state.modelID == preset.modelID
+            && state.thinkingLevel == preset.thinkingLevel
+    }
+
+    private func relaunchNewChatRuntime(
+        _ slot: RuntimeSlot,
+        with preset: AgentPreset,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard slot === activeRuntimeSlot, slot.startedForNewChat, let cwd = slot.cwd else {
+            completion(.failure(AgentRuntimeError.processExited("The pending new chat changed.")))
+            return
+        }
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        slot.runtime.configureLaunch(modelID: preset.modelID, thinkingLevel: preset.thinkingLevel)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: nil, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                guard selectedPreset?.fingerprint == preset.fingerprint else {
+                    applySelectedPreset(to: slot, completion: completion)
+                    return
+                }
+                guard presetMatchesRuntimeState(preset, slot: slot) else {
+                    completion(.failure(AgentRuntimeError.processExited(
+                        "\(slot.agent.displayName) did not apply the preset."
+                    )))
+                    return
+                }
+                slot.appliedPresetFingerprint = preset.fingerprint
+                completion(.success(()))
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: nil)
+    }
+
     func setThinkingLevel(_ level: String) {
         guard runtimeMatchesCurrentRoute,
               activeRuntimeSlot.capabilities.thinking != .unsupported,
               availableThinkingLevels.contains(level) else { return }
         let slot = activeRuntimeSlot
+        if slot.capabilities.thinking == .relaunch {
+            guard !state(for: slot).isBusy else {
+                showToast("Wait for \(slot.agent.displayName) to finish before changing thinking.", style: .warning)
+                return
+            }
+            relaunchRuntime(slot, thinkingLevel: level)
+            return
+        }
         slot.runtime.send(type: "set_thinking_level", payload: ["level": .string(level)]) { [weak self, weak slot] result in
             guard let self, let slot, slot === activeRuntimeSlot, runtimeMatchesCurrentRoute else { return }
             switch result {
@@ -4589,6 +4925,47 @@ final class AppStore: ObservableObject {
             case let .failure(error): showToast(error.localizedDescription, style: .error)
             }
         }
+    }
+
+    private func relaunchRuntime(_ slot: RuntimeSlot, thinkingLevel: String) {
+        guard slot === activeRuntimeSlot, let cwd = slot.cwd else { return }
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        let sessionURL = slot.sessionPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        slot.runtime.configureLaunch(modelID: state(for: slot).modelID, thinkingLevel: thinkingLevel)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: sessionURL, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                updateState(for: slot) { $0.thinkingLevel = thinkingLevel }
+                requestComposerOptions(slot: slot)
+            case let .failure(error):
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: sessionURL)
+    }
+
+    private func relaunchRuntime(_ slot: RuntimeSlot, fastMode enabled: Bool) {
+        guard slot === activeRuntimeSlot, let cwd = slot.cwd else { return }
+        let previous = state(for: slot).fastModeEnabled
+        let cwdURL = URL(fileURLWithPath: cwd).standardizedFileURL
+        let sessionURL = slot.sessionPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        slot.runtime.configureFastMode(enabled)
+        configureRuntimeSlot(slot, cwd: cwdURL, sessionPath: sessionURL, phase: .startingPi) { [weak self, weak slot] result in
+            guard let self, let slot else { return }
+            switch result {
+            case .success:
+                updateState(for: slot) { state in
+                    state.fastModeEnabled = enabled
+                    state.fastModeAvailable = true
+                }
+                requestComposerOptions(slot: slot)
+            case let .failure(error):
+                slot.runtime.configureFastMode(previous)
+                showToast(error.localizedDescription, style: .error)
+            }
+        }
+        coldStartRuntime(slot, cwd: cwdURL, sessionPath: sessionURL)
     }
 
     /// Applies the agent's operating mode: Pi's `/mode` effort ladder, Codex's sandbox policy,
@@ -4702,6 +5079,12 @@ final class AppStore: ObservableObject {
             if case let .success(response) = result, responseError(response) == nil {
                 availableModels = AvailableModel.parse(response["data"]?["models"])
                 slot.models = availableModels
+                if let available = response["data"]?["fastModeAvailable"]?.boolValue {
+                    updateState(for: slot) { $0.fastModeAvailable = available }
+                }
+                if let enabled = response["data"]?["fastModeEnabled"]?.boolValue {
+                    updateState(for: slot) { $0.fastModeEnabled = enabled }
+                }
             }
             requestThinkingOptions(slot: slot)
         }
@@ -4730,6 +5113,13 @@ final class AppStore: ObservableObject {
             composerOptionsLoading = false
             slot.optionsLoading = false
             slot.optionsPrepared = true
+            if slot.startedForNewChat {
+                applySelectedPreset(to: slot) { [weak self] result in
+                    if case let .failure(error) = result {
+                        self?.showToast(error.localizedDescription, style: .error)
+                    }
+                }
+            }
             resetRuntimeRetirementLease(for: slot)
         }
     }
@@ -5409,6 +5799,7 @@ final class AppStore: ObservableObject {
         slot.commandsLoading = false
         slot.optionsLoading = false
         slot.optionsPrepared = false
+        slot.appliedPresetFingerprint = nil
         slot.capability = nil
         slot.questionnaire = nil
         slot.statuses.removeAll()
@@ -5477,6 +5868,9 @@ final class AppStore: ObservableObject {
         updateState(for: slot) { $0 = RuntimeState(phase: .startingPi) }
         if slot.runtime.isRunning { slot.runtime.stop() }
         do {
+            if sessionPath == nil, let preset = selectedPreset, preset.agent == slot.agent {
+                slot.runtime.configureLaunch(modelID: preset.modelID, thinkingLevel: preset.thinkingLevel)
+            }
             try slot.runtime.start(cwd: cwd, sessionPath: sessionPath)
             updateState(for: slot) { state in
                 state.isConnected = true
@@ -6110,6 +6504,8 @@ final class AppStore: ObservableObject {
             state.phase = state.isStreaming ? .working : .idle
             state.isCompacting = data["isCompacting"]?.boolValue ?? false
             state.thinkingLevel = data["thinkingLevel"]?.stringValue
+            state.fastModeEnabled = data["fastModeEnabled"]?.boolValue ?? false
+            state.fastModeAvailable = data["fastModeAvailable"]?.boolValue ?? false
             state.sessionFile = data["sessionFile"]?.stringValue
             state.sessionID = data["sessionId"]?.stringValue
             state.sessionName = data["sessionName"]?.stringValue
@@ -6197,6 +6593,13 @@ final class AppStore: ObservableObject {
 
     private func handleRPCEvent(_ event: JSONValue, from slot: RuntimeSlot) {
         guard !slot.isSuperseded else { return }
+        if event["type"]?.stringValue == "fast_mode_changed" {
+            updateState(for: slot) { state in
+                state.fastModeEnabled = event["enabled"]?.boolValue ?? state.fastModeEnabled
+                state.fastModeAvailable = event["available"]?.boolValue ?? state.fastModeAvailable
+            }
+            return
+        }
         let wasBusy = state(for: slot).isBusy
         defer {
             if state(for: slot).isBusy != wasBusy { updateSleepPrevention() }
