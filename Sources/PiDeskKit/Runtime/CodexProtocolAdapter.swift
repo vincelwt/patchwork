@@ -25,19 +25,9 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         static let toolOutputCharacters = 20_000
         static let openItems = 200
         static let pendingApprovals = 16
+        static let userInputQuestions = 3
         static let listedItems = 500
-    }
-
-    /// What a client request was for, so its response can be routed without re-parsing it.
-    private enum Pending {
-        case initialize
-        case openThread(resume: Bool)
-        case models(appID: String?)
-        case commands(appID: String)
-        case turn(appID: String)
-        case compact(appID: String)
-        /// Answer the caller with an empty object once Codex confirms the request.
-        case acknowledge(appID: String)
+        static let settledTurns = 64
     }
 
     private struct QueuedCommand {
@@ -46,8 +36,45 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         let payload: [String: PiJSONValue]
     }
 
+    /// What a client request was for, so its response can be routed without re-parsing it.
+    private enum Pending {
+        case initialize
+        case openThread(resume: Bool)
+        case models(appID: String?)
+        case commands(appID: String)
+        case turn(
+            entry: QueuedCommand,
+            startsTurn: Bool,
+            startToken: Int?,
+            responseExpected: Bool,
+            retryCount: Int
+        )
+        case compact(appID: String)
+        /// Answer the caller with an empty object once Codex confirms the request.
+        case acknowledge(appID: String)
+
+        var appID: String? {
+            switch self {
+            case .initialize, .openThread:
+                nil
+            case let .models(appID):
+                appID
+            case let .commands(appID), let .compact(appID), let .acknowledge(appID):
+                appID
+            case let .turn(entry, _, _, _, _):
+                entry.id
+            }
+        }
+
+        var startToken: Int? {
+            guard case let .turn(_, startsTurn, token, _, _) = self, startsTurn else { return nil }
+            return token
+        }
+    }
+
     private struct Stream {
         var isThinking: Bool
+        var phase: String?
         var text: String
     }
 
@@ -60,12 +87,18 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         /// Legacy `execCommandApproval` / `applyPatchApproval`, which use `ReviewDecision`.
         case reviewDecision
         case elicitation
-        case userInput(questionID: String)
+        case userInput(groupID: String, questionID: String)
     }
 
     private struct PendingApproval {
         let requestID: PiJSONValue
         let kind: ApprovalKind
+    }
+
+    private struct PendingUserInputGroup {
+        let requestID: PiJSONValue
+        let questionIDs: [String]
+        var answers: [String: [String]] = [:]
     }
 
     // MARK: - Session state
@@ -79,6 +112,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
 
     private var requestCounter = 0
     private var approvalCounter = 0
+    private var userInputGroupCounter = 0
     private var pending: [Int: Pending] = [:]
     private var pendingOrder: [Int] = []
     private var queued: [QueuedCommand] = []
@@ -91,7 +125,15 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     private var followUpMode = "all"
 
     private var turnID: String?
-    private var settledTurn: String?
+    private var activeTurnID: String?
+    private var turnStartCounter = 0
+    private var pendingTurnStartToken: Int?
+    private var turnStartPending: Bool { pendingTurnStartToken != nil }
+    private var settledTurns: Set<String> = []
+    private var settledTurnOrder: [String] = []
+    private var pendingSteers: [QueuedCommand] = []
+    private var pendingAborts: [QueuedCommand] = []
+    private var followUps: [QueuedCommand] = []
     private var isCompacting = false
     private var isRetrying = false
     private var retryAttempt = 0
@@ -107,6 +149,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
 
     private var approvals: [String: PendingApproval] = [:]
     private var approvalOrder: [String] = []
+    private var userInputGroups: [String: PendingUserInputGroup] = [:]
 
 
     // MARK: - Launch
@@ -146,6 +189,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         didRetryThreadStart = false
         requestCounter = 0
         approvalCounter = 0
+        userInputGroupCounter = 0
         pending.removeAll()
         pendingOrder.removeAll()
         queued.removeAll()
@@ -156,7 +200,14 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         steeringMode = "all"
         followUpMode = "all"
         turnID = nil
-        settledTurn = nil
+        activeTurnID = nil
+        turnStartCounter = 0
+        pendingTurnStartToken = nil
+        settledTurns.removeAll()
+        settledTurnOrder.removeAll()
+        pendingSteers.removeAll()
+        pendingAborts.removeAll()
+        followUps.removeAll()
         isCompacting = false
         isRetrying = false
         retryAttempt = 0
@@ -169,6 +220,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         contextWindow = nil
         approvals.removeAll()
         approvalOrder.removeAll()
+        userInputGroups.removeAll()
     }
 
     public func drainPendingWrites() -> [Data] {
@@ -232,9 +284,34 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         case "abort":
             // Nothing is running, so there is nothing to interrupt; failing here would surface
             // an error toast for a stop the user already has.
-            guard turnID != nil else { return .immediate(.object([:])) }
+            guard turnID != nil || turnStartPending else { return .immediate(.object([:])) }
+            if activeTurnID == nil {
+                guard pendingAborts.count < Limit.queuedCommands else {
+                    return .unsupported("more stop requests before the turn starts")
+                }
+                pendingAborts.append(QueuedCommand(command: command, id: id, payload: payload))
+                return .deferred
+            }
             return threadScoped(command, id: id, payload: payload)
-        case "prompt", "compact", "set_session_name", "get_commands":
+        case "follow_up":
+            if turnID != nil || turnStartPending {
+                guard followUps.count < Limit.queuedCommands else {
+                    return .unsupported("more queued follow-up messages")
+                }
+                followUps.append(QueuedCommand(command: command, id: id, payload: payload))
+                return .immediateWithEvents(.object([:]), [queueUpdateValue()])
+            }
+            return threadScoped(command, id: id, payload: payload)
+        case "prompt", "steer":
+            if (turnID != nil || turnStartPending), activeTurnID == nil {
+                guard pendingSteers.count < Limit.queuedCommands else {
+                    return .unsupported("more steering messages before the turn starts")
+                }
+                pendingSteers.append(QueuedCommand(command: command, id: id, payload: payload))
+                return .deferred
+            }
+            return threadScoped(command, id: id, payload: payload)
+        case "compact", "set_session_name", "get_commands":
             return threadScoped(command, id: id, payload: payload)
         case "get_entries":
             return .unsupported("reading transcript entries over its protocol")
@@ -244,6 +321,22 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             return .unsupported("exporting a conversation to HTML")
         default:
             return .unsupported("the \(command) command")
+        }
+    }
+
+    public func rollbackRejectedEncoding(
+        command: String, id: String, payload: [String: PiJSONValue]
+    ) {
+        queued.removeAll { $0.id == id }
+        pendingSteers.removeAll { $0.id == id }
+        pendingAborts.removeAll { $0.id == id }
+        followUps.removeAll { $0.id == id }
+        let rpcIDs = pending.compactMap { rpcID, entry in entry.appID == id ? rpcID : nil }
+        for rpcID in rpcIDs {
+            if let token = pending[rpcID]?.startToken, pendingTurnStartToken == token {
+                pendingTurnStartToken = nil
+            }
+            _ = takePending(rpcID)
         }
     }
 
@@ -260,22 +353,26 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     }
 
     private func line(for command: String, id: String, payload: [String: PiJSONValue], threadID: String) -> Data? {
+        let entry = QueuedCommand(command: command, id: id, payload: payload)
         switch command {
-        case "prompt":
+        case "prompt", "steer", "follow_up":
             let input = Self.userInput(from: payload)
-            if let turnID, settledTurn != turnID {
+            if command != "follow_up", let activeTurnID {
                 return request("turn/steer", params: [
-                    "threadId": threadID, "expectedTurnId": turnID, "input": input
-                ], as: .turn(appID: id))
+                    "threadId": threadID,
+                    "expectedTurnId": activeTurnID,
+                    "input": input,
+                    "clientUserMessageId": id
+                ], as: .turn(
+                    entry: entry, startsTurn: false, startToken: nil,
+                    responseExpected: true, retryCount: 0
+                ))
             }
-            var params: [String: Any] = ["threadId": threadID, "input": input]
-            if let modelID { params["model"] = modelID }
-            if let effort { params["effort"] = effort }
-            return request("turn/start", params: params, as: .turn(appID: id))
+            return makeTurnStart(entry, threadID: threadID, responseExpected: true, retryCount: 0)
         case "abort":
-            guard let turnID else { return nil }
+            guard let activeTurnID else { return nil }
             return request("turn/interrupt", params: [
-                "threadId": threadID, "turnId": turnID
+                "threadId": threadID, "turnId": activeTurnID
             ], as: .acknowledge(appID: id))
         case "compact":
             return request("thread/compact/start", params: ["threadId": threadID], as: .compact(appID: id))
@@ -293,6 +390,32 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         default:
             return nil
         }
+    }
+
+    private func makeTurnStart(
+        _ entry: QueuedCommand,
+        threadID: String,
+        responseExpected: Bool,
+        retryCount: Int
+    ) -> Data? {
+        let token = turnStartCounter &+ 1
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "input": Self.userInput(from: entry.payload),
+            "clientUserMessageId": entry.id
+        ]
+        if let modelID { params["model"] = modelID }
+        if let effort { params["effort"] = effort }
+        guard let line = request("turn/start", params: params, as: .turn(
+            entry: entry,
+            startsTurn: true,
+            startToken: token,
+            responseExpected: responseExpected,
+            retryCount: retryCount
+        )) else { return nil }
+        turnStartCounter = token
+        pendingTurnStartToken = token
+        return line
     }
 
     private func write(_ line: Data?) -> AdapterOutbound {
@@ -320,17 +443,55 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     }
 
     public func encodeUncorrelated(_ value: PiJSONValue) -> [Data] {
+        encodeUncorrelatedWithDisposition(value).lines
+    }
+
+    public func encodeUncorrelatedWithDisposition(
+        _ value: PiJSONValue
+    ) -> AdapterUncorrelatedOutbound {
         guard value["type"]?.stringValue == "extension_ui_response",
               let dialogID = value["id"]?.stringValue,
-              let approval = takeApproval(dialogID) else { return [] }
+              let approval = takeApproval(dialogID) else { return .unmatched }
         let cancelled = value["cancelled"]?.boolValue == true
         let confirmed = value["confirmed"]?.boolValue
         let choice = value["value"]?.stringValue
         let accepted = !cancelled && (confirmed ?? (choice.map { !Self.decliningChoices.contains($0) } ?? false))
         let forSession = choice == Self.approveForSessionChoice
 
+        if case let .userInput(groupID, questionID) = approval.kind {
+            guard var group = userInputGroups[groupID] else { return .unmatched }
+            group.answers[questionID] = accepted ? [choice ?? ""] : []
+            guard group.answers.count == group.questionIDs.count else {
+                userInputGroups[groupID] = group
+                return .acceptedWithoutWrite
+            }
+            userInputGroups.removeValue(forKey: groupID)
+            let answers = Dictionary(uniqueKeysWithValues: group.questionIDs.map { id in
+                (id, ["answers": group.answers[id] ?? []] as [String: Any])
+            })
+            guard let line = AdapterEncoding.line([
+                "id": Self.rpcIdentifier(group.requestID),
+                "result": ["answers": answers]
+            ]) else { return .unmatched }
+            return .write([line])
+        }
+
+        let result = Self.approvalResult(
+            for: approval.kind, accepted: accepted, cancelled: cancelled,
+            forSession: forSession, choice: choice
+        )
+        guard let line = AdapterEncoding.line([
+            "id": Self.rpcIdentifier(approval.requestID), "result": result
+        ]) else { return .unmatched }
+        return .write([line])
+    }
+
+    private static func approvalResult(
+        for kind: ApprovalKind, accepted: Bool, cancelled: Bool,
+        forSession: Bool, choice: String?
+    ) -> [String: Any] {
         let result: [String: Any]
-        switch approval.kind {
+        switch kind {
         case .commandExecution:
             result = ["decision": accepted ? (forSession ? "acceptForSession" : "accept") : (cancelled ? "cancel" : "decline")]
         case .fileChange:
@@ -345,13 +506,10 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             ]
         case .elicitation:
             result = ["action": accepted ? "accept" : (cancelled ? "cancel" : "decline")]
-        case let .userInput(questionID):
+        case let .userInput(_, questionID):
             result = ["answers": [questionID: ["answers": accepted ? [choice ?? ""] : []]]]
         }
-        guard let line = AdapterEncoding.line([
-            "id": Self.rpcIdentifier(approval.requestID), "result": result
-        ]) else { return [] }
-        return [line]
+        return result
     }
 
     /// JSON-RPC ids round-trip verbatim: an integer id must not come back as `3.0`.
@@ -379,11 +537,18 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             return handle(serverRequest: method, id: PiJSONValue(any: id), params: params)
         }
         guard let rpcID = (object["id"] as? NSNumber)?.intValue, let entry = takePending(rpcID) else { return [] }
+        let inbound: [AdapterInbound]
         if let error = object["error"] as? [String: Any] {
             let message = error["message"] as? String ?? "Codex rejected the request."
-            return handle(failure: entry, message: message)
+            inbound = handle(failure: entry, message: message)
+        } else {
+            inbound = handle(result: object["result"] as? [String: Any] ?? [:], for: entry)
         }
-        return handle(result: object["result"] as? [String: Any] ?? [:], for: entry)
+        if let activeTurnID {
+            flushPendingSteers(expectedTurnID: activeTurnID)
+            flushPendingAborts(expectedTurnID: activeTurnID)
+        }
+        return inbound
     }
 
     // MARK: Responses
@@ -409,12 +574,25 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             return [.response(id: appID, value: AdapterEncoding.response(id: appID, data: modelsValue()))]
         case let .commands(appID):
             return [.response(id: appID, value: AdapterEncoding.response(id: appID, data: commandsValue(result)))]
-        case let .turn(appID):
-            if let turn = result["turn"] as? [String: Any], let id = turn["id"] as? String {
-                turnID = id
-                settledTurn = nil
+        case let .turn(entry, startsTurn, startToken, responseExpected, _):
+            let resultTurn = result["turn"] as? [String: Any]
+            if startsTurn, resultTurn?["id"] is String, pendingTurnStartToken == startToken {
+                pendingTurnStartToken = nil
             }
-            return [.response(id: appID, value: AdapterEncoding.response(id: appID, data: .object([:])))]
+            var inbound: [AdapterInbound] = []
+            if responseExpected {
+                inbound.append(.response(
+                    id: entry.id,
+                    value: AdapterEncoding.response(id: entry.id, data: .object([:]))
+                ))
+            }
+            // The response and `turn/started` notification may arrive in either order. Route both
+            // through the same idempotent transition so an early response starts the pulse, while
+            // a late response can never resurrect a turn that already completed.
+            if let id = resultTurn?["id"] as? String {
+                inbound.append(contentsOf: beginTurn(id, confirmed: false))
+            }
+            return inbound
         case let .compact(appID):
             isCompacting = true
             return [
@@ -429,10 +607,10 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     private func handle(failure entry: Pending, message: String) -> [AdapterInbound] {
         switch entry {
         case .initialize:
-            return []
+            return failHandshake(message)
         case let .openThread(resume):
             // A rollout whose thread Codex cannot load must still give the user a usable session.
-            guard resume, !didRetryThreadStart else { return [] }
+            guard resume, !didRetryThreadStart else { return failHandshake(message) }
             didRetryThreadStart = true
             resumeThreadID = nil
             openThread()
@@ -440,7 +618,65 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         case let .models(appID):
             guard let appID else { return [] }
             return [.response(id: appID, value: rejection(id: appID, message: message))]
-        case let .commands(appID), let .turn(appID), let .compact(appID), let .acknowledge(appID):
+        case let .turn(entry, startsTurn, startToken, responseExpected, retryCount):
+            if startsTurn {
+                let ownsPendingStart = pendingTurnStartToken == startToken
+                if !ownsPendingStart {
+                    // A confirmed start may complete before its JSON-RPC reply. Its late failure
+                    // cannot reject a command the agent already ran or disturb the next pending start.
+                    guard responseExpected else { return [] }
+                    return [.response(
+                        id: entry.id,
+                        value: AdapterEncoding.response(id: entry.id, data: .object([:]))
+                    )]
+                }
+                if !responseExpected, retryCount == 0, let threadID {
+                    enqueue(makeTurnStart(
+                        entry, threadID: threadID,
+                        responseExpected: false, retryCount: retryCount + 1
+                    ))
+                    return []
+                }
+                pendingTurnStartToken = nil
+                if !responseExpected {
+                    return completeTurn([
+                        "id": "failed-follow-up-\(startToken.map(String.init) ?? entry.id)",
+                        "status": "failed",
+                        "error": ["message": "The queued follow-up could not start. \(message)"],
+                        "items": []
+                    ])
+                }
+                var inbound = rejectPendingSteers(message: message)
+                inbound.append(contentsOf: resolvePendingAborts())
+                inbound.append(.response(id: entry.id, value: rejection(id: entry.id, message: message)))
+                inbound.append(contentsOf: startNextFollowUp())
+                return inbound
+            }
+
+            if Self.isRecoverableTurnRace(message) {
+                if retryCount == 0, enqueueSteer(entry, retryCount: 1) {
+                    return []
+                }
+                if turnID != nil || turnStartPending {
+                    followUps.insert(entry, at: 0)
+                    return [
+                        .response(
+                            id: entry.id,
+                            value: AdapterEncoding.response(id: entry.id, data: .object([:]))
+                        ),
+                        queueUpdate()
+                    ]
+                }
+                if let threadID {
+                    enqueue(makeTurnStart(
+                        entry, threadID: threadID,
+                        responseExpected: true, retryCount: 0
+                    ))
+                    return []
+                }
+            }
+            return [.response(id: entry.id, value: rejection(id: entry.id, message: message))]
+        case let .commands(appID), let .compact(appID), let .acknowledge(appID):
             if case .compact = entry { isCompacting = false }
             return [.response(id: appID, value: rejection(id: appID, message: message))]
         }
@@ -461,13 +697,24 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
 
     private func threadOpened(_ result: [String: Any]) -> [AdapterInbound] {
         let thread = result["thread"] as? [String: Any] ?? [:]
-        guard let id = thread["id"] as? String else { return [] }
+        guard let id = thread["id"] as? String else {
+            return failHandshake("The agent did not return a thread identifier.")
+        }
         threadID = id
         sessionFile = thread["path"] as? String ?? sessionFile
         sessionName = thread["name"] as? String ?? sessionName
         modelID = result["model"] as? String ?? modelID
         effort = result["reasoningEffort"] as? String ?? effort
         return flushQueuedCommands()
+    }
+
+    private func failHandshake(_ message: String) -> [AdapterInbound] {
+        let stranded = queued
+        queued.removeAll()
+        pendingTurnStartToken = nil
+        return stranded.map { entry in
+            .response(id: entry.id, value: rejection(id: entry.id, message: message))
+        }
     }
 
     /// Commands this adapter answers from its own state rather than from the wire. They are held
@@ -489,17 +736,18 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
                 for line in lines { enqueue(line) }
             case let .immediate(value):
                 inbound.append(.response(id: entry.id, value: AdapterEncoding.response(id: entry.id, data: value)))
+            case let .immediateWithEvents(value, events):
+                inbound.append(.response(id: entry.id, value: AdapterEncoding.response(id: entry.id, data: value)))
+                inbound.append(contentsOf: events.map(AdapterInbound.event))
             case let .unsupported(what):
                 inbound.append(.response(
                     id: entry.id,
                     value: AdapterEncoding.failure(id: entry.id, message: "\(agent.displayName) does not support \(what).")
                 ))
             case .deferred:
-                // Cannot happen: the thread now exists, so nothing re-queues. Answer rather than
-                // strand the caller if it ever does.
-                inbound.append(.response(
-                    id: entry.id, value: AdapterEncoding.response(id: entry.id, data: .object([:]))
-                ))
+                // A second prompt can now be waiting for the first turn's confirmed start. Its
+                // correlation remains reserved until the queued steer reaches the wire.
+                break
             }
         }
         return inbound
@@ -516,7 +764,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             return []
         case "turn/started":
             guard let turn = params["turn"] as? [String: Any], let id = turn["id"] as? String else { return [] }
-            return beginTurn(id)
+            return beginTurn(id, confirmed: true)
         case "turn/completed":
             return completeTurn(params["turn"] as? [String: Any] ?? [:])
         case "item/started":
@@ -552,13 +800,27 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         }
     }
 
-    private func beginTurn(_ id: String) -> [AdapterInbound] {
-        guard turnID != id || settledTurn == id else { return [] }
-        turnID = id
-        settledTurn = nil
-        isRetrying = false
-        retryAttempt = 0
-        return [.event(AdapterEncoding.event("agent_start")), .event(AdapterEncoding.event("turn_start"))]
+    private func beginTurn(_ id: String, confirmed: Bool) -> [AdapterInbound] {
+        guard !settledTurns.contains(id) else { return [] }
+        if let turnID, turnID != id { return [] }
+
+        var inbound: [AdapterInbound] = []
+        if turnID == nil {
+            turnID = id
+            isRetrying = false
+            retryAttempt = 0
+            inbound = [
+                .event(AdapterEncoding.event("agent_start")),
+                .event(AdapterEncoding.event("turn_start"))
+            ]
+        }
+        if confirmed {
+            activeTurnID = id
+            pendingTurnStartToken = nil
+            flushPendingSteers(expectedTurnID: id)
+            flushPendingAborts(expectedTurnID: id)
+        }
+        return inbound
     }
 
     /// The one place a turn ends. `agent_settled` unblocks the composer, so it fires exactly once
@@ -567,16 +829,31 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         let status = turn["status"] as? String ?? "completed"
         guard status != "inProgress" else { return [] }
         let id = turn["id"] as? String ?? turnID ?? ""
-        guard settledTurn != id else { return [] }
-        settledTurn = id
+        guard !id.isEmpty, !settledTurns.contains(id) else { return [] }
+        if let turnID, turnID != id {
+            rememberSettled(id)
+            return []
+        }
+        rememberSettled(id)
         turnID = nil
+        activeTurnID = nil
+        pendingTurnStartToken = nil
 
         var inbound = closeOpenItems()
+        let restartedPendingSteer = restartFirstPendingSteer()
+        if !restartedPendingSteer {
+            inbound.append(contentsOf: rejectPendingSteers(
+                message: "The turn ended before steering was accepted."
+            ))
+        }
+        inbound.append(contentsOf: resolvePendingAborts())
         if status == "failed", let message = (turn["error"] as? [String: Any])?["message"] as? String {
             inbound.append(.event(AdapterEncoding.event("message_end", [
                 "message": .object([
+                    "id": .string("codex-turn-error-\(id)"),
                     "role": .string("assistant"),
                     "content": .array([.object(["type": .string("text"), "text": .string(message)])]),
+                    "provider": .string(Self.provider),
                     "stopReason": .string("error"),
                     "isError": .bool(true)
                 ])
@@ -593,7 +870,137 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         }
         inbound.append(.event(AdapterEncoding.event("turn_end")))
         inbound.append(.event(AdapterEncoding.event("agent_settled")))
+        if !restartedPendingSteer {
+            inbound.append(contentsOf: startNextFollowUp())
+        }
         return inbound
+    }
+
+    private func rememberSettled(_ id: String) {
+        guard settledTurns.insert(id).inserted else { return }
+        settledTurnOrder.append(id)
+        if settledTurnOrder.count > Limit.settledTurns {
+            let overflow = settledTurnOrder.count - Limit.settledTurns
+            let removed = settledTurnOrder.prefix(overflow)
+            settledTurns.subtract(removed)
+            settledTurnOrder.removeFirst(overflow)
+        }
+    }
+
+    private func flushPendingSteers(expectedTurnID: String) {
+        guard let threadID, !pendingSteers.isEmpty else { return }
+        var remaining: [QueuedCommand] = []
+        for entry in pendingSteers {
+            let params: [String: Any] = [
+                "threadId": threadID,
+                "expectedTurnId": expectedTurnID,
+                "input": Self.userInput(from: entry.payload),
+                "clientUserMessageId": entry.id
+            ]
+            guard let line = request("turn/steer", params: params, as: .turn(
+                entry: entry, startsTurn: false, startToken: nil,
+                responseExpected: true, retryCount: 0
+            )) else {
+                remaining.append(entry)
+                continue
+            }
+            enqueue(line)
+        }
+        pendingSteers = remaining
+    }
+
+    @discardableResult
+    private func enqueueSteer(_ entry: QueuedCommand, retryCount: Int) -> Bool {
+        guard let threadID, let activeTurnID else { return false }
+        guard let line = request("turn/steer", params: [
+            "threadId": threadID,
+            "expectedTurnId": activeTurnID,
+            "input": Self.userInput(from: entry.payload),
+            "clientUserMessageId": entry.id
+        ], as: .turn(
+            entry: entry, startsTurn: false, startToken: nil,
+            responseExpected: true, retryCount: retryCount
+        )) else { return false }
+        enqueue(line)
+        return true
+    }
+
+    private static func isRecoverableTurnRace(_ message: String) -> Bool {
+        let message = message.lowercased()
+        return message.contains("no active turn")
+            || (message.contains("expected") && message.contains("turn"))
+            || message.contains("turn is not active")
+    }
+
+    private func flushPendingAborts(expectedTurnID: String) {
+        guard let threadID, !pendingAborts.isEmpty else { return }
+        var remaining: [QueuedCommand] = []
+        for entry in pendingAborts {
+            guard let line = request("turn/interrupt", params: [
+                "threadId": threadID, "turnId": expectedTurnID
+            ], as: .acknowledge(appID: entry.id)) else {
+                remaining.append(entry)
+                continue
+            }
+            enqueue(line)
+        }
+        pendingAborts = remaining
+    }
+
+    private func resolvePendingAborts() -> [AdapterInbound] {
+        let commands = pendingAborts
+        pendingAborts.removeAll()
+        return commands.map { entry in
+            .response(
+                id: entry.id,
+                value: AdapterEncoding.response(id: entry.id, data: .object([:]))
+            )
+        }
+    }
+
+    private func rejectPendingSteers(message: String) -> [AdapterInbound] {
+        let commands = pendingSteers
+        pendingSteers.removeAll()
+        return commands.map { entry in
+            .response(id: entry.id, value: rejection(id: entry.id, message: message))
+        }
+    }
+
+    /// A turn can settle after its start response but before its activation notification. Start
+    /// the first held steer as the next turn and keep later steers behind its confirmation, so
+    /// FIFO and callback acceptance still match the wire.
+    @discardableResult
+    private func restartFirstPendingSteer() -> Bool {
+        guard let threadID, !pendingSteers.isEmpty else { return false }
+        let entry = pendingSteers[0]
+        guard let line = makeTurnStart(
+            entry, threadID: threadID, responseExpected: true, retryCount: 0
+        ) else { return false }
+        pendingSteers.removeFirst()
+        enqueue(line)
+        return true
+    }
+
+    private func startNextFollowUp() -> [AdapterInbound] {
+        guard let threadID, !followUps.isEmpty else { return [] }
+        let entry = followUps[0]
+        guard let line = makeTurnStart(
+            entry, threadID: threadID, responseExpected: false, retryCount: 0
+        ) else { return [] }
+        followUps.removeFirst()
+        enqueue(line)
+        return [queueUpdate()]
+    }
+
+    private func queueUpdate() -> AdapterInbound {
+        .event(queueUpdateValue())
+    }
+
+    private func queueUpdateValue() -> PiJSONValue {
+        AdapterEncoding.event("queue_update", [
+            "steering": .array(pendingSteers.map { .string($0.payload["message"]?.stringValue ?? "") }),
+            "followUp": .array(followUps.map { .string($0.payload["message"]?.stringValue ?? "") })
+        ])
     }
 
     private func startItem(_ item: [String: Any]) -> [AdapterInbound] {
@@ -601,9 +1008,11 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         var inbound = resumedAfterRetry()
         switch type {
         case "agentMessage", "reasoning":
-            openStream(itemID, thinking: type == "reasoning")
+            openStream(itemID, thinking: type == "reasoning", phase: item["phase"] as? String)
             inbound.append(.event(AdapterEncoding.event("message_start", [
-                "message": .object(["role": .string("assistant"), "content": .array([])])
+                "message": .object([
+                    "id": .string(itemID), "role": .string("assistant"), "content": .array([])
+                ])
             ])))
         case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch":
             let name = Self.toolName(for: item)
@@ -624,10 +1033,14 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         switch type {
         case "agentMessage":
             let text = item["text"] as? String ?? streams[itemID]?.text ?? ""
+            let phase = item["phase"] as? String ?? streams[itemID]?.phase
             closeStream(itemID)
             guard !text.isEmpty else { return [] }
             return [.event(AdapterEncoding.event("message_end", [
-                "message": assistantMessage(text: text, thinking: false, stopReason: "stop")
+                "message": assistantMessage(
+                    id: itemID, text: text, thinking: false,
+                    stopReason: phase == "final_answer" ? "stop" : "toolUse"
+                )
             ]))]
         case "reasoning":
             let parts = ((item["summary"] as? [String]) ?? []) + ((item["content"] as? [String]) ?? [])
@@ -635,7 +1048,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             closeStream(itemID)
             guard !text.isEmpty else { return [] }
             return [.event(AdapterEncoding.event("message_end", [
-                "message": assistantMessage(text: text, thinking: true, stopReason: "toolUse")
+                "message": assistantMessage(id: itemID, text: text, thinking: true, stopReason: "toolUse")
             ]))]
         case "userMessage":
             let text = Self.userMessageText(item)
@@ -643,6 +1056,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             return [.event(AdapterEncoding.event("message_end", [
                 "message": .object([
                     "role": .string("user"),
+                    "id": .string(itemID),
                     "content": .array([.object(["type": .string("text"), "text": .string(text)])])
                 ])
             ]))]
@@ -665,7 +1079,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
 
     private func append(delta: String?, to itemID: String?, thinking: Bool) -> [AdapterInbound] {
         guard let delta, !delta.isEmpty, let itemID else { return [] }
-        if streams[itemID] == nil { openStream(itemID, thinking: thinking) }
+        if streams[itemID] == nil { openStream(itemID, thinking: thinking, phase: nil) }
         guard var stream = streams[itemID] else { return [] }
         // Bounded: a runaway stream keeps its head, which is what the reader is looking at.
         if stream.text.count < Limit.streamCharacters {
@@ -675,8 +1089,14 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             }
         }
         streams[itemID] = stream
+        let isWork = stream.isThinking || (stream.phase != nil && stream.phase != "final_answer")
         return [.event(AdapterEncoding.event("message_update", [
-            "message": assistantMessage(text: stream.text, thinking: stream.isThinking, stopReason: nil)
+            "message": assistantMessage(
+                id: itemID,
+                text: stream.text,
+                thinking: stream.isThinking,
+                stopReason: isWork ? "toolUse" : nil
+            )
         ]))]
     }
 
@@ -722,54 +1142,45 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         case "item/commandExecution/requestApproval", "execCommandApproval":
             let command = params["command"] as? String ?? "a command"
             let cwd = params["cwd"] as? String
-            return [dialog(
+            return dialog(
                 id: id,
                 kind: method == "execCommandApproval" ? .reviewDecision : .commandExecution,
                 title: "Codex wants to run a command",
                 message: [command, cwd.map { "in \($0)" }, params["reason"] as? String]
                     .compactMap { $0 }.joined(separator: "\n"),
                 options: Self.approvalChoices
-            )]
+            ).map { [$0] } ?? []
         case "item/fileChange/requestApproval", "applyPatchApproval":
             let files = ((params["fileChanges"] as? [String: Any])?.keys).map { Array($0) } ?? []
-            return [dialog(
+            return dialog(
                 id: id,
                 kind: method == "applyPatchApproval" ? .reviewDecision : .fileChange,
                 title: "Codex wants to edit files",
                 message: [params["reason"] as? String, files.prefix(20).joined(separator: "\n")]
                     .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n"),
                 options: Self.approvalChoices
-            )]
+            ).map { [$0] } ?? []
         case "item/permissions/requestApproval":
-            let requested = PiJSONValue(any: params["permissions"])
-            return [dialog(
+            let requested = PiJSONValue(any: params["permissions"] ?? NSNull())
+            return dialog(
                 id: id,
                 kind: .permissions(requested: requested),
                 title: "Codex wants more access",
                 message: [params["reason"] as? String, params["cwd"] as? String]
                     .compactMap { $0 }.joined(separator: "\n"),
                 options: Self.approvalChoices
-            )]
+            ).map { [$0] } ?? []
         case "mcpServer/elicitation/request":
-            return [dialog(
+            return dialog(
                 id: id,
                 kind: .elicitation,
                 title: "Codex tool request",
                 message: params["message"] as? String ?? "",
                 options: [Self.approveChoice, Self.declineChoice]
-            )]
+            ).map { [$0] } ?? []
         case "item/tool/requestUserInput":
             let questions = params["questions"] as? [[String: Any]] ?? []
-            guard let question = questions.first, let questionID = question["id"] as? String else { return [] }
-            let options = (question["options"] as? [[String: Any]] ?? [])
-                .compactMap { $0["label"] as? String }
-            return [dialog(
-                id: id,
-                kind: .userInput(questionID: questionID),
-                title: question["header"] as? String ?? "Codex has a question",
-                message: question["question"] as? String ?? "",
-                options: options
-            )]
+            return userInputDialogs(requestID: id, questions: questions)
         default:
             // Requests this adapter does not answer (auth token refresh, attestation, tool calls)
             // are left to Codex's own fallbacks rather than answered wrongly.
@@ -783,12 +1194,78 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     private static let approvalChoices = [approveChoice, approveForSessionChoice, declineChoice]
     private static let decliningChoices: Set<String> = [declineChoice]
 
+    private func userInputDialogs(
+        requestID: PiJSONValue,
+        questions: [[String: Any]]
+    ) -> [AdapterInbound] {
+        var seen: Set<String> = []
+        let valid = questions.prefix(Limit.userInputQuestions).compactMap { question -> (String, [String: Any])? in
+            guard let id = question["id"] as? String, !id.isEmpty, seen.insert(id).inserted else { return nil }
+            return (id, question)
+        }
+        guard !valid.isEmpty else {
+            enqueue(AdapterEncoding.line([
+                "id": Self.rpcIdentifier(requestID),
+                "result": ["answers": [String: Any]()]
+            ]))
+            return []
+        }
+        guard approvals.count <= Limit.pendingApprovals - valid.count else {
+            let answers = Dictionary(uniqueKeysWithValues: valid.map { id, _ in
+                (id, ["answers": [String]()] as [String: Any])
+            })
+            enqueue(AdapterEncoding.line([
+                "id": Self.rpcIdentifier(requestID),
+                "result": ["answers": answers]
+            ]))
+            return []
+        }
+
+        userInputGroupCounter &+= 1
+        let groupID = "codex-user-input-\(userInputGroupCounter)"
+        userInputGroups[groupID] = PendingUserInputGroup(
+            requestID: requestID,
+            questionIDs: valid.map(\.0)
+        )
+
+        return valid.compactMap { questionID, question in
+            let rawOptions = question["options"] as? [[String: Any]] ?? []
+            let options = rawOptions.compactMap { $0["label"] as? String }
+            let descriptions = rawOptions.compactMap { option -> String? in
+                guard let label = option["label"] as? String,
+                      let description = option["description"] as? String,
+                      !description.isEmpty else { return nil }
+                return "\(label): \(description)"
+            }
+            let prompt = question["question"] as? String ?? ""
+            let message = ([prompt] + descriptions).filter { !$0.isEmpty }.joined(separator: "\n\n")
+            return dialog(
+                id: requestID,
+                kind: .userInput(groupID: groupID, questionID: questionID),
+                title: question["header"] as? String ?? "Agent question",
+                message: message,
+                options: options
+            )
+        }
+    }
+
     private func dialog(
         id: PiJSONValue, kind: ApprovalKind, title: String, message: String, options: [String]
-    ) -> AdapterInbound {
+    ) -> AdapterInbound? {
+        let approval = PendingApproval(requestID: id, kind: kind)
+        guard approvals.count < Limit.pendingApprovals else {
+            let result = Self.approvalResult(
+                for: kind, accepted: false, cancelled: false,
+                forSession: false, choice: Self.declineChoice
+            )
+            enqueue(AdapterEncoding.line([
+                "id": Self.rpcIdentifier(id), "result": result
+            ]))
+            return nil
+        }
         approvalCounter += 1
         let dialogID = "codex-approval-\(approvalCounter)"
-        remember(approval: PendingApproval(requestID: id, kind: kind), as: dialogID)
+        remember(approval: approval, as: dialogID)
         var fields: [String: PiJSONValue] = [
             "id": .string(dialogID),
             "method": .string(options.isEmpty ? "input" : "select"),
@@ -805,12 +1282,12 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
 
     private func stateValue() -> PiJSONValue {
         var object: [String: PiJSONValue] = [
-            "isStreaming": .bool(turnID != nil),
+            "isStreaming": .bool(turnID != nil || turnStartPending),
             "isCompacting": .bool(isCompacting),
             "steeringMode": .string(steeringMode),
             "followUpMode": .string(followUpMode),
-            "steeringQueue": .array([]),
-            "followUpQueue": .array([]),
+            "steeringQueue": .array(pendingSteers.map { .string($0.payload["message"]?.stringValue ?? "") }),
+            "followUpQueue": .array(followUps.map { .string($0.payload["message"]?.stringValue ?? "") }),
             "thinkingLevel": .string(Self.thinkingLevel(forEffort: effort)),
             "model": selectedModelValue()
         ]
@@ -924,8 +1401,9 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         ])
     }
 
-    private func assistantMessage(text: String, thinking: Bool, stopReason: String?) -> PiJSONValue {
+    private func assistantMessage(id: String, text: String, thinking: Bool, stopReason: String?) -> PiJSONValue {
         var message: [String: PiJSONValue] = [
+            "id": .string(id),
             "role": .string("assistant"),
             "content": .array([thinking
                 ? .object(["type": .string("thinking"), "thinking": .string(text)])
@@ -968,7 +1446,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             let query = item["query"] as? String ?? ""
             return .object(["query": .string(query), "title": .string(query)])
         default:
-            return PiJSONValue(any: item["arguments"]).boundedProjection()
+            return PiJSONValue(any: item["arguments"] ?? NSNull()).boundedProjection()
         }
     }
 
@@ -1024,6 +1502,7 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     // MARK: - Bounded bookkeeping
 
     private func request(_ method: String, params: [String: Any], as entry: Pending) -> Data? {
+        guard pending.count < Limit.inFlightRequests else { return nil }
         requestCounter += 1
         let rpcID = requestCounter
         guard let line = AdapterEncoding.line([
@@ -1031,9 +1510,6 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         ]) else { return nil }
         pending[rpcID] = entry
         pendingOrder.append(rpcID)
-        while pendingOrder.count > Limit.inFlightRequests {
-            pending.removeValue(forKey: pendingOrder.removeFirst())
-        }
         return line
     }
 
@@ -1056,9 +1532,13 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
         ])
     }
 
-    private func openStream(_ itemID: String, thinking: Bool) {
+    private func openStream(_ itemID: String, thinking: Bool, phase: String?) {
         if streams[itemID] == nil { streamOrder.append(itemID) }
-        streams[itemID] = Stream(isThinking: thinking, text: streams[itemID]?.text ?? "")
+        streams[itemID] = Stream(
+            isThinking: thinking,
+            phase: phase ?? streams[itemID]?.phase,
+            text: streams[itemID]?.text ?? ""
+        )
         while streamOrder.count > Limit.openItems {
             streams.removeValue(forKey: streamOrder.removeFirst())
         }
@@ -1101,7 +1581,10 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
             guard let stream = streams[itemID], !stream.text.isEmpty else { continue }
             inbound.append(.event(AdapterEncoding.event("message_end", [
                 "message": assistantMessage(
-                    text: stream.text, thinking: stream.isThinking, stopReason: "stop"
+                    id: itemID, text: stream.text, thinking: stream.isThinking,
+                    // An item that never completed is work interrupted at the turn boundary, not
+                    // a trustworthy final answer.
+                    stopReason: "toolUse"
                 )
             ])))
         }
@@ -1113,9 +1596,6 @@ public final class CodexProtocolAdapter: AgentProtocolAdapter, AdapterWriteback 
     private func remember(approval: PendingApproval, as dialogID: String) {
         approvals[dialogID] = approval
         approvalOrder.append(dialogID)
-        while approvalOrder.count > Limit.pendingApprovals {
-            approvals.removeValue(forKey: approvalOrder.removeFirst())
-        }
     }
 
     private func takeApproval(_ dialogID: String) -> PendingApproval? {

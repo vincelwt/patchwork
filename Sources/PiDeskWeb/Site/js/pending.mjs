@@ -12,7 +12,7 @@
 // DOM, no timers, no network, so the reconciliation rules are testable on their own
 // (docs/js-checks/pending.test.mjs).
 
-/** Never hold more than this many unconfirmed messages; the oldest are dropped first. */
+/** Never hold more than this many unconfirmed messages; new sends are refused at capacity. */
 export const PENDING_LIMIT = 8;
 
 /** Run statuses that mean the text will never produce a user message. */
@@ -53,10 +53,10 @@ export function userTextCounts(messages) {
  * by what the daemon actually did, so retrying a steer that was downgraded to `auto` still asks
  * to steer.
  *
- * Returns `{ list, entry, rejected }`. When the bound is full of messages that cannot be dropped
- * safely, `rejected` is true and the caller must put the text back in the composer: silently
- * evicting a bubble whose send has not been accepted would throw away the only copy of something
- * that may never have been sent at all.
+ * Returns `{ list, entry, rejected }`. When the bound is full of unresolved messages, `rejected`
+ * is true and the caller must put the text back in the composer. A daemon acceptance only means
+ * queued, so even an accepted bubble remains the only visible retry path until its run succeeds
+ * or the transcript accounts for it.
  */
 export function addPending(list, { key, text, delivery = null, clientId = null, messages = [], at = Date.now() }) {
   const entry = {
@@ -70,6 +70,10 @@ export function addPending(list, { key, text, delivery = null, clientId = null, 
     runId: null,
     error: null,
     settled: false,
+    // A transport failure safely retries the same submission id. A terminal run that is
+    // explicitly retryable before prompt delivery needs a new id, because the old id replays the
+    // terminal answer. An accepted or ambiguous failure is review-only.
+    retryMode: "sameSubmission",
     // Set only by `markAccepted`: the daemon answered, so this text is on its way into the
     // transcript whatever happens to this bubble. Until then the bubble holds the only copy.
     accepted: false,
@@ -78,11 +82,9 @@ export function addPending(list, { key, text, delivery = null, clientId = null, 
 
   if (list.length < PENDING_LIMIT) return { list: [...list, entry], entry, rejected: false };
 
-  // Full: drop the oldest entry that is safe to drop — one the daemon has explicitly accepted,
-  // whose text is on its way into the transcript regardless. A bubble still sending, or already
-  // failed, is the only record of that message; if every slot holds one of those, refuse rather
-  // than destroy it.
-  const index = list.findIndex((candidate) => candidate.accepted && candidate.status !== "failed");
+  // A successful run proves the transcript write completed, so a settled bubble is the sole safe
+  // eviction candidate. Sending, queued, working, and failed entries must all remain visible.
+  const index = list.findIndex((candidate) => candidate.settled && candidate.status !== "failed");
   if (index === -1) return { list, entry: null, rejected: true };
   return { list: [...list.slice(0, index), ...list.slice(index + 1), entry], entry, rejected: false };
 }
@@ -109,12 +111,27 @@ export function markAccepted(list, key, { runId = null, queued = false, delivery
  * and this bubble would then hold the only copy of the text, so it must stay un-evictable.
  */
 export function markInFlight(list, key) {
-  return patch(list, key, { status: "working", error: null });
+  return patch(list, key, { status: "sending", error: null });
 }
 
 /** The request itself failed. The text stays put so it can be retried or copied back out. */
-export function markFailed(list, key, error) {
-  return patch(list, key, { status: "failed", error: error || "Message was not sent." });
+export function markFailed(list, key, error, retryMode = "sameSubmission") {
+  return patch(list, key, {
+    status: "failed",
+    error: error || "Message was not sent.",
+    retryMode
+  });
+}
+
+/** Whether an endpoint error may safely retry the same protected submission. */
+export function retryModeForSubmissionError(error, replaySafe = false) {
+  const code = String(error?.code || "");
+  if (["submission_outcome_unknown", "submission_id_conflict"].includes(code)) return "review";
+  if (["prompt_too_large", "empty_text", "invalid_client_id", "attachments_unsupported"].includes(code)) {
+    return "review";
+  }
+  if ([400, 404, 413, 422].includes(Number(error?.status))) return "review";
+  return replaySafe ? "sameSubmission" : "review";
 }
 
 export function removePending(list, key) {
@@ -133,7 +150,15 @@ export function applyRunEvent(list, run) {
     if (run.status === "running") return { ...entry, status: "working" };
     if (run.status === "ok") return { ...entry, settled: true };
     if (FAILED_RUN_STATUSES.has(run.status)) {
-      return { ...entry, status: "failed", error: run.error || `The run ${run.status}.` };
+      const retryMode = run.retryable === true && !run.promptStartedAt
+        ? "newSubmission"
+        : "review";
+      return {
+        ...entry,
+        status: "failed",
+        error: run.error || `The run ${run.status}.`,
+        retryMode
+      };
     }
     return entry;
   });
@@ -151,6 +176,9 @@ export function reconcile(list, messages) {
   return list.filter((entry) => {
     if (entry.status === "failed") return true;
     if (entry.settled) return false;
+    // Until the daemon answers, this bubble is the only durable copy of the text. A history page
+    // containing an older identical message can never prove this particular send was accepted.
+    if (!entry.accepted) return true;
     const key = normalizeText(entry.text);
     const available = (counts.get(key) || 0) - entry.baseline - (used.get(key) || 0);
     if (available <= 0) return true;
@@ -184,11 +212,11 @@ export function statusLabel(entry) {
     case "sending":
       return "Sending\u2026";
     case "queued":
-      return "Queued \u2014 waiting for the current run";
+      return "Queued: waiting for the current run";
     case "working":
       if (entry.delivery === "steer") return "Steering the current run\u2026";
-      if (entry.delivery === "followUp") return "Queued \u2014 waiting for the current run";
-      return "Sent \u2014 waiting for Pi";
+      if (entry.delivery === "followUp") return "Queued: waiting for the current run";
+      return "Sent: waiting for Pi";
     case "failed":
       return entry.error || "Not sent";
     default:

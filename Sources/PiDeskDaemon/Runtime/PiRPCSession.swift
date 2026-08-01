@@ -24,6 +24,9 @@ final class PiRPCSession: @unchecked Sendable {
     private var framer = JSONLFramer()
     private let bufferLock = NSLock()
     private var buffer: [PiJSONValue] = []
+    private var bufferedBytes = 0
+    private static let bufferedValueLimit = 512
+    private static let bufferedByteLimit = 16 * 1_024 * 1_024
     private var requestCounter = 0
     /// Serializes every write to Pi's stdin. Prompts come from the run's own task, while steer/
     /// follow-up deliveries and `extension_ui_response` answers arrive from HTTP handlers on
@@ -38,8 +41,10 @@ final class PiRPCSession: @unchecked Sendable {
     /// Responses seen by whoever is draining output, kept so a caller that is *not* the drainer
     /// (a steer delivered from an HTTP handler) can still collect its acknowledgement. Bounded;
     /// oldest entries are evicted, never accumulated.
-    private var responseCache: [(id: String, value: PiJSONValue)] = []
-    private static let responseCacheLimit = 64
+    private var responseCache: [(id: String, value: PiJSONValue, bytes: Int)] = []
+    private var responseCacheBytes = 0
+    static let responseCacheLimit = 64
+    static let responseCacheByteLimit = 16 * 1_024 * 1_024
 
     var isRunning: Bool { process.isRunning }
 
@@ -65,6 +70,8 @@ final class PiRPCSession: @unchecked Sendable {
     static func start(
         cwd: URL, sessionPath: URL?, piExecutable: URL, environment: [String: String],
         writeTimeout: TimeInterval = BlockingPipeIO.defaultWriteTimeout,
+        initialSessionID: String? = nil,
+        initialSessionName: String? = nil,
         adapter: AgentProtocolAdapter = PiProtocolAdapter()
     ) throws -> PiRPCSession {
         let process = Process()
@@ -72,7 +79,10 @@ final class PiRPCSession: @unchecked Sendable {
         let output = Pipe()
         let error = Pipe()
         process.executableURL = piExecutable
-        process.arguments = adapter.launchArguments(sessionPath: sessionPath, cwd: cwd)
+        process.arguments = adapter.launchArguments(
+            sessionPath: sessionPath, cwd: cwd,
+            initialSessionID: initialSessionID, initialSessionName: initialSessionName
+        )
         process.currentDirectoryURL = cwd
         process.environment = environment
         process.standardInput = input
@@ -122,9 +132,11 @@ final class PiRPCSession: @unchecked Sendable {
             // the response cache alone is only read by `awaitCachedResponse`, so a caller that
             // waits the ordinary way would have waited out its whole timeout.
             let response = AdapterEncoding.response(id: id, data: value)
-            bufferLock.lock()
-            buffer.append(response)
-            bufferLock.unlock()
+            try appendBuffered([response])
+            cacheResponses([response])
+        case let .immediateWithEvents(value, events):
+            let response = AdapterEncoding.response(id: id, data: value)
+            try appendBuffered([response] + events)
             cacheResponses([response])
         case let .unsupported(what):
             throw RunnerError.unsupportedCommand(agent: adapter.agent, what: what)
@@ -137,7 +149,15 @@ final class PiRPCSession: @unchecked Sendable {
     func sendRaw(_ object: [String: PiJSONValue]) throws {
         writeLock.lock()
         defer { writeLock.unlock() }
-        for line in adapterLock.withLock({ adapter.encodeUncorrelated(.object(object)) }) {
+        let encoded = adapterLock.withLock {
+            adapter.encodeUncorrelatedWithDisposition(.object(object))
+        }
+        guard encoded.wasAccepted else {
+            throw RunnerError.ioFailure(
+                "\(adapter.agent.displayName) could not match the dialog response to a pending request."
+            )
+        }
+        for line in encoded.lines {
             try writeRawLocked(line)
         }
     }
@@ -179,21 +199,35 @@ final class PiRPCSession: @unchecked Sendable {
     private func takeCachedResponse(id: String) -> PiJSONValue? {
         bufferLock.lock(); defer { bufferLock.unlock() }
         guard let index = responseCache.firstIndex(where: { $0.id == id }) else { return nil }
-        return responseCache.remove(at: index).value
+        let removed = responseCache.remove(at: index)
+        responseCacheBytes = max(0, responseCacheBytes - removed.bytes)
+        return removed.value
     }
 
     private func cacheResponses(_ values: [PiJSONValue]) {
-        let responses = values.compactMap { value -> (id: String, value: PiJSONValue)? in
+        let responses = values.compactMap { value -> (id: String, value: PiJSONValue, bytes: Int)? in
             guard value["type"]?.stringValue == "response", let id = value["id"]?.stringValue else { return nil }
-            return (id, value)
+            return (id, value, Self.retainedBytes(of: value))
         }
         guard !responses.isEmpty else { return }
         bufferLock.lock()
-        responseCache.append(contentsOf: responses)
-        if responseCache.count > Self.responseCacheLimit {
-            responseCache.removeFirst(responseCache.count - Self.responseCacheLimit)
+        for response in responses {
+            if let existing = responseCache.firstIndex(where: { $0.id == response.id }) {
+                responseCacheBytes = max(0, responseCacheBytes - responseCache.remove(at: existing).bytes)
+            }
+            guard response.bytes <= Self.responseCacheByteLimit else { continue }
+            responseCache.append(response)
+            responseCacheBytes += response.bytes
+            while responseCache.count > Self.responseCacheLimit
+                    || responseCacheBytes > Self.responseCacheByteLimit {
+                responseCacheBytes = max(0, responseCacheBytes - responseCache.removeFirst().bytes)
+            }
         }
         bufferLock.unlock()
+    }
+
+    var responseCacheUsageForTesting: (count: Int, bytes: Int) {
+        bufferLock.withLock { (responseCache.count, responseCacheBytes) }
     }
 
     /// Waits for the next decoded line \u2014 response or event \u2014 up to `timeout`. `nil` means the
@@ -215,37 +249,76 @@ final class PiRPCSession: @unchecked Sendable {
     /// while waiting so a caller that later drains events for `agent_settled` still sees them.
     func receiveMatching(id: String, timeout: TimeInterval) async throws -> PiJSONValue {
         var deferred: [PiJSONValue] = []
-        defer { restoreBuffered(deferred) }
+        var deferredBytes = 0
         let deadline = Date().addingTimeInterval(timeout)
-        while true {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { throw RunnerError.timedOut(afterSeconds: timeout) }
-            guard let value = try await receiveNext(timeout: min(remaining, 5)) else { continue }
-            if value["type"]?.stringValue == "response", value["id"]?.stringValue == id { return value }
-            deferred.append(value)
+        do {
+            while true {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw RunnerError.timedOut(afterSeconds: timeout) }
+                guard let value = try await receiveNext(timeout: min(remaining, 5)) else { continue }
+                if value["type"]?.stringValue == "response", value["id"]?.stringValue == id {
+                    _ = takeCachedResponse(id: id)
+                    try restoreBuffered(deferred)
+                    return value
+                }
+                let bytes = Self.retainedBytes(of: value)
+                guard deferred.count < Self.bufferedValueLimit,
+                      bytes <= Self.bufferedByteLimit,
+                      deferredBytes <= Self.bufferedByteLimit - bytes else {
+                    throw RunnerError.ioFailure("Agent emitted too many events before its response.")
+                }
+                deferred.append(value)
+                deferredBytes += bytes
+            }
+        } catch {
+            try? restoreBuffered(deferred)
+            throw error
         }
     }
 
     /// Graceful SIGTERM with a short deadline before SIGKILL, matching the app's own
     /// `PiProcessReaper` \u2014 the runner must never leave a `pi` process behind.
-    func stop() {
-        guard process.isRunning else { return }
-        process.terminate()
-        let deadline = Date().addingTimeInterval(2)
-        while process.isRunning, Date() < deadline { usleep(40_000) }
-        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-        process.waitUntilExit()
+    @discardableResult
+    func stop() -> Bool {
+        let stopped = PiProcessReaper.terminateAndWait(process)
         try? inputHandle.close()
+        return stopped
     }
 
     private func popBuffered() -> PiJSONValue? {
         bufferLock.lock(); defer { bufferLock.unlock() }
-        return buffer.isEmpty ? nil : buffer.removeFirst()
+        guard !buffer.isEmpty else { return nil }
+        let value = buffer.removeFirst()
+        bufferedBytes = max(0, bufferedBytes - Self.retainedBytes(of: value))
+        return value
     }
 
-    private func restoreBuffered(_ values: [PiJSONValue]) {
+    private func restoreBuffered(_ values: [PiJSONValue]) throws {
         guard !values.isEmpty else { return }
-        bufferLock.lock(); buffer.insert(contentsOf: values, at: 0); bufferLock.unlock()
+        try appendBuffered(values, atFront: true)
+    }
+
+    private func appendBuffered(_ values: [PiJSONValue], atFront: Bool = false) throws {
+        guard !values.isEmpty else { return }
+        let bytes = values.reduce(into: 0) { total, value in
+            let size = Self.retainedBytes(of: value)
+            let (next, overflow) = total.addingReportingOverflow(size)
+            total = overflow ? Int.max : next
+        }
+        bufferLock.lock()
+        defer { bufferLock.unlock() }
+        guard values.count <= Self.bufferedValueLimit - buffer.count,
+              bytes <= Self.bufferedByteLimit,
+              bufferedBytes <= Self.bufferedByteLimit - bytes else {
+            throw RunnerError.ioFailure("Agent event buffer exceeded its memory budget.")
+        }
+        if atFront { buffer.insert(contentsOf: values, at: 0) }
+        else { buffer.append(contentsOf: values) }
+        bufferedBytes += bytes
+    }
+
+    private static func retainedBytes(of value: PiJSONValue) -> Int {
+        (try? PiDeskJSON.encoder.encode(value).count) ?? bufferedByteLimit
     }
 
     /// Must only run on `ioQueue`. One `read()` can surface multiple JSONL records; the rest are
@@ -253,16 +326,26 @@ final class PiRPCSession: @unchecked Sendable {
     private func blockingReadOneLine(timeout: TimeInterval) throws -> PiJSONValue? {
         let deadline = Date().addingTimeInterval(timeout)
         while true {
+            try throwIfWriteBroken()
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { return nil }
             switch BlockingPipeIO.read(fd: outputFD, maxBytes: 64 * 1_024, timeoutSeconds: remaining) {
             case let .data(chunk):
                 let records = framer.append(chunk)
+                if framer.takeOverflowedRecordCount() > 0 {
+                    throw RunnerError.ioFailure(
+                        "\(adapter.agent.displayName) emitted an oversized protocol record."
+                    )
+                }
                 guard !records.isEmpty else { continue }
                 // Translation happens here, so everything above this line — the run loop, the
                 // settlement bookkeeping, steering, dialogs — only ever sees the one vocabulary.
-                let values: [PiJSONValue] = adapterLock.withLock {
-                    records.flatMap { record in
+                // Hold the outbound write lock across decode, writeback drain, and writeback. A
+                // concurrent HTTP delivery cannot overtake a handshake acknowledgement or a
+                // command that this inbound record just unblocked.
+                writeLock.lock()
+                let transaction: (values: [PiJSONValue], writes: [Data]) = adapterLock.withLock {
+                    let values = records.flatMap { record in
                         adapter.decode(line: record).map { message in
                             switch message {
                             case let .response(_, value): value
@@ -270,21 +353,21 @@ final class PiRPCSession: @unchecked Sendable {
                             }
                         }
                     }
+                    let writes = (adapter as? AdapterWriteback)?.drainPendingWrites() ?? []
+                    return (values, writes)
                 }
-                // An adapter may owe the agent a reply as a consequence of decoding (a protocol
-                // acknowledgement, a queued command unblocked by a completed handshake).
-                if let writeback = adapter as? AdapterWriteback {
-                    let pending = adapterLock.withLock { writeback.drainPendingWrites() }
-                    if !pending.isEmpty {
-                        writeLock.lock()
-                        for line in pending { try? writeRawLocked(line) }
-                        writeLock.unlock()
-                    }
+                do {
+                    for line in transaction.writes { try writeRawLocked(line) }
+                    writeLock.unlock()
+                } catch {
+                    writeLock.unlock()
+                    throw error
                 }
+                let values = transaction.values
                 cacheResponses(values)
                 guard let first = values.first else { continue }
                 if values.count > 1 {
-                    bufferLock.lock(); buffer.append(contentsOf: values.dropFirst()); bufferLock.unlock()
+                    try appendBuffered(Array(values.dropFirst()))
                 }
                 return first
             case .timeout:
@@ -294,6 +377,11 @@ final class PiRPCSession: @unchecked Sendable {
                 throw RunnerError.processExited(drainStderrTail())
             }
         }
+    }
+
+    private func throwIfWriteBroken() throws {
+        let failure = writeLock.withLock { writeBroken }
+        if let failure { throw RunnerError.ioFailure(failure) }
     }
 
     private func watchStderr() {

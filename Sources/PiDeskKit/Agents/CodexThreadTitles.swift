@@ -26,7 +26,14 @@ public final class CodexThreadTitles: @unchecked Sendable {
     private let directory: URL
     private let lock = NSLock()
     private var cached: [String: String] = [:]
-    private var loadedFrom: (path: String, modified: Date, size: Int64)?
+    private struct DatabaseFingerprint: Equatable {
+        let path: String
+        let modified: Date
+        let size: Int64
+        let walModified: Date
+        let walSize: Int64
+    }
+    private var loadedFrom: DatabaseFingerprint?
     private var lastAttempt: Date?
     /// A failed read is not retried on every sidebar refresh; a database being written to is a
     /// normal transient state, not something to hammer.
@@ -42,6 +49,9 @@ public final class CodexThreadTitles: @unchecked Sendable {
         guard !threadID.isEmpty else { return nil }
         return refreshedTitles()[threadID]
     }
+
+    /// One current title map for a whole catalog pass. Callers should reuse it across rows.
+    public func snapshot() -> [String: String] { refreshedTitles() }
 
     /// The thread id Codex uses, taken from its rollout filename
     /// (`rollout-<ISO8601>-<threadId>.jsonl`). The timestamp itself contains dashes, so the id
@@ -68,8 +78,7 @@ public final class CodexThreadTitles: @unchecked Sendable {
         }
         // Re-read only when the file actually changed. Codex writes constantly, so this is an
         // mtime/size check rather than a query per sidebar refresh.
-        if let loadedFrom, loadedFrom.path == database.path,
-           loadedFrom.modified == database.modified, loadedFrom.size == database.size {
+        if loadedFrom == database {
             return cached
         }
         if let lastAttempt, Date().timeIntervalSince(lastAttempt) < Self.retryInterval, cached.isEmpty {
@@ -83,7 +92,7 @@ public final class CodexThreadTitles: @unchecked Sendable {
         return cached
     }
 
-    private func newestDatabase() -> (path: String, modified: Date, size: Int64)? {
+    private func newestDatabase() -> DatabaseFingerprint? {
         let manager = FileManager.default
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
         guard let entries = try? manager.contentsOfDirectory(
@@ -106,10 +115,14 @@ public final class CodexThreadTitles: @unchecked Sendable {
         }) else { return nil }
 
         let values = try? newest.resourceValues(forKeys: Set(keys))
-        return (
-            newest.path,
-            values?.contentModificationDate ?? .distantPast,
-            Int64(values?.fileSize ?? 0)
+        let wal = URL(fileURLWithPath: newest.path + "-wal")
+        let walValues = try? wal.resourceValues(forKeys: Set(keys))
+        return DatabaseFingerprint(
+            path: newest.path,
+            modified: values?.contentModificationDate ?? .distantPast,
+            size: Int64(values?.fileSize ?? 0),
+            walModified: walValues?.contentModificationDate ?? .distantPast,
+            walSize: Int64(walValues?.fileSize ?? 0)
         )
     }
 

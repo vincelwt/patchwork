@@ -141,6 +141,9 @@ private struct GitSection: View {
     private var visibleFiles: [GitFileChange] {
         showAllFiles ? boundedFiles : Array(boundedFiles.prefix(PiTheme.gitFilePreviewCount))
     }
+    private var changedFilesTitle: String {
+        "\(snapshot.files.count)\(snapshot.filesTruncated ? "+" : "") changed files"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: PiTheme.space6) {
@@ -179,7 +182,7 @@ private struct GitSection: View {
             }
 
             if snapshot.isDirty {
-                DisclosureButton(title: expanded ? "Hide files" : "\(snapshot.files.count) changed files", expanded: expanded) {
+                DisclosureButton(title: expanded ? "Hide files" : changedFilesTitle, expanded: expanded) {
                     expanded.toggle()
                 }
                 if expanded {
@@ -191,8 +194,8 @@ private struct GitSection: View {
                     } else if showAllFiles, boundedFiles.count > PiTheme.gitFilePreviewCount {
                         MoreButton(title: "Show less") { showAllFiles = false }
                     }
-                    if snapshot.files.count > boundedFiles.count {
-                        Text("\(snapshot.files.count - boundedFiles.count) more files not listed")
+                    if snapshot.filesTruncated || snapshot.files.count > boundedFiles.count {
+                        Text("Additional changed files are not listed")
                             .font(PiFont.micro).foregroundStyle(.tertiary)
                     }
                 }

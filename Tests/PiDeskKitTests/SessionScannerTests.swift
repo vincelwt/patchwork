@@ -100,6 +100,60 @@ final class SessionScannerTests: XCTestCase {
         XCTAssertEqual(found.first?.agent, .claude)
     }
 
+    func testSupplementalPiFileOutsideRootsIsDiscoveredWithoutScanningItsSiblings() {
+        let root = tempDirectory.appendingPathComponent("pi", isDirectory: true)
+        let owned = touch("custom/owned.jsonl")
+        _ = touch("custom/unowned.jsonl")
+
+        let catalog = SessionScanner.discoverCatalog(
+            roots: [(.pi, root)], supplementalPaths: [owned.path]
+        )
+
+        XCTAssertEqual(catalog.sessions, [.init(agent: .pi, url: owned)])
+        XCTAssertTrue(catalog.directories.contains(owned.deletingLastPathComponent()))
+    }
+
+    func testSupplementalPathAlreadyFoundByARootIsNotDuplicated() {
+        let root = tempDirectory.appendingPathComponent("pi", isDirectory: true)
+        let owned = touch("pi/project/owned.jsonl")
+
+        let catalog = SessionScanner.discoverCatalog(
+            roots: [(.pi, root)], supplementalPaths: [owned.path]
+        )
+
+        XCTAssertEqual(catalog.sessions.count, 1)
+        XCTAssertEqual(catalog.sessions.first?.url, owned)
+    }
+
+    func testSupplementalPathsRejectMissingDirectoriesAndNonJSONLFiles() throws {
+        let root = tempDirectory.appendingPathComponent("pi", isDirectory: true)
+        let directory = tempDirectory.appendingPathComponent("custom/folder.jsonl", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let text = touch("custom/not-jsonl.txt")
+        let missing = tempDirectory.appendingPathComponent("custom/missing.jsonl")
+
+        let catalog = SessionScanner.discoverCatalog(
+            roots: [(.pi, root)],
+            supplementalPaths: [directory.path, text.path, missing.path]
+        )
+
+        XCTAssertTrue(catalog.sessions.isEmpty)
+        XCTAssertTrue(catalog.directories.contains(missing.deletingLastPathComponent()))
+    }
+
+    func testSupplementalPathInsideAKnownRootKeepsThatAgent() {
+        let piRoot = tempDirectory.appendingPathComponent("pi", isDirectory: true)
+        let codexRoot = tempDirectory.appendingPathComponent("codex", isDirectory: true)
+        let owned = touch("codex/custom-name.jsonl")
+
+        let catalog = SessionScanner.discoverCatalog(
+            roots: [(.pi, piRoot), (.codex, codexRoot)],
+            supplementalPaths: [owned.path]
+        )
+
+        XCTAssertEqual(catalog.sessions, [.init(agent: .codex, url: owned)])
+    }
+
     // MARK: - Pi's original entry point
 
     func testDefaultRootHonoursTheLegacyPiOverrideVariable() {

@@ -169,14 +169,50 @@ export function isFlatList(groups) {
   return groups.length <= 1 && groups.every((group) => group.kind === "project" && group.children.length === 0);
 }
 
+/** Durable identity for one physical transcript. Public agent ids can collide after a copy. */
+export function threadIdentity(thread) {
+  if (typeof thread?.path === "string" && thread.path) return thread.path;
+  return typeof thread?.id === "string" && thread.id ? thread.id : "";
+}
+
+/** Resolves a route/action reference without guessing when a public id is duplicated. */
+export function findThreadByReference(threads, reference) {
+  const list = Array.isArray(threads) ? threads : [];
+  const byPath = list.find((thread) => thread?.path === reference);
+  if (byPath) return byPath;
+  const byID = list.filter((thread) => thread?.id === reference);
+  return byID.length === 1 ? byID[0] : null;
+}
+
 /**
  * Applies one updated thread to the list currently on screen. The Threads tab shows Active or
  * Archived, never both, so a thread whose `archived` flag no longer matches the visible list
  * leaves it instead of being merged back in; otherwise archiving would appear to do nothing.
  */
 export function applyThreadUpdate(threads, thread, showArchived) {
-  if (!thread?.id) return threads;
-  if (!!thread.archived !== !!showArchived) return threads.filter((entry) => entry.id !== thread.id);
-  const index = threads.findIndex((entry) => entry.id === thread.id);
-  return index === -1 ? [thread, ...threads] : threads.map((entry, i) => (i === index ? { ...entry, ...thread } : entry));
+  const list = Array.isArray(threads) ? threads : [];
+  if (!threadIdentity(thread)) return threads;
+  const index = thread.path
+    ? list.findIndex((entry) => entry?.path === thread.path)
+    : (() => {
+        const matches = list.flatMap((entry, offset) => (entry?.id === thread.id ? [offset] : []));
+        return matches.length === 1 ? matches[0] : -1;
+      })();
+  if (!!thread.archived !== !!showArchived) {
+    return index === -1 ? threads : list.filter((_, offset) => offset !== index);
+  }
+  // A sparse point event with a duplicated public id cannot safely name either copy. Full daemon
+  // thread events always carry a path, so preserve the current list until one arrives.
+  if (index === -1 && !thread.path && list.some((entry) => entry?.id === thread.id)) return threads;
+  if (index === -1) return [thread, ...threads];
+  const existing = list[index];
+  // Run frames own live state for an existing row. A metadata point event can have been built
+  // just before a newer run transition and must not rewind the pulse.
+  const merged = {
+    ...existing,
+    ...thread,
+    running: typeof existing.running === "boolean" ? existing.running : thread.running
+  };
+  if (Object.keys(merged).every((key) => existing?.[key] === merged[key])) return threads;
+  return threads.map((entry, i) => (i === index ? merged : entry));
 }

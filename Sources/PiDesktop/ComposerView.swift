@@ -234,8 +234,9 @@ struct ComposerView: View {
         case .direct:
             direct()
         case let .queue(delivery):
-            store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments)
-            model.content = .empty
+            if store.enqueueOutbox(text: text, delivery: delivery, attachments: attachments) {
+                model.content = .empty
+            }
         }
     }
 }

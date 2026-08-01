@@ -51,8 +51,16 @@ enum HTTPWireFormat {
         }
 
         let bodyBytes = raw[boundary.upperBound...]
-        if let declared = headers["content-length"], let length = Int(declared), length <= bodyBytes.count {
-            return RawHTTPResponse(status: status, headers: headers, body: Data(bodyBytes.prefix(length)))
+        if let declared = headers["content-length"] {
+            guard let length = Int(declared), length >= 0 else {
+                throw PiDeskClientError.invalidResponse("response had an invalid Content-Length")
+            }
+            guard bodyBytes.count == length else {
+                throw PiDeskClientError.invalidResponse(
+                    "response contained \(bodyBytes.count) bytes but declared \(length)"
+                )
+            }
+            return RawHTTPResponse(status: status, headers: headers, body: Data(bodyBytes))
         }
         return RawHTTPResponse(status: status, headers: headers, body: Data(bodyBytes))
     }

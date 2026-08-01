@@ -22,16 +22,28 @@ final class HTTPServer: @unchecked Sendable {
     private let maxBodyBytes: Int
     private let idleTimeout: TimeInterval = 90
     private let connectionQueue = DispatchQueue(label: "dev.pi.desktop.daemon.http", attributes: .concurrent)
+    private let admission: HTTPConnectionAdmission
 
     private var listeners: [POSIXListener] = []
     private let listenersLock = NSLock()
     private let acceptThreads = ThreadGroup()
 
-    init(router: DaemonRouter, logger: DaemonLogger, bus: EventBus, maxBodyBytes: Int = 8 * 1_024 * 1_024, tokenProvider: @escaping @Sendable () -> String?) {
+    init(
+        router: DaemonRouter,
+        logger: DaemonLogger,
+        bus: EventBus,
+        maxBodyBytes: Int = 8 * 1_024 * 1_024,
+        maxConnections: Int = 64,
+        maxSSEConnections: Int = 16,
+        tokenProvider: @escaping @Sendable () -> String?
+    ) {
         self.router = router
         self.logger = logger
         self.bus = bus
         self.maxBodyBytes = maxBodyBytes
+        admission = HTTPConnectionAdmission(
+            maxConnections: maxConnections, maxSSEConnections: maxSSEConnections
+        )
         self.tokenProvider = tokenProvider
     }
 
@@ -70,7 +82,15 @@ final class HTTPServer: @unchecked Sendable {
     private func runAcceptLoop(_ listener: POSIXListener) {
         acceptThreads.run { [weak self] in
             listener.acceptLoop { client in
-                self?.connectionQueue.async { self?.handle(fd: client, origin: listener.origin) }
+                guard let self else { Darwin.close(client); return }
+                guard self.admission.acquireConnection() else {
+                    Darwin.close(client)
+                    return
+                }
+                self.connectionQueue.async {
+                    defer { self.admission.releaseConnection() }
+                    self.handle(fd: client, origin: listener.origin)
+                }
             }
         }
     }
@@ -107,6 +127,18 @@ final class HTTPServer: @unchecked Sendable {
             }
 
             if request.method == "GET", request.path == "/v1/events" {
+                guard admission.acquireSSE() else {
+                    writeResponse(
+                        fd: fd,
+                        .error(
+                            503, code: "event_streams_busy",
+                            message: "Too many event streams are connected."
+                        ),
+                        keepAlive: false
+                    )
+                    return
+                }
+                defer { admission.releaseSSE() }
                 writeSSEHead(fd: fd)
                 streamEvents(fd: fd)
                 return
@@ -273,16 +305,43 @@ final class HTTPServer: @unchecked Sendable {
         // instead proven by the periodic keep-alive write below failing once the peer is gone.
         RawSocket.setTimeouts(fd: fd, timeout: 0)
         let writeLock = NSLock()
+        let stateLock = NSLock()
+        let wake = DispatchSemaphore(value: 0)
         var alive = true
 
-        func send(_ data: Data) {
-            writeLock.lock()
-            defer { writeLock.unlock() }
-            guard alive else { return }
-            if (try? RawSocket.writeAll(fd: fd, data: data)) == nil { alive = false }
+        func markDead() -> Bool {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            let wasAlive = alive
+            alive = false
+            return wasAlive
         }
 
-        let subscriptionID = bus.subscribe { name, payload in
+        func isAlive() -> Bool {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return alive
+        }
+
+        func send(_ data: Data) {
+            guard isAlive() else { return }
+            writeLock.lock()
+            defer { writeLock.unlock() }
+            guard isAlive() else { return }
+            if (try? RawSocket.writeAll(fd: fd, data: data)) == nil {
+                _ = markDead()
+                wake.signal()
+            }
+        }
+
+        let subscriptionID = bus.subscribe(
+            initialName: "ready",
+            initialPayload: Data("{}".utf8),
+            onOverflow: {
+                if markDead() { Darwin.shutdown(fd, SHUT_RDWR) }
+                wake.signal()
+            }
+        ) { name, payload in
             var frame = Data("event: \(name)\ndata: ".utf8)
             frame.append(payload)
             frame.append(Data("\n\n".utf8))
@@ -291,16 +350,10 @@ final class HTTPServer: @unchecked Sendable {
         defer { bus.unsubscribe(subscriptionID) }
 
         while true {
-            Thread.sleep(forTimeInterval: 20)
-            writeLock.lock()
-            let stillAlive = alive
-            writeLock.unlock()
-            guard stillAlive else { return }
+            if wake.wait(timeout: .now() + 20) == .success { return }
+            guard isAlive() else { return }
             send(Data(": keep-alive\n\n".utf8))
-            writeLock.lock()
-            let afterSend = alive
-            writeLock.unlock()
-            if !afterSend { return }
+            if !isAlive() { return }
         }
     }
 
@@ -315,6 +368,50 @@ final class HTTPServer: @unchecked Sendable {
         }
         semaphore.wait()
         return box.value ?? .error(500, code: "internal_error", message: "Handler produced no response.")
+    }
+}
+
+/// A hard admission ceiling keeps idle sockets and long-lived event streams from creating an
+/// unbounded blocking-worker pool. The accept loop uses the total limit; authorized SSE routes
+/// additionally reserve the smaller streaming budget.
+final class HTTPConnectionAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maxConnections: Int
+    private let maxSSEConnections: Int
+    private var connections = 0
+    private var sseConnections = 0
+
+    init(maxConnections: Int, maxSSEConnections: Int) {
+        self.maxConnections = max(1, maxConnections)
+        self.maxSSEConnections = max(0, min(maxSSEConnections, self.maxConnections))
+    }
+
+    func acquireConnection() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard connections < maxConnections else { return false }
+        connections += 1
+        return true
+    }
+
+    func releaseConnection() {
+        lock.lock()
+        connections = max(0, connections - 1)
+        lock.unlock()
+    }
+
+    func acquireSSE() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard sseConnections < maxSSEConnections else { return false }
+        sseConnections += 1
+        return true
+    }
+
+    func releaseSSE() {
+        lock.lock()
+        sseConnections = max(0, sseConnections - 1)
+        lock.unlock()
     }
 }
 

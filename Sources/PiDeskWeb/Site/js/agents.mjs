@@ -22,3 +22,12 @@ export function agentLabel(agent) {
 export function shouldShowAgentBadge(agent) {
   return Boolean(agent) && agent !== "pi";
 }
+
+/** Mutation capabilities that differ on the remote surface today. Unknown agents fail closed. */
+export function canRenameSession(agent) {
+  return agent === "pi" || agent === "codex" || agent === "claude" || !agent;
+}
+
+export function canChangeThinking(agent) {
+  return agent === "pi" || agent === "codex" || !agent;
+}

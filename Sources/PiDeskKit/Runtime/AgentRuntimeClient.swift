@@ -22,6 +22,8 @@ public enum AgentRuntimeError: LocalizedError {
     case notInstalled(AgentKind)
     case notRunning
     case invalidCommand
+    /// Local admission failed before any bytes were offered to the agent.
+    case overloaded(String)
     /// The agent cannot do this at all, and said so without a round trip.
     case unsupported(AgentKind, String)
     /// The agent did not answer a side-effect-free query in time; safe to treat as a failure.
@@ -43,6 +45,8 @@ public enum AgentRuntimeError: LocalizedError {
             "The agent is not running."
         case .invalidCommand:
             "Could not encode a runtime command."
+        case let .overloaded(message):
+            message
         case let .unsupported(agent, what):
             "\(agent.displayName) does not support \(what)."
         case let .timedOut(command, seconds):
@@ -60,17 +64,35 @@ public enum AgentRuntimeError: LocalizedError {
 /// The transport is agent-agnostic: spawning, pipe reads, request correlation, timeouts,
 /// generation fencing, and reaping are identical for Pi, Codex, and Claude Code. Everything
 /// that differs lives behind `AgentProtocolAdapter`.
-public final class AgentRuntimeClient: AgentRuntimeProtocol {
+public final class AgentRuntimeClient: AgentRuntimeProtocol, @unchecked Sendable {
+    private struct RuntimeExitTarget {
+        let handler: ((String?) -> Void)?
+    }
+
     private let callbackLock = NSLock()
     private var eventHandler: ((PiJSONValue) -> Void)?
     private var exitHandler: ((String?) -> Void)?
+    private var eventHandlerRevision = 0
+    private var terminationObservationHook: (() -> Void)?
     public var onEvent: ((PiJSONValue) -> Void)? {
         get { callbackLock.withLock { eventHandler } }
-        set { callbackLock.withLock { eventHandler = newValue } }
+        set {
+            callbackLock.withLock {
+                eventHandlerRevision &+= 1
+                eventHandler = newValue
+            }
+        }
     }
     public var onExit: ((String?) -> Void)? {
         get { callbackLock.withLock { exitHandler } }
         set { callbackLock.withLock { exitHandler = newValue } }
+    }
+
+    /// A deterministic test seam for the instant an exit has captured its owner but has not yet
+    /// entered the serialized state queue. Production never assigns this closure.
+    var terminationObservationHookForTesting: (() -> Void)? {
+        get { callbackLock.withLock { terminationObservationHook } }
+        set { callbackLock.withLock { terminationObservationHook = newValue } }
     }
 
     private let ioQueue = DispatchQueue(label: "dev.pi.desktop.rpc", qos: .userInitiated)
@@ -78,12 +100,16 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
     /// handlers, these do not depend on a GUI app run loop and consume no CPU while idle.
     private let outputQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stdout", qos: .userInitiated, attributes: .concurrent)
     private let errorQueue = DispatchQueue(label: "dev.pi.desktop.rpc.stderr", qos: .utility, attributes: .concurrent)
+    private let runningLock = NSLock()
+    private var runningGeneration: RuntimeGeneration?
     private var process: Process?
     private var inputHandle: FileHandle?
+    private var inputWriter: RuntimeInputWriter?
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
     private var framer = JSONLFramer()
     private let pending = RPCPendingRegistry()
+    private let eventMailbox = RuntimeEventMailbox()
     private var requestCounter = 0
     private var stderr = ""
     private var generationSequence = 0
@@ -117,7 +143,19 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
     }
 
     public var isRunning: Bool {
-        ioQueue.sync { process?.isRunning == true }
+        runningLock.withLock { runningGeneration?.isValid == true }
+    }
+
+    var pendingRequestCount: Int { ioQueue.sync { pending.count } }
+
+    private func setRunningGeneration(_ generation: RuntimeGeneration?) {
+        runningLock.withLock { runningGeneration = generation }
+    }
+
+    private func clearRunningGeneration(_ retired: RuntimeGeneration) {
+        runningLock.withLock {
+            if runningGeneration === retired { runningGeneration = nil }
+        }
     }
 
     public func start(cwd: URL, sessionPath: URL? = nil) throws {
@@ -132,6 +170,19 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
         try ioQueue.sync {
             if process?.isRunning == true { return }
 
+            // A very short-lived process can be dead before its termination callback reaches
+            // this serial queue. Retire that generation before replacing its handles, so every
+            // callback completes now instead of waiting for its normal timeout.
+            if process != nil {
+                let retiredGeneration = generation
+                retiredGeneration.invalidate()
+                clearRunningGeneration(retiredGeneration)
+                rejectPending(processExitMessage: "\(adapter.agent.displayName) exited before it was restarted.")
+                adapter.reset()
+                cleanupHandles()
+                self.process = nil
+            }
+
             let process = Process()
             let input = Pipe()
             let output = Pipe()
@@ -143,6 +194,7 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
             requestCounter = 0
             stderr = ""
             framer = JSONLFramer()
+            eventMailbox.reset()
             adapter.reset()
 
             process.executableURL = executableURL
@@ -161,9 +213,14 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
             outputHandle = output.fileHandleForReading
             errorHandle = error.fileHandleForReading
             self.process = process
+            let writer = try RuntimeInputWriter(handle: input.fileHandleForWriting, generation: currentGeneration)
+            inputWriter = writer
 
             process.terminationHandler = { [weak self] process in
-                self?.ioQueue.async {
+                guard let self else { return }
+                let exitTarget = self.currentExitTarget()
+                self.currentTerminationObservationHook()?()
+                self.ioQueue.async { [weak self] in
                     guard let self, self.generation === currentGeneration, currentGeneration.isValid else { return }
                     let detail = self.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                     let name = self.adapter.agent.displayName
@@ -171,38 +228,57 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
                         ? nil
                         : "\(name) exited with status \(process.terminationStatus).\(detail.isEmpty ? "" : " \(detail)")"
                     currentGeneration.invalidate()
+                    self.clearRunningGeneration(currentGeneration)
                     self.rejectPending(processExitMessage: message ?? "\(name) exited.")
+                    self.eventMailbox.reset()
                     self.cleanupHandles()
                     self.process = nil
-                    DispatchQueue.main.async { [weak self] in self?.onExit?(message) }
+                    DispatchQueue.main.async { exitTarget.handler?(message) }
                 }
             }
 
-            try process.run()
+            do {
+                try process.run()
+            } catch {
+                currentGeneration.invalidate()
+                clearRunningGeneration(currentGeneration)
+                inputWriter = nil
+                cleanupHandles()
+                self.process = nil
+                throw error
+            }
+            setRunningGeneration(currentGeneration)
             startOutputReader(output.fileHandleForReading, generation: currentGeneration)
             startErrorReader(error.fileHandleForReading, generation: currentGeneration)
 
             // The handshake has to be on the wire before any user command, and the adapter is
             // the only thing that knows whether this agent needs one.
-            for line in adapter.startupLines(sessionPath: sessionPath, cwd: cwd) {
-                try? inputHandle?.write(contentsOf: line)
-            }
+            enqueueInput(
+                adapter.startupLines(sessionPath: sessionPath, cwd: cwd),
+                writer: writer,
+                generation: currentGeneration
+            )
         }
     }
 
     public func stop() {
+        setRunningGeneration(nil)
         ioQueue.async { [weak self] in
             guard let self else { return }
+            let retiredGeneration = generation
             generation.invalidate()
             generationSequence += 1
             generation = RuntimeGeneration(sequence: generationSequence)
+            clearRunningGeneration(retiredGeneration)
             rejectPending(processExitMessage: "\(adapter.agent.displayName) was stopped.")
+            eventMailbox.reset()
             adapter.reset()
             // Keep retired read descriptors alive until their process closes them. Closing and
             // immediately spawning can reuse the same descriptor, letting the old blocking read
             // consume the replacement runtime's first response.
             try? inputHandle?.close()
             inputHandle = nil
+            inputWriter = nil
             let retiredOutput = outputHandle
             let retiredError = errorHandle
             outputHandle = nil
@@ -230,8 +306,16 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
         completion: ((Result<PiJSONValue, Error>) -> Void)? = nil
     ) {
         ioQueue.async { [weak self] in
-            guard let self, let inputHandle, process?.isRunning == true else {
+            guard let self, let writer = inputWriter, process?.isRunning == true else {
                 DispatchQueue.main.async { completion?(.failure(AgentRuntimeError.notRunning)) }
+                return
+            }
+
+            if completion != nil, !pending.hasCapacity {
+                let error = AgentRuntimeError.overloaded(
+                    "Too many agent requests are already waiting. Wait for them to finish and try again."
+                )
+                DispatchQueue.main.async { completion?(.failure(error)) }
                 return
             }
 
@@ -242,9 +326,27 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
             switch adapter.encode(command: type, id: id, payload: payload) {
             case let .immediate(value):
                 // Answered from the adapter's own state; nothing reaches the process.
-                DispatchQueue.main.async {
-                    guard currentGeneration.isValid else { return }
-                    completion?(.success(AdapterEncoding.response(id: id, data: value)))
+                if let completion {
+                    RuntimeCompletionDelivery.enqueue(
+                        .success(AdapterEncoding.response(id: id, data: value)),
+                        command: type, generation: currentGeneration, agent: adapter.agent,
+                        callback: completion
+                    )
+                }
+                return
+            case let .immediateWithEvents(value, events):
+                if let completion {
+                    RuntimeCompletionDelivery.enqueue(
+                        .success(AdapterEncoding.response(id: id, data: value)),
+                        command: type, generation: currentGeneration, agent: adapter.agent,
+                        events: events, eventHandler: onEvent, callback: completion
+                    )
+                } else {
+                    let eventHandler = onEvent
+                    DispatchQueue.main.async {
+                        guard currentGeneration.isValid else { return }
+                        for event in events { eventHandler?(event) }
+                    }
                 }
                 return
             case let .unsupported(what):
@@ -262,15 +364,17 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
                     DispatchQueue.main.async { completion?(.failure(AgentRuntimeError.invalidCommand)) }
                     return
                 }
+                guard enqueueInput(lines, writer: writer, generation: currentGeneration) else {
+                    adapter.rollbackRejectedEncoding(command: type, id: id, payload: payload)
+                    let error = AgentRuntimeError.overloaded(
+                        "The agent input queue is full. Wait for the current requests to finish and try again."
+                    )
+                    if let completion { DispatchQueue.main.async { completion(.failure(error)) } }
+                    else { handleInputFailure(error, generation: currentGeneration) }
+                    return
+                }
                 if let completion {
                     pending.register(id: id, command: type, generation: currentGeneration, callback: completion)
-                }
-                do {
-                    for line in lines { try inputHandle.write(contentsOf: line) }
-                } catch {
-                    let callback = pending.remove(id: id) ?? completion
-                    DispatchQueue.main.async { callback?(.failure(error)) }
-                    return
                 }
             }
 
@@ -279,34 +383,59 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
             ioQueue.asyncAfter(deadline: .now() + RPCTimeoutPolicy.delay(for: type)) { [weak self] in
                 guard let self,
                       let callback = pending.takeForTimeout(id: id, generation: currentGeneration) else { return }
-                DispatchQueue.main.async {
-                    guard currentGeneration.isValid else { return }
-                    callback(.failure(timeoutError))
-                }
+                RuntimeCompletionDelivery.enqueue(
+                    .failure(timeoutError), command: type, generation: currentGeneration,
+                    agent: adapter.agent, callback: callback
+                )
             }
         }
     }
 
     public func sendUncorrelated(_ value: PiJSONValue) {
         ioQueue.async { [weak self] in
-            guard let self, let input = inputHandle, process?.isRunning == true else { return }
-            for line in adapter.encodeUncorrelated(value) {
-                try? input.write(contentsOf: line)
+            guard let self, let writer = inputWriter, process?.isRunning == true else { return }
+            let currentGeneration = generation
+            let lines = adapter.encodeUncorrelated(value)
+            // An adapter may intentionally collect several dialog answers before it can emit
+            // one native response. A stale answer is likewise safe to ignore.
+            guard !lines.isEmpty else { return }
+            guard enqueueInput(lines, writer: writer, generation: currentGeneration) else {
+                handleInputFailure(RuntimeInputWriterError.backpressured, generation: currentGeneration)
+                return
             }
         }
     }
 
     private func startOutputReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
+        let pendingChunkSlots = DispatchSemaphore(value: 8)
         outputQueue.async { [weak self] in
             defer { try? handle.close() }
             while currentGeneration.isValid {
                 guard let data = Self.blockingRead(from: handle.fileDescriptor, maximumBytes: 64 * 1024) else { return }
-                let eventHandler = self?.onEvent
+                while currentGeneration.isValid,
+                      pendingChunkSlots.wait(timeout: .now() + 0.1) == .timedOut {}
+                guard currentGeneration.isValid else { return }
+                let eventTarget = self?.currentEventTarget()
                 self?.ioQueue.async { [weak self] in
-                    self?.consume(data, generation: currentGeneration, eventHandler: eventHandler)
+                    defer { pendingChunkSlots.signal() }
+                    self?.consume(data, generation: currentGeneration, eventTarget: eventTarget)
                 }
             }
         }
+    }
+
+    private func currentEventTarget() -> RuntimeEventTarget {
+        callbackLock.withLock {
+            RuntimeEventTarget(revision: eventHandlerRevision, handler: eventHandler)
+        }
+    }
+
+    private func currentExitTarget() -> RuntimeExitTarget {
+        callbackLock.withLock { RuntimeExitTarget(handler: exitHandler) }
+    }
+
+    private func currentTerminationObservationHook() -> (() -> Void)? {
+        callbackLock.withLock { terminationObservationHook }
     }
 
     private func startErrorReader(_ handle: FileHandle, generation currentGeneration: RuntimeGeneration) {
@@ -344,37 +473,134 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
     private func consume(
         _ data: Data,
         generation currentGeneration: RuntimeGeneration,
-        eventHandler: ((PiJSONValue) -> Void)?
+        eventTarget: RuntimeEventTarget?
     ) {
         // A retired generation's buffered output is dropped rather than published.
         guard currentGeneration.isValid, generation === currentGeneration else { return }
-        for record in framer.append(data) {
+        let records = framer.append(data)
+        if framer.takeOverflowedRecordCount() > 0 {
+            retireRuntime(
+                message: "\(adapter.agent.displayName) output contained an oversized protocol record.",
+                generation: currentGeneration
+            )
+            return
+        }
+        for record in records {
             // An adapter may need to write back while decoding (protocol acknowledgements,
             // deferred commands unblocked by a handshake completing).
-            for message in adapter.decode(line: record) {
+            let messages = adapter.decode(line: record)
+            let eventCount = messages.reduce(into: 0) { count, message in
+                if case .event = message { count += 1 }
+            }
+            let sourceBytesPerEvent = eventCount > 0 ? record.count / eventCount : 0
+            var remainingSourceBytes = eventCount > 0 ? record.count % eventCount : 0
+            for message in messages {
                 switch message {
                 case let .response(id, value):
                     // An unmatched or superseded response is dropped, never re-published as an event.
-                    guard let callback = pending.takeForDelivery(id: id, currentGeneration: currentGeneration)
+                    guard let delivery = pending.takeForDelivery(id: id, currentGeneration: currentGeneration)
                     else { continue }
-                    DispatchQueue.main.async {
-                        // Re-checked on main: a stop between queueing and execution must not publish.
-                        guard currentGeneration.isValid else { return }
-                        callback(.success(value))
-                    }
+                    RuntimeCompletionDelivery.enqueue(
+                        .success(value), command: delivery.command,
+                        generation: currentGeneration, agent: adapter.agent, callback: delivery.callback
+                    )
                 case let .event(value):
+                    // One protocol record can expand into many semantic events. Attribute the
+                    // record bytes across those events once, rather than charging its full size
+                    // to each event and falsely tripping mailbox backpressure.
+                    let sourceBytes = sourceBytesPerEvent + (remainingSourceBytes > 0 ? 1 : 0)
+                    remainingSourceBytes = max(0, remainingSourceBytes - 1)
                     // The reader captured the owner with this byte chunk. Rebinding during a
                     // same-process session transition cannot redirect buffered bytes to the new route.
-                    DispatchQueue.main.async {
-                        guard currentGeneration.isValid else { return }
-                        eventHandler?(value)
+                    if let eventTarget,
+                       !eventMailbox.enqueue(
+                           value,
+                           sourceBytes: sourceBytes,
+                           generation: currentGeneration,
+                           target: eventTarget
+                       ) {
+                        retireRuntime(
+                            message: "\(adapter.agent.displayName) produced events faster than the app could present them.",
+                            generation: currentGeneration
+                        )
+                        return
                     }
                 }
             }
             if let outbound = (adapter as? AdapterWriteback)?.drainPendingWrites(), !outbound.isEmpty {
-                for line in outbound { try? inputHandle?.write(contentsOf: line) }
+                guard let writer = inputWriter else { continue }
+                guard enqueueInput(outbound, writer: writer, generation: currentGeneration) else {
+                    handleInputFailure(RuntimeInputWriterError.backpressured, generation: currentGeneration)
+                    return
+                }
             }
         }
+    }
+
+    @discardableResult
+    private func enqueueInput(
+        _ lines: [Data],
+        writer: RuntimeInputWriter,
+        generation currentGeneration: RuntimeGeneration
+    ) -> Bool {
+        guard !lines.isEmpty else { return true }
+        return writer.enqueue(lines) { [weak self] result in
+            guard case let .failure(error) = result else { return }
+            guard let self else { return }
+            let exitTarget = self.currentExitTarget()
+            self.ioQueue.async { [weak self] in
+                self?.handleInputFailure(
+                    error, generation: currentGeneration, exitTarget: exitTarget
+                )
+            }
+        }
+    }
+
+    private func handleInputFailure(
+        _ error: Error,
+        generation currentGeneration: RuntimeGeneration,
+        exitTarget: RuntimeExitTarget? = nil
+    ) {
+        guard generation === currentGeneration, currentGeneration.isValid else { return }
+        let name = adapter.agent.displayName
+        retireRuntime(
+            message: "\(name) input failed. \(error.localizedDescription)",
+            generation: currentGeneration,
+            exitTarget: exitTarget
+        )
+    }
+
+    private func retireRuntime(
+        message: String,
+        generation currentGeneration: RuntimeGeneration,
+        exitTarget capturedExitTarget: RuntimeExitTarget? = nil
+    ) {
+        guard generation === currentGeneration, currentGeneration.isValid else { return }
+        let exitTarget = capturedExitTarget ?? currentExitTarget()
+        currentGeneration.invalidate()
+        clearRunningGeneration(currentGeneration)
+        rejectPending(processExitMessage: message)
+        eventMailbox.reset()
+        adapter.reset()
+        try? inputHandle?.close()
+        inputHandle = nil
+        inputWriter = nil
+        let retiredOutput = outputHandle
+        let retiredError = errorHandle
+        outputHandle = nil
+        errorHandle = nil
+        let dying = process
+        process = nil
+        if let dying {
+            PiProcessReaper.reap(dying) {
+                try? retiredOutput?.close()
+                try? retiredError?.close()
+            }
+        } else {
+            try? retiredOutput?.close()
+            try? retiredError?.close()
+        }
+        DispatchQueue.main.async { exitTarget.handler?(message) }
     }
 
     /// Terminal rejections are always delivered so every caller completes exactly once, even
@@ -398,6 +624,7 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
         try? inputHandle?.close()
         try? outputHandle?.close()
         try? errorHandle?.close()
+        inputWriter = nil
         inputHandle = nil
         outputHandle = nil
         errorHandle = nil
@@ -405,7 +632,20 @@ public final class AgentRuntimeClient: AgentRuntimeProtocol {
 
     deinit {
         generation.invalidate()
-        if let process, process.isRunning { PiProcessReaper.reap(process) }
+        rejectPending(processExitMessage: "\(adapter.agent.displayName) runtime was released.")
+        try? inputHandle?.close()
+        inputWriter = nil
+        let retiredOutput = outputHandle
+        let retiredError = errorHandle
+        if let process, process.isRunning {
+            PiProcessReaper.reap(process) {
+                try? retiredOutput?.close()
+                try? retiredError?.close()
+            }
+        } else {
+            try? retiredOutput?.close()
+            try? retiredError?.close()
+        }
     }
 }
 

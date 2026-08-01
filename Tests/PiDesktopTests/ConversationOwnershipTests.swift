@@ -49,7 +49,7 @@ final class ConversationOwnershipTests: XCTestCase {
         repository.summaries = [summary("/tmp/ours.jsonl"), summary("/tmp/theirs.jsonl", agent: .codex)]
 
         let persistence = await MainActor.run { AppPersistence(baseURL: base) }
-        await MainActor.run { persistence.recordAppStarted(sessionPath: "/tmp/ours.jsonl") }
+        _ = await MainActor.run { persistence.recordAppStarted(sessionPath: "/tmp/ours.jsonl") }
 
         let store = await AppStore(repository: repository, gitService: StubGit(), persistence: persistence)
         await store.refreshSessions()
@@ -136,6 +136,36 @@ final class ConversationOwnershipTests: XCTestCase {
         }
     }
 
+    func testFailedOwnershipWriteRollsBackAndCanBeRetried() async throws {
+        let base = tempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        try await MainActor.run {
+            let persistence = AppPersistence(baseURL: base)
+            let stateURL = base.appendingPathComponent("state.json")
+            try? FileManager.default.removeItem(at: stateURL)
+            try FileManager.default.createDirectory(
+                at: stateURL, withIntermediateDirectories: false
+            )
+
+            XCTAssertFalse(
+                persistence.recordAppStarted(sessionPath: "/tmp/retry-owned.jsonl")
+            )
+            XCTAssertFalse(
+                persistence.state.appStartedSessionPaths.contains("/tmp/retry-owned.jsonl")
+            )
+
+            try FileManager.default.removeItem(at: stateURL)
+            XCTAssertTrue(
+                persistence.recordAppStarted(sessionPath: "/tmp/retry-owned.jsonl")
+            )
+            XCTAssertTrue(
+                AppPersistence(baseURL: base).state.appStartedSessionPaths.contains(
+                    "/tmp/retry-owned.jsonl"
+                )
+            )
+        }
+    }
+
     func testTheOwnershipRecordIsBounded() async throws {
         let base = tempBase()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -148,6 +178,83 @@ final class ConversationOwnershipTests: XCTestCase {
                 persistence.state.appStartedSessionPaths.count, AppPersistence.maxAppStartedPaths
             )
         }
+    }
+
+    func testAppOwnedCustomRootTranscriptSurvivesRepeatedFullRefreshes() async throws {
+        let base = tempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let transcript = try writePiTranscript(
+            at: base.appendingPathComponent("custom/owned.jsonl"), id: "custom-owned"
+        )
+        let defaultRoot = base.appendingPathComponent("default-sessions", isDirectory: true)
+        let repository = FileSessionRepository(
+            rootURL: defaultRoot,
+            summaryCache: SessionSummaryCache(fileURL: base.appendingPathComponent("cache.json"))
+        )
+        let persistence = await MainActor.run { AppPersistence(baseURL: base) }
+        _ = await MainActor.run { persistence.recordAppStarted(sessionPath: transcript.path) }
+        let store = await AppStore(
+            repository: repository,
+            gitService: StubGit(),
+            persistence: persistence,
+            daemonWorktreeProjectsURL: base.appendingPathComponent("empty-overlay.json")
+        )
+
+        for _ in 0..<2 {
+            let refreshed = await store.refreshSessions()
+            XCTAssertTrue(refreshed)
+            await MainActor.run {
+                XCTAssertEqual(store.sessions.map(\.id), ["custom-owned"])
+                XCTAssertEqual(store.sessions.first?.agent, .pi)
+            }
+        }
+    }
+
+    func testDaemonManagedCustomRootTranscriptIsRecoveredAfterAMissedEvent() async throws {
+        let base = tempBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let transcript = try writePiTranscript(
+            at: base.appendingPathComponent("custom/managed.jsonl"), id: "custom-managed"
+        )
+        let overlayURL = base.appendingPathComponent("daemon-overlay.json")
+        try JSONSerialization.data(withJSONObject: [
+            "managedThreadPaths": [transcript.path]
+        ]).write(to: overlayURL)
+        let defaultRoot = base.appendingPathComponent("default-sessions", isDirectory: true)
+        let repository = FileSessionRepository(
+            rootURL: defaultRoot,
+            summaryCache: SessionSummaryCache(fileURL: base.appendingPathComponent("cache.json"))
+        )
+        let store = await AppStore(
+            repository: repository,
+            gitService: StubGit(),
+            persistence: AppPersistence(baseURL: base),
+            daemonWorktreeProjectsURL: overlayURL
+        )
+
+        let refreshed = await store.refreshSessions()
+        XCTAssertTrue(refreshed)
+        await MainActor.run {
+            XCTAssertEqual(store.sessions.map(\.id), ["custom-managed"])
+        }
+
+        try FileManager.default.removeItem(at: transcript)
+        let refreshedAfterDeletion = await store.refreshSessions()
+        XCTAssertTrue(refreshedAfterDeletion)
+        await MainActor.run { XCTAssertTrue(store.sessions.isEmpty) }
+    }
+
+    private func writePiTranscript(at url: URL, id: String) throws -> URL {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let contents = """
+        {"type":"session","id":"\(id)","cwd":"/tmp/custom"}
+        {"type":"message","id":"u1","message":{"role":"user","content":"hello"}}
+
+        """
+        try Data(contents.utf8).write(to: url)
+        return url.standardizedFileURL
     }
 
     private func settle(_ store: AppStore) async {

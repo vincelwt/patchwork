@@ -3,39 +3,70 @@ import Foundation
 /// Pi RPC uses strict LF-delimited JSONL. This intentionally does not treat CR,
 /// U+2028, or U+2029 as record delimiters.
 public struct JSONLFramer: Sendable {
-    public init() {}
+    public let maximumRecordBytes: Int
+
+    public init(maximumRecordBytes: Int = 64 * 1_024 * 1_024) {
+        self.maximumRecordBytes = max(1, maximumRecordBytes)
+    }
 
     private(set) var buffer = Data()
+    private var discardingOversizedRecord = false
+    private var overflowedRecords = 0
+
+    public var bufferedByteCount: Int { buffer.count }
+
+    public mutating func takeOverflowedRecordCount() -> Int {
+        let count = overflowedRecords
+        overflowedRecords = 0
+        return count
+    }
 
     public mutating func append(_ chunk: Data) -> [Data] {
         guard !chunk.isEmpty else { return [] }
-        buffer.append(chunk)
-
         var records: [Data] = []
-        var recordStart = buffer.startIndex
-        var cursor = recordStart
+        var start = chunk.startIndex
 
-        while cursor < buffer.endIndex {
-            if buffer[cursor] == 0x0A {
-                var record = buffer[recordStart..<cursor]
-                if record.last == 0x0D {
-                    record = record.dropLast()
-                }
-                if !record.isEmpty {
-                    records.append(Data(record))
-                }
-                recordStart = buffer.index(after: cursor)
+        while start < chunk.endIndex {
+            if discardingOversizedRecord {
+                guard let newline = chunk[start...].firstIndex(of: 0x0A) else { return records }
+                discardingOversizedRecord = false
+                start = chunk.index(after: newline)
+                continue
             }
-            cursor = buffer.index(after: cursor)
-        }
 
-        if recordStart > buffer.startIndex {
-            buffer.removeSubrange(buffer.startIndex..<recordStart)
+            if let newline = chunk[start...].firstIndex(of: 0x0A) {
+                let segment = chunk[start..<newline]
+                if segment.count <= maximumRecordBytes - buffer.count {
+                    buffer.append(contentsOf: segment)
+                    if buffer.last == 0x0D { buffer.removeLast() }
+                    if !buffer.isEmpty { records.append(buffer) }
+                    buffer.removeAll(keepingCapacity: true)
+                } else {
+                    buffer.removeAll(keepingCapacity: false)
+                    overflowedRecords += 1
+                }
+                start = chunk.index(after: newline)
+            } else {
+                let segment = chunk[start..<chunk.endIndex]
+                if segment.count <= maximumRecordBytes - buffer.count {
+                    buffer.append(contentsOf: segment)
+                } else {
+                    buffer.removeAll(keepingCapacity: false)
+                    discardingOversizedRecord = true
+                    overflowedRecords += 1
+                }
+                break
+            }
         }
         return records
     }
 
     public mutating func finish() -> Data? {
+        guard !discardingOversizedRecord else {
+            discardingOversizedRecord = false
+            buffer.removeAll(keepingCapacity: false)
+            return nil
+        }
         guard !buffer.isEmpty else { return nil }
         var record = buffer
         buffer.removeAll(keepingCapacity: false)
@@ -72,6 +103,14 @@ public enum JSONLFileReader {
         /// oversized transcripts (Codex rollouts reach hundreds of megabytes) are sampled.
         public static let `default` = ReadWindow(
             headBytes: 4 * 1_024 * 1_024, tailBytes: 8 * 1_024 * 1_024, fullReadLimit: 24 * 1_024 * 1_024
+        )
+
+        /// Sidebar/catalog summaries need identity from the head and current state from the tail.
+        /// Keeping this small is what makes a cold scan across hundreds of large transcripts fast.
+        public static let threadSummary = ReadWindow(
+            headBytes: 1 * 1_024 * 1_024,
+            tailBytes: 1 * 1_024 * 1_024,
+            fullReadLimit: 2 * 1_024 * 1_024
         )
     }
 
@@ -138,7 +177,7 @@ public enum JSONLFileReader {
         let tailStart = max(window.headBytes, size - window.tailBytes)
         guard tailStart < size else { return }
         try handle.seek(toOffset: UInt64(tailStart))
-        var tail = (try handle.readToEnd()) ?? Data()
+        var tail = try readSnapshot(handle: handle, byteCount: size - tailStart)
         // Drop whatever precedes the first newline: it is the tail end of a record whose start
         // was skipped.
         if let firstNewline = tail.firstIndex(of: 0x0A) {
@@ -151,5 +190,19 @@ public enum JSONLFileReader {
             try Task.checkCancellation()
             try onRecord(record)
         }
+    }
+
+    /// Reads no more than the caller's captured file snapshot, even if a writer appends while the
+    /// read is in progress.
+    static func readSnapshot(handle: FileHandle, byteCount: Int) throws -> Data {
+        var data = Data()
+        var remaining = max(0, byteCount)
+        while remaining > 0 {
+            guard let chunk = try handle.read(upToCount: min(256 * 1_024, remaining)),
+                  !chunk.isEmpty else { break }
+            data.append(chunk)
+            remaining -= chunk.count
+        }
+        return data
     }
 }

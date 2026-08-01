@@ -35,10 +35,10 @@ enum NewChatFolderResolution {
 /// Bridges the gap between "the user asked for a new chat inside virtual folder X" and "Pi has
 /// assigned that chat a real session id/path" — which, per `AppStore.openNewChat` /
 /// `ensureProvisionalSession`, only becomes true after an attach round-trip, and the underlying
-/// JSONL file itself may not even be written to disk yet. The assignment itself does not care:
-/// `AppStore.moveSession` just records `path -> folderID` in persisted state, so writing it the
-/// moment the path is known is already correct — a later disk scan will match the same
-/// standardized path once Pi actually flushes the file.
+/// JSONL file itself may not even be written to disk yet. The assignment is staged in memory as
+/// soon as the path is known, then committed only after the first prompt materializes and the app
+/// owns its lease. A rejected prompt can therefore retry in the same folder without leaving
+/// metadata for a conversation that never existed.
 ///
 /// Subscribing directly to the store's own `$route` (rather than hooking a View's lifecycle)
 /// means an intervening sidebar re-layout — auto-collapse, a window resize — can never drop the
@@ -85,6 +85,8 @@ final class NewChatFolderIntent {
             existingAssignment: store.virtualFolderID(for: session),
             projectFolder: store.projectFolder(for: session)
         ) else { return }
-        store.moveSession(session, toVirtualFolder: intent.folderID)
+        store.stageProvisionalVirtualFolderAssignment(
+            path: session.fileURL.path, folderID: intent.folderID
+        )
     }
 }

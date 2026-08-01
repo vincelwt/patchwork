@@ -67,7 +67,7 @@ start it with `pidesk daemon start` (or `pidesk daemon install` to run at login)
   *is* that shape, verbatim — e.g. `threads list --json` is exactly `{"threads":[Thread],
   "nextCursor":...}`. No extra wrapping, no internal-type dump.
 - A few shapes are this CLI's own, because the API doesn't define a CLI-level concept:
-  - `threads send --json` always has the keys `runId`, `queued`, `run` — `run` is `null` unless
+  - `threads send --json` always has the keys `runId`, `queued`, `delivery`, `run`; `run` is `null` unless
     `--wait` was given, so the key set never changes based on flags.
   - `threads watch --json` / `daemon logs -f --json`: one line per event, each
     `{"event":"...", "data":{...}, "receivedAt":"..."}` for watch, or `{"line":"..."}` for logs.
@@ -92,8 +92,9 @@ start it with `pidesk daemon start` (or `pidesk daemon install` to run at login)
 pidesk threads list [--query TEXT] [--running] [--automated] [--archived | --all]
                     [--limit N] [--cursor C] [--json]
 pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
-pidesk threads new --cwd DIR [--worktree] [--name NAME] [--message TEXT] [--mode MODE] [--json]
-pidesk threads send <id> <text|-> [--steer | --follow-up] [--wait] [--json]
+pidesk threads new --cwd DIR [--agent AGENT] [--worktree] [--name NAME] [--message TEXT] [--mode MODE]
+                   [--client-id ID] [--json]
+pidesk threads send <id> <text|-> [--steer | --follow-up] [--wait] [--client-id ID] [--json]
 pidesk threads abort <id> [--json]
 pidesk threads archive <id> [--json]
 pidesk threads unarchive <id> [--json]
@@ -105,7 +106,8 @@ Notes:
 
 - Lists default to 20 non-archived threads. `--archived` shows only archived threads; list
   `--all` includes both. `--running` and `--automated` are strict filters. `--cursor` continues a
-  bounded list page.
+  bounded, coherent catalog snapshot. An opaque cursor that has expired returns `409`; restart
+  once without a cursor. A malformed cursor returns `400` rather than silently returning page one.
 - Human lists print a UUID's random final segment instead of all 36 characters. Every thread
   endpoint, `watch`, and `schedule add --thread` accepts an unambiguous prefix or suffix. An
   ambiguous abbreviation fails instead of selecting a thread.
@@ -115,14 +117,28 @@ Notes:
 - `new --worktree` uses the Desktop app's managed worktree flow: main-line base selection,
   `~/.pi/worktrees`, `pi/` branch naming, non-force cleanup on failed creation, and source-project
   organization in the app. The session `cwd` remains the real worktree path.
+- Pi and Codex accept `new` without `--message` and create an idle thread. The Codex service always
+  materializes that thread with a non-empty requested or fallback name. Claude Code creates its
+  conversation with the first message, so `--agent claude` requires `--message`; the CLI rejects a
+  missing message before contacting the daemon.
 - `<text>` (in `send`) and `--message` (in `new`) accept `-` to read the message from stdin:
   `echo "continue" | pidesk threads send <id> -`.
+- `new` and `send` generate one retry id for every invocation. `--client-id` supplies it explicitly
+  for a retry across invocations; valid ids are 1-128 ASCII letters, digits, `_`, or `-`. Reuse the
+  exact id only for the exact same request. Reusing it for different content is rejected. If a
+  create returns a thread plus `firstMessageError`, creation succeeded: send the preserved message
+  to that thread and do not recreate it. For a daemon advertising creation idempotency, the CLI
+  retries `create_retryable` and `creation_pending` with the same id; `creation_outcome_unknown`
+  always requires a thread-list review.
 - Delivery: no flag is `"auto"`; `--steer` interrupts the current turn; `--follow-up` queues
   behind it. They're mutually exclusive.
-- `--wait` subscribes to `/v1/events`, filters for the run just started, and streams until it
-  reaches a terminal status (`ok`/`failed`/`skipped`/`timeout`). Exit code is `1` unless the run
-  ended `ok`. This is not bounded by `--timeout` (that flag governs individual HTTP calls, not a
-  long-lived wait) — it ends when the run finishes, the stream drops, or you Ctrl-C.
+- `--wait` prepares `/v1/events` before sending, filters for the run just started, and streams until
+  it reaches a terminal status (`ok`/`failed`/`skipped`/`timeout`). If the stream drops, it polls
+  `GET /v1/runs/{id}` until the terminal result is visible. A continuously unreachable daemon stops
+  that fallback after the configured global `--timeout`; a healthy long-running run has no overall
+  deadline. Exit code is `1` unless the run ended `ok`. A pre-prompt failure may be retried with a
+  new id; after delivery may have started, the CLI says to review the thread instead of recommending
+  a resend.
 - `watch` prints every `thread`/`run`/`schedule`/`activity` event; give it a thread id to filter
   client-side to that thread (the SSE stream itself isn't scoped per-thread). `activity` events
   are global snapshots and always pass through regardless of the filter.
@@ -134,12 +150,13 @@ pidesk schedule list [--json]
 pidesk schedule add --name NAME (--thread ID | --cwd DIR) --prompt TEXT
                      (--at ISO|LOCAL | --every DUR | --cron EXPR | --heartbeat DUR)
                      [--name-pattern PATTERN] [--timezone TZ] [--start-at ISO|LOCAL]
-                     [--mode MODE] [--skip-if-running] [--timeout DUR] [--json]
+                     [--agent AGENT] [--mode MODE] [--client-id ID]
+                     [--skip-if-running] [--timeout DUR] [--json]
 pidesk schedule show <id> [--json]
 pidesk schedule pause <id> [--json]
 pidesk schedule resume <id> [--json]
 pidesk schedule remove <id> [--json]
-pidesk schedule run <id> [--json]
+pidesk schedule run <id> [--client-id ID] [--json]
 ```
 
 ### Target
@@ -148,6 +165,15 @@ Exactly one of:
 - `--thread ID` — run against an existing thread.
 - `--cwd DIR` — create a new thread each run. `--name-pattern` sets the created thread's name
   (e.g. `"Triage {date}"`); it defaults to `--name` if you don't set it separately.
+
+`--name-pattern` is limited to 256 UTF-8 bytes. `{date}` uses the owed occurrence's UTC calendar
+date, including when a delayed run catches up later.
+
+`--agent AGENT` applies only to `--cwd`; an existing thread keeps its own agent. `--mode` is only
+valid for Pi-backed runs. Schedule creation and manual runs generate a retry id automatically.
+Use `--client-id` to repeat the exact same request after a safe-to-retry failure. If the running
+daemon does not advertise replay protection and the outcome is ambiguous, inspect the schedule
+list or run history before trying again.
 
 ### Trigger (exactly one required — ambiguity is a usage error, not a guess)
 
@@ -264,11 +290,13 @@ an out-of-band run with `pidesk schedule run sch_xxxxx`.
 ```
 # 1. Create a thread. `new` can send the first message too, but splitting it out lets us
 #    --wait on a single, uniform code path for both the first turn and every follow-up.
-result=$(pidesk threads new --cwd ~/code/myapp --name "Voice session" --json)
+result=$(pidesk threads new --cwd ~/code/myapp --name "Voice session" \
+  --client-id voice_create_001 --json)
 thread_id=$(echo "$result" | jq -r '.thread.id')
 
 # 2. Speak the user's request, wait for the full turn, then speak the answer.
-reply=$(pidesk threads send "$thread_id" "Summarise what changed in the last 3 commits" --wait --json)
+reply=$(pidesk threads send "$thread_id" "Summarise what changed in the last 3 commits" \
+  --client-id voice_turn_001 --wait --json)
 if [ $? -ne 0 ]; then
   say "Sorry, that run failed."
 else
@@ -276,7 +304,8 @@ else
 fi
 
 # 3. Later, follow up in the same thread the same way.
-reply=$(pidesk threads send "$thread_id" "Now do the same for the last PR" --wait --json)
+reply=$(pidesk threads send "$thread_id" "Now do the same for the last PR" \
+  --client-id voice_turn_002 --wait --json)
 say "$(echo "$reply" | jq -r '.run.summary')"
 ```
 

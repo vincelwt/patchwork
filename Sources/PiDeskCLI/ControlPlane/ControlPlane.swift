@@ -29,7 +29,8 @@ protocol ControlPlane: Sendable {
     func showSchedule(id: String) async throws -> WireScheduleDetailResponse
     func setSchedulePaused(id: String, paused: Bool) async throws -> WireScheduleResponse
     func deleteSchedule(id: String) async throws -> WireScheduleDeleteResponse
-    func runSchedule(id: String) async throws -> WireScheduleRunResponse
+    func runSchedule(id: String, request: WireScheduleRunRequest) async throws -> WireScheduleRunResponse
+    func showRun(id: String) async throws -> WireRunResponse
 
     func limits() async throws -> WireLimits
 
@@ -45,6 +46,8 @@ enum ControlPlaneError: Error {
     case apiError(status: Int, code: String, message: String)
     case malformedResponse(String)
     case transportFailure(String)
+    /// The mutation was attempted once, but this daemon did not advertise replay protection.
+    case outcomeUnknown(String)
 }
 
 /*

@@ -10,7 +10,8 @@ struct PiDesktopApp: App {
         // The status probe reads Pi's extension host, which is a Pi-only concept, so it always
         // attaches to Pi regardless of which agent the current conversation uses.
         probeRuntimeFactory: { AgentRuntimeClient(adapter: PiProtocolAdapter(), additionalArguments: ["--no-session"]) },
-        sleepPrevention: SleepPreventionController.liveHandler()
+        sleepPrevention: SleepPreventionController.liveHandler(),
+        daemonClient: .unixSocket()
     )
     // Owns the in-process control service lifecycle. Kept on the app delegate (not a second
     // @StateObject) so launch/quit and the Settings scene share the exact same instance.
@@ -52,7 +53,7 @@ struct PiDesktopApp: App {
                     .disabled(store.selectedSession == nil)
                 Button("Rename…") { store.renameRequested = true }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(store.selectedSession == nil)
+                    .disabled(!store.canRenameSelectedSession)
                 Button("Mark as Unread") { store.markSelectedUnread() }
                     .keyboardShortcut("u", modifiers: [.command, .option])
                     .disabled(store.selectedSession == nil)
@@ -253,7 +254,7 @@ struct RootView: View {
     @ViewBuilder
     private var detail: some View {
         if store.schedulesPresented {
-            SchedulesView(service: store.scheduleService)
+            SchedulesView(service: store.scheduleService, persistence: store.persistence)
         } else {
             switch store.route {
             case .newChat: NewChatView()

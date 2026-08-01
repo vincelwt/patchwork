@@ -97,6 +97,38 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertTrue(folders.isEmpty)
     }
 
+    func testVirtualFolderCreationRefusesTheRetainedStateCap() {
+        var folders = (0..<WorkspaceOrganization.maxVirtualFolders).map {
+            VirtualFolder(id: "folder_\($0)", name: "Folder \($0)")
+        }
+
+        XCTAssertNil(WorkspaceOrganization.create(named: "Overflow", in: &folders))
+        XCTAssertEqual(folders.count, WorkspaceOrganization.maxVirtualFolders)
+    }
+
+    func testPersistedVirtualFoldersAndAssignmentsDecodeBoundedly() throws {
+        var state = PersistedAppState()
+        state.virtualFolders = (0...PersistedAppState.maxVirtualFolders).map {
+            VirtualFolder(id: "folder_\($0)", name: "Folder \($0)")
+        }
+        state.virtualFolders.insert(VirtualFolder(id: "folder_0", name: "Duplicate"), at: 0)
+        state.virtualFolders.insert(VirtualFolder(id: "invalid id", name: "Invalid"), at: 0)
+        state.virtualFolderAssignments = [
+            "/tmp/kept.jsonl": "folder_0",
+            "/tmp/dropped.jsonl": "missing"
+        ]
+
+        let decoded = try JSONDecoder().decode(
+            PersistedAppState.self, from: JSONEncoder().encode(state)
+        )
+
+        XCTAssertLessThanOrEqual(decoded.virtualFolders.count, PersistedAppState.maxVirtualFolders)
+        XCTAssertEqual(Set(decoded.virtualFolders.map(\.id)).count, decoded.virtualFolders.count)
+        XCTAssertFalse(decoded.virtualFolders.contains { $0.id == "invalid id" })
+        XCTAssertEqual(decoded.virtualFolderAssignments.count, 1)
+        XCTAssertEqual(decoded.virtualFolderAssignments["/tmp/kept.jsonl"], "folder_0")
+    }
+
     func testNestingUnderAnotherFolderAndUnderAProjectPath() throws {
         var folders: [VirtualFolder] = []
         let top = try XCTUnwrap(WorkspaceOrganization.create(named: "Top", in: &folders))
@@ -513,6 +545,28 @@ final class WorkspaceOrganizationTests: XCTestCase {
         XCTAssertEqual(store.doneSessionCount, 1)
         store.markUnread(done)
         XCTAssertEqual(store.doneSessionCount, 0, "Unread wins over Done, and archived threads never count")
+    }
+
+    @MainActor
+    func testStatusProjectionScalesAcrossThousandsOfSessions() {
+        let base = temporaryDirectory("StatusProjection")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = AppStore(
+            persistence: AppPersistence(baseURL: base),
+            activityMonitor: SessionActivityMonitor(isActiveOverride: false)
+        )
+        let sessions = (0..<5_000).map { index in
+            summary(id: "session-\(index)", cwd: "/tmp", modifiedAt: Date(timeIntervalSince1970: Double(index)))
+        }
+        store.sessions = sessions
+        store.route = .session(sessions.last!.fileURL.standardizedFileURL.path)
+
+        let startedAt = Date()
+        let groups = store.statusGroups(sessions)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertEqual(groups.first(where: { $0.section == .done })?.sessions.count, sessions.count)
+        XCTAssertLessThan(elapsed, 1.0, "Status projection must remain linear rather than scanning the catalog per row")
     }
 
     @MainActor

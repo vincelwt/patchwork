@@ -56,6 +56,8 @@ public struct PendingInteraction: Codable, Hashable, Sendable, Identifiable {
     public var id: String
     public var runId: String
     public var threadId: String?
+    /// Physical transcript identity. Absent on records produced before path-scoped routing.
+    public var threadPath: String?
     public var method: InteractionMethod
     public var title: String
     public var message: String?
@@ -79,6 +81,7 @@ public struct PendingInteraction: Codable, Hashable, Sendable, Identifiable {
         id: String,
         runId: String,
         threadId: String? = nil,
+        threadPath: String? = nil,
         method: InteractionMethod,
         title: String,
         message: String? = nil,
@@ -97,6 +100,7 @@ public struct PendingInteraction: Codable, Hashable, Sendable, Identifiable {
         self.id = id
         self.runId = runId
         self.threadId = threadId
+        self.threadPath = threadPath
         self.method = method
         self.title = title
         self.message = message
@@ -118,6 +122,7 @@ public struct PendingInteraction: Codable, Hashable, Sendable, Identifiable {
         id = try container.decode(String.self, forKey: .id)
         runId = try container.decodeIfPresent(String.self, forKey: .runId) ?? ""
         threadId = try container.decodeIfPresent(String.self, forKey: .threadId)
+        threadPath = try container.decodeIfPresent(String.self, forKey: .threadPath)
         method = try container.decodeIfPresent(InteractionMethod.self, forKey: .method) ?? .other("unknown")
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? "Pi"
         message = try container.decodeIfPresent(String.self, forKey: .message)

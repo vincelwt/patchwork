@@ -16,39 +16,85 @@ struct Heartbeat: Sendable {
     var completionId: String? = nil
 }
 
+private final class DaemonHeartbeatFileCache: @unchecked Sendable {
+    private struct Entry {
+        let fingerprint: BoundedJSONFile.Fingerprint
+        let heartbeat: Heartbeat?
+    }
+
+    private let lock = NSLock()
+    private var directoryPath: String?
+    private var entries: [String: Entry] = [:]
+    private var catalog: BoundedJSONFiles.Catalog?
+
+    func scan(directory: URL, logger: DaemonLogger?) -> [Heartbeat] {
+        lock.lock()
+        defer { lock.unlock() }
+        let directoryPath = directory.standardizedFileURL.path
+        if self.directoryPath != directoryPath {
+            self.directoryPath = directoryPath
+            entries.removeAll(keepingCapacity: false)
+            catalog = nil
+        }
+        let scan = BoundedJSONFiles.scan(
+            in: directory,
+            limit: ActivityReader.maxFilesPerScan,
+            maxBytes: ActivityReader.maxFileBytes,
+            previous: catalog
+        )
+        catalog = scan.catalog
+        let files = scan.catalog.files
+        let retained = Set(files.map(\.path))
+        entries = entries.filter { retained.contains($0.key) }
+
+        let result = files.compactMap { file in
+            if let cached = entries[file.path], cached.fingerprint == file.fingerprint {
+                return cached.heartbeat
+            }
+            let heartbeat = BoundedJSONFiles.read(
+                file, maxBytes: ActivityReader.maxFileBytes
+            ).flatMap(ActivityReader.decode)
+            entries[file.path] = Entry(fingerprint: file.fingerprint, heartbeat: heartbeat)
+            if heartbeat == nil { logger?.warn("Skipping malformed heartbeat file \(file.url.lastPathComponent)") }
+            return heartbeat
+        }
+        return result
+    }
+}
+
 /// Reads and classifies heartbeat files. Never throws: a missing directory (no extension has
 /// run yet), an unreadable file, or a malformed one are all just absent data, not an error.
 enum ActivityReader {
     /// "Fresh" per the contract's "~10s" guidance.
     static let freshnessWindow: TimeInterval = 10
+    static let maxFilesPerScan = 500
+    static let maxFileBytes = 256 * 1_024
+    private static let cache = DaemonHeartbeatFileCache()
 
     static func readHeartbeats(directory: URL = PiDeskPaths.activityDirectory, logger: DaemonLogger? = nil) -> [Heartbeat] {
-        let manager = FileManager.default
-        guard let entries = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
-            return [] // directory does not exist yet, or is unreadable: degrade to "nothing running"
-        }
+        cache.scan(directory: directory, logger: logger)
+    }
 
-        var heartbeats: [Heartbeat] = []
-        for url in entries where url.pathExtension.lowercased() == "json" {
-            guard let data = manager.contents(atPath: url.path),
-                  let value = try? PiJSONValue.decode(data),
-                  let object = value.objectValue,
-                  let sessionId = object["sessionId"]?.stringValue, !sessionId.isEmpty else {
-                logger?.warn("Skipping malformed heartbeat file \(url.lastPathComponent)")
-                continue
-            }
-            heartbeats.append(Heartbeat(
-                sessionId: sessionId,
-                sessionFile: object["sessionFile"]?.stringValue,
-                cwd: object["cwd"]?.stringValue,
-                pid: object["pid"]?.intValue.map(Int32.init),
-                state: object["state"]?.stringValue ?? "idle",
-                startedAt: object["startedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)),
-                updatedAt: object["updatedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)) ?? .distantPast,
-                completionId: object["completionId"]?.stringValue
-            ))
+    fileprivate static func decode(_ data: Data) -> Heartbeat? {
+        guard let value = try? PiJSONValue.decode(data),
+              let object = value.objectValue,
+              let sessionId = object["sessionId"]?.stringValue, !sessionId.isEmpty else {
+            return nil
         }
-        return heartbeats
+        let sessionFile = object["sessionFile"]?.stringValue.flatMap { raw -> String? in
+            guard !raw.isEmpty, (raw as NSString).isAbsolutePath else { return nil }
+            return URL(fileURLWithPath: raw).standardizedFileURL.path
+        }
+        return Heartbeat(
+            sessionId: sessionId,
+            sessionFile: sessionFile,
+            cwd: object["cwd"]?.stringValue,
+            pid: object["pid"]?.intValue.flatMap { Int32(exactly: $0) },
+            state: object["state"]?.stringValue ?? "idle",
+            startedAt: object["startedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)),
+            updatedAt: object["updatedAt"]?.stringValue.flatMap(PiDeskDate.date(from:)) ?? .distantPast,
+            completionId: object["completionId"]?.stringValue
+        )
     }
 
     /// A session counts as running only when all three hold: the file says so, the write is

@@ -101,7 +101,8 @@ carries `X-Pi-Desktop-Api: 1`.
 GET /v1/health
 → {"ok":true,"version":"1.0.0","api":1,"startedAt":"…","runningRuns":1,"queuedRuns":0,
    "piVersion":"0.82.1","schedulesEnabled":true,"scheduleIdempotency":true,
-   "threadWorktrees":true}
+   "threadCreationIdempotency":true,"messageSubmissionIdempotency":true,
+   "scheduleRunIdempotency":true,"threadWorktrees":true}
 ```
 
 ### Threads
@@ -119,8 +120,9 @@ GET  /v1/threads/{id}?messages=20&offset=0&all=true
 
 POST /v1/threads
      {"cwd":"/Users/x/code","name":"Nightly triage","message":"…","mode":"ultra","worktree":true,
-      "agent":"pi","desktopManaged":true}
-→ {"thread":Thread,"runId":"…"}          // message is optional; `thread.id` is always a real session id
+      "agent":"pi","clientId":"web-create-…","desktopManaged":true}
+→ {"thread":Thread,"runId":"…","firstMessageError":null}
+               // message is optional for Pi and Codex; `thread.id` is always a real session id
 
 GET  /v1/threads/{id}/runtime
 → {"runtime":{"provider":"openai-codex","modelId":"gpt-5","modelName":"GPT-5",
@@ -143,13 +145,36 @@ GET  /v1/threads/{id}/images/{imageId}
 → {"id":"…","mimeType":"image/png","byteCount":8321,"fileName":"shot.png","data":"<base64>"}
 ```
 
-A message-bearing create resolves an idle Pi session first, then queues the first prompt against
-that session. The response therefore never invents a `pending:<run>` thread id that cannot be
-opened. Older clients may still use `runId` to follow the prompt itself. With `worktree:true`,
-the daemon uses the same managed worktree algorithm as the Mac app and records the exact source
-`cwd` in its own overlay so the app groups the thread under the source project. If idle-session
-creation fails, the unused worktree is removed non-force. The thread and run keep the real
-worktree as their execution `cwd`.
+Pi and Codex persist a real session before any provider prompt. Omitting `message` creates one of
+those threads idle and returns `201` with no `runId`. Codex requires a non-empty conversation name
+to materialize an idle session, so the service uses the requested name or supplies a fallback.
+A message-bearing create requires `clientId`, resolves that real session first, and then queues the
+prompt against it. The response never invents a `pending:<run>` thread id that cannot be opened.
+
+Claude Code creates its transcript with its first message. Its create request therefore requires
+a non-empty `message`; like every message-bearing create, it also requires `clientId`. Missing
+input returns `400 first_message_required` or `400 client_id_required`. The daemon keeps the fresh
+runtime alive through prompt acceptance and returns `202` only after its callback identifies a
+real, openable thread. If that confirmation takes longer than the request window, `503
+creation_pending` tells the caller to retry the exact request with the same `clientId`. A definite
+pre-prompt runtime failure may return `503 create_retryable`, which is also safe to retry with that
+id. Once prompt delivery may have started, an unconfirmed transcript returns `409
+creation_outcome_unknown` and must be reviewed instead of recreated.
+
+With `worktree:true`, the daemon uses the same managed worktree algorithm as the Mac app and
+records the exact source `cwd` in its own overlay so the app groups the thread under the source
+project. A definite failure before creation removes the unused worktree non-force. The thread and
+run keep the real worktree as their execution `cwd`.
+
+`clientId` gives the whole create request the same 30-minute durable replay protection as a
+message submission. A retry with the same canonical request returns the original thread and run;
+using the id for different input returns `409 creation_id_conflict`. A crash that leaves creation
+in flight returns `409 creation_outcome_unknown`, so the caller reviews the thread list instead of
+risking a duplicate. For Pi or Codex, once the idle-capable agent has created the thread, a later
+first-message admission error is returned as `firstMessageError` with the real thread and a `201`
+response. Clients must keep the unsent text and must not retry the whole create request.
+`mode` is Pi-only because it names Pi's `/mode` extension value. Supplying it for another agent
+returns `400 mode_not_supported`; those agents use their typed runtime controls instead.
 
 Thread detail defaults to the existing raw projection (`all=true`) for API compatibility. Set
 `all=false` to retain only user and assistant roles. `offset` is applied after that filter and
@@ -157,10 +182,17 @@ Thread detail defaults to the existing raw projection (`all=true`) for API compa
 associated with any automation, including paused ones.
 
 List `sidebar=true` to apply the Mac sidebar's current ownership and disabled-agent settings.
-The web remote uses that projection and follows `nextCursor` until it has the complete bounded
-list, so a full first page never hides older sidebar conversations. A create with
-`desktopManaged:true` records its session path in the daemon-owned overlay, which makes a thread
-started from the remote belong to the same sidebar without racing the Mac app's `state.json`.
+The web remote uses that projection for every page. A create with `desktopManaged:true` also
+records the legacy remote-ownership marker for older clients; all control-plane creations are
+recorded in the unified managed-thread overlay so CLI and remote threads appear without racing
+the Mac app's `state.json`.
+
+List cursors identify one of at most eight catalog snapshots retained for five minutes. Snapshot
+retention is also capped at 20,000 threads per walk and 20,000 entries across active walks; a larger
+filtered catalog returns `503 catalog_snapshot_too_large` and asks the caller to narrow its query.
+`409 cursor_expired` means that snapshot is no longer retained and the client should restart
+pagination once from page one. A malformed opaque cursor returns `400 invalid_cursor`; legacy
+numeric offsets remain accepted.
 
 ### Agents
 
@@ -173,10 +205,11 @@ client.
 outside the set — a filter that silently matched everything would look like it worked.
 
 The daemon drives every agent, not just Pi: each thread's commands are translated into its own
-agent's protocol (`pi --mode rpc`, `codex app-server`, `claude -p` stream-json), so a Codex or
-Claude thread can be created, messaged, renamed, and reconfigured through this API exactly like a
-Pi one. Routing follows `thread.agent`, which comes from the session root the transcript was
-discovered under, so a command can never reach the wrong agent's transcript.
+agent's protocol (`pi --mode rpc`, `codex app-server`, `claude -p` stream-json). Pi, Codex, and
+Claude threads can all be created, messaged, and renamed through this API. Other runtime controls
+are capability-aware: mode is Pi-only, and Claude does not support thinking-level changes. Routing
+follows `thread.agent`, which comes from the session root the transcript was discovered under, so
+a command can never reach the wrong agent's transcript.
 
 A thread's history outlives its agent's installation. Reading always works; a route that has to
 launch the agent returns `409 agent_not_installed` when its executable no longer resolves.
@@ -259,16 +292,26 @@ stable id per message (1–128 letters, numbers, dashes, underscores), reused ve
   neither enqueues nor delivers anything again.
 - A retry that overlaps the original gets `409 submission_in_flight`. That is not a failure; the
   first attempt is still running and the client should keep showing the message as sending.
+- Reusing a client id with different text or delivery returns `409 submission_id_conflict`.
 - A submission that *failed* releases its claim, so an honest retry is never locked out.
 - Omitting `clientId` is allowed and behaves exactly as before: no replay protection.
-- Only *completed* submissions are evicted to make room. If all 256 slots hold sends that have not
-  finished, a new `clientId` gets `503 submissions_busy` rather than costing one of them its
-  protection — refusing a message is recoverable, prompting Pi twice is not. Retry shortly.
-- Bounded and in-memory: 256 submissions, 30 minutes. A daemon restart forgets them, so a retry
-  across a restart can still duplicate. `runs.jsonl` records no client id, so closing that window
-  would mean a new persisted store for a gap measured in seconds; it is documented, not built.
+- No unexpired submission is evicted, including a completed one whose HTTP response may have been
+  lost. If all 256 slots are protected, a new `clientId` gets `503 submissions_busy`. Refusing a
+  message is recoverable; prompting Pi twice is not. Retry after an older entry expires.
+- The shared, bounded 256-entry, 30-minute create-and-message ledger is written atomically before
+  delivery. Completed answers
+  replay after a daemon restart. A claim left in flight by a crash returns
+  `409 submission_outcome_unknown` after restart and requires review instead of automatic resend.
+  A corrupt, oversized, or unwritable ledger fails closed with `503 submission_ledger_unavailable`
+  before delivery.
 - Independent of the hosted relay's mutation counter, which rejects a replayed *ciphertext frame*
   outright. This replays a response to a legitimately re-sent request; neither weakens the other.
+
+Clients may retry a message automatically with the same `clientId` only when health reports
+`messageSubmissionIdempotency:true`. A missing capability means one submission attempt only. A
+connection failure before request bytes are sent remains an ordinary unreachable-daemon error;
+a dropped or malformed response after connect requires review unless replay protection was
+advertised.
 
 **`attachments` are rejected, not dropped.** A non-empty `attachments` array returns
 `400 attachments_unsupported`. This daemon has no path from an attachment to Pi's prompt, and
@@ -379,13 +422,25 @@ POST   /v1/schedules      {Schedule}       → {"schedule":Schedule}
 GET    /v1/schedules/{id}                  → {"schedule":Schedule,"runs":[Run]}
 PATCH  /v1/schedules/{id} {partial}        → {"schedule":Schedule}
 DELETE /v1/schedules/{id}                  → {"deleted":true}
-POST   /v1/schedules/{id}/run              → {"runId":"…"}      // run now, out of band
+POST   /v1/schedules/{id}/run {"clientId":"…"} → {"runId":"…"} // run now, out of band
 POST   /v1/schedules/{id}/pause            {"paused":true} → {"schedule":Schedule}
 ```
 
 `POST /v1/schedules` accepts an optional `idempotencyKey` (16–64 letters, numbers, dashes, or
 underscores). Repeating the same request with the same key returns the existing schedule; reusing
-the key for different content is rejected.
+the key for different content is rejected. The daemon retains an opaque fingerprint of a
+path-qualified target, so replaying the same protected creation still succeeds if that path is
+later renamed, becomes ambiguous, or its transcript is removed. Editing the schedule clears that
+creation-only recovery fingerprint.
+
+Manual schedule runs accept an optional `clientId` with the same 1 to 128 character wire-safe format
+as message submissions. The same schedule and id replay the original `runId`. An overlapping call
+returns `schedule_run_in_flight`; a claim recovered after a restart returns
+`schedule_run_outcome_unknown` and requires run-history review. A client may retry automatically
+only when health reports `scheduleRunIdempotency:true`. Thread creation has the equivalent gate in
+`threadCreationIdempotency`; message submission uses `messageSubmissionIdempotency`; schedule
+creation uses `scheduleIdempotency`. Missing capability fields always mean automatic replay is
+unsafe, which keeps current clients compatible with older daemons.
 
 ```jsonc
 // Schedule
@@ -396,20 +451,21 @@ the key for different content is rejected.
   "target": { "kind": "existingThread", "threadId": "…" },
      // or  { "kind": "newThread", "cwd": "/Users/x/code", "namePattern": "Triage {date}" }
   "prompt": "Check overnight CI failures and summarise",
-  "mode": "ultra",                     // optional, applies the /mode extension before the prompt
+  "mode": "ultra",                     // optional Pi-only /mode value
   "trigger": { … see below … },
   "policy": {
     "skipIfRunning": true,             // never stack runs on a busy thread
     "catchUpMissed": false,            // deprecated compatibility field; global catch-up wins
-    "timeoutSeconds": 3600,
+    "timeoutSeconds": 3600,            // optional; accepted range is 1...31622400
     "quietHours": {"from":"23:00","to":"07:00","timeZone":"Europe/Paris"}
   },
   "createdAt": "…", "updatedAt": "…",
   "lastRunAt": "…", "lastStatus": "queued|ok|failed|skipped|timeout|interrupted",
   "nextRunAt": "…",
   "pendingOccurrence": {               // daemon-owned durable work; at most one per schedule
-    "id":"occ_…", "scheduledAt":"…", "phase":"pending|dispatching|accepted",
-    "attemptCount":1, "notBefore":"…", "runId":"run_…"
+    "id":"occ_…", "scheduledAt":"…", "phase":"pending|starting|dispatching|accepted",
+    "attemptCount":1, "notBefore":"…", "runId":"run_…",
+    "threadId":"…", "threadPath":"…" // optional fresh-thread recovery identity
   }
 }
 
@@ -419,6 +475,9 @@ the key for different content is rejected.
 {"kind":"cron",      "expression":"0 9 * * 1-5","timeZone":"Europe/Paris"}
 {"kind":"heartbeat", "everySeconds":900}   // fires only while the thread is idle; never stacks
 ```
+
+`namePattern` is limited to 256 UTF-8 bytes. `{date}` expands to the owed occurrence's UTC
+calendar date, so a delayed catch-up keeps the name of the day it was scheduled for.
 
 Cron support is the standard 5-field form (minute hour day-of-month month day-of-week) with
 `*`, `,`, `-`, `*/n` and named months/days. Anything unparseable is rejected at creation time
@@ -525,16 +584,23 @@ but cannot approve another browser.
 
 ```
 GET /v1/events            // text/event-stream
+event: ready       data: {}              // first frame; reload authoritative endpoints
 event: thread      data: {Thread}
 event: activity    data: {…GET /v1/activity payload…}
 event: run         data: {Run}
 event: schedule    data: {Schedule}
+event: schedule_deleted data: {"id":"sch_..."}
 event: interaction data: {PendingInteraction}   // resolvedAt set = it is no longer answerable
 : keep-alive every 20s
 ```
 
-Clients must tolerate unknown event names and unknown JSON fields — the same
-forward-compatibility rule the app applies to Pi's own RPC events.
+Clients must tolerate unknown event names and unknown JSON fields, following the same
+forward-compatibility rule the app applies to Pi's own RPC events. `ready` is a reconciliation
+barrier, not a claim that the preceding connection delivered every event. Clients reload their
+authoritative lists and any open detail after receiving it.
+`activity` is emitted only when the running-thread set or unread count changes. It includes turns
+started by the app, the daemon, or a terminal, so a client can update thinking indicators without
+polling every transcript.
 
 ## Storage
 
@@ -548,6 +614,7 @@ forward-compatibility rule the app applies to Pi's own RPC events.
                        coordination between Pi Desktop and pidesk, not part of this API
   schedules.json       every Schedule, written atomically
   runs.jsonl           append-only run history, rotated at a bounded size
+  submission-replays.json  bounded durable client-id replay ledger (0600)
   state.json           app state (archive, folders, drafts, unread, bounded native-turn recovery)
 ~/Library/Logs/Pi Desktop/daemon.log
 ```
@@ -565,8 +632,8 @@ the API, never by touching the files, so there is exactly one writer.
   Definite temporary failures before prompt delivery retry after 1m, 5m, 30m, 2h, and 8h; the
   attempt and deadline live in `schedules.json`, so closing the app only pauses the backoff. A
   prompt whose delivery began is outcome-ambiguous after interruption and is never auto-sent again.
-- A run spawns `pi --mode rpc` for the target session, applies `mode` if requested, sends the
-  prompt, streams events until `agent_settled`, then stops the runtime. A run that exceeds
+- A Pi run spawns `pi --mode rpc` for the target session, applies its Pi-only `mode` if requested,
+  then sends the prompt, streams events until `agent_settled`, then stops the runtime. A run that exceeds
   `timeoutSeconds` is aborted and recorded as `timeout`.
 - `skipIfRunning` consults the heartbeat state, so a thread a human is using in a terminal is
   never disturbed.
@@ -613,16 +680,18 @@ pidesk threads list [--query q] [--agent pi|codex|claude] [--running] [--automat
                     [--archived|--all] [--json]
 pidesk threads show <id> [--messages N] [--offset N] [--all] [--json]
 pidesk threads new --cwd DIR [--agent pi|codex|claude] [--worktree] [--name N]
-                   [--message M] [--mode ultra]
-pidesk threads send <id> "text" [--steer|--follow-up] [--wait]
+                   [--message M] [--mode ultra] [--client-id ID]
+pidesk threads send <id> "text" [--steer|--follow-up] [--wait] [--client-id ID]
 pidesk threads abort|archive|unarchive|rename <id> [args]
 pidesk threads watch [<id>]                     # streams /v1/events
 
 pidesk schedule list [--json]
 pidesk schedule add --name N (--thread ID | --cwd DIR) --prompt P
                     (--at ISO | --every 15m | --cron "0 9 * * 1-5" | --heartbeat 15m)
-                    [--mode ultra] [--skip-if-running] [--timeout 30m]
-pidesk schedule show|pause|resume|remove|run <id>
+                    [--agent AGENT] [--mode ultra] [--client-id ID]
+                    [--skip-if-running] [--timeout 30m]
+pidesk schedule show|pause|resume|remove <id>
+pidesk schedule run <id> [--client-id ID]
 
 pidesk daemon status|start|stop|restart|install|uninstall|logs [-f]
 pidesk remote enable [--port 7717] | disable | url | token
@@ -631,6 +700,14 @@ pidesk limits [--json]
 
 Every command supports `--json` so another agent can drive the app without screen-scraping.
 Exit codes: `0` ok, `1` request failed, `2` bad usage, `3` daemon unreachable.
+Thread creation, message submission, schedule creation, and manual runs generate an id once when
+`--client-id` is omitted.
+Supplying one lets a caller retry an ambiguous transport failure with exactly the same id. The CLI
+never recommends an automatic resend after prompt delivery may have started; it tells the caller
+to review the thread instead.
+Pi and Codex may be created without `--message`. Claude Code requires it. Whenever a message is
+present, the CLI supplies the server-required `clientId` automatically even when `--client-id` is
+omitted.
 
 ## Compatibility rules
 

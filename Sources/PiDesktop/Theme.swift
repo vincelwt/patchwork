@@ -108,7 +108,7 @@ enum PiTheme {
     static let runHistoryLimit = 50
     /// Git list starts collapsed and stays bounded even when expanded.
     static let gitFilePreviewCount = 12
-    static let gitFileHardLimit = 400
+    static let gitFileHardLimit = GitSnapshot.maxRetainedFiles
 
     /// The composer editor grows with its content between these bounds.
     static let composerMinEditorHeight: CGFloat = 30

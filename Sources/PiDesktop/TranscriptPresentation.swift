@@ -145,13 +145,18 @@ struct TranscriptWorkBlock: Identifiable, Hashable, Sendable {
                 return Self.statusLine(in: thinking.text, latest: true)
             case let .note(message):
                 if let compaction = TranscriptCompaction(message: message) { return compaction.title }
-                guard message.isError else { continue }
                 let detail = message.blocks.compactMap { block -> String? in
                     guard case let .text(text) = block.kind else { return nil }
                     return text
                 }.joined(separator: "\n")
+                if message.role == .assistant, !message.isError {
+                    let line = Self.statusLine(in: detail, latest: true)
+                    if !line.isEmpty { return line }
+                    continue
+                }
+                guard message.isError else { continue }
                 let line = Self.statusLine(in: detail, latest: false)
-                return line.isEmpty ? "Pi error" : "Pi error: \(line)"
+                return line.isEmpty ? "Agent error" : "Agent error: \(line)"
             case .activity:
                 continue
             }
@@ -332,6 +337,7 @@ private struct TurnBuilder {
     /// the turn's answer, and anything arriving later opens a new turn instead of burying it.
     private var trailingIsAnswer = false
     private var turnStart: Date?
+    private var turnAnchorID: String?
     private var lastTimestamp: Date?
     /// The last assistant message's error state seen so far this turn — overwritten, not OR'd,
     /// so a transient error Pi auto-retried past does not leave the settled turn flagged failed.
@@ -347,6 +353,7 @@ private struct TurnBuilder {
             lastTimestamp = message.timestamp
             userImageData = message.images.map(\.data)
             turnStart = message.timestamp
+            turnAnchorID = message.id
             result.append(.message(message, streaming: streaming))
             return
         }
@@ -434,6 +441,12 @@ private struct TurnBuilder {
         // Recorded after the blocks, not before them: a `demoteTrailing()` inside the loop can
         // close the previous turn, whose header must report *that* turn's answer, not this one.
         turnAnswerFailed = false
+        if message.stopReason == "toolUse", let progress = proseMessage() {
+            demoteTrailing()
+            closeActivity()
+            entries.append(.note(progress))
+            return
+        }
         if let answer = proseMessage() {
             // Prose that follows this turn's own work or carries a terminal stop reason is the
             // answer, not narration. Later custom/system updates must never bury a plain final.
@@ -554,6 +567,17 @@ private struct TurnBuilder {
                 startedAt: turnStart,
                 endedAt: lastTimestamp,
                 answerFailed: turnAnswerFailed
+            )))
+        } else if active, trailing.isEmpty {
+            // A run is visible from the moment it starts, before the transport has produced
+            // reasoning, prose, or a tool call. Once the first durable work entry arrives it
+            // supplies the normal long-lived identity for the row.
+            result.append(.work(TranscriptWorkBlock(
+                id: "work:waiting:\(turnAnchorID ?? "active-thread")",
+                entries: [],
+                isActive: true,
+                startedAt: turnStart,
+                endedAt: lastTimestamp
             )))
         }
         result.append(contentsOf: trailing)

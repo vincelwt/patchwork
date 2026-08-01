@@ -1,6 +1,11 @@
 import { h } from "../dom.js";
-import { describeError } from "../api.js";
+import { api, describeError } from "../api.js";
 import { AGENTS } from "../agents.mjs";
+import { protectedMutationDisposition } from "../liveSync.mjs";
+import {
+  scheduleCreationIntents,
+  scheduleCreationScope
+} from "../scheduleIntent.mjs";
 import { buildTrigger, parseDurationToSeconds } from "../trigger.mjs";
 
 const MODES = ["xfast", "fast", "smart", "ultra"];
@@ -21,6 +26,7 @@ function isoLocalNow(offsetMinutes = 60) {
 /** The schedule creation form: target, prompt, one of the four trigger kinds, and policy. */
 export function renderScheduleForm(state, actions) {
   let triggerKind = "interval";
+  let creationActive = false;
 
   // --- Target ---
   // Options are populated by `paintThreadOptions`, called both now and from `onStateChange`,
@@ -53,6 +59,7 @@ export function renderScheduleForm(state, actions) {
         onclick: (e) => {
           targetKindButtons.forEach((b) => b.setAttribute("aria-pressed", String(b === e.currentTarget)));
           paintTarget();
+          paintModeVisibility();
         }
       },
       kind === "existingThread" ? "Existing thread" : "New thread"
@@ -147,6 +154,24 @@ export function renderScheduleForm(state, actions) {
       mode
     )
   );
+  const modeField = h(
+    "div",
+    { class: "field" },
+    h("label", null, "Mode (optional)"),
+    h("div", { class: "segmented", role: "group", "aria-label": "Mode" }, modeButtons)
+  );
+  function paintModeVisibility() {
+    const useExisting = targetKindButtons[0].getAttribute("aria-pressed") === "true";
+    const selected = useExisting
+      ? state.threads.find((thread) => thread.id === targetExisting.value)
+      : null;
+    const agent = useExisting ? selected?.agent : agentSelect.value;
+    const supported = agent === "pi";
+    modeField.hidden = !supported;
+    if (!supported) modeButtons.forEach((button) => button.setAttribute("aria-pressed", "false"));
+  }
+  targetExisting.addEventListener("change", paintModeVisibility);
+  agentSelect.addEventListener("change", paintModeVisibility);
 
   // --- Advanced policy ---
   const skipIfRunning = h("input", { type: "checkbox", id: "policy-skip", checked: true });
@@ -158,6 +183,18 @@ export function renderScheduleForm(state, actions) {
 
   const errorBox = h("div", { class: "inline-error", role: "alert", hidden: true });
   const submitBtn = h("button", { class: "btn btn-primary btn-block", type: "submit" }, "Create schedule");
+  const retryBtn = h("button", {
+    class: "btn btn-primary btn-block", type: "button", hidden: true,
+    onclick: () => {
+      const pending = scheduleCreationIntents.pending(scheduleCreationScope);
+      if (pending?.disposition === "replayable") submitRequest(pending.body);
+    }
+  }, "Retry saved creation");
+  const reviewBtn = h("button", {
+    class: "btn btn-block", type: "button", hidden: true,
+    onclick: () => actions.navigate("/schedules")
+  }, "Review schedule list");
+  const pendingStatus = h("div", { class: "banner", role: "status", hidden: true });
 
   const form = h(
     "form",
@@ -165,7 +202,7 @@ export function renderScheduleForm(state, actions) {
     h("div", { class: "field" }, h("label", { for: "sched-name" }, "Name"), nameInput),
     h("div", { class: "field" }, h("label", null, "Target"), h("div", { class: "segmented", role: "group", "aria-label": "Target kind" }, targetKindButtons), targetBody),
     h("div", { class: "field" }, h("label", { for: "sched-prompt" }, "Prompt"), promptInput),
-    h("div", { class: "field" }, h("label", null, "Mode (optional)"), h("div", { class: "segmented", role: "group", "aria-label": "Mode" }, modeButtons)),
+    modeField,
     h("div", { class: "field" }, h("label", null, "Trigger"), h("div", { class: "segmented", role: "group", "aria-label": "Trigger kind" }, triggerKindButtons), triggerBody),
     h(
       "details",
@@ -181,11 +218,17 @@ export function renderScheduleForm(state, actions) {
       )
     ),
     errorBox,
+    pendingStatus,
+    retryBtn,
+    reviewBtn,
     submitBtn
   );
+  paintModeVisibility();
+  syncRecoveryControls();
 
-  function onSubmit(event) {
+  async function onSubmit(event) {
     event.preventDefault();
+    if (creationActive || scheduleCreationIntents.pending(scheduleCreationScope)) return;
     const name = nameInput.value.trim();
     const prompt = promptInput.value.trim();
     if (!name || !prompt) return;
@@ -217,25 +260,99 @@ export function renderScheduleForm(state, actions) {
 
     const mode = modeButtons.find((b) => b.getAttribute("aria-pressed") === "true");
 
+    const request = {
+      name,
+      enabled: true,
+      target,
+      prompt,
+      mode: mode ? mode.dataset.mode : undefined,
+      agent: useExisting ? undefined : agentSelect.value || undefined,
+      trigger: triggerResult.trigger,
+      policy
+    };
+    await submitRequest(request);
+  }
+
+  async function submitRequest(request) {
+    if (creationActive) return;
+    creationActive = true;
+    syncRecoveryControls();
+    let health;
+    try {
+      health = await api.health();
+    } catch (err) {
+      showError(`${describeError(err)} Schedule creation was not attempted.`);
+      creationActive = false;
+      syncRecoveryControls();
+      return;
+    }
+    const replaySafe = health?.scheduleIdempotency === true;
+    const reserved = await scheduleCreationIntents.reserve(
+      scheduleCreationScope, request, { replayProtected: replaySafe }
+    );
+    if (!reserved) {
+      showError(scheduleCreationIntents.error || "This saved creation request needs review.");
+      creationActive = false;
+      syncRecoveryControls();
+      return;
+    }
+
     errorBox.hidden = true;
-    submitBtn.disabled = true;
-    submitBtn.textContent = "Creating\u2026";
-    actions
-      .createSchedule({
-        name,
-        enabled: true,
-        target,
-        prompt,
-        mode: mode ? mode.dataset.mode : undefined,
-        agent: useExisting ? undefined : agentSelect.value || undefined,
-        trigger: triggerResult.trigger,
-        policy
-      })
-      .catch((err) => showError(describeError(err)))
-      .finally(() => {
-        submitBtn.disabled = false;
-        submitBtn.textContent = "Create schedule";
+    syncRecoveryControls();
+    try {
+      await actions.createSchedule(
+        reserved.replayProtected
+          ? { ...reserved.body, idempotencyKey: reserved.clientId }
+          : reserved.body
+      );
+      if (!(await scheduleCreationIntents.complete(
+        scheduleCreationScope, reserved.clientId
+      ))) {
+        throw new Error(scheduleCreationIntents.error || "The saved creation request could not be cleared.");
+      }
+      actions.navigate("/schedules", { replace: true });
+    } catch (err) {
+      const disposition = protectedMutationDisposition(err, {
+        replaySafe,
+        reviewCodes: ["schedule_creation_outcome_unknown", "idempotency_conflict"]
       });
+      if (disposition === "reset") {
+        await scheduleCreationIntents.complete(scheduleCreationScope, reserved.clientId);
+      } else if (disposition === "review") {
+        await scheduleCreationIntents.markReview(
+          scheduleCreationScope, reserved.clientId, err?.code || "outcome_unknown"
+        );
+      } else {
+        await scheduleCreationIntents.markReplayable(
+          scheduleCreationScope, reserved.clientId, err?.code || "retryable_failure"
+        );
+      }
+      showError(disposition === "retry"
+        ? `${describeError(err)} Retry uses the same protected creation request.`
+        : disposition === "review"
+          ? `${describeError(err)} Review the schedule list before trying again.`
+          : describeError(err));
+    } finally {
+      creationActive = false;
+      syncRecoveryControls();
+    }
+  }
+
+  function syncRecoveryControls() {
+    const pending = scheduleCreationIntents.pending(scheduleCreationScope);
+    const retryable = pending?.disposition === "replayable";
+    const needsReview = pending?.disposition === "review";
+    const attempting = pending?.disposition === "attempting";
+    retryBtn.hidden = !retryable;
+    retryBtn.disabled = creationActive;
+    reviewBtn.hidden = !needsReview;
+    reviewBtn.disabled = creationActive;
+    pendingStatus.hidden = !attempting;
+    pendingStatus.textContent = attempting
+      ? "This schedule creation request is still being attempted in another tab."
+      : "";
+    submitBtn.disabled = creationActive || !!pending;
+    submitBtn.textContent = creationActive ? "Creating\u2026" : "Create schedule";
   }
 
   function showError(message) {
@@ -254,6 +371,14 @@ export function renderScheduleForm(state, actions) {
     ),
     h("div", { class: "scroll" }, form)
   );
+  const unsubscribeIntent = scheduleCreationIntents.subscribe(syncRecoveryControls);
 
-  return { node, onStateChange: (next) => paintThreadOptions(next.threads) };
+  return {
+    node,
+    dispose: unsubscribeIntent,
+    onStateChange: (next) => {
+      paintThreadOptions(next.threads);
+      paintModeVisibility();
+    }
+  };
 }

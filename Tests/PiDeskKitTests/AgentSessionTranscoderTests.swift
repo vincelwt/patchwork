@@ -48,6 +48,7 @@ final class AgentSessionTranscoderTests: XCTestCase {
         """)
         let message = record?["message"] as? [String: Any]
         XCTAssertEqual(record?["type"] as? String, "message")
+        XCTAssertEqual(record?["id"] as? String, "msg_1")
         XCTAssertEqual(message?["role"] as? String, "assistant")
         // Only Codex's own final answer is a completed answer; see `CodexHarnessAndPhaseTests`.
         XCTAssertEqual(message?["stopReason"] as? String, "stop")
@@ -180,6 +181,61 @@ final class AgentSessionTranscoderTests: XCTestCase {
         // Claude's parent pointers routinely dangle (compaction and resume rewrite the file),
         // so the transcript is read in file order; see `testClaudeIsReadInFileOrder`.
         XCTAssertEqual(AgentSessionTranscoder.make(for: .claude).chain, .linear)
+    }
+
+    func testClaudeAssistantPrefersTheStreamingMessageIDForStableHydration() {
+        let record = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-2","parentUuid":"entry-1","message":{\
+        "id":"msg_2","role":"assistant","stop_reason":"end_turn",\
+        "content":[{"type":"text","text":"Done"}]}}
+        """)
+        XCTAssertEqual(record?["id"] as? String, "msg_2")
+        XCTAssertEqual(record?["parentId"] as? String, "entry-1")
+    }
+
+    func testClaudeNilStopNarrationStaysNonterminalAndKeepsItsRecordIdentity() {
+        let record = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-progress","message":{
+        "id":"msg_shared","role":"assistant",
+        "content":[{"type":"text","text":"Inspecting now"}]}}
+        """)
+        let message = record?["message"] as? [String: Any]
+        XCTAssertEqual(message?["stopReason"] as? String, "toolUse")
+        XCTAssertEqual(record?["id"] as? String, "entry-progress")
+    }
+
+    func testClaudeSplitWorkRecordsKeepUniqueTranscriptIDs() {
+        let thinking = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-thinking","message":{
+        "id":"msg_shared","role":"assistant","stop_reason":"tool_use",
+        "content":[{"type":"thinking","thinking":"Plan"}]}}
+        """)
+        let tool = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-tool","message":{
+        "id":"msg_shared","role":"assistant","stop_reason":"tool_use",
+        "content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}
+        """)
+
+        XCTAssertEqual(thinking?["id"] as? String, "entry-thinking")
+        XCTAssertEqual(tool?["id"] as? String, "entry-tool")
+        XCTAssertNotEqual(thinking?["id"] as? String, tool?["id"] as? String)
+    }
+
+    func testClaudeSplitTerminalRecordsKeepUniqueIDsAndOnlyTheAnswerHydrates() {
+        let thinking = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-thinking","message":{
+        "id":"msg_shared","role":"assistant","stop_reason":"end_turn",
+        "content":[{"type":"thinking","thinking":"Plan"}]}}
+        """)
+        let answer = transcode(.claude, """
+        {"type":"assistant","uuid":"entry-answer","message":{
+        "id":"msg_shared","role":"assistant","stop_reason":"end_turn",
+        "content":[{"type":"text","text":"Done"}]}}
+        """)
+
+        XCTAssertEqual(thinking?["id"] as? String, "entry-thinking")
+        XCTAssertEqual(answer?["id"] as? String, "msg_shared")
+        XCTAssertNotEqual(thinking?["id"] as? String, answer?["id"] as? String)
     }
 
     func testClaudeToolUseBecomesToolCallAndToolResultBecomesToolRole() {

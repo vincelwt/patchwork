@@ -36,6 +36,8 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
     public var id: String
     public var scheduleId: String?
     public var threadId: String?
+    /// Physical transcript identity. Absent on records written before path-scoped routing.
+    public var threadPath: String?
     public var trigger: RunTrigger
     public var startedAt: Date
     public var finishedAt: Date?
@@ -56,6 +58,7 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         id: String,
         scheduleId: String? = nil,
         threadId: String? = nil,
+        threadPath: String? = nil,
         trigger: RunTrigger,
         startedAt: Date,
         finishedAt: Date? = nil,
@@ -74,6 +77,7 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         self.id = id
         self.scheduleId = scheduleId
         self.threadId = threadId
+        self.threadPath = threadPath
         self.trigger = trigger
         self.startedAt = startedAt
         self.finishedAt = finishedAt
@@ -95,6 +99,7 @@ public struct Run: Codable, Hashable, Sendable, Identifiable {
         id = try container.decode(String.self, forKey: .id)
         scheduleId = try container.decodeIfPresent(String.self, forKey: .scheduleId)
         threadId = try container.decodeIfPresent(String.self, forKey: .threadId)
+        threadPath = try container.decodeIfPresent(String.self, forKey: .threadPath)
         trigger = try container.decodeIfPresent(RunTrigger.self, forKey: .trigger) ?? .other("unknown")
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt) ?? .distantPast
         finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)

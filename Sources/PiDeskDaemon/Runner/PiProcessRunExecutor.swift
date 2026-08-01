@@ -47,10 +47,14 @@ struct PiProcessRunExecutor: RunExecuting {
             cwd = URL(fileURLWithPath: cwdPath)
             sessionPath = nil
         }
+        let initialSessionName = Self.initialSessionName(for: job)
+        let adapter = AgentAdapterFactory.make(agent)
         let environment = AgentCatalog.augmentedEnvironment(executable: executable, cwd: cwd)
         let session = try PiRPCSession.start(
             cwd: cwd, sessionPath: sessionPath, piExecutable: executable, environment: environment,
-            adapter: AgentAdapterFactory.make(agent)
+            initialSessionID: sessionPath == nil ? job.initialSessionID : nil,
+            initialSessionName: sessionPath == nil ? initialSessionName : nil,
+            adapter: adapter
         )
         defer { session.stop() }
 
@@ -60,18 +64,65 @@ struct PiProcessRunExecutor: RunExecuting {
         let data = stateResponse["data"]
         let resolvedThreadId = data?["sessionId"]?.stringValue
         let resolvedThreadPath = data?["sessionFile"]?.stringValue
+        if sessionPath == nil, let expected = job.initialSessionID,
+           resolvedThreadId != expected {
+            throw RunnerError.processExited(
+                "\(agent.displayName) resolved session \(resolvedThreadId ?? "<missing>") instead of the preallocated identity \(expected)."
+            )
+        }
+        if let expected = job.target.existingThreadID, resolvedThreadId != expected {
+            throw RunnerError.processExited(
+                "\(agent.displayName) resumed session \(resolvedThreadId ?? "<missing>") instead of the requested identity \(expected)."
+            )
+        }
+        if sessionPath == nil,
+           let resolvedThreadId, !resolvedThreadId.isEmpty,
+           let resolvedThreadPath, !resolvedThreadPath.isEmpty {
+            if await job.onThreadIdentityResolved?(resolvedThreadId, resolvedThreadPath) == false {
+                return RunOutcome(
+                    status: .failed,
+                    error: "Another runtime already owns the conversation this agent resolved.",
+                    summary: nil,
+                    resolvedThreadId: resolvedThreadId,
+                    resolvedThreadPath: resolvedThreadPath,
+                    retryable: true
+                )
+            }
+        }
 
-        if let mode = job.mode?.trimmingCharacters(in: .whitespaces), !mode.isEmpty {
-            let modeID = try session.send(type: "prompt", payload: ["message": .string("/mode \(mode)")])
+        if sessionPath == nil, agent.capabilities.canRenameSession,
+           let initialSessionName {
+            do {
+                let nameID = try session.send(
+                    type: "set_session_name", payload: ["name": .string(initialSessionName)]
+                )
+                let response = try await session.receiveMatching(id: nameID, timeout: 30)
+                if let message = Self.responseError(response) {
+                    logger.warn("Run \(job.id) created its thread, but the initial name was rejected: \(message)")
+                }
+            } catch {
+                logger.warn("Run \(job.id) created its thread, but the initial name could not be confirmed: \(error)")
+            }
+        }
+
+        if let command = Self.piModeCommand(job.mode, agent: agent) {
+            let modeID = try session.send(type: "prompt", payload: ["message": .string(command)])
             let modeResponse = try await session.receiveMatching(id: modeID, timeout: 300)
             if let message = Self.responseError(modeResponse) {
-                return RunOutcome(status: .failed, error: "Could not apply mode \"\(mode)\": \(message)", summary: nil, resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath)
+                return RunOutcome(status: .failed, error: "Could not apply \(command): \(message)", summary: nil, resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath)
             }
         }
 
         // Persist the ambiguous-delivery boundary before writing a byte of the real prompt. If
         // that durable transition fails, stop: executing without it could duplicate side effects
         // after a crash and restart.
+        if Task.isCancelled {
+            return RunOutcome(
+                status: .interrupted, error: "The run stopped before prompt delivery.", summary: nil,
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                retryable: true
+            )
+        }
         let promptStartedAt = Date()
         if let onPromptDispatch = job.onPromptDispatch {
             switch await onPromptDispatch(promptStartedAt) {
@@ -89,6 +140,14 @@ struct PiProcessRunExecutor: RunExecuting {
                     resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath
                 )
             }
+        }
+
+        if Task.isCancelled {
+            return RunOutcome(
+                status: .interrupted, error: "The run stopped at the prompt delivery boundary.", summary: nil,
+                resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
+                promptStartedAt: promptStartedAt
+            )
         }
 
         let promptResponse: PiJSONValue
@@ -118,22 +177,30 @@ struct PiProcessRunExecutor: RunExecuting {
         // settle boundary: outside that window there is no turn to steer into, and a caller must
         // fall back to a fresh queued run.
         let liveThreadID = job.target.existingThreadID ?? resolvedThreadId
-        if let liveThreadID, let liveSessions {
-            liveSessions.register(threadID: liveThreadID, runID: job.id, handle: PiSessionRuntimeHandle(session: session))
+        let liveThreadKey = (job.target.existingThreadPath ?? resolvedThreadPath).map {
+            ThreadInstanceKey(path: $0)
+        }
+        if let liveThreadKey, let liveSessions {
+            liveSessions.register(thread: liveThreadKey, runID: job.id, handle: PiSessionRuntimeHandle(session: session))
+        }
+        if let resolvedThreadId, !resolvedThreadId.isEmpty,
+           let resolvedThreadPath, !resolvedThreadPath.isEmpty {
+            await job.onThreadReady?(resolvedThreadId, resolvedThreadPath)
         }
         // Not a `defer`: unregistering has to happen only *after* `consumeUntilSettled` has closed
         // admission, and the ordering matters more than the brevity. `session.stop()`'s own defer
         // still runs after this, so the process is never left behind on a throw.
         do {
             let outcome = try await consumeUntilSettled(
-                session, job: job, liveThreadID: liveThreadID,
+                session, job: job, liveThreadKey: liveThreadKey, interactionThreadID: liveThreadID,
+                interactionThreadPath: job.target.existingThreadPath ?? resolvedThreadPath,
                 resolvedThreadId: resolvedThreadId, resolvedThreadPath: resolvedThreadPath,
                 promptStartedAt: promptStartedAt, promptAcceptedAt: promptAcceptedAt
             )
-            await finishLive(session, liveThreadID: liveThreadID, job: job)
+            await finishLive(session, liveThreadKey: liveThreadKey, job: job)
             return outcome
         } catch {
-            await finishLive(session, liveThreadID: liveThreadID, job: job)
+            await finishLive(session, liveThreadKey: liveThreadKey, job: job)
             logger.error("Run \(job.id) was interrupted after Pi accepted its prompt: \(error)")
             return RunOutcome(
                 status: .interrupted, error: "The accepted run was interrupted before it settled.", summary: nil,
@@ -143,8 +210,33 @@ struct PiProcessRunExecutor: RunExecuting {
         }
     }
 
-    private func finishLive(_ session: PiRPCSession, liveThreadID: String?, job: RunJob) async {
-        if let liveThreadID, let liveSessions {
+    static func piModeCommand(_ raw: String?, agent: AgentKind) -> String? {
+        guard agent == .pi,
+              let mode = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !mode.isEmpty else { return nil }
+        return "/mode \(mode)"
+    }
+
+    static func initialSessionName(for job: RunJob) -> String? {
+        guard case let .newThread(_, pattern, _) = job.target,
+              let pattern = pattern?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !pattern.isEmpty else { return nil }
+        guard job.scheduleId != nil, pattern.contains("{date}") else {
+            return ThreadCreationService.boundedInitialName(pattern)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        let expanded = pattern.replacingOccurrences(
+            of: "{date}", with: formatter.string(from: job.scheduledAt ?? job.queuedAt)
+        )
+        return ThreadCreationService.boundedInitialName(expanded)
+    }
+
+    private func finishLive(_ session: PiRPCSession, liveThreadKey: ThreadInstanceKey?, job: RunJob) async {
+        if let liveThreadKey, let liveSessions {
             // A settle boundary already closed admission with nothing in flight, so this returns
             // at once on the ordinary path. A timeout or an abort is the case it exists for:
             // those arrive whenever they like, including while a steer is being written, and
@@ -154,7 +246,7 @@ struct PiProcessRunExecutor: RunExecuting {
             // pipe as they do, because an acknowledgement nobody reads is indistinguishable from
             // one Pi never sent, and "outcome unknown" is never retried.
             await liveSessions.drainForShutdown(
-                threadID: liveThreadID, runID: job.id,
+                thread: liveThreadKey, runID: job.id,
                 deadline: Date().addingTimeInterval(LiveSessionRegistry.drainSeconds)
             ) {
                 // A process that has already exited can neither acknowledge anything nor be
@@ -165,7 +257,7 @@ struct PiProcessRunExecutor: RunExecuting {
                 _ = try? await session.receiveNext(timeout: 0.1)
                 return true
             }
-            liveSessions.unregister(threadID: liveThreadID, runID: job.id)
+            liveSessions.unregister(thread: liveThreadKey, runID: job.id)
         }
         interactions?.cancelAll(runID: job.id)
     }
@@ -185,7 +277,9 @@ struct PiProcessRunExecutor: RunExecuting {
     }
 
     private func consumeUntilSettled(
-        _ session: PiRPCSession, job: RunJob, liveThreadID: String?,
+        _ session: PiRPCSession, job: RunJob, liveThreadKey: ThreadInstanceKey?,
+        interactionThreadID: String?,
+        interactionThreadPath: String?,
         resolvedThreadId: String?, resolvedThreadPath: String?,
         promptStartedAt: Date, promptAcceptedAt: Date
     ) async throws -> RunOutcome {
@@ -212,8 +306,8 @@ struct PiProcessRunExecutor: RunExecuting {
             let remaining = deadline.timeIntervalSinceNow
             guard remaining > 0 else { return timedOut() }
 
-            if retryingClose, let liveThreadID, let liveSessions {
-                switch liveSessions.closeAdmission(threadID: liveThreadID, runID: job.id) {
+            if retryingClose, let liveThreadKey, let liveSessions {
+                switch liveSessions.closeAdmission(thread: liveThreadKey, runID: job.id) {
                 case .closed:
                     return settledOutcome(
                         lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
@@ -239,7 +333,11 @@ struct PiProcessRunExecutor: RunExecuting {
             if !specs.isEmpty { questionSpecs = specs }
 
             if type == "extension_ui_request" {
-                registerInteraction(event, session: session, job: job, threadID: liveThreadID, specs: questionSpecs)
+                registerInteraction(
+                    event, session: session, job: job,
+                    threadID: interactionThreadID, threadPath: interactionThreadPath,
+                    specs: questionSpecs
+                )
             }
 
             if type == "message_end", let message = event["message"], message["role"]?.stringValue == "assistant" {
@@ -250,13 +348,13 @@ struct PiProcessRunExecutor: RunExecuting {
                 // A settle boundary is the only place this run may stop accepting live messages,
                 // and closing admission is what makes that safe: a steer accepted moments ago owns
                 // the turn now starting, and stopping the session here would discard it.
-                guard let liveThreadID, let liveSessions else {
+                guard let liveThreadKey, let liveSessions else {
                     return settledOutcome(
                         lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
                         promptStartedAt, promptAcceptedAt
                     )
                 }
-                switch liveSessions.closeAdmission(threadID: liveThreadID, runID: job.id) {
+                switch liveSessions.closeAdmission(thread: liveThreadKey, runID: job.id) {
                 case .closed:
                     return settledOutcome(
                         lastAssistantText, lastAssistantIsError, resolvedThreadId, resolvedThreadPath,
@@ -306,14 +404,19 @@ struct PiProcessRunExecutor: RunExecuting {
     private static let maxOptionLength = 500
     private static let maxOptionsTotalLength = 20_000
 
-    private func registerInteraction(_ event: PiJSONValue, session: PiRPCSession, job: RunJob, threadID: String?, specs: [QuestionSpec]) {
+    private func registerInteraction(
+        _ event: PiJSONValue, session: PiRPCSession, job: RunJob,
+        threadID: String?, threadPath: String?, specs: [QuestionSpec]
+    ) {
         guard let id = event["id"]?.stringValue, !id.isEmpty,
               let method = event["method"]?.stringValue,
               !Self.nonBlockingDialogMethods.contains(method.lowercased()) else { return }
 
+        let wireID = id
+        let publicID = "\(job.id):\(wireID)"
         let cancel: @Sendable () -> Void = {
             try? session.sendRaw([
-                "type": .string("extension_ui_response"), "id": .string(id), "cancelled": .bool(true)
+                "type": .string("extension_ui_response"), "id": .string(wireID), "cancelled": .bool(true)
             ])
         }
         guard let interactions else { return cancel() }
@@ -325,9 +428,10 @@ struct PiProcessRunExecutor: RunExecuting {
         let timeout = min(max(requested ?? InteractionRegistry.defaultTimeout, 1), InteractionRegistry.maxTimeout)
 
         let interaction = PendingInteraction(
-            id: id,
+            id: publicID,
             runId: job.id,
             threadId: threadID,
+            threadPath: threadPath,
             method: InteractionMethod(rawValue: method),
             title: String(title.prefix(2_000)),
             message: event["message"]?.stringValue.map { String($0.prefix(4_000)) },
@@ -345,12 +449,14 @@ struct PiProcessRunExecutor: RunExecuting {
         let registered = interactions.register(interaction) { response in
             // Throwing rather than swallowing: a write that never reached Pi must fail the
             // caller's request, not be reported as an answered dialog.
-            try session.sendRaw(response)
+            var wireResponse = response
+            wireResponse["id"] = .string(wireID)
+            try session.sendRaw(wireResponse)
         }
         if !registered {
             // Pi is blocked on this request; refusing it explicitly is the only safe way to stay
             // within the bound.
-            logger.warn("Interaction \(id) refused: too many dialogs are already pending.")
+            logger.warn("Interaction \(publicID) refused: too many dialogs are already pending.")
             cancel()
         }
     }

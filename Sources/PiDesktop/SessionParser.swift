@@ -84,13 +84,14 @@ struct SessionParser {
         var thinkingLevel: String?
         var metrics = TokenMetrics()
         var pullRequestCreationCallIDs: Set<String> = []
+        var firstUserText: String?
 
         // A summary is derived from a file that may be appended to constantly, so it is
         // recomputed whenever that file changes. Reading a multi-hundred-megabyte transcript in
         // full for that took over a minute per pass; the head and tail carry everything a
         // sidebar row shows, and `isWindowed` records that the counts are partial.
-        let windowed = JSONLFileReader.isWindowed(url: url)
-        try JSONLFileReader.read(url: url, window: .default) { rawRecord in
+        var windowed = JSONLFileReader.isWindowed(url: url, window: .threadSummary)
+        try JSONLFileReader.read(url: url, window: .threadSummary) { rawRecord in
             try Task.checkCancellation()
             guard let data = transcoder.transcode(rawRecord) else { return }
             guard let raw = try? JSONValue.decode(data), let object = raw.objectValue else { return }
@@ -154,7 +155,12 @@ struct SessionParser {
                 messageCount += 1
                 if let message = object["message"] {
                     let role = message["role"]?.stringValue
-                    if role == "user" { userText = extractText(from: message["content"]) }
+                    if role == "user" {
+                        userText = extractText(from: message["content"])
+                        if firstUserText == nil, let text = userText?.condensed.nonEmpty {
+                            firstUserText = text
+                        }
+                    }
                     if role == "assistant" {
                         model = message["model"]?.stringValue ?? model
                         provider = message["provider"]?.stringValue ?? provider
@@ -192,6 +198,7 @@ struct SessionParser {
                 createdPullRequestAt: createdPullRequestAt
             )
         }
+        windowed = windowed || JSONLFileReader.isWindowed(url: url, window: .threadSummary)
 
         var activePath: [MinimalEntry] = []
         switch transcoder.chain {
@@ -208,7 +215,7 @@ struct SessionParser {
             activePath.reverse()
         }
 
-        let firstPrompt = activePath.compactMap(\.userText).first?.condensed
+        let firstPrompt = activePath.compactMap(\.userText).first?.condensed ?? firstUserText
         let title = explicitName?.condensed.nonEmpty ?? firstPrompt?.headline(max: 74) ?? "Untitled conversation"
         // Previews are retained for every discovered session, so they stay bounded while
         // remaining long enough for sidebar search to be useful.
@@ -672,11 +679,22 @@ struct SessionParser {
         return chatMessage(fromAgentMessage: message, id: id, budget: &budget)
     }
 
-    static func chatMessage(fromAgentMessage message: JSONValue, id: String? = nil, budget: inout ImageBudget) -> ChatMessage? {
+    static func chatMessage(
+        fromAgentMessage message: JSONValue,
+        id: String? = nil,
+        budget: inout ImageBudget,
+        fallbackTimestamp: JSONValue? = nil
+    ) -> ChatMessage? {
         guard let roleName = message["role"]?.stringValue else { return nil }
         if roleName == "custom", message["display"]?.boolValue == false { return nil }
-        let timestamp = date(from: message["timestamp"])
-        let stableID = id ?? "rpc-\(roleName)-\(message["timestamp"]?.intValue ?? Int(Date().timeIntervalSince1970 * 1_000))"
+        // Persisted Pi-shaped entries keep their timestamp beside `message`, while live RPC
+        // events keep it inside `message`. Codex and Claude are transcoded to the persisted
+        // shape, so dropping the outer value made their durable user echo impossible to match
+        // against the optimistic row and left two visually identical submissions on screen.
+        let timestamp = date(from: message["timestamp"] ?? fallbackTimestamp)
+        let stableID = id
+            ?? message["id"]?.stringValue
+            ?? "rpc-\(roleName)-\(message["timestamp"]?.intValue ?? Int(Date().timeIntervalSince1970 * 1_000))"
 
         if roleName == "branchSummary" || roleName == "compactionSummary" {
             let title = roleName == "branchSummary" ? "Branch summary" : "Context compacted"
@@ -784,7 +802,12 @@ struct SessionParser {
         switch entry.type {
         case "message":
             guard let message = entry.raw["message"] else { return nil }
-            return chatMessage(fromAgentMessage: message, id: entry.id, budget: &budget)
+            return chatMessage(
+                fromAgentMessage: message,
+                id: entry.id,
+                budget: &budget,
+                fallbackTimestamp: entry.raw["timestamp"]
+            )
         case "custom_message":
             guard entry.raw["display"]?.boolValue != false else { return nil }
             return ChatMessage(

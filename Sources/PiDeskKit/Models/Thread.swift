@@ -409,6 +409,8 @@ public struct CreateThreadRequest: Codable, Sendable {
     public var message: String?
     public var mode: String?
     public var worktree: Bool?
+    /// Stable across retries of the same create request, including a lost HTTP response.
+    public var clientId: String?
     /// Which agent should own the new thread. Absent means Pi, so an older client keeps the
     /// behaviour it has always had.
     public var agent: AgentKind?
@@ -417,7 +419,8 @@ public struct CreateThreadRequest: Codable, Sendable {
     public var desktopManaged: Bool?
     public init(
         cwd: String, name: String? = nil, message: String? = nil, mode: String? = nil,
-        worktree: Bool? = nil, agent: AgentKind? = nil, desktopManaged: Bool? = nil
+        worktree: Bool? = nil, agent: AgentKind? = nil, clientId: String? = nil,
+        desktopManaged: Bool? = nil
     ) {
         self.cwd = cwd
         self.name = name
@@ -425,16 +428,22 @@ public struct CreateThreadRequest: Codable, Sendable {
         self.mode = mode
         self.worktree = worktree
         self.agent = agent
+        self.clientId = clientId
         self.desktopManaged = desktopManaged
     }
 }
 
-public struct CreateThreadResponse: Codable, Sendable {
+public struct CreateThreadResponse: Codable, Equatable, Sendable {
     public var thread: PiThread
     public var runId: String?
-    public init(thread: PiThread, runId: String? = nil) {
+    /// Present when the physical thread was created but its optional first message could not be
+    /// admitted. The caller must keep the real thread and preserve the message for an explicit
+    /// retry instead of creating another thread.
+    public var firstMessageError: String?
+    public init(thread: PiThread, runId: String? = nil, firstMessageError: String? = nil) {
         self.thread = thread
         self.runId = runId
+        self.firstMessageError = firstMessageError
     }
 }
 

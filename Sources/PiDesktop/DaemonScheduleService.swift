@@ -18,15 +18,19 @@ final class DaemonScheduleService: ScheduleServing {
         }
     }
 
-    func save(_ schedule: ScheduleEntry) async throws -> ScheduleEntry {
+    func save(_ schedule: ScheduleEntry, isNew: Bool) async throws -> ScheduleEntry {
         do {
-            // A schedule the daemon has never seen is created; anything else is patched, so an
-            // edit never resurrects a deleted automation under a stale id.
-            let known = try await client.listSchedules().schedules.contains { $0.id == schedule.id }
-            let wire = known
-                ? try await client.updateSchedule(id: schedule.id, schedule.updateRequest).schedule
-                : try await client.createSchedule(schedule.createRequest).schedule
+            // The editor already knows whether this is a draft or an edit. Sending that intent
+            // directly removes a preflight list request and its create/update race.
+            let wire = isNew
+                ? try await client.createSchedule(schedule.createRequest).schedule
+                : try await client.updateSchedule(id: schedule.id, schedule.updateRequest).schedule
             return ScheduleEntry(wire: wire)
+        } catch PiDeskClientError.outcomeUnknown where isNew {
+            throw ScheduleServiceError.creationOutcomeUnknown
+        } catch let PiDeskClientError.badRequest(code, _)
+            where isNew && code == "idempotency_conflict" {
+            throw ScheduleServiceError.creationOutcomeUnknown
         } catch {
             throw Self.surfaced(error)
         }
@@ -48,11 +52,11 @@ final class DaemonScheduleService: ScheduleServing {
         }
     }
 
-    func runNow(id: String) async throws {
+    func runNow(id: String, clientID: String) async throws {
         do {
-            _ = try await client.runSchedule(id: id)
+            _ = try await client.runSchedule(id: id, clientId: clientID)
         } catch {
-            throw Self.surfaced(error)
+            throw Self.surfacedRun(error)
         }
     }
 
@@ -70,6 +74,21 @@ final class DaemonScheduleService: ScheduleServing {
         if case PiDeskClientError.daemonUnreachable = error { return ScheduleServiceError.daemonUnavailable }
         return error
     }
+
+    static func surfacedRun(_ error: Error) -> Error {
+        if case PiDeskClientError.outcomeUnknown = error {
+            return ScheduleServiceError.outcomeUnknown
+        }
+        if case let PiDeskClientError.badRequest(code, _) = error,
+           code == "schedule_run_outcome_unknown" || code == "run_id_conflict" {
+            return ScheduleServiceError.outcomeUnknown
+        }
+        if case let PiDeskClientError.server(_, code, _) = error,
+           code == "schedule_run_outcome_unknown" || code == "run_id_conflict" {
+            return ScheduleServiceError.outcomeUnknown
+        }
+        return surfaced(error)
+    }
 }
 
 extension ScheduleEntry {
@@ -81,6 +100,7 @@ extension ScheduleEntry {
             target: Target(wire: wire.target),
             prompt: wire.prompt,
             mode: wire.mode,
+            agent: wire.agent,
             trigger: Trigger(wire: wire.trigger),
             skipIfRunning: wire.policy.skipIfRunning,
             timeoutSeconds: wire.policy.timeoutSeconds,
@@ -92,13 +112,15 @@ extension ScheduleEntry {
 
     var createRequest: ScheduleCreateRequest {
         ScheduleCreateRequest(
+            idempotencyKey: id,
             name: name,
             enabled: enabled,
             target: target.wire,
             prompt: prompt,
             mode: mode,
             trigger: trigger.wire,
-            policy: SchedulePolicy(skipIfRunning: skipIfRunning, timeoutSeconds: timeoutSeconds)
+            policy: SchedulePolicy(skipIfRunning: skipIfRunning, timeoutSeconds: timeoutSeconds),
+            agent: requestAgent
         )
     }
 
@@ -108,10 +130,16 @@ extension ScheduleEntry {
             enabled: enabled,
             target: target.wire,
             prompt: prompt,
-            mode: mode,
+            mode: mode ?? "",
             trigger: trigger.wire,
-            policy: SchedulePolicy(skipIfRunning: skipIfRunning, timeoutSeconds: timeoutSeconds)
+            policy: SchedulePolicy(skipIfRunning: skipIfRunning, timeoutSeconds: timeoutSeconds),
+            agent: requestAgent
         )
+    }
+
+    private var requestAgent: AgentKind? {
+        if case .newThread = target { return agent }
+        return nil
     }
 }
 

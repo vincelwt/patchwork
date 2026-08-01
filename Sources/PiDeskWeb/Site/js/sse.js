@@ -8,6 +8,7 @@ import { connectRelayEvents, isRelayMode } from "./relay.js";
 
 const INITIAL_DELAY_MS = 1000;
 const MAX_DELAY_MS = 30000;
+const MAX_EVENT_CHARS = 16 * 1024 * 1024;
 
 /**
  * Opens `GET /v1/events` and calls `onEvent(name, data)` per SSE frame. `data` is JSON-parsed
@@ -44,6 +45,7 @@ export function connectEvents({ onEvent, onStatus }) {
         delay = INITIAL_DELAY_MS; // a successful connect resets backoff
         await readFrames(response.body, onEvent);
         if (closed) return;
+        onStatus("offline");
         delay = INITIAL_DELAY_MS; // the stream also ended cleanly: reconnect promptly, not slowly
       } catch {
         if (closed) return;
@@ -70,11 +72,17 @@ async function readFrames(body, onEvent) {
   let buffer = "";
   let eventName = "message";
   let dataLines = [];
+  let dataChars = 0;
 
   const dispatch = () => {
-    if (!dataLines.length) return;
+    if (!dataLines.length) {
+      eventName = "message";
+      dataChars = 0;
+      return;
+    }
     const raw = dataLines.join("\n");
     dataLines = [];
+    dataChars = 0;
     let payload = raw;
     try {
       payload = JSON.parse(raw);
@@ -92,6 +100,7 @@ async function readFrames(body, onEvent) {
       return;
     }
     buffer += decoder.decode(value, { stream: true });
+    if (buffer.length > MAX_EVENT_CHARS) throw new Error("event frame too large");
 
     let newline;
     while ((newline = buffer.indexOf("\n")) !== -1) {
@@ -105,8 +114,14 @@ async function readFrames(body, onEvent) {
       const colon = line.indexOf(":");
       const field = colon === -1 ? line : line.slice(0, colon);
       const fieldValue = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /, "");
-      if (field === "event") eventName = fieldValue;
-      else if (field === "data") dataLines.push(fieldValue);
+      if (field === "event") {
+        eventName = fieldValue;
+        if (eventName.length + dataChars > MAX_EVENT_CHARS) throw new Error("event frame too large");
+      } else if (field === "data") {
+        dataChars += fieldValue.length + 1;
+        if (eventName.length + dataChars > MAX_EVENT_CHARS) throw new Error("event frame too large");
+        dataLines.push(fieldValue);
+      }
       // "id" and "retry" are valid SSE fields; this client has no use for either yet.
     }
   }

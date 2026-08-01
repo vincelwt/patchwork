@@ -60,18 +60,25 @@ final class FakeThreadRPCService: ThreadRPCServing, @unchecked Sendable {
 
     let thread: PiThread
     var runtime: ThreadRuntimeState
+    private let createHook: (@Sendable () async -> Void)?
 
-    init(thread: PiThread, runtime: ThreadRuntimeState = ThreadRuntimeState()) {
+    init(
+        thread: PiThread, runtime: ThreadRuntimeState = ThreadRuntimeState(),
+        createHook: (@Sendable () async -> Void)? = nil
+    ) {
         self.thread = thread
         self.runtime = runtime
+        self.createHook = createHook
     }
 
     func createIdle(agent: AgentKind, cwd: URL, name: String?) async throws -> PiThread {
         recordAgent(agent)
         recordCreate(cwd: cwd)
+        await createHook?()
         var created = thread
         created.cwd = cwd.standardizedFileURL.path
         created.folder = cwd.lastPathComponent
+        created.agent = agent
         return created
     }
 
@@ -164,6 +171,7 @@ enum TestSupport {
             schedulesFileURL: directory.appendingPathComponent("schedules.json"),
             runHistoryFileURL: directory.appendingPathComponent("runs.jsonl"),
             overlayFileURL: directory.appendingPathComponent("overlay.json"),
+            submissionFileURL: directory.appendingPathComponent("submission-replays.json"),
             schedulerPollInterval: schedulerPollInterval,
             schedulerRetryDelays: schedulerRetryDelays,
             networkAvailable: networkAvailable,
@@ -173,7 +181,8 @@ enum TestSupport {
             // Never the real app's `state.json` or worktree root: fixtures must stay inside the
             // throwaway directory and no test may alter the user's managed worktrees.
             appStateURL: directory.appendingPathComponent("state.json"),
-            worktreeRootURL: directory.appendingPathComponent("worktrees", isDirectory: true)
+            worktreeRootURL: directory.appendingPathComponent("worktrees", isDirectory: true),
+            isAgentInstalled: { _ in true }
         )
     }
 
@@ -184,6 +193,7 @@ enum TestSupport {
         assignments: [String: String] = [:],
         projectAssignments: [String: String] = [:],
         archivedSessionIDs: [String] = [],
+        archivedSessionPaths: [String] = [],
         appStartedSessionPaths: [String] = [],
         showsForeignConversations: Bool = false,
         disabledAgents: [String] = []
@@ -191,11 +201,13 @@ enum TestSupport {
         let pairs = assignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
         let projectPairs = projectAssignments.map { "\"\($0.key)\":\"\($0.value)\"" }.joined(separator: ",")
         let archived = archivedSessionIDs.map { "\"\($0)\"" }.joined(separator: ",")
+        let archivedPaths = archivedSessionPaths.map { "\"\($0)\"" }.joined(separator: ",")
         let started = appStartedSessionPaths.map { "\"\($0)\"" }.joined(separator: ",")
         let disabled = disabledAgents.map { "\"\($0)\"" }.joined(separator: ",")
         let json = """
         {"virtualFolders":\(folders),"virtualFolderAssignments":{\(pairs)},\
         "projectFolderAssignments":{\(projectPairs)},"archivedSessionIDs":[\(archived)],\
+        "archivedSessionPaths":[\(archivedPaths)],\
         "appStartedSessionPaths":[\(started)],"showsForeignConversations":\(showsForeignConversations),\
         "disabledAgents":[\(disabled)]}
         """
@@ -212,6 +224,26 @@ enum TestSupport {
         try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         return url
     }
+
+    static func writeClaudeTranscript(
+        in root: URL, id: String, cwd: String, message: String = "hello",
+        name: String? = nil
+    ) -> URL {
+        let project = root.appendingPathComponent("project", isDirectory: true)
+        try? FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let url = project.appendingPathComponent("\(id).jsonl")
+        var lines: [String] = []
+        if let name {
+            lines.append(#"{"type":"custom-title","customTitle":"\#(name)"}"#)
+        }
+        lines.append(
+            #"{"type":"user","uuid":"u1","sessionId":"\#(id)","cwd":"\#(cwd)","timestamp":"2026-07-31T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"\#(message)"}]}}"#
+        )
+        try? (lines.joined(separator: "\n") + "\n").write(
+            to: url, atomically: true, encoding: .utf8
+        )
+        return url
+    }
 }
 
 extension TestSupport {
@@ -224,7 +256,7 @@ extension TestSupport {
         let lines = [
             #"{"timestamp":"2026-07-31T00:00:00.000Z","type":"session_meta","payload":{"session_id":"\#(id)","cwd":"\#(cwd)","timestamp":"2026-07-31T00:00:00.000Z","thread_source":"user"}}"#,
             #"{"timestamp":"2026-07-31T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"a codex question"}]}}"#,
-            #"{"timestamp":"2026-07-31T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a codex answer"}]}}"#
+            #"{"timestamp":"2026-07-31T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"a codex answer"}]}}"#
         ]
         try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
         return url

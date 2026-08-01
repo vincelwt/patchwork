@@ -5,11 +5,21 @@ import SwiftUI
 /// timing, and one error or summary per run; full output remains in the target conversation.
 struct RunHistoryView: View {
     let entry: ScheduleEntry
+    let requiresAcknowledgement: Bool
+    let onReviewed: () -> Bool
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: RunHistoryModel
+    @State private var reviewError: String?
 
-    init(entry: ScheduleEntry, service: any ScheduleServing) {
+    init(
+        entry: ScheduleEntry,
+        service: any ScheduleServing,
+        requiresAcknowledgement: Bool = false,
+        onReviewed: @escaping () -> Bool = { true }
+    ) {
         self.entry = entry
+        self.requiresAcknowledgement = requiresAcknowledgement
+        self.onReviewed = onReviewed
         _model = StateObject(wrappedValue: RunHistoryModel(service: service, scheduleID: entry.id))
     }
 
@@ -20,9 +30,22 @@ struct RunHistoryView: View {
             content
             PiHairline()
             HStack {
+                if let reviewError {
+                    Text(reviewError)
+                        .font(PiFont.caption)
+                        .foregroundStyle(Color.piRed)
+                        .lineLimit(2)
+                }
                 Spacer()
-                Button("Done") { dismiss() }
+                Button(requiresAcknowledgement ? "I Reviewed History" : "Done") {
+                    if !requiresAcknowledgement || onReviewed() {
+                        dismiss()
+                    } else {
+                        reviewError = ScheduleServiceError.recoveryStorageUnavailable.localizedDescription
+                    }
+                }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(requiresAcknowledgement && !model.hasAuthoritativeSnapshot)
             }
             .padding(PiTheme.space12)
         }
@@ -182,25 +205,40 @@ final class RunHistoryModel: ObservableObject {
     @Published private(set) var error: String?
     /// Starts true so the sheet opens on a spinner instead of flashing "No runs yet".
     @Published private(set) var isLoading = true
+    @Published private(set) var hasAuthoritativeSnapshot = false
 
     private let service: any ScheduleServing
     private let scheduleID: String
+    private var reloadGeneration = 0
+    private var outstandingReloads = 0
 
     init(service: any ScheduleServing, scheduleID: String) {
         self.service = service
         self.scheduleID = scheduleID
     }
 
-    func reload() async {
+    @discardableResult
+    func reload() async -> Bool {
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        outstandingReloads += 1
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            outstandingReloads -= 1
+            isLoading = outstandingReloads > 0
+        }
         do {
             let loaded = try await service.loadRuns(scheduleID: scheduleID)
                 .sorted { $0.startedAt > $1.startedAt }
+            guard generation == reloadGeneration else { return false }
             runs = Array(loaded.prefix(PiTheme.runHistoryLimit))
             error = nil
+            hasAuthoritativeSnapshot = true
+            return true
         } catch {
+            guard generation == reloadGeneration else { return false }
             self.error = error.localizedDescription
+            return false
         }
     }
 }

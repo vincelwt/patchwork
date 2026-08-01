@@ -338,6 +338,7 @@ actor RelayService {
     private var eventTask: Task<Void, Never>?
     private var eventContinuation: AsyncStream<QueuedRelayEvent>.Continuation?
     private var busSubscription: UUID?
+    private var eventForwardingGeneration: UInt64 = 0
     private var router: DaemonRouter?
 
     init(
@@ -355,23 +356,65 @@ actor RelayService {
     func start(router: DaemonRouter) {
         guard loopTask == nil else { return }
         self.router = router
-        var continuation: AsyncStream<QueuedRelayEvent>.Continuation?
-        let stream = AsyncStream<QueuedRelayEvent>(bufferingPolicy: .bufferingNewest(256)) { continuation = $0 }
-        eventContinuation = continuation
-        busSubscription = bus.subscribe { name, payload in
-            continuation?.yield(QueuedRelayEvent(name: name, payload: payload))
-        }
-        eventTask = Task { [weak self] in
-            for await event in stream {
-                guard !Task.isCancelled else { break }
-                await self?.broadcastEvent(name: event.name, payload: event.payload)
-            }
-        }
+        installEventForwarding()
         connection = .connecting
         loopTask = Task { [weak self] in await self?.connectionLoop() }
     }
 
+    /// The relay has a second bounded queue after `EventBus`. If either queue overflows, rebuild
+    /// the forwarding pipeline and put a `ready` barrier at the front of the replacement. The web
+    /// client then reloads authoritative endpoints, while future events continue flowing instead
+    /// of leaving the original overflowed subscription permanently silent.
+    private func installEventForwarding() {
+        eventForwardingGeneration &+= 1
+        let generation = eventForwardingGeneration
+        var continuation: AsyncStream<QueuedRelayEvent>.Continuation?
+        let stream = AsyncStream<QueuedRelayEvent>(bufferingPolicy: .bufferingNewest(256)) { continuation = $0 }
+        guard let continuation else { return }
+        eventContinuation = continuation
+        busSubscription = bus.subscribe(
+            initialName: "ready",
+            initialPayload: Data("{}".utf8),
+            onOverflow: { [weak self] in
+                Task { await self?.recoverEventForwarding(generation: generation) }
+            }
+        ) { [weak self] name, payload in
+            switch continuation.yield(QueuedRelayEvent(name: name, payload: payload)) {
+            case .enqueued:
+                break
+            case .dropped:
+                Task { await self?.recoverEventForwarding(generation: generation) }
+            case .terminated:
+                break
+            @unknown default:
+                Task { await self?.recoverEventForwarding(generation: generation) }
+            }
+        }
+        eventTask = Task { [weak self] in
+            for await event in stream {
+                guard !Task.isCancelled else { break }
+                await self?.broadcastEvent(
+                    name: event.name, payload: event.payload,
+                    forwardingGeneration: generation
+                )
+            }
+        }
+    }
+
+    private func recoverEventForwarding(generation: UInt64) {
+        guard generation == eventForwardingGeneration, loopTask != nil else { return }
+        logger.warn("Relay event forwarding fell behind; refreshing connected clients.")
+        if let busSubscription { bus.unsubscribe(busSubscription) }
+        busSubscription = nil
+        eventContinuation?.finish()
+        eventContinuation = nil
+        eventTask?.cancel()
+        eventTask = nil
+        installEventForwarding()
+    }
+
     func stop() {
+        eventForwardingGeneration &+= 1
         loopTask?.cancel()
         loopTask = nil
         eventContinuation?.finish()
@@ -874,11 +917,15 @@ actor RelayService {
         return RemoteRPCResponse(id: id, status: status, body: String(decoding: body, as: UTF8.self))
     }
 
-    private func broadcastEvent(name: String, payload: Data) async {
+    private func broadcastEvent(
+        name: String, payload: Data, forwardingGeneration: UInt64? = nil
+    ) async {
+        if let forwardingGeneration, forwardingGeneration != eventForwardingGeneration { return }
         guard connection == .connected, !deviceKeys.isEmpty else { return }
         let event = RemoteEventEnvelope(name: name, data: String(decoding: payload, as: UTF8.self))
         guard let plaintext = try? PiDeskJSON.encoder.encode(event), plaintext.count <= Self.maxEncryptedPlaintextBytes else { return }
         for deviceID in connectedDeviceIDs {
+            if let forwardingGeneration, forwardingGeneration != eventForwardingGeneration { return }
             guard let key = deviceKeys[deviceID],
                   let payload = try? encrypt(plaintext, using: key, authenticating: Self.hostToDevice) else { continue }
             var message = RelayWireMessage(type: "toDevice")

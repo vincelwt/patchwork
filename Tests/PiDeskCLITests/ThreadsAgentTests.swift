@@ -36,11 +36,43 @@ final class ThreadsAgentTests: XCTestCase {
         XCTAssertTrue(plane.calls.isEmpty, "an invalid flag must not cost a round trip")
     }
 
-    func testNewPassesTheChosenAgent() async {
+    func testNewPassesTheChosenIdleCapableAgent() async {
         let plane = FakeControlPlane()
         let result = await runCLI(["threads", "new", "--cwd", "/code", "--agent", "codex"], controlPlane: plane)
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(plane.lastCreateThreadRequest?.agent, "codex")
+        XCTAssertNil(plane.lastCreateThreadRequest?.message)
+    }
+
+    func testClaudeNewRequiresAMessageBeforeCallingTheDaemon() async {
+        let plane = FakeControlPlane()
+        let result = await runCLI(
+            ["threads", "new", "--cwd", "/code", "--agent", "claude"],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 2)
+        XCTAssertTrue(result.stderr.contains("--message"))
+        XCTAssertTrue(plane.calls.isEmpty)
+        XCTAssertNil(plane.lastCreateThreadRequest)
+    }
+
+    func testClaudeNewPassesItsMessageAndGeneratedClientID() async {
+        let plane = FakeControlPlane()
+        let result = await runCLI(
+            [
+                "threads", "new", "--cwd", "/code", "--agent", "claude",
+                "--message", "survey the repo"
+            ],
+            controlPlane: plane
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(plane.lastCreateThreadRequest?.agent, "claude")
+        XCTAssertEqual(plane.lastCreateThreadRequest?.message, "survey the repo")
+        XCTAssertNotNil(
+            plane.lastCreateThreadRequest?.clientId.flatMap(UUID.init(uuidString:))
+        )
     }
 
     func testNewWithoutAnAgentSendsNoneSoTheDaemonKeepsItsDefault() async {
