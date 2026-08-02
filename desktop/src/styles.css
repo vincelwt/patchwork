@@ -148,6 +148,37 @@ code {
   padding: 0 10px 10px;
   background: var(--bg-sidebar);
   min-height: 0;
+  position: relative;
+}
+
+/* A wide grab area with a hairline that only shows when you reach for it. */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 3px;
+  width: 1px;
+  height: 100%;
+  background: var(--tint-strong);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.sidebar-resizer:hover::after,
+.sidebar-resizer.dragging::after {
+  opacity: 1;
+}
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .sidebar-top {

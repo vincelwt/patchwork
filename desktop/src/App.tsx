@@ -74,7 +74,7 @@ export default function App() {
 }
 
 function Onboarding({ onJoined }: { onJoined: (settings: DesktopSettings) => void }) {
-  const [relayUrl, setRelayUrl] = useState("http://127.0.0.1:7717");
+  const [relayUrl, setRelayUrl] = useState("http://127.0.0.1:7727");
   const [inviteCode, setInviteCode] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -134,6 +134,14 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<string>();
   const [searchOpen, setSearchOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    Number(localStorage.getItem("patchwork.sidebarWidth")) || 248,
+  );
+
+  const resizeSidebar = useCallback((width: number) => {
+    setSidebarWidth(width);
+    localStorage.setItem("patchwork.sidebarWidth", String(width));
+  }, []);
 
   const go = useCallback((next: View) => {
     setView(next);
@@ -181,10 +189,14 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     <NavigationContext.Provider
       value={{ view, go, inspector, inspect: setInspector, toast: showToast }}
     >
-      <div className="shell">
+      <div
+        className="shell"
+        style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
+      >
         <Sidebar
           onOpenMenu={() => setMenuOpen(true)}
           onSearch={() => setSearchOpen(true)}
+          onResize={resizeSidebar}
         />
         <div className="main">
           {!app.live && (

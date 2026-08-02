@@ -111,7 +111,7 @@ directory up and you have backed up the workspace.
 | Flag | Environment | Default |
 |---|---|---|
 | `--data-dir` | `PATCHWORK_DATA_DIR` | platform data dir `/patchwork-relay` |
-| `--port` | `PATCHWORK_PORT` | `7717` |
+| `--port` | `PATCHWORK_PORT` | `7727` |
 | `--bind` | `PATCHWORK_BIND` | `0.0.0.0` |
 | `--public-url` | `PATCHWORK_PUBLIC_URL` | `http://127.0.0.1:<port>` |
 | `--invite` | — | print a fresh admin invite and exit |

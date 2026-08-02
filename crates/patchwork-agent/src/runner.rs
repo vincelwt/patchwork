@@ -781,7 +781,7 @@ mod tests {
             worktree: WorktreeSpec::None,
             prompt: "Fix the failing test".into(),
             context: "#dev — Vince: the checkout test is red".into(),
-            api_base: "http://localhost:7717".into(),
+            api_base: "http://localhost:7727".into(),
             api_token: "tok".into(),
             resume_session_id: None,
             env: vec![],

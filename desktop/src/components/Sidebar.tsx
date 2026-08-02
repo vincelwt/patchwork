@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { Avatar, useNavigation } from "./common";
 import {
@@ -19,9 +19,11 @@ import type { View as NavView } from "./common";
 export function Sidebar({
   onOpenMenu,
   onSearch,
+  onResize,
 }: {
   onOpenMenu: () => void;
   onSearch: () => void;
+  onResize: (width: number) => void;
 }) {
   const app = useApp();
   const api = useApi();
@@ -201,7 +203,44 @@ export function Sidebar({
         <Avatar member={app.me} size={24} />
         <span className="who">{app.me?.display_name}</span>
       </div>
+
+      <SidebarResizer onResize={onResize} />
     </aside>
+  );
+}
+
+export const SIDEBAR_MIN = 200;
+export const SIDEBAR_MAX = 400;
+
+function SidebarResizer({ onResize }: { onResize: (width: number) => void }) {
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (event: MouseEvent) => {
+      onResize(Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, event.clientX)));
+    };
+    const onUp = () => setDragging(false);
+    document.body.classList.add("resizing");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      document.body.classList.remove("resizing");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragging, onResize]);
+
+  return (
+    <div
+      className={`sidebar-resizer${dragging ? " dragging" : ""}`}
+      onMouseDown={(event) => {
+        event.preventDefault();
+        setDragging(true);
+      }}
+      onDoubleClick={() => onResize(248)}
+      title="Drag to resize, double-click to reset"
+    />
   );
 }
 

@@ -38,7 +38,8 @@ struct Args {
     #[arg(long, env = "PATCHWORK_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
-    #[arg(long, env = "PATCHWORK_PORT", default_value_t = 7717)]
+    /// 7717 belongs to an older, unrelated Patchwork; stay off it.
+    #[arg(long, env = "PATCHWORK_PORT", default_value_t = 7727)]
     port: u16,
 
     #[arg(long, env = "PATCHWORK_BIND", default_value = "0.0.0.0")]
