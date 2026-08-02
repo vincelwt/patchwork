@@ -150,6 +150,16 @@ pub enum HostToRelay {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
     },
+    /// The agent's reply so far, while it is still being written.
+    ///
+    /// `body` is the whole message up to this point rather than the newest
+    /// fragment, so a dropped frame costs nothing: the next one is still
+    /// correct. The relay posts the message on the first delta and rewrites it
+    /// in place, which is what makes a reply appear as it is composed.
+    RunMessageDelta {
+        run_id: Id,
+        body: String,
+    },
     /// A concise, human-readable update authored by the agent.
     RunMessage {
         run_id: Id,

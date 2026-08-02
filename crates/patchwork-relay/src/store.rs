@@ -602,6 +602,30 @@ impl Store {
         }
     }
 
+    /// A streamed reply only knows who it mentions once it is finished.
+    pub fn set_message_mentions(&self, id: &str, mentions: &[Id]) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE messages SET mentions = ?2 WHERE id = ?1",
+            params![id, to_json(&mentions)],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrite a reply that is still being written. Unlike an edit this leaves
+    /// `edited_at` alone — the agent is composing, not revising.
+    pub fn stream_message_body(&self, id: &str, body: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE messages SET body = ?2 WHERE id = ?1",
+            params![id, body],
+        )?;
+        conn.execute(
+            "UPDATE message_search SET body = ?2 WHERE message_id = ?1",
+            params![id, body],
+        )?;
+        Ok(())
+    }
+
     pub fn update_message_body(&self, id: &str, body: &str) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(

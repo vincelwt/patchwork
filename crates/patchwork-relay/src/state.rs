@@ -23,6 +23,8 @@ pub struct AppState {
     pub presence: RwLock<HashMap<Id, Presence>>,
     /// Agents waiting inside a blocking `patchwork ask`.
     pub question_waiters: RwLock<HashMap<Id, Vec<oneshot::Sender<Question>>>>,
+    /// Replies still being written, by run: the message the next delta rewrites.
+    pub streaming_messages: RwLock<HashMap<Id, Id>>,
     pub files_dir: PathBuf,
     /// The URL desktops and agents should call back on.
     pub public_url: String,
@@ -41,6 +43,7 @@ impl AppState {
             hosts: RwLock::new(HashMap::new()),
             presence: RwLock::new(HashMap::new()),
             question_waiters: RwLock::new(HashMap::new()),
+            streaming_messages: RwLock::new(HashMap::new()),
             files_dir,
             public_url,
             relay_host_id,

@@ -26,6 +26,9 @@
   --radius-card: 12px;
   --radius-composer: 16px;
   --sidebar-width: 248px;
+  /* Two elevations and no more. A popover floats; a dialog floats further. */
+  --shadow-pop: 0 10px 28px rgba(20, 20, 18, 0.13), 0 1px 2px rgba(20, 20, 18, 0.07);
+  --shadow-dialog: 0 28px 70px rgba(20, 20, 18, 0.24);
   --font:
     -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -52,6 +55,8 @@
     --caution-soft: rgba(219, 171, 82, 0.16);
     --danger: #ef7f74;
     --danger-soft: rgba(239, 127, 116, 0.15);
+    --shadow-pop: 0 10px 28px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 250, 0.06);
+    --shadow-dialog: 0 30px 80px rgba(0, 0, 0, 0.6);
     color-scheme: dark;
   }
 }
@@ -316,10 +321,6 @@ body.resizing {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
-.count.badge {
-  color: var(--accent);
-  font-weight: 600;
-}
 
 .sidebar-footer {
   display: flex;
@@ -507,19 +508,75 @@ body.resizing {
   color: var(--text-faint);
 }
 
+/* A colour per teammate, derived from their id. Muted enough that a row of
+   them is still a calm surface, distinct enough to find someone at a glance. */
 .avatar {
+  --avatar-h: 220;
   border-radius: 7px;
-  background: var(--tint-strong);
+  background: hsl(var(--avatar-h) 46% 92%);
+  color: hsl(var(--avatar-h) 44% 34%);
   display: grid;
   place-items: center;
   font-weight: 600;
-  color: var(--text-muted);
   flex: none;
   overflow: hidden;
   user-select: none;
+  letter-spacing: -0.02em;
 }
 .avatar.agent {
   border-radius: 999px;
+  /* Agents read as a ring rather than a fill: a teammate, but not a person. */
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px hsl(var(--avatar-h) 42% 62%);
+  color: hsl(var(--avatar-h) 40% 40%);
+}
+.avatar.unknown {
+  background: var(--tint-strong);
+  color: var(--text-faint);
+  box-shadow: none;
+}
+@media (prefers-color-scheme: dark) {
+  .avatar {
+    background: hsl(var(--avatar-h) 30% 26%);
+    color: hsl(var(--avatar-h) 55% 84%);
+  }
+  .avatar.agent {
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px hsl(var(--avatar-h) 40% 52%);
+    color: hsl(var(--avatar-h) 55% 78%);
+  }
+  .avatar.unknown {
+    background: var(--tint-strong);
+    color: var(--text-faint);
+  }
+}
+
+.avatar-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+.presence-badge {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  border-radius: 999px;
+  background: var(--text-faint);
+  box-shadow: 0 0 0 2px var(--bg-sidebar);
+}
+.presence-badge.online {
+  background: var(--positive);
+}
+.presence-badge.working,
+.presence-badge.thinking {
+  background: var(--accent);
+}
+.presence-badge.waiting {
+  background: var(--caution);
+}
+.presence-badge.offline,
+.presence-badge.away {
+  background: var(--text-faint);
 }
 
 .message-actions {
@@ -1418,4 +1475,998 @@ details[open] > summary::before {
   font-size: 13px;
   padding: 3px;
   flex: none;
+}
+
+/* --- markdown ------------------------------------------------------------- */
+
+/* An agent's reply is prose, and prose needs a typographic scale. The rules
+   here are about restraint: enough hierarchy to skim a long answer, never so
+   much that a three-line reply looks like a document. */
+
+.md > *:first-child {
+  margin-top: 0;
+}
+.md > *:last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 0.65em;
+  overflow-wrap: anywhere;
+}
+.md p:last-child {
+  margin-bottom: 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 1.1em 0 0.35em;
+  line-height: 1.3;
+  letter-spacing: -0.014em;
+  font-weight: 600;
+}
+.md h1 {
+  font-size: 1.32em;
+}
+.md h2 {
+  font-size: 1.16em;
+}
+.md h3 {
+  font-size: 1.05em;
+}
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 1em;
+  color: var(--text-muted);
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 0.65em;
+  padding-left: 1.35em;
+}
+.md li {
+  margin: 0.16em 0;
+}
+.md li > .md-item > p {
+  margin-bottom: 0.3em;
+}
+.md li.task {
+  list-style: none;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-left: -1.35em;
+}
+.md-check {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--tint-strong);
+  display: grid;
+  place-items: center;
+  flex: none;
+  margin-top: 4px;
+  color: var(--bg);
+}
+.md-check.on {
+  background: var(--positive);
+  border-color: var(--positive);
+}
+.md li.task .md-item {
+  min-width: 0;
+}
+
+.md blockquote {
+  margin: 0 0 0.65em;
+  padding-left: 13px;
+  border-left: 2px solid var(--tint-strong);
+  color: var(--text-muted);
+}
+.md hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 1.1em 0;
+}
+.md a {
+  text-decoration-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  text-decoration-line: underline;
+  text-underline-offset: 2px;
+}
+.md del {
+  color: var(--text-faint);
+}
+
+/* Wide content scrolls inside itself; the transcript never scrolls sideways. */
+.md-table-scroll {
+  overflow-x: auto;
+  margin: 0 0 0.7em;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.md table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.94em;
+}
+.md th,
+.md td {
+  padding: 6px 11px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.md th {
+  font-weight: 570;
+  color: var(--text-muted);
+  background: var(--tint);
+}
+.md tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.md-code {
+  margin: 0 0 0.7em;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-sunken);
+  overflow: hidden;
+}
+.md-code-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 5px 3px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.md-code-head .lang {
+  font-family: var(--mono);
+}
+.md-code pre {
+  margin: 0;
+  padding: 11px 13px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.md-code code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+/* Still being written: the fence has no closing line yet. */
+.md-code.streaming {
+  border-style: dashed;
+}
+
+.md.compact {
+  font-size: 13.5px;
+}
+.md.compact h1,
+.md.compact h2,
+.md.compact h3 {
+  font-size: 1.04em;
+  margin: 0.6em 0 0.25em;
+}
+.md.compact .md-code pre {
+  padding: 8px 10px;
+  font-size: 11.5px;
+}
+.md.compact ul,
+.md.compact ol {
+  padding-left: 1.15em;
+}
+
+/* The reply is still arriving. */
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  background: var(--accent);
+  animation: blink 1.05s steps(2, start) infinite;
+}
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* --- a run in the transcript ---------------------------------------------- */
+
+/* A run is not an announcement. It is one line, the same weight as a status
+   note, that you can act on without it dominating the conversation. */
+.run-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 10px;
+  color: var(--text-faint);
+  font-size: 13.5px;
+  min-height: 24px;
+}
+.run-line > svg {
+  flex: none;
+}
+.run-line .text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-line.active .text {
+  color: var(--text-muted);
+}
+.run-line .who {
+  color: var(--text-faint);
+}
+.run-line-action {
+  color: var(--text-faint);
+  font-size: 13px;
+  padding: 1px 7px;
+  border-radius: 7px;
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.run-line:hover .run-line-action,
+.run-line.active .run-line-action {
+  opacity: 1;
+}
+.run-line-action:hover {
+  background: var(--tint);
+  color: var(--text);
+}
+
+.card.waiting {
+  border-color: color-mix(in srgb, var(--caution) 42%, var(--line));
+}
+.card.failed {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
+}
+
+.run-summary {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 0 6px;
+}
+.run-summary .name {
+  display: block;
+  font-weight: 570;
+}
+.run-summary .sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* --- menus ---------------------------------------------------------------- */
+
+.menu-anchor {
+  position: relative;
+  display: inline-flex;
+  -webkit-app-region: no-drag;
+}
+.menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  z-index: 60;
+  min-width: 216px;
+  max-width: 320px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 5px;
+  box-shadow: var(--shadow-pop);
+}
+.menu.left {
+  left: 0;
+}
+.menu.right {
+  right: 0;
+}
+.menu-header {
+  padding: 5px 10px 6px;
+  font-size: 12px;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 8px;
+  text-align: left;
+}
+.menu-item.active {
+  background: var(--tint);
+}
+.menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.menu-item.danger {
+  color: var(--danger);
+}
+.menu-item .grow {
+  flex: 1;
+  min-width: 0;
+}
+.menu-item .name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-item .sub {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-icon {
+  display: flex;
+  color: var(--text-muted);
+  flex: none;
+}
+.menu-item.danger .menu-icon {
+  color: var(--danger);
+}
+.menu-separator {
+  height: 1px;
+  background: var(--line);
+  margin: 5px 8px;
+}
+
+/* Menus opened from a row rather than from a button of their own. */
+.floating-menu,
+.workspace-menu-anchor {
+  position: fixed;
+  z-index: 60;
+}
+.workspace-menu-anchor {
+  left: 74px;
+  top: 44px;
+}
+
+.keyhint {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+.keyhint kbd {
+  font-family: var(--font);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  background: var(--tint);
+  border-radius: 5px;
+  padding: 1px 5px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* --- editable text -------------------------------------------------------- */
+
+.editable {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border-radius: 7px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  transition: background 0.1s ease;
+}
+.editable:hover {
+  background: var(--tint);
+}
+.editable .placeholder {
+  color: var(--text-faint);
+}
+.editable-input {
+  width: calc(100% + 12px);
+  margin-left: -6px;
+  padding: 2px 6px;
+  border: none;
+  outline: none;
+  border-radius: 7px;
+  background: var(--tint);
+  resize: none;
+  font: inherit;
+  color: inherit;
+}
+
+/* --- task page ------------------------------------------------------------ */
+
+.task-header {
+  padding: 2px 28px 14px;
+  max-width: 880px;
+  width: 100%;
+  flex: none;
+}
+.task-title,
+.task-title.editable-input {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+.task-outcome,
+.task-outcome.editable-input {
+  color: var(--text-muted);
+  font-size: 14.5px;
+  margin-top: 2px;
+  line-height: 1.5;
+}
+
+/* Four steps, so where the task is arrives before you have read anything. */
+.task-rail {
+  display: flex;
+  gap: 3px;
+  margin-top: 14px;
+}
+.rail-step {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  text-align: left;
+  padding: 5px 0 0;
+  border-top: 2.5px solid var(--tint);
+  transition:
+    color 0.14s ease,
+    border-color 0.14s ease;
+}
+.rail-step:hover {
+  color: var(--text-muted);
+  border-top-color: var(--tint-strong);
+}
+.rail-step.past {
+  border-top-color: color-mix(in srgb, var(--text) 26%, transparent);
+  color: var(--text-faint);
+}
+.rail-step.current {
+  border-top-color: var(--accent);
+  color: var(--text);
+  font-weight: 550;
+}
+.rail-step.current.blocked {
+  border-top-color: var(--danger);
+  color: var(--danger);
+}
+
+/* One line about where the task is, and one button about it. */
+.task-situation {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 10px 12px 10px 14px;
+  border-radius: var(--radius-card);
+  background: var(--surface-sunken);
+  border: 1px solid transparent;
+  min-height: 52px;
+}
+.task-situation > svg {
+  flex: none;
+  color: var(--text-muted);
+}
+.task-situation .grow {
+  flex: 1;
+  min-width: 0;
+}
+.task-situation .line {
+  display: block;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-situation .detail {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-situation.accent {
+  background: var(--accent-soft);
+}
+.task-situation.accent > svg {
+  color: var(--accent);
+}
+.task-situation.caution {
+  background: var(--caution-soft);
+}
+.task-situation.caution > svg,
+.task-situation.caution .line {
+  color: var(--caution);
+}
+.task-situation.danger {
+  background: var(--danger-soft);
+}
+.task-situation.danger > svg,
+.task-situation.danger .line {
+  color: var(--danger);
+}
+.task-situation.positive {
+  background: var(--positive-soft);
+}
+.task-situation.positive .line {
+  color: var(--positive);
+}
+
+.task-facts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.fact-label {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  padding-left: 6px;
+}
+
+.notice {
+  margin-top: 12px;
+  padding: 10px 13px;
+  border-radius: var(--radius-row);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+/* --- board ---------------------------------------------------------------- */
+
+.column-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--text-faint);
+  opacity: 0.5;
+  flex: none;
+}
+.column-dot.running {
+  background: var(--accent);
+  opacity: 1;
+}
+.column-dot.blocked {
+  background: var(--danger);
+  opacity: 1;
+}
+.column-dot.review {
+  background: var(--caution);
+  opacity: 1;
+}
+.column-dot.done {
+  background: var(--positive);
+  opacity: 1;
+}
+
+.task-card .head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+.task-card .unowned {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.task-card .situation {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.task-card .situation > svg {
+  flex: none;
+}
+.task-card .situation .line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-card .situation.accent {
+  color: var(--accent);
+}
+.task-card .situation.caution {
+  color: var(--caution);
+}
+.task-card .situation.danger {
+  color: var(--danger);
+}
+/* A card that is asking for something gets an edge, not a colour wash. */
+.task-card.asking {
+  border-color: color-mix(in srgb, var(--caution) 45%, var(--line));
+}
+.task-card.failed,
+.task-card.blocked {
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
+}
+
+.card-action {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  background: var(--tint);
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.task-card:hover .card-action {
+  opacity: 1;
+}
+.card-action:hover {
+  background: var(--text);
+  color: var(--bg);
+}
+
+/* --- sidebar signals ------------------------------------------------------ */
+
+.group-head {
+  display: flex;
+  align-items: center;
+  padding-right: 4px;
+}
+.group-head .group-label {
+  flex: 1;
+}
+.group-label.plain {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding-left: 23px;
+  cursor: default;
+}
+.group-add {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  margin-bottom: 6px;
+}
+.group-head:hover .group-add {
+  opacity: 1;
+}
+.group-empty {
+  padding: 3px 10px 2px 34px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+/* Bold plus a dot: something was said. A number: something wants you. */
+.nav-item.unseen .label {
+  font-weight: 590;
+  color: var(--text);
+}
+.badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  display: grid;
+  place-items: center;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.group-label .dot.unread {
+  margin-left: 2px;
+}
+
+/* --- inbox ---------------------------------------------------------------- */
+
+.inbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 12px;
+  border-radius: var(--radius-row);
+  text-align: left;
+}
+.inbox-row:hover {
+  background: var(--tint);
+}
+.inbox-row.read {
+  opacity: 0.52;
+}
+.inbox-row .grow {
+  flex: 1;
+  min-width: 0;
+}
+.inbox-row .top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.inbox-row .name {
+  font-weight: 560;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inbox-row.read .name {
+  font-weight: 450;
+}
+.inbox-row .more {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.inbox-row .sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  margin-top: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inbox-row .where {
+  display: block;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  margin-top: 2px;
+}
+.inbox-row .when {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex: none;
+  margin-top: 2px;
+}
+
+/* --- command palette ------------------------------------------------------ */
+
+.palette {
+  width: 620px;
+  max-width: 100%;
+  max-height: 68vh;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  box-shadow: var(--shadow-dialog);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-top: -8vh;
+}
+.palette-input {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-faint);
+  flex: none;
+}
+.palette-input input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 16px;
+  color: var(--text);
+}
+.palette-input input::placeholder {
+  color: var(--text-faint);
+}
+.palette-list {
+  overflow-y: auto;
+  min-height: 0;
+  padding: 6px;
+}
+.palette-group {
+  padding: 8px 10px 4px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 9px;
+  text-align: left;
+}
+.palette-item.active {
+  background: var(--tint);
+}
+.palette-icon {
+  display: flex;
+  color: var(--text-muted);
+  flex: none;
+}
+.palette-item .grow {
+  flex: 1;
+  min-width: 0;
+}
+.palette-item .name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-item .sub {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-empty {
+  padding: 26px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 14px;
+}
+
+.shortcut-group {
+  margin-top: 18px;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 2px;
+  font-size: 14px;
+}
+.shortcut-row .grow {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+/* --- channel header ------------------------------------------------------- */
+
+.topbar-hash {
+  display: flex;
+  color: var(--text-faint);
+  flex: none;
+}
+.editable-topic {
+  border-radius: 7px;
+  padding: 2px 6px;
+  max-width: 340px;
+}
+.editable-topic:hover {
+  background: var(--tint);
+  color: var(--text-muted);
+}
+.topic-input {
+  flex: 1;
+  min-width: 0;
+  max-width: 380px;
+  border: none;
+  outline: none;
+  background: var(--tint);
+  border-radius: 7px;
+  padding: 3px 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.facepile {
+  display: flex;
+  align-items: center;
+  padding-right: 4px;
+}
+.facepile > * {
+  margin-right: -6px;
+  box-shadow: 0 0 0 2px var(--bg);
+  border-radius: 7px;
+}
+.facepile .more {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-left: 10px;
+  box-shadow: none;
+}
+
+/* --- machines ------------------------------------------------------------- */
+
+.machine {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 4px 6px 6px;
+  margin-top: 8px;
+}
+.machine-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 6px;
+}
+.machine-head .grow {
+  flex: 1;
+  min-width: 0;
+}
+.machine-head .name {
+  display: block;
+  font-weight: 550;
+}
+.machine-head .sub {
+  display: block;
+  color: var(--text-muted);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.machine-runtime {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.machine-runtime:hover {
+  background: var(--tint);
+}
+.machine-runtime .grow {
+  flex: 1;
+  min-width: 0;
+}
+.machine-runtime .name {
+  display: block;
+  font-size: 14px;
+}
+.machine-runtime .sub {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.machine-runtime.empty {
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.section-note {
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.you {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-left: 6px;
+}
+.button.danger-solid {
+  background: var(--danger);
+  color: #fff;
+}
+.button.danger-solid:hover {
+  opacity: 0.9;
 }

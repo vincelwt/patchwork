@@ -1,17 +1,127 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
+import { readTask, situationTone, stepIndex, TASK_STEPS } from "../lib/task";
+import type { NextAction, TaskState } from "../lib/task";
 import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
-import { Dropdown, FormSelect, Toggle } from "./ui";
-import { ExternalIcon, PlusIcon, Spinner } from "./icons";
+import {
+  Dropdown,
+  EditableText,
+  FormSelect,
+  MenuButton,
+  Section,
+  Toggle,
+} from "./ui";
+import {
+  AgentIcon,
+  ExternalIcon,
+  MoreIcon,
+  PlayIcon,
+  PlusIcon,
+  QuestionIcon,
+  Spinner,
+  StopIcon,
+  TrashIcon,
+  WarningIcon,
+} from "./icons";
 import { ChatView } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { TASK_STATUSES } from "../lib/types";
-import type { Task, TaskStatus } from "../lib/types";
+import type { Id, Member, Task, TaskStatus } from "../lib/types";
+
+/// Everything that can be done to a task, in one place. The task page, the
+/// board card and the inspector all call this, so "Start" means the same thing
+/// and does the same thing wherever you press it.
+function useTaskActions(task: Task) {
+  const api = useApi();
+  const { inspect, toast } = useNavigation();
+  const [assigning, setAssigning] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const start = async (agentId?: Id, prompt?: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      const run = await api.runTask(task.id, { agent_id: agentId, prompt });
+      inspect({ kind: "run", runId: run.id });
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const perform = async (action: NextAction, state: TaskState) => {
+    setError("");
+    try {
+      switch (action.kind) {
+        case "assign":
+          setAssigning(true);
+          break;
+        case "start":
+        case "retry":
+          // Sending work back from review means it is in progress again, and
+          // the board should say so before the agent gets going.
+          if (state.situation === "review") {
+            await api.updateTask(task.id, { status: "running" });
+          }
+          await start();
+          break;
+        case "stop":
+          if (state.run) await api.cancelRun(state.run.id);
+          break;
+        case "answer":
+          if (state.run) inspect({ kind: "run", runId: state.run.id });
+          break;
+        case "complete":
+          await api.updateTask(task.id, { status: "done" });
+          toast("Task closed");
+          break;
+        case "reopen":
+          await api.updateTask(task.id, { status: "planned" });
+          break;
+      }
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  return { perform, start, busy, error, assigning, setAssigning };
+}
+
+function actionIcon(kind: NextAction["kind"]) {
+  switch (kind) {
+    case "start":
+    case "retry":
+      return <PlayIcon size={13} />;
+    case "stop":
+      return <StopIcon size={13} />;
+    case "answer":
+      return <QuestionIcon size={14} />;
+    default:
+      return null;
+  }
+}
+
+/// The default owner: the agent you gave work to last, because a workspace with
+/// one working agent should not make you pick it every single time.
+function suggestedOwner(members: Member[], tasks: Task[]): string {
+  const agents = members.filter((member) => member.kind === "agent");
+  if (agents.length === 0) return "";
+  if (agents.length === 1) return agents[0].id;
+  const recent = [...tasks]
+    .sort((a, b) => b.created_at - a.created_at)
+    .find((task) => agents.some((agent) => agent.id === task.owner_id));
+  return recent?.owner_id ?? agents[0].id;
+}
+
+// --- board ------------------------------------------------------------------
 
 /// The board makes concurrent agent work obvious: one column per state, and
-/// every card says who owns it and whether something is running right now.
+/// every card says who owns it, what it is waiting on, and what pressing it
+/// would do next.
 export function TasksBoard() {
   const app = useApp();
   const api = useApi();
@@ -32,10 +142,16 @@ export function TasksBoard() {
     [app.tasks, filterOwner, filterProject],
   );
 
+  const needsYou = tasks.filter((task) => {
+    const state = readTask(task, app.members, app.runs, app.questions);
+    return state.situation === "asking" || state.situation === "review";
+  }).length;
+
   return (
     <div className="column">
       <div className="topbar">
         <span className="title">Tasks</span>
+        {needsYou > 0 && <Chip tone="caution">{needsYou} waiting on you</Chip>}
         <span className="spacer" />
         <Dropdown
           quiet
@@ -89,6 +205,7 @@ export function TasksBoard() {
               }}
             >
               <div className="board-column-head">
+                <span className={`column-dot ${status}`} />
                 <span>{statusLabel(status)}</span>
                 {column.length > 0 && <span className="count">{column.length}</span>}
               </div>
@@ -140,50 +257,99 @@ function TaskCard({
   onDragStart: () => void;
 }) {
   const app = useApp();
-  const owner = app.members.find((member) => member.id === task.owner_id);
   const project = app.projects.find((candidate) => candidate.id === task.project_id);
-  const run = task.current_run_id ? app.runs[task.current_run_id] : undefined;
+  const state = readTask(task, app.members, app.runs, app.questions);
+  const actions = useTaskActions(task);
+
+  // Only the situations that say something get a line of their own. A card that
+  // is simply planned and owned needs no commentary.
+  const noteworthy = ["working", "queued", "asking", "failed", "blocked"].includes(
+    state.situation,
+  );
 
   return (
     <div
-      className="task-card"
+      className={`task-card ${state.situation}`}
       draggable
       onDragStart={onDragStart}
       onClick={onClick}
     >
-      <div className="key">{task.key}</div>
+      <div className="head">
+        <span className="key">{task.key}</span>
+        <span className="spacer" />
+        {state.owner ? (
+          <Avatar member={state.owner} size={18} />
+        ) : (
+          <span className="unowned">unassigned</span>
+        )}
+      </div>
       <div className="title">{task.title}</div>
-      {(owner || project || run || task.pr_state) && (
-        <div className="meta">
-          {owner && <Avatar member={owner} size={18} />}
-          {project && <Chip>{project.name}</Chip>}
-          {run && (
-            <Chip tone="accent">
-              <Spinner size={11} />
-              {run.headline || "running"}
-            </Chip>
+
+      {noteworthy && (
+        <div className={`situation ${situationTone(state.situation)}`}>
+          {state.situation === "working" || state.situation === "queued" ? (
+            <Spinner size={11} />
+          ) : state.situation === "asking" ? (
+            <QuestionIcon size={12} />
+          ) : (
+            <WarningIcon size={12} />
           )}
-          {task.pr_state && <Chip>PR #{task.pr_state.number}</Chip>}
+          <span className="line">{state.headline}</span>
+        </div>
+      )}
+
+      <div className="meta">
+        {project && <Chip>{project.name}</Chip>}
+        {task.pr_state && (
+          <Chip tone={task.pr_state.checks === "FAILURE" ? "danger" : ""}>
+            #{task.pr_state.number}
+          </Chip>
+        )}
+        <span className="spacer" />
+        {state.action && state.action.kind !== "reopen" && (
+          <button
+            className="card-action"
+            title={state.action.label}
+            onClick={(event) => {
+              event.stopPropagation();
+              void actions.perform(state.action!, state);
+            }}
+          >
+            {actionIcon(state.action.kind) ?? <PlusIcon size={13} />}
+          </button>
+        )}
+      </div>
+
+      {actions.assigning && (
+        <div onClick={(event) => event.stopPropagation()}>
+          <AssignModal task={task} onClose={() => actions.setAssigning(false)} />
         </div>
       )}
     </div>
   );
 }
 
+// --- creating ---------------------------------------------------------------
+
 export function NewTaskModal({
   onClose,
   sourceChannelId,
+  initialTitle,
 }: {
   onClose: () => void;
   sourceChannelId?: string;
+  initialTitle?: string;
 }) {
   const app = useApp();
   const api = useApi();
   const { go } = useNavigation();
-  const [title, setTitle] = useState("");
+  const [title, setTitle] = useState(initialTitle ?? "");
   const [outcome, setOutcome] = useState("");
-  const [owner, setOwner] = useState("");
-  const [project, setProject] = useState("");
+  const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.tasks));
+  const [project, setProject] = useState(() => {
+    const agent = app.members.find((member) => member.id === owner);
+    return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
+  });
   const [start, setStart] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -226,7 +392,7 @@ export function NewTaskModal({
             disabled={!title.trim() || busy}
             onClick={create}
           >
-            Create
+            {ownerIsAgent && start ? "Create and start" : "Create"}
           </button>
         </>
       }
@@ -248,7 +414,7 @@ export function NewTaskModal({
           ...app.members.map((member) => ({
             value: member.id,
             label: member.display_name,
-            hint: member.kind === "agent" ? member.agent?.runtime : undefined,
+            hint: member.kind === "agent" ? member.agent?.runtime : "person",
           })),
         ]}
       />
@@ -278,108 +444,333 @@ export function NewTaskModal({
   );
 }
 
-/// A task page keeps the discussion primary; execution detail opens beside it.
-export function TaskPage({ taskId }: { taskId: string }) {
+/// Assigning is nearly always "and start it", so the two are one step with one
+/// optional extra: what to tell the agent beyond the task itself.
+export function AssignModal({ task, onClose }: { task: Task; onClose: () => void }) {
   const app = useApp();
   const api = useApi();
   const { inspect } = useNavigation();
-  const task = app.tasks.find((candidate) => candidate.id === taskId);
+  const [owner, setOwner] = useState(
+    task.owner_id || suggestedOwner(app.members, app.tasks),
+  );
+  const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [showDetail, setShowDetail] = useState(false);
 
-  if (!task) return <div className="empty">That task is gone.</div>;
+  const chosen = app.members.find((member) => member.id === owner);
+  const isAgent = chosen?.kind === "agent";
 
-  const owner = app.members.find((member) => member.id === task.owner_id);
-  const project = app.projects.find((candidate) => candidate.id === task.project_id);
-  const run = task.current_run_id ? app.runs[task.current_run_id] : undefined;
-  const previews = Object.values(app.previews).filter(
-    (preview) => preview.task_id === task.id && preview.status === "live",
-  );
-
-  const runAgent = async () => {
+  const submit = async (andStart: boolean) => {
     setBusy(true);
     setError("");
     try {
-      const started = await api.runTask(task.id);
-      inspect({ kind: "run", runId: started.id });
+      if (owner !== task.owner_id) {
+        await api.updateTask(task.id, { owner_id: owner });
+      }
+      if (andStart && isAgent) {
+        const run = await api.runTask(task.id, {
+          agent_id: owner,
+          prompt: instruction.trim() || undefined,
+        });
+        inspect({ kind: "run", runId: run.id });
+      }
+      onClose();
     } catch (err) {
       setError(String((err as Error).message ?? err));
-    } finally {
       setBusy(false);
     }
   };
 
   return (
+    <Modal
+      title="Assign this task"
+      subtitle={task.title}
+      onClose={onClose}
+      actions={
+        <>
+          <button className="button quiet" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="button"
+            disabled={!owner || busy}
+            onClick={() => submit(false)}
+          >
+            Assign only
+          </button>
+          <button
+            className="button primary"
+            disabled={!owner || busy || !isAgent}
+            onClick={() => submit(true)}
+          >
+            {busy ? "Starting…" : "Assign and start"}
+          </button>
+        </>
+      }
+    >
+      <FormSelect
+        label="Owner"
+        value={owner}
+        onChange={setOwner}
+        options={app.members.map((member) => ({
+          value: member.id,
+          label: member.display_name,
+          hint:
+            member.kind === "agent"
+              ? member.agent?.description || member.agent?.runtime
+              : "person",
+        }))}
+      />
+      {isAgent && (
+        <Field
+          label="Anything to add"
+          value={instruction}
+          onChange={setInstruction}
+          textarea
+          placeholder="Optional. The agent already has the title and the expected result."
+        />
+      )}
+      {!isAgent && owner && (
+        <div className="notice">
+          People are not started by a button — assigning puts this in their Inbox.
+        </div>
+      )}
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
+  );
+}
+
+// --- the task page ----------------------------------------------------------
+
+/// A task page keeps the discussion primary: the conversation is where the work
+/// actually happens. Above it sits exactly one line about where the task is,
+/// and one button for what to do about it.
+export function TaskPage({ taskId }: { taskId: string }) {
+  const app = useApp();
+  const api = useApi();
+  const { go, toast } = useNavigation();
+  const task = app.tasks.find((candidate) => candidate.id === taskId);
+  const [showDetail, setShowDetail] = useState(false);
+  const actions = useTaskActions(task ?? ({ id: taskId } as Task));
+
+  if (!task) {
+    return (
+      <div className="column">
+        <div className="empty">
+          <div className="empty-title">That task is gone</div>
+        </div>
+      </div>
+    );
+  }
+
+  const state = readTask(task, app.members, app.runs, app.questions);
+  const project = app.projects.find((candidate) => candidate.id === task.project_id);
+  const previews = Object.values(app.previews).filter(
+    (preview) => preview.task_id === task.id && preview.status === "live",
+  );
+  const step = stepIndex(task);
+
+  return (
     <div className="column">
       <div className="topbar">
-        <span className="title">{task.title}</span>
+        <button className="button quiet" onClick={() => go({ kind: "tasks" })}>
+          ‹ Tasks
+        </button>
         <span className="subtitle">{task.key}</span>
         <span className="spacer" />
-        <Dropdown
-          quiet
-          align="right"
-          value={task.status}
-          onChange={(status) => api.updateTask(task.id, { status })}
-          options={TASK_STATUSES.map((status) => ({
-            value: status,
-            label: statusLabel(status),
-          }))}
-        />
-        <Dropdown
-          quiet
-          align="right"
-          value={task.owner_id ?? ""}
-          onChange={(owner_id) => api.updateTask(task.id, { owner_id })}
-          options={[
-            { value: "", label: "Unassigned" },
-            ...app.members.map((member) => ({
-              value: member.id,
-              label: member.display_name,
-              hint: member.kind === "agent" ? member.agent?.runtime : undefined,
-            })),
-          ]}
-        />
-        {owner?.kind === "agent" && (
-          <button className="button primary" disabled={busy} onClick={runAgent}>
-            {run ? "Run again" : "Run"}
-          </button>
-        )}
         <button className="button quiet" onClick={() => setShowDetail(!showDetail)}>
           {showDetail ? "Hide activity" : "Activity"}
         </button>
+        <MenuButton
+          align="right"
+          title="More"
+          header="Move to"
+          items={[
+            ...TASK_STATUSES.map((status) => ({
+              key: status,
+              label: statusLabel(status),
+              onSelect: () => void api.updateTask(task.id, { status }),
+              disabled: status === task.status,
+            })),
+            "separator" as const,
+            {
+              key: "assign",
+              label: "Reassign…",
+              icon: <AgentIcon size={15} />,
+              onSelect: () => actions.setAssigning(true),
+            },
+            {
+              key: "delete",
+              label: "Delete task",
+              icon: <TrashIcon size={15} />,
+              danger: true,
+              onSelect: async () => {
+                try {
+                  await api.deleteTask(task.id);
+                  go({ kind: "tasks" });
+                } catch (err) {
+                  toast(String((err as Error).message ?? err));
+                }
+              },
+            },
+          ]}
+        >
+          <MoreIcon size={17} />
+        </MenuButton>
       </div>
 
-      <div className="card-row" style={{ padding: "0 28px 4px", maxWidth: 980 }}>
-        {project && <Chip>{project.name}</Chip>}
-        {run && <Chip tone="accent">{run.headline}</Chip>}
-        {task.pr_url && (
-          <button className="chip" onClick={() => openExternal(task.pr_url!)}>
-            <ExternalIcon size={12} />
-            {task.pr_state
-              ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
-              : "Pull request"}
-          </button>
-        )}
-        {previews.map((preview) => (
-          <button
-            key={preview.id}
-            className="chip accent"
-            onClick={() =>
-              openExternal(
-                preview.local_only
-                  ? `http://127.0.0.1:${preview.port}`
-                  : preview.url,
-              )
-            }
-          >
-            Preview: {preview.label}
-          </button>
-        ))}
-        <span className="spacer" />
-        <span className="composer-hint">updated {relative(task.updated_at)}</span>
+      <div className="task-header">
+        <EditableText
+          className="task-title"
+          value={task.title}
+          title="Click to rename"
+          onCommit={(title) => void api.updateTask(task.id, { title })}
+        />
+        <EditableText
+          className="task-outcome"
+          value={task.outcome}
+          placeholder="What has to be true when this is done?"
+          multiline
+          title="Click to describe the expected result"
+          onCommit={(outcome) => void api.updateTask(task.id, { outcome })}
+        />
+
+        <div className="task-rail">
+          {TASK_STEPS.map((entry, index) => (
+            <button
+              key={entry.key}
+              className={`rail-step${index === step ? " current" : ""}${
+                index < step ? " past" : ""
+              }${task.status === "blocked" && index === step ? " blocked" : ""}`}
+              title={`Move to ${entry.label}`}
+              onClick={() =>
+                void api.updateTask(task.id, { status: entry.key as TaskStatus })
+              }
+            >
+              {entry.label}
+            </button>
+          ))}
+        </div>
+
+        <div className={`task-situation ${situationTone(state.situation)}`}>
+          {(state.situation === "working" || state.situation === "queued") && (
+            <Spinner size={14} />
+          )}
+          {state.situation === "asking" && <QuestionIcon size={15} />}
+          {(state.situation === "failed" || state.situation === "blocked") && (
+            <WarningIcon size={15} />
+          )}
+          <span className="grow">
+            <span className="line">{state.headline}</span>
+            {state.detail && <span className="detail">{state.detail}</span>}
+          </span>
+          {state.secondary && (
+            <button
+              className="button quiet"
+              onClick={() => void actions.perform(state.secondary!, state)}
+            >
+              {state.secondary.label}
+            </button>
+          )}
+          {state.action && (
+            <button
+              className={`button${
+                state.action.tone === "primary"
+                  ? " primary"
+                  : state.action.tone === "quiet"
+                    ? " quiet"
+                    : ""
+              }`}
+              disabled={actions.busy}
+              onClick={() => void actions.perform(state.action!, state)}
+            >
+              {actionIcon(state.action.kind)}
+              {state.action.label}
+            </button>
+          )}
+        </div>
+
+        <div className="task-facts">
+          <Fact label="Owner">
+            <Dropdown
+              quiet
+              value={task.owner_id ?? ""}
+              onChange={(owner_id) => void api.updateTask(task.id, { owner_id })}
+              options={[
+                { value: "", label: "Unassigned" },
+                ...app.members.map((member) => ({
+                  value: member.id,
+                  label: member.display_name,
+                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
+                })),
+              ]}
+            />
+          </Fact>
+          <Fact label="Project">
+            <Dropdown
+              quiet
+              value={task.project_id ?? ""}
+              onChange={(project_id) => void api.updateTask(task.id, { project_id })}
+              options={[
+                { value: "", label: "None" },
+                ...app.projects.map((candidate) => ({
+                  value: candidate.id,
+                  label: candidate.name,
+                })),
+              ]}
+            />
+          </Fact>
+          {task.pr_url && (
+            <Fact label="Pull request">
+              <button className="chip" onClick={() => openExternal(task.pr_url!)}>
+                <ExternalIcon size={12} />
+                {task.pr_state
+                  ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
+                  : "Open"}
+              </button>
+            </Fact>
+          )}
+          {previews.map((preview) => (
+            <Fact label="Preview" key={preview.id}>
+              <button
+                className="chip accent"
+                onClick={() =>
+                  openExternal(
+                    preview.local_only
+                      ? `http://127.0.0.1:${preview.port}`
+                      : preview.url,
+                  )
+                }
+              >
+                {preview.label}
+              </button>
+            </Fact>
+          ))}
+          {project?.dev_command && previews.length === 0 && (
+            <button
+              className="button quiet"
+              onClick={async () => {
+                try {
+                  await api.startPreview({ task_id: task.id });
+                  toast("Starting the preview");
+                } catch (err) {
+                  toast(String((err as Error).message ?? err));
+                }
+              }}
+            >
+              Start the preview
+            </button>
+          )}
+          <span className="spacer" />
+          <span className="composer-hint">updated {relative(task.updated_at)}</span>
+        </div>
       </div>
-      {error && <div className="error-text" style={{ padding: "0 24px" }}>{error}</div>}
+
+      {actions.error && (
+        <div className="error-text" style={{ padding: "0 28px" }}>
+          {actions.error}
+        </div>
+      )}
 
       {showDetail ? (
         <div className="content">
@@ -392,7 +783,20 @@ export function TaskPage({ taskId }: { taskId: string }) {
       ) : (
         <ChatView channelId={task.discussion_channel_id} />
       )}
+
+      {actions.assigning && (
+        <AssignModal task={task} onClose={() => actions.setAssigning(false)} />
+      )}
     </div>
+  );
+}
+
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <span className="fact">
+      <span className="fact-label">{label}</span>
+      {children}
+    </span>
   );
 }
 
@@ -402,62 +806,55 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
   const { inspect } = useNavigation();
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof api.task>>>();
 
-  useMemo(() => {
+  useEffect(() => {
     void api.task(taskId).then(setDetail);
-  }, [taskId, app.tasks, app.runs]);
+  }, [taskId, app.tasks, app.runs, api]);
 
   if (!detail) return <div className="inspector-body">Loading…</div>;
 
   return (
     <div className="inspector-body">
       {detail.worktree && (
-        <>
-          <div className="section-head">
-            <span className="section-title">Worktree</span>
-          </div>
+        <Section title="Worktree">
           <div className="card-sub" style={{ wordBreak: "break-all" }}>
             {detail.worktree.path}
           </div>
           <Chip>{detail.worktree.branch || "no branch"}</Chip>
-        </>
+        </Section>
       )}
 
-      <div className="section-head">
-        <span className="section-title">Runs</span>
-      </div>
-      {detail.runs.length === 0 && <div className="card-sub">No runs yet.</div>}
-      {detail.runs.map((run) => {
-        const agent = app.members.find((member) => member.id === run.agent_id);
-        return (
-          <button
-            key={run.id}
-            className="row"
-            style={{ width: "100%" }}
-            onClick={() => inspect({ kind: "run", runId: run.id })}
-          >
-            <span className="grow">
-              <span className="name">{agent?.display_name}</span>
-              <span className="sub">{run.headline || run.error || ""}</span>
-            </span>
-            <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
-          </button>
-        );
-      })}
+      <Section title="Runs">
+        {detail.runs.length === 0 && (
+          <div className="card-sub">Nothing has run yet.</div>
+        )}
+        {detail.runs.map((run) => {
+          const agent = app.members.find((member) => member.id === run.agent_id);
+          return (
+            <button
+              key={run.id}
+              className="row"
+              onClick={() => inspect({ kind: "run", runId: run.id })}
+            >
+              <span className="grow">
+                <span className="name">{agent?.display_name}</span>
+                <span className="sub">
+                  {run.headline || run.error || relative(run.created_at)}
+                </span>
+              </span>
+              <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
+            </button>
+          );
+        })}
+      </Section>
 
       {detail.attachments.length > 0 && (
-        <>
-          <div className="section-head">
-            <span className="section-title">Evidence</span>
-          </div>
+        <Section title="Evidence">
           {detail.attachments.map((attachment) => (
             <button
               key={attachment.id}
               className="row"
-              style={{ width: "100%" }}
               onClick={() =>
-                openExternal(
-                  `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`,
-                )
+                openExternal(`${api.baseUrl.replace(/\/$/, "")}${attachment.url}`)
               }
             >
               <span className="grow">
@@ -465,14 +862,11 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
               </span>
             </button>
           ))}
-        </>
+        </Section>
       )}
 
       {detail.previews.length > 0 && (
-        <>
-          <div className="section-head">
-            <span className="section-title">Previews</span>
-          </div>
+        <Section title="Previews">
           {detail.previews.map((preview) => (
             <div className="row" key={preview.id}>
               <span className="grow">
@@ -484,16 +878,13 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
               </Chip>
             </div>
           ))}
-        </>
+        </Section>
       )}
 
       {detail.task.current_run_id && (
-        <>
-          <div className="section-head">
-            <span className="section-title">Current run</span>
-          </div>
-          <RunPanel runId={detail.task.current_run_id} />
-        </>
+        <Section title="Current run">
+          <RunPanel runId={detail.task.current_run_id} embedded />
+        </Section>
       )}
     </div>
   );

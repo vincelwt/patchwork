@@ -164,7 +164,16 @@ struct TurnState {
     thought: String,
     plan_posted: bool,
     stderr: Vec<String>,
+    /// When we last streamed the partial reply, so a fast agent does not turn
+    /// every token into a websocket frame.
+    streamed_at: Option<std::time::Instant>,
+    /// Whether anything has been streamed for the message being written.
+    streaming: bool,
 }
+
+/// Long enough that a chatty model does not flood the relay, short enough that
+/// the reply still reads as if it is being typed.
+const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(140);
 
 async fn execute(
     runner: Arc<Runner>,
@@ -503,7 +512,24 @@ async fn handle_update(
     match kind {
         "agent_message_chunk" => {
             if let Some(text) = content_text(update.get("content")) {
-                state.lock().await.message.push_str(&text);
+                let mut s = state.lock().await;
+                s.message.push_str(&text);
+                let due = s
+                    .streamed_at
+                    .map(|at| at.elapsed() >= STREAM_INTERVAL)
+                    .unwrap_or(true);
+                // Nothing is gained by streaming leading whitespace, and an
+                // empty draft in the transcript looks like a glitch.
+                if due && !s.message.trim().is_empty() {
+                    s.streamed_at = Some(std::time::Instant::now());
+                    s.streaming = true;
+                    let body = s.message.clone();
+                    drop(s);
+                    let _ = out.send(HostToRelay::RunMessageDelta {
+                        run_id: run_id.to_string(),
+                        body,
+                    });
+                }
             }
         }
         "agent_thought_chunk" => {
@@ -637,6 +663,8 @@ fn headline_for(title: &str) -> String {
 async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, _spec: &RunSpec) {
     let (message, thought) = {
         let mut s = state.lock().await;
+        s.streamed_at = None;
+        s.streaming = false;
         (std::mem::take(&mut s.message), std::mem::take(&mut s.thought))
     };
     if !thought.trim().is_empty() {
@@ -841,7 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prose_is_buffered_then_posted_once_per_turn() {
+    async fn prose_streams_as_deltas_but_posts_once_per_turn() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(TurnState::default()));
         for chunk in ["Fixed ", "the ", "test."] {
@@ -853,7 +881,26 @@ mod tests {
             )
             .await;
         }
-        assert!(rx.try_recv().is_err(), "chunks must not post individually");
+
+        let mut deltas = Vec::new();
+        let mut early_messages = 0;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                HostToRelay::RunMessageDelta { body, .. } => deltas.push(body),
+                HostToRelay::RunMessage { .. } => early_messages += 1,
+                _ => {}
+            }
+        }
+        // A delta rewrites a draft; a RunMessage is the turn's final word. Only
+        // the second may happen before the turn is over.
+        assert_eq!(early_messages, 0, "chunks must not post the message itself");
+        // Each delta carries the whole reply so far, never just the newest
+        // fragment — that is what makes a dropped frame harmless.
+        assert!(!deltas.is_empty(), "a reply should stream while it is written");
+        for delta in &deltas {
+            assert!("Fixed the test.".starts_with(delta.as_str()));
+        }
+
         flush_message("r1", &tx, &state, &spec()).await;
         let mut bodies = Vec::new();
         while let Ok(msg) = rx.try_recv() {
@@ -862,5 +909,29 @@ mod tests {
             }
         }
         assert_eq!(bodies, vec!["Fixed the test.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_starts_a_new_draft() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        let chunk = |text: &str| {
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } })
+        };
+
+        handle_update("r1", chunk("first"), &tx, &state).await;
+        flush_message("r1", &tx, &state, &spec()).await;
+        handle_update("r1", chunk("second"), &tx, &state).await;
+        flush_message("r1", &tx, &state, &spec()).await;
+
+        let mut bodies = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let HostToRelay::RunMessage { body, .. } = msg {
+                bodies.push(body);
+            }
+        }
+        // The second turn must not repeat the first: flushing resets the buffer
+        // and the streaming clock together.
+        assert_eq!(bodies, vec!["first".to_string(), "second".to_string()]);
     }
 }

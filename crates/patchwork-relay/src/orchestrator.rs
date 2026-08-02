@@ -105,10 +105,25 @@ async fn post_message_inner(
         state.emit(Event::ChannelUpdated { channel });
     }
 
-    notify_inbox(state, &stored, &channel, &members).await?;
+    follow_through(state, &stored, &channel, &members, options.trigger_agents).await?;
 
-    if options.trigger_agents {
-        if let Err(err) = trigger_agents(state, &stored, &channel, &members).await {
+    Ok(stored)
+}
+
+/// Everything a finished message sets in motion. Split out because a streamed
+/// reply lands in the transcript long before it is finished, and must not
+/// notify anyone or wake another agent until it actually is.
+async fn follow_through(
+    state: &Shared,
+    stored: &Message,
+    channel: &Channel,
+    members: &[Member],
+    trigger_agents_too: bool,
+) -> Result<()> {
+    notify_inbox(state, stored, channel, members).await?;
+
+    if trigger_agents_too {
+        if let Err(err) = trigger_agents(state, stored, channel, members).await {
             tracing::warn!(?err, "failed to route message to agents");
         }
     }
@@ -120,9 +135,87 @@ async fn post_message_inner(
     }
 
     // A message in a task discussion is also a trigger for automations.
-    crate::automations::on_message(state, &stored).await;
+    crate::automations::on_message(state, stored).await;
 
-    Ok(stored)
+    Ok(())
+}
+
+/// A reply that is still being written: posted on the first delta so the reader
+/// watches it arrive, then rewritten in place by every delta after it.
+async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> {
+    let existing = state
+        .streaming_messages
+        .read()
+        .await
+        .get(run_id)
+        .cloned();
+
+    if let Some(message_id) = existing {
+        state.store.stream_message_body(&message_id, body)?;
+        if let Some(message) = state.store.message(&message_id)? {
+            state.emit(Event::MessageUpdated { message });
+        }
+        return Ok(());
+    }
+
+    let Some(run) = state.store.run(run_id)? else {
+        return Ok(());
+    };
+    // Ambient agents are allowed to decide they have nothing to say, and that
+    // decision only arrives at the end. Let them finish before taking the floor.
+    if matches!(run.trigger, RunTrigger::Ambient { .. }) {
+        return Ok(());
+    }
+    let Some(channel) = state.store.channel(&run.channel_id)? else {
+        return Ok(());
+    };
+
+    let message = Message {
+        id: new_id(),
+        channel_id: run.channel_id.clone(),
+        author_id: run.agent_id.clone(),
+        kind: MessageKind::Text,
+        body: body.to_string(),
+        card: None,
+        parent_id: None,
+        reply_count: 0,
+        last_reply_at: 0,
+        run_id: Some(run.id.clone()),
+        task_id: channel.task_id.clone(),
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+        reactions: Vec::new(),
+        created_at: now_ms(),
+        edited_at: None,
+    };
+    state.store.insert_message(&message)?;
+    state
+        .streaming_messages
+        .write()
+        .await
+        .insert(run_id.to_string(), message.id.clone());
+    state.emit(Event::MessageCreated { message });
+    Ok(())
+}
+
+/// A streamed reply reaching its final text: it now knows who it mentions, and
+/// only now may it notify anyone.
+async fn finish_posted_message(state: &Shared, message: &Message) -> Result<()> {
+    let Some(channel) = state.store.channel(&message.channel_id)? else {
+        return Ok(());
+    };
+    let members = state.store.members()?;
+    let mentions = parse_mentions(&message.body, &members);
+    state.store.set_message_mentions(&message.id, &mentions)?;
+
+    let mut settled = message.clone();
+    settled.mentions = mentions;
+    state.emit(Event::MessageUpdated {
+        message: settled.clone(),
+    });
+    state.emit(Event::ChannelUpdated { channel: channel.clone() });
+
+    follow_through(state, &settled, &channel, &members, true).await
 }
 
 /// `@handle` mentions, resolved against real members so unknown handles are
@@ -818,17 +911,45 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             }
         }
 
+        HostToRelay::RunMessageDelta { run_id, body } => {
+            stream_message(state, &run_id, &body).await?;
+        }
+
         HostToRelay::RunMessage { run_id, kind, body } => {
             let Some(run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
+            let draft = state.streaming_messages.write().await.remove(&run_id);
+
             // An ambient agent that has nothing to add says so, and we stay quiet.
             let quiet = matches!(run.trigger, RunTrigger::Ambient { .. })
                 && body.trim().trim_matches(|c: char| !c.is_alphanumeric())
                     .eq_ignore_ascii_case("NOTHING");
             if quiet {
+                // It streamed something before deciding to stay out of it.
+                if let Some(message_id) = draft {
+                    state.store.delete_message(&message_id)?;
+                    state.emit(Event::MessageDeleted {
+                        channel_id: run.channel_id.clone(),
+                        message_id,
+                    });
+                }
                 return Ok(());
             }
+
+            // The reply is already in the transcript; settle it in place rather
+            // than posting the same text twice.
+            if let Some(message_id) = draft {
+                state.store.stream_message_body(&message_id, &body)?;
+                if let Some(message) = state.store.message(&message_id)? {
+                    state.emit(Event::MessageUpdated {
+                        message: message.clone(),
+                    });
+                    finish_posted_message(state, &message).await?;
+                    return Ok(());
+                }
+            }
+
             post_message(
                 state,
                 &run.channel_id,
@@ -964,6 +1085,14 @@ fn discussion_channel(state: &Shared, task_id: &str) -> Result<Id> {
 
 /// A finished run updates the board and the Inbox so nothing silently stalls.
 async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
+    // A run that died mid-sentence leaves its half-written reply in place —
+    // that is the honest record — but nothing may rewrite it after this.
+    if let Some(message_id) = state.streaming_messages.write().await.remove(&run.id) {
+        if let Some(message) = state.store.message(&message_id)? {
+            finish_posted_message(state, &message).await?;
+        }
+    }
+
     if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
         let mut automation_run = automation_run;
         automation_run.status = run.status;

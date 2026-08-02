@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { initials } from "../lib/format";
+import { avatarStyle, initials } from "../lib/format";
 import type { Id, Member, Presence } from "../lib/types";
 
 export type View =
@@ -40,21 +40,45 @@ export const NavigationContext = createContext<Navigation>({
 
 export const useNavigation = () => useContext(NavigationContext);
 
-export function Avatar({ member, size = 26 }: { member?: Member; size?: number }) {
+/// Agents are circles, people are squircles — the shape says which kind of
+/// teammate this is before you have read the name. `presence` adds the live
+/// dot, and is off by default because most avatars are historical (who said
+/// this, three days ago) rather than a statement about right now.
+export function Avatar({
+  member,
+  size = 26,
+  presence,
+}: {
+  member?: Member;
+  size?: number;
+  presence?: boolean;
+}) {
   const isAgent = member?.kind === "agent";
-  return (
+  const avatar = (
     <div
-      className={`avatar${isAgent ? " agent" : ""}`}
+      className={`avatar${isAgent ? " agent" : ""}${member ? "" : " unknown"}`}
       style={{
+        ...avatarStyle(member),
         width: size,
         height: size,
-        fontSize: Math.round(size * 0.42),
-        borderRadius: isAgent ? 999 : Math.max(5, Math.round(size * 0.27)),
+        fontSize: Math.round(size * 0.4),
+        borderRadius: isAgent ? 999 : Math.max(5, Math.round(size * 0.28)),
       }}
       title={member?.display_name}
     >
       {initials(member)}
     </div>
+  );
+
+  if (!presence || !member) return avatar;
+  return (
+    <span className="avatar-wrap" style={{ width: size, height: size }}>
+      {avatar}
+      <span
+        className={`presence-badge ${member.presence}`}
+        style={{ width: Math.max(7, size * 0.3), height: Math.max(7, size * 0.3) }}
+      />
+    </span>
   );
 }
 

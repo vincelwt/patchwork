@@ -1,8 +1,10 @@
-import { useEffect } from "react";
-import { store, useApp } from "../lib/store";
+import { useEffect, useRef } from "react";
+import { store, useApi, useApp } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
-import { Chip, useNavigation } from "./common";
+import { Avatar, Chip, useNavigation } from "./common";
 import { Empty } from "./ui";
+import { Card } from "./Cards";
+import { Markdown } from "./Markdown";
 import {
   CheckIcon,
   CloseIcon,
@@ -11,6 +13,7 @@ import {
   PulseIcon,
   QuestionIcon,
   ShieldIcon,
+  Spinner,
   TasksIcon,
   TerminalIcon,
   ThreadIcon,
@@ -77,33 +80,80 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
   );
 }
 
-export function RunPanel({ runId }: { runId: Id }) {
+export function RunPanel({
+  runId,
+  embedded,
+}: {
+  runId: Id;
+  /// Already inside somebody else's scroller — don't open a second one.
+  embedded?: boolean;
+}) {
   const app = useApp();
+  const api = useApi();
   const run = app.runs[runId];
   const events = app.runEvents[runId] ?? [];
+  const log = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
 
   useEffect(() => {
     void store.loadRun(runId);
   }, [runId]);
 
+  // A live run should scroll itself, but only while the reader has not gone
+  // back to look at something earlier.
+  useEffect(() => {
+    const element = log.current;
+    if (element && pinned.current) element.scrollTop = element.scrollHeight;
+  }, [events.length]);
+
   if (!run) return <Empty title="Loading the run" />;
   const agent = app.members.find((member) => member.id === run.agent_id);
   const host = app.hosts.find((candidate) => candidate.id === run.host_id);
+  const active = !["succeeded", "failed", "cancelled"].includes(run.status);
+  const question = Object.values(app.questions).find(
+    (candidate) => candidate.run_id === run.id && candidate.status === "open",
+  );
 
   return (
-    <div className="inspector-body">
-      <div className="card-title">{agent?.display_name}</div>
-      <div className="card-sub">{run.headline}</div>
-      <div className="card-row">
-        <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
-        <Chip>{run.runtime}</Chip>
-        {host && <Chip>{host.name}</Chip>}
-        <Chip>{duration(run.started_at, run.ended_at)}</Chip>
-      </div>
-      {run.cwd && (
-        <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
-          {run.cwd}
-        </div>
+    <div
+      className={embedded ? "" : "inspector-body"}
+      ref={embedded ? undefined : log}
+      onScroll={
+        embedded
+          ? undefined
+          : (event) => {
+              const element = event.currentTarget;
+              pinned.current =
+                element.scrollHeight - element.scrollTop - element.clientHeight < 60;
+            }
+      }
+    >
+      {!embedded && (
+        <>
+          <div className="run-summary">
+            <Avatar member={agent} size={30} />
+            <span className="grow">
+              <span className="name">{agent?.display_name}</span>
+              <span className="sub">{run.headline || statusLabel(run.status)}</span>
+            </span>
+            {active && (
+              <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
+                Stop
+              </button>
+            )}
+          </div>
+          <div className="card-row">
+            <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
+            <Chip>{run.runtime}</Chip>
+            {host && <Chip>{host.name}</Chip>}
+            <Chip>{duration(run.started_at, run.ended_at)}</Chip>
+          </div>
+          {run.cwd && (
+            <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
+              {run.cwd}
+            </div>
+          )}
+        </>
       )}
       {run.error && (
         <div className="error-text" style={{ whiteSpace: "pre-wrap" }}>
@@ -111,12 +161,15 @@ export function RunPanel({ runId }: { runId: Id }) {
         </div>
       )}
 
+      {/* The question belongs where the person looking at the run is, not only
+          in a transcript they may have scrolled away from. */}
+      {question && <Card card={{ type: "question", question_id: question.id }} />}
+
       <div className="section-head">
         <span className="section-title">Activity</span>
+        {active && <Spinner size={12} />}
       </div>
-      {events.length === 0 && (
-        <div className="card-sub">Nothing recorded yet.</div>
-      )}
+      {events.length === 0 && <div className="card-sub">Nothing recorded yet.</div>}
       {events.map((event) => (
         <RunEventRow key={event.id} event={event} />
       ))}
@@ -152,11 +205,22 @@ function eventIcon(kind: RunEvent["kind"]) {
   }
 }
 
+/// An agent writes markdown even in its log. Prose kinds get rendered; the
+/// mechanical ones (a command, a path) stay verbatim, because a file called
+/// `**init**.py` is not bold.
+const PROSE: RunEvent["kind"][] = ["message", "plan", "thought", "lifecycle"];
+
 function RunEventRow({ event }: { event: RunEvent }) {
   return (
     <div className={`run-event ${event.kind}`}>
       {eventIcon(event.kind)}
-      <div className="text">{event.text}</div>
+      <div className="text">
+        {PROSE.includes(event.kind) ? (
+          <Markdown body={event.text} compact />
+        ) : (
+          event.text
+        )}
+      </div>
     </div>
   );
 }

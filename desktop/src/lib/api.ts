@@ -125,6 +125,14 @@ export class Api {
     return this.post<Section>("/api/sections", { name });
   }
 
+  sections() {
+    return this.get<Section[]>("/api/sections");
+  }
+
+  archiveChannel(id: Id) {
+    return this.delete(`/api/channels/${id}`);
+  }
+
   openDm(memberId: Id) {
     return this.post<Channel>("/api/channels/dm", { member_id: memberId });
   }
@@ -147,6 +155,10 @@ export class Api {
 
   moveTask(id: Id, status: TaskStatus) {
     return this.updateTask(id, { status });
+  }
+
+  deleteTask(id: Id) {
+    return this.delete(`/api/tasks/${id}`);
   }
 
   runTask(id: Id, input?: { agent_id?: Id; prompt?: string }) {

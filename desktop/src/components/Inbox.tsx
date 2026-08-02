@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative } from "../lib/format";
+import { markSeen } from "../lib/unread";
 import { Avatar, Chip, useNavigation } from "./common";
 import { Empty, Page } from "./ui";
 import { CheckIcon } from "./icons";
-import type { InboxItem, InboxKind } from "../lib/types";
+import type { Channel, InboxItem, InboxKind, Task } from "../lib/types";
 
 const LABELS: Record<InboxKind, string> = {
   mention: "Mention",
@@ -24,21 +25,82 @@ const TONES: Partial<Record<InboxKind, string>> = {
   automation_failed: "danger",
 };
 
+/// Some things are blocking somebody; a chatty channel is not. Ordering puts
+/// what is stuck first, whatever the timestamps say.
+const URGENCY: Record<InboxKind, number> = {
+  question: 0,
+  task_blocked: 1,
+  automation_failed: 1,
+  review_ready: 2,
+  task_assigned: 3,
+  direct_message: 4,
+  mention: 5,
+  reply: 6,
+};
+
+interface Group {
+  key: string;
+  items: InboxItem[];
+  latest: InboxItem;
+  /// The most pressing kind in the group — what the row is really about.
+  lead: InboxKind;
+  unread: number;
+}
+
 /// Inbox is a view onto things that need attention. Opening an item always
 /// lands in the original conversation, task or run — never a parallel thread.
+///
+/// One row per conversation, not one per message: six mentions in the same
+/// channel are one thing to go and deal with, and listing them six times buries
+/// the question somebody asked an hour ago.
 export function InboxView() {
   const app = useApp();
   const api = useApi();
   const { go, inspect } = useNavigation();
   const [showRead, setShowRead] = useState(false);
 
-  const items = showRead
-    ? app.inbox
-    : app.inbox.filter((item) => !item.read_at);
-  const sorted = [...items].sort((a, b) => b.created_at - a.created_at);
+  const groups = useMemo(() => {
+    const source = showRead ? app.inbox : app.inbox.filter((item) => !item.read_at);
+    const byConversation = new Map<string, InboxItem[]>();
+    for (const item of source) {
+      // A question or a failed automation is about that specific thing, so it
+      // keeps its own row even when it shares a channel with ordinary chatter.
+      const standalone = item.kind === "question" || item.kind === "automation_failed";
+      const key = standalone
+        ? item.id
+        : (item.task_id ?? item.channel_id ?? item.automation_id ?? item.id);
+      byConversation.set(key, [...(byConversation.get(key) ?? []), item]);
+    }
 
-  const open = async (item: InboxItem) => {
-    await api.markRead(item.id);
+    const out: Group[] = [];
+    for (const [key, items] of byConversation) {
+      const sorted = [...items].sort((a, b) => b.created_at - a.created_at);
+      const lead = [...items].sort((a, b) => URGENCY[a.kind] - URGENCY[b.kind])[0]
+        .kind;
+      out.push({
+        key,
+        items: sorted,
+        latest: sorted[0],
+        lead,
+        unread: items.filter((item) => !item.read_at).length,
+      });
+    }
+
+    return out.sort(
+      (a, b) =>
+        URGENCY[a.lead] - URGENCY[b.lead] ||
+        b.latest.created_at - a.latest.created_at,
+    );
+  }, [app.inbox, showRead]);
+
+  const open = async (group: Group) => {
+    const item = group.latest;
+    await Promise.all(
+      group.items
+        .filter((each) => !each.read_at)
+        .map((each) => api.markRead(each.id)),
+    );
+    if (item.channel_id) markSeen(item.channel_id);
     if (item.task_id) {
       go({ kind: "task", id: item.task_id });
       if (item.run_id) inspect({ kind: "run", runId: item.run_id });
@@ -48,9 +110,7 @@ export function InboxView() {
       go({ kind: "channel", id: item.channel_id });
       return;
     }
-    if (item.automation_id) {
-      go({ kind: "automation", id: item.automation_id });
-    }
+    if (item.automation_id) go({ kind: "automation", id: item.automation_id });
   };
 
   const unread = app.inbox.filter((item) => !item.read_at).length;
@@ -58,7 +118,7 @@ export function InboxView() {
   return (
     <Page
       title="Inbox"
-      subtitle={unread > 0 ? `${unread} unread` : undefined}
+      subtitle={unread > 0 ? `${unread} unread` : "all caught up"}
       actions={
         <>
           <button className="button quiet" onClick={() => setShowRead(!showRead)}>
@@ -73,32 +133,75 @@ export function InboxView() {
         </>
       }
     >
-      {sorted.length === 0 && (
+      {groups.length === 0 && (
         <Empty
           title="Nothing needs you right now"
           hint="Mentions, agent questions, blocked tasks and work ready for review land here."
         />
       )}
-      {sorted.map((item) => {
-            const actor = app.members.find((member) => member.id === item.actor_id);
-            return (
-              <button
-                key={item.id}
-                className={`row${item.read_at ? "" : " unread"}`}
-                style={{ opacity: item.read_at ? 0.5 : 1 }}
-                onClick={() => open(item)}
-              >
-                <Avatar member={actor} size={26} />
-                <span className="grow">
-                  <span className="name">{item.title}</span>
-                  <span className="sub">{item.preview}</span>
-                </span>
-                <Chip tone={TONES[item.kind] ?? ""}>{LABELS[item.kind]}</Chip>
-                <span className="composer-hint">{relative(item.created_at)}</span>
-                {!item.read_at && <span className="dot unread" />}
-              </button>
-        );
-      })}
+      {groups.map((group) => (
+        <InboxRow
+          key={group.key}
+          group={group}
+          where={conversationLabel(group, app.channels, app.tasks)}
+          onOpen={() => void open(group)}
+        />
+      ))}
     </Page>
+  );
+}
+
+function conversationLabel(
+  group: Group,
+  channels: Channel[],
+  tasks: Task[],
+): string | undefined {
+  const item = group.latest;
+  if (item.task_id) {
+    const task = tasks.find((candidate) => candidate.id === item.task_id);
+    return task ? `${task.key} · ${task.title}` : undefined;
+  }
+  if (item.channel_id) {
+    const channel = channels.find((candidate) => candidate.id === item.channel_id);
+    if (!channel) return undefined;
+    return channel.kind === "channel" ? `#${channel.name}` : channel.name;
+  }
+  return undefined;
+}
+
+function InboxRow({
+  group,
+  where,
+  onOpen,
+}: {
+  group: Group;
+  where?: string;
+  onOpen: () => void;
+}) {
+  const app = useApp();
+  const item = group.latest;
+  const actor = app.members.find((member) => member.id === item.actor_id);
+  const read = group.unread === 0;
+  const extra = group.items.length - 1;
+
+  return (
+    <button className={`inbox-row${read ? " read" : ""}`} onClick={onOpen}>
+      <Avatar member={actor} size={30} />
+      <span className="grow">
+        <span className="top">
+          <span className="name">{item.title}</span>
+          <Chip tone={TONES[group.lead] ?? ""}>{LABELS[group.lead]}</Chip>
+          {extra > 0 && (
+            <span className="more">
+              +{extra} more {extra === 1 ? "message" : "messages"}
+            </span>
+          )}
+        </span>
+        <span className="sub">{item.preview}</span>
+        {where && <span className="where">{where}</span>}
+      </span>
+      <span className="when">{relative(item.created_at)}</span>
+      {!read && <span className="dot unread" />}
+    </button>
   );
 }

@@ -13,7 +13,8 @@ import {
   ThreadIcon,
 } from "./icons";
 import { AttachmentRow, Card } from "./Cards";
-import type { Attachment, Channel, Id, Member, Message } from "../lib/types";
+import { Markdown } from "./Markdown";
+import type { Attachment, Channel, Id, Message } from "../lib/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const app = useApp();
@@ -45,12 +46,16 @@ export function Timeline({
   const scroller = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
 
+  // Following the conversation means following the last message as it *grows*,
+  // not only when a new one arrives. A streamed reply adds no rows to the list,
+  // so keying this on the count alone left the agent writing below the fold.
+  const tail = messages[messages.length - 1];
   useEffect(() => {
     const element = scroller.current;
     if (element && atBottom.current) {
       element.scrollTop = element.scrollHeight;
     }
-  }, [messages.length, channelId]);
+  }, [messages.length, tail?.body.length, channelId]);
 
   const onScroll = () => {
     const element = scroller.current;
@@ -118,6 +123,24 @@ export function MessageRow({
   const { inspect } = useNavigation();
   const author = app.members.find((member) => member.id === message.author_id);
   const [showReactions, setShowReactions] = useState(false);
+  const handles = useHandles();
+
+  // A reply the relay is still rewriting: its run is going, and nothing newer
+  // from that run has arrived. It gets a caret, so half a sentence reads as
+  // "still typing" rather than as a truncated answer.
+  const run = message.run_id ? app.runs[message.run_id] : undefined;
+  const siblings = app.messages[message.channel_id];
+  const newestOfRun = useMemo(() => {
+    if (!run || !siblings) return false;
+    for (let index = siblings.length - 1; index >= 0; index -= 1) {
+      if (siblings[index].run_id === run.id) return siblings[index].id === message.id;
+    }
+    return false;
+  }, [siblings, run, message.id]);
+  const streaming =
+    newestOfRun &&
+    message.kind === "text" &&
+    ["running", "dispatched"].includes(run?.status ?? "");
 
   // A status note or a workspace event is not somebody talking. It reads as a
   // quiet line, the way tool activity does in a good agent transcript.
@@ -152,7 +175,8 @@ export function MessageRow({
         )}
         {message.body && (
           <div className="message-body">
-            <Body body={message.body} members={app.members} />
+            <Markdown body={message.body} handles={handles} />
+            {streaming && <span className="caret" />}
           </div>
         )}
         {message.card && <Card card={message.card} />}
@@ -236,44 +260,14 @@ export function MessageRow({
   );
 }
 
-/// Mentions are highlighted; everything else stays plain text so an agent's
-/// prose reads the way it was written.
-function Body({ body, members }: { body: string; members: Member[] }) {
-  const parts = useMemo(() => {
-    const handles = members
-      .map((member) => member.handle)
-      .sort((a, b) => b.length - a.length);
-    if (handles.length === 0) return [body];
-    const pattern = new RegExp(`@(${handles.map(escape).join("|")})\\b`, "g");
-    const out: (string | { handle: string })[] = [];
-    let index = 0;
-    for (const match of body.matchAll(pattern)) {
-      const at = match.index ?? 0;
-      if (at > index) out.push(body.slice(index, at));
-      out.push({ handle: match[1] });
-      index = at + match[0].length;
-    }
-    out.push(body.slice(index));
-    return out;
-  }, [body, members]);
-
-  return (
-    <>
-      {parts.map((part, index) =>
-        typeof part === "string" ? (
-          <span key={index}>{part}</span>
-        ) : (
-          <span className="mention" key={index}>
-            @{part.handle}
-          </span>
-        ),
-      )}
-    </>
+/// Handles that resolve to a real member, so `@2x` in a sentence about screen
+/// resolution does not light up as a mention. Shared by every renderer.
+export function useHandles(): Set<string> {
+  const app = useApp();
+  return useMemo(
+    () => new Set(app.members.map((member) => member.handle.toLowerCase())),
+    [app.members],
   );
-}
-
-function escape(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /// One line above the composer for "somebody or something is busy" — typing

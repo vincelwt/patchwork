@@ -70,32 +70,47 @@ function RunCardInline({ runId }: { runId: string }) {
   const agent = app.members.find((member) => member.id === run.agent_id);
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
 
-  // A run that simply worked is activity, not an announcement: it collapses to
-  // one quiet line, with the full log a click away. Only a run that is still
-  // going, or that needs a person, earns a card.
-  if (!active && run.status === "succeeded") {
+  // A run is not an announcement. Nearly every one of them — starting, working,
+  // finished — is a single quiet line in the transcript, because the thing you
+  // came to read is the agent's actual reply, not a status panel wrapped around
+  // it. Only a run that has failed, or that is sitting waiting for a person,
+  // has earned the weight of a card.
+  const wantsAttention = run.status === "failed" || run.status === "waiting";
+
+  if (!wantsAttention) {
     return (
-      <div className="activity" style={{ marginTop: 8 }}>
-        <RunIcon size={15} />
+      <div className={`run-line${active ? " active" : ""}`}>
+        {active ? <Spinner size={13} /> : <RunIcon size={14} />}
         <span className="text">
-          <span className="who">{agent?.display_name} </span>ran {run.runtime} ·{" "}
-          {duration(run.started_at, run.ended_at)}{" "}
-          <button
-            className="thread-link"
-            style={{ marginTop: 0 }}
-            onClick={() => inspect({ kind: "run", runId: run.id })}
-          >
-            Details
-          </button>
+          {active ? (
+            <>{run.headline || `${agent?.display_name ?? "An agent"} is working`}</>
+          ) : (
+            <>
+              <span className="who">{agent?.display_name} </span>
+              {run.status === "cancelled" ? "was stopped" : `ran ${run.runtime}`} ·{" "}
+              {duration(run.started_at, run.ended_at)}
+            </>
+          )}
         </span>
+        <button
+          className="run-line-action"
+          onClick={() => inspect({ kind: "run", runId: run.id })}
+        >
+          Details
+        </button>
+        {active && (
+          <button className="run-line-action" onClick={() => api.cancelRun(run.id)}>
+            Stop
+          </button>
+        )}
       </div>
     );
   }
 
   return (
-    <div className="card">
+    <div className={`card ${run.status}`}>
       <div className="card-head">
-        {active ? <Spinner size={13} /> : <RunIcon size={14} />}
+        {run.status === "waiting" ? <QuestionIcon size={14} /> : <RunIcon size={14} />}
         <span>
           {agent?.display_name} · {run.runtime}
         </span>

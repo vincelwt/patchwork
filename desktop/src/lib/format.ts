@@ -47,11 +47,34 @@ export function duration(from?: Millis, to?: Millis) {
 export function initials(member?: Member) {
   if (!member) return "?";
   if (member.avatar && member.avatar.length <= 2) return member.avatar;
-  return member.display_name
-    .split(/\s+/)
+  const name = member.display_name.trim() || member.handle;
+  const parts = name.split(/[\s._-]+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) {
+    // One word: two letters read better than one lonely capital.
+    return parts[0].slice(0, 2).replace(/^./, (c) => c.toUpperCase());
+  }
+  return parts
     .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase() ?? "")
+    .map((part) => part[0].toUpperCase())
     .join("");
+}
+
+/// A workspace full of identical grey squares tells you nothing. Colour is
+/// derived from the id, so the same teammate is the same colour on every
+/// machine, and the set is deliberately desaturated — this is a calm app, and
+/// an avatar is a landmark, not a highlight.
+const AVATAR_HUES = [212, 258, 292, 330, 8, 24, 44, 96, 152, 178];
+
+export function avatarStyle(member?: Member): {
+  "--avatar-h": string;
+} {
+  const seed = member?.id ?? member?.handle ?? "";
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+  }
+  return { "--avatar-h": String(AVATAR_HUES[hash % AVATAR_HUES.length]) };
 }
 
 export function statusTone(status: TaskStatus | RunStatus): string {

@@ -10,13 +10,23 @@ import {
 } from "../lib/desktop";
 import type { DesktopInfo } from "../lib/desktop";
 import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
-import { Dropdown, Empty, FormSelect, Page, Section, Toggle } from "./ui";
+import {
+  Dropdown,
+  Empty,
+  FormSelect,
+  MenuButton,
+  Page,
+  Section,
+  Toggle,
+} from "./ui";
 import {
   CheckIcon,
   ExternalIcon,
   FolderIcon,
+  MoreIcon,
   PlusIcon,
   Spinner,
+  TrashIcon,
 } from "./icons";
 import type {
   AgentProfile,
@@ -98,7 +108,13 @@ function locationLabel(profile?: AgentProfile) {
   }
 }
 
-function AgentModal({ agent, onClose }: { agent: Member | null; onClose: () => void }) {
+export function AgentModal({
+  agent,
+  onClose,
+}: {
+  agent: Member | null;
+  onClose: () => void;
+}) {
   const app = useApp();
   const api = useApi();
   const [name, setName] = useState(agent?.display_name ?? "");
@@ -217,6 +233,24 @@ function AgentModal({ agent, onClose }: { agent: Member | null; onClose: () => v
         />
       )}
       <FormSelect
+        label="Default project"
+        value={profile.default_project_id ?? ""}
+        onChange={(default_project_id) =>
+          setProfile({
+            ...profile,
+            default_project_id: default_project_id || undefined,
+          })
+        }
+        options={[
+          { value: "", label: "None" },
+          ...app.projects.map((project) => ({
+            value: project.id,
+            label: project.name,
+          })),
+        ]}
+        help="Pre-selected when you give this agent a task."
+      />
+      <FormSelect
         label="Default participation"
         value={profile.default_participation}
         onChange={(value) =>
@@ -291,6 +325,7 @@ export function ProjectsPage() {
   return (
     <Page
       title="Projects and machines"
+      subtitle="A project is a git repository or a plain folder, plus where it lives on each machine"
       actions={
         <button className="button" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
@@ -398,7 +433,7 @@ export function ProjectsPage() {
   );
 }
 
-function ProjectModal({
+export function ProjectModal({
   project,
   onClose,
   onDelete,
@@ -543,22 +578,18 @@ function ProjectModal({
 export function MembersPage() {
   const app = useApp();
   const api = useApi();
-  const [invite, setInvite] = useState<string>();
-  const [copied, setCopied] = useState(false);
+  const { toast } = useNavigation();
+  const [inviting, setInviting] = useState(false);
+  const [removing, setRemoving] = useState<Member | null>(null);
   const humans = app.members.filter((member) => member.kind === "human");
+  const iAmAdmin = app.me?.is_admin ?? false;
 
   return (
     <Page
       title="Members"
+      subtitle={`${humans.length} ${humans.length === 1 ? "person" : "people"}`}
       actions={
-        <button
-          className="button"
-          onClick={async () => {
-            const created = await api.createInvite({ is_admin: false });
-            setInvite(created.code);
-            setCopied(false);
-          }}
-        >
+        <button className="button" onClick={() => setInviting(true)}>
           <PlusIcon size={15} />
           Invite someone
         </button>
@@ -566,9 +597,12 @@ export function MembersPage() {
     >
       {humans.map((member) => (
         <div className="row hoverable" key={member.id}>
-          <Avatar member={member} size={30} />
+          <Avatar member={member} size={30} presence />
           <span className="grow">
-            <span className="name">{member.display_name}</span>
+            <span className="name">
+              {member.display_name}
+              {member.id === app.me?.id && <span className="you"> you</span>}
+            </span>
             <span className="sub">
               @{member.handle}
               {member.email ? ` · ${member.email}` : ""}
@@ -578,36 +612,152 @@ export function MembersPage() {
           <Chip tone={member.presence === "online" ? "positive" : ""}>
             {member.presence}
           </Chip>
+          {iAmAdmin && member.id !== app.me?.id && (
+            <MenuButton
+              align="right"
+              title="Manage"
+              items={[
+                {
+                  key: "admin",
+                  label: member.is_admin ? "Remove admin" : "Make admin",
+                  disabled: true,
+                  hint: "Admin rights are set by the relay for now",
+                  onSelect: () => {},
+                },
+                "separator",
+                {
+                  key: "remove",
+                  label: `Remove ${member.display_name}`,
+                  icon: <TrashIcon size={15} />,
+                  danger: true,
+                  onSelect: () => setRemoving(member),
+                },
+              ]}
+            >
+              <MoreIcon size={17} />
+            </MenuButton>
+          )}
         </div>
       ))}
 
-      {invite && (
+      {!iAmAdmin && humans.length > 1 && (
+        <div className="notice" style={{ marginTop: 18 }}>
+          Only an admin can remove someone from this workspace.
+        </div>
+      )}
+
+      {inviting && <InviteModal onClose={() => setInviting(false)} />}
+
+      {removing && (
         <Modal
-          title="Invite code"
-          subtitle="They enter this and your relay URL in Patchwork Desktop."
-          onClose={() => setInvite(undefined)}
+          title={`Remove ${removing.display_name}?`}
+          subtitle="They lose access immediately. What they wrote stays in the transcript — removing a person does not rewrite history."
+          onClose={() => setRemoving(null)}
           actions={
-            <button className="button primary" onClick={() => setInvite(undefined)}>
-              Done
-            </button>
+            <>
+              <button className="button quiet" onClick={() => setRemoving(null)}>
+                Cancel
+              </button>
+              <button
+                className="button primary danger-solid"
+                onClick={async () => {
+                  try {
+                    await api.removeMember(removing.id);
+                    toast(`${removing.display_name} was removed`);
+                  } catch (err) {
+                    toast(String((err as Error).message ?? err));
+                  }
+                  setRemoving(null);
+                }}
+              >
+                Remove
+              </button>
+            </>
           }
         >
-          <div className="invite-code">
-            <code>{invite}</code>
-            <button
-              className="button quiet"
-              onClick={() => {
-                void navigator.clipboard.writeText(invite);
-                setCopied(true);
-              }}
-            >
-              {copied ? <CheckIcon size={15} /> : null}
-              {copied ? "Copied" : "Copy"}
-            </button>
+          <div className="row hoverable" style={{ marginTop: 14 }}>
+            <Avatar member={removing} size={30} />
+            <span className="grow">
+              <span className="name">{removing.display_name}</span>
+              <span className="sub">@{removing.handle}</span>
+            </span>
           </div>
         </Modal>
       )}
     </Page>
+  );
+}
+
+/// An invite is a code somebody pastes into their own copy of the app, so the
+/// only useful thing this dialog can do is make the code easy to hand over.
+export function InviteModal({ onClose }: { onClose: () => void }) {
+  const api = useApi();
+  const [code, setCode] = useState<string>();
+  const [admin, setAdmin] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+
+  const create = async () => {
+    setError("");
+    try {
+      const created = await api.createInvite({ is_admin: admin });
+      setCode(created.code);
+      setCopied(false);
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    }
+  };
+
+  return (
+    <Modal
+      title={code ? "Invite code" : "Invite someone"}
+      subtitle={
+        code
+          ? "They enter this and your relay URL in Patchwork Desktop."
+          : "Anyone with the code and your relay URL can join this workspace."
+      }
+      onClose={onClose}
+      actions={
+        code ? (
+          <button className="button primary" onClick={onClose}>
+            Done
+          </button>
+        ) : (
+          <>
+            <button className="button quiet" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="button primary" onClick={create}>
+              Create the code
+            </button>
+          </>
+        )
+      }
+    >
+      {code ? (
+        <div className="invite-code">
+          <code>{code}</code>
+          <button
+            className="button quiet"
+            onClick={() => {
+              void navigator.clipboard.writeText(code);
+              setCopied(true);
+            }}
+          >
+            {copied ? <CheckIcon size={15} /> : null}
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+      ) : (
+        <Toggle
+          checked={admin}
+          onChange={setAdmin}
+          label="Join as an admin"
+          help="Admins can remove members and delete tasks."
+        />
+      )}
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
   );
 }
 
@@ -1001,6 +1151,47 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     void desktopInfo().then(setInfo);
   }, [app.hosts]);
 
+  // The relay knows about every host. This machine also knows things the relay
+  // has not been told yet — its own capabilities before it has registered — so
+  // the two are merged, with the local view winning for the local machine.
+  const machines = app.hosts.map((host) => {
+    const isThis = !!info && host.id === info.host.host_id;
+    const capabilities = isThis ? info.capabilities : host.capabilities;
+    return {
+      id: host.id,
+      name: host.name,
+      kind: host.kind,
+      isThis,
+      platform: isThis ? info.platform : host.platform,
+      online: isThis ? info.host.connected : host.online,
+      lastSeen: host.last_seen,
+      error: isThis ? info.host.last_error : undefined,
+      hasGh: capabilities.has_gh,
+      ghAuthed: capabilities.gh_authenticated,
+      runtimes: capabilities.runtimes.filter((runtime) => runtime.id !== "custom"),
+    };
+  });
+
+  // Not yet registered with the relay: still worth showing, or the user is
+  // staring at a list that does not contain the machine they are sitting at.
+  if (info && !machines.some((machine) => machine.isThis)) {
+    machines.unshift({
+      id: info.host.host_id || "local",
+      name: info.host.host_name || "This machine",
+      kind: "desktop",
+      isThis: true,
+      platform: info.platform,
+      online: info.host.connected,
+      lastSeen: Date.now(),
+      error: info.host.last_error,
+      hasGh: info.capabilities.has_gh,
+      ghAuthed: info.capabilities.gh_authenticated,
+      runtimes: info.capabilities.runtimes.filter(
+        (runtime) => runtime.id !== "custom",
+      ),
+    });
+  }
+
   return (
     <Page title="Settings">
       <Section title="Workspace">
@@ -1020,28 +1211,61 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
         </button>
       </Section>
 
-      <Section title="This machine">
-        <div className="row hoverable">
-          <span className={`dot ${info?.host.connected ? "online" : ""}`} />
-          <span className="grow">
-            <span className="name">{info?.host.host_name || "not connected"}</span>
-            <span className="sub">
-              {info?.platform}
-              {info?.host.last_error ? ` · ${info.host.last_error}` : ""}
-            </span>
+      {/* Every machine, not just this one. An agent installed on the relay is
+          the whole point of running a relay, and it used to be invisible here
+          because this section only ever asked the local host what it had. */}
+      <Section
+        title="Machines and runtimes"
+        action={
+          <span className="section-note">
+            An agent can run anywhere its runtime is installed
           </span>
-        </div>
-        {info?.capabilities.runtimes.map((runtime) => (
-          <div className="row hoverable" key={runtime.id}>
-            <span className="grow">
-              <span className="name">{runtime.label}</span>
-              <span className="sub">
-                {runtime.problem ?? runtime.version ?? runtime.command.join(" ")}
+        }
+      >
+        {machines.length === 0 && (
+          <div className="notice">No machine has reported in yet.</div>
+        )}
+        {machines.map((machine) => (
+          <div className="machine" key={machine.id}>
+            <div className="machine-head">
+              <span className={`dot ${machine.online ? "online" : ""}`} />
+              <span className="grow">
+                <span className="name">
+                  {machine.name}
+                  {machine.isThis && <span className="you"> this machine</span>}
+                </span>
+                <span className="sub">
+                  {machine.platform}
+                  {machine.kind === "relay" ? " · relay" : ""}
+                  {machine.online ? "" : ` · seen ${relative(machine.lastSeen)}`}
+                  {machine.error ? ` · ${machine.error}` : ""}
+                </span>
               </span>
-            </span>
-            <Chip tone={runtime.available ? "positive" : "caution"}>
-              {runtime.available ? "ready" : "unavailable"}
-            </Chip>
+              {machine.hasGh && (
+                <Chip tone={machine.ghAuthed ? "positive" : "caution"}>gh</Chip>
+              )}
+            </div>
+            {machine.runtimes.length === 0 ? (
+              <div className="machine-runtime empty">
+                No agent runtimes detected here
+              </div>
+            ) : (
+              machine.runtimes.map((runtime) => (
+                <div className="machine-runtime" key={runtime.id}>
+                  <span className="grow">
+                    <span className="name">{runtime.label}</span>
+                    <span className="sub">
+                      {runtime.problem ??
+                        runtime.version ??
+                        runtime.command.join(" ")}
+                    </span>
+                  </span>
+                  <Chip tone={runtime.available ? "positive" : "caution"}>
+                    {runtime.available ? "ready" : "unavailable"}
+                  </Chip>
+                </div>
+              ))
+            )}
           </div>
         ))}
       </Section>
