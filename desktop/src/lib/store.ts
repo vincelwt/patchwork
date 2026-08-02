@@ -79,6 +79,7 @@ class Store {
   private listeners = new Set<Listener>();
   private socket?: WebSocket;
   private reconnectTimer?: number;
+  private retryDelay = 1000;
   private loadingChannels = new Set<Id>();
   api?: Api;
 
@@ -96,13 +97,19 @@ class Store {
 
   async connect(baseUrl: string, token: string) {
     this.api = new Api(baseUrl, token);
-    this.set({ status: "loading", error: undefined });
+    if (this.data.status !== "ready") {
+      this.set({ status: "loading", error: undefined });
+    }
     try {
       const bootstrap = await this.api.bootstrap();
+      this.retryDelay = 1000;
       this.applyBootstrap(bootstrap);
       this.openSocket();
     } catch (err) {
+      // A relay restart is routine — keep trying rather than stranding the app
+      // behind a button nobody is there to press.
       this.set({ status: "error", error: String((err as Error).message ?? err) });
+      this.scheduleReconnect();
     }
   }
 
@@ -166,12 +173,14 @@ class Store {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    const delay = this.retryDelay;
+    this.retryDelay = Math.min(delay * 2, 15000);
     this.reconnectTimer = window.setTimeout(() => {
       if (!this.api) return;
       // Re-bootstrap: cheaper than replaying a long backlog, and guarantees
       // the shell is correct after a long sleep.
       void this.connect(this.api.baseUrl, this.api.token);
-    }, 2000);
+    }, delay);
   }
 
   private applyEvent(envelope: Envelope) {

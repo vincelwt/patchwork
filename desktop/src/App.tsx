@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import type { ReactNode } from "react";
 import { store, useApi, useApp } from "./lib/store";
 import { desktopInfo, joinWorkspace } from "./lib/desktop";
 import type { DesktopSettings } from "./lib/desktop";
@@ -22,6 +23,16 @@ import {
   NavigationContext,
   useNavigation,
 } from "./components/common";
+import {
+  AgentIcon,
+  AutomationIcon,
+  FolderIcon,
+  MembersIcon,
+  PlusIcon,
+  SearchIcon,
+  SettingsIcon,
+  Spinner,
+} from "./components/icons";
 import type { Inspector as InspectorState, View } from "./components/common";
 import type { SearchResults } from "./lib/types";
 
@@ -154,14 +165,11 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
         <div className="onboarding-card">
           <h1>Can't reach the relay</h1>
           <p>{app.error}</p>
-          <button
-            className="button"
-            style={{ marginTop: 14 }}
-            onClick={() => window.location.reload()}
-          >
-            Try again
-          </button>
-          <button className="button quiet" style={{ marginTop: 8 }} onClick={onSignOut}>
+          <p style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
+            <Spinner size={13} />
+            Retrying…
+          </p>
+          <button className="button quiet" style={{ marginTop: 16 }} onClick={onSignOut}>
             Use a different workspace
           </button>
         </div>
@@ -174,9 +182,17 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
       value={{ view, go, inspector, inspect: setInspector, toast: showToast }}
     >
       <div className="shell">
-        <Sidebar onOpenMenu={() => setMenuOpen(true)} />
+        <Sidebar
+          onOpenMenu={() => setMenuOpen(true)}
+          onSearch={() => setSearchOpen(true)}
+        />
         <div className="main">
-          {!app.live && <div className="offline-banner">Reconnecting…</div>}
+          {!app.live && (
+            <div className="offline-banner">
+              <Spinner size={12} />
+              Reconnecting to the relay
+            </div>
+          )}
           <div className="content">
             <MainView view={view} onSignOut={onSignOut} />
             <Inspector />
@@ -254,6 +270,7 @@ function ChannelView({ channelId }: { channelId: string }) {
           </Chip>
         )}
         <button className="button quiet" onClick={() => setCreatingTask(true)}>
+          <PlusIcon size={15} />
           New task
         </button>
       </div>
@@ -275,25 +292,51 @@ function WorkspaceMenu({
   onClose: () => void;
   onPick: (view: View) => void;
 }) {
-  const entries: { label: string; view: View }[] = [
-    { label: "Automations", view: { kind: "automations" } },
-    { label: "Agents", view: { kind: "agents" } },
-    { label: "Projects and execution machines", view: { kind: "projects" } },
-    { label: "Members", view: { kind: "members" } },
-    { label: "Settings", view: { kind: "settings" } },
+  const entries: { label: string; hint: string; icon: ReactNode; view: View }[] = [
+    {
+      label: "Automations",
+      hint: "When agents act on their own",
+      icon: <AutomationIcon />,
+      view: { kind: "automations" },
+    },
+    {
+      label: "Agents",
+      hint: "Identities, runtimes and where they run",
+      icon: <AgentIcon />,
+      view: { kind: "agents" },
+    },
+    {
+      label: "Projects and machines",
+      hint: "Repositories, folders and execution hosts",
+      icon: <FolderIcon />,
+      view: { kind: "projects" },
+    },
+    {
+      label: "Members",
+      hint: "People and invitations",
+      icon: <MembersIcon />,
+      view: { kind: "members" },
+    },
+    {
+      label: "Settings",
+      hint: "Workspace, this machine, relay",
+      icon: <SettingsIcon />,
+      view: { kind: "settings" },
+    },
   ];
 
   return (
     <Modal title="Workspace" onClose={onClose}>
-      <div className="stack" style={{ marginTop: 10 }}>
+      <div className="stack" style={{ marginTop: 12 }}>
         {entries.map((entry) => (
-          <button
-            key={entry.label}
-            className="row"
-            style={{ width: "100%" }}
-            onClick={() => onPick(entry.view)}
-          >
-            <span className="grow name">{entry.label}</span>
+          <button key={entry.label} className="row" onClick={() => onPick(entry.view)}>
+            <span style={{ color: "var(--text-muted)", display: "flex" }}>
+              {entry.icon}
+            </span>
+            <span className="grow">
+              <span className="name">{entry.label}</span>
+              <span className="sub">{entry.hint}</span>
+            </span>
           </button>
         ))}
       </div>
@@ -303,27 +346,82 @@ function WorkspaceMenu({
 
 function SearchModal({ onClose }: { onClose: () => void }) {
   const { go } = useNavigation();
+  const app = useApp();
   const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+
+  // Channels, agents and tasks answer instantly from what the client already
+  // has; full-text search is one Enter away.
+  const jumps = needle
+    ? [
+        ...app.channels
+          .filter((c) => c.kind === "channel" && c.name.includes(needle))
+          .slice(0, 4)
+          .map((c) => ({
+            key: c.id,
+            label: `#${c.name}`,
+            hint: c.topic,
+            view: { kind: "channel", id: c.id } as View,
+          })),
+        ...app.tasks
+          .filter(
+            (t) =>
+              t.title.toLowerCase().includes(needle) ||
+              t.key.toLowerCase() === needle,
+          )
+          .slice(0, 4)
+          .map((t) => ({
+            key: t.id,
+            label: `${t.key} — ${t.title}`,
+            hint: t.status,
+            view: { kind: "task", id: t.id } as View,
+          })),
+      ]
+    : [];
+
+  const open = (view: View) => {
+    go(view);
+    onClose();
+  };
 
   return (
     <Modal title="Search" onClose={onClose}>
-      <Field
-        label="Conversations, tasks and outcomes"
-        value={query}
-        onChange={setQuery}
+      <input
+        className="field"
+        style={{ marginTop: 14 }}
         autoFocus
-      />
-      <button
-        className="button primary"
-        style={{ marginTop: 12 }}
-        disabled={!query.trim()}
-        onClick={() => {
-          go({ kind: "search", query: query.trim() });
-          onClose();
+        placeholder="Channels, tasks, conversations…"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && query.trim()) {
+            open({ kind: "search", query: query.trim() });
+          }
         }}
-      >
-        Search
-      </button>
+      />
+      <div className="stack" style={{ marginTop: 10 }}>
+        {jumps.map((jump) => (
+          <button key={jump.key} className="row" onClick={() => open(jump.view)}>
+            <span className="grow">
+              <span className="name">{jump.label}</span>
+              {jump.hint && <span className="sub">{jump.hint}</span>}
+            </span>
+          </button>
+        ))}
+        {query.trim() && (
+          <button
+            className="row"
+            onClick={() => open({ kind: "search", query: query.trim() })}
+          >
+            <span style={{ color: "var(--text-muted)", display: "flex" }}>
+              <SearchIcon size={17} />
+            </span>
+            <span className="grow name">
+              Search every conversation for “{query.trim()}”
+            </span>
+          </button>
+        )}
+      </div>
     </Modal>
   );
 }

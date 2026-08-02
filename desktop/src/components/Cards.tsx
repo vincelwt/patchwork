@@ -3,6 +3,14 @@ import { useApi, useApp, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
 import { Chip, useNavigation } from "./common";
+import {
+  ExternalIcon,
+  PreviewIcon,
+  QuestionIcon,
+  RunIcon,
+  Spinner,
+  TasksIcon,
+} from "./icons";
 import type { MessageCard, QuestionAnswer } from "../lib/types";
 
 /// Cards are how tasks, runs, questions, artifacts, previews and pull requests
@@ -35,7 +43,7 @@ function TaskCardInline({ taskId }: { taskId: string }) {
   return (
     <button className="card" onClick={() => go({ kind: "task", id: task.id })}>
       <div className="card-head">
-        <span>Task</span>
+        <TasksIcon size={14} />
         <span>{task.key}</span>
       </div>
       <div className="card-title">{task.title}</div>
@@ -62,16 +70,42 @@ function RunCardInline({ runId }: { runId: string }) {
   const agent = app.members.find((member) => member.id === run.agent_id);
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
 
+  // A run that simply worked is activity, not an announcement: it collapses to
+  // one quiet line, with the full log a click away. Only a run that is still
+  // going, or that needs a person, earns a card.
+  if (!active && run.status === "succeeded") {
+    return (
+      <div className="activity" style={{ marginTop: 8 }}>
+        <RunIcon size={15} />
+        <span className="text">
+          <span className="who">{agent?.display_name} </span>ran {run.runtime} ·{" "}
+          {duration(run.started_at, run.ended_at)}{" "}
+          <button
+            className="thread-link"
+            style={{ marginTop: 0 }}
+            onClick={() => inspect({ kind: "run", runId: run.id })}
+          >
+            Details
+          </button>
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="card">
       <div className="card-head">
-        <span>Run</span>
-        <span>{run.runtime}</span>
+        {active ? <Spinner size={13} /> : <RunIcon size={14} />}
+        <span>
+          {agent?.display_name} · {run.runtime}
+        </span>
       </div>
-      <div className="card-title">
-        {agent?.display_name ?? "Agent"} — {run.headline || statusLabel(run.status)}
-      </div>
-      {run.error && <div className="card-sub" style={{ color: "var(--danger)" }}>{run.error}</div>}
+      <div className="card-title">{run.headline || statusLabel(run.status)}</div>
+      {run.error && (
+        <div className="card-sub" style={{ color: "var(--danger)" }}>
+          {run.error}
+        </div>
+      )}
       <div className="card-row">
         <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
         <Chip>{duration(run.started_at, run.ended_at)}</Chip>
@@ -107,7 +141,6 @@ function QuestionCard({ questionId }: { questionId: string }) {
   }, [questionId]);
 
   if (!question) return null;
-  const agent = app.members.find((member) => member.id === question.agent_id);
   const answered = question.status === "answered";
 
   const toggle = (itemId: string, label: string, multi: boolean) => {
@@ -146,8 +179,8 @@ function QuestionCard({ questionId }: { questionId: string }) {
   return (
     <div className="card">
       <div className="card-head">
-        <span>Question</span>
-        <span>{agent?.display_name}</span>
+        <QuestionIcon size={14} />
+        <span>Needs your answer</span>
       </div>
       {question.items.map((item) => (
         <div key={item.id} style={{ marginTop: 8 }}>
@@ -233,7 +266,7 @@ function ArtifactCard({
   return (
     <div className="card">
       <div className="card-head">
-        <span>Artifact</span>
+        <span>Attached</span>
       </div>
       {!broken ? (
         <img
@@ -269,8 +302,8 @@ function PreviewCard({ previewId }: { previewId: string }) {
   return (
     <div className="card">
       <div className="card-head">
-        <span>Preview</span>
-        <span>port {preview.port}</span>
+        <PreviewIcon size={14} />
+        <span>Preview · port {preview.port}</span>
       </div>
       <div className="card-title">{preview.label}</div>
       <div className="card-row">
@@ -305,8 +338,8 @@ function PullRequestCard({ url, taskId }: { url: string; taskId?: string }) {
   return (
     <div className="card">
       <div className="card-head">
-        <span>Pull request</span>
-        {pr && <span>#{pr.number}</span>}
+        <ExternalIcon size={14} />
+        <span>Pull request{pr ? ` #${pr.number}` : ""}</span>
       </div>
       <div className="card-title">{pr?.title ?? url}</div>
       <div className="card-row">
@@ -321,6 +354,7 @@ function PullRequestCard({ url, taskId }: { url: string; taskId?: string }) {
         </Chip>}
         <span className="spacer" />
         <button className="button" onClick={() => openExternal(url)}>
+          <ExternalIcon size={14} />
           Open on GitHub
         </button>
       </div>

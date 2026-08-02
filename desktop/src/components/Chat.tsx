@@ -2,6 +2,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useApp } from "../lib/store";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { Avatar, useNavigation } from "./common";
+import {
+  AttachIcon,
+  CloseIcon,
+  EventIcon,
+  PulseIcon,
+  ReactIcon,
+  SendIcon,
+  Spinner,
+  ThreadIcon,
+} from "./icons";
 import { AttachmentRow, Card } from "./Cards";
 import type { Attachment, Channel, Id, Member, Message } from "../lib/types";
 
@@ -19,7 +29,6 @@ export function ChatView({ channelId }: { channelId: Id }) {
   return (
     <div className="column">
       <Timeline channelId={channelId} messages={messages ?? []} />
-      <TypingLine channelId={channelId} />
       <Composer channel={channel} />
     </div>
   );
@@ -78,8 +87,9 @@ export function Timeline({
           lastDay = day;
           const grouped =
             !showDay &&
-            previous?.author_id === message.author_id &&
-            previous.kind === message.kind &&
+            message.kind === "text" &&
+            previous?.kind === "text" &&
+            previous.author_id === message.author_id &&
             message.created_at - previous.created_at < 5 * 60_000;
           previous = message;
           return (
@@ -109,16 +119,34 @@ export function MessageRow({
   const author = app.members.find((member) => member.id === message.author_id);
   const [showReactions, setShowReactions] = useState(false);
 
+  // A status note or a workspace event is not somebody talking. It reads as a
+  // quiet line, the way tool activity does in a good agent transcript.
+  if (message.kind === "status" || message.kind === "system") {
+    return (
+      <div className="activity">
+        {message.kind === "status" ? <PulseIcon size={15} /> : <EventIcon size={15} />}
+        <span className="text">
+          {message.kind === "status" && author && (
+            <span className="who">{author.display_name} · </span>
+          )}
+          {message.body}
+        </span>
+      </div>
+    );
+  }
+
+  // A run card carries its own attribution, so repeating the author above it
+  // just adds weight to something that is meant to be glanceable.
+  const selfAttributed = message.kind === "card" && message.card?.type === "run";
+
   return (
-    <div className={`message ${message.kind}${grouped ? " grouped" : ""}`}>
-      <div>{!grouped && <Avatar member={author} />}</div>
-      <div>
-        {!grouped && (
+    <div className={`message message-${message.kind}${grouped ? " grouped" : ""}`}>
+      <div>{!grouped && !selfAttributed && <Avatar member={author} size={26} />}</div>
+      <div style={{ minWidth: 0 }}>
+        {!grouped && !selfAttributed && (
           <div className="message-head">
             <span className="message-author">{author?.display_name ?? "Unknown"}</span>
-            {author?.kind === "agent" && (
-              <span className="message-time">agent</span>
-            )}
+            {author?.kind === "agent" && <span className="message-badge">agent</span>}
             <span className="message-time">{timeOfDay(message.created_at)}</span>
           </div>
         )}
@@ -165,34 +193,44 @@ export function MessageRow({
 
       <div className="message-actions">
         {showReactions ? (
-          QUICK_REACTIONS.map((emoji) => (
+          <>
+            {QUICK_REACTIONS.map((emoji) => (
+              <button
+                key={emoji}
+                className="icon-button small"
+                onClick={() => {
+                  void api.react(message.id, emoji);
+                  setShowReactions(false);
+                }}
+              >
+                {emoji}
+              </button>
+            ))}
             <button
-              key={emoji}
-              className="icon-button"
-              onClick={() => {
-                void api.react(message.id, emoji);
-                setShowReactions(false);
-              }}
+              className="icon-button small"
+              onClick={() => setShowReactions(false)}
             >
-              {emoji}
+              <CloseIcon size={13} />
             </button>
-          ))
+          </>
         ) : (
-          <button
-            className="icon-button"
-            title="React"
-            onClick={() => setShowReactions(true)}
-          >
-            ☺
-          </button>
+          <>
+            <button
+              className="icon-button small"
+              title="React"
+              onClick={() => setShowReactions(true)}
+            >
+              <ReactIcon size={15} />
+            </button>
+            <button
+              className="icon-button small"
+              title="Reply in thread"
+              onClick={() => inspect({ kind: "thread", messageId: message.id })}
+            >
+              <ThreadIcon size={15} />
+            </button>
+          </>
         )}
-        <button
-          className="icon-button"
-          title="Reply in thread"
-          onClick={() => inspect({ kind: "thread", messageId: message.id })}
-        >
-          ⤷
-        </button>
       </div>
     </div>
   );
@@ -202,7 +240,9 @@ export function MessageRow({
 /// prose reads the way it was written.
 function Body({ body, members }: { body: string; members: Member[] }) {
   const parts = useMemo(() => {
-    const handles = members.map((member) => member.handle).sort((a, b) => b.length - a.length);
+    const handles = members
+      .map((member) => member.handle)
+      .sort((a, b) => b.length - a.length);
     if (handles.length === 0) return [body];
     const pattern = new RegExp(`@(${handles.map(escape).join("|")})\\b`, "g");
     const out: (string | { handle: string })[] = [];
@@ -236,7 +276,9 @@ function escape(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function TypingLine({ channelId }: { channelId: Id }) {
+/// One line above the composer for "somebody or something is busy" — typing
+/// humans first, then the agents actually working in this conversation.
+function WorkingPill({ channelId }: { channelId: Id }) {
   const app = useApp();
   const [, force] = useState(0);
 
@@ -248,23 +290,44 @@ function TypingLine({ channelId }: { channelId: Id }) {
   const typing = Object.entries(app.typing[channelId] ?? {})
     .filter(([id, at]) => id !== app.me?.id && Date.now() - at < 4000)
     .map(([id]) => app.members.find((member) => member.id === id)?.display_name)
-    .filter(Boolean);
+    .filter(Boolean) as string[];
 
-  const working = app.members.filter(
-    (member) =>
-      member.kind === "agent" &&
-      (member.presence === "working" || member.presence === "thinking"),
-  );
+  const working = Object.values(app.runs)
+    .filter(
+      (run) =>
+        run.channel_id === channelId &&
+        ["running", "dispatched", "queued", "waiting"].includes(run.status),
+    )
+    .map((run) => ({
+      run,
+      agent: app.members.find((member) => member.id === run.agent_id),
+    }));
 
-  return (
-    <div className="typing-line">
-      {typing.length > 0
-        ? `${typing.join(", ")} ${typing.length === 1 ? "is" : "are"} typing…`
-        : working.length > 0
-          ? `${working.map((agent) => agent.display_name).join(", ")} ${working.length === 1 ? "is" : "are"} working…`
-          : ""}
-    </div>
-  );
+  let content: React.ReactNode = null;
+  if (typing.length > 0) {
+    content = (
+      <span>
+        {typing.join(", ")} {typing.length === 1 ? "is" : "are"} typing…
+      </span>
+    );
+  } else if (working.length === 1) {
+    const { run, agent } = working[0];
+    content = (
+      <span>
+        <Spinner size={13} />
+        {agent?.display_name} · {run.headline || run.status}
+      </span>
+    );
+  } else if (working.length > 1) {
+    content = (
+      <span>
+        <Spinner size={13} />
+        {working.length} agents working
+      </span>
+    );
+  }
+
+  return <div className="working-pill">{content}</div>;
 }
 
 export function Composer({
@@ -284,14 +347,12 @@ export function Composer({
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement>(null);
 
-  const resize = () => {
+  useEffect(() => {
     const element = box.current;
     if (!element) return;
     element.style.height = "auto";
-    element.style.height = `${Math.min(element.scrollHeight, 220)}px`;
-  };
-
-  useEffect(resize, [text]);
+    element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
+  }, [text]);
 
   const send = async () => {
     if (!text.trim() && pending.length === 0) return;
@@ -309,12 +370,14 @@ export function Composer({
     }
   };
 
-  const candidates = app.members.filter((member) =>
+  const candidates =
     mentionQuery === null
-      ? false
-      : member.handle.startsWith(mentionQuery.toLowerCase()) &&
-        member.id !== app.me?.id,
-  );
+      ? []
+      : app.members.filter(
+          (member) =>
+            member.handle.startsWith(mentionQuery.toLowerCase()) &&
+            member.id !== app.me?.id,
+        );
 
   const applyMention = (handle: string) => {
     setText((current) => current.replace(/@[\w-]*$/, `@${handle} `));
@@ -333,23 +396,29 @@ export function Composer({
     placeholder ??
     (channel.kind === "channel"
       ? `Message #${channel.name}`
-      : `Message ${channel.name}`);
+      : channel.kind === "task"
+        ? "Message this task"
+        : `Message ${channel.name}`);
 
   return (
     <div className="composer-wrap">
+      {!parentId && <WorkingPill channelId={channel.id} />}
+
       {candidates.length > 0 && (
-        <div className="card" style={{ marginBottom: 6 }}>
+        <div className="mention-menu">
           {candidates.slice(0, 6).map((member) => (
             <button
               key={member.id}
               className="row"
-              style={{ width: "100%" }}
               onClick={() => applyMention(member.handle)}
             >
-              <Avatar member={member} size={20} />
+              <Avatar member={member} size={22} />
               <span className="grow">
-                <span className="name">{member.display_name}</span>{" "}
-                <span className="sub">@{member.handle}</span>
+                <span className="name">{member.display_name}</span>
+                <span className="sub">
+                  @{member.handle}
+                  {member.kind === "agent" ? " · agent" : ""}
+                </span>
               </span>
             </button>
           ))}
@@ -363,13 +432,12 @@ export function Composer({
               <span className="attachment-chip" key={attachment.id}>
                 {attachment.file_name}
                 <button
-                  className="icon-button"
-                  style={{ width: 18, height: 18 }}
+                  className="icon-button small"
                   onClick={() =>
                     setPending(pending.filter((item) => item.id !== attachment.id))
                   }
                 >
-                  ×
+                  <CloseIcon size={12} />
                 </button>
               </span>
             ))}
@@ -395,8 +463,8 @@ export function Composer({
           }}
         />
         <div className="composer-row">
-          <label className="button quiet">
-            Attach
+          <label className="icon-button" title="Attach a file">
+            <AttachIcon size={17} />
             <input
               type="file"
               hidden
@@ -408,9 +476,13 @@ export function Composer({
             />
           </label>
           <span className="spacer" />
-          <span className="composer-hint">Enter to send</span>
-          <button className="button primary" disabled={busy} onClick={send}>
-            Send
+          <button
+            className="send-button"
+            disabled={busy || (!text.trim() && pending.length === 0)}
+            onClick={send}
+            title="Send"
+          >
+            <SendIcon size={16} />
           </button>
         </div>
       </div>

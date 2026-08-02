@@ -45,7 +45,12 @@ export function Avatar({ member, size = 26 }: { member?: Member; size?: number }
   return (
     <div
       className={`avatar${isAgent ? " agent" : ""}`}
-      style={{ width: size, height: size, fontSize: size * 0.44 }}
+      style={{
+        width: size,
+        height: size,
+        fontSize: Math.round(size * 0.42),
+        borderRadius: isAgent ? 999 : Math.max(5, Math.round(size * 0.27)),
+      }}
       title={member?.display_name}
     >
       {initials(member)}
@@ -55,6 +60,27 @@ export function Avatar({ member, size = 26 }: { member?: Member; size?: number }
 
 export function PresenceDot({ presence }: { presence: Presence }) {
   return <span className={`dot ${presence}`} />;
+}
+
+export function CheckRow({
+  checked,
+  onChange,
+  children,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  children: ReactNode;
+}) {
+  return (
+    <label className="check-row">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span>{children}</span>
+    </label>
+  );
 }
 
 export function Chip({

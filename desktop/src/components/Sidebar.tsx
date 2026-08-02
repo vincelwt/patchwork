@@ -1,12 +1,28 @@
 import { useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
-import { Avatar, PresenceDot, useNavigation } from "./common";
+import { Avatar, useNavigation } from "./common";
+import {
+  ChevronIcon,
+  HashIcon,
+  InboxIcon,
+  PlusIcon,
+  SearchIcon,
+  Spinner,
+  TasksIcon,
+} from "./icons";
 import type { Channel, Member } from "../lib/types";
 import type { View as NavView } from "./common";
 
 /// The main sidebar stays small: Inbox, Tasks, the channels grouped into
-/// sections, and direct messages. Everything else lives in the workspace menu.
-export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
+/// sections, and direct messages. Everything else lives behind the workspace
+/// name at the top.
+export function Sidebar({
+  onOpenMenu,
+  onSearch,
+}: {
+  onOpenMenu: () => void;
+  onSearch: () => void;
+}) {
   const app = useApp();
   const api = useApi();
   const { view, go } = useNavigation();
@@ -15,6 +31,7 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
   const [newChannel, setNewChannel] = useState("");
 
   const unread = app.inbox.filter((item) => !item.read_at).length;
+  const openTasks = app.tasks.filter((task) => task.status !== "done").length;
 
   const channels = app.channels.filter((channel) => channel.kind === "channel");
   const grouped = useMemo(() => {
@@ -34,24 +51,29 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
     view.kind === candidate.kind &&
     ("id" in candidate ? (view as { id?: string }).id === candidate.id : true);
 
-  const dmPartner = (channel: Channel): Member | undefined =>
+  const partnerOf = (channel: Channel): Member | undefined =>
     app.members.find(
       (member) => channel.member_ids.includes(member.id) && member.id !== app.me?.id,
     );
 
-  async function createChannel(name: string, sectionId?: string) {
-    const section = app.sections.find((s) => s.id === sectionId);
-    const channel = await api.createChannel({
-      name,
-      section_name: section?.name,
-    });
-    go({ kind: "channel", id: channel.id });
-  }
+  const unstartedAgents = app.members.filter(
+    (member) =>
+      member.kind === "agent" &&
+      member.agent?.dm_enabled !== false &&
+      !dms.some((channel) => channel.member_ids.includes(member.id)),
+  );
 
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
-        <span className="sidebar-brand">{app.workspace?.name ?? "Patchwork"}</span>
+        <button className="workspace-button" onClick={onOpenMenu} title="Workspace">
+          <span className="name">{app.workspace?.name ?? "Patchwork"}</span>
+          <ChevronIcon size={14} />
+        </button>
+        <span className="spacer" />
+        <button className="icon-button" onClick={onSearch} title="Search (⌘K)">
+          <SearchIcon size={17} />
+        </button>
       </div>
 
       <div className="sidebar-scroll">
@@ -59,6 +81,7 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
           className={`nav-item${isActive({ kind: "inbox" }) ? " active" : ""}`}
           onClick={() => go({ kind: "inbox" })}
         >
+          <InboxIcon />
           <span className="label">Inbox</span>
           {unread > 0 && <span className="count badge">{unread}</span>}
         </button>
@@ -66,26 +89,26 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
           className={`nav-item${isActive({ kind: "tasks" }) ? " active" : ""}`}
           onClick={() => go({ kind: "tasks" })}
         >
+          <TasksIcon />
           <span className="label">Tasks</span>
-          <span className="count">
-            {app.tasks.filter((task) => task.status !== "done").length || ""}
-          </span>
+          {openTasks > 0 && <span className="count">{openTasks}</span>}
         </button>
 
         {app.sections.map((section) => {
           const list = grouped.get(section.id) ?? [];
+          if (list.length === 0) return null;
           const isCollapsed = collapsed[section.id];
           return (
             <div className="sidebar-group" key={section.id}>
-              <div
-                className={`sidebar-heading${isCollapsed ? " collapsed" : ""}`}
+              <button
+                className={`group-label${isCollapsed ? " collapsed" : ""}`}
                 onClick={() =>
                   setCollapsed({ ...collapsed, [section.id]: !isCollapsed })
                 }
               >
-                <span className="chevron">▾</span>
-                <span>{section.name}</span>
-              </div>
+                <ChevronIcon size={13} />
+                <span>{sentenceCase(section.name)}</span>
+              </button>
               {!isCollapsed &&
                 list.map((channel) => (
                   <ChannelRow
@@ -112,44 +135,36 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
           </div>
         )}
 
-        <div className="sidebar-group">
-          <div className="sidebar-heading">
-            <span>Direct messages</span>
-          </div>
-          {dms.map((channel) => {
-            const partner = dmPartner(channel);
-            return (
-              <button
-                key={channel.id}
-                className={`nav-item${isActive({ kind: "channel", id: channel.id }) ? " active" : ""}`}
-                onClick={() => go({ kind: "channel", id: channel.id })}
-              >
-                <PresenceDot presence={partner?.presence ?? "offline"} />
-                <span className="label">{partner?.display_name ?? channel.name}</span>
-              </button>
-            );
-          })}
-          {app.members
-            .filter(
-              (member) =>
-                member.kind === "agent" &&
-                member.agent?.dm_enabled !== false &&
-                !dms.some((channel) => channel.member_ids.includes(member.id)),
-            )
-            .map((member) => (
-              <button
+        {(dms.length > 0 || unstartedAgents.length > 0) && (
+          <div className="sidebar-group">
+            <div className="group-label" style={{ cursor: "default" }}>
+              <span style={{ marginLeft: 13 }}>Direct messages</span>
+            </div>
+            {dms.map((channel) => {
+              const partner = partnerOf(channel);
+              return (
+                <MemberRow
+                  key={channel.id}
+                  member={partner}
+                  fallback={channel.name}
+                  active={isActive({ kind: "channel", id: channel.id })}
+                  onClick={() => go({ kind: "channel", id: channel.id })}
+                />
+              );
+            })}
+            {unstartedAgents.map((member) => (
+              <MemberRow
                 key={member.id}
-                className="nav-item"
+                member={member}
+                active={false}
                 onClick={async () => {
                   const channel = await api.openDm(member.id);
                   go({ kind: "channel", id: channel.id });
                 }}
-              >
-                <PresenceDot presence={member.presence} />
-                <span className="label">{member.display_name}</span>
-              </button>
+              />
             ))}
-        </div>
+          </div>
+        )}
 
         <div className="sidebar-group">
           {creating ? (
@@ -162,9 +177,10 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
               onBlur={() => setCreating(false)}
               onKeyDown={async (event) => {
                 if (event.key === "Enter" && newChannel.trim()) {
-                  await createChannel(newChannel.trim());
+                  const channel = await api.createChannel({ name: newChannel.trim() });
                   setNewChannel("");
                   setCreating(false);
+                  go({ kind: "channel", id: channel.id });
                 } else if (event.key === "Escape") {
                   setCreating(false);
                 }
@@ -172,18 +188,18 @@ export function Sidebar({ onOpenMenu }: { onOpenMenu: () => void }) {
             />
           ) : (
             <button className="nav-item" onClick={() => setCreating(true)}>
-              <span className="label">+ New channel</span>
+              <PlusIcon />
+              <span className="label" style={{ color: "var(--text-muted)" }}>
+                New channel
+              </span>
             </button>
           )}
         </div>
       </div>
 
       <div className="sidebar-footer">
-        <Avatar member={app.me} size={22} />
+        <Avatar member={app.me} size={24} />
         <span className="who">{app.me?.display_name}</span>
-        <button className="icon-button" onClick={onOpenMenu} title="Workspace">
-          ⋯
-        </button>
       </div>
     </aside>
   );
@@ -200,8 +216,59 @@ function ChannelRow({
 }) {
   return (
     <button className={`nav-item${active ? " active" : ""}`} onClick={onClick}>
-      <span style={{ color: "var(--text-faint)" }}>#</span>
+      <HashIcon />
       <span className="label">{channel.name}</span>
     </button>
   );
+}
+
+/// A DM row carries a second line, because "what is this teammate doing right
+/// now" is exactly what you want from the sidebar.
+function MemberRow({
+  member,
+  fallback,
+  active,
+  onClick,
+}: {
+  member?: Member;
+  fallback?: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const busy = member?.presence === "working" || member?.presence === "thinking";
+  return (
+    <button className={`nav-item${active ? " active" : ""}`} onClick={onClick}>
+      <Avatar member={member} size={20} />
+      <span className="lines">
+        <span className="label">{member?.display_name ?? fallback}</span>
+        <span className="sub">{secondLine(member)}</span>
+      </span>
+      <span className="trailing">
+        {busy && <Spinner size={13} />}
+        {member?.presence === "waiting" && <span className="dot waiting" />}
+      </span>
+    </button>
+  );
+}
+
+function secondLine(member?: Member) {
+  if (!member) return "";
+  switch (member.presence) {
+    case "working":
+      return "working";
+    case "thinking":
+      return "thinking";
+    case "waiting":
+      return "waiting for you";
+    case "online":
+      return member.kind === "agent" ? member.agent?.runtime ?? "ready" : "online";
+    default:
+      return member.kind === "agent" ? member.agent?.runtime ?? "" : "offline";
+  }
+}
+
+/// `MARKETING` reads as shouting; the benchmark uses quiet sentence case.
+function sentenceCase(value: string) {
+  const lowered = value.toLocaleLowerCase();
+  return lowered.charAt(0).toLocaleUpperCase() + lowered.slice(1);
 }

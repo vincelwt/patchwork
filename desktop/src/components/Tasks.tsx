@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
-import { Avatar, Chip, Field, Modal, Select, useNavigation } from "./common";
+import { Avatar, Chip, CheckRow, Field, Modal, Select, useNavigation } from "./common";
+import { ExternalIcon, PlusIcon, Spinner } from "./icons";
 import { ChatView } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
@@ -61,7 +62,8 @@ export function TasksBoard() {
             </option>
           ))}
         </select>
-        <button className="button primary" onClick={() => setCreating(true)}>
+        <button className="button" onClick={() => setCreating(true)}>
+          <PlusIcon size={15} />
           New task
         </button>
       </div>
@@ -86,7 +88,7 @@ export function TasksBoard() {
             >
               <div className="board-column-head">
                 <span>{statusLabel(status)}</span>
-                <span className="count">{column.length}</span>
+                {column.length > 0 && <span className="count">{column.length}</span>}
               </div>
               <div className="board-column-body">
                 {column.map((task) => (
@@ -131,12 +133,19 @@ function TaskCard({
     >
       <div className="key">{task.key}</div>
       <div className="title">{task.title}</div>
-      <div className="meta">
-        {owner && <Avatar member={owner} size={18} />}
-        {project && <Chip>{project.name}</Chip>}
-        {run && <Chip tone="accent">{run.headline || "running"}</Chip>}
-        {task.pr_state && <Chip>PR #{task.pr_state.number}</Chip>}
-      </div>
+      {(owner || project || run || task.pr_state) && (
+        <div className="meta">
+          {owner && <Avatar member={owner} size={18} />}
+          {project && <Chip>{project.name}</Chip>}
+          {run && (
+            <Chip tone="accent">
+              <Spinner size={11} />
+              {run.headline || "running"}
+            </Chip>
+          )}
+          {task.pr_state && <Chip>PR #{task.pr_state.number}</Chip>}
+        </div>
+      )}
     </div>
   );
 }
@@ -235,14 +244,9 @@ export function NewTaskModal({
         ]}
       />
       {ownerIsAgent && (
-        <label className="form-row" style={{ flexDirection: "row", gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={start}
-            onChange={(event) => setStart(event.target.checked)}
-          />
-          <span>Start the agent now</span>
-        </label>
+        <CheckRow checked={start} onChange={setStart}>
+          Start the agent now
+        </CheckRow>
       )}
       {error && <div className="error-text">{error}</div>}
     </Modal>
@@ -322,17 +326,19 @@ export function TaskPage({ taskId }: { taskId: string }) {
           </button>
         )}
         <button className="button quiet" onClick={() => setShowDetail(!showDetail)}>
-          {showDetail ? "Hide detail" : "Detail"}
+          {showDetail ? "Hide activity" : "Activity"}
         </button>
       </div>
 
-      <div className="card-row" style={{ padding: "0 24px 6px", maxWidth: 980 }}>
-        <Chip tone={statusTone(task.status)}>{statusLabel(task.status)}</Chip>
+      <div className="card-row" style={{ padding: "0 28px 4px", maxWidth: 980 }}>
         {project && <Chip>{project.name}</Chip>}
         {run && <Chip tone="accent">{run.headline}</Chip>}
         {task.pr_url && (
           <button className="chip" onClick={() => openExternal(task.pr_url!)}>
-            {task.pr_state ? `PR #${task.pr_state.number} · ${task.pr_state.state}` : "Pull request"}
+            <ExternalIcon size={12} />
+            {task.pr_state
+              ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
+              : "Pull request"}
           </button>
         )}
         {previews.map((preview) => (

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative } from "../lib/format";
 import { Avatar, Chip, useNavigation } from "./common";
+import { CheckIcon } from "./icons";
 import type { InboxItem, InboxKind } from "../lib/types";
 
 const LABELS: Record<InboxKind, string> = {
@@ -60,6 +61,7 @@ export function InboxView() {
           {showRead ? "Only unread" : "Show all"}
         </button>
         <button className="button quiet" onClick={() => api.markAllRead()}>
+          <CheckIcon size={15} />
           Mark all read
         </button>
       </div>
@@ -67,24 +69,28 @@ export function InboxView() {
       <div className="page">
         <div className="page-inner">
           {sorted.length === 0 && (
-            <div className="empty">Nothing needs you right now.</div>
+            <div className="empty">
+              Nothing needs you right now. Mentions, agent questions, blocked
+              tasks and work ready for review land here.
+            </div>
           )}
           {sorted.map((item) => {
             const actor = app.members.find((member) => member.id === item.actor_id);
             return (
               <button
                 key={item.id}
-                className="row"
-                style={{ width: "100%", opacity: item.read_at ? 0.55 : 1 }}
+                className={`row${item.read_at ? "" : " unread"}`}
+                style={{ opacity: item.read_at ? 0.5 : 1 }}
                 onClick={() => open(item)}
               >
-                <Avatar member={actor} size={24} />
+                <Avatar member={actor} size={26} />
                 <span className="grow">
                   <span className="name">{item.title}</span>
                   <span className="sub">{item.preview}</span>
                 </span>
                 <Chip tone={TONES[item.kind] ?? ""}>{LABELS[item.kind]}</Chip>
                 <span className="composer-hint">{relative(item.created_at)}</span>
+                {!item.read_at && <span className="dot unread" />}
               </button>
             );
           })}

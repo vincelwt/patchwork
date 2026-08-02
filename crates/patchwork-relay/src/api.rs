@@ -206,15 +206,15 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
     }))
 }
 
+/// Channels and task discussions belong to the workspace — a board everyone can
+/// see would be useless if its conversations were private. Only DMs are.
 fn visible_channels(state: &Shared, caller: &Caller) -> ApiResult<Vec<Channel>> {
     let channels = state.store.channels()?;
     Ok(channels
         .into_iter()
         .filter(|c| match c.kind {
-            ChannelKind::Channel => true,
-            ChannelKind::Dm | ChannelKind::Task => {
-                c.member_ids.contains(&caller.member.id) || caller.is_agent()
-            }
+            ChannelKind::Channel | ChannelKind::Task => true,
+            ChannelKind::Dm => c.member_ids.contains(&caller.member.id) || caller.is_agent(),
         })
         .collect())
 }
