@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
-import { Avatar, Chip, CheckRow, Field, Modal, Select, useNavigation } from "./common";
+import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
+import { Dropdown, FormSelect, Toggle } from "./ui";
 import { ExternalIcon, PlusIcon, Spinner } from "./icons";
 import { ChatView } from "./Chat";
 import { RunPanel } from "./Inspector";
@@ -36,32 +37,33 @@ export function TasksBoard() {
       <div className="topbar">
         <span className="title">Tasks</span>
         <span className="spacer" />
-        <select
-          className="field"
-          style={{ width: 160 }}
+        <Dropdown
+          quiet
+          align="right"
           value={filterOwner}
-          onChange={(event) => setFilterOwner(event.target.value)}
-        >
-          <option value="">Anyone</option>
-          {app.members.map((member) => (
-            <option key={member.id} value={member.id}>
-              {member.display_name}
-            </option>
-          ))}
-        </select>
-        <select
-          className="field"
-          style={{ width: 160 }}
+          onChange={setFilterOwner}
+          options={[
+            { value: "", label: "Anyone" },
+            ...app.members.map((member) => ({
+              value: member.id,
+              label: member.display_name,
+              hint: member.kind === "agent" ? "agent" : undefined,
+            })),
+          ]}
+        />
+        <Dropdown
+          quiet
+          align="right"
           value={filterProject}
-          onChange={(event) => setFilterProject(event.target.value)}
-        >
-          <option value="">Any project</option>
-          {app.projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
+          onChange={setFilterProject}
+          options={[
+            { value: "", label: "Any project" },
+            ...app.projects.map((project) => ({
+              value: project.id,
+              label: project.name,
+            })),
+          ]}
+        />
         <button className="button" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
           New task
@@ -99,6 +101,9 @@ export function TasksBoard() {
                     onClick={() => go({ kind: "task", id: task.id })}
                   />
                 ))}
+                {column.length === 0 && (
+                  <div className="board-empty">{emptyColumn(status)}</div>
+                )}
               </div>
             </div>
           );
@@ -108,6 +113,21 @@ export function TasksBoard() {
       {creating && <NewTaskModal onClose={() => setCreating(false)} />}
     </div>
   );
+}
+
+function emptyColumn(status: TaskStatus) {
+  switch (status) {
+    case "planned":
+      return "Nothing queued";
+    case "running":
+      return "No agent is working";
+    case "blocked":
+      return "Nothing is stuck";
+    case "review":
+      return "Nothing to review";
+    default:
+      return "Nothing finished yet";
+  }
 }
 
 function TaskCard({
@@ -219,7 +239,7 @@ export function NewTaskModal({
         textarea
         placeholder="What has to be true when this is done?"
       />
-      <Select
+      <FormSelect
         label="Owner"
         value={owner}
         onChange={setOwner}
@@ -227,11 +247,12 @@ export function NewTaskModal({
           { value: "", label: "Nobody yet" },
           ...app.members.map((member) => ({
             value: member.id,
-            label: `${member.display_name}${member.kind === "agent" ? " (agent)" : ""}`,
+            label: member.display_name,
+            hint: member.kind === "agent" ? member.agent?.runtime : undefined,
           })),
         ]}
       />
-      <Select
+      <FormSelect
         label="Project"
         value={project}
         onChange={setProject}
@@ -242,11 +263,15 @@ export function NewTaskModal({
             label: candidate.name,
           })),
         ]}
+        help="A code task gets its own git worktree on the machine that runs it."
       />
       {ownerIsAgent && (
-        <CheckRow checked={start} onChange={setStart}>
-          Start the agent now
-        </CheckRow>
+        <Toggle
+          checked={start}
+          onChange={setStart}
+          label="Start the agent now"
+          help="Otherwise it sits in Planned until someone runs it."
+        />
       )}
       {error && <div className="error-text">{error}</div>}
     </Modal>
@@ -263,7 +288,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
   const [error, setError] = useState("");
   const [showDetail, setShowDetail] = useState(false);
 
-  if (!task) return <div className="empty">Task not found.</div>;
+  if (!task) return <div className="empty">That task is gone.</div>;
 
   const owner = app.members.find((member) => member.id === task.owner_id);
   const project = app.projects.find((candidate) => candidate.id === task.project_id);
@@ -291,35 +316,30 @@ export function TaskPage({ taskId }: { taskId: string }) {
         <span className="title">{task.title}</span>
         <span className="subtitle">{task.key}</span>
         <span className="spacer" />
-        <select
-          className="field"
-          style={{ width: 130 }}
+        <Dropdown
+          quiet
+          align="right"
           value={task.status}
-          onChange={(event) =>
-            api.updateTask(task.id, { status: event.target.value })
-          }
-        >
-          {TASK_STATUSES.map((status) => (
-            <option key={status} value={status}>
-              {statusLabel(status)}
-            </option>
-          ))}
-        </select>
-        <select
-          className="field"
-          style={{ width: 150 }}
+          onChange={(status) => api.updateTask(task.id, { status })}
+          options={TASK_STATUSES.map((status) => ({
+            value: status,
+            label: statusLabel(status),
+          }))}
+        />
+        <Dropdown
+          quiet
+          align="right"
           value={task.owner_id ?? ""}
-          onChange={(event) =>
-            api.updateTask(task.id, { owner_id: event.target.value })
-          }
-        >
-          <option value="">Unassigned</option>
-          {app.members.map((member) => (
-            <option key={member.id} value={member.id}>
-              {member.display_name}
-            </option>
-          ))}
-        </select>
+          onChange={(owner_id) => api.updateTask(task.id, { owner_id })}
+          options={[
+            { value: "", label: "Unassigned" },
+            ...app.members.map((member) => ({
+              value: member.id,
+              label: member.display_name,
+              hint: member.kind === "agent" ? member.agent?.runtime : undefined,
+            })),
+          ]}
+        />
         {owner?.kind === "agent" && (
           <button className="button primary" disabled={busy} onClick={runAgent}>
             {run ? "Run again" : "Run"}
@@ -392,7 +412,9 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
     <div className="inspector-body">
       {detail.worktree && (
         <>
-          <div className="section-title">Worktree</div>
+          <div className="section-head">
+            <span className="section-title">Worktree</span>
+          </div>
           <div className="card-sub" style={{ wordBreak: "break-all" }}>
             {detail.worktree.path}
           </div>
@@ -400,7 +422,9 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
         </>
       )}
 
-      <div className="section-title">Runs</div>
+      <div className="section-head">
+        <span className="section-title">Runs</span>
+      </div>
       {detail.runs.length === 0 && <div className="card-sub">No runs yet.</div>}
       {detail.runs.map((run) => {
         const agent = app.members.find((member) => member.id === run.agent_id);
@@ -422,7 +446,9 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
 
       {detail.attachments.length > 0 && (
         <>
-          <div className="section-title">Evidence</div>
+          <div className="section-head">
+            <span className="section-title">Evidence</span>
+          </div>
           {detail.attachments.map((attachment) => (
             <button
               key={attachment.id}
@@ -444,7 +470,9 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
 
       {detail.previews.length > 0 && (
         <>
-          <div className="section-title">Previews</div>
+          <div className="section-head">
+            <span className="section-title">Previews</span>
+          </div>
           {detail.previews.map((preview) => (
             <div className="row" key={preview.id}>
               <span className="grow">
@@ -461,7 +489,9 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
 
       {detail.task.current_run_id && (
         <>
-          <div className="section-title">Current run</div>
+          <div className="section-head">
+            <span className="section-title">Current run</span>
+          </div>
           <RunPanel runId={detail.task.current_run_id} />
         </>
       )}

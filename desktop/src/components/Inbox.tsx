@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative } from "../lib/format";
 import { Avatar, Chip, useNavigation } from "./common";
+import { Empty, Page } from "./ui";
 import { CheckIcon } from "./icons";
 import type { InboxItem, InboxKind } from "../lib/types";
 
@@ -52,29 +53,33 @@ export function InboxView() {
     }
   };
 
-  return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Inbox</span>
-        <span className="spacer" />
-        <button className="button quiet" onClick={() => setShowRead(!showRead)}>
-          {showRead ? "Only unread" : "Show all"}
-        </button>
-        <button className="button quiet" onClick={() => api.markAllRead()}>
-          <CheckIcon size={15} />
-          Mark all read
-        </button>
-      </div>
+  const unread = app.inbox.filter((item) => !item.read_at).length;
 
-      <div className="page">
-        <div className="page-inner">
-          {sorted.length === 0 && (
-            <div className="empty">
-              Nothing needs you right now. Mentions, agent questions, blocked
-              tasks and work ready for review land here.
-            </div>
+  return (
+    <Page
+      title="Inbox"
+      subtitle={unread > 0 ? `${unread} unread` : undefined}
+      actions={
+        <>
+          <button className="button quiet" onClick={() => setShowRead(!showRead)}>
+            {showRead ? "Only unread" : "Show all"}
+          </button>
+          {unread > 0 && (
+            <button className="button quiet" onClick={() => api.markAllRead()}>
+              <CheckIcon size={15} />
+              Mark all read
+            </button>
           )}
-          {sorted.map((item) => {
+        </>
+      }
+    >
+      {sorted.length === 0 && (
+        <Empty
+          title="Nothing needs you right now"
+          hint="Mentions, agent questions, blocked tasks and work ready for review land here."
+        />
+      )}
+      {sorted.map((item) => {
             const actor = app.members.find((member) => member.id === item.actor_id);
             return (
               <button
@@ -92,10 +97,8 @@ export function InboxView() {
                 <span className="composer-hint">{relative(item.created_at)}</span>
                 {!item.read_at && <span className="dot unread" />}
               </button>
-            );
-          })}
-        </div>
-      </div>
-    </div>
+        );
+      })}
+    </Page>
   );
 }

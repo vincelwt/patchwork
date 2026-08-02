@@ -185,6 +185,34 @@ export const BackIcon = (props: IconProps) => (
   </Svg>
 );
 
+export const TerminalIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="3.5" y="5" width="17" height="14" rx="2.4" />
+    <path d="m7.5 10 2.5 2-2.5 2M12.5 14.5h4" />
+  </Svg>
+);
+
+export const WarningIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <path d="M12 4.6 21 19.4H3z" />
+    <path d="M12 10.4v3.4M12 16.6h.01" />
+  </Svg>
+);
+
+export const FileIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <path d="M13.5 3.5H7A1.5 1.5 0 0 0 5.5 5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5z" />
+    <path d="M13.5 3.5v5h5" />
+  </Svg>
+);
+
+export const ShieldIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <path d="M12 3.6 19 6v5.4c0 4-2.9 7.4-7 8.9-4.1-1.5-7-4.9-7-8.9V6z" />
+    <path d="m9.2 12 2 2 3.6-3.8" />
+  </Svg>
+);
+
 /// An agent's own progress note.
 export const PulseIcon = (props: IconProps) => (
   <Svg {...props}>

@@ -9,7 +9,15 @@ import {
   signOut,
 } from "../lib/desktop";
 import type { DesktopInfo } from "../lib/desktop";
-import { Avatar, Chip, Field, Modal, Select, useNavigation } from "./common";
+import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
+import { Dropdown, Empty, FormSelect, Page, Section, Toggle } from "./ui";
+import {
+  CheckIcon,
+  ExternalIcon,
+  FolderIcon,
+  PlusIcon,
+  Spinner,
+} from "./icons";
 import type {
   AgentProfile,
   Automation,
@@ -28,42 +36,44 @@ export function AgentsPage() {
   const agents = app.members.filter((member) => member.kind === "agent");
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Agents</span>
-        <span className="spacer" />
-        <button className="button primary" onClick={() => setCreating(true)}>
+    <Page
+      title="Agents"
+      actions={
+        <button className="button" onClick={() => setCreating(true)}>
+          <PlusIcon size={15} />
           New agent
         </button>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          {agents.length === 0 && (
-            <div className="empty">
-              No agents yet. An agent is a teammate with a name, a personality and
-              a runtime.
-            </div>
-          )}
-          {agents.map((agent) => (
-            <button
-              key={agent.id}
-              className="row"
-              style={{ width: "100%" }}
-              onClick={() => setEditing(agent)}
-            >
-              <Avatar member={agent} size={26} />
-              <span className="grow">
-                <span className="name">{agent.display_name}</span>
-                <span className="sub">
-                  @{agent.handle} · {agent.agent?.description || "no description yet"}
-                </span>
-              </span>
-              <Chip>{agent.agent?.runtime}</Chip>
-              <Chip>{agent.agent?.location}</Chip>
+      }
+    >
+      {agents.length === 0 ? (
+        <Empty
+          title="No agents yet"
+          hint="An agent is a teammate: a name, a description that defines what it owns, a runtime, and where it runs."
+          action={
+            <button className="button primary" onClick={() => setCreating(true)}>
+              Create the first agent
             </button>
-          ))}
-        </div>
-      </div>
+          }
+        />
+      ) : (
+        agents.map((agent) => (
+          <button key={agent.id} className="row" onClick={() => setEditing(agent)}>
+            <Avatar member={agent} size={30} />
+            <span className="grow">
+              <span className="name">{agent.display_name}</span>
+              <span className="sub">
+                @{agent.handle}
+                {agent.agent?.description ? ` · ${agent.agent.description}` : ""}
+              </span>
+            </span>
+            <Chip>{agent.agent?.runtime}</Chip>
+            <Chip tone={agent.presence === "working" ? "accent" : ""}>
+              {locationLabel(agent.agent)}
+            </Chip>
+          </button>
+        ))
+      )}
+
       {(creating || editing) && (
         <AgentModal
           agent={editing}
@@ -73,17 +83,22 @@ export function AgentsPage() {
           }}
         />
       )}
-    </div>
+    </Page>
   );
 }
 
-function AgentModal({
-  agent,
-  onClose,
-}: {
-  agent: Member | null;
-  onClose: () => void;
-}) {
+function locationLabel(profile?: AgentProfile) {
+  switch (profile?.location) {
+    case "relay":
+      return "on the relay";
+    case "desktop":
+      return "on a desktop";
+    default:
+      return "wherever the project is";
+  }
+}
+
+function AgentModal({ agent, onClose }: { agent: Member | null; onClose: () => void }) {
   const app = useApp();
   const api = useApi();
   const [name, setName] = useState(agent?.display_name ?? "");
@@ -103,7 +118,9 @@ function AgentModal({
   const runtimes = Array.from(
     new Set(
       app.hosts.flatMap((host) =>
-        host.capabilities.runtimes.map((runtime) => runtime.id),
+        host.capabilities.runtimes
+          .filter((runtime) => runtime.available)
+          .map((runtime) => runtime.id),
       ),
     ),
   );
@@ -134,12 +151,8 @@ function AgentModal({
           <button className="button quiet" onClick={onClose}>
             Cancel
           </button>
-          <button
-            className="button primary"
-            disabled={!name.trim() || busy}
-            onClick={save}
-          >
-            Save
+          <button className="button primary" disabled={!name.trim() || busy} onClick={save}>
+            {busy ? "Saving…" : "Save"}
           </button>
         </>
       }
@@ -152,25 +165,29 @@ function AgentModal({
         textarea
         placeholder="Who is this teammate, what do they own, and what will they decline?"
       />
-      <Select
+      <FormSelect
         label="Runtime"
         value={profile.runtime}
         onChange={(runtime) => setProfile({ ...profile, runtime })}
-        options={(runtimes.length ? runtimes : ["codex", "claude", "pi", "custom"]).map(
-          (runtime) => ({ value: runtime, label: runtime }),
-        )}
+        options={(runtimes.length ? runtimes : ["codex", "claude", "pi"])
+          .concat("custom")
+          .map((runtime) => ({ value: runtime, label: runtime }))}
+        help="Detected on the machines connected to this workspace."
       />
       {profile.runtime === "custom" && (
         <Field
           label="ACP command"
           value={(profile.custom_command ?? []).join(" ")}
           onChange={(value) =>
-            setProfile({ ...profile, custom_command: value.split(/\s+/).filter(Boolean) })
+            setProfile({
+              ...profile,
+              custom_command: value.split(/\s+/).filter(Boolean),
+            })
           }
           placeholder="my-agent --acp"
         />
       )}
-      <Select
+      <FormSelect
         label="Runs on"
         value={profile.location}
         onChange={(location) =>
@@ -178,12 +195,12 @@ function AgentModal({
         }
         options={[
           { value: "auto", label: "Wherever the project is available" },
-          { value: "relay", label: "The relay (keeps working when laptops close)" },
+          { value: "relay", label: "The relay", hint: "keeps working when laptops close" },
           { value: "desktop", label: "A specific desktop" },
         ]}
       />
       {profile.location === "desktop" && (
-        <Select
+        <FormSelect
           label="Machine"
           value={profile.host_id ?? ""}
           onChange={(host_id) => setProfile({ ...profile, host_id })}
@@ -191,72 +208,74 @@ function AgentModal({
             { value: "", label: "Pick a machine" },
             ...app.hosts
               .filter((host) => host.kind === "desktop")
-              .map((host) => ({ value: host.id, label: host.name })),
+              .map((host) => ({
+                value: host.id,
+                label: host.name,
+                hint: host.online ? "online" : "offline",
+              })),
           ]}
         />
       )}
-      <Select
+      <FormSelect
         label="Default participation"
         value={profile.default_participation}
         onChange={(value) =>
-          setProfile({
-            ...profile,
-            default_participation: value as Participation,
-          })
+          setProfile({ ...profile, default_participation: value as Participation })
         }
         options={[
           { value: "mention", label: "Only when mentioned" },
-          { value: "ambient", label: "Ambient — may chime in when useful" },
+          { value: "ambient", label: "Ambient", hint: "may chime in when it has something to add" },
           { value: "off", label: "Never speaks on its own" },
         ]}
       />
 
-      <div className="section-title">Per-channel participation</div>
-      {app.channels
-        .filter((channel) => channel.kind === "channel")
-        .map((channel) => (
-          <div className="row" key={channel.id}>
-            <span className="grow">#{channel.name}</span>
-            <select
-              className="field"
-              style={{ width: 150 }}
-              value={
-                profile.channel_participation[channel.id] ??
-                profile.default_participation
-              }
-              onChange={(event) =>
-                setProfile({
-                  ...profile,
-                  channel_participation: {
-                    ...profile.channel_participation,
-                    [channel.id]: event.target.value as Participation,
-                  },
-                })
-              }
-            >
-              <option value="off">Off</option>
-              <option value="mention">Mention</option>
-              <option value="ambient">Ambient</option>
-            </select>
-          </div>
-        ))}
+      <Toggle
+        checked={profile.dm_enabled}
+        onChange={(dm_enabled) => setProfile({ ...profile, dm_enabled })}
+        label="Available in direct messages"
+        help="Shows up under Direct messages for everyone."
+      />
 
-      <label className="form-row" style={{ flexDirection: "row", gap: 8 }}>
-        <input
-          type="checkbox"
-          checked={profile.dm_enabled}
-          onChange={(event) =>
-            setProfile({ ...profile, dm_enabled: event.target.checked })
-          }
-        />
-        <span>Available in direct messages</span>
-      </label>
+      {app.channels.some((channel) => channel.kind === "channel") && (
+        <Section title="Per-channel participation">
+          {app.channels
+            .filter((channel) => channel.kind === "channel")
+            .map((channel) => (
+              <div className="row hoverable" key={channel.id}>
+                <span className="grow name">#{channel.name}</span>
+                <Dropdown
+                  quiet
+                  align="right"
+                  width={130}
+                  value={
+                    profile.channel_participation[channel.id] ??
+                    profile.default_participation
+                  }
+                  onChange={(value) =>
+                    setProfile({
+                      ...profile,
+                      channel_participation: {
+                        ...profile.channel_participation,
+                        [channel.id]: value as Participation,
+                      },
+                    })
+                  }
+                  options={[
+                    { value: "off", label: "Off" },
+                    { value: "mention", label: "Mention" },
+                    { value: "ambient", label: "Ambient" },
+                  ]}
+                />
+              </div>
+            ))}
+        </Section>
+      )}
       {error && <div className="error-text">{error}</div>}
     </Modal>
   );
 }
 
-// --- projects and hosts ----------------------------------------------------
+// --- projects and machines --------------------------------------------------
 
 export function ProjectsPage() {
   const app = useApp();
@@ -270,54 +289,69 @@ export function ProjectsPage() {
   }, [app.hosts]);
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Projects and machines</span>
-        <span className="spacer" />
-        <button className="button primary" onClick={() => setCreating(true)}>
+    <Page
+      title="Projects and machines"
+      actions={
+        <button className="button" onClick={() => setCreating(true)}>
+          <PlusIcon size={15} />
           New project
         </button>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          <div className="section-title">Projects</div>
-          {app.projects.length === 0 && (
-            <div className="empty">
-              A project connects business context to a git repository or an
-              ordinary folder.
-            </div>
-          )}
-          {app.projects.map((project) => (
+      }
+    >
+      <Section title="Projects">
+        {app.projects.length === 0 ? (
+          <Empty
+            title="No projects yet"
+            hint="A project connects business context to a git repository or an ordinary folder, on every machine that has it."
+            action={
+              <button className="button primary" onClick={() => setCreating(true)}>
+                Add a project
+              </button>
+            }
+          />
+        ) : (
+          app.projects.map((project) => (
             <button
               key={project.id}
               className="row"
-              style={{ width: "100%" }}
               onClick={() => setEditing(project)}
             >
+              <span style={{ color: "var(--text-muted)", display: "flex" }}>
+                <FolderIcon />
+              </span>
               <span className="grow">
                 <span className="name">{project.name}</span>
                 <span className="sub">
-                  {Object.keys(project.paths).length} machine
-                  {Object.keys(project.paths).length === 1 ? "" : "s"} ·{" "}
-                  {project.description || project.repo_url || project.kind}
+                  {project.description ||
+                    project.repo_url ||
+                    "no description yet"}
                 </span>
               </span>
-              {project.dev_command && <Chip>preview ready</Chip>}
+              <Chip>
+                {Object.keys(project.paths).length} machine
+                {Object.keys(project.paths).length === 1 ? "" : "s"}
+              </Chip>
+              {project.dev_command && <Chip tone="accent">preview</Chip>}
             </button>
-          ))}
+          ))
+        )}
+      </Section>
 
-          <div className="section-title">Execution machines</div>
-          {app.hosts.map((host) => (
-            <div className="row" key={host.id}>
+      <Section title="Execution machines">
+        {app.hosts.map((host) => {
+          const ready = host.capabilities.runtimes.filter(
+            (runtime) => runtime.available && runtime.id !== "custom",
+          );
+          return (
+            <div className="row hoverable" key={host.id}>
               <span className={`dot ${host.online ? "online" : ""}`} />
               <span className="grow">
                 <span className="name">{host.name}</span>
                 <span className="sub">
-                  {host.platform} ·{" "}
-                  {host.capabilities.runtimes
-                    .filter((runtime) => runtime.available && runtime.id !== "custom")
-                    .map((runtime) => runtime.label)
-                    .join(", ") || "no agent installations detected"}
+                  {host.platform}
+                  {ready.length
+                    ? ` · ${ready.map((runtime) => runtime.label).join(", ")}`
+                    : " · no agent installations detected"}
                 </span>
               </span>
               {host.capabilities.has_gh && (
@@ -325,22 +359,24 @@ export function ProjectsPage() {
                   gh
                 </Chip>
               )}
-              {!host.online && <Chip>offline</Chip>}
+              <Chip tone={host.online ? "positive" : ""}>
+                {host.online ? "online" : `seen ${relative(host.last_seen)}`}
+              </Chip>
+            </div>
+          );
+        })}
+      </Section>
+
+      {info && info.capabilities.notes.length > 0 && (
+        <Section title="This machine">
+          {info.capabilities.notes.map((note) => (
+            <div className="row" key={note}>
+              <span className="grow sub">{note}</span>
             </div>
           ))}
+        </Section>
+      )}
 
-          {info && info.capabilities.notes.length > 0 && (
-            <>
-              <div className="section-title">This machine</div>
-              {info.capabilities.notes.map((note) => (
-                <div className="row" key={note}>
-                  <span className="sub">{note}</span>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-      </div>
       {(creating || editing) && (
         <ProjectModal
           project={editing}
@@ -358,7 +394,7 @@ export function ProjectsPage() {
           }
         />
       )}
-    </div>
+    </Page>
   );
 }
 
@@ -405,7 +441,6 @@ function ProjectModal({
         ? await api.updateProject(project.id, body)
         : await api.createProject(body);
 
-      // Remember where this project lives on this machine so tasks can run here.
       if (localPath) {
         const info = await desktopInfo();
         await setProjectPaths({
@@ -419,6 +454,8 @@ function ProjectModal({
     }
   };
 
+  const otherHosts = app.hosts.filter((host) => host.kind === "relay");
+
   return (
     <Modal
       title={project ? project.name : "New project"}
@@ -427,10 +464,11 @@ function ProjectModal({
       actions={
         <>
           {onDelete && (
-            <button className="button quiet" onClick={onDelete}>
+            <button className="button quiet danger" onClick={onDelete}>
               Delete
             </button>
           )}
+          <span className="spacer" />
           <button className="button quiet" onClick={onClose}>
             Cancel
           </button>
@@ -449,42 +487,52 @@ function ProjectModal({
         placeholder="https://github.com/acme/app"
       />
       <Field label="Default branch" value={branch} onChange={setBranch} />
-      <Field
-        label="Dev server command"
-        value={devCommand}
-        onChange={setDevCommand}
-        placeholder="npm run dev"
-      />
-      <Field label="Dev server port" value={devPort} onChange={setDevPort} />
 
-      <div className="section-title">On this machine</div>
-      <div className="row">
-        <span className="grow sub">{localPath || "not set up here"}</span>
-        <button
-          className="button"
-          onClick={async () => {
-            const chosen = await pickDirectory();
-            if (chosen) setLocalPath(chosen);
-          }}
-        >
-          Choose folder
-        </button>
-      </div>
-
-      <div className="section-title">On other machines</div>
-      {app.hosts.map((host) => (
-        <div className="form-row" key={host.id}>
-          <label>{host.name}</label>
-          <input
-            className="field"
-            value={paths[host.id] ?? ""}
-            placeholder="/absolute/path"
-            onChange={(event) =>
-              setPaths({ ...paths, [host.id]: event.target.value })
-            }
-          />
+      <Section title="This machine">
+        <div className="row hoverable">
+          <span className="grow sub" style={{ wordBreak: "break-all" }}>
+            {localPath || "not set up here"}
+          </span>
+          <button
+            className="button"
+            onClick={async () => {
+              const chosen = await pickDirectory();
+              if (chosen) setLocalPath(chosen);
+            }}
+          >
+            Choose folder
+          </button>
         </div>
-      ))}
+      </Section>
+
+      {otherHosts.length > 0 && (
+        <Section title="On the relay">
+          {otherHosts.map((host) => (
+            <div className="form-row" key={host.id}>
+              <label>{host.name}</label>
+              <input
+                className="field"
+                value={paths[host.id] ?? ""}
+                placeholder="/absolute/path"
+                onChange={(event) =>
+                  setPaths({ ...paths, [host.id]: event.target.value })
+                }
+              />
+            </div>
+          ))}
+        </Section>
+      )}
+
+      <Section title="Previews">
+        <Field
+          label="Dev server command"
+          value={devCommand}
+          onChange={setDevCommand}
+          placeholder="npm run dev"
+        />
+        <Field label="Port" value={devPort} onChange={setDevPort} placeholder="5173" />
+      </Section>
+
       {error && <div className="error-text">{error}</div>}
     </Modal>
   );
@@ -496,45 +544,47 @@ export function MembersPage() {
   const app = useApp();
   const api = useApi();
   const [invite, setInvite] = useState<string>();
+  const [copied, setCopied] = useState(false);
   const humans = app.members.filter((member) => member.kind === "human");
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Members</span>
-        <span className="spacer" />
+    <Page
+      title="Members"
+      actions={
         <button
-          className="button primary"
+          className="button"
           onClick={async () => {
             const created = await api.createInvite({ is_admin: false });
             setInvite(created.code);
+            setCopied(false);
           }}
         >
+          <PlusIcon size={15} />
           Invite someone
         </button>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          {humans.map((member) => (
-            <div className="row" key={member.id}>
-              <Avatar member={member} size={26} />
-              <span className="grow">
-                <span className="name">{member.display_name}</span>
-                <span className="sub">
-                  @{member.handle}
-                  {member.email ? ` · ${member.email}` : ""}
-                </span>
-              </span>
-              {member.is_admin && <Chip>admin</Chip>}
-              <span className={`dot ${member.presence}`} />
-            </div>
-          ))}
+      }
+    >
+      {humans.map((member) => (
+        <div className="row hoverable" key={member.id}>
+          <Avatar member={member} size={30} />
+          <span className="grow">
+            <span className="name">{member.display_name}</span>
+            <span className="sub">
+              @{member.handle}
+              {member.email ? ` · ${member.email}` : ""}
+            </span>
+          </span>
+          {member.is_admin && <Chip>admin</Chip>}
+          <Chip tone={member.presence === "online" ? "positive" : ""}>
+            {member.presence}
+          </Chip>
         </div>
-      </div>
+      ))}
+
       {invite && (
         <Modal
           title="Invite code"
-          subtitle="They enter this and the relay URL in Patchwork Desktop."
+          subtitle="They enter this and your relay URL in Patchwork Desktop."
           onClose={() => setInvite(undefined)}
           actions={
             <button className="button primary" onClick={() => setInvite(undefined)}>
@@ -542,12 +592,22 @@ export function MembersPage() {
             </button>
           }
         >
-          <div className="card" style={{ marginTop: 12 }}>
-            <code style={{ fontSize: 16 }}>{invite}</code>
+          <div className="invite-code">
+            <code>{invite}</code>
+            <button
+              className="button quiet"
+              onClick={() => {
+                void navigator.clipboard.writeText(invite);
+                setCopied(true);
+              }}
+            >
+              {copied ? <CheckIcon size={15} /> : null}
+              {copied ? "Copied" : "Copy"}
+            </button>
           </div>
         </Modal>
       )}
-    </div>
+    </Page>
   );
 }
 
@@ -560,59 +620,64 @@ export function AutomationsPage() {
   const [creating, setCreating] = useState(false);
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Automations</span>
-        <span className="spacer" />
-        <button className="button primary" onClick={() => setCreating(true)}>
+    <Page
+      title="Automations"
+      actions={
+        <button className="button" onClick={() => setCreating(true)}>
+          <PlusIcon size={15} />
           New automation
         </button>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          {app.automations.length === 0 && (
-            <div className="empty">
-              An automation tells an agent when to act, where to act, and where to
-              report the result.
-            </div>
-          )}
-          {app.automations.map((automation) => {
-            const agent = app.members.find(
-              (member) => member.id === automation.agent_id,
-            );
-            return (
-              <div className="row" key={automation.id}>
-                <span className="grow">
-                  <span className="name">{automation.name}</span>
-                  <span className="sub">
-                    {describeTrigger(automation)} · {agent?.display_name ?? "no agent"}
-                  </span>
+      }
+    >
+      {app.automations.length === 0 ? (
+        <Empty
+          title="No automations yet"
+          hint="An automation says what fires it, which agent acts, where it gets context, and where it reports."
+          action={
+            <button className="button primary" onClick={() => setCreating(true)}>
+              Create an automation
+            </button>
+          }
+        />
+      ) : (
+        app.automations.map((automation) => {
+          const agent = app.members.find(
+            (member) => member.id === automation.agent_id,
+          );
+          return (
+            <button
+              key={automation.id}
+              className="row"
+              onClick={() => go({ kind: "automation", id: automation.id })}
+            >
+              <span className="grow">
+                <span className="name">{automation.name}</span>
+                <span className="sub">
+                  {describeTrigger(automation)} · {agent?.display_name ?? "no agent"}
                 </span>
-                {automation.failure_count > 0 && (
-                  <Chip tone="danger">{automation.failure_count} failed</Chip>
-                )}
-                <Chip tone={automation.enabled ? "positive" : ""}>
-                  {automation.enabled ? "on" : "paused"}
-                </Chip>
-                <button
-                  className="button quiet"
-                  onClick={() => api.runAutomation(automation.id)}
-                >
-                  Run now
-                </button>
-                <button
-                  className="button quiet"
-                  onClick={() => go({ kind: "automation", id: automation.id })}
-                >
-                  Debug
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      </div>
+              </span>
+              {automation.failure_count > 0 && (
+                <Chip tone="danger">{automation.failure_count} failed</Chip>
+              )}
+              <Chip tone={automation.enabled ? "positive" : ""}>
+                {automation.enabled ? "on" : "paused"}
+              </Chip>
+              <span
+                className="button quiet"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void api.runAutomation(automation.id);
+                }}
+              >
+                Run now
+              </span>
+            </button>
+          );
+        })
+      )}
+
       {creating && <AutomationModal onClose={() => setCreating(false)} />}
-    </div>
+    </Page>
   );
 }
 
@@ -632,7 +697,7 @@ function describeTrigger(automation: Automation) {
     case "webhook":
       return "on webhook";
     case "manual":
-      return "manual";
+      return "manual only";
   }
 }
 
@@ -722,15 +787,19 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
       }
     >
       <Field label="Name" value={name} onChange={setName} autoFocus />
-      <Select
+      <FormSelect
         label="Agent"
         value={agentId}
         onChange={setAgentId}
         options={app.members
           .filter((member) => member.kind === "agent")
-          .map((member) => ({ value: member.id, label: member.display_name }))}
+          .map((member) => ({
+            value: member.id,
+            label: member.display_name,
+            hint: member.agent?.runtime,
+          }))}
       />
-      <Select
+      <FormSelect
         label="Trigger"
         value={triggerKind}
         onChange={setTriggerKind}
@@ -756,17 +825,17 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
         />
       )}
       {triggerKind === "task_status" && (
-        <Select
+        <FormSelect
           label="Status"
           value={status}
           onChange={setStatus}
           options={["planned", "running", "blocked", "review", "done"].map((value) => ({
             value,
-            label: value,
+            label: statusLabel(value as never),
           }))}
         />
       )}
-      <Select
+      <FormSelect
         label="Channel for context and reporting"
         value={channelId}
         onChange={setChannelId}
@@ -776,8 +845,9 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
             .filter((channel) => channel.kind === "channel")
             .map((channel) => ({ value: channel.id, label: `#${channel.name}` })),
         ]}
+        help="The automation stays connected to this conversation rather than copying it."
       />
-      <Select
+      <FormSelect
         label="What it does"
         value={action}
         onChange={setAction}
@@ -811,63 +881,67 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
     void api.automationDebug(automationId).then(setDebug);
   }, [automationId, app.automations, app.runs]);
 
-  if (!debug) return <div className="empty">Loading…</div>;
+  if (!debug) return <Empty title="Loading" />;
   const automation = debug.automation;
   const agent = app.members.find((member) => member.id === automation.agent_id);
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <button className="button quiet" onClick={() => go({ kind: "automations" })}>
-          ‹ Automations
-        </button>
-        <span className="title">{automation.name}</span>
-        <span className="spacer" />
-        <button
-          className="button"
-          onClick={() =>
-            api.updateAutomation(automation.id, {
-              ...automation,
-              enabled: !automation.enabled,
-            })
-          }
-        >
-          {automation.enabled ? "Pause" : "Resume"}
-        </button>
-        <button
-          className="button primary"
-          onClick={() => api.runAutomation(automation.id)}
-        >
-          Run again
-        </button>
+    <Page
+      wide
+      title={automation.name}
+      back={{ label: "Automations", onClick: () => go({ kind: "automations" }) }}
+      actions={
+        <>
+          <button
+            className="button quiet"
+            onClick={() =>
+              api.updateAutomation(automation.id, {
+                ...automation,
+                enabled: !automation.enabled,
+              })
+            }
+          >
+            {automation.enabled ? "Pause" : "Resume"}
+          </button>
+          <button
+            className="button"
+            onClick={() => api.runAutomation(automation.id)}
+          >
+            Run now
+          </button>
+        </>
+      }
+    >
+      <div className="card-row" style={{ marginTop: 14 }}>
+        <Chip>{describeTrigger(automation)}</Chip>
+        <Chip>{agent?.display_name ?? "no agent"}</Chip>
+        <Chip>{automation.action.replace(/_/g, " ")}</Chip>
+        {automation.next_run_at && <Chip>next {relative(automation.next_run_at)}</Chip>}
+        <Chip tone={automation.enabled ? "positive" : ""}>
+          {automation.enabled ? "on" : "paused"}
+        </Chip>
       </div>
 
-      <div className="page">
-        <div className="page-inner wide">
-          <div className="card-row">
-            <Chip>{describeTrigger(automation)}</Chip>
-            <Chip>{agent?.display_name ?? "no agent"}</Chip>
-            <Chip>{automation.action.replace(/_/g, " ")}</Chip>
-            {automation.next_run_at && (
-              <Chip>next {relative(automation.next_run_at)}</Chip>
-            )}
-          </div>
-          {automation.trigger.type === "webhook" && (
-            <div className="card" style={{ marginTop: 10 }}>
-              <div className="card-head">Webhook</div>
-              <code style={{ wordBreak: "break-all" }}>
-                POST {api.baseUrl}/api/webhooks/{automation.trigger.token}
-              </code>
-            </div>
-          )}
+      {automation.trigger.type === "webhook" && (
+        <div className="card" style={{ maxWidth: "none", marginTop: 14 }}>
+          <div className="card-head">Webhook</div>
+          <code style={{ wordBreak: "break-all" }}>
+            POST {api.baseUrl}/api/webhooks/{automation.trigger.token}
+          </code>
+        </div>
+      )}
 
-          <div className="section-title">Runs</div>
-          {debug.runs.length === 0 && (
-            <div className="card-sub">This automation has not fired yet.</div>
-          )}
-          {debug.runs.map((run) => (
+      <Section title="Runs">
+        {debug.runs.length === 0 ? (
+          <Empty
+            title="This automation has not fired yet"
+            hint="Every firing records its trigger, what it selected, and the context the agent received."
+          />
+        ) : (
+          debug.runs.map((run) => (
             <div className="card" key={run.id} style={{ maxWidth: "none" }}>
               <div className="card-head">
+                {run.status === "running" ? <Spinner size={13} /> : null}
                 <span>{relative(run.created_at)}</span>
                 <span className="spacer" />
                 <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
@@ -875,19 +949,17 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
               <div className="card-title">{run.trigger_summary}</div>
               {run.error && <div className="error-text">{run.error}</div>}
               {run.selection != null && (
-                <details style={{ marginTop: 8 }}>
-                  <summary className="card-sub">What it selected</summary>
-                  <pre className="run-event text" style={{ whiteSpace: "pre-wrap" }}>
+                <details style={{ marginTop: 10 }}>
+                  <summary>What it selected</summary>
+                  <pre className="code-block">
                     {JSON.stringify(run.selection, null, 2)}
                   </pre>
                 </details>
               )}
               {run.context_preview && (
-                <details style={{ marginTop: 4 }}>
-                  <summary className="card-sub">Context it received</summary>
-                  <pre className="run-event text" style={{ whiteSpace: "pre-wrap" }}>
-                    {run.context_preview}
-                  </pre>
+                <details style={{ marginTop: 6 }}>
+                  <summary>Context it received</summary>
+                  <pre className="code-block">{run.context_preview}</pre>
                 </details>
               )}
               <div className="card-row">
@@ -909,10 +981,10 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
                 )}
               </div>
             </div>
-          ))}
-        </div>
-      </div>
-    </div>
+          ))
+        )}
+      </Section>
+    </Page>
   );
 }
 
@@ -923,81 +995,85 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const api = useApi();
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    void desktopInfo().then((loaded) => setInfo(loaded));
+    void desktopInfo().then(setInfo);
   }, [app.hosts]);
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Settings</span>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          <div className="section-title">Workspace</div>
-          <Field label="Name" value={name} onChange={setName} />
-          <button
-            className="button"
-            style={{ marginTop: 8 }}
-            onClick={() => api.renameWorkspace(name)}
-          >
-            Save
-          </button>
+    <Page title="Settings">
+      <Section title="Workspace">
+        <Field label="Name" value={name} onChange={setName} />
+        <button
+          className="button"
+          style={{ marginTop: 10 }}
+          disabled={!name.trim() || name === app.workspace?.name}
+          onClick={async () => {
+            await api.renameWorkspace(name);
+            setSaved(true);
+            window.setTimeout(() => setSaved(false), 1800);
+          }}
+        >
+          {saved ? <CheckIcon size={15} /> : null}
+          {saved ? "Saved" : "Save"}
+        </button>
+      </Section>
 
-          <div className="section-title">This machine</div>
-          <div className="row">
-            <span className={`dot ${info?.host.connected ? "online" : ""}`} />
+      <Section title="This machine">
+        <div className="row hoverable">
+          <span className={`dot ${info?.host.connected ? "online" : ""}`} />
+          <span className="grow">
+            <span className="name">{info?.host.host_name || "not connected"}</span>
+            <span className="sub">
+              {info?.platform}
+              {info?.host.last_error ? ` · ${info.host.last_error}` : ""}
+            </span>
+          </span>
+        </div>
+        {info?.capabilities.runtimes.map((runtime) => (
+          <div className="row hoverable" key={runtime.id}>
             <span className="grow">
-              <span className="name">{info?.host.host_name || "not connected"}</span>
+              <span className="name">{runtime.label}</span>
               <span className="sub">
-                {info?.platform}
-                {info?.host.last_error ? ` · ${info.host.last_error}` : ""}
+                {runtime.problem ?? runtime.version ?? runtime.command.join(" ")}
               </span>
             </span>
+            <Chip tone={runtime.available ? "positive" : "caution"}>
+              {runtime.available ? "ready" : "unavailable"}
+            </Chip>
           </div>
-          {info?.capabilities.runtimes.map((runtime) => (
-            <div className="row" key={runtime.id}>
-              <span className="grow">
-                <span className="name">{runtime.label}</span>
-                <span className="sub">
-                  {runtime.problem ?? runtime.version ?? runtime.command.join(" ")}
-                </span>
-              </span>
-              <Chip tone={runtime.available ? "positive" : "caution"}>
-                {runtime.available ? "ready" : "unavailable"}
-              </Chip>
-            </div>
-          ))}
+        ))}
+      </Section>
 
-          <div className="section-title">Relay</div>
-          <div className="row">
-            <span className="grow">
-              <span className="name">{info?.settings.relay_url}</span>
-              <span className="sub">
-                {app.live ? "connected" : "reconnecting…"}
-              </span>
-            </span>
-            <button
-              className="button quiet"
-              onClick={() => openExternal(`${info?.settings.relay_url}/api/health`)}
-            >
-              Health
-            </button>
-          </div>
-
-          <div className="section-title">Account</div>
+      <Section title="Relay">
+        <div className="row hoverable">
+          <span className={`dot ${app.live ? "online" : "waiting"}`} />
+          <span className="grow">
+            <span className="name">{info?.settings.relay_url}</span>
+            <span className="sub">{app.live ? "connected" : "reconnecting…"}</span>
+          </span>
           <button
-            className="button"
-            onClick={async () => {
-              await signOut();
-              onSignOut();
-            }}
+            className="button quiet"
+            onClick={() => openExternal(`${info?.settings.relay_url}/api/health`)}
           >
-            Sign out of this workspace
+            <ExternalIcon size={14} />
+            Health
           </button>
         </div>
-      </div>
-    </div>
+      </Section>
+
+      <Section title="Account">
+        <button
+          className="button quiet danger"
+          onClick={async () => {
+            await signOut();
+            onSignOut();
+          }}
+        >
+          Sign out of this workspace
+        </button>
+      </Section>
+    </Page>
   );
 }

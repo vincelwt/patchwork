@@ -62,26 +62,6 @@ export function PresenceDot({ presence }: { presence: Presence }) {
   return <span className={`dot ${presence}`} />;
 }
 
-export function CheckRow({
-  checked,
-  onChange,
-  children,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  children: ReactNode;
-}) {
-  return (
-    <label className="check-row">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(event) => onChange(event.target.checked)}
-      />
-      <span>{children}</span>
-    </label>
-  );
-}
 
 export function Chip({
   tone = "",
@@ -123,9 +103,11 @@ export function Modal({
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal" onMouseDown={(event) => event.stopPropagation()}>
-        <h2>{title}</h2>
-        {subtitle && <p className="sub">{subtitle}</p>}
-        {children}
+        <div className="modal-head">
+          <h2>{title}</h2>
+          {subtitle && <p className="sub">{subtitle}</p>}
+        </div>
+        <div className="modal-body">{children}</div>
         {actions && <div className="modal-actions">{actions}</div>}
       </div>
     </div>
@@ -174,34 +156,6 @@ export function Field({
   );
 }
 
-export function Select({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  options: { value: string; label: string }[];
-}) {
-  return (
-    <div className="form-row">
-      <label>{label}</label>
-      <select
-        className="field"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
 
 /// Small helper for the many "load this on mount" panels.
 export function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {

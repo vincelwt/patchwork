@@ -23,6 +23,7 @@ import {
   NavigationContext,
   useNavigation,
 } from "./components/common";
+import { Empty, Page } from "./components/ui";
 import {
   AgentIcon,
   AutomationIcon,
@@ -165,7 +166,13 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }, []);
 
   if (app.status === "loading") {
-    return <div className="empty">Connecting to the relay…</div>;
+    return (
+      <div className="onboarding">
+        <div className="onboarding-card" style={{ textAlign: "center" }}>
+          <Spinner size={18} />
+        </div>
+      </div>
+    );
   }
   if (app.status === "error") {
     return (
@@ -258,7 +265,7 @@ function ChannelView({ channelId }: { channelId: string }) {
   const app = useApp();
   const [creatingTask, setCreatingTask] = useState(false);
   const channel = app.channels.find((candidate) => candidate.id === channelId);
-  if (!channel) return <div className="empty">This conversation is gone.</div>;
+  if (!channel) return <Empty title="This conversation is gone" />;
 
   const partner =
     channel.kind === "dm"
@@ -444,58 +451,55 @@ function SearchPage({ query }: { query: string }) {
   const [results, setResults] = useState<SearchResults>();
 
   useEffect(() => {
+    setResults(undefined);
     void api.search(query).then(setResults);
   }, [query, api]);
 
   return (
-    <div className="column">
-      <div className="topbar">
-        <span className="title">Search</span>
-        <span className="subtitle">{query}</span>
-      </div>
-      <div className="page">
-        <div className="page-inner">
-          {!results && <div className="empty">Searching…</div>}
-          {results?.tasks.length ? <div className="section-title">Tasks</div> : null}
-          {results?.tasks.map((task) => (
-            <button
-              key={task.id}
-              className="row"
-              style={{ width: "100%" }}
-              onClick={() => go({ kind: "task", id: task.id })}
-            >
-              <span className="grow">
-                <span className="name">
-                  {task.key} — {task.title}
-                </span>
-                <span className="sub">{task.outcome}</span>
-              </span>
-              <Chip>{task.status}</Chip>
-            </button>
-          ))}
-          {results?.messages.length ? (
-            <div className="section-title">Messages</div>
-          ) : null}
-          {results?.messages.map((hit) => (
-            <button
-              key={hit.message.id}
-              className="row"
-              style={{ width: "100%" }}
-              onClick={() => go({ kind: "channel", id: hit.message.channel_id })}
-            >
-              <span className="grow">
-                <span className="name">
-                  {hit.author_name} in {hit.channel_name}
-                </span>
-                <span className="sub">{hit.snippet}</span>
-              </span>
-            </button>
-          ))}
-          {results && !results.messages.length && !results.tasks.length && (
-            <div className="empty">Nothing matched.</div>
-          )}
+    <Page title="Search" subtitle={query}>
+      {!results && <Empty title="Searching" />}
+      {results?.tasks.length ? (
+        <div className="section-head">
+          <span className="section-title">Tasks</span>
         </div>
-      </div>
-    </div>
+      ) : null}
+      {results?.tasks.map((task) => (
+        <button
+          key={task.id}
+          className="row"
+          onClick={() => go({ kind: "task", id: task.id })}
+        >
+          <span className="grow">
+            <span className="name">
+              {task.key} — {task.title}
+            </span>
+            <span className="sub">{task.outcome}</span>
+          </span>
+          <Chip>{task.status}</Chip>
+        </button>
+      ))}
+      {results?.messages.length ? (
+        <div className="section-head">
+          <span className="section-title">Messages</span>
+        </div>
+      ) : null}
+      {results?.messages.map((hit) => (
+        <button
+          key={hit.message.id}
+          className="row"
+          onClick={() => go({ kind: "channel", id: hit.message.channel_id })}
+        >
+          <span className="grow">
+            <span className="name">
+              {hit.author_name} in {hit.channel_name}
+            </span>
+            <span className="sub">{hit.snippet}</span>
+          </span>
+        </button>
+      ))}
+      {results && !results.messages.length && !results.tasks.length && (
+        <Empty title="Nothing matched" hint={`No conversation or task mentions “${query}”.`} />
+      )}
+    </Page>
   );
 }

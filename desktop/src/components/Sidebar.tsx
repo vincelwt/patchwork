@@ -126,6 +126,9 @@ export function Sidebar({
 
         {(grouped.get("") ?? []).length > 0 && (
           <div className="sidebar-group">
+            <div className="group-label" style={{ cursor: "default" }}>
+              <span style={{ marginLeft: 13 }}>Channels</span>
+            </div>
             {(grouped.get("") ?? []).map((channel) => (
               <ChannelRow
                 key={channel.id}
