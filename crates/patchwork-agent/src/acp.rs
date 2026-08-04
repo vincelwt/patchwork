@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use patchwork_core::models::RuntimeOption;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -51,6 +52,54 @@ pub struct PermissionOption {
 }
 
 struct Pending(Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>);
+
+/// What opening a session told us about the runtime behind it.
+#[derive(Debug, Clone, Default)]
+pub struct NewSession {
+    pub session_id: String,
+    pub models: Vec<RuntimeOption>,
+    pub modes: Vec<RuntimeOption>,
+    pub current_model: Option<String>,
+    pub current_mode: Option<String>,
+}
+
+/// `{ "models": { "availableModels": [ { modelId, name, description } ] } }`.
+/// The id key differs per group (`modelId` / `id`), so take whichever is there.
+fn options_of(res: &Value, group: &str, list: &str) -> Vec<RuntimeOption> {
+    let Some(items) = res.get(group).and_then(|g| g.get(list)).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("modelId")
+                .or_else(|| item.get("modeId"))
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())?;
+            Some(RuntimeOption {
+                id: id.to_string(),
+                name: item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id)
+                    .to_string(),
+                description: item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn current_of(res: &Value, group: &str, key: &str) -> Option<String> {
+    res.get(group)
+        .and_then(|g| g.get(key))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
 
 pub struct AcpConnection {
     /// Behind a mutex so shutdown never needs to own the connection: the
@@ -217,17 +266,48 @@ impl AcpConnection {
             .map_err(|_| anyhow!("{method}: the agent did not answer in time"))?
     }
 
-    pub async fn new_session(&self, cwd: &str, mcp_servers: Value) -> Result<String> {
+    /// A new session, plus what this runtime turned out to offer. The models
+    /// and modes are only knowable by asking — the catalogue is the runtime's,
+    /// not ours — and opening a session is the moment it tells us.
+    pub async fn new_session(&self, cwd: &str, mcp_servers: Value) -> Result<NewSession> {
         let res = self
             .setup_request(
                 "session/new",
                 json!({ "cwd": cwd, "mcpServers": mcp_servers }),
             )
             .await?;
-        res.get("sessionId")
+        let session_id = res
+            .get("sessionId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("session/new returned no sessionId"))
+            .ok_or_else(|| anyhow!("session/new returned no sessionId"))?;
+        Ok(NewSession {
+            session_id,
+            models: options_of(&res, "models", "availableModels"),
+            modes: options_of(&res, "modes", "availableModes"),
+            current_model: current_of(&res, "models", "currentModelId"),
+            current_mode: current_of(&res, "modes", "currentModeId"),
+        })
+    }
+
+    /// Ask for a specific model. A runtime that does not support choosing is
+    /// not an error worth failing a run over — the caller logs and carries on.
+    pub async fn set_model(&self, session_id: &str, model_id: &str) -> Result<()> {
+        self.setup_request(
+            "session/set_model",
+            json!({ "sessionId": session_id, "modelId": model_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<()> {
+        self.setup_request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": mode_id }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn load_session(&self, session_id: &str, cwd: &str) -> Result<()> {

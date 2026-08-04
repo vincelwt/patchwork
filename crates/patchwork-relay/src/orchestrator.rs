@@ -9,7 +9,7 @@ use patchwork_core::events::Event;
 use patchwork_core::host::{HostToRelay, RelayToHost, RunSpec, WorktreeSpec};
 use patchwork_core::models::*;
 use patchwork_core::wire::SendMessage;
-use patchwork_core::{new_id, now_ms, Id};
+use patchwork_core::{new_id, now_ms, Id, Millis};
 use patchwork_agent::worktree::branch_for;
 
 use crate::auth;
@@ -245,6 +245,78 @@ pub fn parse_mentions(body: &str, members: &[Member]) -> Vec<Id> {
     found
 }
 
+/// The agent a message is plainly a reply to, if any.
+///
+/// Deliberately narrow. Only the agent that spoke last, only if it spoke
+/// recently, only if it was answering *this* person, and only when the new
+/// message does not name somebody else instead — say `@other-agent` and you
+/// meant that one, not the one still on screen.
+fn continuation_target(
+    state: &Shared,
+    message: &Message,
+    author: &Member,
+) -> Result<Option<Id>> {
+    if author.kind != MemberKind::Human || !message.mentions.is_empty() {
+        return Ok(None);
+    }
+
+    let recent = state.store.recent_messages(&message.channel_id, 6)?;
+    let Some(previous) = recent
+        .iter()
+        .rev()
+        .find(|candidate| candidate.id != message.id && candidate.kind != MessageKind::System)
+    else {
+        return Ok(None);
+    };
+    let Some(run_id) = &previous.run_id else {
+        return Ok(None);
+    };
+    let Some(run) = state.store.run(run_id)? else {
+        return Ok(None);
+    };
+
+    // Who the previous run was answering. An agent's aside to somebody else is
+    // not an invitation to have your next sentence routed into it.
+    let spoke_to = match &run.trigger {
+        RunTrigger::Mention { message_id }
+        | RunTrigger::DirectMessage { message_id }
+        | RunTrigger::Ambient { message_id } => {
+            state.store.message(message_id)?.map(|m| m.author_id)
+        }
+        RunTrigger::Manual { by } => Some(by.clone()),
+        _ => None,
+    };
+
+    Ok(continues_conversation(
+        message,
+        previous,
+        &run,
+        spoke_to.as_deref(),
+    ))
+}
+
+/// Long enough to cover a follow-up question, short enough that returning to a
+/// channel tomorrow starts a fresh conversation rather than resuming one nobody
+/// remembers.
+const CONTINUATION_WINDOW_MS: Millis = 10 * 60 * 1000;
+
+/// The rule itself, with the database left outside so it can be read — and
+/// tested — as the single sentence it is.
+fn continues_conversation(
+    message: &Message,
+    previous: &Message,
+    previous_run: &Run,
+    spoke_to: Option<&str>,
+) -> Option<Id> {
+    if message.created_at.saturating_sub(previous.created_at) > CONTINUATION_WINDOW_MS {
+        return None;
+    }
+    if spoke_to != Some(message.author_id.as_str()) {
+        return None;
+    }
+    Some(previous_run.agent_id.clone())
+}
+
 async fn notify_inbox(
     state: &Shared,
     message: &Message,
@@ -362,6 +434,15 @@ async fn trigger_agents(
         None => -1,
     };
 
+    // Who you are plainly still talking to.
+    //
+    // A person answers the agent that just answered them without saying its
+    // name again — that is how conversation works. Without this, the follow-up
+    // reaches an ambient agent as ambient chatter, it decides it has nothing to
+    // add, and the reply you were waiting for never comes. The reader is left
+    // with a working app that simply ignored them.
+    let continuing = continuation_target(state, message, &author)?;
+
     for agent in members.iter().filter(|m| m.kind == MemberKind::Agent) {
         if agent.id == message.author_id {
             continue;
@@ -384,18 +465,26 @@ async fn trigger_agents(
             }
         }
 
-        let should_run = if mentioned {
+        let addressed = mentioned || continuing.as_deref() == Some(agent.id.as_str());
+
+        let should_run = if addressed {
             participation != Participation::Off || in_dm
         } else if in_dm {
             profile.dm_enabled
         } else {
-            participation == Participation::Ambient && author.kind == MemberKind::Human
+            // Ambient means "may chime in", and that is only ever true of a
+            // room. A direct message is between the people in it, and a task
+            // discussion belongs to whoever is on the task — an uninvited agent
+            // wandering into either is not helpfulness, it is eavesdropping.
+            participation == Participation::Ambient
+                && author.kind == MemberKind::Human
+                && channel.kind == ChannelKind::Channel
         };
         if !should_run {
             continue;
         }
 
-        let trigger = if mentioned {
+        let trigger = if addressed {
             RunTrigger::Mention {
                 message_id: message.id.clone(),
             }
@@ -581,6 +670,8 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
         runtime: profile.runtime.clone(),
+        model: profile.model.clone(),
+        permission_mode: profile.permission_mode.clone(),
         custom_command: profile.custom_command.clone(),
         channel_id: run.channel_id.clone(),
         task_id: run.task_id.clone(),
@@ -908,6 +999,42 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
 
             if status.is_terminal() {
                 finish_run(state, &run).await?;
+            }
+        }
+
+        HostToRelay::RuntimeOptions {
+            runtime,
+            models,
+            modes,
+            default_model,
+            default_mode,
+        } => {
+            // Remember it against the machine that reported it, so the agent
+            // editor can offer a real list rather than a free-text box.
+            let Some(mut host) = state.store.host(host_id)? else {
+                return Ok(());
+            };
+            let mut changed = false;
+            for installation in &mut host.capabilities.runtimes {
+                if installation.id != runtime {
+                    continue;
+                }
+                if installation.models != models
+                    || installation.modes != modes
+                    || installation.default_model != default_model
+                    || installation.default_mode != default_mode
+                {
+                    installation.models = models.clone();
+                    installation.modes = modes.clone();
+                    installation.default_model = default_model.clone();
+                    installation.default_mode = default_mode.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                state.store.upsert_host(&host)?;
+                host.online = true;
+                state.emit(Event::HostUpdated { host });
             }
         }
 
@@ -1560,6 +1687,84 @@ mod tests {
             vec!["2"]
         );
         assert!(parse_mentions("email me at a@developer.com", &members).is_empty());
+    }
+
+    fn message_at(id: &str, author: &str, at: Millis, run: Option<&str>) -> Message {
+        Message {
+            id: id.into(),
+            channel_id: "c".into(),
+            author_id: author.into(),
+            kind: MessageKind::Text,
+            body: String::new(),
+            card: None,
+            parent_id: None,
+            reply_count: 0,
+            last_reply_at: 0,
+            run_id: run.map(|r| r.to_string()),
+            task_id: None,
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+            reactions: Vec::new(),
+            created_at: at,
+            edited_at: None,
+        }
+    }
+
+    fn run_by(agent: &str) -> Run {
+        Run {
+            id: "r1".into(),
+            agent_id: agent.into(),
+            status: RunStatus::Succeeded,
+            trigger: RunTrigger::Manual { by: "vince".into() },
+            channel_id: "c".into(),
+            task_id: None,
+            host_id: None,
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "claude".into(),
+            prompt: String::new(),
+            headline: String::new(),
+            error: None,
+            token_usage: None,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn answering_the_agent_that_just_answered_you_counts_as_talking_to_it() {
+        let reply = message_at("m2", "agent", 1_000, Some("r1"));
+        let followup = message_at("m3", "vince", 5_000, None);
+        assert_eq!(
+            continues_conversation(&followup, &reply, &run_by("agent"), Some("vince")),
+            Some("agent".to_string()),
+            "a follow-up with no @ is still directed at whoever just replied",
+        );
+    }
+
+    #[test]
+    fn continuation_does_not_reach_across_a_long_gap() {
+        let reply = message_at("m2", "agent", 0, Some("r1"));
+        let much_later = message_at("m3", "vince", CONTINUATION_WINDOW_MS + 1, None);
+        assert_eq!(
+            continues_conversation(&much_later, &reply, &run_by("agent"), Some("vince")),
+            None,
+        );
+    }
+
+    #[test]
+    fn continuation_only_belongs_to_the_person_being_answered() {
+        let reply = message_at("m2", "agent", 1_000, Some("r1"));
+        let someone_else = message_at("m3", "mallory", 2_000, None);
+        assert_eq!(
+            continues_conversation(&someone_else, &reply, &run_by("agent"), Some("vince")),
+            None,
+            "overhearing an answer to somebody else is not a conversation with you",
+        );
     }
 
     #[test]

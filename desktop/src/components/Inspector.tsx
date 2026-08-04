@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { store, useApi, useApp } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
 import { Avatar, Chip, useNavigation } from "./common";
@@ -19,7 +19,7 @@ import {
   ThreadIcon,
   WarningIcon,
 } from "./icons";
-import { Composer, MessageRow } from "./Chat";
+import { Composer, DropZone, MessageRow } from "./Chat";
 import type { Id, RunEvent } from "../lib/types";
 
 /// An optional side panel — threads, run detail, task detail. The layout never
@@ -52,6 +52,8 @@ export function Inspector() {
 
 function ThreadPanel({ messageId }: { messageId: Id }) {
   const app = useApp();
+  const [dropped, setDropped] = useState<File[]>([]);
+  const clearDropped = useCallback(() => setDropped([]), []);
   const replies = app.threads[messageId];
   const root = Object.values(app.messages)
     .flat()
@@ -67,7 +69,7 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
   if (!root || !channel) return <Empty title="That message is gone" />;
 
   return (
-    <>
+    <DropZone className="thread-pane" onFiles={setDropped}>
       <div className="inspector-body">
         <MessageRow message={root} grouped={false} />
         <div style={{ height: 10 }} />
@@ -75,8 +77,14 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
           <MessageRow key={reply.id} message={reply} grouped={false} />
         ))}
       </div>
-      <Composer channel={channel} parentId={messageId} placeholder="Reply…" />
-    </>
+      <Composer
+        channel={channel}
+        parentId={messageId}
+        placeholder="Reply…"
+        incoming={dropped}
+        onConsumed={clearDropped}
+      />
+    </DropZone>
   );
 }
 

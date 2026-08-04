@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
 import {
@@ -32,9 +32,13 @@ import type {
   AgentProfile,
   Automation,
   AutomationDebug,
+  Host,
+  Id,
   Member,
   Participation,
   Project,
+  RuntimeInstallation,
+  RuntimeOption,
 } from "../lib/types";
 
 // --- agents ----------------------------------------------------------------
@@ -131,15 +135,97 @@ export function AgentModal({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const runtimes = Array.from(
-    new Set(
-      app.hosts.flatMap((host) =>
-        host.capabilities.runtimes
-          .filter((runtime) => runtime.available)
-          .map((runtime) => runtime.id),
-      ),
-    ),
-  );
+  // "Which runtime" and "which machine" were two questions with one answer:
+  // an agent runs a particular runtime *somewhere*, and the somewheres are
+  // exactly the machines that have that runtime installed. One list, and every
+  // entry in it is a combination that can actually run.
+  const placements = useMemo(() => {
+    const out: {
+      value: string;
+      label: string;
+      hint?: string;
+      runtime: string;
+      location: AgentProfile["location"];
+      host_id?: Id;
+    }[] = [];
+    const byRuntime = new Map<string, { label: string; hosts: Host[] }>();
+
+    for (const host of app.hosts) {
+      for (const runtime of host.capabilities.runtimes) {
+        if (!runtime.available || runtime.id === "custom") continue;
+        const entry = byRuntime.get(runtime.id) ?? { label: runtime.label, hosts: [] };
+        entry.hosts.push(host);
+        byRuntime.set(runtime.id, entry);
+      }
+    }
+
+    for (const [id, { label, hosts }] of byRuntime) {
+      // Anywhere it can run — the right default, because a laptop that is shut
+      // should not stop the work.
+      out.push({
+        value: `auto:${id}:`,
+        label,
+        hint:
+          hosts.length > 1
+            ? `on whichever machine has the project (${hosts.length} can)`
+            : `on ${hosts[0].name}`,
+        runtime: id,
+        location: "auto",
+      });
+      if (hosts.length > 1) {
+        for (const host of hosts) {
+          out.push({
+            value: `${host.kind === "relay" ? "relay" : "desktop"}:${id}:${host.id}`,
+            label: `${label} on ${host.name}`,
+            hint: host.online ? "online" : "offline",
+            runtime: id,
+            location: host.kind === "relay" ? "relay" : "desktop",
+            host_id: host.id,
+          });
+        }
+      }
+    }
+
+    out.push({
+      value: "auto:custom:",
+      label: "A custom ACP command",
+      runtime: "custom",
+      location: "auto",
+    });
+    return out;
+  }, [app.hosts]);
+
+  const placementValue = `${profile.location}:${profile.runtime}:${profile.host_id ?? ""}`;
+  const chosenPlacement =
+    placements.find((entry) => entry.value === placementValue) ??
+    placements.find((entry) => entry.runtime === profile.runtime);
+
+  // What that placement can actually think with. When it could run on several
+  // machines, only offer models every one of them has — anything else would be
+  // a setting that works until the run lands on the wrong laptop.
+  const { models, modes, defaultModel, defaultMode } = useMemo(() => {
+    const installs = app.hosts
+      .filter((host) => !profile.host_id || host.id === profile.host_id)
+      .map((host) =>
+        host.capabilities.runtimes.find((runtime) => runtime.id === profile.runtime),
+      )
+      .filter((runtime): runtime is RuntimeInstallation => !!runtime)
+      .filter((runtime) => runtime.models.length > 0 || runtime.modes.length > 0);
+
+    if (installs.length === 0) {
+      return { models: [], modes: [], defaultModel: undefined, defaultMode: undefined };
+    }
+    const shared = (pick: (r: RuntimeInstallation) => RuntimeOption[]) =>
+      pick(installs[0]).filter((option) =>
+        installs.every((install) => pick(install).some((o) => o.id === option.id)),
+      );
+    return {
+      models: shared((runtime) => runtime.models),
+      modes: shared((runtime) => runtime.modes),
+      defaultModel: installs[0].default_model,
+      defaultMode: installs[0].default_mode,
+    };
+  }, [app.hosts, profile.runtime, profile.host_id]);
 
   const save = async () => {
     setBusy(true);
@@ -182,13 +268,29 @@ export function AgentModal({
         placeholder="Who is this teammate, what do they own, and what will they decline?"
       />
       <FormSelect
-        label="Runtime"
-        value={profile.runtime}
-        onChange={(runtime) => setProfile({ ...profile, runtime })}
-        options={(runtimes.length ? runtimes : ["codex", "claude", "pi"])
-          .concat("custom")
-          .map((runtime) => ({ value: runtime, label: runtime }))}
-        help="Detected on the machines connected to this workspace."
+        label="Runs on"
+        value={chosenPlacement?.value ?? placementValue}
+        onChange={(value) => {
+          const entry = placements.find((candidate) => candidate.value === value);
+          if (!entry) return;
+          setProfile({
+            ...profile,
+            runtime: entry.runtime,
+            location: entry.location,
+            host_id: entry.host_id,
+            // A model belongs to a runtime; carrying it across would set this
+            // agent to a model the new runtime has never heard of.
+            model: entry.runtime === profile.runtime ? profile.model : undefined,
+            permission_mode:
+              entry.runtime === profile.runtime ? profile.permission_mode : undefined,
+          });
+        }}
+        options={placements.map(({ value, label, hint }) => ({ value, label, hint }))}
+        help={
+          placements.length <= 1
+            ? "No machine has reported an agent runtime yet."
+            : undefined
+        }
       />
       {profile.runtime === "custom" && (
         <Field
@@ -203,33 +305,59 @@ export function AgentModal({
           placeholder="my-agent --acp"
         />
       )}
-      <FormSelect
-        label="Runs on"
-        value={profile.location}
-        onChange={(location) =>
-          setProfile({ ...profile, location: location as AgentProfile["location"] })
-        }
-        options={[
-          { value: "auto", label: "Wherever the project is available" },
-          { value: "relay", label: "The relay", hint: "keeps working when laptops close" },
-          { value: "desktop", label: "A specific desktop" },
-        ]}
-      />
-      {profile.location === "desktop" && (
+
+      {models.length > 0 ? (
         <FormSelect
-          label="Machine"
-          value={profile.host_id ?? ""}
-          onChange={(host_id) => setProfile({ ...profile, host_id })}
+          label="Model"
+          value={profile.model ?? ""}
+          onChange={(model) => setProfile({ ...profile, model: model || undefined })}
           options={[
-            { value: "", label: "Pick a machine" },
-            ...app.hosts
-              .filter((host) => host.kind === "desktop")
-              .map((host) => ({
-                value: host.id,
-                label: host.name,
-                hint: host.online ? "online" : "offline",
-              })),
+            {
+              value: "",
+              label: defaultModel
+                ? `Whatever the machine is set to (${defaultModel})`
+                : "Whatever the machine is set to",
+            },
+            ...models.map((model) => ({
+              value: model.id,
+              label: model.name,
+              hint: model.description || undefined,
+            })),
           ]}
+          help="Codex folds reasoning depth into the model, so this is also how hard it thinks."
+        />
+      ) : (
+        <div className="form-row">
+          <label>Model</label>
+          <div className="notice">
+            {profile.runtime === "custom"
+              ? "A custom command brings its own model configuration."
+              : "The list appears once this runtime has opened a session — it is the only thing that knows what it can run. Until then it uses the machine's own configuration."}
+          </div>
+        </div>
+      )}
+
+      {modes.length > 0 && (
+        <FormSelect
+          label="Permission mode"
+          value={profile.permission_mode ?? ""}
+          onChange={(permission_mode) =>
+            setProfile({ ...profile, permission_mode: permission_mode || undefined })
+          }
+          options={[
+            {
+              value: "",
+              label: defaultMode
+                ? `The runtime's default (${defaultMode})`
+                : "The runtime's default",
+            },
+            ...modes.map((mode) => ({
+              value: mode.id,
+              label: mode.name,
+              hint: mode.description || undefined,
+            })),
+          ]}
+          help="How much this agent may do without asking."
         />
       )}
       <FormSelect

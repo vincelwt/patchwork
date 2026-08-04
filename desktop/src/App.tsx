@@ -852,8 +852,8 @@ function WorkspaceMenu({
   ];
 
   return (
-    <div className="workspace-menu-anchor">
       <Menu
+        at={{ x: 74, y: 44 }}
         header={app.workspace?.name ?? "Workspace"}
         onClose={onClose}
         items={[
@@ -874,7 +874,6 @@ function WorkspaceMenu({
           },
         ]}
       />
-    </div>
   );
 }
 

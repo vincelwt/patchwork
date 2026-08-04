@@ -4,6 +4,7 @@ import { hasUnseen, useSeen } from "../lib/unread";
 import { Avatar, useNavigation } from "./common";
 import { Menu, MenuButton } from "./ui";
 import {
+  AutomationIcon,
   ChevronIcon,
   HashIcon,
   InboxIcon,
@@ -47,6 +48,10 @@ export function Sidebar({
 
   const unread = app.inbox.filter((item) => !item.read_at).length;
   const openTasks = app.tasks.filter((task) => task.status !== "done").length;
+  const liveAutomations = app.automations.filter((a) => a.enabled).length;
+  const failingAutomations = app.automations.filter(
+    (a) => a.enabled && a.failure_count > 0,
+  ).length;
 
   // Things actually addressed to you, per conversation. This is the number
   // worth colouring; plain activity gets a dot and nothing more.
@@ -177,6 +182,18 @@ export function Sidebar({
           <TasksIcon />
           <span className="label">Tasks</span>
           {openTasks > 0 && <span className="count">{openTasks}</span>}
+        </button>
+        <button
+          className={`nav-item${isActive({ kind: "automations" }) ? " active" : ""}`}
+          onClick={() => go({ kind: "automations" })}
+        >
+          <AutomationIcon />
+          <span className="label">Automations</span>
+          {failingAutomations > 0 ? (
+            <span className="badge danger">{failingAutomations}</span>
+          ) : (
+            liveAutomations > 0 && <span className="count">{liveAutomations}</span>
+          )}
         </button>
 
         {app.sections.map((section) => {
@@ -319,11 +336,8 @@ function ChannelMenu({
   const { toast } = useNavigation();
 
   return (
-    <div
-      className="floating-menu"
-      style={{ left: Math.min(at.x, window.innerWidth - 240), top: at.y }}
-    >
       <Menu
+        at={at}
         header={`#${channel.name}`}
         onClose={onClose}
         items={[
@@ -361,7 +375,6 @@ function ChannelMenu({
           },
         ]}
       />
-    </div>
   );
 }
 
@@ -454,33 +467,35 @@ function MemberRow({
   fallback?: string;
   onClick: () => void;
 }) {
+  // One line. The second line used to spell out the runtime and the presence
+  // in words, which doubled the height of the whole list to say something the
+  // dot already says — and the runtime is a property of the agent, not news.
   const busy = member?.presence === "working" || member?.presence === "thinking";
   return (
     <button
       className={`nav-item${active ? " active" : ""}${unseen ? " unseen" : ""}`}
       onClick={onClick}
+      title={member ? `${member.display_name} · ${presenceWord(member)}` : fallback}
     >
       <Avatar member={member} size={20} />
-      <span className="lines">
-        <span className="label">{member?.display_name ?? fallback}</span>
-        <span className="sub">{secondLine(member)}</span>
-      </span>
+      <span className="label">{member?.display_name ?? fallback}</span>
       <span className="trailing">
-        {busy && <Spinner size={13} />}
+        {busy && <Spinner size={12} />}
         {waiting > 0 ? (
           <span className="badge">{waiting}</span>
         ) : member?.presence === "waiting" ? (
-          <span className="dot waiting" />
+          <span className="dot waiting" title="waiting for you" />
         ) : unseen ? (
           <span className="dot unread" />
+        ) : !busy && member?.presence === "online" ? (
+          <span className="dot online" title="online" />
         ) : null}
       </span>
     </button>
   );
 }
 
-function secondLine(member?: Member) {
-  if (!member) return "";
+function presenceWord(member: Member) {
   switch (member.presence) {
     case "working":
       return "working";
@@ -489,9 +504,13 @@ function secondLine(member?: Member) {
     case "waiting":
       return "waiting for you";
     case "online":
-      return member.kind === "agent" ? member.agent?.runtime ?? "ready" : "online";
+      return member.kind === "agent"
+        ? `ready · ${member.agent?.runtime ?? ""}`.trim()
+        : "online";
     default:
-      return member.kind === "agent" ? member.agent?.runtime ?? "" : "offline";
+      return member.kind === "agent"
+        ? `offline · ${member.agent?.runtime ?? ""}`.trim()
+        : "offline";
   }
 }
 

@@ -117,6 +117,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
             command,
             version,
             problem,
+            models: Vec::new(),
+            modes: Vec::new(),
+            default_model: None,
+            default_mode: None,
         });
     }
 
@@ -127,6 +131,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
         command: vec![],
         version: None,
         problem: None,
+            models: Vec::new(),
+        modes: Vec::new(),
+        default_model: None,
+        default_mode: None,
     });
 
     out

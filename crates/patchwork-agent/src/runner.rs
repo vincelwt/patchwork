@@ -14,7 +14,7 @@ use patchwork_core::Id;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::acp::{choose_permission, AcpConnection, AgentEvent};
+use crate::acp::{choose_permission, AcpConnection, AgentEvent, NewSession};
 use crate::preview::PreviewManager;
 use crate::{detect, worktree};
 
@@ -248,10 +248,13 @@ async fn execute(
     .map_err(|_| anyhow!("`{}` did not answer the ACP handshake", spec.runtime))??;
     let conn = Arc::new(conn);
 
-    let session_id = match spec.resume_session_id.as_deref() {
+    let opened = match spec.resume_session_id.as_deref() {
         Some(sid) if conn.supports_load_session() => {
             match conn.load_session(sid, &prepared.path).await {
-                Ok(()) => sid.to_string(),
+                Ok(()) => NewSession {
+                    session_id: sid.to_string(),
+                    ..Default::default()
+                },
                 // A stale session id must not strand the task.
                 Err(err) => {
                     tracing::debug!(?err, "could not resume session; starting a fresh one");
@@ -261,6 +264,20 @@ async fn execute(
         }
         _ => open_session(&conn, &prepared.path).await?,
     };
+    let session_id = opened.session_id.clone();
+
+    // Tell the relay what this runtime turned out to offer, so the agent editor
+    // can show a real list of models instead of a text box and a hope.
+    if !opened.models.is_empty() || !opened.modes.is_empty() {
+        emit(HostToRelay::RuntimeOptions {
+            runtime: spec.runtime.clone(),
+            models: opened.models.clone(),
+            modes: opened.modes.clone(),
+            default_model: opened.current_model.clone(),
+            default_mode: opened.current_mode.clone(),
+        });
+    }
+    apply_session_preferences(&conn, &session_id, &spec, &opened, &run_id, &out).await;
     emit(HostToRelay::RunStatus {
         run_id: run_id.clone(),
         status: RunStatus::Running,
@@ -433,12 +450,56 @@ async fn execute(
     Ok(())
 }
 
+/// Apply the agent's configured model and permission mode.
+///
+/// A runtime that cannot switch is not a reason to fail the run: the session is
+/// already open and perfectly usable on its defaults. But it *is* worth saying
+/// out loud, because "I set this agent to a cheap model" silently not happening
+/// is exactly the kind of thing that shows up later on a bill.
+async fn apply_session_preferences(
+    conn: &AcpConnection,
+    session_id: &str,
+    spec: &RunSpec,
+    opened: &NewSession,
+    run_id: &str,
+    out: &Sink,
+) {
+    let note = |text: String| {
+        let _ = out.send(HostToRelay::RunEvent {
+            run_id: run_id.to_string(),
+            kind: RunEventKind::Lifecycle,
+            text,
+            data: None,
+        });
+    };
+
+    if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty()) {
+        if opened.current_model.as_deref() == Some(model) {
+            // Already what was asked for.
+        } else if let Err(err) = conn.set_model(session_id, model).await {
+            note(format!("could not select model `{model}`: {err:#}"));
+        } else {
+            note(format!("model: {model}"));
+        }
+    }
+
+    if let Some(mode) = spec.permission_mode.as_deref().filter(|m| !m.is_empty()) {
+        if opened.current_mode.as_deref() != Some(mode) {
+            if let Err(err) = conn.set_mode(session_id, mode).await {
+                note(format!("could not select mode `{mode}`: {err:#}"));
+            } else {
+                note(format!("mode: {mode}"));
+            }
+        }
+    }
+}
+
 /// Open a session, authenticating only if the runtime insists — and only with
 /// a method that needs no human at a browser, since nobody is watching this
 /// process.
-async fn open_session(conn: &AcpConnection, cwd: &str) -> Result<String> {
+async fn open_session(conn: &AcpConnection, cwd: &str) -> Result<NewSession> {
     match conn.new_session(cwd, json!([])).await {
-        Ok(session_id) => Ok(session_id),
+        Ok(session) => Ok(session),
         Err(first_error) => {
             let Some(method) = non_interactive_auth_method(conn) else {
                 return Err(first_error.context(
@@ -801,6 +862,8 @@ mod tests {
             agent_name: "Developer agent".into(),
             agent_description: "You ship small, reviewable changes.".into(),
             runtime: "codex".into(),
+            model: None,
+            permission_mode: None,
             custom_command: None,
             channel_id: "c1".into(),
             task_id: Some("t1".into()),

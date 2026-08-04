@@ -102,6 +102,16 @@ pub struct AgentProfile {
     pub channel_participation: std::collections::BTreeMap<Id, Participation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_project_id: Option<Id>,
+    /// Which model this agent thinks with, as the runtime names it. For Codex
+    /// the reasoning effort is part of the id — `gpt-5.6-sol[high]` — so this
+    /// one field is both "which model" and "how hard should it think".
+    /// Unset means whatever the machine's own runtime config says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The runtime's permission mode: `read-only`, `agent`, and so on. Named
+    /// by the runtime, not by us, because the meanings are the runtime's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 fn default_runtime() -> String {
@@ -123,6 +133,8 @@ impl Default for AgentProfile {
             default_participation: Participation::default(),
             channel_participation: Default::default(),
             default_project_id: None,
+            model: None,
+            permission_mode: None,
         }
     }
 }
@@ -466,6 +478,28 @@ pub struct RuntimeInstallation {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// What this installation offered the last time a session was opened.
+    /// Learned rather than declared: only the runtime knows what it can run,
+    /// and asking costs a process launch, so we remember the answer.
+    #[serde(default)]
+    pub models: Vec<RuntimeOption>,
+    #[serde(default)]
+    pub modes: Vec<RuntimeOption>,
+    /// What it picks on its own when nothing is configured — usually whatever
+    /// the machine's own config file says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<String>,
+}
+
+/// A model or a permission mode, as the runtime describes itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

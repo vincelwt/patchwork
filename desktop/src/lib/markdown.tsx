@@ -311,8 +311,20 @@ export function renderInline(
   let key = 0;
 
   const push = (node: ReactNode) => out.push(node);
+
+  // A newline inside a paragraph is a line break, not whitespace. Strict
+  // markdown would swallow it, but this is a chat window: people press Return
+  // to start a new line and expect a new line, and an agent laying out a short
+  // list without blank lines between the items means exactly what it looks
+  // like. Done here rather than per-paragraph so a break inside **bold** still
+  // breaks and still stays bold.
   const plain = (value: string) => {
-    if (value) push(<span key={`${keyPrefix}-t${key++}`}>{value}</span>);
+    if (!value) return;
+    const lines = value.split("\n");
+    lines.forEach((line, index) => {
+      if (index > 0) push(<br key={`${keyPrefix}-b${key++}`} />);
+      if (line) push(<span key={`${keyPrefix}-t${key++}`}>{line}</span>);
+    });
   };
 
   INLINE.lastIndex = 0;

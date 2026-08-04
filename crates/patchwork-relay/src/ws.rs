@@ -155,6 +155,32 @@ async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Opti
             ClientMsg::Host { msg } => {
                 if let HostToRelay::Register { registration } = &msg {
                     let host_id = registration.host_id.clone();
+                    let mut capabilities = registration.capabilities.clone();
+                    // Detection can tell us a runtime is installed; only the
+                    // runtime itself can say what it can run, and it only says
+                    // so when a session opens. Re-registering must not throw
+                    // that away — a reconnect would otherwise empty every model
+                    // picker in the workspace until the next run.
+                    if let Ok(Some(previous)) = state.store.host(&host_id) {
+                        for runtime in &mut capabilities.runtimes {
+                            let Some(known) = previous
+                                .capabilities
+                                .runtimes
+                                .iter()
+                                .find(|candidate| candidate.id == runtime.id)
+                            else {
+                                continue;
+                            };
+                            if runtime.models.is_empty() {
+                                runtime.models = known.models.clone();
+                                runtime.default_model = known.default_model.clone();
+                            }
+                            if runtime.modes.is_empty() {
+                                runtime.modes = known.modes.clone();
+                                runtime.default_mode = known.default_mode.clone();
+                            }
+                        }
+                    }
                     let host = Host {
                         id: host_id.clone(),
                         name: registration.name.clone(),
@@ -163,7 +189,7 @@ async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Opti
                         owner_id: Some(member_id.clone()),
                         online: true,
                         last_seen: now_ms(),
-                        capabilities: registration.capabilities.clone(),
+                        capabilities,
                         created_at: now_ms(),
                     };
                     if let Err(err) = state.store.upsert_host(&host) {

@@ -2,8 +2,16 @@
 // states. Every page uses these so the app reads as one thing rather than a
 // dozen hand-rolled headers.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
+import type { ReactNode, RefObject } from "react";
 import { ChevronIcon } from "./icons";
 
 export function Page({
@@ -92,6 +100,63 @@ export interface Option {
   hint?: string;
 }
 
+/// Popovers live at the top of the document, not inside whatever opened them.
+///
+/// An absolutely positioned menu is clipped by the first ancestor that scrolls,
+/// and in this app that is every modal body and every board column. Portalling
+/// to `<body>` and positioning against the trigger's rect is the only version
+/// that cannot be cut off — at the cost of having to follow the trigger when
+/// the page moves, which is what the scroll and resize listeners are for.
+function useAnchored(
+  anchor: RefObject<HTMLElement | null>,
+  open: boolean,
+  align: "left" | "right",
+  minWidth = 0,
+) {
+  const [style, setStyle] = useState<React.CSSProperties>();
+
+  const place = useCallback(() => {
+    const trigger = anchor.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const margin = 8;
+    const width = Math.max(rect.width, minWidth);
+    const spaceBelow = window.innerHeight - rect.bottom - margin;
+    const spaceAbove = rect.top - margin;
+    // Flip up only when below genuinely cannot hold a useful menu.
+    const above = spaceBelow < 180 && spaceAbove > spaceBelow;
+
+    const next: React.CSSProperties = {
+      position: "fixed",
+      minWidth: width,
+      maxHeight: Math.max(140, (above ? spaceAbove : spaceBelow) - 4),
+      zIndex: 80,
+    };
+    if (align === "right") {
+      next.right = Math.max(margin, window.innerWidth - rect.right);
+    } else {
+      next.left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin));
+    }
+    if (above) next.bottom = window.innerHeight - rect.top + 4;
+    else next.top = rect.bottom + 4;
+    setStyle(next);
+  }, [anchor, align, minWidth]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    place();
+    // `true` so a scroll in any ancestor repositions, not just the window.
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [open, place]);
+
+  return style;
+}
+
 /// A dropdown that belongs to this app rather than to the platform: native
 /// selects bring their own chrome, sizing and focus ring, and none of it
 /// matches anything else here.
@@ -116,32 +181,27 @@ export function Dropdown({
   const root = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const current = options.find((option) => option.value === value);
+  const style = useAnchored(root, open, align, 200);
 
   useEffect(() => {
     if (!open) return;
     const onDown = (event: MouseEvent) => {
-      if (!root.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (root.current?.contains(target) || list.current?.contains(target)) return;
+      setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setOpen(false);
+      }
     };
     window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
     return () => {
       window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
     };
-  }, [open]);
-
-  // Flip upward when there is no room below.
-  useLayoutEffect(() => {
-    const menu = list.current;
-    if (!open || !menu) return;
-    const rect = menu.getBoundingClientRect();
-    if (rect.bottom > window.innerHeight - 8) {
-      menu.style.bottom = "calc(100% + 4px)";
-      menu.style.top = "auto";
-    }
   }, [open]);
 
   return (
@@ -153,25 +213,28 @@ export function Dropdown({
         <span className="dropdown-value">{current?.label ?? placeholder}</span>
         <ChevronIcon size={13} />
       </button>
-      {open && (
-        <div className={`dropdown-menu ${align}`} ref={list}>
-          {options.map((option) => (
-            <button
-              key={option.value}
-              className={`dropdown-option${option.value === value ? " selected" : ""}`}
-              onClick={() => {
-                onChange(option.value);
-                setOpen(false);
-              }}
-            >
-              <span className="grow">
-                <span className="name">{option.label}</span>
-                {option.hint && <span className="sub">{option.hint}</span>}
-              </span>
-            </button>
-          ))}
-        </div>
-      )}
+      {open &&
+        style &&
+        createPortal(
+          <div className="dropdown-menu" ref={list} style={style}>
+            {options.map((option) => (
+              <button
+                key={option.value}
+                className={`dropdown-option${option.value === value ? " selected" : ""}`}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                }}
+              >
+                <span className="grow">
+                  <span className="name">{option.label}</span>
+                  {option.hint && <span className="sub">{option.hint}</span>}
+                </span>
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
@@ -211,12 +274,17 @@ export function Menu({
   align = "left",
   header,
   footer,
+  anchor,
+  at,
 }: {
   items: (MenuItem | "separator")[];
   onClose: () => void;
   align?: "left" | "right";
   header?: string;
   footer?: ReactNode;
+  /// The element to hang off. Omit and pass `at` for a context menu.
+  anchor?: RefObject<HTMLElement | null>;
+  at?: { x: number; y: number };
 }) {
   const root = useRef<HTMLDivElement>(null);
   const [active, setActive] = useState(0);
@@ -268,11 +336,22 @@ export function Menu({
     };
   }, [onClose, active, selectable.length]);
 
-  return (
-    <div className={`menu ${align}`} ref={root}>
+  const anchored = useAnchored(anchor ?? empty, !!anchor, align, 216);
+  const style: React.CSSProperties = anchor
+    ? (anchored ?? { position: "fixed", visibility: "hidden" })
+    : {
+        position: "fixed",
+        zIndex: 80,
+        left: Math.min(at?.x ?? 0, window.innerWidth - 240),
+        top: Math.min(at?.y ?? 0, window.innerHeight - 200),
+      };
+
+  return createPortal(
+    <div className="menu" ref={root} style={style}>
       {header && <div className="menu-header">{header}</div>}
-      {rows.map(({ item, index }, at) => {
-        if (item === "separator") return <div className="menu-separator" key={at} />;
+      {rows.map(({ item, index }, position) => {
+        if (item === "separator")
+          return <div className="menu-separator" key={position} />;
         const isActive = index === active && index >= 0;
         return (
           <button
@@ -295,9 +374,13 @@ export function Menu({
         );
       })}
       {footer}
-    </div>
+    </div>,
+    document.body,
   );
 }
+
+/// `useAnchored` must be called unconditionally; a context menu has no anchor.
+const empty: RefObject<HTMLElement | null> = { current: null };
 
 /// Trigger plus menu, for the common case where the button is the anchor.
 export function MenuButton({
@@ -316,9 +399,11 @@ export function MenuButton({
   header?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
   return (
     <div className="menu-anchor">
       <button
+        ref={trigger}
         className={`${className}${open ? " open" : ""}`}
         title={title}
         onClick={(event) => {
@@ -333,6 +418,7 @@ export function MenuButton({
           items={items}
           align={align}
           header={header}
+          anchor={trigger}
           onClose={() => setOpen(false)}
         />
       )}

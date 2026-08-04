@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useApp } from "../lib/store";
-import { dayLabel, timeOfDay } from "../lib/format";
+import { bytes, dayLabel, timeOfDay } from "../lib/format";
+import { useVirtualWindow } from "../lib/virtual";
 import { Avatar, useNavigation } from "./common";
 import {
   AttachIcon,
   CloseIcon,
   EventIcon,
+  MoreIcon,
   PulseIcon,
   ReactIcon,
   SendIcon,
@@ -14,12 +16,15 @@ import {
 } from "./icons";
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
+import { ReactionPicker, ReactionRow } from "./Reactions";
 import type { Attachment, Channel, Id, Message } from "../lib/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const app = useApp();
   const channel = app.channels.find((candidate) => candidate.id === channelId);
   const messages = app.messages[channelId];
+  const [dropped, setDropped] = useState<File[]>([]);
+  const clearDropped = useCallback(() => setDropped([]), []);
 
   useEffect(() => {
     void store.loadChannel(channelId);
@@ -28,11 +33,81 @@ export function ChatView({ channelId }: { channelId: Id }) {
   if (!channel) return <div className="empty">This conversation is gone.</div>;
 
   return (
-    <div className="column">
+    // Anywhere in the conversation is a drop target. Aiming for the text box is
+    // a requirement invented by the implementation, not by the person holding
+    // the file — they are dropping it *into this conversation*.
+    <DropZone onFiles={(files) => setDropped(files)}>
       <Timeline channelId={channelId} messages={messages ?? []} />
-      <Composer channel={channel} />
+      <Composer channel={channel} incoming={dropped} onConsumed={clearDropped} />
+    </DropZone>
+  );
+}
+
+/// A drop target that covers its whole subtree.
+///
+/// Enter and leave are counted rather than toggled: moving over a child fires
+/// `dragleave` on the parent, and a naive boolean flickers the overlay on every
+/// message the cursor crosses.
+export function DropZone({
+  onFiles,
+  children,
+  className = "column",
+}: {
+  onFiles: (files: File[]) => void;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const [over, setOver] = useState(false);
+  const depth = useRef(0);
+  const carrying = (event: React.DragEvent) =>
+    event.dataTransfer.types.includes("Files");
+
+  return (
+    <div
+      className={`${className} dropzone${over ? " over" : ""}`}
+      onDragEnter={(event) => {
+        if (!carrying(event)) return;
+        depth.current += 1;
+        setOver(true);
+      }}
+      onDragOver={(event) => {
+        if (!carrying(event)) return;
+        // Without this the browser refuses the drop and shows a "no" cursor.
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+      }}
+      onDragLeave={() => {
+        depth.current = Math.max(0, depth.current - 1);
+        if (depth.current === 0) setOver(false);
+      }}
+      onDrop={(event) => {
+        depth.current = 0;
+        setOver(false);
+        const files = Array.from(event.dataTransfer.files);
+        if (files.length === 0) return;
+        event.preventDefault();
+        onFiles(files);
+      }}
+    >
+      {children}
+      {over && (
+        <div className="drop-overlay">
+          <span>Drop to attach</span>
+        </div>
+      )}
     </div>
   );
+}
+
+/// Two messages are one block when the same person said them close together.
+/// This is what makes a transcript read as conversation rather than as a stack
+/// of envelopes, and it is the single biggest thing that makes chat feel like
+/// chat.
+function groupsWithPrevious(message: Message, previous?: Message): boolean {
+  if (!previous) return false;
+  if (message.kind !== "text" || previous.kind !== "text") return false;
+  if (previous.author_id !== message.author_id) return false;
+  return message.created_at - previous.created_at < 5 * 60_000;
 }
 
 export function Timeline({
@@ -44,18 +119,31 @@ export function Timeline({
 }) {
   const app = useApp();
   const scroller = useRef<HTMLDivElement>(null);
+  const inner = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
+  const window_ = useVirtualWindow(scroller, messages.length);
 
   // Following the conversation means following the last message as it *grows*,
-  // not only when a new one arrives. A streamed reply adds no rows to the list,
-  // so keying this on the count alone left the agent writing below the fold.
+  // not only when a new one arrives: a streamed reply adds no rows to the list.
   const tail = messages[messages.length - 1];
-  useEffect(() => {
+  const pin = useCallback(() => {
     const element = scroller.current;
-    if (element && atBottom.current) {
-      element.scrollTop = element.scrollHeight;
-    }
-  }, [messages.length, tail?.body.length, channelId]);
+    if (element && atBottom.current) element.scrollTop = element.scrollHeight;
+  }, [scroller]);
+
+  useEffect(pin, [messages.length, tail?.body.length, channelId, pin]);
+
+  // Images decode, code blocks reflow and measured rows settle *after* the
+  // first paint, so a single scrollTop assignment lands short of the bottom.
+  // Watching the content box is the only version that ends up in the right
+  // place regardless of what is still arriving.
+  useEffect(() => {
+    const element = inner.current;
+    if (!element) return;
+    const observer = new ResizeObserver(pin);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [pin]);
 
   const onScroll = () => {
     const element = scroller.current;
@@ -75,43 +163,62 @@ export function Timeline({
     }
   };
 
-  let lastDay = "";
-  let previous: Message | undefined;
+  // Day markers and grouping are decided for the whole list, not for the
+  // visible slice — otherwise scrolling would change where the dividers fall.
+  const rows = useMemo(
+    () =>
+      messages.map((message, index) => {
+        const previous = messages[index - 1];
+        const day = dayLabel(message.created_at);
+        const showDay = !previous || day !== dayLabel(previous.created_at);
+        return {
+          message,
+          day: showDay ? day : undefined,
+          grouped: !showDay && groupsWithPrevious(message, previous),
+        };
+      }),
+    [messages],
+  );
 
   return (
     <div className="timeline" ref={scroller} onScroll={onScroll}>
-      <div className="timeline-inner">
+      <div className="timeline-inner" ref={inner}>
         {messages.length === 0 && (
           <div className="empty">
             Nothing here yet. Say something, or bring an agent in with @.
           </div>
         )}
-        {messages.map((message) => {
-          const day = dayLabel(message.created_at);
-          const showDay = day !== lastDay;
-          lastDay = day;
-          const grouped =
-            !showDay &&
-            message.kind === "text" &&
-            previous?.kind === "text" &&
-            previous.author_id === message.author_id &&
-            message.created_at - previous.created_at < 5 * 60_000;
-          previous = message;
+        {window_.padTop > 0 && <div style={{ height: window_.padTop }} />}
+        {rows.slice(window_.start, window_.end).map((row, offset) => {
+          const index = window_.start + offset;
           return (
-            <div key={message.id}>
-              {showDay && <div className="day-marker">{day}</div>}
-              <MessageRow message={message} grouped={grouped} />
+            <div key={row.message.id} ref={(el) => window_.measure(index, el)}>
+              {row.day && (
+                <div className="day-marker">
+                  <span>{row.day}</span>
+                </div>
+              )}
+              <MessageRow message={row.message} grouped={row.grouped} />
             </div>
           );
         })}
+        {window_.padBottom > 0 && <div style={{ height: window_.padBottom }} />}
       </div>
     </div>
   );
 }
 
-const QUICK_REACTIONS = ["👍", "🎉", "👀"];
+/// Handles that resolve to a real member, so `@2x` in a sentence about screen
+/// resolution does not light up as a mention. Shared by every renderer.
+export function useHandles(): Set<string> {
+  const app = useApp();
+  return useMemo(
+    () => new Set(app.members.map((member) => member.handle.toLowerCase())),
+    [app.members],
+  );
+}
 
-export function MessageRow({
+export const MessageRow = memo(function MessageRow({
   message,
   grouped,
 }: {
@@ -122,12 +229,11 @@ export function MessageRow({
   const api = useApi();
   const { inspect } = useNavigation();
   const author = app.members.find((member) => member.id === message.author_id);
-  const [showReactions, setShowReactions] = useState(false);
+  const [picker, setPicker] = useState<{ x: number; y: number } | null>(null);
   const handles = useHandles();
 
   // A reply the relay is still rewriting: its run is going, and nothing newer
-  // from that run has arrived. It gets a caret, so half a sentence reads as
-  // "still typing" rather than as a truncated answer.
+  // from that run has arrived.
   const run = message.run_id ? app.runs[message.run_id] : undefined;
   const siblings = app.messages[message.channel_id];
   const newestOfRun = useMemo(() => {
@@ -161,16 +267,36 @@ export function MessageRow({
   // A run card carries its own attribution, so repeating the author above it
   // just adds weight to something that is meant to be glanceable.
   const selfAttributed = message.kind === "card" && message.card?.type === "run";
+  const showHead = !grouped && !selfAttributed;
+
+  const react = (emoji: string) => {
+    void api.react(message.id, emoji);
+    setPicker(null);
+  };
 
   return (
-    <div className={`message message-${message.kind}${grouped ? " grouped" : ""}`}>
-      <div>{!grouped && !selfAttributed && <Avatar member={author} size={26} />}</div>
-      <div style={{ minWidth: 0 }}>
-        {!grouped && !selfAttributed && (
+    <div
+      className={`message message-${message.kind}${grouped ? " grouped" : ""}${
+        selfAttributed ? " bare" : ""
+      }`}
+    >
+      <div className="message-gutter">
+        {showHead ? (
+          <Avatar member={author} size={30} />
+        ) : (
+          !selfAttributed && (
+            <span className="hover-time">{timeOfDay(message.created_at)}</span>
+          )
+        )}
+      </div>
+
+      <div className="message-main">
+        {showHead && (
           <div className="message-head">
             <span className="message-author">{author?.display_name ?? "Unknown"}</span>
             {author?.kind === "agent" && <span className="message-badge">agent</span>}
             <span className="message-time">{timeOfDay(message.created_at)}</span>
+            {message.edited_at && <span className="message-time">edited</span>}
           </div>
         )}
         {message.body && (
@@ -181,92 +307,77 @@ export function MessageRow({
         )}
         {message.card && <Card card={message.card} />}
         {message.attachments.length > 0 && (
-          <div className="card-row">
+          <div className="attachments">
             {message.attachments.map((attachment: Attachment) => (
-              <AttachmentRow
-                key={attachment.id}
-                fileName={attachment.file_name}
-                size={attachment.size}
-                url={`${api.baseUrl.replace(/\/$/, "")}${attachment.url}`}
-              />
+              <Attached key={attachment.id} attachment={attachment} />
             ))}
           </div>
         )}
-        {message.reactions.length > 0 && (
-          <div className="reactions">
-            {message.reactions.map((reaction) => (
-              <button
-                key={reaction.emoji}
-                className={`reaction${reaction.member_ids.includes(app.me?.id ?? "") ? " mine" : ""}`}
-                onClick={() => api.react(message.id, reaction.emoji)}
-              >
-                {reaction.emoji} {reaction.member_ids.length}
-              </button>
-            ))}
-          </div>
-        )}
+        <ReactionRow message={message} onAdd={setPicker} />
         {message.reply_count > 0 && (
           <button
             className="thread-link"
             onClick={() => inspect({ kind: "thread", messageId: message.id })}
           >
+            <ThreadIcon size={14} />
             {message.reply_count} {message.reply_count === 1 ? "reply" : "replies"}
           </button>
         )}
       </div>
 
       <div className="message-actions">
-        {showReactions ? (
-          <>
-            {QUICK_REACTIONS.map((emoji) => (
-              <button
-                key={emoji}
-                className="icon-button small"
-                onClick={() => {
-                  void api.react(message.id, emoji);
-                  setShowReactions(false);
-                }}
-              >
-                {emoji}
-              </button>
-            ))}
-            <button
-              className="icon-button small"
-              onClick={() => setShowReactions(false)}
-            >
-              <CloseIcon size={13} />
-            </button>
-          </>
-        ) : (
-          <>
-            <button
-              className="icon-button small"
-              title="React"
-              onClick={() => setShowReactions(true)}
-            >
-              <ReactIcon size={15} />
-            </button>
-            <button
-              className="icon-button small"
-              title="Reply in thread"
-              onClick={() => inspect({ kind: "thread", messageId: message.id })}
-            >
-              <ThreadIcon size={15} />
-            </button>
-          </>
-        )}
+        <button
+          className="icon-button small"
+          title="Add a reaction"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            setPicker({ x: rect.left, y: rect.top });
+          }}
+        >
+          <ReactIcon size={16} />
+        </button>
+        <button
+          className="icon-button small"
+          title="Reply in thread"
+          onClick={() => inspect({ kind: "thread", messageId: message.id })}
+        >
+          <ThreadIcon size={16} />
+        </button>
+        <button
+          className="icon-button small"
+          title="Copy text"
+          onClick={() => void navigator.clipboard.writeText(message.body)}
+        >
+          <MoreIcon size={16} />
+        </button>
       </div>
+
+      {picker && (
+        <ReactionPicker at={picker} onPick={react} onClose={() => setPicker(null)} />
+      )}
     </div>
   );
-}
+});
 
-/// Handles that resolve to a real member, so `@2x` in a sentence about screen
-/// resolution does not light up as a mention. Shared by every renderer.
-export function useHandles(): Set<string> {
-  const app = useApp();
-  return useMemo(
-    () => new Set(app.members.map((member) => member.handle.toLowerCase())),
-    [app.members],
+/// An image someone dropped in should be visible without a download step.
+function Attached({ attachment }: { attachment: Attachment }) {
+  const api = useApi();
+  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
+  const [broken, setBroken] = useState(false);
+
+  if (attachment.mime.startsWith("image/") && !broken) {
+    return (
+      <a href={url} target="_blank" rel="noreferrer noopener" className="image-attachment">
+        <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
+      </a>
+    );
+  }
+  return (
+    <AttachmentRow
+      fileName={attachment.file_name}
+      size={attachment.size}
+      url={url}
+    />
   );
 }
 
@@ -328,17 +439,24 @@ export function Composer({
   channel,
   parentId,
   placeholder,
+  incoming,
+  onConsumed,
 }: {
   channel: Channel;
   parentId?: Id;
   placeholder?: string;
+  /// Files dropped anywhere in the conversation, not just on the text box.
+  incoming?: File[];
+  onConsumed?: () => void;
 }) {
   const api = useApi();
   const app = useApp();
   const [text, setText] = useState("");
   const [pending, setPending] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(0);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
   const box = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -347,6 +465,37 @@ export function Composer({
     element.style.height = "auto";
     element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
   }, [text]);
+
+  const attach = useCallback(
+    async (files: FileList | File[]) => {
+      const list = Array.from(files);
+      if (list.length === 0) return;
+      setUploading((n) => n + list.length);
+      try {
+        for (const file of list) {
+          try {
+            const uploaded = await api.upload(file);
+            setPending((current) => [...current, uploaded]);
+          } finally {
+            setUploading((n) => n - 1);
+          }
+        }
+      } catch {
+        setUploading(0);
+      }
+    },
+    [api],
+  );
+
+  // Keyed on the array's identity, not its contents: a re-render for any other
+  // reason must not upload the same drop a second time.
+  const handled = useRef<File[] | null>(null);
+  useEffect(() => {
+    if (!incoming || incoming.length === 0 || handled.current === incoming) return;
+    handled.current = incoming;
+    void attach(incoming);
+    onConsumed?.();
+  }, [incoming, attach, onConsumed]);
 
   const send = async () => {
     if (!text.trim() && pending.length === 0) return;
@@ -367,11 +516,13 @@ export function Composer({
   const candidates =
     mentionQuery === null
       ? []
-      : app.members.filter(
-          (member) =>
-            member.handle.startsWith(mentionQuery.toLowerCase()) &&
-            member.id !== app.me?.id,
-        );
+      : app.members
+          .filter(
+            (member) =>
+              member.handle.startsWith(mentionQuery.toLowerCase()) &&
+              member.id !== app.me?.id,
+          )
+          .slice(0, 6);
 
   const applyMention = (handle: string) => {
     setText((current) => current.replace(/@[\w-]*$/, `@${handle} `));
@@ -383,6 +534,7 @@ export function Composer({
     setText(value);
     const match = value.match(/@([\w-]*)$/);
     setMentionQuery(match ? match[1] : null);
+    setMentionIndex(0);
     store.typing(channel.id);
   };
 
@@ -400,10 +552,11 @@ export function Composer({
 
       {candidates.length > 0 && (
         <div className="mention-menu">
-          {candidates.slice(0, 6).map((member) => (
+          {candidates.map((member, index) => (
             <button
               key={member.id}
-              className="row"
+              className={`row${index === mentionIndex ? " active" : ""}`}
+              onMouseEnter={() => setMentionIndex(index)}
               onClick={() => applyMention(member.handle)}
             >
               <Avatar member={member} size={22} />
@@ -420,21 +573,23 @@ export function Composer({
       )}
 
       <div className="composer">
-        {pending.length > 0 && (
-          <div className="composer-row">
+        {(pending.length > 0 || uploading > 0) && (
+          <div className="composer-attachments">
             {pending.map((attachment) => (
-              <span className="attachment-chip" key={attachment.id}>
-                {attachment.file_name}
-                <button
-                  className="icon-button small"
-                  onClick={() =>
-                    setPending(pending.filter((item) => item.id !== attachment.id))
-                  }
-                >
-                  <CloseIcon size={12} />
-                </button>
-              </span>
+              <PendingAttachment
+                key={attachment.id}
+                attachment={attachment}
+                onRemove={() =>
+                  setPending(pending.filter((item) => item.id !== attachment.id))
+                }
+              />
             ))}
+            {uploading > 0 && (
+              <span className="attachment-chip">
+                <Spinner size={13} />
+                Uploading {uploading}
+              </span>
+            )}
           </div>
         )}
         <textarea
@@ -444,31 +599,55 @@ export function Composer({
           value={text}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
+            if (candidates.length > 0) {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setMentionIndex((index) => Math.min(index + 1, candidates.length - 1));
+                return;
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setMentionIndex((index) => Math.max(index - 1, 0));
+                return;
+              }
+              if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+                event.preventDefault();
+                applyMention(candidates[mentionIndex].handle);
+                return;
+              }
+              if (event.key === "Escape") {
+                setMentionQuery(null);
+                return;
+              }
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
             }
           }}
-          onPaste={async (event) => {
-            const file = event.clipboardData.files[0];
-            if (!file) return;
+          onPaste={(event) => {
+            const files = Array.from(event.clipboardData.files);
+            if (files.length === 0) return;
             event.preventDefault();
-            setPending([...pending, await api.upload(file)]);
+            void attach(files);
           }}
         />
         <div className="composer-row">
-          <label className="icon-button" title="Attach a file">
+          <label className="icon-button" title="Attach files">
             <AttachIcon size={17} />
             <input
               type="file"
+              multiple
               hidden
-              onChange={async (event) => {
-                const file = event.target.files?.[0];
-                if (file) setPending([...pending, await api.upload(file)]);
+              onChange={(event) => {
+                if (event.target.files) void attach(event.target.files);
                 event.target.value = "";
               }}
             />
           </label>
+          <span className="composer-hint">
+            {text.includes("\n") ? "⇧↵ for a new line" : ""}
+          </span>
           <span className="spacer" />
           <button
             className="send-button"
@@ -480,6 +659,37 @@ export function Composer({
           </button>
         </div>
       </div>
+
     </div>
+  );
+}
+
+/// An image gets a thumbnail before it is sent, because "did I attach the right
+/// screenshot" is a question you want answered before pressing Return.
+function PendingAttachment({
+  attachment,
+  onRemove,
+}: {
+  attachment: Attachment;
+  onRemove: () => void;
+}) {
+  const api = useApi();
+  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
+  const isImage = attachment.mime.startsWith("image/");
+
+  return (
+    <span className={`pending-attachment${isImage ? " image" : ""}`}>
+      {isImage ? (
+        <img src={url} alt={attachment.file_name} />
+      ) : (
+        <span className="file">
+          <span className="name">{attachment.file_name}</span>
+          <span className="size">{bytes(attachment.size)}</span>
+        </span>
+      )}
+      <button className="remove" onClick={onRemove} title="Remove">
+        <CloseIcon size={12} />
+      </button>
+    </span>
   );
 }

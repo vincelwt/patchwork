@@ -21,6 +21,11 @@ export interface AgentProfile {
   custom_command?: string[];
   location: ExecutionLocation;
   host_id?: Id;
+  /// Named as the runtime names it. For Codex the reasoning effort is part of
+  /// the id — `gpt-5.6-sol[high]` — so this is both "which model" and "how hard
+  /// should it think".
+  model?: string;
+  permission_mode?: string;
   dm_enabled: boolean;
   default_participation: Participation;
   channel_participation: Record<Id, Participation>;
@@ -162,6 +167,12 @@ export interface Project {
   created_at: Millis;
 }
 
+export interface RuntimeOption {
+  id: string;
+  name: string;
+  description: string;
+}
+
 export interface RuntimeInstallation {
   id: string;
   label: string;
@@ -169,6 +180,12 @@ export interface RuntimeInstallation {
   command: string[];
   version?: string;
   problem?: string;
+  /// Learned the first time a session was opened on this machine — the runtime
+  /// is the only thing that knows what it can run.
+  models: RuntimeOption[];
+  modes: RuntimeOption[];
+  default_model?: string;
+  default_mode?: string;
 }
 
 export interface HostCapabilities {

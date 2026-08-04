@@ -41,6 +41,13 @@ pub struct RunSpec {
     pub agent_description: String,
     /// `codex`, `claude`, `pi`, `custom`.
     pub runtime: String,
+    /// The model this agent should think with, named as the runtime names it.
+    /// Unset leaves the machine's own runtime configuration alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The runtime's permission mode, e.g. `read-only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_command: Option<Vec<String>>,
     pub channel_id: Id,
@@ -149,6 +156,20 @@ pub enum HostToRelay {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
+    },
+    /// What a runtime on this machine offered when a session was opened.
+    /// Sent as it is learned rather than at startup, because asking costs a
+    /// process launch and the answer only matters once somebody runs something.
+    RuntimeOptions {
+        runtime: String,
+        #[serde(default)]
+        models: Vec<RuntimeOption>,
+        #[serde(default)]
+        modes: Vec<RuntimeOption>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_mode: Option<String>,
     },
     /// The agent's reply so far, while it is still being written.
     ///
