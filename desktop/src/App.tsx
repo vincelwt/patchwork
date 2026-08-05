@@ -454,10 +454,17 @@ function useShortcuts(actions: {
       },
       {
         id: "new-task",
-        keys: "⌘N",
+        keys: "C",
         label: "New task",
         group: "Create",
-        match: combo("n"),
+        // A bare letter, the way Linear does it, plus ⌘N for the muscle memory
+        // every other app has trained. Both mean the same thing.
+        match: (event) =>
+          combo("n")(event) ||
+          (!event.metaKey &&
+            !event.ctrlKey &&
+            !event.altKey &&
+            event.key.toLowerCase() === "c"),
         run: () => create("task"),
       },
       {

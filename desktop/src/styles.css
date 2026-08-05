@@ -385,7 +385,20 @@ body.resizing {
   -webkit-app-region: drag;
   flex: none;
 }
-.topbar > * {
+/* The window has no title bar, so its top edge is the handle. Only the things
+   you can actually press opt out — making every child no-drag left a 52px
+   strip that looked draggable and was not. */
+.topbar button,
+.topbar input,
+.topbar select,
+.topbar textarea,
+.topbar .dropdown,
+.topbar .menu-anchor,
+.topbar .segmented,
+.topbar .facepile,
+.topbar .chip,
+.topbar .editable-topic,
+.topbar .topic-input {
   -webkit-app-region: no-drag;
 }
 .topbar .title {
@@ -450,6 +463,10 @@ body.resizing {
   padding: 14px 14px 8px;
   font-weight: 570;
   flex: none;
+  -webkit-app-region: drag;
+}
+.inspector-head button {
+  -webkit-app-region: no-drag;
 }
 .inspector-body {
   overflow-y: auto;
@@ -978,22 +995,53 @@ body.resizing {
   mask-image: linear-gradient(to bottom, transparent, #000 14px);
 }
 
-.working-pill {
+/* "Dispatcher is thinking…", the way a chat app says it: one quiet line under
+   the transcript, not a badge in the middle of the window. */
+.typing-line {
   display: flex;
-  justify-content: center;
-  margin-bottom: 10px;
-  min-height: 24px;
-}
-.working-pill > span {
-  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  background: var(--surface);
-  border: 1px solid var(--line);
+  gap: 7px;
+  padding: 0 4px 6px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  min-height: 18px;
+}
+.typing-line .who {
   color: var(--text-muted);
-  border-radius: 999px;
-  padding: 2px 13px;
-  font-size: 13px;
+}
+.typing-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: typing-bounce 1.1s infinite ease-in-out;
+}
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes typing-bounce {
+  0%, 60%, 100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .typing-dots i {
+    animation: none;
+  }
 }
 
 .composer {
@@ -2919,7 +2967,7 @@ details[open] > summary::before {
 }
 
 /* The pill is the single live indicator, so it carries the live controls. */
-.working-pill .what {
+.typing-line .what {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

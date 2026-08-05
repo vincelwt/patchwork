@@ -68,6 +68,18 @@ impl Store {
         conn.execute_batch(include_str!("schema.sql"))
             .context("failed to apply schema")?;
 
+        // `CREATE TABLE IF NOT EXISTS` does nothing for a table that already
+        // exists, so a column added to the schema after a database was made
+        // has to be asked for by name. SQLite has no "add if missing": the
+        // error for one that is already there is the success case.
+        //
+        // ponytail: a list, not a migration framework. It is only ever appended
+        // to, and dropping a column is left to SQLite ignoring one nobody
+        // writes to any more.
+        for statement in ["ALTER TABLE tasks ADD COLUMN due_at INTEGER"] {
+            let _ = conn.execute(statement, []);
+        }
+
         Ok(Self { pool })
     }
 

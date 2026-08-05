@@ -25,6 +25,11 @@ pub struct AppState {
     pub question_waiters: RwLock<HashMap<Id, Vec<oneshot::Sender<Question>>>>,
     /// Replies still being written, by run: the message the next delta rewrites.
     pub streaming_messages: RwLock<HashMap<Id, Id>>,
+    /// Where each live run is talking: the thread it was asked in, or `None`
+    /// for the channel itself. A follow-up can move it, which is why this is
+    /// not read off the run's trigger. Runs do not outlive the process, so
+    /// neither does this.
+    pub run_threads: RwLock<HashMap<Id, Option<Id>>>,
     pub files_dir: PathBuf,
     /// The URL desktops and agents should call back on.
     pub public_url: String,
@@ -44,6 +49,7 @@ impl AppState {
             presence: RwLock::new(HashMap::new()),
             question_waiters: RwLock::new(HashMap::new()),
             streaming_messages: RwLock::new(HashMap::new()),
+            run_threads: RwLock::new(HashMap::new()),
             files_dir,
             public_url,
             relay_host_id,

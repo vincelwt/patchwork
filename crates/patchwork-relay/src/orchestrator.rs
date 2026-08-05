@@ -140,6 +140,35 @@ async fn follow_through(
     Ok(())
 }
 
+/// Where an agent's answer belongs: in the thread it was asked in.
+///
+/// A run started by a message in a thread replies in that thread, and one
+/// started by a message at the top of a channel replies at the top. The
+/// triggering message already says which, so nothing has to be carried on the
+/// run itself.
+pub async fn reply_parent(state: &Shared, run: &Run) -> Option<Id> {
+    if let Some(known) = state.run_threads.read().await.get(&run.id) {
+        return known.clone();
+    }
+    let message_id = match &run.trigger {
+        RunTrigger::Mention { message_id }
+        | RunTrigger::DirectMessage { message_id }
+        | RunTrigger::Ambient { message_id } => message_id,
+        _ => return None,
+    };
+    state.store.message(message_id).ok().flatten()?.parent_id
+}
+
+/// Follow the conversation: whatever message just spoke to this run decides
+/// where its next answer goes.
+async fn talk_where(state: &Shared, run_id: &str, message: &Message) {
+    state
+        .run_threads
+        .write()
+        .await
+        .insert(run_id.to_string(), message.parent_id.clone());
+}
+
 /// A reply that is still being written: posted on the first delta so the reader
 /// watches it arrive, then rewritten in place by every delta after it.
 async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> {
@@ -177,7 +206,7 @@ async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> 
         kind: MessageKind::Text,
         body: body.to_string(),
         card: None,
-        parent_id: None,
+        parent_id: reply_parent(state, &run).await,
         reply_count: 0,
         last_reply_at: 0,
         run_id: Some(run.id.clone()),
@@ -501,6 +530,7 @@ async fn trigger_agents(
         // If the agent is already working here, this is a follow-up, not a
         // second agent on the same front.
         if let Some(active) = state.store.agent_active_run(&agent.id, &channel.id)? {
+            talk_where(state, &active.id, message).await;
             let prompt = format!(
                 "{} just said:\n\n{}",
                 display_name_of(members, &message.author_id),
@@ -728,6 +758,9 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
                 run_id: run.id.clone(),
             }),
             run_id: Some(run.id.clone()),
+            // Where the work was asked for. A card about a thread's question
+            // does not belong at the top of the channel.
+            parent_id: reply_parent(state, &run).await,
             ..Default::default()
         },
         PostOptions {
@@ -1085,6 +1118,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 SendMessage {
                     body,
                     kind: Some(kind),
+                    parent_id: reply_parent(state, &run).await,
                     ..Default::default()
                 },
                 PostOptions {
@@ -1220,6 +1254,7 @@ async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
             finish_posted_message(state, &message).await?;
         }
     }
+    state.run_threads.write().await.remove(&run.id);
 
     if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
         let mut automation_run = automation_run;

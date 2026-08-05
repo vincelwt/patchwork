@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp, useAppSelector } from "../lib/store";
 import {
   dateInputToMillis,
@@ -15,6 +15,7 @@ import {
   Dropdown,
   EditableText,
   FormSelect,
+  KeyHint,
   MenuButton,
   Section,
   Toggle,
@@ -460,8 +461,13 @@ export function NewTaskModal({
   const [due, setDue] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [justCreated, setJustCreated] = useState("");
+  const outcomeField = useRef<HTMLTextAreaElement>(null);
 
-  const create = async () => {
+  /// Linear's habit: most tasks arrive in threes. `another` keeps the dialog
+  /// open with the owner, project and date you just chose, so the next one is
+  /// a sentence and one chord away.
+  const create = async (another = false) => {
     setBusy(true);
     setError("");
     try {
@@ -473,6 +479,13 @@ export function NewTaskModal({
         due_at: dateInputToMillis(due) || undefined,
         start: start && !!owner,
       });
+      if (another) {
+        setOutcome("");
+        setBusy(false);
+        setJustCreated(task.key);
+        outcomeField.current?.focus();
+        return;
+      }
       onClose();
       go({ kind: "task", id: task.id });
     } catch (err) {
@@ -484,6 +497,22 @@ export function NewTaskModal({
   const ownerIsAgent =
     app.members.find((member) => member.id === owner)?.kind === "agent";
 
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (
+        event.key === "Enter" &&
+        (event.metaKey || event.ctrlKey) &&
+        event.shiftKey
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (outcome.trim() && !busy) void create(true);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  });
+
   return (
     <Modal
       title="New task"
@@ -491,15 +520,28 @@ export function NewTaskModal({
       onClose={onClose}
       actions={
         <>
+          {justCreated && (
+            <span className="composer-hint grow">{justCreated} created</span>
+          )}
           <button className="button quiet" onClick={onClose}>
             Cancel
           </button>
           <button
+            className="button quiet"
+            disabled={!outcome.trim() || busy}
+            title="Create this one and keep going"
+            onClick={() => void create(true)}
+          >
+            Create another
+            <KeyHint keys="⌘⇧↵" />
+          </button>
+          <button
             className="button primary"
             disabled={!outcome.trim() || busy}
-            onClick={create}
+            onClick={() => void create()}
           >
             {ownerIsAgent && start ? "Create and start" : "Create"}
+            <KeyHint keys="⌘↵" />
           </button>
         </>
       }
@@ -510,6 +552,7 @@ export function NewTaskModal({
         onChange={setOutcome}
         textarea
         autoFocus
+        inputRef={outcomeField}
         placeholder="What has to be true when this is done?"
       />
       <FormSelect

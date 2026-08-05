@@ -501,21 +501,26 @@ function WorkingPill({ channelId }: { channelId: Id }) {
       agent: members.find((member) => member.id === run.agent_id),
     }));
 
+  // Slack's line, not a badge: who, what they are doing, and three dots.
   let content: React.ReactNode = null;
   if (typing.length > 0) {
     content = (
-      <span>
-        {typing.join(", ")} {typing.length === 1 ? "is" : "are"} typing…
-      </span>
+      <>
+        <span className="who">{typing.join(", ")}</span>
+        <span className="what">
+          {typing.length === 1 ? "is typing" : "are typing"}
+        </span>
+        <TypingDots />
+      </>
     );
   } else if (working.length === 1) {
     const { run, agent } = working[0];
     content = (
-      <span>
-        <Spinner size={13} />
-        <span className="what">
-          {agent?.display_name} · {run.headline || run.status}
-        </span>
+      <>
+        <Avatar member={agent} size={16} />
+        <span className="who">{agent?.display_name}</span>
+        <span className="what">{run.headline || busyWord(run.status)}</span>
+        <TypingDots />
         {/* The only place these live now, so they are always reachable while
             something is actually happening. */}
         <button
@@ -527,20 +532,33 @@ function WorkingPill({ channelId }: { channelId: Id }) {
         <button className="pill-action" onClick={() => api.cancelRun(run.id)}>
           Stop
         </button>
-      </span>
+      </>
     );
   } else if (working.length > 1) {
     content = (
-      <span>
-        <Spinner size={13} />
-        <span className="what">{working.length} agents working</span>
-      </span>
+      <>
+        <span className="who">{working.length} agents</span>
+        <span className="what">are working</span>
+        <TypingDots />
+      </>
     );
   }
 
-  // ponytail: no content, no box — the fixed 24px height only reserved a blank
-  // strip above the composer.
-  return content ? <div className="working-pill">{content}</div> : null;
+  return content ? <div className="typing-line">{content}</div> : null;
+}
+
+function TypingDots() {
+  return (
+    <span className="typing-dots" aria-hidden>
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
+function busyWord(status: string) {
+  return status === "waiting" ? "is waiting for you" : "is working";
 }
 
 export function Composer({

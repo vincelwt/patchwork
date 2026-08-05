@@ -922,6 +922,8 @@ async fn ask_question(
                 question_id: question.id.clone(),
             }),
             run_id: Some(run.id.clone()),
+            // Asked where the work was asked for.
+            parent_id: orchestrator::reply_parent(&state, &run).await,
             ..Default::default()
         },
         PostOptions {

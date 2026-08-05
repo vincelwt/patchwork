@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { avatarStyle, initials } from "../lib/format";
 import type { Id, Member, Presence } from "../lib/types";
@@ -116,9 +116,27 @@ export function Modal({
   onClose: () => void;
   actions?: ReactNode;
 }) {
+  const root = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        onClose();
+        return;
+      }
+      // ⌘↵ does what the dialog is for, from anywhere inside it — including
+      // the textarea, where ↵ is a new line. Every dialog here ends in one
+      // primary button, so pressing it is the whole implementation: no dialog
+      // has to remember to opt in, and none can disagree about what ⌘↵ means.
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        const primary = root.current?.querySelector<HTMLButtonElement>(
+          ".modal-actions .button.primary",
+        );
+        if (primary && !primary.disabled) {
+          event.preventDefault();
+          primary.click();
+        }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -126,7 +144,11 @@ export function Modal({
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <div className="modal" onMouseDown={(event) => event.stopPropagation()}>
+      <div
+        className="modal"
+        ref={root}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <div className="modal-head">
           <h2>{title}</h2>
           {subtitle && <p className="sub">{subtitle}</p>}
@@ -158,6 +180,7 @@ export function Field({
   placeholder,
   textarea,
   autoFocus,
+  inputRef,
   type = "text",
 }: {
   label: string;
@@ -166,6 +189,7 @@ export function Field({
   placeholder?: string;
   textarea?: boolean;
   autoFocus?: boolean;
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   type?: string;
 }) {
   return (
@@ -175,6 +199,7 @@ export function Field({
         <textarea
           className="field"
           {...proseText}
+          ref={inputRef}
           value={value}
           placeholder={placeholder}
           autoFocus={autoFocus}
