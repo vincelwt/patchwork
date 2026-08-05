@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useApi, useApp, store } from "../lib/store";
+import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
 import { Chip, useNavigation } from "./common";
@@ -33,11 +33,15 @@ export function Card({ card }: { card: MessageCard }) {
 }
 
 function TaskCardInline({ taskId }: { taskId: string }) {
-  const app = useApp();
+  const { task, owner } = useAppSelector((data) => {
+    const task = data.tasks.find((candidate) => candidate.id === taskId);
+    return {
+      task,
+      owner: data.members.find((member) => member.id === task?.owner_id),
+    };
+  });
   const { go } = useNavigation();
-  const task = app.tasks.find((candidate) => candidate.id === taskId);
   if (!task) return null;
-  const owner = app.members.find((member) => member.id === task.owner_id);
 
   return (
     <button className="card" onClick={() => go({ kind: "task", id: task.id })}>
@@ -56,16 +60,24 @@ function TaskCardInline({ taskId }: { taskId: string }) {
 }
 
 function RunCardInline({ runId }: { runId: string }) {
-  const app = useApp();
+  const { run, agent } = useAppSelector((data) => {
+    const run = data.runs[runId];
+    return {
+      run,
+      agent: data.members.find((member) => member.id === run?.agent_id),
+    };
+  });
   const { inspect } = useNavigation();
-  const run = app.runs[runId];
 
+  // Keyed on whether we have it, not on the runs map: that map gets a new
+  // identity on every run event in the workspace, and re-running this on each
+  // one meant re-deciding the same "no, we already have it" repeatedly.
+  const missing = !run;
   useEffect(() => {
-    if (!app.runs[runId]) void store.loadRun(runId);
-  }, [runId, app.runs]);
+    if (missing) void store.loadRun(runId);
+  }, [runId, missing]);
 
   if (!run) return null;
-  const agent = app.members.find((member) => member.id === run.agent_id);
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
 
   // A run is not an announcement. Nearly every one of them — starting, working,
@@ -132,9 +144,8 @@ function RunCardInline({ runId }: { runId: string }) {
 /// The clarification flow: an agent's question is answered in place, and the
 /// answer goes straight back to the waiting run.
 function QuestionCard({ questionId }: { questionId: string }) {
-  const app = useApp();
+  const question = useAppSelector((data) => data.questions[questionId]);
   const api = useApi();
-  const question = app.questions[questionId];
   const [selection, setSelection] = useState<Record<string, string[]>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [sending, setSending] = useState(false);
@@ -289,9 +300,8 @@ function ArtifactCard({
 }
 
 function PreviewCard({ previewId }: { previewId: string }) {
-  const app = useApp();
+  const preview = useAppSelector((data) => data.previews[previewId]);
   const api = useApi();
-  const preview = app.previews[previewId];
 
   useEffect(() => {
     void store.loadPreview(previewId);
@@ -334,9 +344,9 @@ function PreviewCard({ previewId }: { previewId: string }) {
 }
 
 function PullRequestCard({ url, taskId }: { url: string; taskId?: string }) {
-  const app = useApp();
-  const task = app.tasks.find((candidate) => candidate.id === taskId);
-  const pr = task?.pr_state;
+  const pr = useAppSelector(
+    (data) => data.tasks.find((candidate) => candidate.id === taskId)?.pr_state,
+  );
 
   return (
     <div className="card">

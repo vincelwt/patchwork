@@ -31,12 +31,22 @@ export interface DesktopInfo {
   capabilities: HostCapabilities;
 }
 
+/// What the first frame needs. Deliberately without `capabilities`: working out
+/// which agent runtimes exist costs a subprocess each plus a round trip to
+/// GitHub, and the window should not be waiting on any of it.
+export type DesktopBoot = Omit<DesktopInfo, "capabilities">;
+
 const BROWSER_KEY = "patchwork.settings";
 
 export const inTauri = "__TAURI_INTERNALS__" in window;
 
+// Started at module load rather than at the first call: the very first thing
+// the app does is invoke a command, and fetching this chunk only then puts a
+// module round trip in front of it.
+const core = inTauri ? import("@tauri-apps/api/core") : undefined;
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
+  const { invoke } = await (core ?? import("@tauri-apps/api/core"));
   return invoke<T>(command, args);
 }
 
@@ -52,6 +62,16 @@ function browserSettings(): DesktopSettings {
     host_name: parsed.host_name ?? "",
     project_paths: parsed.project_paths ?? {},
     awake: parsed.awake ?? "never",
+  };
+}
+
+/// Settings and host status only, for the paths that cannot afford to wait.
+export async function desktopBoot(): Promise<DesktopBoot> {
+  if (inTauri) return invoke<DesktopBoot>("desktop_boot");
+  return {
+    settings: browserSettings(),
+    host: { connected: false, host_id: "", host_name: "" },
+    platform: "browser",
   };
 }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useApi, useApp } from "../lib/store";
+import { useApi, useApp, useAppSelector } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
 import { readTask, situationTone, stepIndex, TASK_STEPS } from "../lib/task";
 import type { NextAction, TaskState } from "../lib/task";
@@ -802,13 +802,27 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
 
 function TaskDetailPanel({ taskId }: { taskId: string }) {
   const api = useApi();
-  const app = useApp();
   const { inspect } = useNavigation();
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof api.task>>>();
 
+  // What actually makes this panel stale: this task moving, or one of its runs
+  // changing state. Watching the whole tasks and runs maps meant refetching
+  // the detail over HTTP on every run event in the workspace — several times a
+  // second while any agent is working, most of it for other people's tasks.
+  const members = useAppSelector((data) => data.members);
+  const signature = useAppSelector((data) => {
+    const task = data.tasks.find((candidate) => candidate.id === taskId);
+    const runs = Object.values(data.runs)
+      .filter((run) => run.task_id === taskId)
+      .map((run) => `${run.id}:${run.status}`)
+      .sort()
+      .join(",");
+    return `${task?.status ?? ""}|${task?.updated_at ?? ""}|${runs}`;
+  });
+
   useEffect(() => {
     void api.task(taskId).then(setDetail);
-  }, [taskId, app.tasks, app.runs, api]);
+  }, [taskId, signature, api]);
 
   if (!detail) return <div className="inspector-body">Loading…</div>;
 
@@ -828,7 +842,7 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
           <div className="card-sub">Nothing has run yet.</div>
         )}
         {detail.runs.map((run) => {
-          const agent = app.members.find((member) => member.id === run.agent_id);
+          const agent = members.find((member) => member.id === run.agent_id);
           return (
             <button
               key={run.id}

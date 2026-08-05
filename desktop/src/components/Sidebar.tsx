@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useApi, useApp } from "../lib/store";
+import { useApi, useApp, useAppSelector } from "../lib/store";
 import { hasUnseen, useSeen } from "../lib/unread";
 import { Avatar, useNavigation } from "./common";
 import { Menu, MenuButton } from "./ui";
@@ -39,7 +39,19 @@ export function Sidebar({
   onResize: (width: number) => void;
   onCreate: (what: Creatable, sectionId?: Id) => void;
 }) {
-  const app = useApp();
+  // Deliberately not `useApp`: the sidebar is on screen the whole time, so a
+  // subscription to everything means it redraws for every message body an
+  // agent streams into a conversation you are not even looking at.
+  const app = useAppSelector((data) => ({
+    workspace: data.workspace,
+    me: data.me,
+    members: data.members,
+    sections: data.sections,
+    channels: data.channels,
+    tasks: data.tasks,
+    inbox: data.inbox,
+    automations: data.automations,
+  }));
   const api = useApi();
   const seen = useSeen();
   const { view, go } = useNavigation();
@@ -64,10 +76,10 @@ export function Sidebar({
     return counts;
   }, [app.inbox]);
 
-  const channels = app.channels.filter((channel) => channel.kind === "channel");
   const grouped = useMemo(() => {
     const bySection = new Map<string, Channel[]>();
-    for (const channel of channels) {
+    for (const channel of app.channels) {
+      if (channel.kind !== "channel") continue;
       const key = channel.section_id ?? "";
       bySection.set(key, [...(bySection.get(key) ?? []), channel]);
     }
@@ -75,11 +87,15 @@ export function Sidebar({
       list.sort((a, b) => a.position - b.position || a.name.localeCompare(b.name));
     }
     return bySection;
-  }, [channels]);
+  }, [app.channels]);
 
-  const dms = app.channels
-    .filter((channel) => channel.kind === "dm")
-    .sort((a, b) => b.last_message_at - a.last_message_at);
+  const dms = useMemo(
+    () =>
+      app.channels
+        .filter((channel) => channel.kind === "dm")
+        .sort((a, b) => b.last_message_at - a.last_message_at),
+    [app.channels],
+  );
 
   const isActive = (candidate: NavView) =>
     view.kind === candidate.kind &&

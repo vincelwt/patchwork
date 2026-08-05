@@ -1,24 +1,54 @@
 import type { Member, Millis, RunStatus, TaskStatus } from "./types";
 
+// Locale formatting is the expensive part of drawing a transcript: every
+// message carries a time, and a channel's day markers are recomputed whenever
+// a reply streams in. `Intl` formatters are costly to construct and cheap to
+// reuse, and the answer for a given day never changes, so both are kept.
+const TIME_FORMAT = new Intl.DateTimeFormat([], {
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+const DATE_FORMAT = new Intl.DateTimeFormat([], {
+  weekday: "long",
+  month: "short",
+  day: "numeric",
+});
+
 export function timeOfDay(at: Millis) {
-  return new Date(at).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  return TIME_FORMAT.format(at);
 }
 
-export function dayLabel(at: Millis) {
+/// Which calendar day a moment falls on, in local time, as a number that can
+/// be compared and used as a cache key.
+function dayNumber(at: Millis): number {
   const date = new Date(at);
-  const today = new Date();
-  const yesterday = new Date(today.getTime() - 86_400_000);
-  const same = (a: Date, b: Date) => a.toDateString() === b.toDateString();
-  if (same(date, today)) return "Today";
-  if (same(date, yesterday)) return "Yesterday";
-  return date.toLocaleDateString([], {
-    weekday: "long",
-    month: "short",
-    day: "numeric",
-  });
+  return (
+    date.getFullYear() * 10_000 + (date.getMonth() + 1) * 100 + date.getDate()
+  );
+}
+
+const dayLabels = new Map<number, string>();
+let labelsAnchoredTo = -1;
+
+export function dayLabel(at: Millis) {
+  const day = dayNumber(at);
+  const today = dayNumber(Date.now());
+  // "Today" stops being true at midnight, so the cache is only good for as
+  // long as today is.
+  if (today !== labelsAnchoredTo) {
+    dayLabels.clear();
+    labelsAnchoredTo = today;
+  }
+  const known = dayLabels.get(day);
+  if (known !== undefined) return known;
+
+  let label: string;
+  if (day === today) label = "Today";
+  else if (day === dayNumber(Date.now() - 86_400_000)) label = "Yesterday";
+  else label = DATE_FORMAT.format(at);
+  dayLabels.set(day, label);
+  return label;
 }
 
 export function relative(at?: Millis) {

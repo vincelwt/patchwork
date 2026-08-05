@@ -24,8 +24,11 @@ export interface Window {
   end: number;
   padTop: number;
   padBottom: number;
-  /// Attach to each rendered row. Passing null on unmount is fine and ignored.
-  measure: (index: number, element: HTMLElement | null) => void;
+  /// A `ref` for the row at `index`, stable for as long as that index exists.
+  /// Stability is the point: an inline `el => measure(i, el)` is a new function
+  /// on every render, so React detaches and reattaches every visible row, and
+  /// each reattachment used to throw away a ResizeObserver and build another.
+  rowRef: (index: number) => (element: HTMLElement | null) => void;
   /// True when the window is actually narrower than the list.
   active: boolean;
 }
@@ -37,7 +40,8 @@ export function useVirtualWindow(
 ): Window {
   const heights = useRef<number[]>([]);
   const observers = useRef(new Map<number, ResizeObserver>());
-  const [, bump] = useState(0);
+  const refs = useRef(new Map<number, (element: HTMLElement | null) => void>());
+  const [measured, bump] = useState(0);
   const [range, setRange] = useState({ start: 0, end: count });
   const active = count > VIRTUALIZE_ABOVE;
 
@@ -50,9 +54,10 @@ export function useVirtualWindow(
       out[index + 1] = out[index] + (heights.current[index] ?? estimate);
     }
     return out;
-    // `range` is in the deps because a scroll is the moment the sums are read,
-    // and new measurements arrive with it.
-  }, [count, estimate, range]);
+    // Rebuilt when a row is measured, not when the visible range moves: the
+    // sums do not depend on where you are scrolled, and rebuilding them on
+    // every scroll event is a full pass over the conversation per frame.
+  }, [count, estimate, measured]);
 
   const recompute = useCallback(() => {
     const element = scroller.current;
@@ -115,6 +120,17 @@ export function useVirtualWindow(
     [],
   );
 
+  const rowRef = useCallback(
+    (index: number) => {
+      const known = refs.current.get(index);
+      if (known) return known;
+      const callback = (element: HTMLElement | null) => measure(index, element);
+      refs.current.set(index, callback);
+      return callback;
+    },
+    [measure],
+  );
+
   useEffect(() => {
     const current = observers.current;
     return () => {
@@ -129,7 +145,7 @@ export function useVirtualWindow(
   }, [count]);
 
   if (!active) {
-    return { start: 0, end: count, padTop: 0, padBottom: 0, measure, active: false };
+    return { start: 0, end: count, padTop: 0, padBottom: 0, rowRef, active: false };
   }
 
   const start = Math.min(range.start, count);
@@ -139,7 +155,7 @@ export function useVirtualWindow(
     end,
     padTop: offsets[start] ?? 0,
     padBottom: (offsets[count] ?? 0) - (offsets[end] ?? 0),
-    measure,
+    rowRef,
     active: true,
   };
 }

@@ -26,11 +26,33 @@ struct DesktopInfo {
     capabilities: patchwork_core::models::HostCapabilities,
 }
 
+/// Everything the app needs before it can draw anything, and nothing else.
+///
+/// Kept apart from [`desktop_info`] because the window opens behind this call:
+/// asking the machine what agents it has installed means a subprocess per
+/// runtime and a round trip to GitHub, and none of that decides what the first
+/// frame looks like.
+#[derive(Debug, Serialize)]
+struct DesktopBoot {
+    settings: Settings,
+    host: HostStatus,
+    platform: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct JoinInput {
     relay_url: String,
     invite_code: String,
     display_name: String,
+}
+
+#[tauri::command]
+async fn desktop_boot(state: tauri::State<'_, AppState>) -> Result<DesktopBoot, String> {
+    Ok(DesktopBoot {
+        settings: settings::load(),
+        host: state.local_host.status().await,
+        platform: patchwork_agent::detect::platform(),
+    })
 }
 
 #[tauri::command]
@@ -136,6 +158,10 @@ async fn set_awake_policy(
 
 #[tauri::command]
 async fn reconnect_host(state: tauri::State<'_, AppState>) -> Result<HostStatus, String> {
+    // An explicit "try again" is also the moment to look at this machine
+    // afresh, since the usual reason for pressing it is having just installed
+    // something that was missing.
+    patchwork_agent::refresh_capabilities().await;
     let settings = settings::load();
     state.local_host.restart(settings).await;
     Ok(state.local_host.status().await)
@@ -178,9 +204,15 @@ pub fn run() {
                 awake.set_policy(settings.awake);
                 local_host.restart(settings).await;
             });
+            // Warm the capability answer off the critical path, so that host
+            // registration and the settings page both find it already there.
+            tauri::async_runtime::spawn(async {
+                patchwork_agent::detect_capabilities().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_boot,
             desktop_info,
             join_workspace,
             sign_out,

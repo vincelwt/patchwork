@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { store, useApi, useApp } from "../lib/store";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { store, useApi, useApp, useAppSelector } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
 import { Avatar, Chip, useNavigation } from "./common";
 import { Empty } from "./ui";
@@ -19,7 +19,7 @@ import {
   ThreadIcon,
   WarningIcon,
 } from "./icons";
-import { Composer, DropZone, MessageRow } from "./Chat";
+import { Composer, DropZone, MessageRow, useHandles } from "./Chat";
 import type { Id, RunEvent } from "../lib/types";
 
 /// An optional side panel — threads, run detail, task detail. The layout never
@@ -52,15 +52,23 @@ export function Inspector() {
 
 function ThreadPanel({ messageId }: { messageId: Id }) {
   const app = useApp();
+  const handles = useHandles();
   const [dropped, setDropped] = useState<File[]>([]);
   const clearDropped = useCallback(() => setDropped([]), []);
   const replies = app.threads[messageId];
-  const root = Object.values(app.messages)
-    .flat()
-    .find((message) => message.id === messageId);
+  // Flattening every loaded channel to find one message is a lot of work to
+  // repeat on each event; the answer only changes when the messages do.
+  const root = useMemo(() => {
+    for (const list of Object.values(app.messages)) {
+      const hit = list.find((message) => message.id === messageId);
+      if (hit) return hit;
+    }
+    return undefined;
+  }, [app.messages, messageId]);
   const channel = app.channels.find(
     (candidate) => candidate.id === root?.channel_id,
   );
+  const authorOf = (id: Id) => app.members.find((member) => member.id === id);
 
   useEffect(() => {
     void store.loadThread(messageId);
@@ -71,10 +79,21 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
   return (
     <DropZone className="thread-pane" onFiles={setDropped}>
       <div className="inspector-body">
-        <MessageRow message={root} grouped={false} />
+        <MessageRow
+          message={root}
+          grouped={false}
+          author={authorOf(root.author_id)}
+          handles={handles}
+        />
         <div style={{ height: 10 }} />
         {(replies ?? []).map((reply) => (
-          <MessageRow key={reply.id} message={reply} grouped={false} />
+          <MessageRow
+            key={reply.id}
+            message={reply}
+            grouped={false}
+            author={authorOf(reply.author_id)}
+            handles={handles}
+          />
         ))}
       </div>
       <Composer
@@ -96,10 +115,22 @@ export function RunPanel({
   /// Already inside somebody else's scroller — don't open a second one.
   embedded?: boolean;
 }) {
-  const app = useApp();
+  // A live run appends to this log several times a second, so the panel reads
+  // only what it draws — otherwise every unrelated message in the workspace
+  // redraws the whole activity list.
+  const { run, events, agent, host, question } = useAppSelector((data) => {
+    const run = data.runs[runId];
+    return {
+      run,
+      events: data.runEvents[runId],
+      agent: data.members.find((member) => member.id === run?.agent_id),
+      host: data.hosts.find((candidate) => candidate.id === run?.host_id),
+      question: Object.values(data.questions).find(
+        (candidate) => candidate.run_id === runId && candidate.status === "open",
+      ),
+    };
+  });
   const api = useApi();
-  const run = app.runs[runId];
-  const events = app.runEvents[runId] ?? [];
   const log = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
 
@@ -112,15 +143,10 @@ export function RunPanel({
   useEffect(() => {
     const element = log.current;
     if (element && pinned.current) element.scrollTop = element.scrollHeight;
-  }, [events.length]);
+  }, [events?.length]);
 
   if (!run) return <Empty title="Loading the run" />;
-  const agent = app.members.find((member) => member.id === run.agent_id);
-  const host = app.hosts.find((candidate) => candidate.id === run.host_id);
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
-  const question = Object.values(app.questions).find(
-    (candidate) => candidate.run_id === run.id && candidate.status === "open",
-  );
 
   return (
     <div
@@ -177,8 +203,8 @@ export function RunPanel({
         <span className="section-title">Activity</span>
         {active && <Spinner size={12} />}
       </div>
-      {events.length === 0 && <div className="card-sub">Nothing recorded yet.</div>}
-      {events.map((event) => (
+      {!events?.length && <div className="card-sub">Nothing recorded yet.</div>}
+      {events?.map((event) => (
         <RunEventRow key={event.id} event={event} />
       ))}
     </div>
@@ -218,7 +244,9 @@ function eventIcon(kind: RunEvent["kind"]) {
 /// `**init**.py` is not bold.
 const PROSE: RunEvent["kind"][] = ["message", "plan", "thought", "lifecycle"];
 
-function RunEventRow({ event }: { event: RunEvent }) {
+/// A log line never changes once written, so appending the next one should not
+/// re-render — or re-parse the markdown of — every line above it.
+const RunEventRow = memo(function RunEventRow({ event }: { event: RunEvent }) {
   return (
     <div className={`run-event ${event.kind}`}>
       {eventIcon(event.kind)}
@@ -231,14 +259,18 @@ function RunEventRow({ event }: { event: RunEvent }) {
       </div>
     </div>
   );
-}
+});
 
 function TaskPanel({ taskId }: { taskId: Id }) {
-  const app = useApp();
+  const { task, owner } = useAppSelector((data) => {
+    const task = data.tasks.find((candidate) => candidate.id === taskId);
+    return {
+      task,
+      owner: data.members.find((member) => member.id === task?.owner_id),
+    };
+  });
   const { go } = useNavigation();
-  const task = app.tasks.find((candidate) => candidate.id === taskId);
   if (!task) return <Empty title="That task is gone" />;
-  const owner = app.members.find((member) => member.id === task.owner_id);
 
   return (
     <div className="inspector-body">

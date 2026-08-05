@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
 import {
+  desktopBoot,
   desktopInfo,
   openExternal,
   pickDirectory,
@@ -44,6 +45,16 @@ import type {
   RuntimeInstallation,
   RuntimeOption,
 } from "../lib/types";
+
+/// A string that changes when the machine list meaningfully changes — a host
+/// appearing, disappearing, or going up or down — and stays put through the
+/// `last_seen` bump every heartbeat brings.
+function useHostSignature(hosts: Host[]): string {
+  return useMemo(
+    () => hosts.map((host) => `${host.id}:${host.online ? 1 : 0}`).join(","),
+    [hosts],
+  );
+}
 
 // --- agents ----------------------------------------------------------------
 
@@ -511,9 +522,13 @@ export function ProjectsPage() {
   const [creating, setCreating] = useState(false);
   const [info, setInfo] = useState<DesktopInfo>();
 
+  // Which machines exist and whether they are up — not every heartbeat. The
+  // hosts array gets a new identity on each one, and re-asking this machine
+  // about itself forty times an hour is work nobody sees.
+  const hostSignature = useHostSignature(app.hosts);
   useEffect(() => {
     void desktopInfo().then(setInfo);
-  }, [app.hosts]);
+  }, [hostSignature]);
 
   return (
     <Page
@@ -648,7 +663,7 @@ export function ProjectModal({
   const [error, setError] = useState("");
 
   useEffect(() => {
-    void desktopInfo().then((info) => {
+    void desktopBoot().then((info) => {
       if (project) setLocalPath(info.settings.project_paths[project.id] ?? "");
     });
   }, [project]);
@@ -670,7 +685,7 @@ export function ProjectModal({
         : await api.createProject(body);
 
       if (localPath) {
-        const info = await desktopInfo();
+        const info = await desktopBoot();
         await setProjectPaths({
           ...info.settings.project_paths,
           [saved.id]: localPath,
@@ -1602,12 +1617,13 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
 
+  const hostSignature = useHostSignature(app.hosts);
   useEffect(() => {
     void desktopInfo().then((loaded) => {
       setInfo(loaded);
       setAwake(loaded.settings.awake ?? "never");
     });
-  }, [app.hosts]);
+  }, [hostSignature]);
 
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so

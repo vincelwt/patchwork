@@ -11,5 +11,5 @@ pub mod preview;
 pub mod runner;
 pub mod worktree;
 
-pub use detect::{detect_capabilities, detect_runtimes, runtime_command};
+pub use detect::{detect_capabilities, detect_runtimes, refresh_capabilities, runtime_command};
 pub use runner::{RunHandle, Runner, RunnerConfig, Sink};

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { store, useApi, useApp } from "./lib/store";
-import { desktopInfo, joinWorkspace } from "./lib/desktop";
+import { store, useApi, useApp, useAppSelector } from "./lib/store";
+import { desktopBoot, joinWorkspace } from "./lib/desktop";
 import type { DesktopSettings } from "./lib/desktop";
 import { markSeen } from "./lib/unread";
 import { chord, combo, isTyping } from "./lib/shortcuts";
@@ -56,12 +56,15 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    void desktopInfo().then((info) => {
-      setSettings(info.settings);
-      setLoading(false);
+    void desktopBoot().then((info) => {
+      // Connect first: the relay round trip is the long pole, and starting it
+      // before React has re-rendered means the shell and its contents arrive
+      // together rather than one after the other.
       if (info.settings.relay_url && info.settings.token) {
         void store.connect(info.settings.relay_url, info.settings.token);
       }
+      setSettings(info.settings);
+      setLoading(false);
     });
   }, []);
 
@@ -143,7 +146,14 @@ function Onboarding({ onJoined }: { onJoined: (settings: DesktopSettings) => voi
 }
 
 function Workspace({ onSignOut }: { onSignOut: () => void }) {
-  const app = useApp();
+  // The root of the tree, so what it subscribes to decides how often
+  // everything below it redraws. Only the connection state belongs here;
+  // anything derived from workspace content is read where it is used.
+  const app = useAppSelector((data) => ({
+    status: data.status,
+    error: data.error,
+    live: data.live,
+  }));
   const [view, setView] = useState<View>({ kind: "inbox" });
   const [inspector, setInspector] = useState<InspectorState>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -177,36 +187,6 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     setCreating({ what, sectionId });
   }, []);
 
-  // Opening a conversation is what "I have seen this" means. Keeping the mark
-  // in an effect on the channel *and* its newest message means a channel you
-  // are sitting in never accumulates a phantom unread badge.
-  const activeChannel = view.kind === "channel" ? view.id : undefined;
-  const activeTaskChannel =
-    view.kind === "task"
-      ? app.tasks.find((task) => task.id === view.id)?.discussion_channel_id
-      : undefined;
-  const watching = activeChannel ?? activeTaskChannel;
-  const watchingLastMessage = watching
-    ? app.channels.find((channel) => channel.id === watching)?.last_message_at
-    : undefined;
-
-  useEffect(() => {
-    if (watching) markSeen(watching, Math.max(Date.now(), watchingLastMessage ?? 0));
-  }, [watching, watchingLastMessage]);
-
-  // Reading the mention where it was written is reading it. Leaving the Inbox
-  // item unread would put a badge on the very conversation you are looking at.
-  const inboxHere = app.inbox.filter(
-    (item) => !item.read_at && item.channel_id === watching,
-  );
-  useEffect(() => {
-    if (!watching || inboxHere.length === 0) return;
-    const timer = window.setTimeout(() => {
-      for (const item of inboxHere) void store.api?.markRead(item.id);
-    }, 700);
-    return () => window.clearTimeout(timer);
-  }, [watching, inboxHere]);
-
   const shortcuts = useShortcuts({
     go,
     create,
@@ -214,6 +194,14 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     openHelp: () => setHelpOpen(true),
     closeInspector: () => setInspector(null),
   });
+
+  // A fresh object here would re-render every consumer of the context — which
+  // is most of the app — on any state change in this component, including the
+  // ones that only move a menu.
+  const navigation = useMemo(
+    () => ({ view, go, inspector, inspect: setInspector, toast: showToast }),
+    [view, go, inspector, showToast],
+  );
 
   if (app.status === "loading") {
     return (
@@ -243,9 +231,8 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }
 
   return (
-    <NavigationContext.Provider
-      value={{ view, go, inspector, inspect: setInspector, toast: showToast }}
-    >
+    <NavigationContext.Provider value={navigation}>
+      <MarkAsSeen view={view} />
       <div
         className="shell"
         style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
@@ -302,6 +289,56 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
       {toast && <div className="toast">{toast}</div>}
     </NavigationContext.Provider>
   );
+}
+
+/// Opening a conversation is what "I have seen this" means.
+///
+/// Its own component, drawing nothing, because these effects need to watch the
+/// message list and the inbox — and having the root of the tree watch those
+/// would redraw the entire app every time either moved.
+function MarkAsSeen({ view }: { view: View }) {
+  const { watching, watchingLastMessage, inboxHere } = useAppSelector((data) => {
+    const watching =
+      view.kind === "channel"
+        ? view.id
+        : view.kind === "task"
+          ? data.tasks.find((task) => task.id === view.id)?.discussion_channel_id
+          : undefined;
+    return {
+      watching,
+      watchingLastMessage: watching
+        ? data.channels.find((channel) => channel.id === watching)?.last_message_at
+        : undefined,
+      // A count, not the items: the array is rebuilt on every event and only
+      // its emptiness decides whether there is anything to do.
+      inboxHere: watching
+        ? data.inbox.filter((item) => !item.read_at && item.channel_id === watching)
+            .length
+        : 0,
+    };
+  });
+
+  // Keeping the mark on the channel *and* its newest message means a channel
+  // you are sitting in never accumulates a phantom unread badge.
+  useEffect(() => {
+    if (watching) markSeen(watching, Math.max(Date.now(), watchingLastMessage ?? 0));
+  }, [watching, watchingLastMessage]);
+
+  // Reading the mention where it was written is reading it. Leaving the Inbox
+  // item unread would put a badge on the very conversation you are looking at.
+  useEffect(() => {
+    if (!watching || inboxHere === 0) return;
+    const timer = window.setTimeout(() => {
+      for (const item of store.getSnapshot().inbox) {
+        if (!item.read_at && item.channel_id === watching) {
+          void store.api?.markRead(item.id);
+        }
+      }
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [watching, inboxHere]);
+
+  return null;
 }
 
 // --- keyboard ---------------------------------------------------------------

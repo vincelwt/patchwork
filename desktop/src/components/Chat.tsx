@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { store, useApi, useApp } from "../lib/store";
+import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
 import { Avatar, useNavigation } from "./common";
@@ -17,12 +17,13 @@ import {
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
-import type { Attachment, Channel, Id, Message } from "../lib/types";
+import type { Attachment, Channel, Id, Member, Message } from "../lib/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
-  const app = useApp();
-  const channel = app.channels.find((candidate) => candidate.id === channelId);
-  const messages = app.messages[channelId];
+  const { channel, messages } = useAppSelector((data) => ({
+    channel: data.channels.find((candidate) => candidate.id === channelId),
+    messages: data.messages[channelId],
+  }));
   const [dropped, setDropped] = useState<File[]>([]);
   const clearDropped = useCallback(() => setDropped([]), []);
 
@@ -99,6 +100,9 @@ export function DropZone({
   );
 }
 
+/// How long a typing signal stands for before the person counts as stopped.
+const TYPING_TTL = 4000;
+
 /// Two messages are one block when the same person said them close together.
 /// This is what makes a transcript read as conversation rather than as a stack
 /// of envelopes, and it is the single biggest thing that makes chat feel like
@@ -117,7 +121,12 @@ export function Timeline({
   channelId: Id;
   messages: Message[];
 }) {
-  const app = useApp();
+  const { members, runs, hasMore } = useAppSelector((data) => ({
+    members: data.members,
+    runs: data.runs,
+    hasMore: !!data.hasMore[channelId],
+  }));
+  const handles = useHandles();
   const scroller = useRef<HTMLDivElement>(null);
   const inner = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
@@ -150,7 +159,7 @@ export function Timeline({
     if (!element) return;
     atBottom.current =
       element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-    if (element.scrollTop < 60 && app.hasMore[channelId]) {
+    if (element.scrollTop < 60 && hasMore) {
       const previousHeight = element.scrollHeight;
       void store.loadOlder(channelId).then(() => {
         requestAnimationFrame(() => {
@@ -165,20 +174,37 @@ export function Timeline({
 
   // Day markers and grouping are decided for the whole list, not for the
   // visible slice — otherwise scrolling would change where the dividers fall.
-  const rows = useMemo(
-    () =>
-      messages.map((message, index) => {
-        const previous = messages[index - 1];
-        const day = dayLabel(message.created_at);
-        const showDay = !previous || day !== dayLabel(previous.created_at);
-        return {
-          message,
-          day: showDay ? day : undefined,
-          grouped: !showDay && groupsWithPrevious(message, previous),
-        };
-      }),
-    [messages],
-  );
+  const rows = useMemo(() => {
+    let previousDay: string | undefined;
+    return messages.map((message, index) => {
+      const previous = messages[index - 1];
+      const day = dayLabel(message.created_at);
+      const showDay = day !== previousDay;
+      previousDay = day;
+      return {
+        message,
+        day: showDay ? day : undefined,
+        grouped: !showDay && groupsWithPrevious(message, previous),
+      };
+    });
+  }, [messages]);
+
+  // Which message a run is currently writing into. Working this out inside
+  // each row meant every visible row scanning the whole channel on every
+  // event — quadratic, in the one place that updates most often.
+  const lastOfRun = useMemo(() => {
+    const map = new Map<Id, Id>();
+    for (const message of messages) {
+      if (message.run_id) map.set(message.run_id, message.id);
+    }
+    return map;
+  }, [messages]);
+
+  const authorOf = useMemo(() => {
+    const map = new Map<Id, Member>();
+    for (const member of members) map.set(member.id, member);
+    return map;
+  }, [members]);
 
   return (
     <div className="timeline" ref={scroller} onScroll={onScroll}>
@@ -191,14 +217,27 @@ export function Timeline({
         {window_.padTop > 0 && <div style={{ height: window_.padTop }} />}
         {rows.slice(window_.start, window_.end).map((row, offset) => {
           const index = window_.start + offset;
+          const message = row.message;
+          const run = message.run_id ? runs[message.run_id] : undefined;
           return (
-            <div key={row.message.id} ref={(el) => window_.measure(index, el)}>
+            <div key={message.id} ref={window_.rowRef(index)}>
               {row.day && (
                 <div className="day-marker">
                   <span>{row.day}</span>
                 </div>
               )}
-              <MessageRow message={row.message} grouped={row.grouped} />
+              <MessageRow
+                message={message}
+                grouped={row.grouped}
+                author={authorOf.get(message.author_id)}
+                handles={handles}
+                streaming={
+                  message.kind === "text" &&
+                  !!run &&
+                  lastOfRun.get(run.id) === message.id &&
+                  (run.status === "running" || run.status === "dispatched")
+                }
+              />
             </div>
           );
         })}
@@ -211,42 +250,36 @@ export function Timeline({
 /// Handles that resolve to a real member, so `@2x` in a sentence about screen
 /// resolution does not light up as a mention. Shared by every renderer.
 export function useHandles(): Set<string> {
-  const app = useApp();
+  const members = useAppSelector((data) => data.members);
   return useMemo(
-    () => new Set(app.members.map((member) => member.handle.toLowerCase())),
-    [app.members],
+    () => new Set(members.map((member) => member.handle.toLowerCase())),
+    [members],
   );
 }
 
+/// Everything a row draws, handed to it rather than looked up by it.
+///
+/// A row that reads the store re-renders whenever *anything* in the workspace
+/// changes, which during a streamed reply is several times a second for every
+/// message on screen. Taking plain props instead is what lets `memo` do its
+/// job: one token arriving re-renders one row.
 export const MessageRow = memo(function MessageRow({
   message,
   grouped,
+  author,
+  handles,
+  streaming = false,
 }: {
   message: Message;
   grouped: boolean;
+  author?: Member;
+  handles?: Set<string>;
+  /// The reply the relay is still writing into.
+  streaming?: boolean;
 }) {
-  const app = useApp();
   const api = useApi();
   const { inspect } = useNavigation();
-  const author = app.members.find((member) => member.id === message.author_id);
   const [picker, setPicker] = useState<{ x: number; y: number } | null>(null);
-  const handles = useHandles();
-
-  // A reply the relay is still rewriting: its run is going, and nothing newer
-  // from that run has arrived.
-  const run = message.run_id ? app.runs[message.run_id] : undefined;
-  const siblings = app.messages[message.channel_id];
-  const newestOfRun = useMemo(() => {
-    if (!run || !siblings) return false;
-    for (let index = siblings.length - 1; index >= 0; index -= 1) {
-      if (siblings[index].run_id === run.id) return siblings[index].id === message.id;
-    }
-    return false;
-  }, [siblings, run, message.id]);
-  const streaming =
-    newestOfRun &&
-    message.kind === "text" &&
-    ["running", "dispatched"].includes(run?.status ?? "");
 
   // A status note or a workspace event is not somebody talking. It reads as a
   // quiet line, the way tool activity does in a good agent transcript.
@@ -384,22 +417,35 @@ function Attached({ attachment }: { attachment: Attachment }) {
 /// One line above the composer for "somebody or something is busy" — typing
 /// humans first, then the agents actually working in this conversation.
 function WorkingPill({ channelId }: { channelId: Id }) {
-  const app = useApp();
+  const { typingHere, me, members, runs } = useAppSelector((data) => ({
+    typingHere: data.typing[channelId],
+    me: data.me,
+    members: data.members,
+    runs: data.runs,
+  }));
   const api = useApi();
   const { inspect } = useNavigation();
   const [, force] = useState(0);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => force((n) => n + 1), 1500);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const typing = Object.entries(app.typing[channelId] ?? {})
-    .filter(([id, at]) => id !== app.me?.id && Date.now() - at < 4000)
-    .map(([id]) => app.members.find((member) => member.id === id)?.display_name)
+  const typing = Object.entries(typingHere ?? {})
+    .filter(([id, at]) => id !== me?.id && Date.now() - at < TYPING_TTL)
+    .map(([id]) => members.find((member) => member.id === id)?.display_name)
     .filter(Boolean) as string[];
 
-  const working = Object.values(app.runs)
+  // "X is typing" is the one thing here that goes stale on its own, so it is
+  // the only thing worth a timer — and only until the last entry has expired.
+  // The previous version ticked once a second and a half for the life of the
+  // app, waking React in every open conversation to redraw nothing.
+  const newestTyping = Math.max(0, ...Object.values(typingHere ?? {}));
+  useEffect(() => {
+    if (typing.length === 0) return;
+    const remaining = newestTyping + TYPING_TTL - Date.now();
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(() => force((n) => n + 1), remaining + 50);
+    return () => window.clearTimeout(timer);
+  }, [typing.length, newestTyping]);
+
+  const working = Object.values(runs)
     .filter(
       (run) =>
         run.channel_id === channelId &&
@@ -407,7 +453,7 @@ function WorkingPill({ channelId }: { channelId: Id }) {
     )
     .map((run) => ({
       run,
-      agent: app.members.find((member) => member.id === run.agent_id),
+      agent: members.find((member) => member.id === run.agent_id),
     }));
 
   let content: React.ReactNode = null;
@@ -465,7 +511,10 @@ export function Composer({
   onConsumed?: () => void;
 }) {
   const api = useApi();
-  const app = useApp();
+  const { members, me } = useAppSelector((data) => ({
+    members: data.members,
+    me: data.me,
+  }));
   const [text, setText] = useState("");
   const [pending, setPending] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
@@ -531,11 +580,11 @@ export function Composer({
   const candidates =
     mentionQuery === null
       ? []
-      : app.members
+      : members
           .filter(
             (member) =>
               member.handle.startsWith(mentionQuery.toLowerCase()) &&
-              member.id !== app.me?.id,
+              member.id !== me?.id,
           )
           .slice(0, 6);
 

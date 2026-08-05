@@ -2,7 +2,7 @@
 // goes over HTTP and comes back as a realtime event, so what the UI shows is
 // always what the workspace actually agreed on.
 
-import { useSyncExternalStore } from "react";
+import { useCallback, useRef, useSyncExternalStore } from "react";
 import { Api } from "./api";
 import type {
   Automation,
@@ -81,6 +81,9 @@ class Store {
   private reconnectTimer?: number;
   private retryDelay = 1000;
   private loadingChannels = new Set<Id>();
+  private notifying = false;
+  /// Events that arrived on the socket before the bootstrap they belong after.
+  private queued?: Envelope[];
   api?: Api;
 
   subscribe = (listener: Listener) => {
@@ -90,9 +93,19 @@ class Store {
 
   getSnapshot = () => this.data;
 
+  // Applying one event often means more than one `set` — a message and its
+  // parent's reply count, a run and its question. Each of those used to be a
+  // separate render of every subscribed component. The snapshot is updated
+  // synchronously, so anything reading it sees the truth immediately; only the
+  // telling-everyone part waits for the end of the turn.
   private set(patch: Partial<AppData>) {
     this.data = { ...this.data, ...patch };
-    this.listeners.forEach((listener) => listener());
+    if (this.notifying) return;
+    this.notifying = true;
+    queueMicrotask(() => {
+      this.notifying = false;
+      this.listeners.forEach((listener) => listener());
+    });
   }
 
   async connect(baseUrl: string, token: string) {
@@ -101,21 +114,37 @@ class Store {
       this.set({ status: "loading", error: undefined });
     }
     try {
+      // The socket handshake and the bootstrap fetch do not depend on each
+      // other, so they happen at the same time and the app is live a whole
+      // round trip sooner. Anything the socket delivers in the meantime is
+      // held back and replayed once the bootstrap it post-dates is in place.
+      this.queued = [];
+      this.openSocket();
       const bootstrap = await this.api.bootstrap();
       this.retryDelay = 1000;
       this.applyBootstrap(bootstrap);
-      this.openSocket();
+      const pending = this.queued ?? [];
+      this.queued = undefined;
+      for (const envelope of pending) {
+        if (envelope.seq === 0 || envelope.seq > bootstrap.seq) {
+          this.applyEvent(envelope);
+        }
+      }
     } catch (err) {
       // A relay restart is routine — keep trying rather than stranding the app
       // behind a button nobody is there to press.
+      this.queued = undefined;
+      this.closeSocket();
       this.set({ status: "error", error: String((err as Error).message ?? err) });
       this.scheduleReconnect();
     }
   }
 
   disconnect() {
-    this.socket?.close();
-    this.socket = undefined;
+    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.queued = undefined;
+    this.closeSocket();
     this.data = EMPTY;
     this.api = undefined;
     this.listeners.forEach((listener) => listener());
@@ -150,6 +179,7 @@ class Store {
 
   private openSocket() {
     if (!this.api) return;
+    this.closeSocket();
     const url = new URL(
       this.api.baseUrl.replace(/^http/, "ws").replace(/\/$/, "") + "/ws",
     );
@@ -162,13 +192,29 @@ class Store {
     socket.onopen = () => this.set({ live: true });
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data as string);
-      if (payload.t === "event") this.applyEvent(payload.envelope as Envelope);
+      if (payload.t !== "event") return;
+      const envelope = payload.envelope as Envelope;
+      // Still waiting on the bootstrap this event comes after.
+      if (this.queued) this.queued.push(envelope);
+      else this.applyEvent(envelope);
     };
     socket.onclose = () => {
       this.set({ live: false });
       this.scheduleReconnect();
     };
     socket.onerror = () => socket.close();
+  }
+
+  /// Close a socket we are done with without it looking like a disconnection.
+  private closeSocket() {
+    const socket = this.socket;
+    if (!socket) return;
+    this.socket = undefined;
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.onmessage = null;
+    socket.onopen = null;
+    socket.close();
   }
 
   private scheduleReconnect() {
@@ -435,6 +481,60 @@ export const store = new Store();
 
 export function useApp(): AppData {
   return useSyncExternalStore(store.subscribe, store.getSnapshot);
+}
+
+/// Subscribe to a part of the store rather than to all of it.
+///
+/// `useApp` wakes every component in the app for every event, which is fine
+/// for a page you are looking at and ruinous for the hundred small things
+/// mounted around it while an agent streams a reply several times a second.
+/// A selector re-renders only when the slice it names actually changed —
+/// compared one level deep, so returning a fresh `{ a, b }` each time is the
+/// expected way to use it.
+export function useAppSelector<T>(select: (data: AppData) => T): T {
+  const selector = useRef(select);
+  selector.current = select;
+  const cached = useRef<{
+    from: AppData;
+    select: (data: AppData) => T;
+    value: T;
+  }>(undefined);
+
+  const getSnapshot = useCallback(() => {
+    const data = store.getSnapshot();
+    const previous = cached.current;
+    // The selector is part of the key, not just the data: one that closes over
+    // a prop — the channel being looked at — asks a different question after
+    // that prop changes, even though the store has not moved.
+    if (previous && previous.from === data && previous.select === selector.current) {
+      return previous.value;
+    }
+    const next = selector.current(data);
+    // Same contents as last time: hand back the old object so React can see
+    // that nothing changed and skip the render.
+    const value = previous && shallowEqual(previous.value, next) ? previous.value : next;
+    cached.current = { from: data, select: selector.current, value };
+    return value;
+  }, []);
+
+  return useSyncExternalStore(store.subscribe, getSnapshot);
+}
+
+function shallowEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || !a || !b) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const aKeys = Object.keys(a as object);
+  const bKeys = Object.keys(b as object);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(b, key) &&
+      Object.is(
+        (a as Record<string, unknown>)[key],
+        (b as Record<string, unknown>)[key],
+      ),
+  );
 }
 
 export function useApi(): Api {

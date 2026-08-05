@@ -7,7 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useApi, useApp } from "../lib/store";
+import { useApi, useAppSelector } from "../lib/store";
 import { SearchIcon } from "./icons";
 import type { Message, Reaction } from "../lib/types";
 
@@ -179,16 +179,20 @@ export function ReactionRow({
   message: Message;
   onAdd: (at: { x: number; y: number }) => void;
 }) {
-  const app = useApp();
+  // One of these sits under every message on screen, so it subscribes to the
+  // two lists it actually reads rather than to the whole workspace.
+  const { members, myId } = useAppSelector((data) => ({
+    members: data.members,
+    myId: data.me?.id ?? "",
+  }));
   const api = useApi();
   if (message.reactions.length === 0) return null;
 
   const who = (reaction: Reaction) => {
     const names = reaction.member_ids.map(
-      (id) =>
-        app.members.find((member) => member.id === id)?.display_name ?? "someone",
+      (id) => members.find((member) => member.id === id)?.display_name ?? "someone",
     );
-    const mine = reaction.member_ids.includes(app.me?.id ?? "");
+    const mine = reaction.member_ids.includes(myId);
     const listed =
       names.length <= 3
         ? names.join(", ")
@@ -201,7 +205,7 @@ export function ReactionRow({
       {message.reactions.map((reaction) => (
         <button
           key={reaction.emoji}
-          className={`reaction${reaction.member_ids.includes(app.me?.id ?? "") ? " mine" : ""}`}
+          className={`reaction${reaction.member_ids.includes(myId) ? " mine" : ""}`}
           title={who(reaction)}
           onClick={() => api.react(message.id, reaction.emoji)}
         >
