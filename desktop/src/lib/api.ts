@@ -273,8 +273,8 @@ export class Api {
     return this.get<SearchResults>(`/api/search?q=${encodeURIComponent(query)}`);
   }
 
-  renameWorkspace(name: string) {
-    return this.patch<Workspace>("/api/workspace", { name });
+  updateWorkspace(input: { name?: string; task_prefix?: string }) {
+    return this.patch<Workspace>("/api/workspace", input);
   }
 
   invites() {

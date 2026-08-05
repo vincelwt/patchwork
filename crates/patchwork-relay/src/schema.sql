@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS workspace (
   id          TEXT PRIMARY KEY,
   name        TEXT NOT NULL,
   created_at  INTEGER NOT NULL,
+  task_prefix TEXT NOT NULL DEFAULT 'PW',
   task_seq    INTEGER NOT NULL DEFAULT 0
 );
 

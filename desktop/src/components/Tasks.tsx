@@ -115,14 +115,18 @@ function actionIcon(kind: NextAction["kind"]) {
 
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
-function suggestedOwner(members: Member[], tasks: Task[]): string {
-  const agents = members.filter((member) => member.kind === "agent");
-  if (agents.length === 0) return "";
-  if (agents.length === 1) return agents[0].id;
-  const recent = [...tasks]
-    .sort((a, b) => b.created_at - a.created_at)
-    .find((task) => agents.some((agent) => agent.id === task.owner_id));
-  return recent?.owner_id ?? agents[0].id;
+const LAST_OWNER = "patchwork.lastTaskOwner";
+
+/// Who a new task should belong to: whoever you gave the last one to, and
+/// yourself before you have given anyone anything. Guessing an agent for you
+/// was wrong often enough to be worse than no guess at all — a task quietly
+/// assigned to an agent starts it working.
+function suggestedOwner(members: Member[], me?: Member): string {
+  const remembered = localStorage.getItem(LAST_OWNER);
+  if (remembered && members.some((member) => member.id === remembered)) {
+    return remembered;
+  }
+  return me?.id ?? "";
 }
 
 // --- board ------------------------------------------------------------------
@@ -452,7 +456,7 @@ export function NewTaskModal({
   const api = useApi();
   const { go } = useNavigation();
   const [outcome, setOutcome] = useState("");
-  const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.tasks));
+  const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.me));
   const [project, setProject] = useState(() => {
     const agent = app.members.find((member) => member.id === owner);
     return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
@@ -471,6 +475,7 @@ export function NewTaskModal({
     setBusy(true);
     setError("");
     try {
+      localStorage.setItem(LAST_OWNER, owner);
       const task = await api.createTask({
         outcome,
         owner_id: owner || undefined,
@@ -613,7 +618,7 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
   const api = useApi();
   const { inspect } = useNavigation();
   const [owner, setOwner] = useState(
-    task.owner_id || suggestedOwner(app.members, app.tasks),
+    task.owner_id || suggestedOwner(app.members, app.me),
   );
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState(false);
@@ -627,6 +632,7 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
     setError("");
     try {
       if (owner !== task.owner_id) {
+        localStorage.setItem(LAST_OWNER, owner);
         await api.updateTask(task.id, { owner_id: owner });
       }
       if (andStart && isAgent) {

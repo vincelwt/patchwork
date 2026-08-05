@@ -1816,6 +1816,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const api = useApi();
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
+  const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
 
@@ -1887,12 +1888,29 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     <Page title="Settings">
       <Section title="Workspace">
         <Field label="Name" value={name} onChange={setName} />
+        <Field
+          label="Task prefix"
+          value={prefix}
+          onChange={(value) => setPrefix(value.toUpperCase().slice(0, 6))}
+          placeholder="PW"
+        />
+        <span className="form-help">
+          The next task will be {prefix.trim() || "PW"}-
+          {(app.workspace?.task_seq ?? 0) + 1}. Keys already handed out keep
+          the prefix they were made with.
+        </span>
         <button
           className="button"
           style={{ marginTop: 10 }}
-          disabled={!name.trim() || name === app.workspace?.name}
+          disabled={
+            (!name.trim() || name === app.workspace?.name) &&
+            (!prefix.trim() || prefix === app.workspace?.task_prefix)
+          }
           onClick={async () => {
-            await api.renameWorkspace(name);
+            await api.updateWorkspace({
+              name: name.trim() || undefined,
+              task_prefix: prefix.trim() || undefined,
+            });
             setSaved(true);
             window.setTimeout(() => setSaved(false), 1800);
           }}

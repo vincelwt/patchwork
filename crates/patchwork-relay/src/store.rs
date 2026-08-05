@@ -76,7 +76,10 @@ impl Store {
         // ponytail: a list, not a migration framework. It is only ever appended
         // to, and dropping a column is left to SQLite ignoring one nobody
         // writes to any more.
-        for statement in ["ALTER TABLE tasks ADD COLUMN due_at INTEGER"] {
+        for statement in [
+            "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
+            "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
+        ] {
             let _ = conn.execute(statement, []);
         }
 
@@ -92,14 +95,15 @@ impl Store {
     pub fn workspace(&self) -> Result<Workspace> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, created_at, task_seq FROM workspace LIMIT 1",
+            "SELECT id, name, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
             [],
             |r| {
                 Ok(Workspace {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     created_at: r.get(2)?,
-                    task_seq: r.get(3)?,
+                    task_prefix: r.get(3)?,
+                    task_seq: r.get(4)?,
                 })
             },
         )
@@ -112,6 +116,7 @@ impl Store {
     pub fn create_workspace(&self, id: &str, name: &str) -> Result<Workspace> {
         let ws = Workspace {
             id: id.to_string(),
+            task_prefix: patchwork_core::models::default_task_prefix(),
             name: name.to_string(),
             created_at: now_ms(),
             task_seq: 0,
@@ -123,17 +128,28 @@ impl Store {
         Ok(ws)
     }
 
-    pub fn rename_workspace(&self, name: &str) -> Result<Workspace> {
-        self.conn()?
-            .execute("UPDATE workspace SET name = ?1", params![name])?;
+    pub fn update_workspace(&self, name: Option<&str>, task_prefix: Option<&str>) -> Result<Workspace> {
+        let conn = self.conn()?;
+        if let Some(name) = name {
+            conn.execute("UPDATE workspace SET name = ?1", params![name])?;
+        }
+        if let Some(prefix) = task_prefix {
+            conn.execute("UPDATE workspace SET task_prefix = ?1", params![prefix])?;
+        }
         self.workspace()
     }
 
+    /// Keys already handed out keep the prefix they were made with: renaming
+    /// the series is not rewriting history.
     pub fn next_task_key(&self) -> Result<String> {
         let conn = self.conn()?;
         conn.execute("UPDATE workspace SET task_seq = task_seq + 1", [])?;
-        let seq: i64 = conn.query_row("SELECT task_seq FROM workspace LIMIT 1", [], |r| r.get(0))?;
-        Ok(format!("PW-{seq}"))
+        let (prefix, seq): (String, i64) = conn.query_row(
+            "SELECT task_prefix, task_seq FROM workspace LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(format!("{prefix}-{seq}"))
     }
 
     // -- members -----------------------------------------------------------

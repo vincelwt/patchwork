@@ -43,12 +43,16 @@ export function Sidebar({
   onResize,
   onCreate,
   onSignOut,
+  rail = false,
 }: {
   onHelp: () => void;
   onSearch: () => void;
   onResize: (width: number) => void;
   onCreate: (what: Creatable, sectionId?: Id) => void;
   onSignOut: () => void;
+  /// Narrow enough that only the icons fit. Everything is still here, and
+  /// every row keeps its tooltip; the words are what goes.
+  rail?: boolean;
 }) {
   // Deliberately not `useApp`: the sidebar is on screen the whole time, so a
   // subscription to everything means it redraws for every message body an
@@ -134,9 +138,13 @@ export function Sidebar({
   };
 
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${rail ? " rail" : ""}`}>
       <div className="sidebar-top">
-        <span className="workspace-title">{app.workspace?.name ?? "Patchwork"}</span>
+        {!rail && (
+          <span className="workspace-title">
+            {app.workspace?.name ?? "Patchwork"}
+          </span>
+        )}
         <span className="spacer" />
         <button className="icon-button" onClick={onSearch} title="Search (⌘K)">
           <SearchIcon size={17} />
@@ -193,6 +201,7 @@ export function Sidebar({
       <div className="sidebar-scroll">
         <button
           className={`nav-item${isActive({ kind: "inbox" }) ? " active" : ""}`}
+          title="Inbox"
           onClick={() => go({ kind: "inbox" })}
         >
           <InboxIcon />
@@ -201,6 +210,7 @@ export function Sidebar({
         </button>
         <button
           className={`nav-item${isActive({ kind: "tasks" }) ? " active" : ""}`}
+          title="Tasks"
           onClick={() => go({ kind: "tasks" })}
         >
           <TasksIcon />
@@ -209,6 +219,7 @@ export function Sidebar({
         </button>
         <button
           className={`nav-item${isActive({ kind: "automations" }) ? " active" : ""}`}
+          title="Automations"
           onClick={() => go({ kind: "automations" })}
         >
           <AutomationIcon />
@@ -267,9 +278,15 @@ export function Sidebar({
         {(grouped.get("") ?? []).length > 0 && (
           <div className="sidebar-group">
             <div className="group-head">
-              <div className="group-label plain">
+              <button
+                className={`group-label${collapsed.channels ? " collapsed" : ""}`}
+                onClick={() =>
+                  setCollapsed({ ...collapsed, channels: !collapsed.channels })
+                }
+              >
+                <ChevronIcon size={13} />
                 <span>Channels</span>
-              </div>
+              </button>
               <button
                 className="icon-button small group-add"
                 title="New channel"
@@ -278,26 +295,31 @@ export function Sidebar({
                 <PlusIcon size={14} />
               </button>
             </div>
-            {(grouped.get("") ?? []).map((channel) => (
-              <ChannelRow
-                key={channel.id}
-                channel={channel}
-                {...signals(channel)}
-                onClick={() => go({ kind: "channel", id: channel.id })}
-                onMenu={(x, y) => setMenuFor({ channel, x, y })}
-              />
-            ))}
+            {!collapsed.channels &&
+              (grouped.get("") ?? []).map((channel) => (
+                <ChannelRow
+                  key={channel.id}
+                  channel={channel}
+                  {...signals(channel)}
+                  onClick={() => go({ kind: "channel", id: channel.id })}
+                  onMenu={(x, y) => setMenuFor({ channel, x, y })}
+                />
+              ))}
           </div>
         )}
 
         {(dms.length > 0 || unstartedAgents.length > 0) && (
           <div className="sidebar-group">
             <div className="group-head">
-              <div className="group-label plain">
-                <span>Direct messages</span>
-              </div>
+              <button
+                className={`group-label${collapsed.dms ? " collapsed" : ""}`}
+                onClick={() => setCollapsed({ ...collapsed, dms: !collapsed.dms })}
+              >
+                <ChevronIcon size={13} />
+                <span>DMs</span>
+              </button>
             </div>
-            {dms.map((channel) => {
+            {!collapsed.dms && dms.map((channel) => {
               const partner = partnerOf(channel);
               return (
                 <MemberRow
@@ -309,7 +331,8 @@ export function Sidebar({
                 />
               );
             })}
-            {unstartedAgents.map((member) => (
+            {!collapsed.dms &&
+              unstartedAgents.map((member) => (
               <MemberRow
                 key={member.id}
                 member={member}
@@ -660,8 +683,10 @@ function ChannelMenu({
   );
 }
 
-export const SIDEBAR_MIN = 200;
+export const SIDEBAR_MIN = 190;
 export const SIDEBAR_MAX = 400;
+/// Below this the labels have nowhere to go, so the sidebar becomes a rail.
+export const SIDEBAR_RAIL = 60;
 
 function SidebarResizer({ onResize }: { onResize: (width: number) => void }) {
   const [dragging, setDragging] = useState(false);
@@ -669,7 +694,10 @@ function SidebarResizer({ onResize }: { onResize: (width: number) => void }) {
   useEffect(() => {
     if (!dragging) return;
     const onMove = (event: MouseEvent) => {
-      onResize(Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, event.clientX)));
+      const width = Math.min(SIDEBAR_MAX, event.clientX);
+      // A gap between the two widths, so a drag settles on one or the other
+      // instead of hovering somewhere neither works.
+      onResize(width < SIDEBAR_MIN - 20 ? SIDEBAR_RAIL : Math.max(SIDEBAR_MIN, width));
     };
     const onUp = () => setDragging(false);
     document.body.classList.add("resizing");
@@ -719,6 +747,7 @@ function ChannelRow({
     <button
       className={`nav-item${active ? " active" : ""}${unseen ? " unseen" : ""}`}
       onClick={onClick}
+      title={`#${channel.name}`}
       onContextMenu={(event) => {
         event.preventDefault();
         onMenu(event.clientX, event.clientY);

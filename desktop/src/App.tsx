@@ -20,7 +20,7 @@ import { markSeen } from "./lib/unread";
 import logo from "./assets/logo.png";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
-import { Sidebar } from "./components/Sidebar";
+import { Sidebar, SIDEBAR_RAIL } from "./components/Sidebar";
 import type { Creatable } from "./components/Sidebar";
 import { ChatView, useHandles } from "./components/Chat";
 import { Inspector } from "./components/Inspector";
@@ -230,6 +230,12 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     localStorage.setItem("patchwork.sidebarWidth", String(width));
   }, []);
 
+  // A narrow window has no room for two columns of words. Rather than refuse
+  // to be resized, the sidebar becomes a rail on its own and gives the main
+  // column everything it has.
+  const narrow = useMediaQuery("(max-width: 720px)");
+  const rail = narrow || sidebarWidth <= SIDEBAR_RAIL;
+
   const go = useCallback((next: View) => {
     setView(next);
     setInspector(null);
@@ -294,9 +300,14 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
       <MarkAsSeen view={view} />
       <div
         className="shell"
-        style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
+        style={
+          {
+            "--sidebar-width": `${rail ? SIDEBAR_RAIL : sidebarWidth}px`,
+          } as React.CSSProperties
+        }
       >
         <Sidebar
+          rail={rail}
           onHelp={() => setHelpOpen(true)}
           onSearch={() => setSearchOpen(true)}
           onResize={resizeSidebar}
@@ -336,6 +347,18 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
       {toast && <div className="toast">{toast}</div>}
     </NavigationContext.Provider>
   );
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const onChange = () => setMatches(media.matches);
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
 }
 
 /// Each workspace keeps the page you were on. Channel and task ids mean

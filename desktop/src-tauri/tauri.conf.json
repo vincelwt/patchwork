@@ -15,7 +15,7 @@
         "title": "Patchwork",
         "width": 1180,
         "height": 780,
-        "minWidth": 720,
+        "minWidth": 520,
         "minHeight": 520,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,

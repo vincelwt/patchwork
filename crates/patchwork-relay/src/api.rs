@@ -1600,13 +1600,38 @@ async fn download_file(
 // workspace admin and search
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
+struct WorkspaceInput {
+    #[serde(default)]
+    name: Option<String>,
+    /// What task keys start with. Letters and digits, upper-cased.
+    #[serde(default)]
+    task_prefix: Option<String>,
+}
+
 async fn rename_workspace(
     State(state): State<Shared>,
     caller: Caller,
-    Json(input): Json<NameInput>,
+    Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
-    let workspace = state.store.rename_workspace(input.name.trim())?;
+    let name = input.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let prefix = match input.task_prefix.as_deref() {
+        Some(raw) => {
+            let cleaned: String = raw
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(6)
+                .collect::<String>()
+                .to_uppercase();
+            if cleaned.is_empty() {
+                return Err(ApiError::bad_request("a task prefix needs a letter or two"));
+            }
+            Some(cleaned)
+        }
+        None => None,
+    };
+    let workspace = state.store.update_workspace(name, prefix.as_deref())?;
     state.emit(Event::WorkspaceUpdated {
         workspace: workspace.clone(),
     });

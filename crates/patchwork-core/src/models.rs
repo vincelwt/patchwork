@@ -953,9 +953,16 @@ pub struct Workspace {
     pub id: Id,
     pub name: String,
     pub created_at: Millis,
-    /// Next task number for `PW-<n>` keys.
+    /// What task keys start with: `PW` gives `PW-14`.
+    #[serde(default = "default_task_prefix")]
+    pub task_prefix: String,
+    /// Next task number.
     #[serde(default)]
     pub task_seq: i64,
+}
+
+pub fn default_task_prefix() -> String {
+    "PW".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

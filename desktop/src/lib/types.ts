@@ -428,6 +428,8 @@ export interface Preview {
 export interface Workspace {
   id: Id;
   name: string;
+  /// What task keys start with: "PW" gives PW-14.
+  task_prefix: string;
   created_at: Millis;
   task_seq: number;
 }

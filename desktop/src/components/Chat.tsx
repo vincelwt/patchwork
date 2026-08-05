@@ -177,7 +177,7 @@ export function Timeline({
   // visible slice — otherwise scrolling would change where the dividers fall.
   const rows = useMemo(() => {
     let previousDay: string | undefined;
-    return messages.map((message, index) => {
+    const out = messages.map((message, index) => {
       const previous = messages[index - 1];
       const day = dayLabel(message.created_at);
       const showDay = day !== previousDay;
@@ -186,8 +186,37 @@ export function Timeline({
         message,
         day: showDay ? day : undefined,
         grouped: !showDay && groupsWithPrevious(message, previous),
+        /// Set on the first of a run of workspace events: the whole run,
+        /// drawn as one line.
+        group: undefined as Message[] | undefined,
+        /// Swallowed by the line above it.
+        hidden: false,
       };
     });
+
+    // Dragging a card across the board four times is one thing that happened,
+    // not four things to read. A run of workspace events collapses into its
+    // latest line, which opens if you actually want the history.
+    for (let start = 0; start < out.length; ) {
+      if (out[start].message.kind !== "system") {
+        start += 1;
+        continue;
+      }
+      let end = start + 1;
+      while (
+        end < out.length &&
+        out[end].message.kind === "system" &&
+        !out[end].day
+      ) {
+        end += 1;
+      }
+      if (end - start >= 3) {
+        out[start].group = out.slice(start, end).map((row) => row.message);
+        for (let at = start + 1; at < end; at += 1) out[at].hidden = true;
+      }
+      start = end;
+    }
+    return out;
   }, [messages]);
 
   // Which message a run is currently writing into. Working this out inside
@@ -238,7 +267,8 @@ export function Timeline({
             runsWithReply.has(message.card.run_id) &&
             !!runs[message.card.run_id] &&
             !["failed", "waiting"].includes(runs[message.card.run_id].status);
-          if (folded) return <div key={message.id} ref={window_.rowRef(index)} />;
+          if (folded || row.hidden)
+            return <div key={message.id} ref={window_.rowRef(index)} />;
           return (
             <div key={message.id} ref={window_.rowRef(index)}>
               {row.day && (
@@ -246,6 +276,9 @@ export function Timeline({
                   <span>{row.day}</span>
                 </div>
               )}
+              {row.group ? (
+                <ActivityGroup messages={row.group} />
+              ) : (
               <MessageRow
                 message={message}
                 grouped={row.grouped}
@@ -259,11 +292,44 @@ export function Timeline({
                   (run.status === "running" || run.status === "dispatched")
                 }
               />
+              )}
             </div>
           );
         })}
         {window_.padBottom > 0 && <div style={{ height: window_.padBottom }} />}
       </div>
+    </div>
+  );
+}
+
+/// A run of workspace events as one line, with the rest one click away.
+function ActivityGroup({ messages }: { messages: Message[] }) {
+  const [open, setOpen] = useState(false);
+  const latest = messages[messages.length - 1];
+
+  if (open) {
+    return (
+      <>
+        {messages.map((message) => (
+          <div className="activity" key={message.id}>
+            <EventIcon size={15} />
+            <span className="text">{message.body}</span>
+          </div>
+        ))}
+        <button className="activity-toggle" onClick={() => setOpen(false)}>
+          Hide
+        </button>
+      </>
+    );
+  }
+
+  return (
+    <div className="activity">
+      <EventIcon size={15} />
+      <span className="text">{latest.body}</span>
+      <button className="activity-toggle" onClick={() => setOpen(true)}>
+        {messages.length - 1} earlier
+      </button>
     </div>
   );
 }
