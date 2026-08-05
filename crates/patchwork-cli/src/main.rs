@@ -53,6 +53,8 @@ enum Command {
     Ask(AskArgs),
     /// Attach a file as evidence.
     Attach(AttachArgs),
+    /// Post a chart from a Flint chart spec.
+    Chart(ChartArgs),
     /// Expose a dev server you started as a task preview.
     Preview(PreviewArgs),
     /// Link a pull request to the current task.
@@ -114,6 +116,17 @@ struct AttachArgs {
     path: String,
     #[arg(long, default_value = "")]
     caption: String,
+}
+
+#[derive(Args)]
+struct ChartArgs {
+    /// File holding the Flint chart spec, or `-` for stdin.
+    spec: String,
+    /// One line saying what the chart shows.
+    #[arg(long, default_value = "")]
+    caption: String,
+    #[arg(long)]
+    channel: Option<String>,
 }
 
 #[derive(Args)]
@@ -334,6 +347,7 @@ async fn run() -> Result<()> {
         Command::Status(args) => say(&client, &ctx, args, MessageKind::Status).await,
         Command::Ask(args) => ask(&client, &ctx, args).await,
         Command::Attach(args) => attach(&client, &ctx, args).await,
+        Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
         Command::Pr { url } => link_pr(&client, &ctx, url).await,
         Command::Task(command) => task(&client, &ctx, command).await,
@@ -469,6 +483,7 @@ fn card_label(card: &MessageCard) -> &'static str {
         MessageCard::Artifact { .. } => "artifact",
         MessageCard::Preview { .. } => "preview",
         MessageCard::PullRequest { .. } => "pull request",
+        MessageCard::Chart { .. } => "chart",
     }
 }
 
@@ -514,6 +529,54 @@ async fn say(client: &Client, ctx: &RunContext, args: SayArgs, kind: MessageKind
         .post(
             &format!("/api/channels/{channel_id}/messages"),
             json!({ "body": body, "kind": kind, "run_id": ctx.run_id }),
+        )
+        .await?;
+    client.print(&message, || println!("posted"));
+    Ok(())
+}
+
+/// A chart is data plus what the data means, not a picture: the workspace
+/// renders it, so it stays legible on any screen and can be read back later by
+/// whoever asks what the numbers actually were.
+async fn chart(client: &Client, ctx: &RunContext, args: ChartArgs) -> Result<()> {
+    let raw = if args.spec == "-" {
+        use std::io::Read;
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        buffer
+    } else {
+        std::fs::read_to_string(&args.spec)
+            .with_context(|| format!("cannot read {}", args.spec))?
+    };
+
+    // Charts ride inside a message row. A spec big enough to matter here is a
+    // file the agent should have attached instead.
+    const LIMIT: usize = 512 * 1024;
+    if raw.len() > LIMIT {
+        bail!(
+            "that spec is {}KB; summarise or aggregate the data first (limit {}KB)",
+            raw.len() / 1024,
+            LIMIT / 1024
+        );
+    }
+
+    let spec: Value = serde_json::from_str(&raw).context("the chart spec is not valid JSON")?;
+    if spec.get("chart_spec").and_then(|s| s.get("chartType")).is_none() {
+        bail!("a chart spec needs `chart_spec.chartType` (see the Flint chart format)");
+    }
+    if spec.get("data").is_none() {
+        bail!("a chart spec needs `data.values` or `data.url`");
+    }
+
+    let channel_id = resolve_channel(client, ctx, args.channel).await?;
+    let card = MessageCard::Chart {
+        spec,
+        caption: Some(args.caption.clone()).filter(|c| !c.trim().is_empty()),
+    };
+    let message: Message = client
+        .post(
+            &format!("/api/channels/{channel_id}/messages"),
+            json!({ "body": args.caption, "kind": MessageKind::Card, "card": card, "run_id": ctx.run_id }),
         )
         .await?;
     client.print(&message, || println!("posted"));

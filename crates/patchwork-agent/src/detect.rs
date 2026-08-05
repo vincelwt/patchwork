@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use patchwork_core::models::{HostCapabilities, RuntimeInstallation};
+use patchwork_core::models::{HostCapabilities, RuntimeInstallation, RuntimeOption};
 use tokio::process::Command;
 
 /// `gh auth status` contacts GitHub. On a captive-portal network it can hang
@@ -34,7 +34,10 @@ struct Builtin {
     native: &'static [&'static str],
     /// The underlying agent CLI whose presence means "this is worth offering".
     base_cli: &'static str,
-    /// npm package providing the ACP adapter.
+    /// Arguments that put the base CLI itself into ACP mode. Newer agents ship
+    /// ACP in the box, so there is nothing to adapt and nothing to install.
+    acp_args: &'static [&'static str],
+    /// npm package providing the ACP adapter, for the agents that need one.
     npm_package: &'static str,
 }
 
@@ -44,6 +47,7 @@ const BUILTINS: &[Builtin] = &[
         label: "Codex",
         native: &["codex-acp"],
         base_cli: "codex",
+        acp_args: &[],
         npm_package: "@agentclientprotocol/codex-acp",
     },
     Builtin {
@@ -51,16 +55,109 @@ const BUILTINS: &[Builtin] = &[
         label: "Claude Code",
         native: &["claude-code-acp"],
         base_cli: "claude",
+        acp_args: &[],
         npm_package: "@zed-industries/claude-code-acp",
+    },
+    Builtin {
+        id: "opencode",
+        label: "OpenCode",
+        native: &[],
+        base_cli: "opencode",
+        acp_args: &["acp"],
+        npm_package: "",
+    },
+    Builtin {
+        id: "gemini",
+        label: "Gemini CLI",
+        native: &[],
+        base_cli: "gemini",
+        // `--experimental-acp` on releases before the flag was promoted; the
+        // current one is what we ask for, and an old CLI fails loudly rather
+        // than silently opening a terminal UI nobody can see.
+        acp_args: &["--acp"],
+        npm_package: "",
+    },
+    Builtin {
+        id: "grok",
+        label: "Grok Build",
+        native: &[],
+        base_cli: "grok",
+        // Nothing is watching this process, so its updater must not decide to
+        // rewrite itself in the middle of a run.
+        acp_args: &["agent", "stdio", "--no-auto-update"],
+        npm_package: "",
     },
     Builtin {
         id: "pi",
         label: "Pi",
         native: &["pi-acp"],
         base_cli: "pi",
+        acp_args: &[],
         npm_package: "pi-acp",
     },
 ];
+
+/// Patchwork's own agent: Pi, driven through its ACP adapter, with a provider
+/// the user chooses. It is the one runtime that needs no coding agent
+/// installed — `npx` fetches both packages and puts `pi` on the adapter's PATH
+/// itself, so a fresh machine with Node can run agents immediately.
+pub const PATCHWORK_RUNTIME: &str = "patchwork";
+const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+const PI_ACP_PACKAGE: &str = "pi-acp";
+
+fn patchwork_command() -> Option<Vec<String>> {
+    let npx = on_path("npx")?;
+    Some(vec![
+        npx,
+        "-y".into(),
+        "--package".into(),
+        PI_ACP_PACKAGE.into(),
+        "--package".into(),
+        PI_PACKAGE.into(),
+        "--".into(),
+        "pi-acp".into(),
+    ])
+}
+
+/// Models worth offering before this runtime has ever opened a session, so the
+/// agent editor is not an empty list on a machine that has everything it needs.
+/// The catalogue proper comes from the runtime itself on the first run.
+fn patchwork_models() -> Vec<RuntimeOption> {
+    [
+        (
+            "openrouter/deepseek/deepseek-v4-flash",
+            "DeepSeek V4 Flash",
+            "Recommended: fast, capable, and cents per task",
+        ),
+        (
+            "openrouter/anthropic/claude-fable-5",
+            "Claude Fable 5",
+            "Strongest coding model, priced like it",
+        ),
+        (
+            "openrouter/openai/gpt-5.6",
+            "GPT-5.6",
+            "OpenAI's coding model through OpenRouter",
+        ),
+        (
+            "anthropic/claude-fable-5",
+            "Claude Fable 5 (Anthropic)",
+            "Uses an Anthropic key or a Claude subscription",
+        ),
+        (
+            "openai-codex/gpt-5.6-terra",
+            "GPT-5.6 Terra (Codex)",
+            "Uses a ChatGPT subscription",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, description)| RuntimeOption {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+    })
+    .collect()
+}
 
 /// Where each binary we care about lives, resolved at most once.
 ///
@@ -92,23 +189,28 @@ fn on_path(bin: &str) -> Option<String> {
 ///
 /// `custom` returns whatever the agent profile carries; the caller supplies it.
 pub fn runtime_command(runtime: &str) -> Option<Vec<String>> {
+    if runtime == PATCHWORK_RUNTIME {
+        return patchwork_command();
+    }
     let b = BUILTINS.iter().find(|b| b.id == runtime)?;
     for native in b.native {
         if let Some(path) = on_path(native) {
             return Some(vec![path]);
         }
     }
-    if on_path(b.base_cli).is_some() {
-        if let Some(npx) = on_path("npx") {
-            return Some(vec![
-                npx,
-                "-y".into(),
-                "--".into(),
-                b.npm_package.to_string(),
-            ]);
-        }
+    let base = on_path(b.base_cli)?;
+    if !b.acp_args.is_empty() {
+        let mut command = vec![base];
+        command.extend(b.acp_args.iter().map(|a| a.to_string()));
+        return Some(command);
     }
-    None
+    let npx = on_path("npx")?;
+    Some(vec![
+        npx,
+        "-y".into(),
+        "--".into(),
+        b.npm_package.to_string(),
+    ])
 }
 
 pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
@@ -122,8 +224,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
     for b in BUILTINS {
         let native = b.native.iter().find_map(|n| on_path(n));
         let base = on_path(b.base_cli);
+        // An agent that speaks ACP itself only needs to be installed.
+        let self_hosted = !b.acp_args.is_empty();
 
-        let (available, command, problem) = match (&native, &base, has_npx) {
+        let (available, command, problem) = match (&native, &base, has_npx || self_hosted) {
             (Some(path), _, _) => (true, vec![path.clone()], None),
             (None, Some(_), true) => (
                 true,
@@ -168,6 +272,22 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
     for ((index, _), version) in pending.into_iter().zip(versions) {
         out[index].version = version;
     }
+
+    // Ours, and the only one that can be offered on a machine where nothing is
+    // installed: `npx` brings both the adapter and the agent with it.
+    out.push(RuntimeInstallation {
+        id: PATCHWORK_RUNTIME.to_string(),
+        label: "Patchwork Agent".to_string(),
+        available: has_npx,
+        command: patchwork_command().unwrap_or_default(),
+        version: None,
+        problem: (!has_npx)
+            .then(|| "needs Node.js (npx) on PATH — nothing else to install".to_string()),
+        models: patchwork_models(),
+        modes: Vec::new(),
+        default_model: Some("openrouter/deepseek/deepseek-v4-flash".to_string()),
+        default_mode: None,
+    });
 
     out.push(RuntimeInstallation {
         id: "custom".to_string(),

@@ -121,7 +121,9 @@ async fn connect(
     let runner = Runner::new(
         RunnerConfig {
             cli_dir: cli_dir(),
-            env: Vec::new(),
+            // Provider keys never leave this machine: they are read from its
+            // own settings and handed to the agent process, not to the relay.
+            env: settings.provider_env(),
         },
         out_tx.clone(),
     );

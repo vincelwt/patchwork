@@ -4,15 +4,27 @@ import { relative, statusLabel, statusTone } from "../lib/format";
 import {
   desktopBoot,
   desktopInfo,
+  inTauri,
   openExternal,
   pickDirectory,
+  piLogin,
+  providerCatalog,
   setAwakePolicy,
   setProjectPaths,
+  setProviderKey,
   signOut,
 } from "../lib/desktop";
 import type { AwakePolicy } from "../lib/desktop";
-import type { DesktopInfo } from "../lib/desktop";
-import { Avatar, Chip, Field, Modal, plainText, useNavigation } from "./common";
+import type { DesktopInfo, ProviderInfo } from "../lib/desktop";
+import {
+  Avatar,
+  Chip,
+  Field,
+  Modal,
+  plainText,
+  useAsync,
+  useNavigation,
+} from "./common";
 import {
   Dropdown,
   Empty,
@@ -32,6 +44,7 @@ import {
   Spinner,
   TrashIcon,
 } from "./icons";
+import { RuntimeIcon } from "./RuntimeIcon";
 import { describeCron, PRESETS, presetFor, WEEKDAYS } from "../lib/schedule";
 import type {
   AgentProfile,
@@ -303,6 +316,25 @@ export function AgentModal({
     };
   }, [machines, profile.runtime, profile.host_id]);
 
+  // Our own runtime is the one with nothing to install, so the question it
+  // asks instead is which model provider to think with — and whether the
+  // machine you are sitting at has a key for it. Both are loaded together
+  // because neither is worth a render on its own.
+  const isPatchwork = profile.runtime === "patchwork";
+  const { value: providers } = useAsync(
+    async () =>
+      isPatchwork
+        ? {
+            list: await providerCatalog(),
+            keys: (await desktopBoot()).settings.provider_keys,
+          }
+        : { list: [] as ProviderInfo[], keys: {} as Record<string, string> },
+    [isPatchwork],
+  );
+  const provider = profile.provider ?? "openrouter";
+  const chosenProvider = providers?.list.find((entry) => entry.id === provider);
+  const providerUnkeyed = !!chosenProvider && !providers?.keys[provider];
+
   const save = async () => {
     setBusy(true);
     setError("");
@@ -359,9 +391,18 @@ export function AgentModal({
             model: entry.runtime === profile.runtime ? profile.model : undefined,
             permission_mode:
               entry.runtime === profile.runtime ? profile.permission_mode : undefined,
+            provider:
+              entry.runtime === "patchwork"
+                ? (profile.provider ?? "openrouter")
+                : undefined,
           });
         }}
-        options={placements.map(({ value, label, hint }) => ({ value, label, hint }))}
+        options={placements.map((entry) => ({
+          value: entry.value,
+          label: entry.label,
+          hint: entry.hint,
+          icon: <RuntimeIcon runtime={entry.runtime} />,
+        }))}
         help={
           placements.length <= 1
             ? "No machine has reported an agent runtime yet."
@@ -380,6 +421,27 @@ export function AgentModal({
           }
           placeholder="my-agent --acp"
         />
+      )}
+      {isPatchwork && (
+        <>
+          <FormSelect
+            label="Provider"
+            value={provider}
+            onChange={(value) => setProfile({ ...profile, provider: value })}
+            options={(providers?.list ?? []).map((entry) => ({
+              value: entry.id,
+              label: entry.label,
+              hint: entry.hint,
+            }))}
+            help="The Patchwork agent brings no model of its own."
+          />
+          {providerUnkeyed && (
+            <div className="notice">
+              No key for {chosenProvider?.label} on this machine. Add one in
+              Settings.
+            </div>
+          )}
+        </>
       )}
 
       {models.length > 0 ? (
@@ -408,7 +470,9 @@ export function AgentModal({
           <div className="notice">
             {profile.runtime === "custom"
               ? "A custom command brings its own model configuration."
-              : "The list appears once this runtime has opened a session — it is the only thing that knows what it can run. Until then it uses the machine's own configuration."}
+              : isPatchwork
+                ? "The recommended model is DeepSeek V4 Flash, and it is what runs unless you pick another once the provider has reported its list."
+                : "The list appears once this runtime has opened a session — it is the only thing that knows what it can run. Until then it uses the machine's own configuration."}
           </div>
         </div>
       )}
@@ -1736,6 +1800,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             ) : (
               machine.runtimes.map((runtime) => (
                 <div className="machine-runtime" key={runtime.id}>
+                  <RuntimeIcon runtime={runtime.id} />
                   <span className="grow">
                     <span className="name">{runtime.label}</span>
                     <span className="sub">
@@ -1786,6 +1851,9 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
         ))}
       </Section>
 
+      {/* Only inside the app: a browser tab has no machine to keep a key on. */}
+      {inTauri && <ProviderSection />}
+
       <Section title="Relay">
         <div className="row hoverable">
           <span className={`dot ${app.live ? "online" : "waiting"}`} />
@@ -1815,5 +1883,108 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
         </button>
       </Section>
     </Page>
+  );
+}
+
+/// What the built-in Patchwork agent thinks with. Nothing here is workspace
+/// state: a key is typed on one machine, kept there, and comes back redacted,
+/// so this is the one settings section that describes only the box you are
+/// sitting at.
+function ProviderSection() {
+  const { toast } = useNavigation();
+  const { value: state, setValue } = useAsync(
+    async () => ({
+      list: await providerCatalog(),
+      keys: (await desktopBoot()).settings.provider_keys,
+    }),
+    [],
+  );
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [command, setCommand] = useState("");
+
+  if (!state?.list.length) return null;
+
+  const save = async (provider: string, key: string) => {
+    try {
+      const settings = await setProviderKey(provider, key);
+      setDrafts({ ...drafts, [provider]: "" });
+      setValue({ list: state.list, keys: settings.provider_keys });
+    } catch (err) {
+      toast(String((err as Error).message ?? err));
+    }
+  };
+
+  return (
+    <Section
+      title="Patchwork agent providers"
+      action={
+        <span className="section-note">
+          Keys stay on this machine and are never sent to the relay
+        </span>
+      }
+    >
+      {state.list.map((provider) => {
+        const draft = drafts[provider.id] ?? "";
+        return (
+          <div className="row" key={provider.id}>
+            <span className="grow">
+              <span className="name">{provider.label}</span>
+              <span className="sub">{provider.hint}</span>
+            </span>
+            {state.keys[provider.id] ? (
+              <>
+                <Chip tone="positive">key stored</Chip>
+                <button
+                  className="button quiet danger"
+                  onClick={() => save(provider.id, "")}
+                >
+                  Remove
+                </button>
+              </>
+            ) : provider.subscription ? (
+              <button
+                className="button"
+                onClick={async () => {
+                  try {
+                    setCommand(await piLogin(provider.id));
+                  } catch (err) {
+                    toast(String((err as Error).message ?? err));
+                  }
+                }}
+              >
+                Sign in
+              </button>
+            ) : (
+              <>
+                <input
+                  className="field"
+                  {...plainText}
+                  type="password"
+                  style={{ width: 190 }}
+                  placeholder={provider.env_var}
+                  value={draft}
+                  onChange={(event) =>
+                    setDrafts({ ...drafts, [provider.id]: event.target.value })
+                  }
+                />
+                <button
+                  className="button"
+                  disabled={!draft.trim()}
+                  onClick={() => save(provider.id, draft.trim())}
+                >
+                  Save
+                </button>
+              </>
+            )}
+          </div>
+        );
+      })}
+      {command && (
+        <div className="notice">
+          Run this in a terminal to finish signing in
+          <pre className="code-block">{command}</pre>
+        </div>
+      )}
+    </Section>
   );
 }

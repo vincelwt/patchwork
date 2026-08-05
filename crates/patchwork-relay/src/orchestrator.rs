@@ -670,6 +670,7 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
         runtime: profile.runtime.clone(),
+        provider: profile.provider.clone(),
         model: profile.model.clone(),
         permission_mode: profile.permission_mode.clone(),
         custom_command: profile.custom_command.clone(),

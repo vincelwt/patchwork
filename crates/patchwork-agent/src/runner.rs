@@ -261,11 +261,11 @@ async fn execute(
                 // A stale session id must not strand the task.
                 Err(err) => {
                     tracing::debug!(?err, "could not resume session; starting a fresh one");
-                    open_session(&conn, &prepared.path).await?
+                    open_session(&conn, &prepared.path, &spec).await?
                 }
             }
         }
-        _ => open_session(&conn, &prepared.path).await?,
+        _ => open_session(&conn, &prepared.path, &spec).await?,
     };
     let session_id = opened.session_id.clone();
 
@@ -479,7 +479,7 @@ async fn apply_session_preferences(
     if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty()) {
         if opened.current_model.as_deref() == Some(model) {
             // Already what was asked for.
-        } else if let Err(err) = conn.set_model(session_id, model).await {
+        } else if let Err(err) = conn.set_model(session_id, model, opened.config_options).await {
             note(format!("could not select model `{model}`: {err:#}"));
         } else {
             note(format!("model: {model}"));
@@ -488,7 +488,7 @@ async fn apply_session_preferences(
 
     if let Some(mode) = spec.permission_mode.as_deref().filter(|m| !m.is_empty()) {
         if opened.current_mode.as_deref() != Some(mode) {
-            if let Err(err) = conn.set_mode(session_id, mode).await {
+            if let Err(err) = conn.set_mode(session_id, mode, opened.config_options).await {
                 note(format!("could not select mode `{mode}`: {err:#}"));
             } else {
                 note(format!("mode: {mode}"));
@@ -500,11 +500,19 @@ async fn apply_session_preferences(
 /// Open a session, authenticating only if the runtime insists — and only with
 /// a method that needs no human at a browser, since nobody is watching this
 /// process.
-async fn open_session(conn: &AcpConnection, cwd: &str) -> Result<NewSession> {
+async fn open_session(conn: &AcpConnection, cwd: &str, spec: &RunSpec) -> Result<NewSession> {
     match conn.new_session(cwd, json!([])).await {
         Ok(session) => Ok(session),
         Err(first_error) => {
             let Some(method) = non_interactive_auth_method(conn) else {
+                // Ours is the one runtime whose credentials Patchwork itself
+                // is responsible for, so it can say exactly where to fix it.
+                if spec.runtime == detect::PATCHWORK_RUNTIME {
+                    return Err(first_error.context(
+                        "this machine has no key for the provider this agent uses \
+(Settings → Patchwork agent providers)",
+                    ));
+                }
                 return Err(first_error.context(
                     "the runtime needs to be signed in on this machine \
 (run it once yourself, or set its API key environment variable)",
@@ -826,6 +834,14 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Vec<(String, Stri
         let path = std::env::var("PATH").unwrap_or_default();
         env.push(("PATH".into(), format!("{dir}:{path}")));
     }
+    // Our own agent is Pi with a provider the workspace picked, pointed at a
+    // config directory this app owns rather than the user's own `~/.pi`.
+    if spec.runtime == detect::PATCHWORK_RUNTIME {
+        env.extend(crate::providers::pi_env(
+            spec.provider.as_deref(),
+            spec.model.as_deref(),
+        ));
+    }
     env.extend(cfg.env.iter().cloned());
     env.extend(spec.env.iter().cloned());
     env
@@ -882,6 +898,7 @@ mod tests {
             agent_name: "Developer agent".into(),
             agent_description: "You ship small, reviewable changes.".into(),
             runtime: "codex".into(),
+            provider: None,
             model: None,
             permission_mode: None,
             custom_command: None,

@@ -15,6 +15,23 @@ export interface DesktopSettings {
   host_name: string;
   project_paths: Record<string, string>;
   awake: AwakePolicy;
+  /// Provider id to the literal string `stored`. The key itself never leaves
+  /// the machine it was typed on, so what comes back is only ever the fact
+  /// that there is one.
+  provider_keys: Record<string, string>;
+}
+
+/// A model provider the built-in Patchwork agent can be pointed at. The list
+/// comes from the app rather than from a constant here, because which
+/// providers exist is a property of the Pi agent this machine will run.
+export interface ProviderInfo {
+  id: string;
+  label: string;
+  /// Empty for subscription providers: there is nothing to paste.
+  env_var: string;
+  subscription: boolean;
+  hint: string;
+  recommended_model?: string;
 }
 
 export interface HostStatus {
@@ -62,6 +79,7 @@ function browserSettings(): DesktopSettings {
     host_name: parsed.host_name ?? "",
     project_paths: parsed.project_paths ?? {},
     awake: parsed.awake ?? "never",
+    provider_keys: parsed.provider_keys ?? {},
   };
 }
 
@@ -131,6 +149,7 @@ export async function joinWorkspace(input: {
     host_name: "",
     project_paths: {},
     awake: "never",
+    provider_keys: {},
   };
   localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
   return settings;
@@ -158,6 +177,30 @@ export async function setProjectPaths(
 export async function setAwakePolicy(policy: AwakePolicy): Promise<DesktopSettings> {
   if (inTauri) return invoke<DesktopSettings>("set_awake_policy", { policy });
   return { ...browserSettings(), awake: policy };
+}
+
+/// The providers this machine could run the Patchwork agent against. Empty in
+/// a browser: there is no machine here to hold a key, so there is nothing to
+/// offer.
+export async function providerCatalog(): Promise<ProviderInfo[]> {
+  if (inTauri) return invoke<ProviderInfo[]>("patchwork_providers");
+  return [];
+}
+
+/// An empty key removes the stored one.
+export async function setProviderKey(
+  provider: string,
+  key: string,
+): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("set_provider_key", { provider, key });
+  return browserSettings();
+}
+
+/// Subscription providers are signed into, not pasted. Returns the command
+/// that does it; on macOS the app has already opened a Terminal running it.
+export async function piLogin(provider: string): Promise<string> {
+  if (inTauri) return invoke<string>("pi_login", { provider });
+  return "";
 }
 
 export async function reconnectHost(): Promise<HostStatus> {

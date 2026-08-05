@@ -1,4 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChartAssemblyInput } from "flint-chart";
+import type { EChartsType } from "echarts";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
@@ -29,6 +31,8 @@ export function Card({ card }: { card: MessageCard }) {
       return <PreviewCard previewId={card.preview_id} />;
     case "pull_request":
       return <PullRequestCard url={card.url} taskId={card.task_id} />;
+    case "chart":
+      return <ChartCard spec={card.spec} caption={card.caption} />;
   }
 }
 
@@ -294,6 +298,79 @@ function ArtifactCard({
         <button className="button" onClick={() => openExternal(url)}>
           Open file
         </button>
+      )}
+      {caption && <div className="card-sub">{caption}</div>}
+    </div>
+  );
+}
+
+/// A chart arrives as a spec, not as a picture: the agent says what the data is
+/// and what to show, and it is compiled here. Both libraries are imported
+/// inside the effect rather than at the top of the file, so they land in their
+/// own chunk — a workspace that never sees a chart never pays for one.
+function ChartCard({ spec, caption }: { spec: unknown; caption?: string }) {
+  const host = useRef<HTMLDivElement>(null);
+  const [failed, setFailed] = useState("");
+  // A reaction or an edit hands us a fresh copy of the same message, and
+  // redrawing the chart because an emoji arrived would be a visible flicker.
+  // Only the contents decide whether it is a different chart.
+  const identity = useMemo(() => JSON.stringify(spec), [spec]);
+
+  // The app has no theme control of its own, it follows the system, so the
+  // chart follows it too rather than picking a side at mount and keeping it.
+  const [dark, setDark] = useState(
+    () => window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+  useEffect(() => {
+    const scheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const sync = () => setDark(scheme.matches);
+    scheme.addEventListener("change", sync);
+    return () => scheme.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
+    let chart: EChartsType | undefined;
+    let observer: ResizeObserver | undefined;
+    let dropped = false;
+
+    void (async () => {
+      try {
+        const [flint, echarts] = await Promise.all([
+          import("flint-chart"),
+          import("echarts"),
+        ]);
+        const option = flint.assembleECharts(spec as ChartAssemblyInput);
+        if (dropped || !host.current) return;
+        chart = echarts.init(host.current, dark ? "dark" : null);
+        // The card already paints `--surface`; the chart sits on it.
+        chart.setOption({ ...option, backgroundColor: "transparent" });
+        observer = new ResizeObserver(() => chart?.resize());
+        observer.observe(host.current);
+      } catch (error) {
+        // A spec we cannot draw is one quiet card, never a broken transcript.
+        if (!dropped) setFailed(String((error as Error).message ?? error));
+      }
+    })();
+
+    return () => {
+      dropped = true;
+      observer?.disconnect();
+      chart?.dispose();
+    };
+    // `spec` is deliberately absent: `identity` is what says it changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identity, dark]);
+
+  const height =
+    (spec as { chart_spec?: { baseSize?: { height?: number } } })?.chart_spec
+      ?.baseSize?.height ?? 320;
+
+  return (
+    <div className="card">
+      {failed ? (
+        <div className="notice">This chart could not be drawn: {failed}</div>
+      ) : (
+        <div ref={host} style={{ width: "100%", height }} />
       )}
       {caption && <div className="card-sub">{caption}</div>}
     </div>

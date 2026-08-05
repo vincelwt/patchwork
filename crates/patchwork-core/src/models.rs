@@ -83,12 +83,18 @@ pub struct AgentProfile {
     /// responsibilities, working style, and what it will decline.
     #[serde(default)]
     pub description: String,
-    /// Id of a runtime in the host's catalog: `codex`, `claude`, `pi`, `custom`.
+    /// Id of a runtime in the host's catalog: `codex`, `claude`, `gemini`,
+    /// `grok`, `opencode`, `pi`, `patchwork`, `custom`.
     #[serde(default = "default_runtime")]
     pub runtime: String,
     /// For `runtime == "custom"`: the ACP command line to launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_command: Option<Vec<String>>,
+    /// For `runtime == "patchwork"`: whose models it thinks with. The key or
+    /// login itself belongs to the machine that runs it, never to the
+    /// workspace, so only the choice is stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub location: ExecutionLocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +133,7 @@ impl Default for AgentProfile {
             description: String::new(),
             runtime: default_runtime(),
             custom_command: None,
+            provider: None,
             location: ExecutionLocation::default(),
             host_id: None,
             dm_enabled: true,
@@ -224,6 +231,14 @@ pub enum MessageCard {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<Id>,
+    },
+    /// A chart, as a Flint chart spec: data, what the fields mean, and how to
+    /// draw them. Kept as the spec rather than an image so it stays readable,
+    /// re-renderable and small.
+    Chart {
+        spec: Json,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
     },
 }
 

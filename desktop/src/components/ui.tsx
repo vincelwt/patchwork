@@ -99,6 +99,10 @@ export interface Option {
   value: string;
   label: string;
   hint?: string;
+  /// A mark that identifies the option faster than its name does — a runtime's
+  /// logo, not decoration. `.menu-icon` is the same leading-icon slot the
+  /// popover menus use, so nothing new had to be styled.
+  icon?: ReactNode;
 }
 
 /// Popovers live at the top of the document, not inside whatever opened them.
@@ -288,6 +292,7 @@ export function Dropdown({
           }
         }}
       >
+        {current?.icon && <span className="menu-icon">{current.icon}</span>}
         <span className="dropdown-value">{current?.label ?? placeholder}</span>
         <ChevronIcon size={13} />
       </button>
@@ -307,6 +312,7 @@ export function Dropdown({
                   setOpen(false);
                 }}
               >
+                {option.icon && <span className="menu-icon">{option.icon}</span>}
                 <span className="grow">
                   <span className="name">{option.label}</span>
                   {option.hint && <span className="sub">{option.hint}</span>}

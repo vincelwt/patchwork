@@ -72,6 +72,37 @@ patchwork pr https://github.com/acme/app/pull/42
 `preview` exposes a dev server you started so a human can open it. Attach
 screenshots and other evidence to the task when work is ready for review.
 
+## Charts
+
+Numbers worth comparing belong in a chart, not a markdown table.
+
+```bash
+patchwork chart chart.json --caption "p95 latency by endpoint, last 7 days"
+cat chart.json | patchwork chart - --caption "Signups per week"
+```
+
+The file is a [Flint](https://microsoft.github.io/flint-chart/) chart spec:
+data, what each field means, and how to draw it. Patchwork renders it, so send
+the spec rather than an image.
+
+```json
+{
+  "data": { "values": [{ "week": "2026-07-06", "signups": 128 }] },
+  "semantic_types": { "week": "Date", "signups": "Count" },
+  "chart_spec": {
+    "chartType": "Line Chart",
+    "encodings": { "x": { "field": "week" }, "y": { "field": "signups" } }
+  }
+}
+```
+
+Common `chartType` values: `Bar Chart`, `Line Chart`, `Area Chart`,
+`Scatter Plot`, `Pie Chart`, `Histogram`, `Heatmap`, `Box Plot`. Semantic types
+(`Date`, `Count`, `Price`, `Percentage`, `Duration`, `Rank`, `Country`, …) are
+what let Flint pick sensible axes and colours — name them where you can.
+Aggregate before sending: the spec carries its own data, so keep it to the rows
+that make the point.
+
 ## Automations
 
 ```bash

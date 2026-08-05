@@ -152,11 +152,17 @@ patchwork ask --question "Which auth?" --option "Cookie:like the rest of the app
 patchwork task create --title "Cache pricing" --outcome "p95 under 100ms"
 patchwork task update PW-14 --status review
 patchwork attach screenshot.png --caption "Checkout after the fix"
+patchwork chart latency.json --caption "p95 by endpoint, last 7 days"
 patchwork preview --port 5173
 patchwork pr https://github.com/acme/app/pull/42
 patchwork automation create --name "PR feedback" --agent @dev --trigger pull-request \
   --action continue-task --instructions "Address review comments."
 ```
+
+`patchwork chart` takes a [Flint](https://microsoft.github.io/flint-chart/)
+chart spec — data plus what the fields mean — and posts it as a card the app
+renders. Numbers an agent measured stay legible and re-readable instead of
+being flattened into a markdown table or a screenshot.
 
 `patchwork ask` blocks until a human answers. The question appears as a native
 card in the conversation and in the right person's Inbox, the run visibly waits,

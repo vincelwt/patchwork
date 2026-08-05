@@ -29,11 +29,39 @@ pub struct Settings {
     /// Whether to stop this machine sleeping, and when.
     #[serde(default)]
     pub awake: crate::awake::AwakePolicy,
+    /// Provider id -> API key for the Patchwork agent. Deliberately here and
+    /// not in the workspace: a key is this machine's, and syncing it to a
+    /// relay would put every teammate's device between it and the model.
+    #[serde(default)]
+    pub provider_keys: BTreeMap<String, String>,
 }
 
 impl Settings {
     pub fn is_connected(&self) -> bool {
         !self.relay_url.is_empty() && !self.token.is_empty()
+    }
+
+    /// The same settings with the keys' values replaced by the fact that they
+    /// exist. Everything the UI needs, and nothing it could leak.
+    pub fn redacted(&self) -> Settings {
+        let mut copy = self.clone();
+        for value in copy.provider_keys.values_mut() {
+            *value = "stored".into();
+        }
+        copy
+    }
+
+    /// What an agent process needs to reach the models it was configured with.
+    pub fn provider_env(&self) -> Vec<(String, String)> {
+        self.provider_keys
+            .iter()
+            .filter(|(_, key)| !key.is_empty())
+            .filter_map(|(id, key)| {
+                let provider = patchwork_agent::providers::provider(id)?;
+                (!provider.env_var.is_empty())
+                    .then(|| (provider.env_var.to_string(), key.clone()))
+            })
+            .collect()
     }
 }
 
@@ -59,6 +87,12 @@ pub fn save(settings: &Settings) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(settings)?)?;
+    // This file holds provider API keys, so it is nobody else's business.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 

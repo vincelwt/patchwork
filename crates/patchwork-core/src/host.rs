@@ -39,8 +39,13 @@ pub struct RunSpec {
     /// The agent's public description / personality prompt.
     #[serde(default)]
     pub agent_description: String,
-    /// `codex`, `claude`, `pi`, `custom`.
+    /// `codex`, `claude`, `gemini`, `grok`, `opencode`, `pi`, `patchwork`,
+    /// `custom`.
     pub runtime: String,
+    /// For the `patchwork` runtime: whose models to think with. The credential
+    /// stays on the host; this is only the choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// The model this agent should think with, named as the runtime names it.
     /// Unset leaves the machine's own runtime configuration alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]

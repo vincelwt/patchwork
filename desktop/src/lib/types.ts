@@ -25,6 +25,9 @@ export interface AgentProfile {
   /// the id — `gpt-5.6-sol[high]` — so this is both "which model" and "how hard
   /// should it think".
   model?: string;
+  /// Only the built-in `patchwork` runtime asks for one: it brings the agent
+  /// but not the model, so a provider has to be named and keyed per machine.
+  provider?: string;
   permission_mode?: string;
   dm_enabled: boolean;
   default_participation: Participation;
@@ -75,7 +78,10 @@ export type MessageCard =
   | { type: "question"; question_id: Id }
   | { type: "artifact"; attachment_id: Id; caption?: string }
   | { type: "preview"; preview_id: Id }
-  | { type: "pull_request"; url: string; task_id?: Id };
+  | { type: "pull_request"; url: string; task_id?: Id }
+  /// A Flint `ChartAssemblyInput`. Left `unknown` because the shape belongs to
+  /// flint-chart, and re-declaring it here would only rot against it.
+  | { type: "chart"; spec: unknown; caption?: string };
 
 export interface Attachment {
   id: Id;

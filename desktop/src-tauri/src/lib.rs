@@ -49,7 +49,7 @@ struct JoinInput {
 #[tauri::command]
 async fn desktop_boot(state: tauri::State<'_, AppState>) -> Result<DesktopBoot, String> {
     Ok(DesktopBoot {
-        settings: settings::load(),
+        settings: settings::load().redacted(),
         host: state.local_host.status().await,
         platform: patchwork_agent::detect::platform(),
     })
@@ -58,11 +58,57 @@ async fn desktop_boot(state: tauri::State<'_, AppState>) -> Result<DesktopBoot, 
 #[tauri::command]
 async fn desktop_info(state: tauri::State<'_, AppState>) -> Result<DesktopInfo, String> {
     Ok(DesktopInfo {
-        settings: settings::load(),
+        settings: settings::load().redacted(),
         host: state.local_host.status().await,
         platform: patchwork_agent::detect::platform(),
         capabilities: patchwork_agent::detect_capabilities().await,
     })
+}
+
+/// The providers the Patchwork agent can be pointed at.
+#[tauri::command]
+fn patchwork_providers() -> &'static [patchwork_agent::ProviderInfo] {
+    patchwork_agent::PROVIDERS
+}
+
+/// Remember an API key for a provider, or forget it when the key is empty.
+/// The host is restarted because a run picks its environment up at launch.
+#[tauri::command]
+async fn set_provider_key(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    key: String,
+) -> Result<Settings, String> {
+    let mut current = settings::load();
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        current.provider_keys.remove(&provider);
+    } else {
+        current.provider_keys.insert(provider, key);
+    }
+    settings::save(&current).map_err(|e| e.to_string())?;
+    state.local_host.restart(current.clone()).await;
+    Ok(current.redacted())
+}
+
+/// Sign the Patchwork agent into a subscription. The flow is a browser login
+/// and a pasted code, so it belongs in a terminal: we open one where we can,
+/// and hand back the command either way.
+#[tauri::command]
+fn pi_login(provider: String) -> Result<String, String> {
+    let command = patchwork_agent::providers::login_command(&provider);
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{}\"\ntell application \"Terminal\" to activate",
+            command.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn();
+    }
+    Ok(command)
 }
 
 /// Redeem an invite, remember the device token, and bring this machine online
@@ -117,7 +163,7 @@ async fn join_workspace(
     settings::save(&current).map_err(|e| e.to_string())?;
 
     state.local_host.restart(current.clone()).await;
-    Ok(current)
+    Ok(current.redacted())
 }
 
 #[tauri::command]
@@ -139,7 +185,7 @@ async fn set_project_paths(
     current.project_paths = paths;
     settings::save(&current).map_err(|e| e.to_string())?;
     state.local_host.restart(current.clone()).await;
-    Ok(current)
+    Ok(current.redacted())
 }
 
 /// Keep this machine awake — never, only while it is running an agent, or for
@@ -153,7 +199,7 @@ async fn set_awake_policy(
     current.awake = policy;
     settings::save(&current).map_err(|e| e.to_string())?;
     state.awake.set_policy(policy);
-    Ok(current)
+    Ok(current.redacted())
 }
 
 #[tauri::command]
@@ -218,7 +264,10 @@ pub fn run() {
             sign_out,
             set_project_paths,
             set_awake_policy,
-            reconnect_host
+            reconnect_host,
+            patchwork_providers,
+            set_provider_key,
+            pi_login
         ])
         .run(tauri::generate_context!())
         .expect("error while running Patchwork");
