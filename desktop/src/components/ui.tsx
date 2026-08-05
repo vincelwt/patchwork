@@ -281,10 +281,14 @@ export function Dropdown({
         }
       }
     };
-    window.addEventListener("mousedown", onDown);
+    // Capture, like the keys: a dialog stops mousedown from bubbling so that
+    // a click inside it is not taken for a click on the backdrop, and a
+    // dropdown listening on the way up never hears about the click that
+    // should close it.
+    window.addEventListener("mousedown", onDown, true);
     window.addEventListener("keydown", onKey, true);
     return () => {
-      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousedown", onDown, true);
       window.removeEventListener("keydown", onKey, true);
     };
   }, [open, options, active, onChange]);
@@ -423,11 +427,12 @@ export function Menu({
         }
       }
     };
-    // Capture, so a menu inside a modal closes the menu and not the modal.
-    window.addEventListener("mousedown", onDown);
+    // Capture, so a menu inside a modal closes the menu and not the modal —
+    // and so it hears clicks the dialog stops from bubbling at all.
+    window.addEventListener("mousedown", onDown, true);
     window.addEventListener("keydown", onKey, true);
     return () => {
-      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousedown", onDown, true);
       window.removeEventListener("keydown", onKey, true);
     };
   }, [onClose, active, selectable.length]);

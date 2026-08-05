@@ -36,6 +36,7 @@ import {
 } from "./ui";
 import {
   CheckIcon,
+  ChevronIcon,
   ExternalIcon,
   FolderIcon,
   MoreIcon,
@@ -194,6 +195,153 @@ function locationLabel(profile?: AgentProfile) {
   }
 }
 
+/// A model by its id, typed or picked.
+///
+/// A list is a suggestion, not the truth: a runtime only reports what it can
+/// run once it has opened a session, and providers add models faster than
+/// anything here learns about them. So the field is an input, and the list
+/// fills it in.
+function ModelField({
+  value,
+  onChange,
+  models,
+  fallback,
+  help,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  models: RuntimeOption[];
+  /// What runs when the field is empty.
+  fallback?: string;
+  help: string;
+}) {
+  return (
+    <div className="form-row">
+      <label>Model</label>
+      <div className="field-row">
+        <input
+          className="field grow"
+          {...plainText}
+          value={value}
+          placeholder={
+            fallback ? `${fallback} — the default` : "whatever the machine is set to"
+          }
+          onChange={(event) => onChange(event.target.value)}
+        />
+        {models.length > 0 && (
+          <MenuButton
+            align="right"
+            title="Models this runtime reported"
+            header="Reported by the runtime"
+            items={[
+              {
+                key: "",
+                label: fallback ? `${fallback} — the default` : "The machine's default",
+                onSelect: () => onChange(""),
+              },
+              ...models.map((model) => ({
+                key: model.id,
+                label: model.name,
+                hint: model.description || model.id,
+                onSelect: () => onChange(model.id),
+              })),
+            ]}
+          >
+            <ChevronIcon size={14} />
+          </MenuButton>
+        )}
+      </div>
+      <span className="form-help">{help}</span>
+    </div>
+  );
+}
+
+/// Store a provider key, sign into a subscription, or forget one. Used both
+/// in Settings and wherever a provider is being chosen, because "add one in
+/// Settings" is a worse answer than a box to paste it in.
+function ProviderKeyControls({
+  provider,
+  stored,
+  onChanged,
+}: {
+  provider: ProviderInfo;
+  stored: boolean;
+  onChanged: (keys: Record<string, string>) => void;
+}) {
+  const { toast } = useNavigation();
+  const [draft, setDraft] = useState("");
+  const [command, setCommand] = useState("");
+
+  const save = async (key: string) => {
+    try {
+      const settings = await setProviderKey(provider.id, key);
+      setDraft("");
+      onChanged(settings.provider_keys);
+    } catch (err) {
+      toast(String((err as Error).message ?? err));
+    }
+  };
+
+  if (stored) {
+    return (
+      <>
+        <Chip tone="positive">key stored</Chip>
+        <button className="button quiet danger" onClick={() => void save("")}>
+          Remove
+        </button>
+      </>
+    );
+  }
+
+  if (provider.subscription) {
+    return (
+      <>
+        <button
+          className="button"
+          onClick={async () => {
+            try {
+              setCommand(await piLogin(provider.id));
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+          }}
+        >
+          Sign in
+        </button>
+        {command && (
+          <div className="notice">
+            Run this in a terminal to finish signing in
+            <pre className="code-block">{command}</pre>
+          </div>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <input
+        className="field grow"
+        {...plainText}
+        type="password"
+        placeholder={provider.env_var}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && draft.trim()) void save(draft.trim());
+        }}
+      />
+      <button
+        className="button"
+        disabled={!draft.trim()}
+        onClick={() => void save(draft.trim())}
+      >
+        Save
+      </button>
+    </>
+  );
+}
+
 export function AgentModal({
   agent,
   onClose,
@@ -321,7 +469,7 @@ export function AgentModal({
   // machine you are sitting at has a key for it. Both are loaded together
   // because neither is worth a render on its own.
   const isPatchwork = profile.runtime === "patchwork";
-  const { value: providers } = useAsync(
+  const { value: providers, setValue: setProviders } = useAsync(
     async () =>
       isPatchwork
         ? {
@@ -435,46 +583,50 @@ export function AgentModal({
             }))}
             help="The Patchwork agent brings no model of its own."
           />
-          {providerUnkeyed && (
-            <div className="notice">
-              No key for {chosenProvider?.label} on this machine. Add one in
-              Settings.
+          {/* Asking for the key here rather than sending you to Settings: it
+              is the one thing standing between this agent and its first run. */}
+          {chosenProvider && (
+            <div className="form-row">
+              <label>
+                {chosenProvider.label} key
+                <span className="label-note">stays on this machine</span>
+              </label>
+              <div className="field-row">
+                <ProviderKeyControls
+                  provider={chosenProvider}
+                  stored={!providerUnkeyed}
+                  onChanged={(keys) =>
+                    setProviders({ list: providers?.list ?? [], keys })
+                  }
+                />
+              </div>
             </div>
           )}
         </>
       )}
 
-      {models.length > 0 ? (
-        <FormSelect
-          label="Model"
-          value={profile.model ?? ""}
-          onChange={(model) => setProfile({ ...profile, model: model || undefined })}
-          options={[
-            {
-              value: "",
-              label: defaultModel
-                ? `Whatever the machine is set to (${defaultModel})`
-                : "Whatever the machine is set to",
-            },
-            ...models.map((model) => ({
-              value: model.id,
-              label: model.name,
-              hint: model.description || undefined,
-            })),
-          ]}
-          help="Codex folds reasoning depth into the model, so this is also how hard it thinks."
-        />
-      ) : (
+      {profile.runtime === "custom" ? (
         <div className="form-row">
           <label>Model</label>
           <div className="notice">
-            {profile.runtime === "custom"
-              ? "A custom command brings its own model configuration."
-              : isPatchwork
-                ? "The recommended model is DeepSeek V4 Flash, and it is what runs unless you pick another once the provider has reported its list."
-                : "The list appears once this runtime has opened a session — it is the only thing that knows what it can run. Until then it uses the machine's own configuration."}
+            A custom command brings its own model configuration.
           </div>
         </div>
+      ) : (
+        <ModelField
+          value={profile.model ?? ""}
+          onChange={(model) => setProfile({ ...profile, model: model || undefined })}
+          models={models}
+          fallback={
+            defaultModel ??
+            (isPatchwork ? chosenProvider?.recommended_model : undefined)
+          }
+          help={
+            models.length > 0
+              ? "An id you can type, so a model this machine has not reported yet is still reachable."
+              : "Type the model id. The picker fills in once the runtime has opened a session and said what it can run."
+          }
+        />
       )}
 
       {modes.length > 0 && (
@@ -1947,7 +2099,6 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
 /// so this is the one settings section that describes only the box you are
 /// sitting at.
 function ProviderSection() {
-  const { toast } = useNavigation();
   const { value: state, setValue } = useAsync(
     async () => ({
       list: await providerCatalog(),
@@ -1955,20 +2106,7 @@ function ProviderSection() {
     }),
     [],
   );
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [command, setCommand] = useState("");
-
   if (!state?.list.length) return null;
-
-  const save = async (provider: string, key: string) => {
-    try {
-      const settings = await setProviderKey(provider, key);
-      setDrafts({ ...drafts, [provider]: "" });
-      setValue({ list: state.list, keys: settings.provider_keys });
-    } catch (err) {
-      toast(String((err as Error).message ?? err));
-    }
-  };
 
   return (
     <Section
@@ -1979,68 +2117,19 @@ function ProviderSection() {
         </span>
       }
     >
-      {state.list.map((provider) => {
-        const draft = drafts[provider.id] ?? "";
-        return (
-          <div className="row" key={provider.id}>
-            <span className="grow">
-              <span className="name">{provider.label}</span>
-              <span className="sub">{provider.hint}</span>
-            </span>
-            {state.keys[provider.id] ? (
-              <>
-                <Chip tone="positive">key stored</Chip>
-                <button
-                  className="button quiet danger"
-                  onClick={() => save(provider.id, "")}
-                >
-                  Remove
-                </button>
-              </>
-            ) : provider.subscription ? (
-              <button
-                className="button"
-                onClick={async () => {
-                  try {
-                    setCommand(await piLogin(provider.id));
-                  } catch (err) {
-                    toast(String((err as Error).message ?? err));
-                  }
-                }}
-              >
-                Sign in
-              </button>
-            ) : (
-              <>
-                <input
-                  className="field"
-                  {...plainText}
-                  type="password"
-                  style={{ width: 190 }}
-                  placeholder={provider.env_var}
-                  value={draft}
-                  onChange={(event) =>
-                    setDrafts({ ...drafts, [provider.id]: event.target.value })
-                  }
-                />
-                <button
-                  className="button"
-                  disabled={!draft.trim()}
-                  onClick={() => save(provider.id, draft.trim())}
-                >
-                  Save
-                </button>
-              </>
-            )}
-          </div>
-        );
-      })}
-      {command && (
-        <div className="notice">
-          Run this in a terminal to finish signing in
-          <pre className="code-block">{command}</pre>
+      {state.list.map((provider) => (
+        <div className="row" key={provider.id}>
+          <span className="grow">
+            <span className="name">{provider.label}</span>
+            <span className="sub">{provider.hint}</span>
+          </span>
+          <ProviderKeyControls
+            provider={provider}
+            stored={!!state.keys[provider.id]}
+            onChanged={(keys) => setValue({ list: state.list, keys })}
+          />
         </div>
-      )}
+      ))}
     </Section>
   );
 }
