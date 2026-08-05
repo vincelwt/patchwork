@@ -11,7 +11,7 @@ CANVAS = 1024
 PLATE = 824              # Apple's macOS icon content box inside a 1024 canvas
 RADIUS_RATIO = 0.2251    # 185.4 / 824
 PLATE_TOP = (253, 252, 249)     # plate gradient, lit from the top
-PLATE_BOTTOM = (234, 229, 219)
+PLATE_BOTTOM = (242, 238, 230)
 BUBBLE_INSET = 0.115     # bubble block margin inside the plate
 LAYERS = ["BubbleTopLeft", "BubbleTopRight", "BubbleBottomLeft", "BubbleBottomRight"]
 
@@ -49,14 +49,14 @@ def main(assets, out):
     ] + [plate_mask])
 
     # rim: darken toward the edge, then a highlight along the top-left
-    edge = plate_mask.filter(ImageFilter.GaussianBlur(26))
-    rim = Image.new("RGBA", (PLATE, PLATE), (150, 142, 128, 255))
-    rim.putalpha(edge.point(lambda v: round((255 - v) * 0.5)))
+    edge = plate_mask.filter(ImageFilter.GaussianBlur(40))
+    rim = Image.new("RGBA", (PLATE, PLATE), (178, 170, 156, 255))
+    rim.putalpha(edge.point(lambda v: round((255 - v) * 0.18)))
     plate.alpha_composite(Image.composite(rim, Image.new("RGBA", rim.size), plate_mask))
     lit = Image.new("RGBA", (PLATE, PLATE), (255, 255, 255, 255))
     shifted = Image.new("L", (PLATE, PLATE))
     shifted.paste(edge, (7, 9))
-    lit.putalpha(Image.eval(ImageChops.subtract(edge, shifted), lambda v: round(v * 2.2)))
+    lit.putalpha(Image.eval(ImageChops.subtract(edge, shifted), lambda v: round(v * 1.3)))
     plate.alpha_composite(Image.composite(lit, Image.new("RGBA", lit.size), plate_mask))
 
     # bubbles: source layers are laid out in a 1024 grid, scale into the plate
