@@ -65,6 +65,48 @@ export function relative(at?: Millis) {
   return new Date(at).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+/// A due date reads as a deadline, not as a timestamp: what matters is how
+/// many days are left, and whether that number is negative.
+export function dueLabel(at?: Millis): { text: string; overdue: boolean } | undefined {
+  if (!at) return undefined;
+  const days = Math.round((dayStart(at) - dayStart(Date.now())) / 86_400_000);
+  const text =
+    days === 0
+      ? "due today"
+      : days === 1
+        ? "due tomorrow"
+        : days === -1
+          ? "due yesterday"
+          : days > 0
+            ? `due in ${days}d`
+            : `${-days}d overdue`;
+  return { text, overdue: days <= 0 };
+}
+
+/// Local midnight: a due date is a day, not an instant.
+export function dayStart(at: Millis): Millis {
+  const date = new Date(at);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+/// The `yyyy-mm-dd` an `<input type="date">` speaks, in local time.
+export function dateInputValue(at?: Millis): string {
+  if (!at) return "";
+  const date = new Date(at);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+/// 0 means "no date", which is what the relay understands as clearing it.
+export function dateInputToMillis(value: string): number {
+  if (!value) return 0;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return 0;
+  return new Date(year, month - 1, day).getTime();
+}
+
 export function duration(from?: Millis, to?: Millis) {
   if (!from) return "";
   const seconds = Math.max(0, Math.round(((to ?? Date.now()) - from) / 1000));

@@ -136,6 +136,9 @@ pub struct CreateTask {
     pub code_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_worktree_id: Option<Id>,
+    /// Epoch millis, or 0 for no date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<i64>,
     /// Start the owning agent immediately.
     #[serde(default)]
     pub start: bool,
@@ -157,6 +160,9 @@ pub struct UpdateTask {
     pub host_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// Epoch millis, or 0 to clear the date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<f64>,
 }
@@ -247,10 +253,6 @@ pub struct CreateProject {
     /// host id -> absolute path
     #[serde(default)]
     pub paths: std::collections::BTreeMap<Id, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dev_command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dev_port: Option<u16>,
 }
 
 // --- automations ------------------------------------------------------------

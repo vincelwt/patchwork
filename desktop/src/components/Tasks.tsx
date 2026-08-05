@@ -1,6 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useApi, useApp, useAppSelector } from "../lib/store";
-import { relative, statusLabel, statusTone } from "../lib/format";
+import {
+  dateInputToMillis,
+  dateInputValue,
+  dueLabel,
+  relative,
+  statusLabel,
+  statusTone,
+} from "../lib/format";
 import { readTask, situationTone, stepIndex, TASK_STEPS } from "../lib/task";
 import type { NextAction, TaskState } from "../lib/task";
 import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
@@ -131,6 +138,16 @@ export function TasksBoard() {
   const [dragging, setDragging] = useState<string | null>(null);
   const [dropColumn, setDropColumn] = useState<TaskStatus | null>(null);
   const [creating, setCreating] = useState(false);
+  // Two ways to look at the same tasks, remembered: a board is for moving work
+  // along, a list is for reading it. Which one you want is a habit, not a
+  // per-visit decision.
+  const [layout, setLayout] = useState<"board" | "list">(
+    () => (localStorage.getItem("patchwork.taskLayout") as "board" | "list") ?? "board",
+  );
+  const setLayoutAndRemember = (next: "board" | "list") => {
+    setLayout(next);
+    localStorage.setItem("patchwork.taskLayout", next);
+  };
 
   const tasks = useMemo(
     () =>
@@ -180,12 +197,29 @@ export function TasksBoard() {
             })),
           ]}
         />
+        <div className="segmented compact">
+          <button
+            className={layout === "board" ? "active" : ""}
+            onClick={() => setLayoutAndRemember("board")}
+          >
+            Board
+          </button>
+          <button
+            className={layout === "list" ? "active" : ""}
+            onClick={() => setLayoutAndRemember("list")}
+          >
+            List
+          </button>
+        </div>
         <button className="button" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
           New task
         </button>
       </div>
 
+      {layout === "list" ? (
+        <TaskList tasks={tasks} />
+      ) : (
       <div className="board">
         {TASK_STATUSES.map((status) => {
           const column = tasks.filter((task) => task.status === status);
@@ -226,8 +260,79 @@ export function TasksBoard() {
           );
         })}
       </div>
+      )}
 
       {creating && <NewTaskModal onClose={() => setCreating(false)} />}
+    </div>
+  );
+}
+
+/// The same tasks as rows, grouped by status, with the empty statuses left
+/// out: a board shows you that Blocked is empty because the column is part of
+/// the shape; a list saying "Blocked (0)" is just noise to scroll past.
+function TaskList({ tasks }: { tasks: Task[] }) {
+  const app = useApp();
+  const { go } = useNavigation();
+
+  const groups = TASK_STATUSES.map((status) => ({
+    status,
+    items: tasks
+      .filter((task) => task.status === status)
+      .sort(
+        (a, b) =>
+          (a.due_at ?? Number.MAX_SAFE_INTEGER) - (b.due_at ?? Number.MAX_SAFE_INTEGER) ||
+          b.updated_at - a.updated_at,
+      ),
+  })).filter((group) => group.items.length > 0);
+
+  if (groups.length === 0) {
+    return (
+      <div className="empty">
+        <div className="empty-title">Nothing here yet</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="task-list">
+      {groups.map((group) => (
+        <div key={group.status}>
+          <div className="section-head">
+            <span className={`column-dot ${group.status}`} />
+            <span className="section-title">{statusLabel(group.status)}</span>
+            <span className="count">{group.items.length}</span>
+          </div>
+          {group.items.map((task) => {
+            const state = readTask(task, app.members, app.runs, app.questions);
+            const project = app.projects.find(
+              (candidate) => candidate.id === task.project_id,
+            );
+            const due = dueLabel(task.due_at);
+            return (
+              <button
+                key={task.id}
+                className="row hoverable"
+                onClick={() => go({ kind: "task", id: task.id })}
+              >
+                <span className="task-key">{task.key}</span>
+                <span className="grow">
+                  <span className="name">{task.title}</span>
+                  <span className="sub">{state.headline}</span>
+                </span>
+                {due && task.status !== "done" && (
+                  <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
+                )}
+                {project && <Chip>{project.name}</Chip>}
+                {state.owner ? (
+                  <Avatar member={state.owner} size={20} />
+                ) : (
+                  <span className="unowned">unassigned</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -260,6 +365,7 @@ function TaskCard({
   const project = app.projects.find((candidate) => candidate.id === task.project_id);
   const state = readTask(task, app.members, app.runs, app.questions);
   const actions = useTaskActions(task);
+  const due = dueLabel(task.due_at);
 
   // Only the situations that say something get a line of their own. A card that
   // is simply planned and owned needs no commentary.
@@ -299,6 +405,9 @@ function TaskCard({
       )}
 
       <div className="meta">
+        {due && task.status !== "done" && (
+          <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
+        )}
         {project && <Chip>{project.name}</Chip>}
         {task.pr_state && (
           <Chip tone={task.pr_state.checks === "FAILURE" ? "danger" : ""}>
@@ -348,6 +457,7 @@ export function NewTaskModal({
     return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
   });
   const [start, setStart] = useState(true);
+  const [due, setDue] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -360,6 +470,7 @@ export function NewTaskModal({
         owner_id: owner || undefined,
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
+        due_at: dateInputToMillis(due) || undefined,
         start: start && !!owner,
       });
       onClose();
@@ -427,6 +538,18 @@ export function NewTaskModal({
         ]}
         help="A code task gets its own git worktree on the machine that runs it."
       />
+      <div className="form-row">
+        <label>Due</label>
+        <input
+          className="date-input"
+          type="date"
+          value={due}
+          onChange={(event) => setDue(event.target.value)}
+        />
+        <span className="form-help">
+          Optional. It lands in the Inbox of whoever owns it on the day.
+        </span>
+      </div>
       {ownerIsAgent && (
         <Toggle
           checked={start}
@@ -560,11 +683,11 @@ export function TaskPage({ taskId }: { taskId: string }) {
   }
 
   const state = readTask(task, app.members, app.runs, app.questions);
-  const project = app.projects.find((candidate) => candidate.id === task.project_id);
   const previews = Object.values(app.previews).filter(
     (preview) => preview.task_id === task.id && preview.status === "live",
   );
   const step = stepIndex(task);
+  const due = dueLabel(task.due_at);
 
   return (
     <div className="column">
@@ -716,6 +839,21 @@ export function TaskPage({ taskId }: { taskId: string }) {
               ]}
             />
           </Fact>
+          <Fact label="Due">
+            <input
+              className="date-input"
+              type="date"
+              value={dateInputValue(task.due_at)}
+              onChange={(event) =>
+                void api.updateTask(task.id, {
+                  due_at: dateInputToMillis(event.target.value),
+                })
+              }
+            />
+            {due && task.status !== "done" && (
+              <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
+            )}
+          </Fact>
           {task.pr_url && (
             <Fact label="Pull request">
               <button className="chip" onClick={() => openExternal(task.pr_url!)}>
@@ -742,21 +880,6 @@ export function TaskPage({ taskId }: { taskId: string }) {
               </button>
             </Fact>
           ))}
-          {project?.dev_command && previews.length === 0 && (
-            <button
-              className="button quiet"
-              onClick={async () => {
-                try {
-                  await api.startPreview({ task_id: task.id });
-                  toast("Starting the preview");
-                } catch (err) {
-                  toast(String((err as Error).message ?? err));
-                }
-              }}
-            >
-              Start the preview
-            </button>
-          )}
           <span className="spacer" />
           <span className="composer-hint">updated {relative(task.updated_at)}</span>
         </div>

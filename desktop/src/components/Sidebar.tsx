@@ -207,6 +207,18 @@ export function Sidebar({
           <span className="label">Tasks</span>
           {openTasks > 0 && <span className="count">{openTasks}</span>}
         </button>
+        <button
+          className={`nav-item${isActive({ kind: "automations" }) ? " active" : ""}`}
+          onClick={() => go({ kind: "automations" })}
+        >
+          <AutomationIcon />
+          <span className="label">Automations</span>
+          {failingAutomations > 0 ? (
+            <span className="badge danger">{failingAutomations}</span>
+          ) : (
+            liveAutomations > 0 && <span className="count">{liveAutomations}</span>
+          )}
+        </button>
 
         {app.sections.map((section) => {
           const list = grouped.get(section.id) ?? [];
@@ -320,7 +332,6 @@ export function Sidebar({
           onCreate={onCreate}
           onHelp={onHelp}
           onSignOut={onSignOut}
-          automations={{ live: liveAutomations, failing: failingAutomations }}
         />
         <WorkspaceSwitcher />
       </div>
@@ -344,20 +355,13 @@ function MoreMenu({
   onCreate,
   onHelp,
   onSignOut,
-  automations,
 }: {
   me?: Member;
   onCreate: (what: Creatable, sectionId?: Id) => void;
   onHelp: () => void;
   onSignOut: () => void;
-  automations: { live: number; failing: number };
 }) {
   const { go } = useNavigation();
-  const automationHint = automations.failing
-    ? `${automations.failing} failing`
-    : automations.live
-      ? `${automations.live} on`
-      : undefined;
 
   return (
     <MenuButton
@@ -365,13 +369,6 @@ function MoreMenu({
       align="left"
       title="You, and everything else"
       items={[
-        {
-          key: "automations",
-          label: "Automations",
-          hint: automationHint,
-          icon: <AutomationIcon />,
-          onSelect: () => go({ kind: "automations" }),
-        },
         {
           key: "agents",
           label: "Agents",

@@ -133,9 +133,9 @@ struct ChartArgs {
 struct PreviewArgs {
     #[arg(long)]
     port: Option<u16>,
-    /// Command that starts the dev server. Defaults to the project's.
+    /// Command that starts the dev server.
     #[arg(long)]
-    command: Option<String>,
+    command: String,
     #[arg(long)]
     label: Option<String>,
 }

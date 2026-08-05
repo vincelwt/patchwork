@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_url                TEXT,
   pr_state              TEXT,
   created_by            TEXT NOT NULL,
+  due_at                INTEGER,
   position              REAL NOT NULL DEFAULT 0,
   created_at            INTEGER NOT NULL,
   updated_at            INTEGER NOT NULL
@@ -145,8 +146,6 @@ CREATE TABLE IF NOT EXISTS projects (
   repo_url       TEXT,
   default_branch TEXT NOT NULL DEFAULT 'main',
   paths          TEXT NOT NULL DEFAULT '{}',
-  dev_command    TEXT,
-  dev_port       INTEGER,
   created_at     INTEGER NOT NULL
 );
 

@@ -1206,8 +1206,6 @@ async fn create_project(
         repo_url: input.repo_url.clone(),
         default_branch: input.default_branch.clone().unwrap_or_else(|| "main".into()),
         paths: input.paths.clone(),
-        dev_command: input.dev_command.clone(),
-        dev_port: input.dev_port,
         created_at: now_ms(),
     };
     state.store.upsert_project(&project)?;
@@ -1241,8 +1239,6 @@ async fn update_project(
     if !input.paths.is_empty() {
         project.paths = input.paths.clone();
     }
-    project.dev_command = input.dev_command.clone();
-    project.dev_port = input.dev_port;
     state.store.upsert_project(&project)?;
     state.emit(Event::ProjectUpdated {
         project: project.clone(),
@@ -1422,10 +1418,7 @@ async fn start_preview(
     let command = input
         .command
         .clone()
-        .or_else(|| project.as_ref().and_then(|p| p.dev_command.clone()))
-        .ok_or_else(|| {
-            ApiError::bad_request("no dev command: set one on the project or pass --command")
-        })?;
+        .ok_or_else(|| ApiError::bad_request("what should I run? pass --command"))?;
     let host_id = task
         .host_id
         .clone()
@@ -1443,10 +1436,7 @@ async fn start_preview(
         })
         .ok_or_else(|| ApiError::bad_request("this task has no folder to run in"))?;
 
-    let port = input
-        .port
-        .or_else(|| project.as_ref().and_then(|p| p.dev_port))
-        .unwrap_or(4321);
+    let port = input.port.unwrap_or(4321);
 
     let preview = Preview {
         id: new_id(),

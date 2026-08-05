@@ -155,6 +155,8 @@ export interface Task {
   pr_url?: string;
   pr_state?: PullRequestState;
   created_by: Id;
+  /// When this is meant to be done. The Inbox says so on the day.
+  due_at?: Millis;
   created_at: Millis;
   updated_at: Millis;
   position: number;
@@ -168,8 +170,6 @@ export interface Project {
   repo_url?: string;
   default_branch: string;
   paths: Record<Id, string>;
-  dev_command?: string;
-  dev_port?: number;
   created_at: Millis;
 }
 
@@ -338,6 +338,7 @@ export type InboxKind =
   | "question"
   | "task_assigned"
   | "task_blocked"
+  | "task_due"
   | "review_ready"
   | "automation_failed";
 

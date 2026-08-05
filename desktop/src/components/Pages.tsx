@@ -790,7 +790,6 @@ export function ProjectsPage() {
                 {Object.keys(project.paths).length} machine
                 {Object.keys(project.paths).length === 1 ? "" : "s"}
               </Chip>
-              {project.dev_command && <Chip tone="accent">preview</Chip>}
             </button>
           ))
         )}
@@ -872,8 +871,6 @@ export function ProjectModal({
   const [description, setDescription] = useState(project?.description ?? "");
   const [repoUrl, setRepoUrl] = useState(project?.repo_url ?? "");
   const [branch, setBranch] = useState(project?.default_branch ?? "main");
-  const [devCommand, setDevCommand] = useState(project?.dev_command ?? "");
-  const [devPort, setDevPort] = useState(String(project?.dev_port ?? ""));
   const [paths, setPaths] = useState<Record<string, string>>(project?.paths ?? {});
   const [localPath, setLocalPath] = useState("");
   const [error, setError] = useState("");
@@ -893,8 +890,6 @@ export function ProjectModal({
         repo_url: repoUrl || undefined,
         default_branch: branch,
         paths,
-        dev_command: devCommand || undefined,
-        dev_port: devPort ? Number(devPort) : undefined,
       };
       const saved = project
         ? await api.updateProject(project.id, body)
@@ -982,16 +977,6 @@ export function ProjectModal({
           ))}
         </Section>
       )}
-
-      <Section title="Previews">
-        <Field
-          label="Dev server command"
-          value={devCommand}
-          onChange={setDevCommand}
-          placeholder="npm run dev"
-        />
-        <Field label="Port" value={devPort} onChange={setDevPort} placeholder="5173" />
-      </Section>
 
       {error && <div className="error-text">{error}</div>}
     </Modal>

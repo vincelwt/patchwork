@@ -14,12 +14,14 @@ const LABELS: Record<InboxKind, string> = {
   question: "Question",
   task_assigned: "Assigned",
   task_blocked: "Blocked",
+  task_due: "Due",
   review_ready: "Ready for review",
   automation_failed: "Automation failed",
 };
 
 const TONES: Partial<Record<InboxKind, string>> = {
   question: "caution",
+  task_due: "caution",
   task_blocked: "danger",
   review_ready: "positive",
   automation_failed: "danger",
@@ -31,6 +33,7 @@ const URGENCY: Record<InboxKind, number> = {
   question: 0,
   task_blocked: 1,
   automation_failed: 1,
+  task_due: 1,
   review_ready: 2,
   task_assigned: 3,
   direct_message: 4,

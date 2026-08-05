@@ -1406,6 +1406,7 @@ async fn create_task_inner(
         pr_url: None,
         pr_state: None,
         created_by: creator_id.to_string(),
+        due_at: input.due_at.filter(|at| *at > 0),
         created_at: now,
         updated_at: now,
         position: now as f64,
@@ -1539,12 +1540,22 @@ pub async fn update_task(
     if let Some(pr_url) = input.pr_url {
         task.pr_url = if pr_url.is_empty() { None } else { Some(pr_url) };
     }
+    // 0 is how a client says "no date": there is no such instant in practice,
+    // and `null` cannot be told apart from "not mentioned" in a patch.
+    if let Some(due_at) = input.due_at {
+        task.due_at = (due_at > 0).then_some(due_at);
+    }
     if let Some(position) = input.position {
         task.position = position;
     }
 
     state.store.update_task(&task)?;
     state.emit(Event::TaskUpdated { task: task.clone() });
+
+    // A moved date is a new promise, so it gets to be announced again.
+    if previous.due_at != task.due_at {
+        state.store.clear_inbox(&task.id, InboxKind::TaskDue)?;
+    }
 
     if previous.owner_id != task.owner_id {
         if let Some(owner) = &task.owner_id {

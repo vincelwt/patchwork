@@ -8,7 +8,7 @@ use anyhow::Result;
 use patchwork_core::events::Event;
 use patchwork_core::models::*;
 use patchwork_core::wire::CreateTask;
-use patchwork_core::{new_id, now_ms, Id};
+use patchwork_core::{new_id, now_ms, Id, Millis};
 use serde_json::json;
 
 use crate::orchestrator::{self, StartRunParams};
@@ -346,6 +346,7 @@ pub async fn scheduler(state: Shared) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
     loop {
         ticker.tick().await;
+        announce_due_tasks(&state);
         let Ok(automations) = state.store.automations() else {
             continue;
         };
@@ -386,6 +387,39 @@ pub async fn scheduler(state: Shared) {
     }
 }
 
+/// A due date is only a promise until somebody is told about it. On the day,
+/// the task lands in the Inbox of whoever owns it and whoever asked for it,
+/// once — the same tick that runs the schedules, because it is the same kind
+/// of "something is due now".
+fn announce_due_tasks(state: &Shared) {
+    let now = now_ms();
+    let Ok(tasks) = state.store.tasks() else {
+        return;
+    };
+    for task in tasks {
+        if !is_due(&task, now) {
+            continue;
+        }
+        if state
+            .store
+            .inbox_has(&task.id, InboxKind::TaskDue)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let title = format!("{} is due", task.key);
+        if let Err(err) = crate::orchestrator::notify_task(state, &task, InboxKind::TaskDue, title) {
+            tracing::warn!(?err, task = %task.key, "could not announce a due task");
+        }
+    }
+}
+
+/// Due, and still worth saying so. Finishing a task is the way to stop it
+/// nagging, whatever its date says.
+fn is_due(task: &Task, now: Millis) -> bool {
+    matches!(task.due_at, Some(at) if at <= now) && task.status != TaskStatus::Done
+}
+
 /// The next firing after `after`, in the relay's local time.
 ///
 /// The `cron` crate wants a seconds field; a person writing "0 9 * * *" means
@@ -422,6 +456,40 @@ mod tests {
         let _ = local;
         // Within a day and a bit — a daily schedule never waits two days.
         assert!(next - start <= 25 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_done() {
+        let mut task = Task {
+            id: "t".into(),
+            key: "PW-1".into(),
+            title: "Ship it".into(),
+            outcome: String::new(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            created_by: "m".into(),
+            due_at: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        assert!(!is_due(&task, 1_000), "no date is not a deadline");
+
+        task.due_at = Some(2_000);
+        assert!(!is_due(&task, 1_999));
+        assert!(is_due(&task, 2_000));
+
+        task.status = TaskStatus::Done;
+        assert!(!is_due(&task, 9_999));
     }
 
     #[test]

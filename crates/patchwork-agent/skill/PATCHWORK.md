@@ -72,7 +72,7 @@ Split work into new tasks when a piece is genuinely separable and someone else
 
 ```bash
 patchwork attach screenshot.png --caption "Checkout after the fix"
-patchwork preview --port 5173 --label "Storefront"
+patchwork preview --command "npm run dev" --port 5173 --label "Storefront"
 patchwork pr https://github.com/acme/app/pull/42
 ```
 

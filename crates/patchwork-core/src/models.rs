@@ -374,6 +374,9 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_state: Option<PullRequestState>,
     pub created_by: Id,
+    /// When this is meant to be done. The Inbox says so on the day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<Millis>,
     pub created_at: Millis,
     pub updated_at: Millis,
     /// Ordering within its board column.
@@ -419,11 +422,6 @@ pub struct Project {
     /// Where this project lives on each host: host id -> absolute path.
     #[serde(default)]
     pub paths: std::collections::BTreeMap<Id, String>,
-    /// Optional command used to start a dev server for previews.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dev_command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dev_port: Option<u16>,
     pub created_at: Millis,
 }
 
@@ -760,6 +758,7 @@ pub enum InboxKind {
     Question,
     TaskAssigned,
     TaskBlocked,
+    TaskDue,
     ReviewReady,
     AutomationFailed,
 }

@@ -855,6 +855,7 @@ impl Store {
             pr_url: row.get("pr_url")?,
             pr_state: json_col(row, "pr_state"),
             created_by: row.get("created_by")?,
+            due_at: row.get("due_at")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             position: row.get("position")?,
@@ -865,13 +866,13 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
-                                pr_state, created_by, position, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                                pr_state, created_by, due_at, position, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.source_channel_id, task.source_message_id, task.discussion_channel_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.created_by, task.position,
+                task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.position,
                 task.created_at, task.updated_at
             ],
         )?;
@@ -881,12 +882,12 @@ impl Store {
     pub fn update_task(&self, task: &Task) -> Result<()> {
         self.conn()?.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
-                              worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, position=?12,
-                              updated_at=?13 WHERE id=?1",
+                              worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
+                              position=?13, updated_at=?14 WHERE id=?1",
             params![
                 task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.position, now_ms()
+                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms()
             ],
         )?;
         Ok(())
@@ -946,23 +947,21 @@ impl Store {
             repo_url: row.get("repo_url")?,
             default_branch: row.get("default_branch")?,
             paths: json_col_or(row, "paths"),
-            dev_command: row.get("dev_command")?,
-            dev_port: row.get::<_, Option<i64>>("dev_port")?.map(|p| p as u16),
             created_at: row.get("created_at")?,
         })
     }
 
     pub fn upsert_project(&self, project: &Project) -> Result<()> {
         self.conn()?.execute(
-            "INSERT INTO projects (id, name, description, kind, repo_url, default_branch, paths, dev_command, dev_port, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO projects (id, name, description, kind, repo_url, default_branch, paths, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET name=?2, description=?3, kind=?4, repo_url=?5,
-                                           default_branch=?6, paths=?7, dev_command=?8, dev_port=?9",
+                                           default_branch=?6, paths=?7",
             params![
                 project.id, project.name, project.description,
                 match project.kind { ProjectKind::Folder => "folder", ProjectKind::Git => "git" },
                 project.repo_url, project.default_branch, to_json(&project.paths),
-                project.dev_command, project.dev_port.map(|p| p as i64), project.created_at
+                project.created_at
             ],
         )?;
         Ok(())
@@ -1400,6 +1399,30 @@ impl Store {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![member_id], |r| Self::inbox_from_row(r))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Whether this task has already put something of this kind in an Inbox.
+    /// Read or not: telling someone twice that the same task is due is worse
+    /// than telling them once.
+    pub fn inbox_has(&self, task_id: &str, kind: InboxKind) -> Result<bool> {
+        let kind = serde_json::to_string(&kind).unwrap_or_default();
+        let count: i64 = self.conn()?.query_row(
+            "SELECT COUNT(*) FROM inbox WHERE task_id = ?1 AND kind = ?2",
+            params![task_id, kind.trim_matches('"')],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Forget that a task ever announced this, so moving its date can announce
+    /// it again.
+    pub fn clear_inbox(&self, task_id: &str, kind: InboxKind) -> Result<()> {
+        let kind = serde_json::to_string(&kind).unwrap_or_default();
+        self.conn()?.execute(
+            "DELETE FROM inbox WHERE task_id = ?1 AND kind = ?2",
+            params![task_id, kind.trim_matches('"')],
+        )?;
+        Ok(())
     }
 
     pub fn inbox_item(&self, id: &str) -> Result<Option<InboxItem>> {
