@@ -12,7 +12,7 @@ import {
 } from "../lib/desktop";
 import type { AwakePolicy } from "../lib/desktop";
 import type { DesktopInfo } from "../lib/desktop";
-import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
+import { Avatar, Chip, Field, Modal, plainText, useNavigation } from "./common";
 import {
   Dropdown,
   Empty,
@@ -755,6 +755,7 @@ export function ProjectModal({
               <label>{host.name}</label>
               <input
                 className="field"
+                {...plainText}
                 value={paths[host.id] ?? ""}
                 placeholder="/absolute/path"
                 onChange={(event) =>

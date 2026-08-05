@@ -9,6 +9,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useApi, useAppSelector } from "../lib/store";
 import { SearchIcon } from "./icons";
+import { plainText } from "./common";
 import type { Message, Reaction } from "../lib/types";
 
 /// Small on purpose. A full Unicode set needs a data file and an index; this
@@ -138,7 +139,7 @@ export function ReactionPicker({
         <SearchIcon size={15} />
         <input
           autoFocus
-          spellCheck={false}
+          {...plainText}
           placeholder="Search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}

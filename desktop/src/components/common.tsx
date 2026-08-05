@@ -138,6 +138,19 @@ export function Modal({
   );
 }
 
+/// Most fields in this app hold identifiers — channel names, handles, paths,
+/// commands, search terms. macOS "correcting" `support` to `Support` there is a
+/// bug, not a favour, so single-line fields opt out of the lot and prose fields
+/// keep only the spell checker.
+export const plainText = {
+  autoCorrect: "off",
+  autoCapitalize: "off",
+  spellCheck: false,
+} as const;
+
+/// Prose that still contains names and paths: check the spelling, change nothing.
+export const proseText = { autoCorrect: "off", autoCapitalize: "sentences" } as const;
+
 export function Field({
   label,
   value,
@@ -161,6 +174,7 @@ export function Field({
       {textarea ? (
         <textarea
           className="field"
+          {...proseText}
           value={value}
           placeholder={placeholder}
           autoFocus={autoFocus}
@@ -169,6 +183,7 @@ export function Field({
       ) : (
         <input
           className="field"
+          {...plainText}
           type={type}
           value={value}
           placeholder={placeholder}

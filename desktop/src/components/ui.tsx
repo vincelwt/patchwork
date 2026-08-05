@@ -13,6 +13,7 @@ import {
 import { createPortal } from "react-dom";
 import type { ReactNode, RefObject } from "react";
 import { ChevronIcon } from "./icons";
+import { plainText, proseText } from "./common";
 
 export function Page({
   title,
@@ -587,12 +588,17 @@ export function EditableText({
 
   return multiline ? (
     <textarea
+      {...proseText}
       {...shared}
       ref={input as React.RefObject<HTMLTextAreaElement>}
       rows={2}
     />
   ) : (
-    <input {...shared} ref={input as React.RefObject<HTMLInputElement>} />
+    <input
+      {...plainText}
+      {...shared}
+      ref={input as React.RefObject<HTMLInputElement>}
+    />
   );
 }
 

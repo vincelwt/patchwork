@@ -1,8 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useAppSelector } from "../lib/store";
-import { bytes, dayLabel, timeOfDay } from "../lib/format";
+import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
-import { Avatar, useNavigation } from "./common";
+import { Avatar, proseText, useNavigation } from "./common";
 import {
   AttachIcon,
   CloseIcon,
@@ -10,6 +10,7 @@ import {
   MoreIcon,
   PulseIcon,
   ReactIcon,
+  RunIcon,
   SendIcon,
   Spinner,
   ThreadIcon,
@@ -17,7 +18,7 @@ import {
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
-import type { Attachment, Channel, Id, Member, Message } from "../lib/types";
+import type { Attachment, Channel, Id, Member, Message, Run } from "../lib/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const { channel, messages } = useAppSelector((data) => ({
@@ -206,6 +207,16 @@ export function Timeline({
     return map;
   }, [members]);
 
+  // A finished run belongs *in* the reply it produced, not on a line of its own
+  // above it. Two rows for one thing the agent did is one row too many.
+  const runsWithReply = useMemo(() => {
+    const set = new Set<Id>();
+    for (const message of messages) {
+      if (message.kind === "text" && message.run_id) set.add(message.run_id);
+    }
+    return set;
+  }, [messages]);
+
   return (
     <div className="timeline" ref={scroller} onScroll={onScroll}>
       <div className="timeline-inner" ref={inner}>
@@ -219,6 +230,15 @@ export function Timeline({
           const index = window_.start + offset;
           const message = row.message;
           const run = message.run_id ? runs[message.run_id] : undefined;
+          // The card only still earns its own row when the run failed, is
+          // waiting on someone, or produced no reply to fold itself into.
+          const folded =
+            message.kind === "card" &&
+            message.card?.type === "run" &&
+            runsWithReply.has(message.card.run_id) &&
+            !!runs[message.card.run_id] &&
+            !["failed", "waiting"].includes(runs[message.card.run_id].status);
+          if (folded) return <div key={message.id} ref={window_.rowRef(index)} />;
           return (
             <div key={message.id} ref={window_.rowRef(index)}>
               {row.day && (
@@ -231,6 +251,7 @@ export function Timeline({
                 grouped={row.grouped}
                 author={authorOf.get(message.author_id)}
                 handles={handles}
+                run={run}
                 streaming={
                   message.kind === "text" &&
                   !!run &&
@@ -268,12 +289,15 @@ export const MessageRow = memo(function MessageRow({
   grouped,
   author,
   handles,
+  run,
   streaming = false,
 }: {
   message: Message;
   grouped: boolean;
   author?: Member;
   handles?: Set<string>;
+  /// The run that produced this message, summarised in its header.
+  run?: Run;
   /// The reply the relay is still writing into.
   streaming?: boolean;
 }) {
@@ -330,6 +354,7 @@ export const MessageRow = memo(function MessageRow({
             {author?.kind === "agent" && <span className="message-badge">agent</span>}
             <span className="message-time">{timeOfDay(message.created_at)}</span>
             {message.edited_at && <span className="message-time">edited</span>}
+            {run && <RunMeta run={run} />}
           </div>
         )}
         {message.body && (
@@ -391,6 +416,26 @@ export const MessageRow = memo(function MessageRow({
     </div>
   );
 });
+
+/// What the run behind a reply cost, sitting in the reply's own header: which
+/// runtime, how long, and the way into the full trace. Live runs say nothing
+/// here — the pill above the composer is already saying it.
+function RunMeta({ run }: { run: Run }) {
+  const { inspect } = useNavigation();
+  if (!["succeeded", "failed", "cancelled"].includes(run.status)) return null;
+  return (
+    <button
+      className={`message-run${run.status === "failed" ? " failed" : ""}`}
+      title="Open the run"
+      onClick={() => inspect({ kind: "run", runId: run.id })}
+    >
+      <RunIcon size={11} />
+      {run.status === "cancelled" ? "stopped" : run.runtime}
+      <span className="sep">·</span>
+      {duration(run.started_at, run.ended_at)}
+    </button>
+  );
+}
 
 /// An image someone dropped in should be visible without a download step.
 function Attached({ attachment }: { attachment: Attachment }) {
@@ -493,7 +538,9 @@ function WorkingPill({ channelId }: { channelId: Id }) {
     );
   }
 
-  return <div className="working-pill">{content}</div>;
+  // ponytail: no content, no box — the fixed 24px height only reserved a blank
+  // strip above the composer.
+  return content ? <div className="working-pill">{content}</div> : null;
 }
 
 export function Composer({
@@ -522,6 +569,7 @@ export function Composer({
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const box = useRef<HTMLTextAreaElement>(null);
+  const wrap = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const element = box.current;
@@ -529,6 +577,23 @@ export function Composer({
     element.style.height = "auto";
     element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
   }, [text]);
+
+  // The composer floats over the transcript, so the scroller behind it has to
+  // know how tall it currently is — it grows with text, attachments and the
+  // working pill.
+  useEffect(() => {
+    const element = wrap.current;
+    const scroller = element?.parentElement;
+    if (!element || !scroller) return;
+    const observer = new ResizeObserver(() => {
+      scroller.style.setProperty("--composer-h", `${element.offsetHeight}px`);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      scroller.style.removeProperty("--composer-h");
+    };
+  }, []);
 
   const attach = useCallback(
     async (files: FileList | File[]) => {
@@ -611,7 +676,7 @@ export function Composer({
         : `Message ${channel.name}`);
 
   return (
-    <div className="composer-wrap">
+    <div className="composer-wrap" ref={wrap}>
       {!parentId && <WorkingPill channelId={channel.id} />}
 
       {candidates.length > 0 && (
@@ -659,6 +724,9 @@ export function Composer({
         <textarea
           ref={box}
           rows={1}
+          // Prose, but prose full of paths and flags: check it, do not rewrite it.
+          {...proseText}
+          spellCheck
           placeholder={label}
           value={text}
           onChange={(event) => onChange(event.target.value)}

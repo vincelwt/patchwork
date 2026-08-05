@@ -405,6 +405,7 @@ body.resizing {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
 }
 
 .inspector {
@@ -425,7 +426,7 @@ body.resizing {
 }
 .inspector-body {
   overflow-y: auto;
-  padding: 0 16px 24px;
+  padding: 0 16px calc(var(--composer-h, 24px) + 8px);
   min-height: 0;
   flex: 1;
 }
@@ -442,7 +443,9 @@ body.resizing {
 .timeline-inner {
   max-width: 1000px;
   margin: 0 auto;
-  padding: 0 20px 10px;
+  /* The composer floats over the transcript, so the last message needs room to
+     clear it. Its live height comes from the composer itself. */
+  padding: 0 20px calc(var(--composer-h, 100px) + 10px);
 }
 
 /* A rule with the date sitting on it: the eye finds the boundary without
@@ -542,6 +545,34 @@ body.resizing {
   font-size: 10.5px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+/* What the run cost, in the header of the reply it produced. */
+.message-run {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 8px 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  flex: none;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.message-run:hover {
+  background: var(--tint);
+  color: var(--text-muted);
+}
+.message-run .sep {
+  opacity: 0.5;
+}
+.message-run.failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--line));
 }
 .message-body {
   overflow-wrap: anywhere;
@@ -904,21 +935,29 @@ body.resizing {
 /* --- composer ------------------------------------------------------------ */
 
 .composer-wrap {
-  padding: 0 28px 20px;
+  padding: 14px 28px 20px;
   max-width: 1000px;
   margin: 0 auto;
   width: 100%;
-  flex: none;
-  position: relative;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--bg) 62%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  /* Mask the blur out at the top so the transcript fades under it instead of
+     ending on a hard edge. */
+  mask-image: linear-gradient(to bottom, transparent, #000 14px);
 }
 
 .working-pill {
   display: flex;
   justify-content: center;
   margin-bottom: 10px;
-  height: 24px;
+  min-height: 24px;
 }
-.working-pill span {
+.working-pill > span {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -2742,6 +2781,7 @@ details[open] > summary::before {
   flex-direction: column;
   min-height: 0;
   flex: 1;
+  position: relative;
 }
 
 /* Keyboard position and current value are different things: one is where the

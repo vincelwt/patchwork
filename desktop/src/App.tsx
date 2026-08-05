@@ -29,6 +29,7 @@ import {
   Field,
   Modal,
   NavigationContext,
+  proseText,
   useNavigation,
 } from "./components/common";
 import { Empty, KeyHint, Menu, MenuButton, Page } from "./components/ui";
@@ -811,6 +812,7 @@ function ChannelTopic({ channel }: { channel: Channel }) {
     return (
       <input
         className="topic-input"
+        {...proseText}
         autoFocus
         value={draft}
         placeholder="What is this channel for?"
@@ -855,34 +857,29 @@ function WorkspaceMenu({
   onHelp: () => void;
 }) {
   const app = useApp();
-  const entries: { label: string; hint: string; icon: ReactNode; view: View }[] = [
+  const entries: { label: string; icon: ReactNode; view: View }[] = [
     {
       label: "Automations",
-      hint: "When agents act on their own",
       icon: <AutomationIcon />,
       view: { kind: "automations" },
     },
     {
       label: "Agents",
-      hint: "Identities, runtimes and where they run",
       icon: <AgentIcon />,
       view: { kind: "agents" },
     },
     {
       label: "Projects and machines",
-      hint: "Repositories, folders and execution hosts",
       icon: <FolderIcon />,
       view: { kind: "projects" },
     },
     {
       label: "Members",
-      hint: "People and invitations",
       icon: <MembersIcon />,
       view: { kind: "members" },
     },
     {
       label: "Settings",
-      hint: "Workspace, machines, relay",
       icon: <SettingsIcon />,
       view: { kind: "settings" },
     },
@@ -897,7 +894,6 @@ function WorkspaceMenu({
           ...entries.map((entry) => ({
             key: entry.label,
             label: entry.label,
-            hint: entry.hint,
             icon: entry.icon,
             onSelect: () => onPick(entry.view),
           })),

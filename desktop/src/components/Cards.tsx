@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
-import { Chip, useNavigation } from "./common";
+import { Chip, proseText, useNavigation } from "./common";
 import {
   ExternalIcon,
   PreviewIcon,
@@ -227,6 +227,7 @@ function QuestionCard({ questionId }: { questionId: string }) {
           {item.allow_free_text && !answered && (
             <input
               className="field"
+              {...proseText}
               style={{ marginTop: 6 }}
               placeholder={item.options.length ? "Or say something else" : "Your answer"}
               value={notes[item.id] ?? ""}
