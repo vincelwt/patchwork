@@ -87,7 +87,7 @@ struct SearchArgs {
 struct SayArgs {
     /// The message. Multiple words are joined.
     text: Vec<String>,
-    /// Post in a different conversation.
+    /// Post somewhere else: `#deploys`, a channel name, or a channel id.
     #[arg(long)]
     channel: Option<String>,
 }
@@ -420,25 +420,47 @@ fn channel_label(channel: &Channel) -> String {
     }
 }
 
+/// A conversation by whatever an agent is likely to have: `#deploys`, the
+/// name on its own, a DM partner's `@handle`, or an id copied from a link.
+/// Being strict here meant an agent that wanted to post an update in another
+/// channel got a "not found" for writing the name the way people write it.
 async fn resolve_channel(client: &Client, ctx: &RunContext, given: Option<String>) -> Result<String> {
-    match given {
-        Some(reference) => {
-            if !reference.starts_with('#') {
-                return Ok(reference);
-            }
-            let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
-            bootstrap
-                .channels
-                .into_iter()
-                .find(|c| c.slug == reference.trim_start_matches('#'))
-                .map(|c| c.id)
-                .ok_or_else(|| anyhow!("no channel called {reference}"))
-        }
-        None => ctx
+    let Some(reference) = given else {
+        return ctx
             .channel_id
             .clone()
-            .ok_or_else(|| anyhow!("no conversation in context: pass --channel")),
+            .ok_or_else(|| anyhow!("no conversation in context: pass --channel"));
+    };
+
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    if bootstrap.channels.iter().any(|c| c.id == reference) {
+        return Ok(reference);
     }
+
+    let wanted = reference.trim_start_matches('#').trim_start_matches('@');
+    if let Some(channel) = bootstrap.channels.iter().find(|c| {
+        c.kind == ChannelKind::Channel && (c.slug == wanted || c.name.eq_ignore_ascii_case(wanted))
+    }) {
+        return Ok(channel.id.clone());
+    }
+
+    // A DM, named by who is in it.
+    let partner = bootstrap.members.iter().find(|m| {
+        m.handle.eq_ignore_ascii_case(wanted) || m.display_name.eq_ignore_ascii_case(wanted)
+    });
+    if let Some(partner) = partner {
+        if let Some(channel) = bootstrap.channels.iter().find(|c| {
+            c.kind == ChannelKind::Dm && c.member_ids.contains(&partner.id)
+        }) {
+            return Ok(channel.id.clone());
+        }
+        let channel: Channel = client
+            .post("/api/channels/dm", json!({ "member_id": partner.id }))
+            .await?;
+        return Ok(channel.id);
+    }
+
+    Err(anyhow!("no conversation called {reference}"))
 }
 
 async fn history(client: &Client, ctx: &RunContext, args: HistoryArgs) -> Result<()> {

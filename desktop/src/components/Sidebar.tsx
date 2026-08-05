@@ -1,15 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
-import { useApi, useApp, useAppSelector } from "../lib/store";
+import { store, useApi, useApp, useAppSelector, useWorkspaces } from "../lib/store";
+import { create, join, switchTo } from "../lib/session";
 import { hasUnseen, useSeen } from "../lib/unread";
-import { Avatar, useNavigation } from "./common";
+import { Avatar, Field, Modal, useNavigation } from "./common";
 import { Menu, MenuButton } from "./ui";
 import {
+  AgentIcon,
   AutomationIcon,
+  CheckIcon,
   ChevronIcon,
+  FolderIcon,
   HashIcon,
   InboxIcon,
+  KeyboardIcon,
+  MembersIcon,
   PlusIcon,
   SearchIcon,
+  SettingsIcon,
   Spinner,
   TasksIcon,
 } from "./icons";
@@ -25,19 +32,23 @@ export type Creatable =
   | "invite";
 
 /// The main sidebar stays small: Inbox, Tasks, the channels grouped into
-/// sections, and direct messages. Everything else lives behind the workspace
-/// name at the top — and everything you can *create* lives behind one plus, so
-/// "how do I add a channel / a section / a project" has a single answer.
+/// sections, and direct messages. Everything else — automations, agents,
+/// projects, members, settings — lives in the drop-up behind your own name at
+/// the bottom, next to the workspace you are in. Everything you can *create*
+/// lives behind one plus, so "how do I add a channel / a section / a project"
+/// has a single answer.
 export function Sidebar({
-  onOpenMenu,
+  onHelp,
   onSearch,
   onResize,
   onCreate,
+  onSignOut,
 }: {
-  onOpenMenu: () => void;
+  onHelp: () => void;
   onSearch: () => void;
   onResize: (width: number) => void;
   onCreate: (what: Creatable, sectionId?: Id) => void;
+  onSignOut: () => void;
 }) {
   // Deliberately not `useApp`: the sidebar is on screen the whole time, so a
   // subscription to everything means it redraws for every message body an
@@ -125,10 +136,7 @@ export function Sidebar({
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
-        <button className="workspace-button" onClick={onOpenMenu} title="Workspace">
-          <span className="name">{app.workspace?.name ?? "Patchwork"}</span>
-          <ChevronIcon size={14} />
-        </button>
+        <span className="workspace-title">{app.workspace?.name ?? "Patchwork"}</span>
         <span className="spacer" />
         <button className="icon-button" onClick={onSearch} title="Search (⌘K)">
           <SearchIcon size={17} />
@@ -198,18 +206,6 @@ export function Sidebar({
           <TasksIcon />
           <span className="label">Tasks</span>
           {openTasks > 0 && <span className="count">{openTasks}</span>}
-        </button>
-        <button
-          className={`nav-item${isActive({ kind: "automations" }) ? " active" : ""}`}
-          onClick={() => go({ kind: "automations" })}
-        >
-          <AutomationIcon />
-          <span className="label">Automations</span>
-          {failingAutomations > 0 ? (
-            <span className="badge danger">{failingAutomations}</span>
-          ) : (
-            liveAutomations > 0 && <span className="count">{liveAutomations}</span>
-          )}
         </button>
 
         {app.sections.map((section) => {
@@ -319,8 +315,14 @@ export function Sidebar({
       </div>
 
       <div className="sidebar-footer">
-        <Avatar member={app.me} size={24} presence />
-        <span className="who">{app.me?.display_name}</span>
+        <MoreMenu
+          me={app.me}
+          onCreate={onCreate}
+          onHelp={onHelp}
+          onSignOut={onSignOut}
+          automations={{ live: liveAutomations, failing: failingAutomations }}
+        />
+        <WorkspaceSwitcher />
       </div>
 
       {menuFor && (
@@ -334,6 +336,273 @@ export function Sidebar({
       <SidebarResizer onResize={onResize} />
     </aside>
   );
+}
+
+/// Everything that is not a conversation, one click from your own name.
+function MoreMenu({
+  me,
+  onCreate,
+  onHelp,
+  onSignOut,
+  automations,
+}: {
+  me?: Member;
+  onCreate: (what: Creatable, sectionId?: Id) => void;
+  onHelp: () => void;
+  onSignOut: () => void;
+  automations: { live: number; failing: number };
+}) {
+  const { go } = useNavigation();
+  const automationHint = automations.failing
+    ? `${automations.failing} failing`
+    : automations.live
+      ? `${automations.live} on`
+      : undefined;
+
+  return (
+    <MenuButton
+      className="footer-button grow"
+      align="left"
+      title="You, and everything else"
+      items={[
+        {
+          key: "automations",
+          label: "Automations",
+          hint: automationHint,
+          icon: <AutomationIcon />,
+          onSelect: () => go({ kind: "automations" }),
+        },
+        {
+          key: "agents",
+          label: "Agents",
+          icon: <AgentIcon />,
+          onSelect: () => go({ kind: "agents" }),
+        },
+        {
+          key: "projects",
+          label: "Projects and machines",
+          icon: <FolderIcon />,
+          onSelect: () => go({ kind: "projects" }),
+        },
+        {
+          key: "members",
+          label: "Members",
+          icon: <MembersIcon />,
+          onSelect: () => go({ kind: "members" }),
+        },
+        {
+          key: "settings",
+          label: "Settings",
+          icon: <SettingsIcon />,
+          onSelect: () => go({ kind: "settings" }),
+        },
+        "separator",
+        {
+          key: "invite",
+          label: "Invite a person",
+          icon: <PlusIcon />,
+          onSelect: () => onCreate("invite"),
+        },
+        {
+          key: "shortcuts",
+          label: "Keyboard shortcuts",
+          icon: <KeyboardIcon />,
+          shortcut: "\u2318/",
+          onSelect: onHelp,
+        },
+        "separator",
+        {
+          key: "sign-out",
+          label: "Sign out of every workspace",
+          danger: true,
+          onSelect: onSignOut,
+        },
+      ]}
+    >
+      <Avatar member={me} size={24} presence />
+      <span className="who">{me?.display_name}</span>
+      <ChevronIcon size={13} />
+    </MenuButton>
+  );
+}
+
+/// Which workspace the window is showing. The others stay connected, so this
+/// is a change of view and not a reconnection: agents keep working in all of
+/// them, and switching back is instant.
+function WorkspaceSwitcher() {
+  const workspaces = useWorkspaces();
+  const { toast } = useNavigation();
+  const [adding, setAdding] = useState<"join" | "create" | null>(null);
+  const active = workspaces.find((workspace) => workspace.active);
+  const elsewhere = workspaces
+    .filter((workspace) => !workspace.active)
+    .reduce((total, workspace) => total + workspace.unread, 0);
+
+  return (
+    <>
+      <MenuButton
+        className="footer-button workspace-chip"
+        align="right"
+        header="Workspaces"
+        title={active ? `${active.name} \u2014 switch workspace` : "Workspaces"}
+        items={[
+          ...workspaces.map((workspace) => ({
+            key: workspace.id,
+            label: workspace.name,
+            hint: workspace.unread
+              ? `${workspace.unread} waiting`
+              : workspace.live
+                ? undefined
+                : "connecting\u2026",
+            icon: workspace.active ? <CheckIcon size={15} /> : undefined,
+            onSelect: () => void switchTo(workspace.id),
+          })),
+          "separator" as const,
+          {
+            key: "new",
+            label: "New workspace",
+            hint: "On this relay",
+            icon: <PlusIcon />,
+            onSelect: () => setAdding("create"),
+          },
+          {
+            key: "join",
+            label: "Join with an invite code",
+            onSelect: () => setAdding("join"),
+          },
+        ]}
+      >
+        <span className="workspace-initial">
+          {(active?.name ?? "?").trim().charAt(0).toUpperCase()}
+        </span>
+        {elsewhere > 0 && <span className="dot unread" />}
+        <ChevronIcon size={13} />
+      </MenuButton>
+      {adding === "create" && (
+        <NewWorkspaceModal
+          onClose={() => setAdding(null)}
+          onDone={(name) => toast(`Switched to ${name}`)}
+        />
+      )}
+      {adding === "join" && (
+        <JoinWorkspaceModal
+          onClose={() => setAdding(null)}
+          onDone={() => toast("Joined")}
+        />
+      )}
+    </>
+  );
+}
+
+function NewWorkspaceModal({
+  onClose,
+  onDone,
+}: {
+  onClose: () => void;
+  onDone: (name: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  return (
+    <Modal
+      title="New workspace"
+      subtitle="A separate workspace on the same relay: its own channels, tasks, agents and members. You will be its first admin."
+      onClose={onClose}
+      actions={
+        <>
+          <button className="button quiet" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || !name.trim()}
+            onClick={async () => {
+              setBusy(true);
+              setError("");
+              try {
+                await create(name.trim());
+                onDone(name.trim());
+                onClose();
+              } catch (err) {
+                setError(String((err as Error).message ?? err));
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Creating\u2026" : "Create"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Name" value={name} onChange={setName} autoFocus placeholder="Acme" />
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
+  );
+}
+
+function JoinWorkspaceModal({
+  onClose,
+  onDone,
+}: {
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const app = useApp();
+  const [relayUrl, setRelayUrl] = useState(relayRoot);
+  const [code, setCode] = useState("");
+  const [displayName, setDisplayName] = useState(app.me?.display_name ?? "");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  return (
+    <Modal
+      title="Join a workspace"
+      subtitle="Any relay, including this one. Both workspaces stay connected."
+      onClose={onClose}
+      actions={
+        <>
+          <button className="button quiet" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || !code.trim() || !displayName.trim()}
+            onClick={async () => {
+              setBusy(true);
+              setError("");
+              try {
+                await join({
+                  relay_url: relayUrl,
+                  invite_code: code.trim(),
+                  display_name: displayName.trim(),
+                });
+                onDone();
+                onClose();
+              } catch (err) {
+                setError(String((err as Error).message ?? err));
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Joining\u2026" : "Join"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} />
+      <Field label="Invite code" value={code} onChange={setCode} autoFocus />
+      <Field label="Your name" value={displayName} onChange={setDisplayName} />
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
+  );
+}
+
+/// The relay the current workspace is on, so joining a second one on the same
+/// relay does not mean typing the URL again.
+function relayRoot() {
+  return store.api?.baseUrl.replace(/\/w\/[^/]+$/, "") ?? "";
 }
 
 /// Where a channel gets filed. Moving one between sections was impossible from

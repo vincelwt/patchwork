@@ -203,30 +203,14 @@ body.resizing {
   flex: none;
 }
 
-.workspace-button {
-  display: flex;
-  align-items: center;
-  gap: 3px;
+.workspace-title {
   font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.012em;
-  padding: 3px 6px;
-  margin-left: -6px;
-  border-radius: 8px;
-  -webkit-app-region: no-drag;
   min-width: 0;
-}
-.workspace-button:hover {
-  background: var(--tint);
-}
-.workspace-button .name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.workspace-button svg {
-  color: var(--text-faint);
-  flex: none;
 }
 
 .sidebar-scroll {
@@ -322,14 +306,37 @@ body.resizing {
   font-variant-numeric: tabular-nums;
 }
 
+/* You on the left, the workspace you are in on the right. Both are drop-ups:
+   everything that is not a conversation lives here rather than cluttering the
+   list above it. */
 .sidebar-footer {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 6px 4px 0;
+  gap: 4px;
+  padding: 6px 2px 0;
   flex: none;
 }
-.sidebar-footer .who {
+.sidebar-footer .menu-anchor {
+  min-width: 0;
+}
+.sidebar-footer .menu-anchor:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.footer-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 6px;
+  border-radius: 9px;
+}
+.footer-button:hover,
+.footer-button.open {
+  background: var(--tint);
+}
+.footer-button .who {
   flex: 1;
   min-width: 0;
   font-size: 14px;
@@ -337,6 +344,26 @@ body.resizing {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: left;
+}
+.footer-button svg {
+  color: var(--text-faint);
+  flex: none;
+}
+.workspace-chip {
+  gap: 4px;
+}
+.workspace-initial {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  background: var(--tint-strong);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  flex: none;
 }
 
 /* --- main ---------------------------------------------------------------- */
@@ -1690,6 +1717,35 @@ details[open] > summary::before {
   color: var(--text-muted);
   margin: 0;
   font-size: 14px;
+}
+
+.onboarding .brand {
+  display: block;
+  margin: 0 auto 20px;
+  width: 72px;
+  height: 72px;
+}
+
+/* Two ways in, side by side, so neither looks like the fallback. */
+.segmented {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin-bottom: 18px;
+  background: var(--surface-sunken);
+  border-radius: 9px;
+}
+.segmented button {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.segmented button.active {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(20, 20, 18, 0.08);
 }
 
 .error-text {

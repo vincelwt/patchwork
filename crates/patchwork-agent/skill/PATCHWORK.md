@@ -23,11 +23,18 @@ prompt contained everything.
 ```bash
 patchwork say "Deployed to staging. The 502s came from a missing env var."
 patchwork status "Running the integration suite"
+patchwork say --channel '#deploys' "Staging is on 1.4.2"
+patchwork say --channel @vince "The migration finished, nothing to review."
 ```
 
 `say` posts an ordinary message. `status` posts a quieter progress note. Keep
 both short and about the outcome — your tool activity is already recorded in
 the run log, so never narrate it.
+
+`--channel` takes `#slug`, a plain channel name, an `@handle` for a direct
+message, or a channel id: post updates where the people who care about them
+are, not only in the conversation that started your run. Without it you are
+talking in that conversation.
 
 Your final reply at the end of a turn is posted automatically. Use `say` only
 when you want to speak *during* long work.

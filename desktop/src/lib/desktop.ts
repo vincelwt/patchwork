@@ -6,11 +6,22 @@ import type { HostCapabilities } from "./types";
 
 export type AwakePolicy = "never" | "while_running" | "while_open";
 
-export interface DesktopSettings {
+/// One joined workspace. Several can be live at once, on one relay or on
+/// several.
+export interface WorkspaceSettings {
+  id: string;
+  name: string;
+  /// The relay root, without the workspace prefix.
   relay_url: string;
   token: string;
   member_id: string;
   member_name: string;
+}
+
+export interface DesktopSettings {
+  workspaces: WorkspaceSettings[];
+  /// Which workspace the window is showing.
+  active: string;
   host_id: string;
   host_name: string;
   project_paths: Record<string, string>;
@@ -34,11 +45,18 @@ export interface ProviderInfo {
   recommended_model?: string;
 }
 
+/// Everything a workspace is reached through hangs off here.
+export function workspaceBaseUrl(workspace: WorkspaceSettings) {
+  return `${workspace.relay_url.replace(/\/$/, "")}/w/${workspace.id}`;
+}
+
 export interface HostStatus {
   connected: boolean;
   host_id: string;
   host_name: string;
   last_error?: string;
+  workspaces_online?: number;
+  workspaces?: number;
 }
 
 export interface DesktopInfo {
@@ -46,6 +64,8 @@ export interface DesktopInfo {
   host: HostStatus;
   platform: string;
   capabilities: HostCapabilities;
+  /// This machine is the relay, and is serving right now.
+  hosting_relay: boolean;
 }
 
 /// What the first frame needs. Deliberately without `capabilities`: working out
@@ -71,16 +91,19 @@ function browserSettings(): DesktopSettings {
   const raw = localStorage.getItem(BROWSER_KEY);
   const parsed = raw ? (JSON.parse(raw) as Partial<DesktopSettings>) : {};
   return {
-    relay_url: parsed.relay_url ?? "",
-    token: parsed.token ?? "",
-    member_id: parsed.member_id ?? "",
-    member_name: parsed.member_name ?? "",
+    workspaces: parsed.workspaces ?? [],
+    active: parsed.active ?? "",
     host_id: parsed.host_id ?? "",
     host_name: parsed.host_name ?? "",
     project_paths: parsed.project_paths ?? {},
     awake: parsed.awake ?? "never",
     provider_keys: parsed.provider_keys ?? {},
   };
+}
+
+function saveBrowserSettings(settings: DesktopSettings): DesktopSettings {
+  localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
+  return settings;
 }
 
 /// Settings and host status only, for the paths that cannot afford to wait.
@@ -90,7 +113,23 @@ export async function desktopBoot(): Promise<DesktopBoot> {
     settings: browserSettings(),
     host: { connected: false, host_id: "", host_name: "" },
     platform: "browser",
+    hosting_relay: false,
   };
+}
+
+/// Use this machine as the relay: the app serves one itself, so a solo user
+/// never has to run a server. Only the desktop app can do this.
+export async function useThisDeviceAsRelay(input: {
+  workspace_name: string;
+  display_name: string;
+}): Promise<DesktopSettings> {
+  if (!inTauri) {
+    throw new Error("hosting a relay needs the Patchwork Desktop app");
+  }
+  // Wrapped in `input`, like every other command here: Tauri renames loose
+  // arguments to camelCase, and a struct's fields keep the names serde gives
+  // them.
+  return invoke<DesktopSettings>("use_this_device_as_relay", { input });
 }
 
 export async function desktopInfo(): Promise<DesktopInfo> {
@@ -99,6 +138,7 @@ export async function desktopInfo(): Promise<DesktopInfo> {
     settings: browserSettings(),
     host: { connected: false, host_id: "", host_name: "" },
     platform: "browser",
+    hosting_relay: false,
     capabilities: {
       runtimes: [],
       has_git: false,
@@ -113,21 +153,18 @@ export async function desktopInfo(): Promise<DesktopInfo> {
   };
 }
 
-export async function joinWorkspace(input: {
-  relay_url: string;
-  invite_code: string;
-  display_name: string;
-}): Promise<DesktopSettings> {
-  if (inTauri) return invoke<DesktopSettings>("join_workspace", { input });
-
-  const base = input.relay_url.trim().replace(/\/$/, "");
-  const response = await fetch(`${base}/api/auth/join`, {
+async function postAuth(
+  url: string,
+  token: string | undefined,
+  body: unknown,
+): Promise<{ token: string; member: { id: string; display_name: string }; workspace: { id: string; name: string } }> {
+  const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      invite_code: input.invite_code.trim(),
-      display_name: input.display_name.trim(),
-    }),
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
   });
   const text = await response.text();
   if (!response.ok) {
@@ -139,20 +176,75 @@ export async function joinWorkspace(input: {
     }
     throw new Error(message);
   }
-  const auth = JSON.parse(text);
-  const settings: DesktopSettings = {
-    relay_url: base,
+  return JSON.parse(text);
+}
+
+function remember(
+  settings: DesktopSettings,
+  relayUrl: string,
+  auth: { token: string; member: { id: string; display_name: string }; workspace: { id: string; name: string } },
+): DesktopSettings {
+  const workspace: WorkspaceSettings = {
+    id: auth.workspace.id,
+    name: auth.workspace.name,
+    relay_url: relayUrl,
     token: auth.token,
     member_id: auth.member.id,
     member_name: auth.member.display_name,
-    host_id: "",
-    host_name: "",
-    project_paths: {},
-    awake: "never",
-    provider_keys: {},
   };
-  localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
-  return settings;
+  const workspaces = settings.workspaces.filter((w) => w.id !== workspace.id);
+  workspaces.push(workspace);
+  return saveBrowserSettings({ ...settings, workspaces, active: workspace.id });
+}
+
+/// Redeem an invite. Workspaces already joined keep running.
+export async function joinWorkspace(input: {
+  relay_url: string;
+  invite_code: string;
+  display_name: string;
+}): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("join_workspace", { input });
+
+  const base = input.relay_url.trim().replace(/\/$/, "");
+  const auth = await postAuth(`${base}/api/auth/join`, undefined, {
+    invite_code: input.invite_code.trim(),
+    display_name: input.display_name.trim(),
+  });
+  return remember(browserSettings(), base, auth);
+}
+
+/// A second workspace on the relay this desktop is already in.
+export async function createWorkspace(name: string): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("create_workspace", { name });
+
+  const settings = browserSettings();
+  const active =
+    settings.workspaces.find((w) => w.id === settings.active) ??
+    settings.workspaces[0];
+  if (!active) throw new Error("join a workspace first");
+  const auth = await postAuth(
+    `${active.relay_url}/api/workspaces`,
+    active.token,
+    { name: name.trim() },
+  );
+  return remember(settings, active.relay_url, auth);
+}
+
+/// Only which workspace is on screen: nothing disconnects.
+export async function switchWorkspace(id: string): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("switch_workspace", { id });
+  return saveBrowserSettings({ ...browserSettings(), active: id });
+}
+
+export async function leaveWorkspace(id: string): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("leave_workspace", { id });
+  const settings = browserSettings();
+  const workspaces = settings.workspaces.filter((w) => w.id !== id);
+  return saveBrowserSettings({
+    ...settings,
+    workspaces,
+    active: settings.active === id ? (workspaces[0]?.id ?? "") : settings.active,
+  });
 }
 
 export async function signOut(): Promise<void> {
@@ -167,9 +259,7 @@ export async function setProjectPaths(
   paths: Record<string, string>,
 ): Promise<DesktopSettings> {
   if (inTauri) return invoke<DesktopSettings>("set_project_paths", { paths });
-  const settings = { ...browserSettings(), project_paths: paths };
-  localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
-  return settings;
+  return saveBrowserSettings({ ...browserSettings(), project_paths: paths });
 }
 
 /// Stopping this machine from sleeping mid-run. A no-op outside the app,

@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 patchwork-core.workspace = true
 patchwork-agent.workspace = true
+# Desktop can be the relay: one machine, no second thing to install.
+patchwork-relay = { path = "../../crates/patchwork-relay" }
 
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"

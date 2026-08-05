@@ -142,8 +142,17 @@ function useAnchored(
     } else {
       next.left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin));
     }
-    if (above) next.bottom = window.innerHeight - rect.top + 4;
-    else next.top = rect.bottom + 4;
+    // Both edges have to be stated. The stylesheet gives `.menu` a `top`, so
+    // a flipped-up menu that only sets `bottom` is stretched between the two
+    // and collapses to its padding — which is what a drop-up in the sidebar
+    // footer does if this is left implicit.
+    if (above) {
+      next.bottom = window.innerHeight - rect.top + 4;
+      next.top = "auto";
+    } else {
+      next.top = rect.bottom + 4;
+      next.bottom = "auto";
+    }
     setStyle(next);
   }, [anchor, align, minWidth]);
 

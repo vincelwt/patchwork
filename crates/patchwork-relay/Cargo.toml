@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "The Patchwork relay: shared data, realtime collaboration, files, automations and hosted agents"
 
+[lib]
+name = "patchwork_relay"
+path = "src/lib.rs"
+
 [[bin]]
 name = "patchwork-relay"
 path = "src/main.rs"
@@ -32,7 +36,7 @@ regex.workspace = true
 which.workspace = true
 
 axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace", "limit"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"

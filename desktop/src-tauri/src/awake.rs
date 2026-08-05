@@ -8,6 +8,7 @@
 //! rather than taking an IOKit assertion directly: a leaked assertion would
 //! keep somebody's laptop awake until they rebooted.
 
+use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -33,7 +34,10 @@ pub struct Keeper {
 #[derive(Default)]
 struct State {
     policy: AwakePolicy,
-    running: usize,
+    /// Active runs per workspace connection: this machine can be executing
+    /// work for several workspaces at once, and any one of them is a reason
+    /// to stay awake.
+    running: HashMap<String, usize>,
     process: Option<Child>,
 }
 
@@ -45,12 +49,12 @@ impl Keeper {
     }
 
     /// Called whenever the number of active runs on this machine changes.
-    pub fn set_running(&self, running: usize) {
+    pub fn set_running(&self, workspace_id: &str, running: usize) {
         let mut state = self.inner.lock().unwrap();
-        if state.running == running {
+        if state.running.get(workspace_id).copied().unwrap_or(0) == running {
             return;
         }
-        state.running = running;
+        state.running.insert(workspace_id.to_string(), running);
         Self::apply(&mut state);
     }
 
@@ -63,7 +67,7 @@ impl Keeper {
         match state.policy {
             AwakePolicy::Never => false,
             AwakePolicy::WhileOpen => true,
-            AwakePolicy::WhileRunning => state.running > 0,
+            AwakePolicy::WhileRunning => state.running.values().sum::<usize>() > 0,
         }
     }
 
