@@ -334,16 +334,13 @@ function TaskCard({
 export function NewTaskModal({
   onClose,
   sourceChannelId,
-  initialTitle,
 }: {
   onClose: () => void;
   sourceChannelId?: string;
-  initialTitle?: string;
 }) {
   const app = useApp();
   const api = useApi();
   const { go } = useNavigation();
-  const [title, setTitle] = useState(initialTitle ?? "");
   const [outcome, setOutcome] = useState("");
   const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.tasks));
   const [project, setProject] = useState(() => {
@@ -359,7 +356,6 @@ export function NewTaskModal({
     setError("");
     try {
       const task = await api.createTask({
-        title,
         outcome,
         owner_id: owner || undefined,
         project_id: project || undefined,
@@ -389,7 +385,7 @@ export function NewTaskModal({
           </button>
           <button
             className="button primary"
-            disabled={!title.trim() || busy}
+            disabled={!outcome.trim() || busy}
             onClick={create}
           >
             {ownerIsAgent && start ? "Create and start" : "Create"}
@@ -397,12 +393,12 @@ export function NewTaskModal({
         </>
       }
     >
-      <Field label="Title" value={title} onChange={setTitle} autoFocus />
       <Field
         label="Expected result"
         value={outcome}
         onChange={setOutcome}
         textarea
+        autoFocus
         placeholder="What has to be true when this is done?"
       />
       <FormSelect

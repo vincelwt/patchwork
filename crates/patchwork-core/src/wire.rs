@@ -113,6 +113,8 @@ pub struct OpenDm {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateTask {
+    /// Optional: derived from the first line of `outcome` when blank.
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub outcome: String,

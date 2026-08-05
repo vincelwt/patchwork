@@ -141,7 +141,8 @@ enum TaskCommand {
         reference: String,
     },
     Create {
-        #[arg(long)]
+        /// Optional: derived from the first line of `--outcome` when omitted.
+        #[arg(long, default_value = "")]
         title: String,
         #[arg(long, default_value = "")]
         outcome: String,

@@ -539,8 +539,8 @@ async fn create_task(
     caller: Caller,
     Json(input): Json<CreateTask>,
 ) -> ApiResult<Json<Task>> {
-    if input.title.trim().is_empty() {
-        return Err(ApiError::bad_request("a task needs a title"));
+    if input.title.trim().is_empty() && input.outcome.trim().is_empty() {
+        return Err(ApiError::bad_request("a task needs an expected result"));
     }
     Ok(Json(
         orchestrator::create_task(&state, &caller.member.id, input).await?,

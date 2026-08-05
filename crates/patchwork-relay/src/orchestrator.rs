@@ -1319,6 +1319,29 @@ pub fn notify_task(
 // Tasks
 // ---------------------------------------------------------------------------
 
+/// First line of the expected result, trimmed to something a board row can show.
+fn title_from(outcome: &str) -> String {
+    let line = outcome
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(['.', ':', ';', ',']);
+    if line.is_empty() {
+        return "Untitled task".to_string();
+    }
+    if line.chars().count() <= 60 {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(60).collect();
+    let head = match head.rsplit_once(' ') {
+        Some((words, _)) if words.chars().count() >= 20 => words,
+        _ => head.as_str(),
+    };
+    format!("{}\u{2026}", head.trim_end())
+}
+
 /// Boxed: creating a task can fire an automation that creates a task.
 pub fn create_task<'a>(
     state: &'a Shared,
@@ -1335,13 +1358,19 @@ async fn create_task_inner(
 ) -> Result<Task> {
     let key = state.store.next_task_key()?;
     let now = now_ms();
+    // ponytail: the title is the outcome's first line, not a model call. Swap in
+    // a written title if these read badly; the task page already renames in place.
+    let title = match input.title.trim() {
+        "" => title_from(&input.outcome),
+        given => given.to_string(),
+    };
 
     let discussion = Channel {
         id: new_id(),
         kind: ChannelKind::Task,
         section_id: None,
         slug: String::new(),
-        name: format!("{key} — {}", input.title),
+        name: format!("{key} — {title}"),
         topic: input.outcome.clone(),
         position: 0.0,
         created_at: now,
@@ -1362,7 +1391,7 @@ async fn create_task_inner(
     let task = Task {
         id: new_id(),
         key: key.clone(),
-        title: input.title.clone(),
+        title,
         outcome: input.outcome.clone(),
         status: input.status.unwrap_or(TaskStatus::Planned),
         owner_id: input.owner_id.clone(),
@@ -1659,6 +1688,15 @@ pub async fn answer_question(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_come_from_the_first_line() {
+        assert_eq!(title_from("Ship the billing page."), "Ship the billing page");
+        assert_eq!(title_from("  Fix login\nmore detail here"), "Fix login");
+        assert_eq!(title_from(""), "Untitled task");
+        let long = title_from(&"alpha beta gamma delta epsilon zeta eta".repeat(3));
+        assert!(long.ends_with('\u{2026}') && long.chars().count() <= 61, "{long}");
+    }
 
     fn member(id: &str, handle: &str, kind: MemberKind) -> Member {
         Member {
