@@ -8,8 +8,8 @@ import {
   pickDirectory,
   setAwakePolicy,
   setProjectPaths,
-  signOut,
 } from "../lib/desktop";
+import { leave, signOutOfEverything, switchTo } from "../lib/session";
 import type { AwakePolicy } from "../lib/desktop";
 import type { DesktopInfo } from "../lib/desktop";
 import { Avatar, Chip, Field, Modal, plainText, useNavigation } from "./common";
@@ -1626,6 +1626,11 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     });
   }, [hostSignature]);
 
+  const relayUrl =
+    info?.settings.workspaces.find(
+      (workspace) => workspace.id === app.workspace?.id,
+    )?.relay_url ?? "";
+
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so
   // the two are merged, with the local view winning for the local machine.
@@ -1786,16 +1791,61 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
         ))}
       </Section>
 
+      {/* Every workspace this machine has joined stays connected, whichever
+          one the window is showing: an agent working in one of them does not
+          care what you are looking at. */}
+      <Section
+        title="Workspaces"
+        action={
+          <span className="section-note">All connected, all working</span>
+        }
+      >
+        {(info?.settings.workspaces ?? []).map((workspace) => {
+          const here = workspace.id === app.workspace?.id;
+          return (
+            <div className="row hoverable" key={workspace.id}>
+              <span className={`dot ${here && app.live ? "online" : ""}`} />
+              <span className="grow">
+                <span className="name">
+                  {workspace.name}
+                  {here && <span className="you"> showing</span>}
+                </span>
+                <span className="sub">
+                  {workspace.relay_url} · {workspace.member_name}
+                </span>
+              </span>
+              {!here && (
+                <button
+                  className="button quiet"
+                  onClick={() => void switchTo(workspace.id)}
+                >
+                  Switch
+                </button>
+              )}
+              <button
+                className="button quiet danger"
+                onClick={async () => {
+                  await leave(workspace.id);
+                  setInfo(await desktopInfo());
+                }}
+              >
+                Leave
+              </button>
+            </div>
+          );
+        })}
+      </Section>
+
       <Section title="Relay">
         <div className="row hoverable">
           <span className={`dot ${app.live ? "online" : "waiting"}`} />
           <span className="grow">
-            <span className="name">{info?.settings.relay_url}</span>
+            <span className="name">{relayUrl}</span>
             <span className="sub">{app.live ? "connected" : "reconnecting…"}</span>
           </span>
           <button
             className="button quiet"
-            onClick={() => openExternal(`${info?.settings.relay_url}/api/health`)}
+            onClick={() => openExternal(`${relayUrl}/api/health`)}
           >
             <ExternalIcon size={14} />
             Health
@@ -1807,11 +1857,11 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
         <button
           className="button quiet danger"
           onClick={async () => {
-            await signOut();
+            await signOutOfEverything();
             onSignOut();
           }}
         >
-          Sign out of this workspace
+          Sign out of every workspace
         </button>
       </Section>
     </Page>

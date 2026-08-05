@@ -1,6 +1,6 @@
-//! What this desktop remembers between launches: which relay it belongs to,
-//! its device token, its stable host identity, and where each project lives on
-//! this machine.
+//! What this desktop remembers between launches: the workspaces it has joined
+//! and their device tokens, its stable host identity, and where each project
+//! lives on this machine.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,16 +8,33 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// One joined workspace. A relay can hold several, and this machine can be in
+/// workspaces on different relays at once.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceSettings {
+    pub id: String,
+    pub name: String,
+    /// The relay root, without the workspace prefix.
+    pub relay_url: String,
+    pub token: String,
+    pub member_id: String,
+    pub member_name: String,
+}
+
+impl WorkspaceSettings {
+    /// Everything this workspace is reached through hangs off here.
+    pub fn base_url(&self) -> String {
+        format!("{}/w/{}", self.relay_url.trim_end_matches('/'), self.id)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
-    pub relay_url: String,
+    pub workspaces: Vec<WorkspaceSettings>,
+    /// Which one the window is showing. Every one of them stays connected.
     #[serde(default)]
-    pub token: String,
-    #[serde(default)]
-    pub member_id: String,
-    #[serde(default)]
-    pub member_name: String,
+    pub active: String,
     /// Stable across restarts so this machine keeps one host identity.
     #[serde(default)]
     pub host_id: String,
@@ -33,7 +50,25 @@ pub struct Settings {
 
 impl Settings {
     pub fn is_connected(&self) -> bool {
-        !self.relay_url.is_empty() && !self.token.is_empty()
+        !self.workspaces.is_empty()
+    }
+
+    pub fn workspace(&self, id: &str) -> Option<&WorkspaceSettings> {
+        self.workspaces.iter().find(|w| w.id == id)
+    }
+
+    pub fn active_workspace(&self) -> Option<&WorkspaceSettings> {
+        self.workspace(&self.active).or_else(|| self.workspaces.first())
+    }
+
+    /// Adding the same workspace twice replaces the old token rather than
+    /// leaving two entries fighting over one member.
+    pub fn upsert(&mut self, workspace: WorkspaceSettings) {
+        match self.workspaces.iter_mut().find(|w| w.id == workspace.id) {
+            Some(existing) => *existing = workspace.clone(),
+            None => self.workspaces.push(workspace.clone()),
+        }
+        self.active = workspace.id;
     }
 }
 
@@ -70,4 +105,41 @@ pub fn stable_host_id() -> String {
     let digest = Sha256::digest(patchwork_agent::detect::machine_key().as_bytes());
     let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..12]);
     format!("host-{short}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_workspace_is_reached_under_its_own_prefix() {
+        let workspace = WorkspaceSettings {
+            id: "ws1".into(),
+            relay_url: "http://127.0.0.1:7727/".into(),
+            ..Default::default()
+        };
+        assert_eq!(workspace.base_url(), "http://127.0.0.1:7727/w/ws1");
+    }
+
+    #[test]
+    fn rejoining_replaces_rather_than_duplicates() {
+        let mut settings = Settings::default();
+        settings.upsert(WorkspaceSettings {
+            id: "a".into(),
+            token: "one".into(),
+            ..Default::default()
+        });
+        settings.upsert(WorkspaceSettings {
+            id: "b".into(),
+            ..Default::default()
+        });
+        settings.upsert(WorkspaceSettings {
+            id: "a".into(),
+            token: "two".into(),
+            ..Default::default()
+        });
+        assert_eq!(settings.workspaces.len(), 2);
+        assert_eq!(settings.workspace("a").unwrap().token, "two");
+        assert_eq!(settings.active, "a");
+    }
 }

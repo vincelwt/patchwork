@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
-use patchwork_core::{new_id, now_ms, Id};
+use patchwork_core::{now_ms, Id};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row};
 use serde_json::Value as Json;
@@ -95,9 +95,11 @@ impl Store {
         .ok_or_else(|| anyhow!("workspace is not initialised"))
     }
 
-    pub fn create_workspace(&self, name: &str) -> Result<Workspace> {
+    /// The id is chosen by the caller: it names the workspace's directory on
+    /// disk and its URL prefix, so the two can never drift apart.
+    pub fn create_workspace(&self, id: &str, name: &str) -> Result<Workspace> {
         let ws = Workspace {
-            id: new_id(),
+            id: id.to_string(),
             name: name.to_string(),
             created_at: now_ms(),
             task_seq: 0,

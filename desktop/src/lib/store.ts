@@ -74,7 +74,13 @@ const EMPTY: AppData = {
 
 type Listener = () => void;
 
-class Store {
+/// One workspace's live connection and everything it knows.
+///
+/// A desktop keeps one of these per joined workspace, all connected at the
+/// same time: switching what the window shows must never interrupt an agent
+/// working in the workspace you looked away from, and coming back must not
+/// cost a round trip.
+class Session {
   private data: AppData = EMPTY;
   private listeners = new Set<Listener>();
   private socket?: WebSocket;
@@ -85,6 +91,8 @@ class Store {
   /// Events that arrived on the socket before the bootstrap they belong after.
   private queued?: Envelope[];
   api?: Api;
+
+  constructor(readonly id: Id) {}
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -477,10 +485,174 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
   return next;
 }
 
-export const store = new Store();
+export interface WorkspaceHandle {
+  id: Id;
+  name: string;
+  unread: number;
+  live: boolean;
+  active: boolean;
+}
+
+export interface Joined {
+  id: Id;
+  name: string;
+  /// The workspace's own root on its relay, prefix and all.
+  base_url: string;
+  token: string;
+}
+
+/// Every workspace this desktop has joined, all connected at once.
+///
+/// The rest of the app talks to whichever one is on screen and never knows
+/// the others exist — but they are live, so their agents keep working, their
+/// unread counts stay true, and switching back is instant.
+class Workspaces {
+  private sessions = new Map<Id, Session>();
+  private order: Id[] = [];
+  private names = new Map<Id, string>();
+  /// What a background workspace last showed in the switcher. Its own traffic
+  /// must not redraw the workspace you are actually looking at.
+  private badges = new Map<Id, string>();
+  private listeners = new Set<Listener>();
+  private activeId?: Id;
+  private handles: WorkspaceHandle[] = [];
+
+  subscribe = (listener: Listener) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  getSnapshot = (): AppData => this.session?.getSnapshot() ?? EMPTY;
+
+  /// The switcher's view. Cached so `useSyncExternalStore` sees a stable value.
+  getWorkspaces = (): WorkspaceHandle[] => this.handles;
+
+  private get session(): Session | undefined {
+    return this.activeId ? this.sessions.get(this.activeId) : undefined;
+  }
+
+  get api(): Api | undefined {
+    return this.session?.api;
+  }
+
+  get activeWorkspaceId(): Id | undefined {
+    return this.activeId;
+  }
+
+  /// Bring the set of workspaces in line with what this desktop has joined,
+  /// and show one of them. Connections that are already up are left alone.
+  connect(joined: Joined[], activeId?: Id) {
+    for (const [id, session] of this.sessions) {
+      if (joined.some((workspace) => workspace.id === id)) continue;
+      session.disconnect();
+      this.sessions.delete(id);
+      this.badges.delete(id);
+    }
+    this.order = joined.map((workspace) => workspace.id);
+
+    for (const workspace of joined) {
+      this.names.set(workspace.id, workspace.name);
+      const existing = this.sessions.get(workspace.id);
+      if (existing) {
+        if (existing.api?.token === workspace.token) continue;
+        existing.disconnect();
+      }
+      const session = new Session(workspace.id);
+      session.subscribe(() => this.onSessionChanged(session));
+      this.sessions.set(workspace.id, session);
+      void session.connect(workspace.base_url, workspace.token);
+    }
+
+    this.activeId =
+      (activeId && this.sessions.has(activeId) ? activeId : undefined) ??
+      this.order[0];
+    this.notify();
+  }
+
+  setActive(id: Id) {
+    if (this.activeId === id || !this.sessions.has(id)) return;
+    this.activeId = id;
+    this.notify();
+  }
+
+  disconnect() {
+    for (const session of this.sessions.values()) session.disconnect();
+    this.sessions.clear();
+    this.badges.clear();
+    this.order = [];
+    this.activeId = undefined;
+    this.notify();
+  }
+
+  private onSessionChanged(session: Session) {
+    if (session.id === this.activeId) {
+      this.notify();
+      return;
+    }
+    // A background workspace only ever changes the switcher, so it only wakes
+    // the app when what the switcher shows actually moved.
+    const data = session.getSnapshot();
+    const badge = `${data.workspace?.name ?? ""}·${unreadOf(data)}·${data.live}`;
+    if (this.badges.get(session.id) === badge) return;
+    this.badges.set(session.id, badge);
+    this.notify();
+  }
+
+  private notify() {
+    this.handles = this.order.flatMap((id) => {
+      const session = this.sessions.get(id);
+      if (!session) return [];
+      const data = session.getSnapshot();
+      return [
+        {
+          id,
+          name: data.workspace?.name ?? this.names.get(id) ?? "Workspace",
+          unread: unreadOf(data),
+          live: data.live,
+          active: id === this.activeId,
+        },
+      ];
+    });
+    this.listeners.forEach((listener) => listener());
+  }
+
+  // What the app calls on the workspace it is looking at.
+  loadChannel(channelId: Id, force = false) {
+    return this.session?.loadChannel(channelId, force);
+  }
+  loadOlder(channelId: Id) {
+    return this.session?.loadOlder(channelId) ?? Promise.resolve();
+  }
+  loadThread(messageId: Id) {
+    return this.session?.loadThread(messageId);
+  }
+  loadRun(runId: Id) {
+    return this.session?.loadRun(runId);
+  }
+  loadQuestion(questionId: Id) {
+    return this.session?.loadQuestion(questionId);
+  }
+  loadPreview(previewId: Id) {
+    return this.session?.loadPreview(previewId);
+  }
+  typing(channelId: Id) {
+    this.session?.typing(channelId);
+  }
+}
+
+function unreadOf(data: AppData) {
+  return data.inbox.filter((item) => !item.read_at).length;
+}
+
+export const store = new Workspaces();
 
 export function useApp(): AppData {
   return useSyncExternalStore(store.subscribe, store.getSnapshot);
+}
+
+/// Every joined workspace, for the switcher.
+export function useWorkspaces(): WorkspaceHandle[] {
+  return useSyncExternalStore(store.subscribe, store.getWorkspaces);
 }
 
 /// Subscribe to a part of the store rather than to all of it.

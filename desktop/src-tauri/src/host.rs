@@ -1,9 +1,15 @@
 //! This machine as an execution host.
 //!
-//! There is no separate host product: the Desktop keeps a WebSocket open to the
-//! relay, registers what it can run, and executes the runs the relay sends it.
-//! Close the app and its local agents simply stop being offered work.
+//! There is no separate host product: the Desktop keeps a WebSocket open per
+//! joined workspace, registers what it can run, and executes the runs each
+//! relay sends it. Close the app and its local agents simply stop being
+//! offered work.
+//!
+//! One connection per workspace, all of them live at once: switching what the
+//! window shows is a UI decision and must never stop an agent working in the
+//! workspace you just looked away from.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
@@ -14,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::settings::Settings;
+use crate::settings::{Settings, WorkspaceSettings};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -44,76 +50,106 @@ enum ServerMsg {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HostStatus {
+    /// True when every joined workspace has this machine online.
     pub connected: bool,
     pub host_id: String,
     pub host_name: String,
     pub last_error: Option<String>,
+    pub workspaces_online: usize,
+    pub workspaces: usize,
+}
+
+#[derive(Default)]
+struct Links {
+    host_id: String,
+    host_name: String,
+    /// Workspace id -> is this machine online in it.
+    online: HashMap<String, bool>,
+    last_error: Option<String>,
+}
+
+impl Links {
+    fn status(&self) -> HostStatus {
+        let online = self.online.values().filter(|up| **up).count();
+        HostStatus {
+            connected: online > 0 && online == self.online.len(),
+            host_id: self.host_id.clone(),
+            host_name: self.host_name.clone(),
+            last_error: self.last_error.clone(),
+            workspaces_online: online,
+            workspaces: self.online.len(),
+        }
+    }
 }
 
 pub struct LocalHost {
-    status: Arc<Mutex<HostStatus>>,
-    stop: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    links: Arc<Mutex<Links>>,
+    stop: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     awake: Arc<crate::awake::Keeper>,
 }
 
 impl LocalHost {
     pub fn new(awake: Arc<crate::awake::Keeper>) -> Self {
         Self {
-            status: Arc::new(Mutex::new(HostStatus::default())),
-            stop: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(Links::default())),
+            stop: Arc::new(Mutex::new(Vec::new())),
             awake,
         }
     }
 
     pub async fn status(&self) -> HostStatus {
-        self.status.lock().await.clone()
+        self.links.lock().await.status()
     }
 
-    /// Restart the connection with the current settings. Safe to call whenever
-    /// settings change.
+    /// Reconnect every workspace with the current settings. Safe to call
+    /// whenever settings change.
     pub async fn restart(&self, settings: Settings) {
-        if let Some(handle) = self.stop.lock().await.take() {
+        for handle in self.stop.lock().await.drain(..) {
             handle.abort();
         }
         {
-            let mut status = self.status.lock().await;
-            status.connected = false;
-            status.host_id = settings.host_id.clone();
-            status.host_name = settings.host_name.clone();
-        }
-        if !settings.is_connected() {
-            return;
+            let mut links = self.links.lock().await;
+            links.host_id = settings.host_id.clone();
+            links.host_name = settings.host_name.clone();
+            links.online.clear();
+            links.last_error = None;
         }
 
-        let status = self.status.clone();
-        let awake = self.awake.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                match connect(&settings, &status, &awake).await {
-                    Ok(()) => {}
-                    Err(err) => {
-                        let mut status = status.lock().await;
-                        status.connected = false;
-                        status.last_error = Some(format!("{err:#}"));
+        for workspace in settings.workspaces.clone() {
+            self.links
+                .lock()
+                .await
+                .online
+                .insert(workspace.id.clone(), false);
+
+            let links = self.links.clone();
+            let awake = self.awake.clone();
+            let shared = settings.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    if let Err(err) = connect(&shared, &workspace, &links, &awake).await {
+                        links.lock().await.last_error = Some(format!("{err:#}"));
                     }
+                    {
+                        let mut links = links.lock().await;
+                        links.online.insert(workspace.id.clone(), false);
+                    }
+                    awake.set_running(&workspace.id, 0);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
-                {
-                    let mut status = status.lock().await;
-                    status.connected = false;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        });
-        *self.stop.lock().await = Some(handle);
+            });
+            self.stop.lock().await.push(handle);
+        }
     }
 }
 
 async fn connect(
     settings: &Settings,
-    status: &Arc<Mutex<HostStatus>>,
+    workspace: &WorkspaceSettings,
+    links: &Arc<Mutex<Links>>,
     awake: &Arc<crate::awake::Keeper>,
 ) -> anyhow::Result<()> {
-    let ws_url = websocket_url(&settings.relay_url, &settings.token);
+    let ws_url = websocket_url(&workspace.base_url(), &workspace.token);
     let (socket, _) = tokio_tungstenite::connect_async(&ws_url).await?;
     let (mut sink, mut stream) = socket.split();
 
@@ -151,9 +187,9 @@ async fn connect(
     });
 
     {
-        let mut status = status.lock().await;
-        status.connected = true;
-        status.last_error = None;
+        let mut links = links.lock().await;
+        links.online.insert(workspace.id.clone(), true);
+        links.last_error = None;
     }
 
     // Keep the relay's view of this host fresh, and keep the machine awake for
@@ -162,10 +198,11 @@ async fn connect(
         let out_tx = out_tx.clone();
         let runner = runner.clone();
         let awake = awake.clone();
+        let workspace_id = workspace.id.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                awake.set_running(runner.active_runs().await);
+                awake.set_running(&workspace_id, runner.active_runs().await);
                 if out_tx
                     .send(HostToRelay::Heartbeat { capabilities: None })
                     .is_err()
@@ -185,7 +222,7 @@ async fn connect(
                 runner.handle(msg).await;
                 // Checked on every command rather than only on the heartbeat,
                 // so a run that starts now is covered now.
-                awake.set_running(runner.active_runs().await);
+                awake.set_running(&workspace.id, runner.active_runs().await);
             }
             Ok(ServerMsg::Error { message }) => {
                 tracing::warn!(%message, "relay rejected a host message");
@@ -198,12 +235,13 @@ async fn connect(
     heartbeat.abort();
     writer.abort();
     runner.shutdown().await;
-    awake.set_running(0);
+    awake.set_running(&workspace.id, 0);
     Ok(())
 }
 
-fn websocket_url(relay_url: &str, token: &str) -> String {
-    let base = relay_url.trim_end_matches('/');
+/// The workspace's own WebSocket, derived from its base URL.
+fn websocket_url(base_url: &str, token: &str) -> String {
+    let base = base_url.trim_end_matches('/');
     let base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -232,14 +270,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn websocket_urls_follow_the_relay_scheme() {
+    fn websocket_urls_follow_the_relay_scheme_and_stay_inside_the_workspace() {
         assert_eq!(
-            websocket_url("https://relay.example.com/", "abc"),
-            "wss://relay.example.com/ws?token=abc"
+            websocket_url("https://relay.example.com/w/ws1/", "abc"),
+            "wss://relay.example.com/w/ws1/ws?token=abc"
         );
         assert_eq!(
-            websocket_url("http://127.0.0.1:7717", "abc"),
-            "ws://127.0.0.1:7717/ws?token=abc"
+            websocket_url("http://127.0.0.1:7727/w/ws1", "abc"),
+            "ws://127.0.0.1:7727/w/ws1/ws?token=abc"
         );
     }
 }

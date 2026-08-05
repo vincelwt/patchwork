@@ -2,10 +2,13 @@
 //! speak exactly this.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use tower::ServiceExt;
 use patchwork_core::events::Event;
 use patchwork_core::host::RelayToHost;
 use patchwork_core::models::*;
@@ -16,13 +19,151 @@ use serde::Deserialize;
 use crate::auth::{self, Caller};
 use crate::error::{ApiError, ApiResult};
 use crate::orchestrator::{self, PostOptions, StartRunParams};
+use crate::relay::Relay;
 use crate::state::Shared;
 use crate::{automations, preview_proxy};
 
+/// The relay itself: what is true before you have picked a workspace.
+/// Everything else lives under `/w/{workspace_id}/` and is served by that
+/// workspace's own router.
+pub fn relay_router(relay: Arc<Relay>) -> Router {
+    Router::new()
+        .route("/api/health", get(relay_health))
+        .route("/api/workspaces", get(list_workspaces).post(create_workspace))
+        .route("/api/auth/join", post(join))
+        .fallback(dispatch)
+        .with_state(relay)
+}
+
+/// `/w/{workspace_id}/api/thing` -> the workspace, and `/api/thing`.
+fn split_workspace(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/w/")?;
+    let (workspace_id, tail) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    (!workspace_id.is_empty()).then_some((workspace_id, tail))
+}
+
+/// Hand the request to the workspace named in its path.
+async fn dispatch(State(relay): State<Arc<Relay>>, mut request: Request) -> Response {
+    let path = request.uri().path().to_string();
+    let Some((workspace_id, tail)) = split_workspace(&path) else {
+        return ApiError::not_found("no such endpoint").into_response();
+    };
+    let Some(router) = relay.router(workspace_id).await else {
+        return ApiError::not_found("no such workspace").into_response();
+    };
+
+    let query = request
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let Ok(uri) = format!("{tail}{query}").parse() else {
+        return ApiError::bad_request("bad path").into_response();
+    };
+    *request.uri_mut() = uri;
+    router.oneshot(request).await.into_response()
+}
+
+async fn relay_health(State(relay): State<Arc<Relay>>) -> ApiResult<Json<Health>> {
+    let states = relay.states().await;
+    let mut hosts_online = 0;
+    let mut runs_active = 0;
+    let mut started_at = now_ms();
+    for state in &states {
+        hosts_online += state.online_host_ids().await.len();
+        runs_active += state.store.active_runs().map(|r| r.len()).unwrap_or(0);
+        started_at = started_at.min(state.started_at);
+    }
+    Ok(Json(Health {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        api: 1,
+        started_at,
+        hosts_online,
+        runs_active,
+    }))
+}
+
+/// Every workspace on this relay, for a caller who already belongs to one of
+/// them. Names only: the contents stay behind each workspace's own token.
+async fn list_workspaces(
+    State(relay): State<Arc<Relay>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<Vec<Workspace>>> {
+    relay
+        .workspace_for_token(&bearer(&headers)?)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("invalid token"))?;
+    Ok(Json(relay.workspaces().await))
+}
+
+/// A second workspace on the same relay, created by someone who is already in
+/// one. They own it: they are its first admin, with a token of its own.
+async fn create_workspace(
+    State(relay): State<Arc<Relay>>,
+    headers: axum::http::HeaderMap,
+    Json(input): Json<NameInput>,
+) -> ApiResult<Json<AuthResponse>> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a workspace needs a name"));
+    }
+    let (_, caller) = relay
+        .workspace_for_token(&bearer(&headers)?)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("invalid token"))?;
+
+    let (state, code) = relay
+        .create(name)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let response = join_workspace(
+        &state,
+        JoinRequest {
+            invite_code: code,
+            display_name: caller.member.display_name.clone(),
+            email: caller.member.email.clone(),
+            device_name: None,
+        },
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("missing token"))
+}
+
+async fn join(
+    State(relay): State<Arc<Relay>>,
+    Json(input): Json<JoinRequest>,
+) -> ApiResult<Json<AuthResponse>> {
+    let state = relay
+        .workspace_for_invite(input.invite_code.trim())
+        .await
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "invalid_invite",
+                "that invite code is not valid",
+            )
+        })?;
+    Ok(Json(join_workspace(&state, input).await?))
+}
+
+/// One workspace's API. Mounted under `/w/{workspace_id}/`.
 pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/api/health", get(health))
-        .route("/api/auth/join", post(join))
         .route("/api/webhooks/{token}", post(webhook));
 
     let api = Router::new()
@@ -124,10 +265,7 @@ async fn health(State(state): State<Shared>) -> ApiResult<Json<Health>> {
     }))
 }
 
-async fn join(
-    State(state): State<Shared>,
-    Json(input): Json<JoinRequest>,
-) -> ApiResult<Json<AuthResponse>> {
+async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthResponse> {
     let display_name = input.display_name.trim();
     if display_name.is_empty() {
         return Err(ApiError::bad_request("a display name is required"));
@@ -169,11 +307,11 @@ async fn join(
         member: member.clone(),
     });
 
-    Ok(Json(AuthResponse {
+    Ok(AuthResponse {
         token,
         member,
         workspace: state.store.workspace()?,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,6 +1724,18 @@ fn snippet(body: &str, needle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_is_split_into_a_workspace_and_the_api_it_calls() {
+        assert_eq!(
+            split_workspace("/w/ws1/api/bootstrap"),
+            Some(("ws1", "/api/bootstrap"))
+        );
+        assert_eq!(split_workspace("/w/ws1/ws"), Some(("ws1", "/ws")));
+        assert_eq!(split_workspace("/w/ws1"), Some(("ws1", "/")));
+        assert_eq!(split_workspace("/w/"), None);
+        assert_eq!(split_workspace("/api/health"), None);
+    }
 
     #[test]
     fn snippets_centre_on_the_match() {

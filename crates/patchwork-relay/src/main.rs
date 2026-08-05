@@ -11,25 +11,21 @@ mod error;
 mod github;
 mod orchestrator;
 mod preview_proxy;
+mod relay;
 mod state;
 mod store;
 mod ws;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use patchwork_agent::{Runner, RunnerConfig};
-use patchwork_core::events::Event;
 use patchwork_core::models::*;
-use patchwork_core::{new_id, now_ms};
-use tokio::sync::mpsc;
+use patchwork_core::now_ms;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::state::{AppState, Shared};
-use crate::store::Store;
+use crate::relay::Relay;
 
 #[derive(Parser, Debug)]
 #[command(name = "patchwork-relay", version, about = "The Patchwork relay")]
@@ -56,6 +52,10 @@ struct Args {
     /// Print a fresh admin invite code and exit.
     #[arg(long)]
     invite: bool,
+
+    /// Which workspace `--invite` belongs to. Defaults to the oldest one.
+    #[arg(long)]
+    workspace: Option<String>,
 }
 
 #[tokio::main]
@@ -72,21 +72,31 @@ async fn main() -> Result<()> {
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
-    let store = Store::open(&data_dir.join("patchwork.db"))?;
-    let first_run = store.workspace().is_err();
-    if first_run {
-        store.create_workspace(&args.workspace_name)?;
-    }
+    let public_url = args
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", args.port));
+    let relay = Relay::open(data_dir, public_url.clone()).await?;
 
     if args.invite {
+        let state = match &args.workspace {
+            Some(id) => relay.state(id).await.context("no such workspace")?,
+            None => relay
+                .states()
+                .await
+                .into_iter()
+                .min_by_key(|s| s.store.workspace().map(|w| w.created_at).unwrap_or(0))
+                .context("this relay has no workspace yet")?,
+        };
         let code = crate::auth::generate_invite_code();
-        let admin = store
+        let admin = state
+            .store
             .members()?
             .into_iter()
             .find(|m| m.is_admin)
             .map(|m| m.id)
             .unwrap_or_else(|| "system".into());
-        store.insert_invite(&Invite {
+        state.store.insert_invite(&Invite {
             code: code.clone(),
             created_by: admin,
             created_at: now_ms(),
@@ -99,47 +109,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let public_url = args
-        .public_url
-        .clone()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", args.port));
-    let relay_host_id = ensure_relay_host(&store)?;
-
-    let state: Shared = Arc::new(AppState::new(
-        store,
-        data_dir.join("files"),
-        public_url.clone(),
-        relay_host_id.clone(),
-    ));
-
-    if first_run {
-        seed_workspace(&state).await?;
-        let code = crate::auth::generate_invite_code();
-        state.store.insert_invite(&Invite {
-            code: code.clone(),
-            created_by: "system".into(),
-            created_at: now_ms(),
-            email: None,
-            is_admin: true,
-            used_at: None,
-            used_by: None,
-        })?;
+    if relay.is_empty().await {
+        let (state, code) = relay.create(&args.workspace_name).await?;
+        let workspace = state.store.workspace()?;
         println!();
         println!("  Patchwork is ready.");
         println!();
         println!("  Relay URL:   {public_url}");
+        println!("  Workspace:   {} ({})", workspace.name, workspace.id);
         println!("  Invite code: {code}");
         println!();
-        println!("  Open the Desktop app and join with those two values.");
+        println!("  Open the Desktop app and join with the URL and the code.");
         println!();
     }
 
-    let runner = start_hosted_execution(&state);
-    tokio::spawn(automations::scheduler(state.clone()));
-    tokio::spawn(github::watcher(state.clone()));
-    reconcile_interrupted_runs(&state).await;
-
-    let app = api::router(state.clone()).layer(
+    let app = api::relay_router(relay.clone()).layer(
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -156,8 +140,7 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Stop hosted agents deliberately rather than orphaning their runtimes.
-    runner.shutdown().await;
+    relay.shutdown().await;
     Ok(())
 }
 
@@ -165,161 +148,6 @@ fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("patchwork-relay")
-}
-
-fn ensure_relay_host(store: &Store) -> Result<String> {
-    if let Some(existing) = store.hosts()?.into_iter().find(|h| h.kind == HostKind::Relay) {
-        return Ok(existing.id);
-    }
-    let host = Host {
-        id: new_id(),
-        name: "Relay".into(),
-        kind: HostKind::Relay,
-        platform: patchwork_agent::detect::platform(),
-        owner_id: None,
-        online: false,
-        last_seen: 0,
-        capabilities: HostCapabilities::default(),
-        created_at: now_ms(),
-    };
-    store.upsert_host(&host)?;
-    Ok(host.id)
-}
-
-/// The relay is itself an execution host: hosted agents keep working when
-/// every laptop is closed.
-fn start_hosted_execution(state: &Shared) -> std::sync::Arc<Runner> {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let cli_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()));
-    let runner = Runner::new(
-        RunnerConfig {
-            cli_dir,
-            env: Vec::new(),
-        },
-        out_tx,
-    );
-
-    // Host -> relay.
-    {
-        let state = state.clone();
-        let host_id = state.relay_host_id.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                orchestrator::handle_host_message(&state, &host_id, msg).await;
-            }
-        });
-    }
-
-    // Relay -> host.
-    let (in_tx, mut in_rx) = mpsc::unbounded_channel();
-    {
-        let runner = runner.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = in_rx.recv().await {
-                runner.handle(msg).await;
-            }
-        });
-    }
-
-    ws::register_relay_host(state, in_tx);
-
-    // Report what this machine can do, so setup problems are visible in the UI.
-    {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut capabilities = patchwork_agent::detect_capabilities().await;
-            if let Ok(Some(mut host)) = state.store.host(&state.relay_host_id) {
-                // Detection cannot know what a runtime can *run* — only opening
-                // a session tells us that — so carry forward what we learned.
-                for runtime in &mut capabilities.runtimes {
-                    let Some(known) = host
-                        .capabilities
-                        .runtimes
-                        .iter()
-                        .find(|candidate| candidate.id == runtime.id)
-                    else {
-                        continue;
-                    };
-                    if runtime.models.is_empty() {
-                        runtime.models = known.models.clone();
-                        runtime.default_model = known.default_model.clone();
-                    }
-                    if runtime.modes.is_empty() {
-                        runtime.modes = known.modes.clone();
-                        runtime.default_mode = known.default_mode.clone();
-                    }
-                }
-                host.capabilities = capabilities;
-                host.last_seen = now_ms();
-                host.online = true;
-                if state.store.upsert_host(&host).is_ok() {
-                    state.emit(Event::HostUpdated { host });
-                }
-            }
-        });
-    }
-
-    runner
-}
-
-/// A run that was in flight when the relay stopped is never left claiming to
-/// be running.
-async fn reconcile_interrupted_runs(state: &Shared) {
-    let Ok(runs) = state.store.active_runs() else {
-        return;
-    };
-    for mut run in runs {
-        run.status = RunStatus::Failed;
-        run.error = Some("the relay restarted while this run was in flight".into());
-        run.ended_at = Some(now_ms());
-        if state.store.update_run(&run).is_ok() {
-            state.store.revoke_run_tokens(&run.id).ok();
-            state.store.cancel_questions_for_run(&run.id).ok();
-            state.emit(Event::RunUpdated { run });
-        }
-    }
-}
-
-async fn seed_workspace(state: &Shared) -> Result<()> {
-    // A member to author system messages.
-    let system = Member {
-        id: new_id(),
-        kind: MemberKind::Human,
-        handle: "patchwork".into(),
-        display_name: "Patchwork".into(),
-        email: None,
-        avatar: Some("◆".into()),
-        is_admin: false,
-        created_at: now_ms(),
-        agent: None,
-        presence: Presence::Offline,
-    };
-    state.store.insert_member(&system)?;
-
-    let section = Section {
-        id: new_id(),
-        name: "OPERATIONS".into(),
-        position: 0.0,
-    };
-    state.store.upsert_section(&section)?;
-
-    let general = Channel {
-        id: new_id(),
-        kind: ChannelKind::Channel,
-        section_id: Some(section.id.clone()),
-        slug: "general".into(),
-        name: "general".into(),
-        topic: "Everything that does not have a better home yet".into(),
-        position: 0.0,
-        created_at: now_ms(),
-        member_ids: Vec::new(),
-        task_id: None,
-        last_message_at: 0,
-    };
-    state.store.insert_channel(&general)?;
-    Ok(())
 }
 
 async fn shutdown_signal() {

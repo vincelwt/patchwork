@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use host::{HostStatus, LocalHost};
 use serde::{Deserialize, Serialize};
-use settings::Settings;
+use settings::{Settings, WorkspaceSettings};
 
 struct AppState {
     local_host: Arc<LocalHost>,
@@ -46,6 +46,38 @@ struct JoinInput {
     display_name: String,
 }
 
+/// POST some JSON at a relay and read the error message it sends back, which
+/// is written for a person rather than for a log.
+async fn post_json(
+    url: String,
+    token: Option<&str>,
+    body: serde_json::Value,
+) -> Result<patchwork_core::wire::AuthResponse, String> {
+    let mut request = reqwest::Client::new().post(url).json(&body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the relay: {e}"))?;
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or(text);
+        return Err(message);
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn desktop_boot(state: tauri::State<'_, AppState>) -> Result<DesktopBoot, String> {
     Ok(DesktopBoot {
@@ -66,7 +98,8 @@ async fn desktop_info(state: tauri::State<'_, AppState>) -> Result<DesktopInfo, 
 }
 
 /// Redeem an invite, remember the device token, and bring this machine online
-/// as an execution host.
+/// as an execution host in that workspace. Workspaces already joined keep
+/// running.
 #[tauri::command]
 async fn join_workspace(
     state: tauri::State<'_, AppState>,
@@ -79,43 +112,99 @@ async fn join_workspace(
         friendly_machine_name()
     );
 
-    let response = reqwest::Client::new()
-        .post(format!("{base}/api/auth/join"))
-        .json(&serde_json::json!({
+    let auth = post_json(
+        format!("{base}/api/auth/join"),
+        None,
+        serde_json::json!({
             "invite_code": input.invite_code.trim(),
             "display_name": input.display_name.trim(),
             "device_name": host_name,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("could not reach the relay: {e}"))?;
+        }),
+    )
+    .await?;
 
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let message = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or(text);
-        return Err(message);
-    }
+    remember(&state, base, host_name, auth).await
+}
 
-    let auth: patchwork_core::wire::AuthResponse =
-        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+/// A new workspace on the relay this desktop is already in. The caller
+/// becomes its first admin.
+#[tauri::command]
+async fn create_workspace(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<Settings, String> {
+    let current = settings::load();
+    let active = current
+        .active_workspace()
+        .cloned()
+        .ok_or_else(|| "join a workspace first".to_string())?;
 
+    let auth = post_json(
+        format!("{}/api/workspaces", active.relay_url),
+        Some(&active.token),
+        serde_json::json!({ "name": name.trim() }),
+    )
+    .await?;
+
+    let host_name = if current.host_name.is_empty() {
+        format!("{}'s {}", auth.member.display_name, friendly_machine_name())
+    } else {
+        current.host_name.clone()
+    };
+    remember(&state, active.relay_url.clone(), host_name, auth).await
+}
+
+async fn remember(
+    state: &tauri::State<'_, AppState>,
+    relay_url: String,
+    host_name: String,
+    auth: patchwork_core::wire::AuthResponse,
+) -> Result<Settings, String> {
     let mut current = settings::load();
-    current.relay_url = base;
-    current.token = auth.token;
-    current.member_id = auth.member.id.clone();
-    current.member_name = auth.member.display_name.clone();
+    current.upsert(WorkspaceSettings {
+        id: auth.workspace.id.clone(),
+        name: auth.workspace.name.clone(),
+        relay_url,
+        token: auth.token,
+        member_id: auth.member.id.clone(),
+        member_name: auth.member.display_name.clone(),
+    });
     current.host_id = settings::stable_host_id();
     current.host_name = host_name;
     settings::save(&current).map_err(|e| e.to_string())?;
 
+    state.local_host.restart(current.clone()).await;
+    Ok(current)
+}
+
+/// Which workspace the window is showing. Nothing disconnects: the others
+/// keep their agents, their runs and their unread counts.
+#[tauri::command]
+async fn switch_workspace(id: String) -> Result<Settings, String> {
+    let mut current = settings::load();
+    if current.workspace(&id).is_none() {
+        return Err("no such workspace on this machine".into());
+    }
+    current.active = id;
+    settings::save(&current).map_err(|e| e.to_string())?;
+    Ok(current)
+}
+
+#[tauri::command]
+async fn leave_workspace(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<Settings, String> {
+    let mut current = settings::load();
+    current.workspaces.retain(|workspace| workspace.id != id);
+    if current.active == id {
+        current.active = current
+            .workspaces
+            .first()
+            .map(|workspace| workspace.id.clone())
+            .unwrap_or_default();
+    }
+    settings::save(&current).map_err(|e| e.to_string())?;
     state.local_host.restart(current.clone()).await;
     Ok(current)
 }
@@ -215,6 +304,9 @@ pub fn run() {
             desktop_boot,
             desktop_info,
             join_workspace,
+            create_workspace,
+            switch_workspace,
+            leave_workspace,
             sign_out,
             set_project_paths,
             set_awake_policy,

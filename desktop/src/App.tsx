@@ -1,8 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { ReactNode } from "react";
 import { store, useApi, useApp, useAppSelector } from "./lib/store";
-import { desktopBoot, joinWorkspace } from "./lib/desktop";
-import type { DesktopSettings } from "./lib/desktop";
+import { boot, join, signOutOfEverything, useSettings } from "./lib/session";
 import { markSeen } from "./lib/unread";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
@@ -32,20 +38,14 @@ import {
   proseText,
   useNavigation,
 } from "./components/common";
-import { Empty, KeyHint, Menu, MenuButton, Page } from "./components/ui";
+import { Empty, KeyHint, MenuButton, Page } from "./components/ui";
 import { Markdown } from "./components/Markdown";
 import {
-  AgentIcon,
-  AutomationIcon,
-  FolderIcon,
   HashIcon,
   InboxIcon,
-  KeyboardIcon,
-  MembersIcon,
   MoreIcon,
   PlusIcon,
   SearchIcon,
-  SettingsIcon,
   Spinner,
   TasksIcon,
 } from "./components/icons";
@@ -53,63 +53,39 @@ import type { Inspector as InspectorState, View } from "./components/common";
 import type { Channel, Id, SearchResults } from "./lib/types";
 
 export default function App() {
-  const [settings, setSettings] = useState<DesktopSettings>();
+  const settings = useSettings();
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    void desktopBoot().then((info) => {
-      // Connect first: the relay round trip is the long pole, and starting it
-      // before React has re-rendered means the shell and its contents arrive
-      // together rather than one after the other.
-      if (info.settings.relay_url && info.settings.token) {
-        void store.connect(info.settings.relay_url, info.settings.token);
-      }
-      setSettings(info.settings);
-      setLoading(false);
-    });
+    // Connect first: the relay round trip is the long pole, and starting it
+    // before React has re-rendered means the shell and its contents arrive
+    // together rather than one after the other.
+    void boot().then(() => setLoading(false));
   }, []);
 
   if (loading) return <div className="empty">Starting Patchwork…</div>;
 
-  if (!settings?.relay_url || !settings.token) {
-    return (
-      <Onboarding
-        onJoined={(joined) => {
-          setSettings(joined);
-          void store.connect(joined.relay_url, joined.token);
-        }}
-      />
-    );
-  }
+  if (!settings?.workspaces.length) return <Onboarding />;
 
-  return (
-    <Workspace
-      onSignOut={() => {
-        store.disconnect();
-        setSettings(undefined);
-      }}
-    />
-  );
+  return <Workspace onSignOut={() => void signOutOfEverything()} />;
 }
 
-function Onboarding({ onJoined }: { onJoined: (settings: DesktopSettings) => void }) {
+export function Onboarding() {
   const [relayUrl, setRelayUrl] = useState("http://127.0.0.1:7727");
   const [inviteCode, setInviteCode] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  const join = async () => {
+  const submit = async () => {
     setBusy(true);
     setError("");
     try {
-      onJoined(
-        await joinWorkspace({
-          relay_url: relayUrl,
-          invite_code: inviteCode,
-          display_name: displayName,
-        }),
-      );
+      await join({
+        relay_url: relayUrl,
+        invite_code: inviteCode,
+        display_name: displayName,
+      });
     } catch (err) {
       setError(String((err as Error).message ?? err));
       setBusy(false);
@@ -137,7 +113,7 @@ function Onboarding({ onJoined }: { onJoined: (settings: DesktopSettings) => voi
           className="button primary"
           style={{ marginTop: 16, width: "100%", justifyContent: "center" }}
           disabled={busy || !inviteCode.trim() || !displayName.trim()}
-          onClick={join}
+          onClick={submit}
         >
           {busy ? "Joining…" : "Join"}
         </button>
@@ -157,7 +133,6 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }));
   const [view, setView] = useState<View>({ kind: "inbox" });
   const [inspector, setInspector] = useState<InspectorState>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState<string>();
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -178,6 +153,8 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     setView(next);
     setInspector(null);
   }, []);
+
+  useRememberedView(view, setView, setInspector);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -239,10 +216,11 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
         style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}
       >
         <Sidebar
-          onOpenMenu={() => setMenuOpen(true)}
+          onHelp={() => setHelpOpen(true)}
           onSearch={() => setSearchOpen(true)}
           onResize={resizeSidebar}
           onCreate={create}
+          onSignOut={onSignOut}
         />
         <div className="main">
           {!app.live && (
@@ -258,19 +236,6 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
         </div>
       </div>
 
-      {menuOpen && (
-        <WorkspaceMenu
-          onClose={() => setMenuOpen(false)}
-          onPick={(next) => {
-            setMenuOpen(false);
-            go(next);
-          }}
-          onHelp={() => {
-            setMenuOpen(false);
-            setHelpOpen(true);
-          }}
-        />
-      )}
       {searchOpen && (
         <CommandPalette
           shortcuts={shortcuts}
@@ -290,6 +255,33 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
       {toast && <div className="toast">{toast}</div>}
     </NavigationContext.Provider>
   );
+}
+
+/// Each workspace keeps the page you were on. Channel and task ids mean
+/// nothing in another workspace, so switching cannot simply carry the view
+/// across — and coming back to "wherever I was" is the whole point of the
+/// connections staying up.
+function useRememberedView(
+  view: View,
+  setView: (view: View) => void,
+  setInspector: (inspector: InspectorState) => void,
+) {
+  const workspaceId = useSyncExternalStore(
+    store.subscribe,
+    () => store.activeWorkspaceId,
+  );
+  const remembered = useRef<Record<string, View>>({});
+  const previous = useRef(workspaceId);
+
+  useEffect(() => {
+    if (previous.current === workspaceId) return;
+    if (previous.current) remembered.current[previous.current] = view;
+    previous.current = workspaceId;
+    setInspector(null);
+    setView(
+      (workspaceId && remembered.current[workspaceId]) || { kind: "inbox" },
+    );
+  }, [workspaceId, view, setView, setInspector]);
 }
 
 /// Opening a conversation is what "I have seen this" means.
@@ -846,69 +838,6 @@ function ChannelTopic({ channel }: { channel: Channel }) {
 }
 
 // --- workspace menu, palette, help ------------------------------------------
-
-function WorkspaceMenu({
-  onClose,
-  onPick,
-  onHelp,
-}: {
-  onClose: () => void;
-  onPick: (view: View) => void;
-  onHelp: () => void;
-}) {
-  const app = useApp();
-  const entries: { label: string; icon: ReactNode; view: View }[] = [
-    {
-      label: "Automations",
-      icon: <AutomationIcon />,
-      view: { kind: "automations" },
-    },
-    {
-      label: "Agents",
-      icon: <AgentIcon />,
-      view: { kind: "agents" },
-    },
-    {
-      label: "Projects and machines",
-      icon: <FolderIcon />,
-      view: { kind: "projects" },
-    },
-    {
-      label: "Members",
-      icon: <MembersIcon />,
-      view: { kind: "members" },
-    },
-    {
-      label: "Settings",
-      icon: <SettingsIcon />,
-      view: { kind: "settings" },
-    },
-  ];
-
-  return (
-      <Menu
-        at={{ x: 74, y: 44 }}
-        header={app.workspace?.name ?? "Workspace"}
-        onClose={onClose}
-        items={[
-          ...entries.map((entry) => ({
-            key: entry.label,
-            label: entry.label,
-            icon: entry.icon,
-            onSelect: () => onPick(entry.view),
-          })),
-          "separator",
-          {
-            key: "shortcuts",
-            label: "Keyboard shortcuts",
-            icon: <KeyboardIcon />,
-            shortcut: "⌘/",
-            onSelect: onHelp,
-          },
-        ]}
-      />
-  );
-}
 
 interface Entry {
   key: string;

@@ -105,8 +105,9 @@ Put it behind a TLS terminator (Caddy, nginx, Cloudflare) and set
 `PATCHWORK_PUBLIC_URL` to the public address — Desktops and agents call back on
 it.
 
-Everything lives in `PATCHWORK_DATA_DIR`: `patchwork.db`, `files/`. Back that
-directory up and you have backed up the workspace.
+Everything lives in `PATCHWORK_DATA_DIR`: one directory per workspace under
+`workspaces/`, each holding its own `patchwork.db` and `files/`. Back that
+directory up and you have backed up every workspace.
 
 | Flag | Environment | Default |
 |---|---|---|
@@ -115,6 +116,19 @@ directory up and you have backed up the workspace.
 | `--bind` | `PATCHWORK_BIND` | `0.0.0.0` |
 | `--public-url` | `PATCHWORK_PUBLIC_URL` | `http://127.0.0.1:<port>` |
 | `--invite` | — | print a fresh admin invite and exit |
+| `--workspace` | — | which workspace `--invite` belongs to |
+
+## Several workspaces, one relay
+
+A relay holds as many workspaces as you like. Each is a whole Patchwork — its
+own members, channels, tasks, agents, automations and database file — reached
+under `/w/{workspace_id}/`, and they share nothing but the process and the port.
+
+In Desktop, the switcher sits next to your name at the bottom of the sidebar:
+**New workspace** creates one on the relay you are already in, **Join with an
+invite code** adds one from anywhere. Every joined workspace stays connected
+while the app is open, so switching is instant and agents keep working in the
+workspace you are not looking at.
 
 Put the `patchwork` CLI next to `patchwork-relay`: hosted agents get it on their
 PATH automatically.
@@ -147,6 +161,7 @@ patchwork whoami                     # identity, run, task, project, worktree
 patchwork history --limit 100        # this conversation
 patchwork search "checkout totals"   # past conversations, tasks, outcomes
 patchwork say "Deployed to staging." # post a message
+patchwork say --channel '#deploys' "Staging is on 1.4.2"  # …or in another room
 patchwork status "Running the suite" # a quieter progress note
 patchwork ask --question "Which auth?" --option "Cookie:like the rest of the app"
 patchwork task create --title "Cache pricing" --outcome "p95 under 100ms"
