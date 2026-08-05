@@ -35,6 +35,10 @@ pub struct Settings {
     /// Which one the window is showing. Every one of them stays connected.
     #[serde(default)]
     pub active: String,
+    /// This machine *is* the relay: the app serves one for as long as it is
+    /// open, instead of talking to a server somewhere else.
+    #[serde(default)]
+    pub hosts_relay: bool,
     /// Stable across restarts so this machine keeps one host identity.
     #[serde(default)]
     pub host_id: String,

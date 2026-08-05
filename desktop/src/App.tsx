@@ -8,8 +8,16 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { store, useApi, useApp, useAppSelector } from "./lib/store";
-import { boot, join, signOutOfEverything, useSettings } from "./lib/session";
+import {
+  boot,
+  canHostRelay,
+  hostRelayHere,
+  join,
+  signOutOfEverything,
+  useSettings,
+} from "./lib/session";
 import { markSeen } from "./lib/unread";
+import logo from "./assets/logo.png";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
 import { Sidebar } from "./components/Sidebar";
@@ -70,22 +78,25 @@ export default function App() {
   return <Workspace onSignOut={() => void signOutOfEverything()} />;
 }
 
+/// Two ways in, and the first one needs no server: this machine can *be* the
+/// relay, since the app already contains one. Joining somebody else's relay
+/// is the other tab.
 export function Onboarding() {
+  const [mode, setMode] = useState<"here" | "join">(
+    canHostRelay ? "here" : "join",
+  );
   const [relayUrl, setRelayUrl] = useState("http://127.0.0.1:7727");
   const [inviteCode, setInviteCode] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("Patchwork");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  const submit = async () => {
+  const run = async (action: () => Promise<void>) => {
     setBusy(true);
     setError("");
     try {
-      await join({
-        relay_url: relayUrl,
-        invite_code: inviteCode,
-        display_name: displayName,
-      });
+      await action();
     } catch (err) {
       setError(String((err as Error).message ?? err));
       setBusy(false);
@@ -95,28 +106,98 @@ export function Onboarding() {
   return (
     <div className="onboarding">
       <div className="onboarding-card">
-        <h1>Join a workspace</h1>
-        <p>
-          Your relay prints an invite code the first time it starts. Paste both
-          here.
-        </p>
-        <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} />
-        <Field
-          label="Invite code"
-          value={inviteCode}
-          onChange={setInviteCode}
-          autoFocus
-        />
-        <Field label="Your name" value={displayName} onChange={setDisplayName} />
-        {error && <div className="error-text">{error}</div>}
-        <button
-          className="button primary"
-          style={{ marginTop: 16, width: "100%", justifyContent: "center" }}
-          disabled={busy || !inviteCode.trim() || !displayName.trim()}
-          onClick={submit}
-        >
-          {busy ? "Joining…" : "Join"}
-        </button>
+        <img className="brand" src={logo} alt="" width={72} height={72} />
+        {canHostRelay && (
+          <div className="segmented">
+            <button
+              className={mode === "here" ? "active" : ""}
+              onClick={() => setMode("here")}
+            >
+              Use this Mac
+            </button>
+            <button
+              className={mode === "join" ? "active" : ""}
+              onClick={() => setMode("join")}
+            >
+              Join a relay
+            </button>
+          </div>
+        )}
+
+        {mode === "here" ? (
+          <>
+            <h1>Start a workspace here</h1>
+            <p>
+              This app runs the relay itself, on this machine, for as long as it
+              is open. Nothing to install, and you can move to a server later
+              without changing anything else.
+            </p>
+            <Field
+              label="Workspace name"
+              value={workspaceName}
+              onChange={setWorkspaceName}
+            />
+            <Field
+              label="Your name"
+              value={displayName}
+              onChange={setDisplayName}
+              autoFocus
+            />
+            {error && <div className="error-text">{error}</div>}
+            <button
+              className="button primary"
+              style={{ marginTop: 16, width: "100%", justifyContent: "center" }}
+              disabled={busy || !displayName.trim()}
+              onClick={() =>
+                run(() =>
+                  hostRelayHere({
+                    workspace_name: workspaceName.trim(),
+                    display_name: displayName.trim(),
+                  }),
+                )
+              }
+            >
+              {busy ? "Starting…" : "Start"}
+            </button>
+          </>
+        ) : (
+          <>
+            <h1>Join a workspace</h1>
+            <p>
+              Your relay prints an invite code the first time it starts. Paste
+              both here.
+            </p>
+            <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} />
+            <Field
+              label="Invite code"
+              value={inviteCode}
+              onChange={setInviteCode}
+              autoFocus
+            />
+            <Field
+              label="Your name"
+              value={displayName}
+              onChange={setDisplayName}
+            />
+            {error && <div className="error-text">{error}</div>}
+            <button
+              className="button primary"
+              style={{ marginTop: 16, width: "100%", justifyContent: "center" }}
+              disabled={busy || !inviteCode.trim() || !displayName.trim()}
+              onClick={() =>
+                run(() =>
+                  join({
+                    relay_url: relayUrl,
+                    invite_code: inviteCode,
+                    display_name: displayName,
+                  }),
+                )
+              }
+            >
+              {busy ? "Joining…" : "Join"}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

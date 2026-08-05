@@ -47,6 +47,8 @@ export interface DesktopInfo {
   host: HostStatus;
   platform: string;
   capabilities: HostCapabilities;
+  /// This machine is the relay, and is serving right now.
+  hosting_relay: boolean;
 }
 
 /// What the first frame needs. Deliberately without `capabilities`: working out
@@ -93,7 +95,23 @@ export async function desktopBoot(): Promise<DesktopBoot> {
     settings: browserSettings(),
     host: { connected: false, host_id: "", host_name: "" },
     platform: "browser",
+    hosting_relay: false,
   };
+}
+
+/// Use this machine as the relay: the app serves one itself, so a solo user
+/// never has to run a server. Only the desktop app can do this.
+export async function useThisDeviceAsRelay(input: {
+  workspace_name: string;
+  display_name: string;
+}): Promise<DesktopSettings> {
+  if (!inTauri) {
+    throw new Error("hosting a relay needs the Patchwork Desktop app");
+  }
+  // Wrapped in `input`, like every other command here: Tauri renames loose
+  // arguments to camelCase, and a struct's fields keep the names serde gives
+  // them.
+  return invoke<DesktopSettings>("use_this_device_as_relay", { input });
 }
 
 export async function desktopInfo(): Promise<DesktopInfo> {
@@ -102,6 +120,7 @@ export async function desktopInfo(): Promise<DesktopInfo> {
     settings: browserSettings(),
     host: { connected: false, host_id: "", host_name: "" },
     platform: "browser",
+    hosting_relay: false,
     capabilities: {
       runtimes: [],
       has_git: false,

@@ -56,23 +56,28 @@ You need Rust 1.88+, Node 20+, and at least one ACP-capable agent installed
 ```bash
 git clone https://github.com/vincelwt/patchwork
 cd patchwork
-
-# 1. Start the relay. On first run it prints an invite code.
-cargo run -p patchwork-relay
-
-# 2. In another terminal, start Desktop.
 cd desktop && npm install && npm run tauri dev
 ```
 
-Paste the relay URL and the invite code into the join screen. That is the whole
-setup.
+On the first screen, **Use this Mac**: the app contains the relay and serves
+one itself, for as long as it is open. Nothing else to start.
+
+Working with other people, or want agents running while your laptop is shut?
+Run the relay somewhere that stays on — it prints an invite code on first
+start — and pick **Join a relay** instead.
+
+```bash
+cargo run -p patchwork-relay
+```
 
 To add someone else: **Members → Invite someone**, and send them the code plus
 your relay URL.
 
 ## Self-hosting the relay
 
-The relay is a single binary with an embedded database.
+The relay is a single binary with an embedded database — and a library, which
+is how Desktop hosts one without a second thing to install. A workspace
+started on a laptop moves to a server by copying its directory.
 
 ```bash
 cargo build --release -p patchwork-relay -p patchwork-cli

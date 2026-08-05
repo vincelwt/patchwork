@@ -9,10 +9,12 @@ import { useSyncExternalStore } from "react";
 import {
   createWorkspace,
   desktopBoot,
+  inTauri,
   joinWorkspace,
   leaveWorkspace,
   signOut,
   switchWorkspace,
+  useThisDeviceAsRelay,
   workspaceBaseUrl,
 } from "./desktop";
 import type { DesktopSettings } from "./desktop";
@@ -62,6 +64,17 @@ export async function join(input: {
 export async function create(name: string) {
   publish(await createWorkspace(name));
 }
+
+/// Start a relay inside this app and join the workspace it holds.
+export async function hostRelayHere(input: {
+  workspace_name: string;
+  display_name: string;
+}) {
+  publish(await useThisDeviceAsRelay(input));
+}
+
+/// Only the desktop app can serve a relay; a browser tab cannot.
+export const canHostRelay = inTauri;
 
 export async function leave(id: string) {
   publish(await leaveWorkspace(id));

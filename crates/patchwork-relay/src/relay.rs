@@ -45,14 +45,7 @@ impl Relay {
             mounted: RwLock::new(HashMap::new()),
         });
         std::fs::create_dir_all(relay.workspaces_dir())?;
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(relay.workspaces_dir())? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() && entry.path().join("patchwork.db").exists() {
-                ids.push(entry.file_name().to_string_lossy().to_string());
-            }
-        }
-        for id in ids {
+        for id in workspace_ids(&relay.data_dir)? {
             relay
                 .mount(&id)
                 .await
@@ -204,6 +197,26 @@ impl Relay {
             runner.shutdown().await;
         }
     }
+}
+
+/// Which workspaces are on disk, without opening any of them.
+pub fn workspace_ids(data_dir: &std::path::Path) -> Result<Vec<Id>> {
+    let dir = data_dir.join("workspaces");
+    let mut ids = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(ids);
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join("patchwork.db").exists() {
+            ids.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    Ok(ids)
+}
+
+pub fn workspace_db(data_dir: &std::path::Path, id: &str) -> PathBuf {
+    data_dir.join("workspaces").join(id).join("patchwork.db")
 }
 
 fn ensure_relay_host(store: &Store) -> Result<Id> {

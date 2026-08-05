@@ -1841,7 +1841,13 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           <span className={`dot ${app.live ? "online" : "waiting"}`} />
           <span className="grow">
             <span className="name">{relayUrl}</span>
-            <span className="sub">{app.live ? "connected" : "reconnecting…"}</span>
+            <span className="sub">
+              {info?.hosting_relay
+                ? `served by this machine · ${app.live ? "connected" : "reconnecting…"}`
+                : app.live
+                  ? "connected"
+                  : "reconnecting…"}
+            </span>
           </span>
           <button
             className="button quiet"

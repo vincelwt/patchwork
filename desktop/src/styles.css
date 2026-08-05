@@ -1719,6 +1719,35 @@ details[open] > summary::before {
   font-size: 14px;
 }
 
+.onboarding .brand {
+  display: block;
+  margin: 0 auto 20px;
+  width: 72px;
+  height: 72px;
+}
+
+/* Two ways in, side by side, so neither looks like the fallback. */
+.segmented {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin-bottom: 18px;
+  background: var(--surface-sunken);
+  border-radius: 9px;
+}
+.segmented button {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.segmented button.active {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(20, 20, 18, 0.08);
+}
+
 .error-text {
   color: var(--danger);
   font-size: 13px;

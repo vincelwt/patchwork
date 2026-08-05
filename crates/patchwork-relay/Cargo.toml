@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "The Patchwork relay: shared data, realtime collaboration, files, automations and hosted agents"
 
+[lib]
+name = "patchwork_relay"
+path = "src/lib.rs"
+
 [[bin]]
 name = "patchwork-relay"
 path = "src/main.rs"
