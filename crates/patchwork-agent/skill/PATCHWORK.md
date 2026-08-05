@@ -90,7 +90,10 @@ cat chart.json | patchwork chart - --caption "Signups per week"
 
 The file is a [Flint](https://microsoft.github.io/flint-chart/) chart spec:
 data, what each field means, and how to draw it. Patchwork renders it, so send
-the spec rather than an image.
+the spec rather than an image. Never draw a chart yourself and attach the
+picture: a rendered PNG cannot be resized, themed, or read by the next agent,
+and the caption you would write for it is already the message you are sending.
+The caption is for what the numbers *mean*, not for repeating the title.
 
 ```json
 {

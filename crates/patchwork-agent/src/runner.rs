@@ -595,10 +595,12 @@ async fn handle_update(
             if let Some(text) = content_text(update.get("content")) {
                 let mut s = state.lock().await;
                 // "Let me check the PATH." <tool runs> "Yes, it is at /usr/bin."
-                // are two things the agent said, not one sentence. Without a
-                // break they arrive glued together mid-word.
-                if s.interrupted && !s.message.is_empty() {
-                    if !s.message.ends_with('\n') {
+                // are two things the agent said, not one sentence. But a tool
+                // call in the middle of a sentence does not end the sentence,
+                // and breaking there is what put a blank line after the first
+                // word of half the replies in the app.
+                if s.interrupted {
+                    if needs_break(&s.message) {
                         s.message.push_str("\n\n");
                     }
                     s.interrupted = false;
@@ -638,7 +640,10 @@ async fn handle_update(
                 }
             }
         }
-        "tool_call" | "tool_call_update" | "plan" | "available_commands_update" => {
+        // Only a tool actually starting interrupts what is being said. An
+        // update to one already running, or the runtime listing its commands,
+        // is not the agent pausing mid-thought.
+        "tool_call" | "plan" => {
             state.lock().await.interrupted = true;
         }
         _ => {}
@@ -755,6 +760,17 @@ fn headline_for(title: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Whether a paragraph break belongs between what has been said and what
+/// comes next. Only after a finished sentence: a tool call mid-sentence is an
+/// interruption to the agent, not to the reader.
+fn needs_break(message: &str) -> bool {
+    let trimmed = message.trim_end();
+    if trimmed.is_empty() || message.ends_with('\n') {
+        return false;
+    }
+    trimmed.ends_with(['.', '!', '?', ':', '\u{201d}', '"', ')', '`'])
 }
 
 async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, _spec: &RunSpec) {
@@ -988,6 +1004,17 @@ mod tests {
             resume_session_id: None,
             env: vec![],
         }
+    }
+
+    #[test]
+    fn a_tool_call_only_breaks_the_text_between_sentences() {
+        // What put "Not\n\ndirectly \u2014 the CLI\u2026" in the transcript.
+        assert!(!needs_break("Not"));
+        assert!(!needs_break("the file is at /usr/bin/"));
+        assert!(needs_break("Let me check the PATH."));
+        assert!(needs_break("Here is what I found:"));
+        assert!(!needs_break(""));
+        assert!(!needs_break("Done.\n"));
     }
 
     #[test]

@@ -1872,6 +1872,23 @@ details[open] > summary::before {
   background: var(--tint);
 }
 
+/* A picture and a chart are the thing itself: no frame, no header. The
+   message above is the title; the chart draws none of its own. */
+.artifact,
+.chart {
+  margin: 8px 0 0;
+  max-width: 640px;
+}
+.artifact img {
+  display: block;
+  max-width: 100%;
+  border-radius: 10px;
+}
+.artifact .card-sub,
+.chart .card-sub {
+  margin-top: 4px;
+}
+
 /* Evidence pinned to a task, small enough to sit under its description. */
 .task-files {
   display: flex;

@@ -429,7 +429,7 @@ export const MessageRow = memo(function MessageRow({
             {streaming && <span className="caret" />}
           </div>
         )}
-        {message.card && <Card card={message.card} />}
+        {message.card && <Card card={message.card} body={message.body} />}
         {message.attachments.length > 0 && (
           <div className="attachments">
             {message.attachments.map((attachment: Attachment) => (

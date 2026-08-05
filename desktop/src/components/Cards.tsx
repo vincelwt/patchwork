@@ -17,7 +17,12 @@ import type { MessageCard, QuestionAnswer } from "../lib/types";
 /// Cards are how tasks, runs, questions, artifacts, previews and pull requests
 /// appear inline in a conversation — the same objects the rest of the app
 /// navigates to, not copies of them.
-export function Card({ card }: { card: MessageCard }) {
+export function Card({ card, body = "" }: { card: MessageCard; body?: string }) {
+  // The message above already says it. A caption that repeats the sentence
+  // word for word is the same title twice.
+  const captionOf = (caption?: string) =>
+    caption && caption.trim() === body.trim() ? undefined : caption;
+
   switch (card.type) {
     case "task":
       return <TaskCardInline taskId={card.task_id} />;
@@ -26,13 +31,18 @@ export function Card({ card }: { card: MessageCard }) {
     case "question":
       return <QuestionCard questionId={card.question_id} />;
     case "artifact":
-      return <ArtifactCard attachmentId={card.attachment_id} caption={card.caption} />;
+      return (
+        <ArtifactCard
+          attachmentId={card.attachment_id}
+          caption={captionOf(card.caption)}
+        />
+      );
     case "preview":
       return <PreviewCard previewId={card.preview_id} />;
     case "pull_request":
       return <PullRequestCard url={card.url} taskId={card.task_id} />;
     case "chart":
-      return <ChartCard spec={card.spec} caption={card.caption} />;
+      return <ChartCard spec={card.spec} caption={captionOf(card.caption)} />;
   }
 }
 
@@ -282,25 +292,27 @@ function ArtifactCard({
   const url = `${api.baseUrl.replace(/\/$/, "")}/api/files/${attachmentId}`;
   const [broken, setBroken] = useState(false);
 
-  return (
-    <div className="card">
-      <div className="card-head">
-        <span>Attached</span>
-      </div>
-      {!broken ? (
-        <img
-          src={url}
-          alt={caption ?? "attachment"}
-          style={{ maxWidth: "100%", borderRadius: 8 }}
-          onError={() => setBroken(true)}
-        />
-      ) : (
+  if (broken) {
+    return (
+      <div className="card">
+        <div className="card-head">
+          <span>Attached</span>
+        </div>
         <button className="button" onClick={() => openExternal(url)}>
           Open file
         </button>
-      )}
-      {caption && <div className="card-sub">{caption}</div>}
-    </div>
+        {caption && <div className="card-sub">{caption}</div>}
+      </div>
+    );
+  }
+
+  // No frame around a picture: a border, a header and a caption stacked
+  // around an image say nothing the image does not.
+  return (
+    <figure className="artifact">
+      <img src={url} alt={caption ?? "attachment"} onError={() => setBroken(true)} />
+      {caption && <figcaption className="card-sub">{caption}</figcaption>}
+    </figure>
   );
 }
 
@@ -342,8 +354,14 @@ function ChartCard({ spec, caption }: { spec: unknown; caption?: string }) {
         const option = flint.assembleECharts(spec as ChartAssemblyInput);
         if (dropped || !host.current) return;
         chart = echarts.init(host.current, dark ? "dark" : null);
-        // The card already paints `--surface`; the chart sits on it.
-        chart.setOption({ ...option, backgroundColor: "transparent" });
+        // No title inside the canvas: the message above the chart is its
+        // title, and a second one drawn over the plot is what collided with
+        // the legend. The transcript sits behind it, so no background either.
+        chart.setOption({
+          ...option,
+          title: undefined,
+          backgroundColor: "transparent",
+        });
         observer = new ResizeObserver(() => chart?.resize());
         observer.observe(host.current);
       } catch (error) {
@@ -365,15 +383,15 @@ function ChartCard({ spec, caption }: { spec: unknown; caption?: string }) {
     (spec as { chart_spec?: { baseSize?: { height?: number } } })?.chart_spec
       ?.baseSize?.height ?? 320;
 
+  if (failed) {
+    return <div className="notice">This chart could not be drawn: {failed}</div>;
+  }
+
   return (
-    <div className="card">
-      {failed ? (
-        <div className="notice">This chart could not be drawn: {failed}</div>
-      ) : (
-        <div ref={host} style={{ width: "100%", height }} />
-      )}
-      {caption && <div className="card-sub">{caption}</div>}
-    </div>
+    <figure className="chart">
+      <div ref={host} style={{ width: "100%", height }} />
+      {caption && <figcaption className="card-sub">{caption}</figcaption>}
+    </figure>
   );
 }
 
