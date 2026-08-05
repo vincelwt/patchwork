@@ -5,9 +5,11 @@ import {
   desktopInfo,
   openExternal,
   pickDirectory,
+  setAwakePolicy,
   setProjectPaths,
   signOut,
 } from "../lib/desktop";
+import type { AwakePolicy } from "../lib/desktop";
 import type { DesktopInfo } from "../lib/desktop";
 import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
 import {
@@ -24,10 +26,12 @@ import {
   ExternalIcon,
   FolderIcon,
   MoreIcon,
+  PencilIcon,
   PlusIcon,
   Spinner,
   TrashIcon,
 } from "./icons";
+import { describeCron, PRESETS, presetFor, WEEKDAYS } from "../lib/schedule";
 import type {
   AgentProfile,
   Automation,
@@ -101,6 +105,60 @@ export function AgentsPage() {
   );
 }
 
+export interface Machine {
+  /// The host that work is actually dispatched to.
+  host: Host;
+  /// What to call it. A person recognises "Vince's laptop"; "Relay" is a role.
+  name: string;
+  /// Every host id living on this box, so "is this me" has one answer.
+  hostIds: string[];
+  isRelay: boolean;
+  isDesktop: boolean;
+}
+
+/// One entry per physical machine.
+///
+/// The relay and the desktop app can be the same box — that is the normal setup
+/// for one person working alone — and offering "Codex on Vince's laptop" and
+/// "Codex on Relay" as separate choices is offering the same computer twice.
+/// Work is dispatched to the relay side, because an agent there keeps going
+/// when the app is closed, which is the whole reason to run one; the name comes
+/// from the desktop side, because that is the one a person named.
+export function distinctMachines(hosts: Host[]): Machine[] {
+  const out: Machine[] = [];
+  const byKey = new Map<string, Machine>();
+
+  for (const host of hosts) {
+    const key = host.capabilities.machine_key;
+    const isRelay = host.kind === "relay";
+    const existing = key ? byKey.get(key) : undefined;
+
+    if (!existing) {
+      const machine: Machine = {
+        host,
+        name: host.name,
+        hostIds: [host.id],
+        isRelay,
+        isDesktop: !isRelay,
+      };
+      if (key) byKey.set(key, machine);
+      out.push(machine);
+      continue;
+    }
+
+    existing.hostIds.push(host.id);
+    existing.isRelay ||= isRelay;
+    existing.isDesktop ||= !isRelay;
+    // Dispatch to the relay; keep whichever name a human chose.
+    if (isRelay) {
+      existing.host = host;
+    } else {
+      existing.name = host.name;
+    }
+  }
+  return out;
+}
+
 function locationLabel(profile?: AgentProfile) {
   switch (profile?.location) {
     case "relay":
@@ -139,6 +197,8 @@ export function AgentModal({
   // an agent runs a particular runtime *somewhere*, and the somewheres are
   // exactly the machines that have that runtime installed. One list, and every
   // entry in it is a combination that can actually run.
+  const machines = useMemo(() => distinctMachines(app.hosts), [app.hosts]);
+
   const placements = useMemo(() => {
     const out: {
       value: string;
@@ -148,39 +208,42 @@ export function AgentModal({
       location: AgentProfile["location"];
       host_id?: Id;
     }[] = [];
-    const byRuntime = new Map<string, { label: string; hosts: Host[] }>();
+    const byRuntime = new Map<string, { label: string; machines: Machine[] }>();
 
-    for (const host of app.hosts) {
-      for (const runtime of host.capabilities.runtimes) {
+    for (const machine of machines) {
+      for (const runtime of machine.host.capabilities.runtimes) {
         if (!runtime.available || runtime.id === "custom") continue;
-        const entry = byRuntime.get(runtime.id) ?? { label: runtime.label, hosts: [] };
-        entry.hosts.push(host);
+        const entry = byRuntime.get(runtime.id) ?? {
+          label: runtime.label,
+          machines: [],
+        };
+        entry.machines.push(machine);
         byRuntime.set(runtime.id, entry);
       }
     }
 
-    for (const [id, { label, hosts }] of byRuntime) {
+    for (const [id, { label, machines: where }] of byRuntime) {
       // Anywhere it can run — the right default, because a laptop that is shut
       // should not stop the work.
       out.push({
         value: `auto:${id}:`,
         label,
         hint:
-          hosts.length > 1
-            ? `on whichever machine has the project (${hosts.length} can)`
-            : `on ${hosts[0].name}`,
+          where.length > 1
+            ? `on whichever machine has the project (${where.length} can)`
+            : `on ${where[0].name}`,
         runtime: id,
         location: "auto",
       });
-      if (hosts.length > 1) {
-        for (const host of hosts) {
+      if (where.length > 1) {
+        for (const machine of where) {
           out.push({
-            value: `${host.kind === "relay" ? "relay" : "desktop"}:${id}:${host.id}`,
-            label: `${label} on ${host.name}`,
-            hint: host.online ? "online" : "offline",
+            value: `${machine.host.kind === "relay" ? "relay" : "desktop"}:${id}:${machine.host.id}`,
+            label: `${label} on ${machine.name}`,
+            hint: machine.host.online ? "online" : "offline",
             runtime: id,
-            location: host.kind === "relay" ? "relay" : "desktop",
-            host_id: host.id,
+            location: machine.host.kind === "relay" ? "relay" : "desktop",
+            host_id: machine.host.id,
           });
         }
       }
@@ -193,7 +256,7 @@ export function AgentModal({
       location: "auto",
     });
     return out;
-  }, [app.hosts]);
+  }, [machines]);
 
   const placementValue = `${profile.location}:${profile.runtime}:${profile.host_id ?? ""}`;
   const chosenPlacement =
@@ -204,10 +267,12 @@ export function AgentModal({
   // machines, only offer models every one of them has — anything else would be
   // a setting that works until the run lands on the wrong laptop.
   const { models, modes, defaultModel, defaultMode } = useMemo(() => {
-    const installs = app.hosts
-      .filter((host) => !profile.host_id || host.id === profile.host_id)
-      .map((host) =>
-        host.capabilities.runtimes.find((runtime) => runtime.id === profile.runtime),
+    const installs = machines
+      .filter((machine) => !profile.host_id || machine.hostIds.includes(profile.host_id))
+      .map((machine) =>
+        machine.host.capabilities.runtimes.find(
+          (runtime) => runtime.id === profile.runtime,
+        ),
       )
       .filter((runtime): runtime is RuntimeInstallation => !!runtime)
       .filter((runtime) => runtime.models.length > 0 || runtime.modes.length > 0);
@@ -225,7 +290,7 @@ export function AgentModal({
       defaultModel: installs[0].default_model,
       defaultMode: installs[0].default_mode,
     };
-  }, [app.hosts, profile.runtime, profile.host_id]);
+  }, [machines, profile.runtime, profile.host_id]);
 
   const save = async () => {
     setBusy(true);
@@ -894,8 +959,10 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
 export function AutomationsPage() {
   const app = useApp();
   const api = useApi();
-  const { go } = useNavigation();
+  const { go, toast } = useNavigation();
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<Automation | null>(null);
+  const [deleting, setDeleting] = useState<Automation | null>(null);
 
   return (
     <Page
@@ -949,13 +1016,102 @@ export function AutomationsPage() {
               >
                 Run now
               </span>
+              <MenuButton
+                align="right"
+                title="Manage"
+                items={[
+                  {
+                    key: "edit",
+                    label: "Edit…",
+                    icon: <PencilIcon size={15} />,
+                    onSelect: () => setEditing(automation),
+                  },
+                  {
+                    key: "toggle",
+                    label: automation.enabled ? "Pause" : "Resume",
+                    onSelect: () =>
+                      void api.updateAutomation(automation.id, {
+                        ...automation,
+                        enabled: !automation.enabled,
+                      }),
+                  },
+                  "separator",
+                  {
+                    key: "delete",
+                    label: "Delete automation",
+                    icon: <TrashIcon size={15} />,
+                    danger: true,
+                    onSelect: () => setDeleting(automation),
+                  },
+                ]}
+              >
+                <MoreIcon size={17} />
+              </MenuButton>
             </button>
           );
         })
       )}
 
-      {creating && <AutomationModal onClose={() => setCreating(false)} />}
+      {(creating || editing) && (
+        <AutomationModal
+          automation={editing}
+          onClose={() => {
+            setCreating(false);
+            setEditing(null);
+          }}
+        />
+      )}
+      {deleting && (
+        <ConfirmDelete
+          what={deleting.name}
+          detail="It stops firing immediately. Runs it already made stay in the record."
+          onCancel={() => setDeleting(null)}
+          onConfirm={async () => {
+            try {
+              await api.deleteAutomation(deleting.id);
+              toast(`“${deleting.name}” deleted`);
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+            setDeleting(null);
+          }}
+        />
+      )}
     </Page>
+  );
+}
+
+/// Deleting is the one action worth a second of friction, and the dialog should
+/// say what is actually lost rather than asking "are you sure".
+export function ConfirmDelete({
+  what,
+  detail,
+  onCancel,
+  onConfirm,
+}: {
+  what: string;
+  detail: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <Modal
+      title={`Delete “${what}”?`}
+      subtitle={detail}
+      onClose={onCancel}
+      actions={
+        <>
+          <button className="button quiet" onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="button primary danger-solid" onClick={onConfirm}>
+            Delete
+          </button>
+        </>
+      }
+    >
+      <div />
+    </Modal>
   );
 }
 
@@ -964,6 +1120,8 @@ function describeTrigger(automation: Automation) {
   switch (trigger.type) {
     case "schedule":
       return `every ${Math.round(trigger.every_seconds / 60)} min`;
+    case "cron":
+      return describeCron(trigger.expression);
     case "message":
       return "on new messages";
     case "task_status":
@@ -979,26 +1137,70 @@ function describeTrigger(automation: Automation) {
   }
 }
 
-function AutomationModal({ onClose }: { onClose: () => void }) {
+/// One dialog for creating and for editing.
+///
+/// An automation is mostly its instructions — the paragraph telling the agent
+/// what to do — and not being able to read that back, let alone fix a typo in
+/// it, made every automation a black box you could only delete and recreate.
+export function AutomationModal({
+  automation,
+  onClose,
+}: {
+  automation?: Automation | null;
+  onClose: () => void;
+}) {
   const app = useApp();
   const api = useApi();
-  const [name, setName] = useState("");
+  const { toast } = useNavigation();
+  const editing = !!automation;
+
+  const [name, setName] = useState(automation?.name ?? "");
   const [agentId, setAgentId] = useState(
-    app.members.find((member) => member.kind === "agent")?.id ?? "",
+    automation?.agent_id ??
+      app.members.find((member) => member.kind === "agent")?.id ??
+      "",
   );
-  const [triggerKind, setTriggerKind] = useState("schedule");
-  const [minutes, setMinutes] = useState("60");
+  const [triggerKind, setTriggerKind] = useState(
+    automation?.trigger.type === "cron" ? "cron" : (automation?.trigger.type ?? "cron"),
+  );
+  const initialCron =
+    automation?.trigger.type === "cron" ? automation.trigger.expression : "0 9 * * *";
+  const initial = presetFor(initialCron);
+  const [preset, setPreset] = useState(initial.preset);
+  const [time, setTime] = useState(initial.time);
+  const [weekday, setWeekday] = useState(initial.weekday);
+  const [expression, setExpression] = useState(initialCron);
+  const [minutes, setMinutes] = useState(
+    automation?.trigger.type === "schedule"
+      ? String(Math.round(automation.trigger.every_seconds / 60))
+      : "60",
+  );
   const [channelId, setChannelId] = useState(
-    app.channels.find((channel) => channel.kind === "channel")?.id ?? "",
+    automation?.context_channel_id ??
+      app.channels.find((channel) => channel.kind === "channel")?.id ??
+      "",
   );
-  const [pattern, setPattern] = useState("");
-  const [status, setStatus] = useState("review");
-  const [action, setAction] = useState("post_in_chat");
-  const [instructions, setInstructions] = useState("");
+  const [pattern, setPattern] = useState(
+    automation?.trigger.type === "message" ? automation.trigger.pattern : "",
+  );
+  const [status, setStatus] = useState(
+    automation?.trigger.type === "task_status" ? automation.trigger.status : "review",
+  );
+  const [action, setAction] = useState<string>(automation?.action ?? "post_in_chat");
+  const [instructions, setInstructions] = useState(automation?.instructions ?? "");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const cronExpression =
+    preset === "custom"
+      ? expression
+      : (PRESETS.find((entry) => entry.id === preset)?.cron(time, weekday) ??
+        expression);
 
   const trigger = () => {
     switch (triggerKind) {
+      case "cron":
+        return { type: "cron", expression: cronExpression };
       case "schedule":
         return { type: "schedule", every_seconds: Number(minutes) * 60 };
       case "message":
@@ -1019,34 +1221,44 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
           on_checks_failed: true,
         };
       case "webhook":
-        return { type: "webhook", token: crypto.randomUUID() };
+        return automation?.trigger.type === "webhook"
+          ? automation.trigger
+          : { type: "webhook", token: crypto.randomUUID() };
       default:
         return { type: "manual" };
     }
   };
 
   const save = async () => {
+    setBusy(true);
     setError("");
+    const body = {
+      name,
+      trigger: trigger(),
+      agent_id: agentId,
+      action,
+      instructions,
+      context_channel_id: channelId || undefined,
+      report_channel_id: channelId || undefined,
+      enabled: automation?.enabled ?? true,
+    };
     try {
-      await api.createAutomation({
-        name,
-        trigger: trigger(),
-        agent_id: agentId,
-        action,
-        instructions,
-        context_channel_id: channelId || undefined,
-        report_channel_id: channelId || undefined,
-        enabled: true,
-      });
+      if (automation) {
+        await api.updateAutomation(automation.id, body);
+        toast("Automation updated");
+      } else {
+        await api.createAutomation(body);
+      }
       onClose();
     } catch (err) {
       setError(String((err as Error).message ?? err));
+      setBusy(false);
     }
   };
 
   return (
     <Modal
-      title="New automation"
+      title={editing ? automation.name : "New automation"}
       subtitle="What fires it, which agent acts, and where the result lands."
       onClose={onClose}
       actions={
@@ -1056,10 +1268,10 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
           </button>
           <button
             className="button primary"
-            disabled={!name.trim() || !agentId}
+            disabled={!name.trim() || !agentId || busy}
             onClick={save}
           >
-            Create
+            {editing ? "Save" : "Create"}
           </button>
         </>
       }
@@ -1082,7 +1294,12 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
         value={triggerKind}
         onChange={setTriggerKind}
         options={[
-          { value: "schedule", label: "On a schedule" },
+          { value: "cron", label: "On a schedule", hint: "at a time of day" },
+          {
+            value: "schedule",
+            label: "At an interval",
+            hint: "every N minutes, from the last run",
+          },
           { value: "message", label: "On a new message" },
           { value: "task_status", label: "When a task changes status" },
           { value: "task_assigned", label: "When a task is assigned to it" },
@@ -1091,6 +1308,53 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
           { value: "manual", label: "Only when run manually" },
         ]}
       />
+
+      {triggerKind === "cron" && (
+        <>
+          <FormSelect
+            label="How often"
+            value={preset}
+            onChange={setPreset}
+            options={[
+              ...PRESETS.map((entry) => ({ value: entry.id, label: entry.label })),
+              { value: "custom", label: "Custom cron" },
+            ]}
+          />
+          {preset !== "custom" && PRESETS.find((e) => e.id === preset)?.needsTime && (
+            <div className="form-row">
+              <label>At</label>
+              <input
+                className="field"
+                type="time"
+                value={time}
+                onChange={(event) => setTime(event.target.value)}
+              />
+            </div>
+          )}
+          {preset === "weekly" && (
+            <FormSelect
+              label="On"
+              value={String(weekday)}
+              onChange={(value) => setWeekday(Number(value))}
+              options={WEEKDAYS.map((day, index) => ({
+                value: String(index),
+                label: day,
+              }))}
+            />
+          )}
+          {preset === "custom" && (
+            <Field
+              label="Cron expression"
+              value={expression}
+              onChange={setExpression}
+              placeholder="0 9 * * 1-5"
+            />
+          )}
+          <div className="form-help">
+            Runs {describeCron(cronExpression)}, in the relay's local time.
+          </div>
+        </>
+      )}
       {triggerKind === "schedule" && (
         <Field label="Every (minutes)" value={minutes} onChange={setMinutes} />
       )}
@@ -1106,7 +1370,7 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
         <FormSelect
           label="Status"
           value={status}
-          onChange={setStatus}
+          onChange={(value) => setStatus(value as typeof status)}
           options={["planned", "running", "blocked", "review", "done"].map((value) => ({
             value,
             label: statusLabel(value as never),
@@ -1147,13 +1411,13 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-/// The debugger exists for understanding failures: what fired, what it picked,
-/// what context it got, and what happened.
 export function AutomationDebugPage({ automationId }: { automationId: string }) {
   const api = useApi();
   const app = useApp();
-  const { inspect, go } = useNavigation();
+  const { inspect, go, toast } = useNavigation();
   const [debug, setDebug] = useState<AutomationDebug>();
+  const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     void api.automationDebug(automationId).then(setDebug);
@@ -1181,12 +1445,28 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           >
             {automation.enabled ? "Pause" : "Resume"}
           </button>
-          <button
-            className="button"
-            onClick={() => api.runAutomation(automation.id)}
-          >
+          <button className="button" onClick={() => api.runAutomation(automation.id)}>
             Run now
           </button>
+          <button className="button" onClick={() => setEditing(true)}>
+            <PencilIcon size={15} />
+            Edit
+          </button>
+          <MenuButton
+            align="right"
+            title="More"
+            items={[
+              {
+                key: "delete",
+                label: "Delete automation",
+                icon: <TrashIcon size={15} />,
+                danger: true,
+                onSelect: () => setDeleting(true),
+              },
+            ]}
+          >
+            <MoreIcon size={17} />
+          </MenuButton>
         </>
       }
     >
@@ -1208,6 +1488,25 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           </code>
         </div>
       )}
+
+      {/* The instructions are the automation. Hiding them made every one of
+          these a black box you could only delete and recreate. */}
+      <Section
+        title="Instructions"
+        action={
+          <button className="button quiet" onClick={() => setEditing(true)}>
+            Edit
+          </button>
+        }
+      >
+        {automation.instructions.trim() ? (
+          <div className="instructions">{automation.instructions}</div>
+        ) : (
+          <div className="notice">
+            No instructions — the agent only gets the trigger and the channel.
+          </div>
+        )}
+      </Section>
 
       <Section title="Runs">
         {debug.runs.length === 0 ? (
@@ -1262,6 +1561,33 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           ))
         )}
       </Section>
+
+      {editing && (
+        <AutomationModal
+          automation={automation}
+          onClose={() => {
+            setEditing(false);
+            void api.automationDebug(automationId).then(setDebug);
+          }}
+        />
+      )}
+      {deleting && (
+        <ConfirmDelete
+          what={automation.name}
+          detail="It stops firing immediately. Runs it already made stay in the record."
+          onCancel={() => setDeleting(false)}
+          onConfirm={async () => {
+            try {
+              await api.deleteAutomation(automation.id);
+              toast(`“${automation.name}” deleted`);
+              go({ kind: "automations" });
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+            setDeleting(false);
+          }}
+        />
+      )}
     </Page>
   );
 }
@@ -1274,25 +1600,39 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
   const [saved, setSaved] = useState(false);
+  const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
 
   useEffect(() => {
-    void desktopInfo().then(setInfo);
+    void desktopInfo().then((loaded) => {
+      setInfo(loaded);
+      setAwake(loaded.settings.awake ?? "never");
+    });
   }, [app.hosts]);
 
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so
   // the two are merged, with the local view winning for the local machine.
-  const machines = app.hosts.map((host) => {
-    const isThis = !!info && host.id === info.host.host_id;
-    const capabilities = isThis ? info.capabilities : host.capabilities;
+  const machines = distinctMachines(app.hosts).map((machine) => {
+    // "This machine" is about the box, not about which of its hosts you happen
+    // to be looking at: the same laptop can be both the relay and a desktop.
+    const isThis =
+      !!info &&
+      (machine.hostIds.includes(info.host.host_id) ||
+        (!!info.capabilities.machine_key &&
+          machine.host.capabilities.machine_key === info.capabilities.machine_key));
+    const capabilities = isThis ? info.capabilities : machine.host.capabilities;
     return {
-      id: host.id,
-      name: host.name,
-      kind: host.kind,
+      id: machine.host.id,
+      name: machine.name,
+      role: machine.isRelay && machine.isDesktop
+        ? "relay and desktop"
+        : machine.isRelay
+          ? "relay"
+          : "desktop",
       isThis,
-      platform: isThis ? info.platform : host.platform,
-      online: isThis ? info.host.connected : host.online,
-      lastSeen: host.last_seen,
+      platform: isThis ? info.platform : machine.host.platform,
+      online: isThis ? info.host.connected : machine.host.online,
+      lastSeen: machine.host.last_seen,
       error: isThis ? info.host.last_error : undefined,
       hasGh: capabilities.has_gh,
       ghAuthed: capabilities.gh_authenticated,
@@ -1306,7 +1646,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     machines.unshift({
       id: info.host.host_id || "local",
       name: info.host.host_name || "This machine",
-      kind: "desktop",
+      role: "desktop",
       isThis: true,
       platform: info.platform,
       online: info.host.connected,
@@ -1363,8 +1703,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
                   {machine.isThis && <span className="you"> this machine</span>}
                 </span>
                 <span className="sub">
-                  {machine.platform}
-                  {machine.kind === "relay" ? " · relay" : ""}
+                  {machine.platform} · {machine.role}
                   {machine.online ? "" : ` · seen ${relative(machine.lastSeen)}`}
                   {machine.error ? ` · ${machine.error}` : ""}
                 </span>
@@ -1393,6 +1732,38 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
                   </Chip>
                 </div>
               ))
+            )}
+
+            {/* Only this machine, because only this machine's sleep is ours to
+                prevent. An agent working here dies when the lid closes. */}
+            {machine.isThis && (
+              <div className="machine-runtime">
+                <span className="grow">
+                  <span className="name">Keep awake</span>
+                  <span className="sub">
+                    Stops this machine sleeping and killing a run part-way
+                  </span>
+                </span>
+                <Dropdown
+                  align="right"
+                  width={210}
+                  value={awakePolicy}
+                  onChange={(value) => {
+                    const policy = value as AwakePolicy;
+                    setAwake(policy);
+                    void setAwakePolicy(policy);
+                  }}
+                  options={[
+                    { value: "never", label: "Never" },
+                    {
+                      value: "while_running",
+                      label: "While an agent is running",
+                      hint: "recommended",
+                    },
+                    { value: "while_open", label: "While Patchwork is open" },
+                  ]}
+                />
+              </div>
             )}
           </div>
         ))}

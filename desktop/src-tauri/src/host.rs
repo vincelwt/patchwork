@@ -53,13 +53,15 @@ pub struct HostStatus {
 pub struct LocalHost {
     status: Arc<Mutex<HostStatus>>,
     stop: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    awake: Arc<crate::awake::Keeper>,
 }
 
 impl LocalHost {
-    pub fn new() -> Self {
+    pub fn new(awake: Arc<crate::awake::Keeper>) -> Self {
         Self {
             status: Arc::new(Mutex::new(HostStatus::default())),
             stop: Arc::new(Mutex::new(None)),
+            awake,
         }
     }
 
@@ -84,9 +86,10 @@ impl LocalHost {
         }
 
         let status = self.status.clone();
+        let awake = self.awake.clone();
         let handle = tokio::spawn(async move {
             loop {
-                match connect(&settings, &status).await {
+                match connect(&settings, &status, &awake).await {
                     Ok(()) => {}
                     Err(err) => {
                         let mut status = status.lock().await;
@@ -105,7 +108,11 @@ impl LocalHost {
     }
 }
 
-async fn connect(settings: &Settings, status: &Arc<Mutex<HostStatus>>) -> anyhow::Result<()> {
+async fn connect(
+    settings: &Settings,
+    status: &Arc<Mutex<HostStatus>>,
+    awake: &Arc<crate::awake::Keeper>,
+) -> anyhow::Result<()> {
     let ws_url = websocket_url(&settings.relay_url, &settings.token);
     let (socket, _) = tokio_tungstenite::connect_async(&ws_url).await?;
     let (mut sink, mut stream) = socket.split();
@@ -149,12 +156,16 @@ async fn connect(settings: &Settings, status: &Arc<Mutex<HostStatus>>) -> anyhow
         status.last_error = None;
     }
 
-    // Keep the relay's view of this host fresh.
+    // Keep the relay's view of this host fresh, and keep the machine awake for
+    // exactly as long as it is doing work.
     let heartbeat = {
         let out_tx = out_tx.clone();
+        let runner = runner.clone();
+        let awake = awake.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                awake.set_running(runner.active_runs().await);
                 if out_tx
                     .send(HostToRelay::Heartbeat { capabilities: None })
                     .is_err()
@@ -170,7 +181,12 @@ async fn connect(settings: &Settings, status: &Arc<Mutex<HostStatus>>) -> anyhow
             continue;
         };
         match serde_json::from_str::<ServerMsg>(&text) {
-            Ok(ServerMsg::Host { msg }) => runner.handle(msg).await,
+            Ok(ServerMsg::Host { msg }) => {
+                runner.handle(msg).await;
+                // Checked on every command rather than only on the heartbeat,
+                // so a run that starts now is covered now.
+                awake.set_running(runner.active_runs().await);
+            }
             Ok(ServerMsg::Error { message }) => {
                 tracing::warn!(%message, "relay rejected a host message");
             }
@@ -182,6 +198,7 @@ async fn connect(settings: &Settings, status: &Arc<Mutex<HostStatus>>) -> anyhow
     heartbeat.abort();
     writer.abort();
     runner.shutdown().await;
+    awake.set_running(0);
     Ok(())
 }
 

@@ -4,6 +4,8 @@
 
 import type { HostCapabilities } from "./types";
 
+export type AwakePolicy = "never" | "while_running" | "while_open";
+
 export interface DesktopSettings {
   relay_url: string;
   token: string;
@@ -12,6 +14,7 @@ export interface DesktopSettings {
   host_id: string;
   host_name: string;
   project_paths: Record<string, string>;
+  awake: AwakePolicy;
 }
 
 export interface HostStatus {
@@ -48,6 +51,7 @@ function browserSettings(): DesktopSettings {
     host_id: parsed.host_id ?? "",
     host_name: parsed.host_name ?? "",
     project_paths: parsed.project_paths ?? {},
+    awake: parsed.awake ?? "never",
   };
 }
 
@@ -65,6 +69,7 @@ export async function desktopInfo(): Promise<DesktopInfo> {
       has_node: false,
       browser_automation: false,
       home_dir: "",
+      machine_key: "",
       notes: ["local agent execution needs the Patchwork Desktop app"],
     },
   };
@@ -105,6 +110,7 @@ export async function joinWorkspace(input: {
     host_id: "",
     host_name: "",
     project_paths: {},
+    awake: "never",
   };
   localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
   return settings;
@@ -125,6 +131,13 @@ export async function setProjectPaths(
   const settings = { ...browserSettings(), project_paths: paths };
   localStorage.setItem(BROWSER_KEY, JSON.stringify(settings));
   return settings;
+}
+
+/// Stopping this machine from sleeping mid-run. A no-op outside the app,
+/// because a browser tab has no business holding a power assertion.
+export async function setAwakePolicy(policy: AwakePolicy): Promise<DesktopSettings> {
+  if (inTauri) return invoke<DesktopSettings>("set_awake_policy", { policy });
+  return { ...browserSettings(), awake: policy };
 }
 
 export async function reconnectHost(): Promise<HostStatus> {

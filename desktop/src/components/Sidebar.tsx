@@ -477,18 +477,16 @@ function MemberRow({
       onClick={onClick}
       title={member ? `${member.display_name} · ${presenceWord(member)}` : fallback}
     >
-      <Avatar member={member} size={20} />
+      {/* Presence rides on the avatar. On the right it sat where unread dots
+          live and read as "something new here", which is a different claim. */}
+      <Avatar member={member} size={20} presence />
       <span className="label">{member?.display_name ?? fallback}</span>
       <span className="trailing">
         {busy && <Spinner size={12} />}
         {waiting > 0 ? (
           <span className="badge">{waiting}</span>
-        ) : member?.presence === "waiting" ? (
-          <span className="dot waiting" title="waiting for you" />
         ) : unseen ? (
           <span className="dot unread" />
-        ) : !busy && member?.presence === "online" ? (
-          <span className="dot online" title="online" />
         ) : null}
       </span>
     </button>

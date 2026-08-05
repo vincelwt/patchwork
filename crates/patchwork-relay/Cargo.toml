@@ -38,4 +38,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 mime_guess = "2"
+# Real schedules: "every day at 09:00" is a different promise from "every
+# 1440 minutes", which drifts to whenever you happened to create it.
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 reqwest.workspace = true

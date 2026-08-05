@@ -2,6 +2,7 @@
 //! execution. The UI talks to the relay directly; this side owns the host
 //! connection and the settings that survive a restart.
 
+mod awake;
 mod host;
 mod settings;
 
@@ -14,6 +15,7 @@ use settings::Settings;
 
 struct AppState {
     local_host: Arc<LocalHost>,
+    awake: Arc<awake::Keeper>,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +120,20 @@ async fn set_project_paths(
     Ok(current)
 }
 
+/// Keep this machine awake — never, only while it is running an agent, or for
+/// as long as the app is open.
+#[tauri::command]
+async fn set_awake_policy(
+    state: tauri::State<'_, AppState>,
+    policy: awake::AwakePolicy,
+) -> Result<Settings, String> {
+    let mut current = settings::load();
+    current.awake = policy;
+    settings::save(&current).map_err(|e| e.to_string())?;
+    state.awake.set_policy(policy);
+    Ok(current)
+}
+
 #[tauri::command]
 async fn reconnect_host(state: tauri::State<'_, AppState>) -> Result<HostStatus, String> {
     let settings = settings::load();
@@ -139,16 +155,19 @@ pub fn run() {
         )
         .init();
 
-    let local_host = Arc::new(LocalHost::new());
+    let awake = Arc::new(awake::Keeper::default());
+    let local_host = Arc::new(LocalHost::new(awake.clone()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             local_host: local_host.clone(),
+            awake: awake.clone(),
         })
         .setup(move |_app| {
             let local_host = local_host.clone();
+            let awake = awake.clone();
             tauri::async_runtime::spawn(async move {
                 let mut settings = settings::load();
                 // A machine that has joined before keeps its host identity.
@@ -156,6 +175,7 @@ pub fn run() {
                     settings.host_id = settings::stable_host_id();
                     let _ = settings::save(&settings);
                 }
+                awake.set_policy(settings.awake);
                 local_host.restart(settings).await;
             });
             Ok(())
@@ -165,6 +185,7 @@ pub fn run() {
             join_workspace,
             sign_out,
             set_project_paths,
+            set_awake_policy,
             reconnect_host
         ])
         .run(tauri::generate_context!())

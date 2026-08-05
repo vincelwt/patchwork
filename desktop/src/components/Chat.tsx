@@ -385,6 +385,8 @@ function Attached({ attachment }: { attachment: Attachment }) {
 /// humans first, then the agents actually working in this conversation.
 function WorkingPill({ channelId }: { channelId: Id }) {
   const app = useApp();
+  const api = useApi();
+  const { inspect } = useNavigation();
   const [, force] = useState(0);
 
   useEffect(() => {
@@ -420,14 +422,27 @@ function WorkingPill({ channelId }: { channelId: Id }) {
     content = (
       <span>
         <Spinner size={13} />
-        {agent?.display_name} · {run.headline || run.status}
+        <span className="what">
+          {agent?.display_name} · {run.headline || run.status}
+        </span>
+        {/* The only place these live now, so they are always reachable while
+            something is actually happening. */}
+        <button
+          className="pill-action"
+          onClick={() => inspect({ kind: "run", runId: run.id })}
+        >
+          Details
+        </button>
+        <button className="pill-action" onClick={() => api.cancelRun(run.id)}>
+          Stop
+        </button>
       </span>
     );
   } else if (working.length > 1) {
     content = (
       <span>
         <Spinner size={13} />
-        {working.length} agents working
+        <span className="what">{working.length} agents working</span>
       </span>
     );
   }

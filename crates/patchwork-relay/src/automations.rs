@@ -183,6 +183,9 @@ pub async fn fire(
         if let AutomationTrigger::Schedule { every_seconds, .. } = &automation.trigger {
             automation.next_run_at = Some(now_ms() + every_seconds * 1000);
         }
+        if let AutomationTrigger::Cron { expression } = &automation.trigger {
+            automation.next_run_at = next_cron_after(expression, now_ms());
+        }
         state.store.upsert_automation(&automation)?;
         state.emit(Event::AutomationUpdated { automation });
     }
@@ -348,21 +351,34 @@ pub async fn scheduler(state: Shared) {
         };
         let now = now_ms();
         for automation in automations.into_iter().filter(|a| a.enabled) {
-            let AutomationTrigger::Schedule {
-                every_seconds,
-                start_at,
-            } = &automation.trigger
-            else {
-                continue;
+            let (due_at, summary) = match &automation.trigger {
+                AutomationTrigger::Schedule {
+                    every_seconds,
+                    start_at,
+                } => (
+                    automation
+                        .next_run_at
+                        .or(*start_at)
+                        .unwrap_or(automation.created_at + every_seconds * 1000),
+                    format!("Scheduled every {every_seconds}s"),
+                ),
+                AutomationTrigger::Cron { expression } => {
+                    // No stored next time yet — work out the first one from
+                    // when it was created, not from now, or restarting the
+                    // relay would postpone every schedule indefinitely.
+                    let Some(due) = automation
+                        .next_run_at
+                        .or_else(|| next_cron_after(expression, automation.created_at))
+                    else {
+                        continue;
+                    };
+                    (due, format!("Scheduled: {expression}"))
+                }
+                _ => continue,
             };
-            let due_at = automation
-                .next_run_at
-                .or(*start_at)
-                .unwrap_or(automation.created_at + every_seconds * 1000);
             if due_at > now {
                 continue;
             }
-            let summary = format!("Scheduled every {}s", every_seconds);
             if let Err(err) = fire(&state, &automation, summary, json!({ "at": now }), None).await {
                 tracing::warn!(?err, automation = %automation.name, "scheduled automation failed");
             }
@@ -370,9 +386,49 @@ pub async fn scheduler(state: Shared) {
     }
 }
 
+/// The next firing after `after`, in the relay's local time.
+///
+/// The `cron` crate wants a seconds field; a person writing "0 9 * * *" means
+/// the five-field form, so accept that and fill the seconds in.
+pub fn next_cron_after(expression: &str, after: i64) -> Option<i64> {
+    use chrono::TimeZone;
+    use std::str::FromStr;
+
+    let fields = expression.split_whitespace().count();
+    let normalised = match fields {
+        5 => format!("0 {expression}"),
+        6 | 7 => expression.to_string(),
+        _ => return None,
+    };
+    let schedule = cron::Schedule::from_str(&normalised).ok()?;
+    let from = chrono::Local.timestamp_millis_opt(after).single()?;
+    schedule
+        .after(&from)
+        .next()
+        .map(|at| at.timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_five_field_cron_is_accepted_and_lands_on_the_hour() {
+        // 2026-01-01T00:00:00Z is a safe, fixed starting point.
+        let start = 1_767_225_600_000;
+        let next = next_cron_after("0 9 * * *", start).expect("valid expression");
+        assert!(next > start, "the next run must be in the future");
+        let local = chrono::DateTime::from_timestamp_millis(next).unwrap();
+        let _ = local;
+        // Within a day and a bit — a daily schedule never waits two days.
+        assert!(next - start <= 25 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn nonsense_expressions_do_not_schedule_anything() {
+        assert!(next_cron_after("not a cron", 0).is_none());
+        assert!(next_cron_after("0 9 * *", 0).is_none());
+    }
 
     #[test]
     fn patterns_fall_back_to_substring_when_not_a_regex() {

@@ -8,7 +8,6 @@ import {
   PreviewIcon,
   QuestionIcon,
   RunIcon,
-  Spinner,
   TasksIcon,
 } from "./icons";
 import type { MessageCard, QuestionAnswer } from "../lib/types";
@@ -58,7 +57,6 @@ function TaskCardInline({ taskId }: { taskId: string }) {
 
 function RunCardInline({ runId }: { runId: string }) {
   const app = useApp();
-  const api = useApi();
   const { inspect } = useNavigation();
   const run = app.runs[runId];
 
@@ -77,20 +75,20 @@ function RunCardInline({ runId }: { runId: string }) {
   // has earned the weight of a card.
   const wantsAttention = run.status === "failed" || run.status === "waiting";
 
+  // While a run is going, the floating pill above the composer is already
+  // saying so, and saying it twice — once here, once down there — is the app
+  // talking over itself. The transcript keeps the finished record; the pill
+  // owns "right now", including the controls.
+  if (active) return null;
+
   if (!wantsAttention) {
     return (
-      <div className={`run-line${active ? " active" : ""}`}>
-        {active ? <Spinner size={13} /> : <RunIcon size={14} />}
+      <div className="run-line">
+        <RunIcon size={14} />
         <span className="text">
-          {active ? (
-            <>{run.headline || `${agent?.display_name ?? "An agent"} is working`}</>
-          ) : (
-            <>
-              <span className="who">{agent?.display_name} </span>
-              {run.status === "cancelled" ? "was stopped" : `ran ${run.runtime}`} ·{" "}
-              {duration(run.started_at, run.ended_at)}
-            </>
-          )}
+          <span className="who">{agent?.display_name} </span>
+          {run.status === "cancelled" ? "was stopped" : `ran ${run.runtime}`} ·{" "}
+          {duration(run.started_at, run.ended_at)}
         </span>
         <button
           className="run-line-action"
@@ -98,11 +96,6 @@ function RunCardInline({ runId }: { runId: string }) {
         >
           Details
         </button>
-        {active && (
-          <button className="run-line-action" onClick={() => api.cancelRun(run.id)}>
-            Stop
-          </button>
-        )}
       </div>
     );
   }
@@ -131,11 +124,6 @@ function RunCardInline({ runId }: { runId: string }) {
         >
           Details
         </button>
-        {active && (
-          <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
-            Stop
-          </button>
-        )}
       </div>
     </div>
   );

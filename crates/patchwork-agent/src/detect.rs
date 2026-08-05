@@ -196,6 +196,7 @@ pub async fn detect_capabilities() -> HostCapabilities {
         // Agents use their own browser tooling; we report whether a driver is
         // even plausible so the UI can explain a failure.
         browser_automation: has_node || on_path("playwright").is_some(),
+        machine_key: machine_key(),
         home_dir: dirs::home_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default(),

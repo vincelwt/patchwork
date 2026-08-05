@@ -229,8 +229,28 @@ fn start_hosted_execution(state: &Shared) -> std::sync::Arc<Runner> {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            let capabilities = patchwork_agent::detect_capabilities().await;
+            let mut capabilities = patchwork_agent::detect_capabilities().await;
             if let Ok(Some(mut host)) = state.store.host(&state.relay_host_id) {
+                // Detection cannot know what a runtime can *run* — only opening
+                // a session tells us that — so carry forward what we learned.
+                for runtime in &mut capabilities.runtimes {
+                    let Some(known) = host
+                        .capabilities
+                        .runtimes
+                        .iter()
+                        .find(|candidate| candidate.id == runtime.id)
+                    else {
+                        continue;
+                    };
+                    if runtime.models.is_empty() {
+                        runtime.models = known.models.clone();
+                        runtime.default_model = known.default_model.clone();
+                    }
+                    if runtime.modes.is_empty() {
+                        runtime.modes = known.modes.clone();
+                        runtime.default_mode = known.default_mode.clone();
+                    }
+                }
                 host.capabilities = capabilities;
                 host.last_seen = now_ms();
                 host.online = true;

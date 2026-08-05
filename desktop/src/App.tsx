@@ -978,8 +978,11 @@ function CommandPalette({
     return out.slice(0, 40);
   }, [app, needle, query, shortcuts, open, onClose]);
 
-  useEffect(() => setActive(0), [needle]);
-
+  // Arrow keys must walk the list the way it is *drawn*. Grouping reorders
+  // everything — two channels either side of a task end up adjacent — so the
+  // flat navigation order has to be derived from the grouped order, not from
+  // the order the entries happened to be collected in. Getting this backwards
+  // is what made the selection jump around.
   const grouped = useMemo(() => {
     const map = new Map<string, Entry[]>();
     for (const entry of entries) {
@@ -987,6 +990,14 @@ function CommandPalette({
     }
     return [...map.entries()];
   }, [entries]);
+
+  const ordered = useMemo(() => grouped.flatMap(([, items]) => items), [grouped]);
+
+  // A shorter list must never leave the cursor pointing past the end.
+  useEffect(() => {
+    setActive((at) => (at >= ordered.length ? Math.max(0, ordered.length - 1) : at));
+  }, [ordered.length]);
+  useEffect(() => setActive(0), [needle]);
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -1029,7 +1040,7 @@ function CommandPalette({
             <div key={group}>
               <div className="palette-group">{group}</div>
               {items.map((entry) => {
-                const index = entries.indexOf(entry);
+                const index = ordered.indexOf(entry);
                 return (
                   <button
                     key={entry.key}

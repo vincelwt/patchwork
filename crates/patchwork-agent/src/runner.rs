@@ -169,6 +169,9 @@ struct TurnState {
     streamed_at: Option<std::time::Instant>,
     /// Whether anything has been streamed for the message being written.
     streaming: bool,
+    /// The agent did something between two pieces of prose. The next chunk
+    /// starts a new paragraph rather than running into the last sentence.
+    interrupted: bool,
 }
 
 /// Long enough that a chatty model does not flood the relay, short enough that
@@ -574,6 +577,15 @@ async fn handle_update(
         "agent_message_chunk" => {
             if let Some(text) = content_text(update.get("content")) {
                 let mut s = state.lock().await;
+                // "Let me check the PATH." <tool runs> "Yes, it is at /usr/bin."
+                // are two things the agent said, not one sentence. Without a
+                // break they arrive glued together mid-word.
+                if s.interrupted && !s.message.is_empty() {
+                    if !s.message.ends_with('\n') {
+                        s.message.push_str("\n\n");
+                    }
+                    s.interrupted = false;
+                }
                 s.message.push_str(&text);
                 let due = s
                     .streamed_at
@@ -609,6 +621,13 @@ async fn handle_update(
                 }
             }
         }
+        "tool_call" | "tool_call_update" | "plan" | "available_commands_update" => {
+            state.lock().await.interrupted = true;
+        }
+        _ => {}
+    }
+
+    match kind {
         "tool_call" | "tool_call_update" => {
             let title = update
                 .get("title")
@@ -726,6 +745,7 @@ async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, 
         let mut s = state.lock().await;
         s.streamed_at = None;
         s.streaming = false;
+        s.interrupted = false;
         (std::mem::take(&mut s.message), std::mem::take(&mut s.thought))
     };
     if !thought.trim().is_empty() {
@@ -972,6 +992,38 @@ mod tests {
             }
         }
         assert_eq!(bodies, vec!["Fixed the test.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn work_between_two_sentences_becomes_a_paragraph_break() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        let chunk = |text: &str| {
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } })
+        };
+
+        handle_update("r1", chunk("Let me check the PATH."), &tx, &state).await;
+        handle_update(
+            "r1",
+            json!({ "sessionUpdate": "tool_call", "title": "bash", "status": "completed" }),
+            &tx,
+            &state,
+        )
+        .await;
+        handle_update("r1", chunk("Yes, it is at /usr/bin."), &tx, &state).await;
+        flush_message("r1", &tx, &state, &spec()).await;
+
+        let mut bodies = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let HostToRelay::RunMessage { body, .. } = msg {
+                bodies.push(body);
+            }
+        }
+        assert_eq!(
+            bodies,
+            vec!["Let me check the PATH.\n\nYes, it is at /usr/bin.".to_string()],
+            "two things the agent said must not arrive glued together",
+        );
     }
 
     #[tokio::test]

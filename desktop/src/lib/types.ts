@@ -196,6 +196,9 @@ export interface HostCapabilities {
   has_node: boolean;
   browser_automation: boolean;
   home_dir: string;
+  /// `user@hostname`. The relay and a desktop app on the same box are two hosts
+  /// but one machine.
+  machine_key: string;
   notes: string[];
 }
 
@@ -350,6 +353,7 @@ export interface InboxItem {
 
 export type AutomationTrigger =
   | { type: "schedule"; every_seconds: number; start_at?: Millis }
+  | { type: "cron"; expression: string }
   | {
       type: "message";
       channel_id: Id;

@@ -26,6 +26,9 @@ pub struct Settings {
     /// Project id -> absolute path on this machine.
     #[serde(default)]
     pub project_paths: BTreeMap<String, String>,
+    /// Whether to stop this machine sleeping, and when.
+    #[serde(default)]
+    pub awake: crate::awake::AwakePolicy,
 }
 
 impl Settings {

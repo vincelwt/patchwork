@@ -2743,3 +2743,48 @@ details[open] > summary::before {
   min-height: 0;
   flex: 1;
 }
+
+/* Keyboard position and current value are different things: one is where the
+   arrows are, the other is what is set. */
+.dropdown-option.active {
+  background: var(--tint);
+}
+.dropdown-option.selected {
+  background: var(--tint-strong);
+}
+.dropdown-option.selected.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* The pill is the single live indicator, so it carries the live controls. */
+.working-pill .what {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
+.pill-action {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 0 6px;
+  border-radius: 6px;
+  flex: none;
+}
+.pill-action:hover {
+  background: var(--tint);
+  color: var(--text);
+}
+
+/* An automation's instructions are prose the agent will act on, so they are
+   shown as written — line breaks and all — not reflowed into a paragraph. */
+.instructions {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-card);
+  background: var(--surface-sunken);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  line-height: 1.55;
+}

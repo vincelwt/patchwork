@@ -462,6 +462,10 @@ pub struct HostCapabilities {
     pub browser_automation: bool,
     #[serde(default)]
     pub home_dir: String,
+    /// `user@hostname`. The relay and a desktop app on the same box are two
+    /// hosts but one machine, and only this can tell you so.
+    #[serde(default)]
+    pub machine_key: String,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -777,12 +781,19 @@ pub struct InboxItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AutomationTrigger {
-    /// Cron-ish: every N seconds, optionally anchored.
+    /// Every N seconds from whenever it last ran. Fine for "poll this often";
+    /// wrong for "every morning", which is what `Cron` is for.
     Schedule {
         /// Seconds between runs.
         every_seconds: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_at: Option<Millis>,
+    },
+    /// A wall-clock schedule in the relay's local time. "Daily at 09:00" has to
+    /// mean 09:00 tomorrow, not "24 hours after I set this up".
+    Cron {
+        /// Standard five-field cron (`min hour day month weekday`).
+        expression: String,
     },
     /// A new message in a channel, optionally matching a pattern.
     Message {

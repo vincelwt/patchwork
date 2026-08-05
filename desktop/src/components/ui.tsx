@@ -178,10 +178,27 @@ export function Dropdown({
   width?: number;
 }) {
   const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
   const root = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const current = options.find((option) => option.value === value);
   const style = useAnchored(root, open, align, 200);
+  const typed = useRef({ text: "", at: 0 });
+
+  // Opening lands on what is already selected, not on the top of the list.
+  useEffect(() => {
+    if (!open) return;
+    const at = options.findIndex((option) => option.value === value);
+    setActive(at === -1 ? 0 : at);
+  }, [open, options, value]);
+
+  // Keep the highlighted row in view when the arrows walk past the edge.
+  useEffect(() => {
+    if (!open) return;
+    list.current
+      ?.querySelector<HTMLElement>(".dropdown-option.active")
+      ?.scrollIntoView({ block: "nearest" });
+  }, [open, active]);
 
   useEffect(() => {
     if (!open) return;
@@ -190,10 +207,64 @@ export function Dropdown({
       if (root.current?.contains(target) || list.current?.contains(target)) return;
       setOpen(false);
     };
+    const choose = (at: number) => {
+      const option = options[at];
+      if (!option) return;
+      onChange(option.value);
+      setOpen(false);
+    };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.stopPropagation();
-        setOpen(false);
+      switch (event.key) {
+        case "Escape":
+          event.stopPropagation();
+          event.preventDefault();
+          setOpen(false);
+          return;
+        case "ArrowDown":
+          event.preventDefault();
+          event.stopPropagation();
+          setActive((at) => Math.min(at + 1, options.length - 1));
+          return;
+        case "ArrowUp":
+          event.preventDefault();
+          event.stopPropagation();
+          setActive((at) => Math.max(at - 1, 0));
+          return;
+        case "Home":
+          event.preventDefault();
+          setActive(0);
+          return;
+        case "End":
+          event.preventDefault();
+          setActive(options.length - 1);
+          return;
+        case "Enter":
+        case " ":
+          event.preventDefault();
+          event.stopPropagation();
+          choose(active);
+          return;
+        case "Tab":
+          setOpen(false);
+          return;
+      }
+
+      // Typeahead: the thing every native select does, and the reason a long
+      // list of models is usable at all without reaching for the mouse.
+      if (event.key.length === 1 && !event.metaKey && !event.ctrlKey) {
+        const now = Date.now();
+        const text =
+          now - typed.current.at < 900
+            ? typed.current.text + event.key.toLowerCase()
+            : event.key.toLowerCase();
+        typed.current = { text, at: now };
+        const found = options.findIndex((option) =>
+          option.label.toLowerCase().startsWith(text),
+        );
+        if (found !== -1) {
+          event.preventDefault();
+          setActive(found);
+        }
       }
     };
     window.addEventListener("mousedown", onDown);
@@ -202,13 +273,19 @@ export function Dropdown({
       window.removeEventListener("mousedown", onDown);
       window.removeEventListener("keydown", onKey, true);
     };
-  }, [open]);
+  }, [open, options, active, onChange]);
 
   return (
     <div className="dropdown" ref={root} style={width ? { width } : undefined}>
       <button
         className={`dropdown-trigger${quiet ? " quiet" : ""}${open ? " open" : ""}`}
         onClick={() => setOpen(!open)}
+        onKeyDown={(event) => {
+          if (!open && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
       >
         <span className="dropdown-value">{current?.label ?? placeholder}</span>
         <ChevronIcon size={13} />
@@ -217,10 +294,13 @@ export function Dropdown({
         style &&
         createPortal(
           <div className="dropdown-menu" ref={list} style={style}>
-            {options.map((option) => (
+            {options.map((option, at) => (
               <button
                 key={option.value}
-                className={`dropdown-option${option.value === value ? " selected" : ""}`}
+                className={`dropdown-option${option.value === value ? " selected" : ""}${
+                  at === active ? " active" : ""
+                }`}
+                onMouseEnter={() => setActive(at)}
                 onClick={() => {
                   onChange(option.value);
                   setOpen(false);
