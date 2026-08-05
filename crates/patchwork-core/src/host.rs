@@ -69,6 +69,11 @@ pub struct RunSpec {
     /// outcome. Deep history stays retrievable through the Patchwork CLI.
     #[serde(default)]
     pub context: String,
+    /// Files attached to this task. The host downloads them next to the work
+    /// and hands the agent paths: a screenshot is a file, not a wall of
+    /// base64 in a prompt.
+    #[serde(default)]
+    pub files: Vec<RunFile>,
     /// Base URL and token the agent's `patchwork` CLI should use.
     pub api_base: String,
     pub api_token: String,
@@ -78,6 +83,13 @@ pub struct RunSpec {
     pub resume_session_id: Option<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunFile {
+    pub file_name: String,
+    /// Absolute, so the host does not have to know how the relay is addressed.
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

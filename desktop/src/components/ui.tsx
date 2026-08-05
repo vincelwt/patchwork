@@ -34,7 +34,7 @@ export function Page({
 }) {
   return (
     <div className="column">
-      <div className="topbar">
+      <div className="topbar" data-tauri-drag-region="deep">
         {back && (
           <button className="button quiet" onClick={back.onClick}>
             ‹ {back.label}

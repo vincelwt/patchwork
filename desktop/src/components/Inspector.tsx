@@ -30,7 +30,7 @@ export function Inspector() {
 
   return (
     <aside className="inspector">
-      <div className="inspector-head">
+      <div className="inspector-head" data-tauri-drag-region="deep">
         <span>
           {inspector.kind === "thread"
             ? "Thread"

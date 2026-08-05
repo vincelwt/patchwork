@@ -435,9 +435,11 @@ body.resizing {
   -webkit-app-region: drag;
   flex: none;
 }
-/* The window has no title bar, so its top edge is the handle. Only the things
-   you can actually press opt out — making every child no-drag left a 52px
-   strip that looked draggable and was not. */
+/* The window has no title bar, so its top edge is the handle. macOS ignores
+   `-webkit-app-region` in a WKWebView entirely, which is why none of this
+   worked: the toolbars carry `data-tauri-drag-region="deep"`, and Tauri's own
+   handler exempts buttons and inputs. These rules are what does the same job
+   on Windows and Linux. */
 .topbar button,
 .topbar input,
 .topbar select,
@@ -1868,6 +1870,19 @@ details[open] > summary::before {
 }
 .task-facts .date-input:hover {
   background: var(--tint);
+}
+
+/* Evidence pinned to a task, small enough to sit under its description. */
+.task-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.task-files .image-attachment img {
+  max-height: 96px;
+  border-radius: 8px;
 }
 
 .task-list {

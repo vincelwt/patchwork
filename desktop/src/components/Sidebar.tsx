@@ -139,7 +139,7 @@ export function Sidebar({
 
   return (
     <aside className={`sidebar${rail ? " rail" : ""}`}>
-      <div className="sidebar-top">
+      <div className="sidebar-top" data-tauri-drag-region="deep">
         {!rail && (
           <span className="workspace-title">
             {app.workspace?.name ?? "Patchwork"}

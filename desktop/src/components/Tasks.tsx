@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp, useAppSelector } from "../lib/store";
 import {
   dateInputToMillis,
@@ -32,11 +32,11 @@ import {
   TrashIcon,
   WarningIcon,
 } from "./icons";
-import { ChatView } from "./Chat";
+import { Attached, ChatView } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { TASK_STATUSES } from "../lib/types";
-import type { Id, Member, Task, TaskStatus } from "../lib/types";
+import type { Attachment, Id, Member, Task, TaskStatus } from "../lib/types";
 
 /// Everything that can be done to a task, in one place. The task page, the
 /// board card and the inspector all call this, so "Start" means the same thing
@@ -171,7 +171,7 @@ export function TasksBoard() {
 
   return (
     <div className="column">
-      <div className="topbar">
+      <div className="topbar" data-tauri-drag-region="deep">
         <span className="title">Tasks</span>
         {needsYou > 0 && <Chip tone="caution">{needsYou} waiting on you</Chip>}
         <span className="spacer" />
@@ -611,6 +611,56 @@ export function NewTaskModal({
   );
 }
 
+/// Screenshots and other evidence pinned to a task.
+///
+/// Paste an image anywhere on the task and it lands here — and on the machine
+/// that runs the task, as a file the agent opens by path. A prompt is a bad
+/// place to put a PNG.
+function TaskFiles({ taskId }: { taskId: Id }) {
+  const api = useApi();
+  const { toast } = useNavigation();
+  const [files, setFiles] = useState<Attachment[]>([]);
+  const [busy, setBusy] = useState(0);
+
+  const reload = useCallback(() => {
+    void api.task(taskId).then((detail) => setFiles(detail.attachments));
+  }, [api, taskId]);
+
+  useEffect(reload, [reload]);
+
+  // The paste lands wherever the cursor happens to be, including the title and
+  // the description, so it is caught once for the whole page.
+  useEffect(() => {
+    const onPaste = async (event: ClipboardEvent) => {
+      const images = [...(event.clipboardData?.files ?? [])];
+      if (images.length === 0) return;
+      event.preventDefault();
+      setBusy((n) => n + images.length);
+      try {
+        for (const file of images) await api.upload(file, taskId);
+        reload();
+      } catch (err) {
+        toast(String((err as Error).message ?? err));
+      } finally {
+        setBusy(0);
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [api, taskId, reload, toast]);
+
+  if (files.length === 0 && busy === 0) return null;
+
+  return (
+    <div className="task-files">
+      {files.map((attachment) => (
+        <Attached key={attachment.id} attachment={attachment} />
+      ))}
+      {busy > 0 && <span className="composer-hint">Attaching…</span>}
+    </div>
+  );
+}
+
 /// Assigning is nearly always "and start it", so the two are one step with one
 /// optional extra: what to tell the agent beyond the task itself.
 export function AssignModal({ task, onClose }: { task: Task; onClose: () => void }) {
@@ -740,7 +790,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
 
   return (
     <div className="column">
-      <div className="topbar">
+      <div className="topbar" data-tauri-drag-region="deep">
         <button className="button quiet" onClick={() => go({ kind: "tasks" })}>
           ‹ Tasks
         </button>
@@ -802,6 +852,8 @@ export function TaskPage({ taskId }: { taskId: string }) {
           title="Click to describe the expected result"
           onCommit={(outcome) => void api.updateTask(task.id, { outcome })}
         />
+
+        <TaskFiles taskId={task.id} />
 
         <div className="task-rail">
           {TASK_STEPS.map((entry, index) => (

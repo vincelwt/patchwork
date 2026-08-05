@@ -17,6 +17,8 @@ futures.workspace = true
 which.workspace = true
 dirs.workspace = true
 uuid.workspace = true
+# Task files are fetched over HTTP so the agent gets a path, not base64.
+reqwest.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

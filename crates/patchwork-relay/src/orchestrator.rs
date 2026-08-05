@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use patchwork_core::events::Event;
-use patchwork_core::host::{HostToRelay, RelayToHost, RunSpec, WorktreeSpec};
+use patchwork_core::host::{HostToRelay, RelayToHost, RunFile, RunSpec, WorktreeSpec};
 use patchwork_core::models::*;
 use patchwork_core::wire::SendMessage;
 use patchwork_core::{new_id, now_ms, Id, Millis};
@@ -711,6 +711,7 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         worktree: worktree_spec,
         prompt,
         context,
+        files: task_files(state, &task),
         api_base: state.public_url.clone(),
         api_token: token,
         resume_session_id: resume_session_for(state, &agent.id, &params.task_id)?,
@@ -867,6 +868,24 @@ fn resolve_worktree(
         },
         None,
     ))
+}
+
+/// What has been pinned to this task: screenshots pasted into its
+/// description, evidence attached by an earlier run.
+fn task_files(state: &Shared, task: &Option<Task>) -> Vec<RunFile> {
+    let Some(task) = task else {
+        return Vec::new();
+    };
+    state
+        .store
+        .task_attachments(&task.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|attachment| RunFile {
+            file_name: attachment.file_name,
+            url: format!("{}{}", state.public_url, attachment.url),
+        })
+        .collect()
 }
 
 fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTrigger) -> String {

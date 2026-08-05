@@ -233,6 +233,15 @@ async fn execute(
     // 3. Environment: the agent's native access to Patchwork.
     let env = build_env(&runner.cfg, &spec, &prepared.path);
     write_skill(&prepared.path).await;
+    let files = fetch_files(&prepared.path, &spec).await;
+    if !files.is_empty() {
+        emit(HostToRelay::RunEvent {
+            run_id: run_id.clone(),
+            kind: RunEventKind::Lifecycle,
+            text: format!("Fetched {} attached file(s)", files.len()),
+            data: Some(json!({ "files": files })),
+        });
+    }
 
     emit(HostToRelay::RunStatus {
         run_id: run_id.clone(),
@@ -359,7 +368,7 @@ async fn execute(
 
     // 5. Prompt turns. The first carries identity and context; later turns are
     //    follow-ups the user typed while the run was still going.
-    let mut next_prompt = Some(compose_first_prompt(&spec));
+    let mut next_prompt = Some(compose_first_prompt(&spec, &files));
     let mut turns = 0usize;
 
     loop {
@@ -858,7 +867,64 @@ async fn write_skill(cwd: &str) {
     }
 }
 
-fn compose_first_prompt(spec: &RunSpec) -> String {
+/// Task files, downloaded next to the work.
+///
+/// An agent that can read a file does not need it pasted into its prompt: a
+/// screenshot is a path, and every runtime here can open one. Failures are
+/// not fatal — a missing screenshot is worth less than the run.
+async fn fetch_files(cwd: &str, spec: &RunSpec) -> Vec<String> {
+    if spec.files.is_empty() {
+        return Vec::new();
+    }
+    let dir = std::path::Path::new(cwd).join(".patchwork").join("files");
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        return Vec::new();
+    }
+
+    let client = reqwest::Client::new();
+    let mut taken: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::new();
+    for file in &spec.files {
+        let name = unique_name(&mut taken, &file.file_name);
+        let path = dir.join(&name);
+        let bytes = match client.get(&file.url).send().await {
+            Ok(response) => response.bytes().await.ok(),
+            Err(err) => {
+                tracing::warn!(?err, file = %file.file_name, "could not fetch a task file");
+                None
+            }
+        };
+        let Some(bytes) = bytes else { continue };
+        if tokio::fs::write(&path, &bytes).await.is_ok() {
+            out.push(path.to_string_lossy().to_string());
+        }
+    }
+    out
+}
+
+/// Two screenshots called `image.png` are two files, not one.
+fn unique_name(taken: &mut HashMap<String, usize>, file_name: &str) -> String {
+    let clean: String = file_name
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect();
+    let clean = if clean.trim().is_empty() {
+        "file".to_string()
+    } else {
+        clean
+    };
+    let seen = taken.entry(clean.clone()).or_insert(0);
+    *seen += 1;
+    if *seen == 1 {
+        return clean;
+    }
+    match clean.rsplit_once('.') {
+        Some((stem, extension)) => format!("{stem}-{seen}.{extension}"),
+        None => format!("{clean}-{seen}"),
+    }
+}
+
+fn compose_first_prompt(spec: &RunSpec, files: &[String]) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "You are {} (@{}), a teammate in a Patchwork workspace.\n",
@@ -874,6 +940,13 @@ fn compose_first_prompt(spec: &RunSpec) -> String {
         s.push_str("## Context\n\n");
         s.push_str(spec.context.trim());
         s.push_str("\n\n---\n");
+    }
+    if !files.is_empty() {
+        s.push_str("## Files on this task\n\n");
+        for path in files {
+            s.push_str(&format!("- {path}\n"));
+        }
+        s.push_str("\nRead them from disk; they are not in this prompt.\n\n---\n");
     }
     s.push_str("## Your turn\n\n");
     s.push_str(spec.prompt.trim());
@@ -909,6 +982,7 @@ mod tests {
             worktree: WorktreeSpec::None,
             prompt: "Fix the failing test".into(),
             context: "#dev — Vince: the checkout test is red".into(),
+            files: Vec::new(),
             api_base: "http://localhost:7727".into(),
             api_token: "tok".into(),
             resume_session_id: None,
@@ -918,7 +992,7 @@ mod tests {
 
     #[test]
     fn first_prompt_carries_identity_skill_and_context() {
-        let p = compose_first_prompt(&spec());
+        let p = compose_first_prompt(&spec(), &[]);
         assert!(p.contains("Developer agent"));
         assert!(p.contains("You ship small, reviewable changes."));
         assert!(p.contains("patchwork ask"));

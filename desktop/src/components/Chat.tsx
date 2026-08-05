@@ -504,7 +504,7 @@ function RunMeta({ run }: { run: Run }) {
 }
 
 /// An image someone dropped in should be visible without a download step.
-function Attached({ attachment }: { attachment: Attachment }) {
+export function Attached({ attachment }: { attachment: Attachment }) {
   const api = useApi();
   const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
   const [broken, setBroken] = useState(false);

@@ -823,7 +823,7 @@ function ChannelView({ channelId }: { channelId: string }) {
 
   return (
     <div className="column">
-      <div className="topbar">
+      <div className="topbar" data-tauri-drag-region="deep">
         {channel.kind === "dm" ? (
           <Avatar member={partner} size={22} presence />
         ) : (
