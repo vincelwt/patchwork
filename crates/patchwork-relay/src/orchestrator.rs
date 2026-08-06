@@ -652,6 +652,34 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         .or_else(|| task.as_ref().and_then(|t| t.host_id.clone()));
     let host_id = choose_host(state, &profile, pinned_host, project.as_ref()).await?;
 
+    // A project with no repository is one folder that every task shares, so
+    // two agents in it would edit the same files at the same time. A git
+    // project has a worktree each and needs none of this.
+    //
+    // ponytail: refuse rather than queue. Queuing means a second dispatch path
+    // and a wake-up on every run that ends; add it when someone actually runs
+    // into this more than once.
+    if let Some(project) = &project {
+        if project.repo_url.is_none() {
+            if let Some(busy) =
+                state
+                    .store
+                    .project_active_run(&project.id, params.task_id.as_deref())?
+            {
+                let who = state
+                    .store
+                    .member(&busy.agent_id)?
+                    .map(|m| m.display_name)
+                    .unwrap_or_else(|| "another agent".into());
+                bail!(
+                    "{who} is already working in `{}`, and it has no repository to give each task \
+a worktree of its own. Wait for that run, or give the project a repository URL.",
+                    project.name
+                );
+            }
+        }
+    }
+
     // Where the agent will work.
     let (worktree_spec, existing_worktree) = resolve_worktree(state, &task, &project, &host_id)?;
 
@@ -854,15 +882,14 @@ fn resolve_worktree(
         }
     }
 
-    let project_path = project
-        .paths
-        .get(host_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("`{}` is not checked out on this machine", project.name))?;
-
+    // No path on this machine is not a failure any more: a project with a
+    // repository is something the host can fetch for itself, and it reports
+    // where it put it.
     Ok((
         WorktreeSpec::New {
-            project_path,
+            project_path: project.paths.get(host_id).cloned(),
+            repo_url: project.repo_url.clone(),
+            project_name: project.name.clone(),
             branch: branch_for(&task.key, &task.title),
             base_branch: project.default_branch.clone(),
         },
@@ -1053,6 +1080,18 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             if status.is_terminal() {
                 finish_run(state, &run).await?;
             }
+        }
+
+        HostToRelay::ProjectCheckout { project_id, path } => {
+            let Some(mut project) = state.store.project(&project_id)? else {
+                return Ok(());
+            };
+            if project.paths.get(host_id) == Some(&path) {
+                return Ok(());
+            }
+            project.paths.insert(host_id.to_string(), path);
+            state.store.upsert_project(&project)?;
+            state.emit(Event::ProjectUpdated { project });
         }
 
         HostToRelay::RuntimeOptions {

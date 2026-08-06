@@ -1204,7 +1204,6 @@ async fn create_project(
         id: new_id(),
         name: input.name.trim().to_string(),
         description: input.description.clone(),
-        kind: input.kind.unwrap_or(ProjectKind::Git),
         repo_url: input.repo_url.clone(),
         default_branch: input.default_branch.clone().unwrap_or_else(|| "main".into()),
         paths: input.paths.clone(),
@@ -1231,9 +1230,6 @@ async fn update_project(
         project.name = input.name.trim().to_string();
     }
     project.description = input.description.clone();
-    if let Some(kind) = input.kind {
-        project.kind = kind;
-    }
     project.repo_url = input.repo_url.clone();
     if let Some(branch) = input.default_branch {
         project.default_branch = branch;

@@ -168,7 +168,8 @@ export interface Project {
   id: Id;
   name: string;
   description: string;
-  kind: "git" | "folder";
+  /// With a URL, every machine clones it for itself. Without one this is a
+  /// folder that already exists, and `paths` says where.
   repo_url?: string;
   default_branch: string;
   paths: Record<Id, string>;

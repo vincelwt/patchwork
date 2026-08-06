@@ -205,6 +205,18 @@ async fn execute(
         run_id: run_id.clone(),
         cwd: Some(prepared.path.clone()),
     });
+    if let (Some(path), Some(project_id)) = (&prepared.cloned_to, &spec.project_id) {
+        emit(HostToRelay::ProjectCheckout {
+            project_id: project_id.clone(),
+            path: path.clone(),
+        });
+        emit(HostToRelay::RunEvent {
+            run_id: run_id.clone(),
+            kind: RunEventKind::Lifecycle,
+            text: format!("Cloned the project to {path}"),
+            data: None,
+        });
+    }
     if !matches!(spec.worktree, WorktreeSpec::None) {
         emit(HostToRelay::WorktreeReady {
             run_id: run_id.clone(),

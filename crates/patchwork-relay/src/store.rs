@@ -962,16 +962,10 @@ impl Store {
     // -- projects, hosts, worktrees ----------------------------------------
 
     fn project_from_row(row: &Row) -> rusqlite::Result<Project> {
-        let kind: String = row.get("kind")?;
         Ok(Project {
             id: row.get("id")?,
             name: row.get("name")?,
             description: row.get("description")?,
-            kind: if kind == "folder" {
-                ProjectKind::Folder
-            } else {
-                ProjectKind::Git
-            },
             repo_url: row.get("repo_url")?,
             default_branch: row.get("default_branch")?,
             paths: json_col_or(row, "paths"),
@@ -981,13 +975,12 @@ impl Store {
 
     pub fn upsert_project(&self, project: &Project) -> Result<()> {
         self.conn()?.execute(
-            "INSERT INTO projects (id, name, description, kind, repo_url, default_branch, paths, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(id) DO UPDATE SET name=?2, description=?3, kind=?4, repo_url=?5,
-                                           default_branch=?6, paths=?7",
+            "INSERT INTO projects (id, name, description, repo_url, default_branch, paths, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(id) DO UPDATE SET name=?2, description=?3, repo_url=?4,
+                                           default_branch=?5, paths=?6",
             params![
                 project.id, project.name, project.description,
-                match project.kind { ProjectKind::Folder => "folder", ProjectKind::Git => "git" },
                 project.repo_url, project.default_branch, to_json(&project.paths),
                 project.created_at
             ],
@@ -1221,6 +1214,22 @@ impl Store {
                 "SELECT * FROM runs WHERE agent_id = ?1 AND channel_id = ?2
                  AND status IN ('queued','dispatched','running','waiting') ORDER BY id DESC LIMIT 1",
                 params![agent_id, channel_id],
+                |r| Self::run_from_row(r),
+            )
+            .optional()?)
+    }
+
+    /// A run already working in this project, on a different task. Only
+    /// interesting for projects with no repository, where every task shares
+    /// the one folder.
+    pub fn project_active_run(&self, project_id: &str, task_id: Option<&str>) -> Result<Option<Run>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM runs WHERE project_id = ?1
+                 AND (?2 IS NULL OR task_id IS NULL OR task_id != ?2)
+                 AND status IN ('queued','dispatched','running','waiting') ORDER BY id DESC LIMIT 1",
+                params![project_id, task_id],
                 |r| Self::run_from_row(r),
             )
             .optional()?)

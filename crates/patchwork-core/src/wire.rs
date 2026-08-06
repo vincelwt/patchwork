@@ -245,8 +245,6 @@ pub struct CreateProject {
     #[serde(default)]
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<ProjectKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,

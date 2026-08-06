@@ -143,7 +143,6 @@ CREATE TABLE IF NOT EXISTS projects (
   id             TEXT PRIMARY KEY,
   name           TEXT NOT NULL,
   description    TEXT NOT NULL DEFAULT '',
-  kind           TEXT NOT NULL,
   repo_url       TEXT,
   default_branch TEXT NOT NULL DEFAULT 'main',
   paths          TEXT NOT NULL DEFAULT '{}',

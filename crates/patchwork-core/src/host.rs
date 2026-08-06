@@ -19,7 +19,17 @@ pub enum WorktreeSpec {
     None,
     /// Create (or reuse) a git worktree owned by the task.
     New {
-        project_path: String,
+        /// Where the project is on this machine, when it is already there.
+        /// Absent means the host clones `repo_url` for itself: a checkout is
+        /// something a machine can get, not something a person should have to
+        /// put there by hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_url: Option<String>,
+        /// Names the directory a clone lands in.
+        #[serde(default)]
+        project_name: String,
         branch: String,
         base_branch: String,
     },
@@ -177,6 +187,13 @@ pub enum HostToRelay {
     /// What a runtime on this machine offered when a session was opened.
     /// Sent as it is learned rather than at startup, because asking costs a
     /// process launch and the answer only matters once somebody runs something.
+    /// This machine now has a checkout of a project, at this path. Sent after
+    /// a clone, so the workspace shows where the code is without anyone
+    /// typing a path into a box.
+    ProjectCheckout {
+        project_id: Id,
+        path: String,
+    },
     RuntimeOptions {
         runtime: String,
         #[serde(default)]

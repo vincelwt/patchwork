@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
 import {
@@ -776,7 +776,7 @@ export function ProjectsPage() {
   return (
     <Page
       title="Projects and machines"
-      subtitle="A project is a git repository or a plain folder, plus where it lives on each machine"
+      subtitle="A repository every machine clones for itself, or a folder that already exists on one"
       actions={
         <button className="button" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
@@ -788,7 +788,7 @@ export function ProjectsPage() {
         {app.projects.length === 0 ? (
           <Empty
             title="No projects yet"
-            hint="A project connects business context to a git repository or an ordinary folder, on every machine that has it."
+            hint="Paste a repository URL and the machines that run its tasks clone it themselves."
             action={
               <button className="button primary" onClick={() => setCreating(true)}>
                 Add a project
@@ -813,10 +813,19 @@ export function ProjectsPage() {
                     "no description yet"}
                 </span>
               </span>
-              <Chip>
-                {Object.keys(project.paths).length} machine
-                {Object.keys(project.paths).length === 1 ? "" : "s"}
-              </Chip>
+              {project.repo_url ? (
+                <Chip>
+                  {Object.keys(project.paths).length > 0
+                    ? `cloned on ${Object.keys(project.paths).length}`
+                    : "clones on demand"}
+                </Chip>
+              ) : (
+                <Chip tone={Object.keys(project.paths).length ? "" : "caution"}>
+                  {Object.keys(project.paths).length > 0
+                    ? `folder on ${Object.keys(project.paths).length}`
+                    : "no folder set"}
+                </Chip>
+              )}
             </button>
           ))
         )}
@@ -898,6 +907,10 @@ export function ProjectModal({
   const [description, setDescription] = useState(project?.description ?? "");
   const [repoUrl, setRepoUrl] = useState(project?.repo_url ?? "");
   const [branch, setBranch] = useState(project?.default_branch ?? "main");
+  // A URL says what the project is called. Typing the name again is work
+  // nobody needs to do, so it fills itself in until you disagree with it.
+  const named = useRef(!!project);
+  const isRepo = !!repoUrl.trim();
   const [paths, setPaths] = useState<Record<string, string>>(project?.paths ?? {});
   const [localPath, setLocalPath] = useState("");
   const [error, setError] = useState("");
@@ -959,38 +972,60 @@ export function ProjectModal({
         </>
       }
     >
-      <Field label="Name" value={name} onChange={setName} autoFocus />
-      <Field label="What it is" value={description} onChange={setDescription} />
       <Field
         label="Repository URL"
         value={repoUrl}
-        onChange={setRepoUrl}
+        onChange={(value) => {
+          setRepoUrl(value);
+          if (!named.current) setName(nameFromRepo(value));
+        }}
+        autoFocus={!project}
         placeholder="https://github.com/acme/app"
       />
-      <Field label="Default branch" value={branch} onChange={setBranch} />
+      <Field
+        label="Name"
+        value={name}
+        onChange={(value) => {
+          named.current = true;
+          setName(value);
+        }}
+      />
+      <Field label="What it is" value={description} onChange={setDescription} />
+      {isRepo && <Field label="Default branch" value={branch} onChange={setBranch} />}
 
-      <Section title="This machine">
-        <div className="row hoverable">
-          <span className="grow sub" style={{ wordBreak: "break-all" }}>
-            {localPath || "not set up here"}
-          </span>
-          <button
-            className="button"
-            onClick={async () => {
-              const chosen = await pickDirectory();
-              if (chosen) setLocalPath(chosen);
-            }}
-          >
-            Choose folder
-          </button>
+      {isRepo ? (
+        <div className="notice">
+          Every machine that runs a task here clones this for itself, into
+          <code> ~/.patchwork/projects</code>. A private repository needs that
+          machine to have access: an SSH URL uses its key, an https one uses
+          <code> gh auth login</code> there.
         </div>
-      </Section>
-
-      {otherHosts.length > 0 && (
-        <Section title="On the relay">
+      ) : (
+        <>
+          <div className="notice">
+            No repository, so this is a folder that already exists on a machine.
+            Tasks work in the folder itself rather than in a worktree, which
+            means one task at a time and no branch to review.
+          </div>
+          <Section title="This machine">
+            <div className="row hoverable">
+              <span className="grow sub" style={{ wordBreak: "break-all" }}>
+                {localPath || "not set up here"}
+              </span>
+              <button
+                className="button"
+                onClick={async () => {
+                  const chosen = await pickDirectory();
+                  if (chosen) setLocalPath(chosen);
+                }}
+              >
+                Choose folder
+              </button>
+            </div>
+          </Section>
           {otherHosts.map((host) => (
             <div className="form-row" key={host.id}>
-              <label>{host.name}</label>
+              <label>On {host.name}</label>
               <input
                 className="field"
                 {...plainText}
@@ -1002,7 +1037,7 @@ export function ProjectModal({
               />
             </div>
           ))}
-        </Section>
+        </>
       )}
 
       {error && <div className="error-text">{error}</div>}
@@ -2122,6 +2157,18 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
       </Section>
     </Page>
   );
+}
+
+/// `https://github.com/acme/app.git` is called `app`.
+function nameFromRepo(url: string) {
+  const tail = url
+    .trim()
+    .replace(/\.git$/, "")
+    .replace(/\/+$/, "")
+    .split(/[/:]/)
+    .filter(Boolean)
+    .pop();
+  return tail ?? "";
 }
 
 /// What the built-in Patchwork agent thinks with. Nothing here is workspace

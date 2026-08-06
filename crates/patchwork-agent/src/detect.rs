@@ -328,7 +328,7 @@ async fn version_of(bin: &str) -> Option<String> {
     text.lines().next().map(|l| l.trim().to_string())
 }
 
-async fn gh_is_authenticated() -> bool {
+pub async fn gh_is_authenticated() -> bool {
     let Ok(mut child) = Command::new("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())

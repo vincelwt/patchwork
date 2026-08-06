@@ -404,20 +404,15 @@ pub struct PullRequestState {
 // Projects, hosts, worktrees
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectKind {
-    Git,
-    Folder,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Id,
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub kind: ProjectKind,
+    /// A repository the machines that run it can clone for themselves. Without
+    /// one this is a folder that already exists somewhere, and `paths` says
+    /// where. Nothing else distinguishes the two: git decides at run time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_url: Option<String>,
     #[serde(default = "default_branch")]
