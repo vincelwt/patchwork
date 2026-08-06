@@ -50,9 +50,9 @@ pub struct RunSpec {
     /// Unset leaves the machine's own runtime configuration alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The runtime's permission mode, e.g. `read-only`.
+    /// How hard to think, in the runtime's own words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
+    pub thinking: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_command: Option<Vec<String>>,
     pub channel_id: Id,
@@ -182,12 +182,13 @@ pub enum HostToRelay {
         #[serde(default)]
         models: Vec<RuntimeOption>,
         #[serde(default)]
+        thinking: Vec<RuntimeOption>,
+        #[serde(default)]
         modes: Vec<RuntimeOption>,
-        /// What this runtime calls `modes`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        modes_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_thinking: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_mode: Option<String>,
     },

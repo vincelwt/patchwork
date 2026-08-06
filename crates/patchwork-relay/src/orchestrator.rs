@@ -702,7 +702,7 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         runtime: profile.runtime.clone(),
         provider: profile.provider.clone(),
         model: profile.model.clone(),
-        permission_mode: profile.permission_mode.clone(),
+        thinking: profile.thinking.clone(),
         custom_command: profile.custom_command.clone(),
         channel_id: run.channel_id.clone(),
         task_id: run.task_id.clone(),
@@ -1058,9 +1058,10 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         HostToRelay::RuntimeOptions {
             runtime,
             models,
+            thinking,
             modes,
-            modes_label,
             default_model,
+            default_thinking,
             default_mode,
         } => {
             // Remember it against the machine that reported it, so the agent
@@ -1074,15 +1075,17 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                     continue;
                 }
                 if installation.models != models
+                    || installation.thinking != thinking
                     || installation.modes != modes
-                    || installation.modes_label != modes_label
                     || installation.default_model != default_model
+                    || installation.default_thinking != default_thinking
                     || installation.default_mode != default_mode
                 {
                     installation.models = models.clone();
+                    installation.thinking = thinking.clone();
                     installation.modes = modes.clone();
-                    installation.modes_label = modes_label.clone();
                     installation.default_model = default_model.clone();
+                    installation.default_thinking = default_thinking.clone();
                     installation.default_mode = default_mode.clone();
                     changed = true;
                 }

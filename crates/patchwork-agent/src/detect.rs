@@ -261,9 +261,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
             version: None,
             problem,
             models: Vec::new(),
+            thinking: Vec::new(),
             modes: Vec::new(),
-            modes_label: None,
             default_model: None,
+            default_thinking: None,
             default_mode: None,
         });
     }
@@ -285,9 +286,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
         problem: (!has_npx)
             .then(|| "needs Node.js (npx) on PATH — nothing else to install".to_string()),
         models: patchwork_models(),
+        thinking: Vec::new(),
         modes: Vec::new(),
-        modes_label: None,
         default_model: Some("openrouter/deepseek/deepseek-v4-flash".to_string()),
+        default_thinking: None,
         default_mode: None,
     });
 
@@ -299,9 +301,10 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
         version: None,
         problem: None,
             models: Vec::new(),
+        thinking: Vec::new(),
         modes: Vec::new(),
-        modes_label: None,
         default_model: None,
+        default_thinking: None,
         default_mode: None,
     });
 

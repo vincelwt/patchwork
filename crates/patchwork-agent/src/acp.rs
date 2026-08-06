@@ -58,12 +58,14 @@ struct Pending(Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>);
 pub struct NewSession {
     pub session_id: String,
     pub models: Vec<RuntimeOption>,
+    /// How hard to think. Its own knob, because it is its own question:
+    /// Claude's modes are permissions, OpenCode's are build or plan, and
+    /// neither has anything to do with reasoning effort.
+    pub thinking: Vec<RuntimeOption>,
+    /// Permission or session modes, whatever this runtime means by them.
     pub modes: Vec<RuntimeOption>,
-    /// What the runtime calls its second knob. Claude's is permissions, Pi's
-    /// is how hard to think; calling both "permission mode" was a guess that
-    /// happened to be wrong half the time.
-    pub modes_label: Option<String>,
     pub current_model: Option<String>,
+    pub current_thinking: Option<String>,
     pub current_mode: Option<String>,
     /// The runtime described itself with `configOptions` rather than the older
     /// `models`/`modes` groups, so changing one goes through
@@ -164,29 +166,29 @@ fn config_current(option: &Value) -> Option<String> {
 /// Read a `session/new` result in either dialect.
 fn describe_session(session_id: String, res: &Value) -> NewSession {
     let model = config_option(res, "model");
-    // Pi calls it `thought_level`; others call the same idea a mode. Either way
-    // it is the second thing a session can be set to.
-    let mode = config_option(res, "thought_level").or_else(|| config_option(res, "mode"));
-    if model.is_some() || mode.is_some() {
+    let thinking = config_option(res, "thought_level");
+    let mode = config_option(res, "mode");
+    if model.is_some() || thinking.is_some() || mode.is_some() {
         return NewSession {
             session_id,
             models: model.map(config_choices).unwrap_or_default(),
+            thinking: thinking.map(config_choices).unwrap_or_default(),
             modes: mode.map(config_choices).unwrap_or_default(),
-            modes_label: mode
-                .and_then(|option| option.get("name"))
-                .and_then(|name| name.as_str())
-                .map(|name| name.to_string()),
             current_model: model.and_then(config_current),
+            current_thinking: thinking.and_then(config_current),
             current_mode: mode.and_then(config_current),
             config_options: true,
         };
     }
+    // The older dialect has no thinking knob at all: runtimes that speak it
+    // put reasoning effort in the model id.
     NewSession {
         session_id,
         models: options_of(res, "models", "availableModels"),
+        thinking: Vec::new(),
         modes: options_of(res, "modes", "availableModes"),
-        modes_label: None,
         current_model: current_of(res, "models", "currentModelId"),
+        current_thinking: None,
         current_mode: current_of(res, "modes", "currentModeId"),
         config_options: false,
     }
@@ -394,11 +396,21 @@ impl AcpConnection {
         Ok(())
     }
 
+    /// How hard to think. Only the config-option dialect has one.
+    pub async fn set_thinking(&self, session_id: &str, level: &str) -> Result<()> {
+        self.setup_request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": "thought_level", "value": level }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn set_mode(&self, session_id: &str, mode_id: &str, config: bool) -> Result<()> {
         if config {
             self.setup_request(
                 "session/set_config_option",
-                json!({ "sessionId": session_id, "configId": "thought_level", "value": mode_id }),
+                json!({ "sessionId": session_id, "configId": "mode", "value": mode_id }),
             )
             .await?;
             return Ok(());

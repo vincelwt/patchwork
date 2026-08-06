@@ -458,7 +458,7 @@ export function AgentModal({
   // What that placement can actually think with. When it could run on several
   // machines, only offer models every one of them has — anything else would be
   // a setting that works until the run lands on the wrong laptop.
-  const { models, modes, modesLabel, defaultModel, defaultMode } = useMemo(() => {
+  const { models, thinking, defaultModel, defaultThinking } = useMemo(() => {
     const installs = machines
       .filter((machine) => !profile.host_id || machine.hostIds.includes(profile.host_id))
       .map((machine) =>
@@ -467,15 +467,14 @@ export function AgentModal({
         ),
       )
       .filter((runtime): runtime is RuntimeInstallation => !!runtime)
-      .filter((runtime) => runtime.models.length > 0 || runtime.modes.length > 0);
+      .filter((runtime) => runtime.models.length > 0 || runtime.thinking.length > 0);
 
     if (installs.length === 0) {
       return {
         models: [],
-        modes: [],
-        modesLabel: undefined,
+        thinking: [],
         defaultModel: undefined,
-        defaultMode: undefined,
+        defaultThinking: undefined,
       };
     }
     const shared = (pick: (r: RuntimeInstallation) => RuntimeOption[]) =>
@@ -484,13 +483,9 @@ export function AgentModal({
       );
     return {
       models: shared((runtime) => runtime.models),
-      modes: shared((runtime) => runtime.modes),
-      // Claude's second knob is permissions, Pi's is how hard to think. The
-      // runtime says which; calling both "permission mode" was wrong half the
-      // time.
-      modesLabel: installs[0].modes_label,
+      thinking: shared((runtime) => runtime.thinking),
       defaultModel: installs[0].default_model,
-      defaultMode: installs[0].default_mode,
+      defaultThinking: installs[0].default_thinking,
     };
   }, [machines, profile.runtime, profile.host_id]);
 
@@ -567,8 +562,7 @@ export function AgentModal({
             // A model belongs to a runtime; carrying it across would set this
             // agent to a model the new runtime has never heard of.
             model: entry.runtime === profile.runtime ? profile.model : undefined,
-            permission_mode:
-              entry.runtime === profile.runtime ? profile.permission_mode : undefined,
+            thinking: entry.runtime === profile.runtime ? profile.thinking : undefined,
             provider:
               entry.runtime === "patchwork"
                 ? (profile.provider ?? "openrouter")
@@ -659,29 +653,30 @@ export function AgentModal({
         />
       )}
 
-      {modes.length > 0 && (
+      {/* Permissions are not here on purpose: a run takes the widest mode its
+          runtime offers. This is how hard it thinks, which is the setting
+          that costs money and time. */}
+      {thinking.length > 0 && (
         <FormSelect
-          label={modesLabel ?? "Permission mode"}
-          value={profile.permission_mode ?? ""}
-          onChange={(permission_mode) =>
-            setProfile({ ...profile, permission_mode: permission_mode || undefined })
+          label="Thinking"
+          value={profile.thinking ?? ""}
+          onChange={(level) =>
+            setProfile({ ...profile, thinking: level || undefined })
           }
           options={[
             {
               value: "",
-              label: defaultMode
-                ? `The runtime's default (${defaultMode})`
+              label: defaultThinking
+                ? `The runtime's default (${defaultThinking})`
                 : "The runtime's default",
             },
-            ...modes.map((mode) => ({
-              value: mode.id,
-              label: mode.name,
-              hint: mode.description || undefined,
+            ...thinking.map((level) => ({
+              value: level.id,
+              label: level.name,
+              hint: level.description || undefined,
             })),
           ]}
-          // A knob the runtime named needs no gloss from us; the one we had
-          // to name ourselves is permissions, which does.
-          help={modesLabel ? undefined : "How much this agent may do without asking."}
+          help="How hard this agent thinks before it answers."
         />
       )}
       <FormSelect

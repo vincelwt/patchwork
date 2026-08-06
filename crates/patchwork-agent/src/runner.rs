@@ -280,13 +280,14 @@ async fn execute(
 
     // Tell the relay what this runtime turned out to offer, so the agent editor
     // can show a real list of models instead of a text box and a hope.
-    if !opened.models.is_empty() || !opened.modes.is_empty() {
+    if !opened.models.is_empty() || !opened.thinking.is_empty() || !opened.modes.is_empty() {
         emit(HostToRelay::RuntimeOptions {
             runtime: spec.runtime.clone(),
             models: opened.models.clone(),
+            thinking: opened.thinking.clone(),
             modes: opened.modes.clone(),
-            modes_label: opened.modes_label.clone(),
             default_model: opened.current_model.clone(),
+            default_thinking: opened.current_thinking.clone(),
             default_mode: opened.current_mode.clone(),
         });
     }
@@ -496,15 +497,48 @@ async fn apply_session_preferences(
         }
     }
 
-    if let Some(mode) = spec.permission_mode.as_deref().filter(|m| !m.is_empty()) {
-        if opened.current_mode.as_deref() != Some(mode) {
-            if let Err(err) = conn.set_mode(session_id, mode, opened.config_options).await {
+    if let Some(level) = spec.thinking.as_deref().filter(|m| !m.is_empty()) {
+        if opened.current_thinking.as_deref() == Some(level) {
+            // Already what was asked for.
+        } else if let Err(err) = conn.set_thinking(session_id, level).await {
+            note(format!("could not think `{level}`: {err:#}"));
+        } else {
+            note(format!("thinking: {level}"));
+        }
+    }
+
+    // Permissions are not a per-agent setting: an agent here works in its own
+    // worktree with its own run log, and being asked to approve every edit
+    // while nobody is watching is how a run stalls. Take the widest mode the
+    // runtime offers, or leave its default alone when none of them is about
+    // permission at all.
+    if let Some(mode) = most_permissive(&opened.modes) {
+        if opened.current_mode.as_deref() != Some(mode.as_str()) {
+            if let Err(err) = conn.set_mode(session_id, &mode, opened.config_options).await {
                 note(format!("could not select mode `{mode}`: {err:#}"));
             } else {
                 note(format!("mode: {mode}"));
             }
         }
     }
+}
+
+/// The widest of the modes a runtime offers, by the names they use for it.
+/// Anything unrecognised is left alone: OpenCode's `build`/`plan` are a
+/// different question, and picking one of them at random is not an answer.
+fn most_permissive(modes: &[patchwork_core::models::RuntimeOption]) -> Option<String> {
+    const WIDEST: [&str; 6] = [
+        "bypassPermissions",
+        "full-access",
+        "dontAsk",
+        "yolo",
+        "acceptEdits",
+        "auto",
+    ];
+    WIDEST
+        .iter()
+        .find(|wanted| modes.iter().any(|mode| mode.id == **wanted))
+        .map(|found| found.to_string())
 }
 
 /// Open a session, authenticating only if the runtime insists — and only with
@@ -990,7 +1024,7 @@ mod tests {
             runtime: "codex".into(),
             provider: None,
             model: None,
-            permission_mode: None,
+            thinking: None,
             custom_command: None,
             channel_id: "c1".into(),
             task_id: Some("t1".into()),
@@ -1005,6 +1039,30 @@ mod tests {
             resume_session_id: None,
             env: vec![],
         }
+    }
+
+    #[test]
+    fn a_run_takes_the_widest_mode_its_runtime_offers() {
+        let modes = |ids: &[&str]| -> Vec<patchwork_core::models::RuntimeOption> {
+            ids.iter()
+                .map(|id| patchwork_core::models::RuntimeOption {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: String::new(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            most_permissive(&modes(&["default", "acceptEdits", "plan", "bypassPermissions"])),
+            Some("bypassPermissions".into())
+        );
+        assert_eq!(
+            most_permissive(&modes(&["read-only", "auto", "full-access"])),
+            Some("full-access".into())
+        );
+        // Build or plan is a different question, and neither answer is "wider".
+        assert_eq!(most_permissive(&modes(&["build", "plan"])), None);
+        assert_eq!(most_permissive(&[]), None);
     }
 
     #[test]

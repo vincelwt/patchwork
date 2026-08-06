@@ -36,7 +36,10 @@ pub async fn report_runtime_options(out: Sink, env: Vec<(String, String)>) {
     for runtime in capabilities.runtimes {
         // A runtime that has already told us, or that has no session to open,
         // has nothing to add.
-        if !runtime.available || !runtime.models.is_empty() || runtime.id == "custom" {
+        if !runtime.available
+            || !(runtime.models.is_empty() && runtime.thinking.is_empty())
+            || runtime.id == "custom"
+        {
             continue;
         }
         let Some(command) = detect::runtime_command(&runtime.id) else {
@@ -44,13 +47,18 @@ pub async fn report_runtime_options(out: Sink, env: Vec<(String, String)>) {
         };
 
         match tokio::time::timeout(PROBE_TIMEOUT, ask(&command, &cwd, &env)).await {
-            Ok(Ok(session)) if !session.models.is_empty() || !session.modes.is_empty() => {
+            Ok(Ok(session))
+                if !session.models.is_empty()
+                    || !session.thinking.is_empty()
+                    || !session.modes.is_empty() =>
+            {
                 let _ = out.send(HostToRelay::RuntimeOptions {
                     runtime: runtime.id.clone(),
                     models: session.models,
+                    thinking: session.thinking,
                     modes: session.modes,
-                    modes_label: session.modes_label,
                     default_model: session.current_model,
+                    default_thinking: session.current_thinking,
                     default_mode: session.current_mode,
                 });
             }

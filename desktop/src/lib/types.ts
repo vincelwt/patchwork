@@ -28,7 +28,9 @@ export interface AgentProfile {
   /// Only the built-in `patchwork` runtime asks for one: it brings the agent
   /// but not the model, so a provider has to be named and keyed per machine.
   provider?: string;
-  permission_mode?: string;
+  /// How hard it thinks, in the runtime's own words. Permissions are not a
+  /// setting: a run takes the widest mode its runtime offers.
+  thinking?: string;
   dm_enabled: boolean;
   default_participation: Participation;
   channel_participation: Record<Id, Participation>;
@@ -189,11 +191,11 @@ export interface RuntimeInstallation {
   /// Learned the first time a session was opened on this machine — the runtime
   /// is the only thing that knows what it can run.
   models: RuntimeOption[];
+  /// Empty for runtimes that fold reasoning effort into the model id.
+  thinking: RuntimeOption[];
   modes: RuntimeOption[];
-  /// What this runtime calls `modes`: permissions for most, thinking level
-  /// for others.
-  modes_label?: string;
   default_model?: string;
+  default_thinking?: string;
   default_mode?: string;
 }
 
