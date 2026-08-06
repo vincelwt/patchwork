@@ -190,6 +190,9 @@ export interface RuntimeInstallation {
   /// is the only thing that knows what it can run.
   models: RuntimeOption[];
   modes: RuntimeOption[];
+  /// What this runtime calls `modes`: permissions for most, thinking level
+  /// for others.
+  modes_label?: string;
   default_model?: string;
   default_mode?: string;
 }

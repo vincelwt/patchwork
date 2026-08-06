@@ -59,6 +59,10 @@ pub struct NewSession {
     pub session_id: String,
     pub models: Vec<RuntimeOption>,
     pub modes: Vec<RuntimeOption>,
+    /// What the runtime calls its second knob. Claude's is permissions, Pi's
+    /// is how hard to think; calling both "permission mode" was a guess that
+    /// happened to be wrong half the time.
+    pub modes_label: Option<String>,
     pub current_model: Option<String>,
     pub current_mode: Option<String>,
     /// The runtime described itself with `configOptions` rather than the older
@@ -168,6 +172,10 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
             session_id,
             models: model.map(config_choices).unwrap_or_default(),
             modes: mode.map(config_choices).unwrap_or_default(),
+            modes_label: mode
+                .and_then(|option| option.get("name"))
+                .and_then(|name| name.as_str())
+                .map(|name| name.to_string()),
             current_model: model.and_then(config_current),
             current_mode: mode.and_then(config_current),
             config_options: true,
@@ -177,6 +185,7 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
         session_id,
         models: options_of(res, "models", "availableModels"),
         modes: options_of(res, "modes", "availableModes"),
+        modes_label: None,
         current_model: current_of(res, "models", "currentModelId"),
         current_mode: current_of(res, "modes", "currentModeId"),
         config_options: false,

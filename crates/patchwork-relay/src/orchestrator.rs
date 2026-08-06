@@ -1059,6 +1059,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             runtime,
             models,
             modes,
+            modes_label,
             default_model,
             default_mode,
         } => {
@@ -1074,11 +1075,13 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 }
                 if installation.models != models
                     || installation.modes != modes
+                    || installation.modes_label != modes_label
                     || installation.default_model != default_model
                     || installation.default_mode != default_mode
                 {
                     installation.models = models.clone();
                     installation.modes = modes.clone();
+                    installation.modes_label = modes_label.clone();
                     installation.default_model = default_model.clone();
                     installation.default_mode = default_mode.clone();
                     changed = true;

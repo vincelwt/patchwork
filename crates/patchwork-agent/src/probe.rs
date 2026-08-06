@@ -49,6 +49,7 @@ pub async fn report_runtime_options(out: Sink, env: Vec<(String, String)>) {
                     runtime: runtime.id.clone(),
                     models: session.models,
                     modes: session.modes,
+                    modes_label: session.modes_label,
                     default_model: session.current_model,
                     default_mode: session.current_mode,
                 });

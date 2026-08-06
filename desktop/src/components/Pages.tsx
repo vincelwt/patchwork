@@ -458,7 +458,7 @@ export function AgentModal({
   // What that placement can actually think with. When it could run on several
   // machines, only offer models every one of them has — anything else would be
   // a setting that works until the run lands on the wrong laptop.
-  const { models, modes, defaultModel, defaultMode } = useMemo(() => {
+  const { models, modes, modesLabel, defaultModel, defaultMode } = useMemo(() => {
     const installs = machines
       .filter((machine) => !profile.host_id || machine.hostIds.includes(profile.host_id))
       .map((machine) =>
@@ -470,7 +470,13 @@ export function AgentModal({
       .filter((runtime) => runtime.models.length > 0 || runtime.modes.length > 0);
 
     if (installs.length === 0) {
-      return { models: [], modes: [], defaultModel: undefined, defaultMode: undefined };
+      return {
+        models: [],
+        modes: [],
+        modesLabel: undefined,
+        defaultModel: undefined,
+        defaultMode: undefined,
+      };
     }
     const shared = (pick: (r: RuntimeInstallation) => RuntimeOption[]) =>
       pick(installs[0]).filter((option) =>
@@ -479,6 +485,10 @@ export function AgentModal({
     return {
       models: shared((runtime) => runtime.models),
       modes: shared((runtime) => runtime.modes),
+      // Claude's second knob is permissions, Pi's is how hard to think. The
+      // runtime says which; calling both "permission mode" was wrong half the
+      // time.
+      modesLabel: installs[0].modes_label,
       defaultModel: installs[0].default_model,
       defaultMode: installs[0].default_mode,
     };
@@ -651,7 +661,7 @@ export function AgentModal({
 
       {modes.length > 0 && (
         <FormSelect
-          label="Permission mode"
+          label={modesLabel ?? "Permission mode"}
           value={profile.permission_mode ?? ""}
           onChange={(permission_mode) =>
             setProfile({ ...profile, permission_mode: permission_mode || undefined })
@@ -669,7 +679,9 @@ export function AgentModal({
               hint: mode.description || undefined,
             })),
           ]}
-          help="How much this agent may do without asking."
+          // A knob the runtime named needs no gloss from us; the one we had
+          // to name ourselves is permissions, which does.
+          help={modesLabel ? undefined : "How much this agent may do without asking."}
         />
       )}
       <FormSelect

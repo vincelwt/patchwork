@@ -285,6 +285,7 @@ async fn execute(
             runtime: spec.runtime.clone(),
             models: opened.models.clone(),
             modes: opened.modes.clone(),
+            modes_label: opened.modes_label.clone(),
             default_model: opened.current_model.clone(),
             default_mode: opened.current_mode.clone(),
         });

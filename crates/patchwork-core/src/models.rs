@@ -502,6 +502,10 @@ pub struct RuntimeInstallation {
     pub models: Vec<RuntimeOption>,
     #[serde(default)]
     pub modes: Vec<RuntimeOption>,
+    /// What this runtime calls the `modes` list: permissions for most of
+    /// them, how hard to think for others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes_label: Option<String>,
     /// What it picks on its own when nothing is configured — usually whatever
     /// the machine's own config file says.
     #[serde(default, skip_serializing_if = "Option::is_none")]

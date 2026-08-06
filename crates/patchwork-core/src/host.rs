@@ -183,6 +183,9 @@ pub enum HostToRelay {
         models: Vec<RuntimeOption>,
         #[serde(default)]
         modes: Vec<RuntimeOption>,
+        /// What this runtime calls `modes`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modes_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
