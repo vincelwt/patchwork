@@ -177,6 +177,13 @@ async fn connect(
         registration: Box::new(registration),
     });
 
+    // What each runtime can run, asked once per connection rather than left
+    // until the first run — the agent editor needs the list before that.
+    tokio::spawn(patchwork_agent::report_runtime_options(
+        out_tx.clone(),
+        settings.provider_env(),
+    ));
+
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             let Ok(text) = serde_json::to_string(&ClientMsg::Host { msg }) else {

@@ -8,10 +8,12 @@
 pub mod acp;
 pub mod detect;
 pub mod preview;
+pub mod probe;
 pub mod providers;
 pub mod runner;
 pub mod worktree;
 
 pub use detect::{detect_capabilities, detect_runtimes, refresh_capabilities, runtime_command};
+pub use probe::report_runtime_options;
 pub use providers::{ProviderInfo, PROVIDERS};
 pub use runner::{RunHandle, Runner, RunnerConfig, Sink};

@@ -249,6 +249,10 @@ fn ensure_relay_host(store: &Store) -> Result<Id> {
 /// every laptop is closed.
 fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Runner> {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::spawn(patchwork_agent::report_runtime_options(
+        out_tx.clone(),
+        env.clone(),
+    ));
     let cli_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_string_lossy().to_string()));

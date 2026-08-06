@@ -195,6 +195,10 @@ function locationLabel(profile?: AgentProfile) {
   }
 }
 
+/// Long enough to browse, short enough to scroll. Past this the field's own
+/// filtering is the better tool.
+const MODEL_MENU_LIMIT = 40;
+
 /// A model by its id, typed or picked.
 ///
 /// A list is a suggestion, not the truth: a runtime only reports what it can
@@ -222,24 +226,40 @@ function ModelField({
         <input
           className="field grow"
           {...plainText}
+          list={models.length > 0 ? "runtime-models" : undefined}
           value={value}
           placeholder={
             fallback ? `${fallback} — the default` : "whatever the machine is set to"
           }
           onChange={(event) => onChange(event.target.value)}
         />
+        {/* Some runtimes report a thousand models. Typing filters them; the
+            menu is for browsing, so it shows a readable number and says so. */}
+        {models.length > 0 && (
+          <datalist id="runtime-models">
+            {models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.name}
+              </option>
+            ))}
+          </datalist>
+        )}
         {models.length > 0 && (
           <MenuButton
             align="right"
             title="Models this runtime reported"
-            header="Reported by the runtime"
+            header={
+              models.length > MODEL_MENU_LIMIT
+                ? `${models.length} models — type to filter`
+                : "Reported by the runtime"
+            }
             items={[
               {
                 key: "",
                 label: fallback ? `${fallback} — the default` : "The machine's default",
                 onSelect: () => onChange(""),
               },
-              ...models.map((model) => ({
+              ...models.slice(0, MODEL_MENU_LIMIT).map((model) => ({
                 key: model.id,
                 label: model.name,
                 hint: model.description || model.id,
