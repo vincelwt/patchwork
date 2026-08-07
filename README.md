@@ -71,6 +71,13 @@ changes, PR activity, webhooks), which agent acts, what context it gets, and
 where it reports. Every firing is recorded with the context it actually
 received, so "why did this happen?" always has an answer.
 
+Two of those triggers let an agent wire up its own loop. A **webhook** gives
+anything outside Patchwork a URL to post to, so "file a task whenever a user
+reports an issue" is one call away, with `?once=` to keep a redelivery from
+acting twice. A **watch** is a shell command polled on the relay that wakes an
+agent only when it prints something new: the scan costs a process, not a model
+call, so it can run every minute.
+
 Ambient agents go further: they watch a channel and may chime in on any human
 message when they have something material to add. They are told they may say
 nothing, and agent-to-agent chains are bounded, so two agents can never talk

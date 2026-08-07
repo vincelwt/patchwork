@@ -819,6 +819,14 @@ pub enum AutomationTrigger {
         /// Standard five-field cron (`min hour day month weekday`).
         expression: String,
     },
+    /// A command polled on a timer, firing only when it prints something.
+    /// A watcher that finds nothing costs a process, not a model call, which
+    /// is what makes polling every minute affordable.
+    Watch {
+        /// Shell command, run by the relay in the automation's state directory.
+        command: String,
+        every_seconds: i64,
+    },
     /// A new message in a channel, optionally matching a pattern.
     Message {
         channel_id: Id,
@@ -916,6 +924,10 @@ pub struct AutomationRun {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<Id>,
+    /// The caller's idempotency key, when it gave one. A second delivery
+    /// carrying a key that already fired is dropped before it costs a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once_key: Option<String>,
     pub created_at: Millis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<Millis>,

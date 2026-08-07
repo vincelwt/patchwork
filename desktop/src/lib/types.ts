@@ -377,6 +377,7 @@ export type AutomationTrigger =
   | { type: "task_assigned" }
   | { type: "pull_request"; on_review_comment: boolean; on_checks_failed: boolean }
   | { type: "webhook"; token: string }
+  | { type: "watch"; command: string; every_seconds: number }
   | { type: "manual" };
 
 export type AutomationAction = "post_in_chat" | "create_task" | "continue_task";

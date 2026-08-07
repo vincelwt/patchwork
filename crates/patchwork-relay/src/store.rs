@@ -80,6 +80,10 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
+            "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
+            // After the column, never in schema.sql: an index on a column an
+            // older database has not been given yet would fail the batch.
+            "CREATE INDEX IF NOT EXISTS automation_runs_once ON automation_runs(automation_id, once_key)",
         ] {
             let _ = conn.execute(statement, []);
         }
@@ -1615,6 +1619,7 @@ impl Store {
             status: RunStatus::parse(&status).unwrap_or(RunStatus::Queued),
             error: row.get("error")?,
             task_id: row.get("task_id")?,
+            once_key: row.get("once_key")?,
             created_at: row.get("created_at")?,
             ended_at: row.get("ended_at")?,
         })
@@ -1623,18 +1628,37 @@ impl Store {
     pub fn upsert_automation_run(&self, run: &AutomationRun) -> Result<()> {
         self.conn()?.execute(
             "INSERT INTO automation_runs (id, automation_id, run_id, trigger_summary, trigger_payload,
-                                          selection, context_preview, status, error, task_id, created_at, ended_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                                          selection, context_preview, status, error, task_id, created_at, ended_at,
+                                          once_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(id) DO UPDATE SET run_id=?3, selection=?6, context_preview=?7, status=?8,
                                            error=?9, task_id=?10, ended_at=?12",
             params![
                 run.id, run.automation_id, run.run_id, run.trigger_summary,
                 run.trigger_payload.as_ref().map(to_json), run.selection.as_ref().map(to_json),
                 run.context_preview, run.status.as_str(), run.error, run.task_id,
-                run.created_at, run.ended_at
+                run.created_at, run.ended_at, run.once_key
             ],
         )?;
         Ok(())
+    }
+
+    /// Has this automation already acted on this key? The guard that makes a
+    /// webhook safe to retry.
+    pub fn automation_run_by_once_key(
+        &self,
+        automation_id: &str,
+        once_key: &str,
+    ) -> Result<Option<AutomationRun>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM automation_runs WHERE automation_id = ?1 AND once_key = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![automation_id, once_key],
+                |r| Self::automation_run_from_row(r),
+            )
+            .optional()?)
     }
 
     pub fn automation_runs(&self, automation_id: &str, limit: usize) -> Result<Vec<AutomationRun>> {
