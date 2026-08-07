@@ -1872,6 +1872,26 @@ details[open] > summary::before {
   background: var(--tint);
 }
 
+/* On the box you are talking into, not in the row of tools underneath it. */
+.composer,
+.task-composer {
+  position: relative;
+}
+.icon-button.dictate {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  color: var(--text-faint);
+}
+.task-composer .icon-button.dictate {
+  top: 12px;
+  right: 0;
+}
+.icon-button.dictate:hover {
+  color: var(--text-muted);
+}
+
 /* Dictation is live, so the button says so rather than the app going quiet. */
 .icon-button.recording {
   color: var(--danger);

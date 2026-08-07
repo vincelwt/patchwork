@@ -568,6 +568,8 @@ export function NewTaskModal({
           }}
         />
 
+        <DictateButton value={outcome} onText={setOutcome} />
+
         {images.length > 0 && (
           <div className="task-composer-files">
             {images.map((file, at) => (
@@ -611,7 +613,6 @@ export function NewTaskModal({
             ]}
           />
           <DueField value={due} onChange={setDue} />
-          <DictateButton value={outcome} onText={setOutcome} />
           <label className="attach-button" title="Attach an image">
             <AttachIcon size={15} />
             <input

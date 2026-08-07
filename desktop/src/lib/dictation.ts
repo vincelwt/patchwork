@@ -19,10 +19,31 @@ async function invoke<T>(command: string, args?: Record<string, unknown>) {
   return invoke<T>(command, args);
 }
 
+/// Every composer on screen that can be dictated into, newest last.
+///
+/// The chord goes to the one you are typing in. When focus is somewhere else
+/// entirely it goes to the newest, which is the task dialog if one is open
+/// and the message box otherwise — the same thing you would have clicked.
+type Composer = { within: () => HTMLElement | null; toggle: () => void };
+const composers: Composer[] = [];
+
+export function toggleDictation() {
+  const active = document.activeElement;
+  const focused = composers.find((composer) => {
+    const node = composer.within();
+    return !!node && !!active && node.contains(active);
+  });
+  (focused ?? composers[composers.length - 1])?.toggle();
+}
+
 /// Dictate into a field. `onText` is handed the whole value the field should
 /// show, so the caller never has to reason about which words are settled.
 export function useDictation(onText: (text: string) => void) {
   const [supported, setSupported] = useState(false);
+  /// The box this button belongs to, so the chord can tell which composer is
+  /// being typed in.
+  const within = useRef<HTMLElement | null>(null);
+  const latestToggle = useRef(() => {});
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState("");
   const base = useRef("");
@@ -68,6 +89,18 @@ export function useDictation(onText: (text: string) => void) {
     return () => stop?.();
   }, [recording]);
 
+  useEffect(() => {
+    const composer: Composer = {
+      within: () => within.current,
+      toggle: () => latestToggle.current(),
+    };
+    composers.push(composer);
+    return () => {
+      const at = composers.indexOf(composer);
+      if (at >= 0) composers.splice(at, 1);
+    };
+  }, []);
+
   const start = useCallback((current: string) => {
     base.current = current;
     settled.current = "";
@@ -86,5 +119,5 @@ export function useDictation(onText: (text: string) => void) {
     setRecording(false);
   }, []);
 
-  return { supported, recording, error, start, stop };
+  return { supported, recording, error, start, stop, within, latestToggle };
 }

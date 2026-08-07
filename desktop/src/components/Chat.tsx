@@ -313,14 +313,23 @@ export function DictateButton({
   value: string;
   onText: (text: string) => void;
 }) {
-  const { supported, recording, error, start, stop } = useDictation(onText);
+  const { supported, recording, error, start, stop, within, latestToggle } =
+    useDictation(onText);
+  const toggle = () => (recording ? stop() : start(value));
+  // Re-pointed on every render so the chord always starts from the text that
+  // is in the box now, not the text that was there when it mounted.
+  latestToggle.current = toggle;
+
   if (!supported) return null;
 
   return (
     <button
-      className={`icon-button${recording ? " recording" : ""}`}
-      title={error || (recording ? "Stop dictating" : "Dictate")}
-      onClick={() => (recording ? stop() : start(value))}
+      ref={(node) => {
+        within.current = node?.closest(".composer, .task-composer") ?? null;
+      }}
+      className={`icon-button dictate${recording ? " recording" : ""}`}
+      title={error || (recording ? "Stop dictating (⌘D)" : "Dictate (⌘D)")}
+      onClick={toggle}
     >
       <MicIcon size={17} />
     </button>
@@ -873,8 +882,8 @@ export function Composer({
             void attach(files);
           }}
         />
+        <DictateButton value={text} onText={onChange} />
         <div className="composer-row">
-          <DictateButton value={text} onText={onChange} />
           <label className="icon-button" title="Attach files">
             <AttachIcon size={17} />
             <input

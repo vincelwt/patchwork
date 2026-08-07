@@ -17,6 +17,7 @@ import {
   useSettings,
 } from "./lib/session";
 import { markSeen } from "./lib/unread";
+import { toggleDictation } from "./lib/dictation";
 import logo from "./assets/logo.png";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
@@ -461,6 +462,14 @@ function useShortcuts(actions: {
         group: "Do",
         match: combo("k"),
         run: openSearch,
+      },
+      {
+        id: "dictate",
+        keys: "⌘D",
+        label: "Dictate into the box you are in",
+        group: "Do",
+        match: combo("d"),
+        run: toggleDictation,
       },
       {
         id: "help",
