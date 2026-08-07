@@ -176,13 +176,59 @@ fn on_path(bin: &str) -> Option<String> {
     if let Some(hit) = path_cache().lock().ok().and_then(|c| c.get(bin).cloned()) {
         return hit;
     }
-    let found = which::which(bin)
+    let found = which::which_in(bin, Some(search_path()), std::env::current_dir().unwrap_or_default())
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     if let Ok(mut cache) = path_cache().lock() {
         cache.insert(bin.to_string(), found.clone());
     }
     found
+}
+
+/// The PATH to look in, and to hand to everything we launch.
+///
+/// An app opened from the Finder inherits `/usr/bin:/bin:/usr/sbin:/sbin` and
+/// nothing else, so `codex`, `npm` and `cargo` are all invisible and the
+/// machine looks empty. A login shell knows where they are, so it is asked
+/// once, and its answer is appended to whatever this process already had.
+pub fn search_path() -> String {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let mut seen: Vec<String> = Vec::new();
+        for entry in inherited
+            .split(':')
+            .chain(login_shell_path().split(':'))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            if !seen.iter().any(|known| known == entry) {
+                seen.push(entry.to_string());
+            }
+        }
+        seen.join(":")
+    })
+    .clone()
+}
+
+/// What `$SHELL -lic 'echo $PATH'` says. Interactive as well as login,
+/// because that is where most people's version managers actually get added.
+fn login_shell_path() -> String {
+    if !cfg!(unix) {
+        return String::new();
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let out = std::process::Command::new(&shell)
+        .args(["-lic", "printf %s \"$PATH\""])
+        .env("PATCHWORK_PATH_PROBE", "1")
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 /// Resolve the command line used to launch a runtime's ACP adapter.

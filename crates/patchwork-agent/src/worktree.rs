@@ -244,6 +244,7 @@ async fn new_worktree(
     git(project_path, &args)
         .await
         .with_context(|| format!("git worktree add failed for {branch}"))?;
+    carry_untracked_config(project_path, &path_str).await;
 
     Ok(PreparedWorktree {
         path: path_str,
@@ -253,6 +254,39 @@ async fn new_worktree(
         is_main_checkout: false,
         created: true,
     })
+}
+
+/// A fresh worktree has only what git tracks, so the `.env` the project needs
+/// to run is exactly the file it does not get. Copy those across from the
+/// checkout it was cut from: local file to local file, nothing leaves the
+/// machine, and a dev server started by an agent behaves like one started by
+/// hand.
+///
+/// ponytail: the checkout root only. A monorepo with `apps/web/.env` needs a
+/// per-project list of paths; add one when that is somebody's actual repo,
+/// not before, because walking a tree for `.env*` finds them in
+/// `node_modules` too.
+async fn carry_untracked_config(checkout: &str, worktree: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(checkout).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(".env") {
+            continue;
+        }
+        if entry.file_type().await.map(|t| !t.is_file()).unwrap_or(true) {
+            continue;
+        }
+        let target = Path::new(worktree).join(&name);
+        // Never over a tracked file: `.env.example` belongs to the repo.
+        if target.exists() {
+            continue;
+        }
+        if let Err(err) = tokio::fs::copy(entry.path(), &target).await {
+            tracing::warn!(?err, %name, "could not carry a config file into the worktree");
+        }
+    }
 }
 
 pub async fn is_git_repo(path: &str) -> bool {

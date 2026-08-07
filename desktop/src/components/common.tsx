@@ -109,12 +109,16 @@ export function Modal({
   children,
   onClose,
   actions,
+  wide,
 }: {
-  title: string;
+  /// Omit it when the dialog is one thing you type into: a heading above a
+  /// text box that already says what it is for is a label for a label.
+  title?: string;
   subtitle?: string;
   children: ReactNode;
   onClose: () => void;
   actions?: ReactNode;
+  wide?: boolean;
 }) {
   const root = useRef<HTMLDivElement>(null);
 
@@ -145,14 +149,16 @@ export function Modal({
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div
-        className="modal"
+        className={`modal${wide ? " wide" : ""}`}
         ref={root}
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <div className="modal-head">
-          <h2>{title}</h2>
-          {subtitle && <p className="sub">{subtitle}</p>}
-        </div>
+        {(title || subtitle) && (
+          <div className="modal-head">
+            {title && <h2>{title}</h2>}
+            {subtitle && <p className="sub">{subtitle}</p>}
+          </div>
+        )}
         <div className="modal-body">{children}</div>
         {actions && <div className="modal-actions">{actions}</div>}
       </div>

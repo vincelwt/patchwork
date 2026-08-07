@@ -735,6 +735,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         channel_id: run.channel_id.clone(),
         task_id: run.task_id.clone(),
         project_id: project_id.clone(),
+        project_name: project.as_ref().map(|p| p.name.clone()),
         automation_id: params.automation_id.clone(),
         worktree: worktree_spec,
         prompt,

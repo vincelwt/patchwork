@@ -1993,6 +1993,101 @@ details[open] > summary::before {
   min-height: 0;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.3);
 }
+.modal.wide {
+  width: 620px;
+}
+
+/* The task composer: the sentence is the dialog, and what it needs to know
+   sits under it as controls rather than as a form in front of it. */
+.task-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 0 4px;
+  border-radius: 12px;
+}
+.task-composer.dropping {
+  outline: 2px dashed var(--accent);
+  outline-offset: 6px;
+}
+.task-composer-text {
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 19px;
+  line-height: 1.45;
+  letter-spacing: -0.011em;
+  min-height: 132px;
+}
+.task-composer-text::placeholder {
+  color: var(--text-faint);
+}
+.task-composer-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pending-image {
+  position: relative;
+  display: inline-flex;
+}
+.pending-image img {
+  height: 72px;
+  border-radius: 8px;
+  display: block;
+}
+.pending-image .remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+.task-composer-attributes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+.task-composer-attributes .check-row {
+  margin-top: 0;
+}
+.date-input.quiet {
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 5px 7px;
+}
+.date-input.quiet:hover {
+  background: var(--tint);
+}
+.attach-button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.attach-button:hover {
+  background: var(--tint);
+  color: var(--text-muted);
+}
+
 .modal-head {
   padding: 20px 22px 0;
   flex: none;

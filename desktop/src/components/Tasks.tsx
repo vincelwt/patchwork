@@ -10,7 +10,7 @@ import {
 } from "../lib/format";
 import { readTask, situationTone, stepIndex, TASK_STEPS } from "../lib/task";
 import type { NextAction, TaskState } from "../lib/task";
-import { Avatar, Chip, Field, Modal, useNavigation } from "./common";
+import { Avatar, Chip, Field, Modal, proseText, useNavigation } from "./common";
 import {
   Dropdown,
   EditableText,
@@ -22,6 +22,7 @@ import {
 } from "./ui";
 import {
   AgentIcon,
+  AttachIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -445,6 +446,12 @@ function TaskCard({
 
 // --- creating ---------------------------------------------------------------
 
+/// The task composer: one big box you type into, with everything else
+/// underneath it.
+///
+/// A task is a sentence and sometimes a screenshot. Owner, project and date
+/// are answers to questions the sentence raises, so they sit below it as
+/// small controls rather than as a form the sentence has to get through.
 export function NewTaskModal({
   onClose,
   sourceChannelId,
@@ -463,14 +470,23 @@ export function NewTaskModal({
   });
   const [start, setStart] = useState(true);
   const [due, setDue] = useState("");
+  // Held, not uploaded: there is no task to attach them to until you save,
+  // and a dialog you close should leave nothing behind.
+  const [images, setImages] = useState<File[]>([]);
+  const [dropping, setDropping] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [justCreated, setJustCreated] = useState("");
   const outcomeField = useRef<HTMLTextAreaElement>(null);
 
-  /// Linear's habit: most tasks arrive in threes. `another` keeps the dialog
-  /// open with the owner, project and date you just chose, so the next one is
-  /// a sentence and one chord away.
+  const add = (files: FileList | File[] | null | undefined) => {
+    const picked = [...(files ?? [])].filter((file) => file.size > 0);
+    if (picked.length > 0) setImages((held) => [...held, ...picked]);
+    return picked.length > 0;
+  };
+
+  /// Linear's habit: most tasks arrive in threes. `another` keeps the box
+  /// open with the owner, project and date you just chose.
   const create = async (another = false) => {
     setBusy(true);
     setError("");
@@ -482,10 +498,17 @@ export function NewTaskModal({
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
         due_at: dateInputToMillis(due) || undefined,
-        start: start && !!owner,
+        // Wait for the files: an agent that starts before its screenshot
+        // lands is an agent working from half the question.
+        start: false,
       });
+      for (const file of images) await api.upload(file, task.id);
+      if (start && owner && ownerIsAgent) {
+        await api.runTask(task.id, { agent_id: owner });
+      }
       if (another) {
         setOutcome("");
+        setImages([]);
         setBusy(false);
         setJustCreated(task.key);
         outcomeField.current?.focus();
@@ -520,8 +543,7 @@ export function NewTaskModal({
 
   return (
     <Modal
-      title="New task"
-      subtitle="A durable outcome someone — or some agent — owns."
+      wide
       onClose={onClose}
       actions={
         <>
@@ -551,63 +573,123 @@ export function NewTaskModal({
         </>
       }
     >
-      <Field
-        label="Expected result"
-        value={outcome}
-        onChange={setOutcome}
-        textarea
-        autoFocus
-        inputRef={outcomeField}
-        placeholder="What has to be true when this is done?"
-      />
-      <FormSelect
-        label="Owner"
-        value={owner}
-        onChange={setOwner}
-        options={[
-          { value: "", label: "Nobody yet" },
-          ...app.members.map((member) => ({
-            value: member.id,
-            label: member.display_name,
-            hint: member.kind === "agent" ? member.agent?.runtime : "person",
-          })),
-        ]}
-      />
-      <FormSelect
-        label="Project"
-        value={project}
-        onChange={setProject}
-        options={[
-          { value: "", label: "No code folder" },
-          ...app.projects.map((candidate) => ({
-            value: candidate.id,
-            label: candidate.name,
-          })),
-        ]}
-        help="A code task gets its own git worktree on the machine that runs it."
-      />
-      <div className="form-row">
-        <label>Due</label>
-        <input
-          className="date-input"
-          type="date"
-          value={due}
-          onChange={(event) => setDue(event.target.value)}
+      <div
+        className={`task-composer${dropping ? " dropping" : ""}`}
+        onDragOver={(event) => {
+          event.preventDefault();
+          setDropping(true);
+        }}
+        onDragLeave={() => setDropping(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDropping(false);
+          add(event.dataTransfer?.files);
+        }}
+      >
+        <textarea
+          className="task-composer-text"
+          {...proseText}
+          ref={outcomeField}
+          autoFocus
+          value={outcome}
+          placeholder="What has to be true when this is done?"
+          onChange={(event) => setOutcome(event.target.value)}
+          onPaste={(event) => {
+            if (add(event.clipboardData?.files)) event.preventDefault();
+          }}
         />
-        <span className="form-help">
-          Optional. It lands in the Inbox of whoever owns it on the day.
-        </span>
+
+        {images.length > 0 && (
+          <div className="task-composer-files">
+            {images.map((file, at) => (
+              <PendingImage
+                key={`${file.name}-${at}`}
+                file={file}
+                onRemove={() =>
+                  setImages(images.filter((_, index) => index !== at))
+                }
+              />
+            ))}
+          </div>
+        )}
+
+        <div className="task-composer-attributes">
+          <Dropdown
+            quiet
+            value={owner}
+            onChange={setOwner}
+            placeholder="Nobody yet"
+            options={[
+              { value: "", label: "Nobody yet" },
+              ...app.members.map((member) => ({
+                value: member.id,
+                label: member.display_name,
+                hint: member.kind === "agent" ? member.agent?.runtime : "person",
+              })),
+            ]}
+          />
+          <Dropdown
+            quiet
+            value={project}
+            onChange={setProject}
+            placeholder="No project"
+            options={[
+              { value: "", label: "No project" },
+              ...app.projects.map((candidate) => ({
+                value: candidate.id,
+                label: candidate.name,
+              })),
+            ]}
+          />
+          <input
+            className="date-input quiet"
+            type="date"
+            title="Due date"
+            value={due}
+            onChange={(event) => setDue(event.target.value)}
+          />
+          <label className="attach-button" title="Attach an image">
+            <AttachIcon size={15} />
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+              onChange={(event) => {
+                add(event.target.files);
+                event.target.value = "";
+              }}
+            />
+          </label>
+          <span className="spacer" />
+          {ownerIsAgent && (
+            <Toggle checked={start} onChange={setStart} label="Start now" />
+          )}
+        </div>
       </div>
-      {ownerIsAgent && (
-        <Toggle
-          checked={start}
-          onChange={setStart}
-          label="Start the agent now"
-          help="Otherwise it sits in Planned until someone runs it."
-        />
-      )}
       {error && <div className="error-text">{error}</div>}
     </Modal>
+  );
+}
+
+/// An image waiting for the task to exist.
+function PendingImage({ file, onRemove }: { file: File; onRemove: () => void }) {
+  // Made inside the effect, not beside it: a URL created during render is
+  // revoked by StrictMode's second pass and the thumbnail is born broken.
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    const made = URL.createObjectURL(file);
+    setUrl(made);
+    return () => URL.revokeObjectURL(made);
+  }, [file]);
+
+  return (
+    <span className="pending-image">
+      <img src={url} alt={file.name} />
+      <button className="remove" title="Remove" onClick={onRemove}>
+        ×
+      </button>
+    </span>
   );
 }
 

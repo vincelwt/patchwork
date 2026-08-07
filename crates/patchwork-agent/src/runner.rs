@@ -902,10 +902,16 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Vec<(String, Stri
     if let Some(project_id) = &spec.project_id {
         env.push(("PATCHWORK_PROJECT_ID".into(), project_id.clone()));
     }
-    if let Some(dir) = &cfg.cli_dir {
-        let path = std::env::var("PATH").unwrap_or_default();
-        env.push(("PATH".into(), format!("{dir}:{path}")));
-    }
+    // The same PATH detection used, so a run finds what the machine reported —
+    // and so `npm test` works in an app that was opened from the Finder.
+    let path = detect::search_path();
+    env.push((
+        "PATH".into(),
+        match &cfg.cli_dir {
+            Some(dir) => format!("{dir}:{path}"),
+            None => path,
+        },
+    ));
     // Our own agent is Pi with a provider the workspace picked, pointed at a
     // config directory this app owns rather than the user's own `~/.pi`.
     if spec.runtime == detect::PATCHWORK_RUNTIME {
@@ -914,9 +920,57 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Vec<(String, Stri
             spec.model.as_deref(),
         ));
     }
+    env.extend(project_env(spec.project_name.as_deref()));
     env.extend(cfg.env.iter().cloned());
     env.extend(spec.env.iter().cloned());
     env
+}
+
+/// What this machine knows about a project that the workspace must not: a
+/// database URL, an API key, whatever the code needs to run here.
+///
+/// `~/.patchwork/env/<project>.env`, plain `KEY=value` lines. It belongs to
+/// the machine, so a relay and a laptop can hold different values for the
+/// same project and neither is in the workspace database.
+pub fn project_env(project_name: Option<&str>) -> Vec<(String, String)> {
+    let Some(name) = project_name else {
+        return Vec::new();
+    };
+    let path = project_env_path(name);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_env(&text)
+}
+
+pub fn project_env_path(project_name: &str) -> std::path::PathBuf {
+    worktree::work_root()
+        .join("env")
+        .join(format!("{}.env", worktree::sanitize(&project_name.to_lowercase())))
+}
+
+/// `KEY=value`, `export KEY=value`, `#` comments, optional quotes. Deliberately
+/// not a dotenv library: this is a handful of lines a person typed.
+fn parse_env(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// The Patchwork skill: how an agent talks back to the workspace it lives in.
@@ -1041,6 +1095,7 @@ mod tests {
             channel_id: "c1".into(),
             task_id: Some("t1".into()),
             project_id: None,
+            project_name: None,
             automation_id: None,
             worktree: WorktreeSpec::None,
             prompt: "Fix the failing test".into(),
@@ -1096,6 +1151,21 @@ mod tests {
         assert!(p.contains("patchwork ask"));
         assert!(p.contains("the checkout test is red"));
         assert!(p.contains("Fix the failing test"));
+    }
+
+    #[test]
+    fn an_env_file_is_a_handful_of_lines_a_person_typed() {
+        let parsed = parse_env(
+            "# the database\nDATABASE_URL=postgres://localhost/dev\n\nexport TOKEN=\"abc 123\"\nBAD\nEMPTY=\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("DATABASE_URL".into(), "postgres://localhost/dev".into()),
+                ("TOKEN".into(), "abc 123".into()),
+                ("EMPTY".into(), String::new()),
+            ]
+        );
     }
 
     #[test]

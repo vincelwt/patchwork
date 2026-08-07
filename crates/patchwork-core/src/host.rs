@@ -70,6 +70,9 @@ pub struct RunSpec {
     pub task_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Id>,
+    /// Names the project's env file on the machine that runs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<Id>,
     pub worktree: WorktreeSpec,
