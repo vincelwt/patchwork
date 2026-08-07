@@ -51,6 +51,7 @@ import type {
   AgentProfile,
   Automation,
   AutomationDebug,
+  AutomationRun,
   Host,
   Id,
   Member,
@@ -1795,48 +1796,12 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           />
         ) : (
           debug.runs.map((run) => (
-            <div className="card" key={run.id} style={{ maxWidth: "none" }}>
-              <div className="card-head">
-                {run.status === "running" ? <Spinner size={13} /> : null}
-                <span>{relative(run.created_at)}</span>
-                <span className="spacer" />
-                <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
-              </div>
-              <div className="card-title">{run.trigger_summary}</div>
-              {run.error && <div className="error-text">{run.error}</div>}
-              {run.selection != null && (
-                <details style={{ marginTop: 10 }}>
-                  <summary>What it selected</summary>
-                  <pre className="code-block">
-                    {JSON.stringify(run.selection, null, 2)}
-                  </pre>
-                </details>
-              )}
-              {run.context_preview && (
-                <details style={{ marginTop: 6 }}>
-                  <summary>Context it received</summary>
-                  <pre className="code-block">{run.context_preview}</pre>
-                </details>
-              )}
-              <div className="card-row">
-                {run.run_id && (
-                  <button
-                    className="button quiet"
-                    onClick={() => inspect({ kind: "run", runId: run.run_id! })}
-                  >
-                    Open run log
-                  </button>
-                )}
-                {run.task_id && (
-                  <button
-                    className="button quiet"
-                    onClick={() => go({ kind: "task", id: run.task_id! })}
-                  >
-                    Open task
-                  </button>
-                )}
-              </div>
-            </div>
+            <AutomationRunRow
+              key={run.id}
+              run={run}
+              onOpenRun={(runId) => inspect({ kind: "run", runId })}
+              onOpenTask={(taskId) => go({ kind: "task", id: taskId })}
+            />
           ))
         )}
       </Section>
@@ -2169,6 +2134,77 @@ function nameFromRepo(url: string) {
     .filter(Boolean)
     .pop();
   return tail ?? "";
+}
+
+/// One firing, one line: when, what set it off, how it went. A firing is
+/// something you scan a hundred of looking for the one that failed, so the
+/// evidence behind it opens on demand rather than standing open forever.
+function AutomationRunRow({
+  run,
+  onOpenRun,
+  onOpenTask,
+}: {
+  run: AutomationRun;
+  onOpenRun: (runId: Id) => void;
+  onOpenTask: (taskId: Id) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const hasDetail = run.selection != null || !!run.context_preview;
+
+  return (
+    <div className={`run-row${open ? " open" : ""}`}>
+      <button
+        className="run-row-head"
+        onClick={() => hasDetail && setOpen(!open)}
+        title={hasDetail ? "What it selected and the context it received" : undefined}
+      >
+        {run.status === "running" ? (
+          <Spinner size={12} />
+        ) : (
+          <span className={`dot ${statusTone(run.status)}`} />
+        )}
+        <span className="when">{relative(run.created_at)}</span>
+        <span className="grow summary">{run.error || run.trigger_summary}</span>
+        {run.run_id && (
+          <span
+            className="run-row-link"
+            role="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenRun(run.run_id!);
+            }}
+          >
+            Log
+          </span>
+        )}
+        {run.task_id && (
+          <span
+            className="run-row-link"
+            role="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenTask(run.task_id!);
+            }}
+          >
+            Task
+          </span>
+        )}
+        <Chip tone={run.error ? "danger" : statusTone(run.status)}>
+          {statusLabel(run.status)}
+        </Chip>
+      </button>
+      {open && (
+        <div className="run-row-detail">
+          {run.selection != null && (
+            <pre className="code-block">{JSON.stringify(run.selection, null, 2)}</pre>
+          )}
+          {run.context_preview && (
+            <pre className="code-block">{run.context_preview}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /// What the built-in Patchwork agent thinks with. Nothing here is workspace

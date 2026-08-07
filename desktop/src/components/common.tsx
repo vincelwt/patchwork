@@ -129,12 +129,12 @@ export function Modal({
         return;
       }
       // ⌘↵ does what the dialog is for, from anywhere inside it — including
-      // the textarea, where ↵ is a new line. Every dialog here ends in one
-      // primary button, so pressing it is the whole implementation: no dialog
-      // has to remember to opt in, and none can disagree about what ⌘↵ means.
+      // the textarea, where ↵ is a new line. Every dialog here has one primary
+      // button, so pressing it is the whole implementation: no dialog has to
+      // remember to opt in, and none can disagree about what ⌘↵ means.
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
         const primary = root.current?.querySelector<HTMLButtonElement>(
-          ".modal-actions .button.primary",
+          ".button.primary",
         );
         if (primary && !primary.disabled) {
           event.preventDefault();

@@ -15,7 +15,6 @@ import {
   Dropdown,
   EditableText,
   FormSelect,
-  KeyHint,
   MenuButton,
   Section,
   Toggle,
@@ -542,37 +541,7 @@ export function NewTaskModal({
   });
 
   return (
-    <Modal
-      wide
-      onClose={onClose}
-      actions={
-        <>
-          {justCreated && (
-            <span className="composer-hint grow">{justCreated} created</span>
-          )}
-          <button className="button quiet" onClick={onClose}>
-            Cancel
-          </button>
-          <button
-            className="button quiet"
-            disabled={!outcome.trim() || busy}
-            title="Create this one and keep going"
-            onClick={() => void create(true)}
-          >
-            Create another
-            <KeyHint keys="⌘⇧↵" />
-          </button>
-          <button
-            className="button primary"
-            disabled={!outcome.trim() || busy}
-            onClick={() => void create()}
-          >
-            {ownerIsAgent && start ? "Create and start" : "Create"}
-            <KeyHint keys="⌘↵" />
-          </button>
-        </>
-      }
-    >
+    <Modal wide onClose={onClose}>
       <div
         className={`task-composer${dropping ? " dropping" : ""}`}
         onDragOver={(event) => {
@@ -641,13 +610,7 @@ export function NewTaskModal({
               })),
             ]}
           />
-          <input
-            className="date-input quiet"
-            type="date"
-            title="Due date"
-            value={due}
-            onChange={(event) => setDue(event.target.value)}
-          />
+          <DueField value={due} onChange={setDue} />
           <label className="attach-button" title="Attach an image">
             <AttachIcon size={15} />
             <input
@@ -662,13 +625,68 @@ export function NewTaskModal({
             />
           </label>
           <span className="spacer" />
+          {justCreated && (
+            <span className="composer-hint">{justCreated} created</span>
+          )}
           {ownerIsAgent && (
             <Toggle checked={start} onChange={setStart} label="Start now" />
           )}
+          <button
+            className="button quiet"
+            disabled={!outcome.trim() || busy}
+            title="Create this one and keep the box open (⌘⇧↵)"
+            onClick={() => void create(true)}
+          >
+            Another
+          </button>
+          <button
+            className="button primary"
+            disabled={!outcome.trim() || busy}
+            onClick={() => void create()}
+          >
+            {ownerIsAgent && start ? "Create and start" : "Create"}
+          </button>
         </div>
       </div>
       {error && <div className="error-text">{error}</div>}
     </Modal>
+  );
+}
+
+/// A date takes as much room as its placeholder, and `mm/dd/yyyy` is three
+/// times the width of the word "Due". So it is a word until it is a date.
+function DueField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const label = value ? dueLabel(dateInputToMillis(value))?.text : undefined;
+
+  if (!editing && !value) {
+    return (
+      <button
+        className="chip-button"
+        title="Due date"
+        onClick={() => setEditing(true)}
+      >
+        Due
+      </button>
+    );
+  }
+
+  return (
+    <input
+      className="date-input quiet"
+      type="date"
+      title={label ?? "Due date"}
+      autoFocus={editing}
+      value={value}
+      onBlur={() => setEditing(false)}
+      onChange={(event) => onChange(event.target.value)}
+    />
   );
 }
 

@@ -125,7 +125,11 @@ function useAnchored(
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
     const margin = 8;
-    const width = Math.max(rect.width, minWidth);
+    const room = window.innerWidth - margin * 2;
+    // A menu can be wider than the window it opens in. Right-aligning by the
+    // right edge alone let the left edge walk off the window, which is how a
+    // create menu ends up showing the ends of its own sentences.
+    const width = Math.min(Math.max(rect.width, minWidth), room);
     const spaceBelow = window.innerHeight - rect.bottom - margin;
     const spaceAbove = rect.top - margin;
     // Flip up only when below genuinely cannot hold a useful menu.
@@ -134,14 +138,14 @@ function useAnchored(
     const next: React.CSSProperties = {
       position: "fixed",
       minWidth: width,
+      maxWidth: room,
       maxHeight: Math.max(140, (above ? spaceAbove : spaceBelow) - 4),
       zIndex: 80,
     };
-    if (align === "right") {
-      next.right = Math.max(margin, window.innerWidth - rect.right);
-    } else {
-      next.left = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin));
-    }
+    // Placed by its left edge whichever way it is aligned, so the clamp has
+    // one thing to keep inside the window.
+    const wanted = align === "right" ? rect.right - width : rect.left;
+    next.left = Math.min(Math.max(margin, wanted), window.innerWidth - width - margin);
     // Both edges have to be stated. The stylesheet gives `.menu` a `top`, so
     // a flipped-up menu that only sets `bottom` is stretched between the two
     // and collapses to its padding — which is what a drop-up in the sidebar

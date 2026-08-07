@@ -1872,6 +1872,61 @@ details[open] > summary::before {
   background: var(--tint);
 }
 
+/* A firing is a line. Rows of them are for scanning, so the evidence behind
+   one opens underneath it instead of every card carrying its own. */
+.run-row {
+  border-bottom: 1px solid var(--line);
+}
+.run-row:last-child {
+  border-bottom: none;
+}
+.run-row-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  text-align: left;
+  font-size: 13.5px;
+}
+.run-row-head:hover {
+  background: var(--tint);
+}
+.run-row-head .when {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  flex: none;
+  min-width: 62px;
+}
+.run-row-head .summary {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.run-row-link {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  flex: none;
+}
+.run-row-link:hover {
+  background: var(--tint-strong);
+  color: var(--text);
+}
+.run-row-detail {
+  padding: 0 10px 10px;
+}
+.run-row-detail .code-block {
+  margin-top: 6px;
+  max-height: 240px;
+  overflow: auto;
+}
+
 /* A picture and a chart are the thing itself: no frame, no header. The
    message above is the title; the chart draws none of its own. */
 .artifact,
@@ -2057,10 +2112,34 @@ details[open] > summary::before {
 .task-composer-attributes {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding-top: 6px;
+  gap: 4px;
+  padding: 8px 0 2px;
   border-top: 1px solid var(--line);
+}
+.task-composer-attributes .button,
+.task-composer-attributes .dropdown,
+.task-composer-attributes .chip-button {
+  flex: none;
+}
+.task-composer-attributes .button {
+  font-size: 13px;
+  padding: 5px 10px;
+}
+.task-composer-attributes .dropdown-trigger {
+  font-size: 13px;
+  max-width: 150px;
+}
+.task-composer-attributes .check-row .label {
+  font-size: 13px;
+}
+.chip-button {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 5px 8px;
+  border-radius: 8px;
+}
+.chip-button:hover {
+  background: var(--tint);
 }
 .task-composer-attributes .check-row {
   margin-top: 0;
