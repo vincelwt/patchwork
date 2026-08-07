@@ -32,7 +32,7 @@ import {
   TrashIcon,
   WarningIcon,
 } from "./icons";
-import { Attached, ChatView } from "./Chat";
+import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { TASK_STATUSES } from "../lib/types";
@@ -611,6 +611,7 @@ export function NewTaskModal({
             ]}
           />
           <DueField value={due} onChange={setDue} />
+          <DictateButton value={outcome} onText={setOutcome} />
           <label className="attach-button" title="Attach an image">
             <AttachIcon size={15} />
             <input

@@ -1872,6 +1872,24 @@ details[open] > summary::before {
   background: var(--tint);
 }
 
+/* Dictation is live, so the button says so rather than the app going quiet. */
+.icon-button.recording {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.icon-button.recording svg {
+  animation: mic-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-button.recording svg {
+    animation: none;
+  }
+}
+
 /* A firing is a line. Rows of them are for scanning, so the evidence behind
    one opens underneath it instead of every card carrying its own. */
 .run-row {

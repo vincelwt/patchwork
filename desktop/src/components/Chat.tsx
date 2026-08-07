@@ -3,10 +3,12 @@ import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
 import { Avatar, proseText, useNavigation } from "./common";
+import { useDictation } from "../lib/dictation";
 import {
   AttachIcon,
   CloseIcon,
   EventIcon,
+  MicIcon,
   MoreIcon,
   PulseIcon,
   ReactIcon,
@@ -299,6 +301,29 @@ export function Timeline({
         {window_.padBottom > 0 && <div style={{ height: window_.padBottom }} />}
       </div>
     </div>
+  );
+}
+
+/// Talk instead of typing. Only where the machine can do it on its own: a
+/// button that needs an API key is a button that needs a settings page.
+export function DictateButton({
+  value,
+  onText,
+}: {
+  value: string;
+  onText: (text: string) => void;
+}) {
+  const { supported, recording, error, start, stop } = useDictation(onText);
+  if (!supported) return null;
+
+  return (
+    <button
+      className={`icon-button${recording ? " recording" : ""}`}
+      title={error || (recording ? "Stop dictating" : "Dictate")}
+      onClick={() => (recording ? stop() : start(value))}
+    >
+      <MicIcon size={17} />
+    </button>
   );
 }
 
@@ -849,6 +874,7 @@ export function Composer({
           }}
         />
         <div className="composer-row">
+          <DictateButton value={text} onText={onChange} />
           <label className="icon-button" title="Attach files">
             <AttachIcon size={17} />
             <input

@@ -20,3 +20,6 @@ desktop/src-tauri/target/
 .env
 .env.*
 !.env.example
+
+# stray tooling caches
+.wrangler/

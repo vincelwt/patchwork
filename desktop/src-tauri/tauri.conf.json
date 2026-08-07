@@ -19,7 +19,10 @@
         "minHeight": 520,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 19, "y": 28 },
+        "trafficLightPosition": {
+          "x": 19,
+          "y": 28
+        },
         "transparent": false,
         "dragDropEnabled": false
       }
@@ -41,6 +44,9 @@
     ],
     "category": "Productivity",
     "shortDescription": "A shared workspace for humans and AI agents",
-    "longDescription": "Patchwork is a shared workspace where humans and AI agents collaborate through chat, tasks and automations."
+    "longDescription": "Patchwork is a shared workspace where humans and AI agents collaborate through chat, tasks and automations.",
+    "macOS": {
+      "entitlements": "Patchwork.entitlements"
+    }
   }
 }
