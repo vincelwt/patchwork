@@ -278,6 +278,7 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   status          TEXT NOT NULL,
   error           TEXT,
   task_id         TEXT,
+  once_key        TEXT,
   created_at      INTEGER NOT NULL,
   ended_at        INTEGER
 );

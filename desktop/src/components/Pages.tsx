@@ -1412,6 +1412,8 @@ function describeTrigger(automation: Automation) {
       return "on pull request activity";
     case "webhook":
       return "on webhook";
+    case "watch":
+      return `scans every ${Math.round(trigger.every_seconds / 60)} min`;
     case "manual":
       return "manual only";
   }
@@ -1451,9 +1453,12 @@ export function AutomationModal({
   const [weekday, setWeekday] = useState(initial.weekday);
   const [expression, setExpression] = useState(initialCron);
   const [minutes, setMinutes] = useState(
-    automation?.trigger.type === "schedule"
+    automation?.trigger.type === "schedule" || automation?.trigger.type === "watch"
       ? String(Math.round(automation.trigger.every_seconds / 60))
       : "60",
+  );
+  const [command, setCommand] = useState(
+    automation?.trigger.type === "watch" ? automation.trigger.command : "",
   );
   const [channelId, setChannelId] = useState(
     automation?.context_channel_id ??
@@ -1483,6 +1488,8 @@ export function AutomationModal({
         return { type: "cron", expression: cronExpression };
       case "schedule":
         return { type: "schedule", every_seconds: Number(minutes) * 60 };
+      case "watch":
+        return { type: "watch", command, every_seconds: Number(minutes) * 60 };
       case "message":
         return {
           type: "message",
@@ -1548,7 +1555,12 @@ export function AutomationModal({
           </button>
           <button
             className="button primary"
-            disabled={!name.trim() || !agentId || busy}
+            disabled={
+              !name.trim() ||
+              !agentId ||
+              busy ||
+              (triggerKind === "watch" && !command.trim())
+            }
             onClick={save}
           >
             {editing ? "Save" : "Create"}
@@ -1579,6 +1591,11 @@ export function AutomationModal({
             value: "schedule",
             label: "At an interval",
             hint: "every N minutes, from the last run",
+          },
+          {
+            value: "watch",
+            label: "When a script finds something",
+            hint: "polls a command, fires only on new output",
           },
           { value: "message", label: "On a new message" },
           { value: "task_status", label: "When a task changes status" },
@@ -1637,6 +1654,23 @@ export function AutomationModal({
       )}
       {triggerKind === "schedule" && (
         <Field label="Every (minutes)" value={minutes} onChange={setMinutes} />
+      )}
+      {triggerKind === "watch" && (
+        <>
+          <Field
+            label="Command"
+            value={command}
+            onChange={setCommand}
+            placeholder="curl -s https://api.example.com/issues/new | jq -r '.[].title'"
+          />
+          <Field label="Check every (minutes)" value={minutes} onChange={setMinutes} />
+          <div className="form-help">
+            Runs on the relay. The agent only wakes when the command prints
+            something it did not print last time, so checking often is cheap.
+            <code>$PATCHWORK_STATE_DIR</code> is a directory of its own, kept
+            between runs.
+          </div>
+        </>
       )}
       {triggerKind === "message" && (
         <Field
@@ -1766,6 +1800,17 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           <code style={{ wordBreak: "break-all" }}>
             POST {api.baseUrl}/api/webhooks/{automation.trigger.token}
           </code>
+          <div className="form-help">
+            Add <code>?once=your-key</code> so a redelivery of the same event
+            does not act twice.
+          </div>
+        </div>
+      )}
+
+      {automation.trigger.type === "watch" && (
+        <div className="card" style={{ maxWidth: "none", marginTop: 14 }}>
+          <div className="card-head">Scan</div>
+          <code style={{ wordBreak: "break-all" }}>{automation.trigger.command}</code>
         </div>
       )}
 

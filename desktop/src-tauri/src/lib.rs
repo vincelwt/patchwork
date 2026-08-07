@@ -3,6 +3,7 @@
 //! connection and the settings that survive a restart.
 
 mod awake;
+mod dictation;
 mod host;
 mod relay;
 mod settings;
@@ -355,6 +356,23 @@ async fn set_awake_policy(
     Ok(current.redacted())
 }
 
+/// Speaking instead of typing. On this machine, with the system's own
+/// recogniser: no key, no upload, no model of ours to download.
+#[tauri::command]
+fn dictation_supported() -> bool {
+    dictation::supported()
+}
+
+#[tauri::command]
+fn dictation_start(app: tauri::AppHandle, locale: Option<String>) -> Result<(), String> {
+    dictation::start(app, locale.as_deref().unwrap_or(""))
+}
+
+#[tauri::command]
+fn dictation_stop() {
+    dictation::stop();
+}
+
 #[tauri::command]
 async fn reconnect_host(state: tauri::State<'_, AppState>) -> Result<HostStatus, String> {
     // An explicit "try again" is also the moment to look at this machine
@@ -433,6 +451,9 @@ pub fn run() {
             set_project_paths,
             set_awake_policy,
             reconnect_host,
+            dictation_supported,
+            dictation_start,
+            dictation_stop,
             patchwork_providers,
             set_provider_key,
             pi_login

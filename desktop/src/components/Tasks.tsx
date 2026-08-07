@@ -32,7 +32,7 @@ import {
   TrashIcon,
   WarningIcon,
 } from "./icons";
-import { Attached, ChatView } from "./Chat";
+import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { TASK_STATUSES } from "../lib/types";
@@ -567,6 +567,8 @@ export function NewTaskModal({
             if (add(event.clipboardData?.files)) event.preventDefault();
           }}
         />
+
+        <DictateButton value={outcome} onText={setOutcome} />
 
         {images.length > 0 && (
           <div className="task-composer-files">

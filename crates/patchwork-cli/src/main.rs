@@ -206,7 +206,7 @@ enum AutomationCommand {
         /// `@handle` of the agent that should act.
         #[arg(long)]
         agent: String,
-        /// `schedule`, `message`, `task-status`, `task-assigned`,
+        /// `schedule`, `watch`, `message`, `task-status`, `task-assigned`,
         /// `pull-request`, `webhook` or `manual`.
         #[arg(long)]
         trigger: String,
@@ -215,9 +215,15 @@ enum AutomationCommand {
         action: String,
         #[arg(long, default_value = "")]
         instructions: String,
-        /// Seconds between runs, for `--trigger schedule`.
+        /// Seconds between runs, for `--trigger schedule` and `--trigger watch`.
         #[arg(long)]
         every: Option<i64>,
+        /// Shell command for `--trigger watch`. It runs on the relay every
+        /// `--every` seconds and only fires the agent when it prints
+        /// something new. `$PATCHWORK_STATE_DIR` is its own directory, kept
+        /// between polls, for whatever it needs to remember.
+        #[arg(long)]
+        command: Option<String>,
         /// Channel for message triggers and for reporting.
         #[arg(long)]
         channel: Option<String>,
@@ -950,6 +956,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
             action,
             instructions,
             every,
+            command,
             channel,
             status,
         } => {
@@ -958,7 +965,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 Some(reference) => Some(resolve_channel(client, ctx, Some(reference)).await?),
                 None => ctx.channel_id.clone(),
             };
-            let trigger = build_trigger(&trigger, every, channel_id.clone(), status)?;
+            let trigger = build_trigger(&trigger, every, command, channel_id.clone(), status)?;
             let action = match action.as_str() {
                 "create-task" => "create_task",
                 "continue-task" => "continue_task",
@@ -981,7 +988,15 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                     }),
                 )
                 .await?;
-            client.print(&created, || println!("created automation {}", created.name));
+            client.print(&created, || {
+                println!("created automation {}", created.name);
+                // The URL is the whole automation for a webhook trigger, and
+                // it is not knowable without being told.
+                if let AutomationTrigger::Webhook { token } = &created.trigger {
+                    println!("POST {}/api/webhooks/{token}", client.base);
+                    println!("  add ?once=<your-key> so a repeated delivery does not act twice");
+                }
+            });
         }
         AutomationCommand::Run { id } => {
             let automation = resolve_automation(client, &id).await?;
@@ -1067,6 +1082,7 @@ async fn set_enabled(client: &Client, reference: &str, enabled: bool) -> Result<
 fn build_trigger(
     kind: &str,
     every: Option<i64>,
+    command: Option<String>,
     channel_id: Option<String>,
     status: Option<String>,
 ) -> Result<Value> {
@@ -1074,6 +1090,12 @@ fn build_trigger(
         "schedule" => json!({
             "type": "schedule",
             "every_seconds": every.ok_or_else(|| anyhow!("--every is required for a schedule"))?
+        }),
+        "watch" => json!({
+            "type": "watch",
+            "command": command.filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| anyhow!("--command is required for a watch"))?,
+            "every_seconds": every.unwrap_or(300)
         }),
         "message" => json!({
             "type": "message",
@@ -1121,10 +1143,19 @@ mod tests {
 
     #[test]
     fn schedule_triggers_need_an_interval() {
-        assert!(build_trigger("schedule", None, None, None).is_err());
+        assert!(build_trigger("schedule", None, None, None, None).is_err());
         assert_eq!(
-            build_trigger("schedule", Some(3600), None, None).unwrap()["every_seconds"],
+            build_trigger("schedule", Some(3600), None, None, None).unwrap()["every_seconds"],
             3600
         );
+    }
+
+    #[test]
+    fn watch_triggers_need_a_command_and_default_their_interval() {
+        assert!(build_trigger("watch", Some(60), None, None, None).is_err());
+        assert!(build_trigger("watch", Some(60), Some("  ".into()), None, None).is_err());
+        let watch = build_trigger("watch", None, Some("scan.sh".into()), None, None).unwrap();
+        assert_eq!(watch["command"], "scan.sh");
+        assert_eq!(watch["every_seconds"], 300);
     }
 }

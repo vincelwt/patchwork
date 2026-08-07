@@ -1379,13 +1379,22 @@ async fn automation_debug(
     }))
 }
 
+/// `?once=` is the sender's own name for the event. Deliveries are retried by
+/// everything that sends them, and a retry should not buy a second task.
+#[derive(Deserialize)]
+struct WebhookQuery {
+    #[serde(default)]
+    once: Option<String>,
+}
+
 async fn webhook(
     State(state): State<Shared>,
     Path(token): Path<String>,
+    Query(query): Query<WebhookQuery>,
     body: Option<Json<serde_json::Value>>,
 ) -> ApiResult<Json<Ok>> {
     let payload = body.map(|Json(v)| v).unwrap_or(serde_json::json!({}));
-    let fired = automations::on_webhook(&state, &token, payload).await?;
+    let fired = automations::on_webhook(&state, &token, payload, query.once).await?;
     if !fired {
         return Err(ApiError::not_found("no automation listens on that webhook"));
     }

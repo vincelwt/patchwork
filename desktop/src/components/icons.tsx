@@ -75,6 +75,13 @@ export const AttachIcon = (props: IconProps) => (
   </Svg>
 );
 
+export const MicIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3" />
+  </Svg>
+);
+
 export const SendIcon = (props: IconProps) => (
   <Svg {...props}>
     <path d="M12 19V6M6 11.5 12 5.5l6 6" />

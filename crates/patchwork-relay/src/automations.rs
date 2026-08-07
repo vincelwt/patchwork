@@ -4,6 +4,8 @@
 //! received, so the debugger can answer "why did this happen?" without anyone
 //! having to reproduce it.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use patchwork_core::events::Event;
 use patchwork_core::models::*;
@@ -51,7 +53,7 @@ pub async fn on_message(state: &Shared, message: &Message) {
 
         let summary = format!("New message in {}", message.channel_id);
         let payload = json!({ "message_id": message.id, "author_id": message.author_id, "body": message.body });
-        if let Err(err) = fire(state, &automation, summary, payload, None).await {
+        if let Err(err) = fire(state, &automation, summary, payload, None, None).await {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
     }
@@ -87,7 +89,9 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
 
         let summary = format!("Task {} entered {}", task.key, task.status.as_str());
         let payload = json!({ "task_id": task.id, "key": task.key, "status": task.status.as_str() });
-        if let Err(err) = fire(state, &automation, summary, payload, Some(task.id.clone())).await {
+        if let Err(err) =
+            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
     }
@@ -115,26 +119,55 @@ pub async fn on_pull_request(state: &Shared, task: &Task, kind: &str, detail: &s
         }
         let summary = format!("Pull request {kind} on {}", task.key);
         let payload = json!({ "task_id": task.id, "kind": kind, "detail": detail });
-        if let Err(err) = fire(state, &automation, summary, payload, Some(task.id.clone())).await {
+        if let Err(err) =
+            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        {
             tracing::warn!(?err, "pull request automation failed");
         }
     }
 }
 
-pub async fn on_webhook(state: &Shared, token: &str, payload: serde_json::Value) -> Result<bool> {
+pub async fn on_webhook(
+    state: &Shared,
+    token: &str,
+    payload: serde_json::Value,
+    once_key: Option<String>,
+) -> Result<bool> {
     let Some(automation) = state.store.automation_by_webhook(token)? else {
         return Ok(false);
     };
     if !automation.enabled {
         return Ok(false);
     }
-    fire(state, &automation, "Incoming webhook".into(), payload, None).await?;
+    let once_key = once_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    // A delivery repeating a key that already fired is the same event told
+    // twice. Acknowledge it, so the sender stops retrying, and pay for it once.
+    if let Some(key) = &once_key {
+        if state
+            .store
+            .automation_run_by_once_key(&automation.id, key)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    fire(
+        state,
+        &automation,
+        "Incoming webhook".into(),
+        payload,
+        None,
+        once_key,
+    )
+    .await?;
     Ok(true)
 }
 
 pub async fn run_now(state: &Shared, automation: &Automation, by: &str) -> Result<AutomationRun> {
     let summary = format!("Run manually by {by}");
-    fire(state, automation, summary, json!({ "by": by }), None).await
+    fire(state, automation, summary, json!({ "by": by }), None, None).await
 }
 
 /// The single path every trigger funnels through.
@@ -144,6 +177,7 @@ pub async fn fire(
     trigger_summary: String,
     trigger_payload: serde_json::Value,
     task_id: Option<Id>,
+    once_key: Option<String>,
 ) -> Result<AutomationRun> {
     let mut record = AutomationRun {
         id: new_id(),
@@ -156,6 +190,7 @@ pub async fn fire(
         status: RunStatus::Queued,
         error: None,
         task_id: task_id.clone(),
+        once_key,
         created_at: now_ms(),
         ended_at: None,
     };
@@ -166,28 +201,26 @@ pub async fn fire(
 
     let outcome = dispatch(state, automation, &mut record, task_id).await;
 
-    if let Err(err) = &outcome {
+    let mut updated = automation.clone();
+    updated.last_run_at = Some(now_ms());
+    // Whether it worked or not: a schedule that only books its next time after
+    // a success fires again on every tick once it starts failing.
+    updated.next_run_at = next_due_after(&automation.trigger, now_ms());
+    let failure = outcome.as_ref().err().map(|err| format!("{err:#}"));
+    if let Some(message) = &failure {
         record.status = RunStatus::Failed;
-        record.error = Some(format!("{err:#}"));
+        record.error = Some(message.clone());
         record.ended_at = Some(now_ms());
-        let mut automation = automation.clone();
-        automation.failure_count += 1;
-        automation.last_run_at = Some(now_ms());
-        state.store.upsert_automation(&automation)?;
-        state.emit(Event::AutomationUpdated { automation });
-        notify_creator_of_failure(state, &record, &format!("{err:#}"))?;
+        updated.failure_count += 1;
     } else {
-        let mut automation = automation.clone();
-        automation.last_run_at = Some(now_ms());
-        automation.failure_count = 0;
-        if let AutomationTrigger::Schedule { every_seconds, .. } = &automation.trigger {
-            automation.next_run_at = Some(now_ms() + every_seconds * 1000);
-        }
-        if let AutomationTrigger::Cron { expression } = &automation.trigger {
-            automation.next_run_at = next_cron_after(expression, now_ms());
-        }
-        state.store.upsert_automation(&automation)?;
-        state.emit(Event::AutomationUpdated { automation });
+        updated.failure_count = 0;
+    }
+    state.store.upsert_automation(&updated)?;
+    state.emit(Event::AutomationUpdated {
+        automation: updated,
+    });
+    if let Some(message) = &failure {
+        notify_creator_of_failure(state, &record, message)?;
     }
 
     state.store.upsert_automation_run(&record)?;
@@ -231,6 +264,9 @@ async fn dispatch(
                     title: automation.name.clone(),
                     outcome: automation.instructions.clone(),
                     owner_id: Some(automation.agent_id.clone()),
+                    // The caller's idempotency key doubles as the task's: two
+                    // deliveries about one issue make one task, not two.
+                    once_key: record.once_key.clone(),
                     source_channel_id: report_channel.clone(),
                     project_id: automation.project_id.clone(),
                     host_id: automation.host_id.clone(),
@@ -352,6 +388,31 @@ pub async fn scheduler(state: Shared) {
         };
         let now = now_ms();
         for automation in automations.into_iter().filter(|a| a.enabled) {
+            if let AutomationTrigger::Watch {
+                command,
+                every_seconds,
+            } = &automation.trigger
+            {
+                let due = automation
+                    .next_run_at
+                    .unwrap_or(automation.created_at + every_seconds * 1000);
+                if due > now {
+                    continue;
+                }
+                // Book the next poll before running this one: a scan that
+                // hangs or dies must not be retried on every tick. Polling off
+                // the ticker thread keeps one slow watcher from delaying the
+                // rest.
+                let mut pending = automation.clone();
+                pending.next_run_at = Some(now + every_seconds * 1000);
+                let _ = state.store.upsert_automation(&pending);
+                tokio::spawn(poll_watch(
+                    state.clone(),
+                    automation.clone(),
+                    command.clone(),
+                ));
+                continue;
+            }
             let (due_at, summary) = match &automation.trigger {
                 AutomationTrigger::Schedule {
                     every_seconds,
@@ -380,10 +441,120 @@ pub async fn scheduler(state: Shared) {
             if due_at > now {
                 continue;
             }
-            if let Err(err) = fire(&state, &automation, summary, json!({ "at": now }), None).await {
+            if let Err(err) = fire(
+                &state,
+                &automation,
+                summary,
+                json!({ "at": now }),
+                None,
+                None,
+            )
+            .await
+            {
                 tracing::warn!(?err, automation = %automation.name, "scheduled automation failed");
             }
         }
+    }
+}
+
+/// Long enough for a slow HTTP call, short enough that a hung script is not a
+/// watcher that quietly stopped watching.
+const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs one watch command and fires the agent only if it found something.
+///
+/// This is the whole point of a watch: the scan costs a process, so it can run
+/// every minute, and the model is only paid for when there is something to
+/// think about.
+async fn poll_watch(state: Shared, automation: Automation, command: String) {
+    // Its own directory, kept between polls, so a script can remember the last
+    // id it saw without the relay inventing a storage API for it.
+    let dir = state.files_dir.join("watch").join(&automation.id);
+    if let Err(err) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!(?err, automation = %automation.name, "watch state directory unavailable");
+        return;
+    }
+
+    let output = tokio::time::timeout(
+        WATCH_TIMEOUT,
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&dir)
+            .env("PATCHWORK_STATE_DIR", &dir)
+            .env("PATCHWORK_AUTOMATION_ID", &automation.id)
+            .output(),
+    )
+    .await;
+    let output = match output {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            tracing::warn!(?err, automation = %automation.name, "watch command could not run");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(automation = %automation.name, "watch command timed out");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let last = state
+        .store
+        .automation_runs(&automation.id, 1)
+        .unwrap_or_default();
+    let previous = last
+        .first()
+        .and_then(|run| run.trigger_payload.as_ref())
+        .and_then(|payload| payload.get("stdout"))
+        .and_then(|value| value.as_str());
+
+    if !watch_found_something(output.status.success(), &stdout, previous) {
+        tracing::debug!(
+            automation = %automation.name,
+            code = output.status.code(),
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "watch found nothing"
+        );
+        return;
+    }
+
+    let headline: String = stdout
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect();
+    if let Err(err) = fire(
+        &state,
+        &automation,
+        format!("Watch: {headline}"),
+        json!({ "stdout": stdout }),
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(?err, automation = %automation.name, "watch automation failed");
+    }
+}
+
+/// A non-zero exit means "nothing to report", the way `grep` means it, so the
+/// obvious one-liner works. Printing the same finding as last time is not a
+/// new finding, which is what lets a scan be stateless.
+fn watch_found_something(exited_ok: bool, stdout: &str, previous: Option<&str>) -> bool {
+    exited_ok && !stdout.is_empty() && previous != Some(stdout)
+}
+
+/// When a trigger that runs on the clock is next due. `None` for the ones that
+/// wait to be told.
+fn next_due_after(trigger: &AutomationTrigger, now: Millis) -> Option<Millis> {
+    match trigger {
+        AutomationTrigger::Schedule { every_seconds, .. }
+        | AutomationTrigger::Watch { every_seconds, .. } => Some(now + every_seconds * 1000),
+        AutomationTrigger::Cron { expression } => next_cron_after(expression, now),
+        _ => None,
     }
 }
 
@@ -497,6 +668,28 @@ mod tests {
     fn nonsense_expressions_do_not_schedule_anything() {
         assert!(next_cron_after("not a cron", 0).is_none());
         assert!(next_cron_after("0 9 * *", 0).is_none());
+    }
+
+    #[test]
+    fn a_watch_fires_only_on_a_new_finding() {
+        // Nothing printed, or a failed scan: nothing happened.
+        assert!(!watch_found_something(true, "", None));
+        assert!(!watch_found_something(false, "issue-1", None));
+        // Something new.
+        assert!(watch_found_something(true, "issue-1", None));
+        assert!(watch_found_something(true, "issue-2", Some("issue-1")));
+        // The same finding as last time is not a new one.
+        assert!(!watch_found_something(true, "issue-1", Some("issue-1")));
+    }
+
+    #[test]
+    fn clock_triggers_book_their_next_run_and_others_do_not() {
+        let watch = AutomationTrigger::Watch {
+            command: "true".into(),
+            every_seconds: 60,
+        };
+        assert_eq!(next_due_after(&watch, 1_000), Some(61_000));
+        assert_eq!(next_due_after(&AutomationTrigger::Manual, 1_000), None);
     }
 
     #[test]

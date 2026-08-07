@@ -3,10 +3,12 @@ import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
 import { Avatar, proseText, useNavigation } from "./common";
+import { useDictation } from "../lib/dictation";
 import {
   AttachIcon,
   CloseIcon,
   EventIcon,
+  MicIcon,
   MoreIcon,
   PulseIcon,
   ReactIcon,
@@ -299,6 +301,38 @@ export function Timeline({
         {window_.padBottom > 0 && <div style={{ height: window_.padBottom }} />}
       </div>
     </div>
+  );
+}
+
+/// Talk instead of typing. Only where the machine can do it on its own: a
+/// button that needs an API key is a button that needs a settings page.
+export function DictateButton({
+  value,
+  onText,
+}: {
+  value: string;
+  onText: (text: string) => void;
+}) {
+  const { supported, recording, error, start, stop, within, latestToggle } =
+    useDictation(onText);
+  const toggle = () => (recording ? stop() : start(value));
+  // Re-pointed on every render so the chord always starts from the text that
+  // is in the box now, not the text that was there when it mounted.
+  latestToggle.current = toggle;
+
+  if (!supported) return null;
+
+  return (
+    <button
+      ref={(node) => {
+        within.current = node?.closest(".composer, .task-composer") ?? null;
+      }}
+      className={`icon-button dictate${recording ? " recording" : ""}`}
+      title={error || (recording ? "Stop dictating (⌘D)" : "Dictate (⌘D)")}
+      onClick={toggle}
+    >
+      <MicIcon size={17} />
+    </button>
   );
 }
 
@@ -848,6 +882,7 @@ export function Composer({
             void attach(files);
           }}
         />
+        <DictateButton value={text} onText={onChange} />
         <div className="composer-row">
           <label className="icon-button" title="Attach files">
             <AttachIcon size={17} />

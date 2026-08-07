@@ -1872,6 +1872,44 @@ details[open] > summary::before {
   background: var(--tint);
 }
 
+/* On the box you are talking into, not in the row of tools underneath it. */
+.composer,
+.task-composer {
+  position: relative;
+}
+.icon-button.dictate {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  color: var(--text-faint);
+}
+.task-composer .icon-button.dictate {
+  top: 12px;
+  right: 0;
+}
+.icon-button.dictate:hover {
+  color: var(--text-muted);
+}
+
+/* Dictation is live, so the button says so rather than the app going quiet. */
+.icon-button.recording {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.icon-button.recording svg {
+  animation: mic-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-button.recording svg {
+    animation: none;
+  }
+}
+
 /* A firing is a line. Rows of them are for scanning, so the evidence behind
    one opens underneath it instead of every card carrying its own. */
 .run-row {

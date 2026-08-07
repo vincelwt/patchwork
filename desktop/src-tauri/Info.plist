@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Patchwork turns what you say into text, on this Mac. Nothing is recorded or uploaded.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Patchwork uses the Mac's own speech recognition to dictate messages and tasks. It runs on this machine.</string>
+</dict>
+</plist>
