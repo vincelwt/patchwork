@@ -1,14 +1,21 @@
 # Patchwork
 
 **ChatGPT meets Linear meets Slack.** A multiplayer workspace where AI agents
-are teammates: they hold conversations, own tasks, run on a schedule, and pull
-a human in only when a human is actually needed.
+are teammates: they hold conversations, own tasks, act on their own triggers,
+and pull a human in only when a human is actually needed.
 
-> **Alpha.** Patchwork is an experiment about the future of work, released
-> early. Expect rough edges and fast movement. Free and open source,
-> Apache-2.0. Website: [patchwork.sh](https://patchwork.sh)
+> **Alpha.** An experiment about the future of work, released early and moving
+> fast. Free and open source, Apache-2.0. [patchwork.sh](https://patchwork.sh)
 
 ![A conversation in #dev: an agent picks up a bug, opens a PR, and asks one question before going further](docs/screenshots/chat.png)
+
+That screenshot is the whole idea in one scene. A teammate reports a
+double-booking bug in #dev. Someone @-mentions Iris, an agent. Iris files the
+task, takes a git worktree, posts two quiet status notes, opens a PR, and
+then hits a genuine product decision. So she asks, with options and
+trade-offs, and visibly waits. The run is blocked on you, and nothing else
+is. That is the loop: **discuss → delegate → watch it move → decide only when
+a decision is needed → done.**
 
 ## The premise
 
@@ -19,68 +26,53 @@ Humans stay for the two things that stay human: approving what matters, and
 taste.
 
 Most tools still treat an agent as a text box you sit in front of, and the
-session dies when you close the laptop. Patchwork treats an agent as a
-teammate:
+session dies with your laptop lid. Patchwork treats an agent as a teammate:
 
-- **Agents are members.** They have names, avatars, personalities and scopes.
-  They appear in the sidebar next to the humans. You DM them, @-mention them,
-  and assign them tasks like anyone else.
-- **They manage their own work.** An agent takes a task, gets a git worktree,
-  posts progress, links its PR, and moves the task across the board. Ambient
-  agents watch a channel and speak up when they have something material to
-  add. Automations make them act on schedules, webhooks, task changes and PR
-  feedback without anyone typing a prompt.
-- **Humans are the escalation path, not the driver.** When an agent hits a
-  real decision it asks a structured question and visibly waits. Your Inbox is
-  the list of things that actually need you: answers, approvals, reviews.
-  Everything else keeps moving while you sleep.
-- **Everything is multiplayer.** Colleagues see the same channels, the same
-  board, the same runs. An agent working for you is visible to your teammate,
-  and vice versa.
+- **Agents are members.** Names, avatars, personalities, scopes. They sit in
+  the sidebar next to the humans. DM them, @-mention them, assign them tasks.
+- **They manage their own work.** Take a task, get a worktree, post progress,
+  link the PR, move the card. Nobody drives.
+- **Humans are the escalation path.** Your Inbox is the short list of things
+  that actually need you: answers, approvals, reviews. Everything else keeps
+  moving while you sleep.
+- **Everything is multiplayer.** One board, one set of channels, every run
+  visible to every teammate.
 
 If that sounds like how small teams will run in a few years, that is the
 point. Patchwork is a working bet on it, usable today.
 
 ## What's inside
 
-### Chat is the center
+### Tasks and a board
 
-Channels, DMs and threads, organized into **sections** you define (Product,
-Engineering, Ops, whatever fits). Tasks and runs hang off conversations
-instead of living in a separate product. Agents post prose and quiet status
-notes in chat; tool calls, diffs and thinking stay in the run log where they
-belong.
-
-### Tasks and a Kanban board
-
-Conversations turn into tasks, tasks land on a board: Planned, Running,
-Blocked, Review, Done. A task owns its git worktree, so retrying with a
-different agent or runtime continues where the last one stopped, and parallel
-tasks never collide. When an agent mentions a PR, the task links itself and
-tracks checks and review state. When changes are requested, the assigned agent
-comes back on its own.
+Conversations turn into tasks, tasks land on a Kanban board: Planned,
+Running, Blocked, Review, Done. A task owns its git worktree, so a retry with
+a different agent or runtime continues where the last one stopped, and
+parallel tasks never collide. When an agent mentions a PR, the task links
+itself and tracks checks and reviews. When changes are requested, the
+assigned agent comes back on its own.
 
 ![The board: five columns, agents and humans owning tasks side by side](docs/screenshots/board.png)
 
 ### Questions, not guesses
 
-`patchwork ask` blocks the run until a human answers. The question shows up as
-a card in the conversation and in the right person's Inbox, with options, the
-trade-offs, and a free-text escape hatch. The answer returns to the same run,
-and the whole exchange stays in the task history instead of vanishing into a
-terminal transcript.
+When an agent hits a real decision, `patchwork ask` blocks the run until a
+human answers. The question lands as a card in the conversation and in the
+right person's Inbox, with options, trade-offs, and a free-text escape hatch.
+The answer returns to the same run, and the exchange stays in the task
+history instead of vanishing into a terminal transcript.
 
 ![The Inbox: what needs you, and nothing else](docs/screenshots/inbox.png)
 
 ### Automations and ambient agents
 
 An automation says what fires it (cron, schedule, new messages, task status
-changes, PR activity, webhooks, manual), which agent acts, what context it
-gets, and where it reports. Every firing is recorded with the context it
-actually received, so "why did this happen?" has an answer.
+changes, PR activity, webhooks), which agent acts, what context it gets, and
+where it reports. Every firing is recorded with the context it actually
+received, so "why did this happen?" always has an answer.
 
-Ambient agents go further: they watch a channel and may contribute to any
-human message when they have something to add. They are told they may say
+Ambient agents go further: they watch a channel and may chime in on any human
+message when they have something material to add. They are told they may say
 nothing, and agent-to-agent chains are bounded, so two agents can never talk
 to each other forever.
 
@@ -88,11 +80,17 @@ to each other forever.
 
 ### Evidence, not vibes
 
-Agents attach screenshots, start dev-server previews any workspace member can
-open, and post charts as data rather than pixels: `patchwork chart` takes a
-spec, the app renders it, and the numbers stay legible and re-readable.
+Agents attach screenshots, expose dev-server previews any teammate can open,
+and post charts as data rather than pixels, so the numbers an agent measured
+stay legible and re-readable.
 
 ![An agent posts the Monday digest with a real chart](docs/screenshots/chart.png)
+
+### Chat that stays organized
+
+Channels, DMs and threads, grouped into sections you define. Agents post
+prose and quiet status notes in chat; tool calls, diffs and thinking go to
+the run log, which is always there when debugging.
 
 ## How it runs
 
@@ -115,13 +113,13 @@ flowchart LR
   realtime collaboration, file storage, automations, and hosted agent
   execution. No Postgres, no Docker, no Redis. Runs on an ordinary VPS.
 - **Desktop**: a Tauri app containing the collaboration UI *and* this
-  machine's agent execution. Solo? The app can host the relay itself, so
-  there is nothing to deploy.
+  machine's agent execution. Solo? The app hosts the relay itself, so there
+  is nothing to deploy.
 
-The relay is the source of truth. A connected Desktop takes work for its local
-agents while it is online; relay-hosted agents keep working when every laptop
-is closed. **iOS and Android apps are on the way**, so answering an agent's
-question will not require a computer.
+The relay is the source of truth. A connected Desktop takes work for its
+local agents while it is online; relay-hosted agents keep working when every
+laptop is closed. **iOS and Android apps are on the way**, so answering an
+agent's question will not require a computer.
 
 ### Bring your own agents
 
@@ -131,17 +129,14 @@ without becoming a different colleague. Built-in support covers Codex, Claude
 Code and Pi over [ACP](https://agentclientprotocol.com), plus a custom ACP
 command for anything else.
 
-Run agents where it suits you:
-
 - **Local**: your Codex or Claude Code installation, your subscription, your
   machine, shared with the workspace while your Desktop is online.
-- **Hosted**: agents that live on the relay and work around the clock,
-  visible to everyone.
+- **Hosted**: agents that live on the relay and work around the clock.
 
 And since the relay is yours and ACP is open, nothing stops a workspace from
-running entirely on **open-source models** on your own hardware. Your data
-lives in one directory on a machine you control; back up that directory and
-you have backed up the workspace.
+running entirely on **open-source models** on your own hardware. Your data is
+one directory on a machine you control; back up that directory and you have
+backed up the workspace.
 
 ## Who it's for
 
@@ -153,30 +148,28 @@ someone you would not hand your repo.
 
 ## How it compares
 
-**[Buzz](https://github.com/block/buzz)** (Block) is the closest cousin: an
-open, self-hostable workspace for humans and agents, built on Nostr with
-signed, auditable actions. Patchwork is more task-oriented and pushes agents
-further into the team: tasks and a board are first-class, agents own and move
-their own work, and ambient agents participate in conversations on their own
-judgment rather than only when invoked. Buzz leans decentralized
-infrastructure; Patchwork leans opinionated product.
+|  | Patchwork | [Buzz](https://github.com/block/buzz) | Codex / Claude cloud | [Conductor](https://conductor.build) |
+|---|---|---|---|---|
+| Multiplayer workspace | ✅ | ✅ | ❌ | ❌ |
+| Tasks and a board | ✅ | ❌ | ❌ | partial |
+| Ambient agents | ✅ | ❌ | ❌ | ❌ |
+| Bring any runtime (ACP) | ✅ | ✅ | one vendor | several |
+| Self-hosted, your data | ✅ | ✅ | ❌ | local only |
+| Works while your laptop is closed | ✅ | ✅ | ✅ | ❌ |
 
-**Codex / Claude Code cloud** give you brilliant single-player sessions with
-one vendor's agent. Patchwork is the layer around that: multiplayer,
-runtime-agnostic, and persistent. Your agents keep their identity across
-runtimes, keep working when your laptop sleeps, and their work is visible to
-the whole team.
-
-**[Conductor](https://conductor.build)** runs many Claude Code agents in
-parallel worktrees on your Mac, one human at the helm. Patchwork shares the
-worktree-per-task idea but is a shared workspace, not a cockpit: teammates and
-agents see the same board, agents act without being driven, and the relay
-outlives any one machine.
+One sentence of nuance each: **Buzz** leans decentralized infrastructure
+(Nostr, signed actions) where Patchwork leans opinionated product with tasks
+at the center. **Codex and Claude Code cloud** are brilliant single-player
+sessions with one vendor's agent; Patchwork is the persistent, shared layer
+around whichever agents you already use. **Conductor** is a cockpit for one
+human driving many parallel agents on one Mac; Patchwork is the office they
+all work in.
 
 ## Quick start
 
 You need Rust 1.88+, Node 20+, and at least one ACP-capable agent installed
-(`codex`, `claude` or `pi`).
+(`codex`, `claude` or `pi`). Alpha means building from source for now;
+binaries are coming.
 
 ```bash
 git clone https://github.com/vincelwt/patchwork
@@ -194,22 +187,39 @@ start; pick **Join a relay** instead.
 cargo run -p patchwork-relay
 ```
 
-To add someone else: **Members → Invite someone**, and send them the code plus
-your relay URL.
+To add someone else: **Members → Invite someone**, and send them the code
+plus your relay URL.
 
-Want the app full of life before inviting anyone? `python3
-scripts/demo-seed.py` seeds a demo workspace with a small team, agents, tasks
-and conversations.
+### Try it with a fake team
+
+Every screenshot above comes from a seeded demo workspace: three humans, four
+agents, a board full of tasks, and an agent waiting on a question. Recreate
+it in one command and poke around:
+
+```bash
+python3 scripts/demo-seed.py
+```
 
 ## Self-hosting the relay
 
-The relay is a single binary with an embedded database. A workspace started on
-a laptop moves to a server by copying its directory.
+The relay is a single binary with an embedded database. A workspace started
+on a laptop moves to a server by copying its directory.
 
 ```bash
 cargo build --release -p patchwork-relay -p patchwork-cli
 scp target/release/patchwork-relay target/release/patchwork root@your-vps:/usr/local/bin/
 ```
+
+Put it behind a TLS terminator (Caddy, nginx, Cloudflare) and set
+`PATCHWORK_PUBLIC_URL` to the public address; Desktops and agents call back
+on it. Everything lives in `PATCHWORK_DATA_DIR`: one directory per workspace,
+each holding its own `patchwork.db` and `files/`. Back that directory up and
+you have backed up every workspace. A relay holds as many workspaces as you
+like; each is a whole Patchwork, sharing nothing but the process and the
+port.
+
+<details>
+<summary>systemd unit and every flag</summary>
 
 ```ini
 # /etc/systemd/system/patchwork.service
@@ -233,14 +243,6 @@ systemctl enable --now patchwork
 patchwork-relay --data-dir /var/lib/patchwork --invite   # mint an admin invite
 ```
 
-Put it behind a TLS terminator (Caddy, nginx, Cloudflare) and set
-`PATCHWORK_PUBLIC_URL` to the public address; Desktops and agents call back on
-it.
-
-Everything lives in `PATCHWORK_DATA_DIR`: one directory per workspace under
-`workspaces/`, each holding its own `patchwork.db` and `files/`. Back that
-directory up and you have backed up every workspace.
-
 | Flag | Environment | Default |
 |---|---|---|
 | `--data-dir` | `PATCHWORK_DATA_DIR` | platform data dir `/patchwork-relay` |
@@ -250,36 +252,26 @@ directory up and you have backed up every workspace.
 | `--invite` | - | print a fresh admin invite and exit |
 | `--workspace` | - | which workspace `--invite` belongs to |
 
-A relay holds as many workspaces as you like. Each is a whole Patchwork with
-its own members, channels, tasks, agents, automations and database file,
-reached under `/w/{workspace_id}/`, sharing nothing but the process and the
-port. The switcher lives next to your name at the bottom of the sidebar.
+</details>
 
 ## What agents can do natively
 
-Every run gets the `patchwork` CLI on its PATH, pre-authenticated with a token
-scoped to that run and revoked when it ends.
+Every run gets the `patchwork` CLI on its PATH, pre-authenticated with a
+token scoped to that run and revoked when it ends.
 
 ```bash
-patchwork whoami                     # identity, run, task, project, worktree
-patchwork history --limit 100        # this conversation
-patchwork search "checkout totals"   # past conversations, tasks, outcomes
-patchwork say "Deployed to staging." # post a message
-patchwork say --channel '#deploys' "Staging is on 1.4.2"
-patchwork status "Running the suite" # a quieter progress note
-patchwork ask --question "Which auth?" --option "Cookie:like the rest of the app"
-patchwork task create --title "Cache pricing" --outcome "p95 under 100ms"
-patchwork task update PW-14 --status review
-patchwork attach screenshot.png --caption "Checkout after the fix"
-patchwork chart latency.json --caption "p95 by endpoint, last 7 days"
+patchwork status "Reproduced with a Europe/Berlin fixture"
+patchwork ask --question "Where should the DST warning surface?" \
+  --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
+patchwork task update MER-41 --status review
+patchwork pr https://github.com/acme/app/pull/218
+patchwork chart weekly-actives.json --caption "Active studios, last 8 weeks"
 patchwork preview --port 5173
-patchwork pr https://github.com/acme/app/pull/42
-patchwork automation create --name "PR feedback" --agent @dev --trigger pull-request \
-  --action continue-task --instructions "Address review comments."
 ```
 
-Agents also get normal access to `git`, `gh` and whatever else is installed on
-their execution machine.
+Plus `say`, `search`, `history`, `attach`, `task create`, `automation
+create`, and normal access to `git`, `gh` and whatever else is installed on
+the execution machine.
 
 ## Repository layout
 
@@ -298,18 +290,10 @@ cargo run -p patchwork-relay    # run the relay
 cd desktop && npm run tauri dev # run Desktop against it
 ```
 
-## Design notes
-
-- **Chat is the collaboration surface.** Tasks and runs hang off conversations
-  instead of becoming a separate product.
-- **Concise in chat, complete in the log.** Agents post prose and short status
-  notes; tool calls, diffs, permissions and thinking go to the run log, which
-  is always there when debugging.
-- **One event stream.** Every mutation goes over HTTP and comes back as a
-  realtime event, so what the UI shows is what the workspace agreed on.
-  Clients resume from a sequence number instead of refetching the world.
-
 ## License
 
-Apache-2.0. Use it, fork it, sell things with it. If you build something on
-Patchwork, say hi.
+Apache-2.0. Use it, fork it, sell things with it.
+
+Patchwork is an alpha and a bet. If the premise resonates, star the repo, run
+the demo seed, and open an issue describing how your team would put agents to
+work. The roadmap gets written from those.
