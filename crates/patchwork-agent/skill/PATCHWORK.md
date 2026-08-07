@@ -62,11 +62,52 @@ patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
 patchwork task update PW-14 --status review
+patchwork task update PW-14 --owner @vince --due 2026-08-14
 patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it.
+
+### A task is how you ask a person for something
+
+Anything you need from a human is a task owned by that human, not a message
+repeated until they notice. A message scrolls away and reads as chatter; a
+task has an owner, a status, a place on the board and an Inbox entry, and it
+is still there tomorrow.
+
+Use `--once <key>` whenever the thing you are reporting can recur. The key is
+your own short name for the condition. Creating it again with the same key
+returns the open task instead of making a second one, so a sweep that runs
+every two hours leaves one thing on the board rather than twelve.
+
+```bash
+# Blocked on something only a person can provide.
+patchwork task create --once posthog-credentials --owner @vince \
+  --title "PostHog needs an API key" \
+  --outcome "POSTHOG_CLI_API_KEY and POSTHOG_CLI_PROJECT_ID are set on the relay, \
+so the next sweep covers error tracking"
+
+# A decision you should not make alone.
+patchwork task create --once auth-approach --owner @vince \
+  --title "Decide how the API authenticates" \
+  --outcome "Session cookie or bearer token, decided and written down"
+
+# A plan somebody asked for: yours to write, theirs to approve.
+patchwork task create --title "Plan the checkout rewrite" \
+  --outcome "A sequence of reviewable steps, each shippable on its own"
+```
+
+Then say it once in chat, or say nothing at all, and move on. Do not repeat
+the blocker every run: the task is the record, and its discussion is where a
+note like "still blocked as of this morning" belongs.
+
+When you are blocked on a person, set your own task to `--status blocked` and
+create theirs. Two tasks, one waiting on the other, and the board shows both.
+
+`patchwork ask` is for a decision you need inside the next few minutes, while
+the run is still alive. A task is for everything else, including everything a
+scheduled run finds at three in the morning.
 
 ## Evidence, previews and pull requests
 
@@ -116,10 +157,18 @@ that make the point.
 ## Automations
 
 ```bash
+patchwork automation list
+patchwork automation show "PR feedback"
 patchwork automation create --name "PR feedback" --agent @dev-agent \
   --trigger pull-request --action continue-task \
   --instructions "Address review comments, then re-request review."
+patchwork automation pause "Morning sweep"
+patchwork automation resume "Morning sweep"
+patchwork automation delete "Morning sweep"
 ```
+
+Pause, resume and delete take a name as readily as an id, because that is how
+somebody will ask you for it.
 
 An automation created from a conversation stays connected to it — you do not
 need to copy the conversation into the instructions.

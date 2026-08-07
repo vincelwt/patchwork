@@ -380,6 +380,10 @@ pub struct Task {
     /// When this is meant to be done. The Inbox says so on the day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<Millis>,
+    /// An agent's own name for the thing this task is about, so asking twice
+    /// makes one task. Free of the wording, which drifts between runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once_key: Option<String>,
     pub created_at: Millis,
     pub updated_at: Millis,
     /// Ordering within its board column.

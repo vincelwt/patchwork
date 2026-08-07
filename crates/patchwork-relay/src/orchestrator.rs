@@ -1457,6 +1457,14 @@ async fn create_task_inner(
     creator_id: &str,
     input: patchwork_core::wire::CreateTask,
 ) -> Result<Task> {
+    // Asked twice, one task. An agent that reports the same blocker every two
+    // hours should leave one thing on the board, not twelve.
+    if let Some(once_key) = input.once_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        if let Some(existing) = state.store.task_by_once_key(once_key.trim())? {
+            return Ok(existing);
+        }
+    }
+
     let key = state.store.next_task_key()?;
     let now = now_ms();
     // ponytail: the title is the outcome's first line, not a model call. Swap in
@@ -1507,6 +1515,12 @@ async fn create_task_inner(
         pr_state: None,
         created_by: creator_id.to_string(),
         due_at: input.due_at.filter(|at| *at > 0),
+        once_key: input
+            .once_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string),
         created_at: now,
         updated_at: now,
         position: now as f64,

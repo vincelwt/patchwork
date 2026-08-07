@@ -159,13 +159,20 @@ enum TaskCommand {
         title: String,
         #[arg(long, default_value = "")]
         outcome: String,
-        /// `@handle` of the owner.
+        /// `@handle` of the owner. A person, when the task is for a person.
         #[arg(long)]
         owner: Option<String>,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
         project: Option<String>,
+        /// `YYYY-MM-DD`. It reaches the owner's Inbox on the day.
+        #[arg(long)]
+        due: Option<String>,
+        /// Your own name for what this is about. Creating it again with the
+        /// same key returns the open task instead of making a second one.
+        #[arg(long)]
+        once: Option<String>,
         /// Start the owning agent right away.
         #[arg(long)]
         start: bool,
@@ -180,6 +187,11 @@ enum TaskCommand {
         status: Option<String>,
         #[arg(long)]
         owner: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        /// `YYYY-MM-DD`, or `none` to clear it.
+        #[arg(long)]
+        due: Option<String>,
         #[arg(long)]
         pr: Option<String>,
     },
@@ -213,8 +225,23 @@ enum AutomationCommand {
         #[arg(long)]
         status: Option<String>,
     },
+    /// Everything about one automation, including its last firings.
+    Show {
+        /// Id or name.
+        reference: String,
+    },
     Run {
         id: String,
+    },
+    /// Stop it firing, without losing it.
+    Pause {
+        reference: String,
+    },
+    Resume {
+        reference: String,
+    },
+    Delete {
+        reference: String,
     },
 }
 
@@ -257,6 +284,16 @@ impl Client {
             .patch(self.url(path))
             .bearer_auth(&self.token)
             .json(&body)
+            .send()
+            .await?;
+        parse(response).await
+    }
+
+    async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self
+            .http
+            .delete(self.url(path))
+            .bearer_auth(&self.token)
             .send()
             .await?;
         parse(response).await
@@ -424,6 +461,27 @@ fn channel_label(channel: &Channel) -> String {
 /// name on its own, a DM partner's `@handle`, or an id copied from a link.
 /// Being strict here meant an agent that wanted to post an update in another
 /// channel got a "not found" for writing the name the way people write it.
+/// `YYYY-MM-DD` at local midnight, which is what a due date means.
+fn parse_due(value: &str) -> Result<i64> {
+    use chrono::TimeZone;
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Ok(0);
+    }
+    let parts: Vec<&str> = value.split('-').collect();
+    let [year, month, day] = parts.as_slice() else {
+        bail!("a due date looks like 2026-08-14, not `{value}`");
+    };
+    let date = chrono::NaiveDate::from_ymd_opt(year.parse()?, month.parse()?, day.parse()?)
+        .ok_or_else(|| anyhow!("there is no such date as {value}"))?;
+    let naive = date.and_hms_opt(0, 0, 0).unwrap();
+    Ok(chrono::Local
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| anyhow!("ambiguous local date {value}"))?
+        .timestamp_millis())
+}
+
 async fn resolve_channel(client: &Client, ctx: &RunContext, given: Option<String>) -> Result<String> {
     let Some(reference) = given else {
         return ctx
@@ -798,6 +856,8 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             owner,
             status,
             project,
+            due,
+            once,
             start,
         } => {
             let owner_id = match owner {
@@ -813,6 +873,8 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "owner_id": owner_id,
                         "status": status.as_deref().and_then(TaskStatus::parse),
                         "project_id": project,
+                        "due_at": due.as_deref().map(parse_due).transpose()?,
+                        "once_key": once,
                         "source_channel_id": ctx.channel_id,
                         "start": start,
                     }),
@@ -826,6 +888,8 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             outcome,
             status,
             owner,
+            project,
+            due,
             pr,
         } => {
             let owner_id = match owner {
@@ -840,6 +904,8 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "outcome": outcome,
                         "status": status.as_deref().and_then(TaskStatus::parse),
                         "owner_id": owner_id,
+                        "project_id": project,
+                        "due_at": due.as_deref().map(parse_due).transpose()?,
                         "pr_url": pr,
                     }),
                 )
@@ -918,13 +984,84 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
             client.print(&created, || println!("created automation {}", created.name));
         }
         AutomationCommand::Run { id } => {
+            let automation = resolve_automation(client, &id).await?;
             let run: AutomationRun = client
-                .post(&format!("/api/automations/{id}/run"), json!({}))
+                .post(&format!("/api/automations/{}/run", automation.id), json!({}))
                 .await?;
             client.print(&run, || println!("automation fired"));
         }
+        AutomationCommand::Show { reference } => {
+            let automation = resolve_automation(client, &reference).await?;
+            let debug: AutomationDebug = client
+                .get(&format!("/api/automations/{}/debug", automation.id))
+                .await?;
+            client.print(&debug, || {
+                println!(
+                    "{} [{}] {}",
+                    debug.automation.name,
+                    if debug.automation.enabled { "on" } else { "off" },
+                    debug.automation.description
+                );
+                if !debug.automation.instructions.trim().is_empty() {
+                    println!("Instructions: {}", debug.automation.instructions.trim());
+                }
+                for run in debug.runs.iter().take(10) {
+                    println!(
+                        "  {} [{}] {}",
+                        run.trigger_summary,
+                        run.status.as_str(),
+                        run.error.clone().unwrap_or_default()
+                    );
+                }
+            });
+        }
+        AutomationCommand::Pause { reference } => {
+            let updated = set_enabled(client, &reference, false).await?;
+            client.print(&updated, || println!("{} paused", updated.name));
+        }
+        AutomationCommand::Resume { reference } => {
+            let updated = set_enabled(client, &reference, true).await?;
+            client.print(&updated, || println!("{} resumed", updated.name));
+        }
+        AutomationCommand::Delete { reference } => {
+            let automation = resolve_automation(client, &reference).await?;
+            let _: Value = client
+                .delete(&format!("/api/automations/{}", automation.id))
+                .await?;
+            client.print(&json!({ "deleted": automation.id }), || {
+                println!("{} deleted", automation.name)
+            });
+        }
     }
     Ok(())
+}
+
+/// An automation by id or by name, because a person tells an agent to pause
+/// "the morning sweep", not to pause `019fd8…`.
+async fn resolve_automation(client: &Client, reference: &str) -> Result<Automation> {
+    let automations: Vec<Automation> = client.get("/api/automations").await?;
+    automations
+        .iter()
+        .find(|a| a.id == reference)
+        .or_else(|| {
+            automations
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(reference.trim()))
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("no automation called {reference}"))
+}
+
+/// The relay takes a whole automation on update, so pausing one means sending
+/// back what it already was with `enabled` flipped.
+async fn set_enabled(client: &Client, reference: &str, enabled: bool) -> Result<Automation> {
+    let automation = resolve_automation(client, reference).await?;
+    let mut body = serde_json::to_value(&automation)?;
+    body["enabled"] = json!(enabled);
+    let updated: Automation = client
+        .patch(&format!("/api/automations/{}", automation.id), body)
+        .await?;
+    Ok(updated)
 }
 
 fn build_trigger(

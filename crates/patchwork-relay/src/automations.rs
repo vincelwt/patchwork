@@ -478,6 +478,7 @@ mod tests {
             pr_state: None,
             created_by: "m".into(),
             due_at: None,
+            once_key: None,
             created_at: 0,
             updated_at: 0,
             position: 0.0,

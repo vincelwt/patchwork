@@ -139,6 +139,10 @@ pub struct CreateTask {
     /// Epoch millis, or 0 for no date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<i64>,
+    /// Asking twice about the same thing makes one task: an open task with
+    /// this key is returned instead of a second one being created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once_key: Option<String>,
     /// Start the owning agent immediately.
     #[serde(default)]
     pub start: bool,

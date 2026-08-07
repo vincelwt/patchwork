@@ -79,6 +79,7 @@ impl Store {
         for statement in [
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
+            "ALTER TABLE tasks ADD COLUMN once_key TEXT",
         ] {
             let _ = conn.execute(statement, []);
         }
@@ -884,6 +885,7 @@ impl Store {
             pr_state: json_col(row, "pr_state"),
             created_by: row.get("created_by")?,
             due_at: row.get("due_at")?,
+            once_key: row.get("once_key")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
             position: row.get("position")?,
@@ -894,14 +896,14 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
-                                pr_state, created_by, due_at, position, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                                pr_state, created_by, due_at, once_key, position, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.source_channel_id, task.source_message_id, task.discussion_channel_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.position,
-                task.created_at, task.updated_at
+                task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.once_key,
+                task.position, task.created_at, task.updated_at
             ],
         )?;
         Ok(())
@@ -951,6 +953,20 @@ impl Store {
         let mut stmt = conn.prepare("SELECT * FROM tasks ORDER BY position, created_at DESC")?;
         let rows = stmt.query_map([], |r| Self::task_from_row(r))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// The open task an agent already made about this, if it made one. Done is
+    /// not open: the same thing going wrong again is a new task, not a ghost.
+    pub fn task_by_once_key(&self, key: &str) -> Result<Option<Task>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM tasks WHERE once_key = ?1 AND status != 'done'
+                 ORDER BY created_at DESC LIMIT 1",
+                params![key],
+                |r| Self::task_from_row(r),
+            )
+            .optional()?)
     }
 
     pub fn delete_task(&self, id: &str) -> Result<()> {

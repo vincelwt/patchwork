@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_state              TEXT,
   created_by            TEXT NOT NULL,
   due_at                INTEGER,
+  once_key              TEXT,
   position              REAL NOT NULL DEFAULT 0,
   created_at            INTEGER NOT NULL,
   updated_at            INTEGER NOT NULL
