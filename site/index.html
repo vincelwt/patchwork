@@ -58,12 +58,10 @@
   .btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
   .btn:hover { text-decoration: none; opacity: .85; }
 
-  .shot {
-    display: block; width: 100%; border-radius: 12px;
-    border: 1px solid var(--line);
-    box-shadow: 0 24px 60px -24px rgba(20, 20, 40, .25);
-  }
-  .hero .shot { margin-top: 48px; }
+  /* The screenshots are native macOS window captures: chrome, corners and
+     shadow are already in the pixels, so the page adds no frame of its own. */
+  .shot { display: block; width: 100%; }
+  .hero .shot { margin-top: 24px; }
 
   section { padding: 56px 0; }
   section.alt { background: var(--soft); }
