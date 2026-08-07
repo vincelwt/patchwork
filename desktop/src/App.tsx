@@ -18,6 +18,7 @@ import {
 } from "./lib/session";
 import { markSeen } from "./lib/unread";
 import { toggleDictation } from "./lib/dictation";
+import { inTauri } from "./lib/desktop";
 import logo from "./assets/logo.png";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
@@ -453,6 +454,19 @@ function useShortcuts(actions: {
 }): Shortcut[] {
   const { go, create, openSearch, openHelp, closeInspector } = actions;
 
+  // The system-wide chord is registered natively, so it arrives as an event
+  // instead of a key press. Same action, and it brings the window forward
+  // first, so the words land somewhere you can see them.
+  useEffect(() => {
+    if (!inTauri) return;
+    let stop: (() => void) | undefined;
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      stop = await listen("dictate", () => toggleDictation());
+    })();
+    return () => stop?.();
+  }, []);
+
   const shortcuts = useMemo<Shortcut[]>(
     () => [
       {
@@ -469,6 +483,17 @@ function useShortcuts(actions: {
         label: "Dictate into the box you are in",
         group: "Do",
         match: combo("d"),
+        run: toggleDictation,
+      },
+      {
+        id: "dictate-anywhere",
+        keys: "⌘⇧D",
+        label: "Dictate from whatever app you are in",
+        group: "Do",
+        // Registered with the system, so it normally never reaches the window
+        // at all. Matching it here as well costs a line and covers the window
+        // being in front when the system chord was refused.
+        match: combo("d", { shift: true }),
         run: toggleDictation,
       },
       {
