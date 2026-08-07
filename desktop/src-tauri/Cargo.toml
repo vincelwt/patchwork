@@ -35,3 +35,8 @@ reqwest.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 sha2.workspace = true
 base64.workspace = true
+
+# The chord that starts dictation works when Patchwork is not the app you are
+# in, which is a system-level hotkey and so is desktop-only.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use host::{HostStatus, LocalHost};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, WorkspaceSettings};
+use tauri::Emitter;
 
 struct AppState {
     local_host: Arc<LocalHost>,
@@ -389,6 +390,11 @@ fn friendly_machine_name() -> String {
     host.trim_end_matches(".local").to_string()
 }
 
+/// System-wide, so it has to be a chord nothing else is likely to want. ⌘D on
+/// its own stays the in-window one.
+#[cfg(desktop)]
+const DICTATE_CHORD: &str = "CmdOrCtrl+Shift+D";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -411,7 +417,44 @@ pub fn run() {
             awake: awake.clone(),
             hosted_relay: hosted_relay.clone(),
         })
-        .setup(move |_app| {
+        .setup(move |app| {
+            // Dictation you can reach from whatever you were doing. A thought
+            // worth capturing rarely arrives while you are already looking at
+            // the right box, and the in-app chord needs the app in front.
+            #[cfg(desktop)]
+            {
+                use tauri::Manager;
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(|app, _shortcut, event| {
+                            // Pressed only: a hotkey reports its release too,
+                            // and toggling twice per press starts and stops
+                            // the recogniser in the same breath.
+                            if event.state() != ShortcutState::Pressed {
+                                return;
+                            }
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                            let _ = app.emit("dictate", ());
+                        })
+                        .build(),
+                )?;
+                // A chord another app already owns is not worth refusing to
+                // start over. Everything else still works, and ⌘D still does
+                // this from inside the window.
+                if let Err(err) = app.global_shortcut().register(DICTATE_CHORD) {
+                    tracing::warn!(
+                        ?err,
+                        chord = DICTATE_CHORD,
+                        "the global dictation chord is taken"
+                    );
+                }
+            }
+
             let local_host = local_host.clone();
             let awake = awake.clone();
             let hosted_relay = hosted_relay.clone();
