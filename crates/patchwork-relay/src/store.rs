@@ -80,6 +80,7 @@ impl Store {
         for statement in [
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
+            "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             // After the column, never in schema.sql: an index on a column an
@@ -101,15 +102,16 @@ impl Store {
     pub fn workspace(&self) -> Result<Workspace> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
+            "SELECT id, name, icon, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
             [],
             |r| {
                 Ok(Workspace {
                     id: r.get(0)?,
                     name: r.get(1)?,
-                    created_at: r.get(2)?,
-                    task_prefix: r.get(3)?,
-                    task_seq: r.get(4)?,
+                    icon: r.get(2)?,
+                    created_at: r.get(3)?,
+                    task_prefix: r.get(4)?,
+                    task_seq: r.get(5)?,
                 })
             },
         )
@@ -124,6 +126,7 @@ impl Store {
             id: id.to_string(),
             task_prefix: patchwork_core::models::default_task_prefix(),
             name: name.to_string(),
+            icon: String::new(),
             created_at: now_ms(),
             task_seq: 0,
         };
@@ -137,11 +140,15 @@ impl Store {
     pub fn update_workspace(
         &self,
         name: Option<&str>,
+        icon: Option<&str>,
         task_prefix: Option<&str>,
     ) -> Result<Workspace> {
         let conn = self.conn()?;
         if let Some(name) = name {
             conn.execute("UPDATE workspace SET name = ?1", params![name])?;
+        }
+        if let Some(icon) = icon {
+            conn.execute("UPDATE workspace SET icon = ?1", params![icon])?;
         }
         if let Some(prefix) = task_prefix {
             conn.execute("UPDATE workspace SET task_prefix = ?1", params![prefix])?;

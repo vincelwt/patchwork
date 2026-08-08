@@ -7,13 +7,25 @@
     "icon": "./assets/icon.png",
     "scheme": "patchwork",
     "userInterfaceStyle": "automatic",
-    "platforms": ["ios", "android"],
+    "platforms": [
+      "ios",
+      "android"
+    ],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "sh.patchwork.app"
+      "bundleIdentifier": "sh.patchwork.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSSpeechRecognitionUsageDescription": "Allow Patchwork to transcribe dictation on this device.",
+        "NSMicrophoneUsageDescription": "Allow Patchwork to dictate text using the microphone."
+      }
     },
     "android": {
-      "package": "sh.patchwork.app"
+      "package": "sh.patchwork.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "plugins": [
       "expo-router",
@@ -43,13 +55,22 @@
           "image": "./assets/icon.png",
           "imageWidth": 112,
           "backgroundColor": "#ffffff",
-          "dark": { "backgroundColor": "#1a1a1a" }
+          "dark": {
+            "backgroundColor": "#1a1a1a"
+          }
         }
       ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "b931705f-2c7f-469a-b798-a36300de9e07"
+      }
+    },
+    "owner": "vincelwt"
   }
 }

@@ -1660,6 +1660,26 @@ fn discussion_channel(state: &Shared, task_id: &str) -> Result<Id> {
         .ok_or_else(|| anyhow!("task not found"))
 }
 
+pub(crate) fn has_review_evidence(
+    state: &Shared,
+    task: &Task,
+    run_id: Option<&str>,
+    pending_pr_url: Option<&str>,
+) -> Result<bool> {
+    Ok(pending_pr_url.is_some_and(|url| !url.is_empty())
+        || task.pr_url.as_deref().is_some_and(|url| !url.is_empty())
+        || state
+            .store
+            .task_attachments(&task.id)?
+            .iter()
+            .any(|attachment| attachment.run_id.as_deref() == run_id)
+        || state
+            .store
+            .task_previews(&task.id)?
+            .iter()
+            .any(|preview| preview.run_id.as_deref() == run_id))
+}
+
 /// A finished run updates the board and the Inbox so nothing silently stalls.
 pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
@@ -1700,13 +1720,17 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     match run.status {
         RunStatus::Succeeded => {
             if task.status == TaskStatus::Running {
-                task.status = TaskStatus::Review;
-                notify_task(
-                    state,
-                    &task,
-                    InboxKind::ReviewReady,
-                    format!("{} is ready for review", task.key),
-                )?;
+                if has_review_evidence(state, &task, Some(run.id.as_str()), None)? {
+                    task.status = TaskStatus::Review;
+                    notify_task(
+                        state,
+                        &task,
+                        InboxKind::ReviewReady,
+                        format!("{} is ready for review", task.key),
+                    )?;
+                } else {
+                    task.status = TaskStatus::Planned;
+                }
             }
         }
         RunStatus::Failed => {

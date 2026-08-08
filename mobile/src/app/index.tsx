@@ -33,7 +33,7 @@ function Welcome() {
         <Text style={[styles.lede, { color: theme.muted }]}>Your workspace, wherever you are.</Text>
         <Card style={styles.card}>
           <Text style={[styles.body, { color: theme.text }]}>Pair this phone or tablet from Patchwork Desktop.</Text>
-          <Text style={[styles.detail, { color: theme.muted }]}>Each device receives its own revocable key. The workspace relay must be reachable over HTTPS.</Text>
+          <Text style={[styles.detail, { color: theme.muted }]}>Each device receives its own revocable key. Patchwork Relay handles the secure connection automatically.</Text>
           <Button label="Scan pairing code" onPress={() => router.push("/pair")} />
         </Card>
       </View>

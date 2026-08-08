@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: npm ci
+        working-directory: desktop
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: Patchwork ${{ github.ref_name }}
+          releaseBody: Desktop and relay binaries for ${{ github.ref_name }}.
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin
+
+  relay:
+    needs: desktop
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          cargo build --release -p patchwork-relay -p patchwork-cli
+          cp target/release/patchwork-relay patchwork-relay-linux-x86_64
+          cp target/release/patchwork patchwork-linux-x86_64
+          sha256sum patchwork-relay-linux-x86_64 > patchwork-relay-linux-x86_64.sha256
+          sha256sum patchwork-linux-x86_64 > patchwork-linux-x86_64.sha256
+          gh release upload "$GITHUB_REF_NAME" \
+            patchwork-relay-linux-x86_64 \
+            patchwork-relay-linux-x86_64.sha256 \
+            patchwork-linux-x86_64 \
+            patchwork-linux-x86_64.sha256 \
+            --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

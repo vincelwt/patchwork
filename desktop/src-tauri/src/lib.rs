@@ -143,10 +143,13 @@ async fn desktop_boot(state: tauri::State<'_, AppState>) -> Result<DesktopBoot, 
     // The window asks for this before it connects to anything, which is
     // exactly when a relay living in this app has to be listening.
     if current.hosts_relay {
-        if let Err(err) = state.hosted_relay.ensure_started().await {
-            tracing::error!(?err, "could not start the relay on this device");
-        } else {
-            state.local_host.restart(current.clone()).await;
+        match state.hosted_relay.ensure_started().await {
+            Ok(url) => {
+                remember_hosted_url(&mut current, &url);
+                let _ = settings::save(&current);
+                state.local_host.restart(current.clone()).await;
+            }
+            Err(err) => tracing::error!(?err, "could not start the relay on this device"),
         }
     }
     // A machine that has joined before keeps its host identity.
@@ -390,6 +393,52 @@ fn friendly_machine_name() -> String {
     host.trim_end_matches(".local").to_string()
 }
 
+/// Workspaces created before managed ingress existed pointed at loopback.
+/// Once this app's relay has a stable public URL, move only those local entries
+/// to it; workspaces joined on somebody else's relay are untouched.
+fn remember_hosted_url(settings: &mut Settings, url: &str) {
+    if !url.starts_with("https://") {
+        return;
+    }
+    for workspace in &mut settings.workspaces {
+        if workspace.relay_url.starts_with("http://127.0.0.1:")
+            || workspace.relay_url.starts_with("http://localhost:")
+        {
+            workspace.relay_url = url.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_relay_tests {
+    use super::*;
+
+    #[test]
+    fn managed_url_migrates_only_the_relay_hosted_here() {
+        let mut settings = Settings {
+            workspaces: vec![
+                WorkspaceSettings {
+                    id: "local".into(),
+                    relay_url: "http://127.0.0.1:7727".into(),
+                    ..Default::default()
+                },
+                WorkspaceSettings {
+                    id: "other".into(),
+                    relay_url: "https://team.example".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        remember_hosted_url(&mut settings, "https://relay.patchwork.sh/r/abc");
+        assert_eq!(
+            settings.workspaces[0].relay_url,
+            "https://relay.patchwork.sh/r/abc"
+        );
+        assert_eq!(settings.workspaces[1].relay_url, "https://team.example");
+    }
+}
+
 /// System-wide, so it has to be a chord nothing else is likely to want. ⌘D on
 /// its own stays the in-window one.
 #[cfg(desktop)]
@@ -412,6 +461,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             local_host: local_host.clone(),
             awake: awake.clone(),
@@ -469,8 +520,14 @@ pub fn run() {
                 // Before the host connections, or they spend their first
                 // seconds failing to reach a relay that is about to exist.
                 if settings.hosts_relay {
-                    if let Err(err) = hosted_relay.ensure_started().await {
-                        tracing::error!(?err, "could not start the relay on this device");
+                    match hosted_relay.ensure_started().await {
+                        Ok(url) => {
+                            remember_hosted_url(&mut settings, &url);
+                            let _ = settings::save(&settings);
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "could not start the relay on this device")
+                        }
                     }
                 }
                 local_host.restart(settings).await;

@@ -183,12 +183,16 @@ git clone https://github.com/vincelwt/patchwork
 cd patchwork/desktop && npm install && npm run tauri dev
 ```
 
-On the first screen, **Use this Mac**: the app contains the relay and serves
-one itself for as long as it is open. Nothing else to start.
+Installed Desktop builds can fetch signed releases from **Settings → Updates**.
 
-Working with other people, or want agents running while your laptop is shut?
-Run the relay somewhere that stays on. It prints an invite code on first
-start; pick **Join a relay** instead.
+On the first screen, **Start a workspace**: the app contains the relay and
+serves one itself for as long as it is open. It connects out to the hosted
+Patchwork Relay by default, so phones and teammates get a stable HTTPS address
+without domains, certificates, port forwarding or an open inbound port.
+
+Want agents running while your laptop is shut? Run the same relay somewhere
+that stays on. It prints its managed URL and an invite code on first start;
+pick **Join with invite** in Desktop.
 
 ```bash
 cargo run -p patchwork-relay
@@ -217,13 +221,23 @@ cargo build --release -p patchwork-relay -p patchwork-cli
 scp target/release/patchwork-relay target/release/patchwork root@your-vps:/usr/local/bin/
 ```
 
-Put it behind a TLS terminator (Caddy, nginx, Cloudflare) and set
-`PATCHWORK_PUBLIC_URL` to the public address; Desktops and agents call back
-on it. Everything lives in `PATCHWORK_DATA_DIR`: one directory per workspace,
-each holding its own `patchwork.db` and `files/`. Back that directory up and
-you have backed up every workspace. A relay holds as many workspaces as you
-like; each is a whole Patchwork, sharing nothing but the process and the
-port.
+Release tags build Desktop, Linux relay, and CLI assets automatically. On a
+systemd relay, enable hourly relay and CLI updates from the latest release with:
+
+```bash
+PATCHWORK_USER=patchwork sudo -E scripts/install-relay-updater.sh
+```
+
+By default the binary opens an outbound connection to the open-source broker
+hosted at `relay.patchwork.sh` and needs no public network configuration. Pass
+`--direct` when you prefer to expose it yourself; then put it behind a TLS
+terminator and set `PATCHWORK_PUBLIC_URL` to the public address.
+
+Everything lives in `PATCHWORK_DATA_DIR`: one directory per workspace, each
+holding its own `patchwork.db` and `files/`, plus the private managed-relay
+identity. Back that directory up and you have backed up every workspace and
+kept its stable URL. A relay holds as many workspaces as you like; each is a
+whole Patchwork, sharing nothing but the process and the port.
 
 <details>
 <summary>systemd unit and every flag</summary>
@@ -237,7 +251,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/patchwork-relay
 Environment=PATCHWORK_DATA_DIR=/var/lib/patchwork
-Environment=PATCHWORK_PUBLIC_URL=https://patchwork.example.com
+# Optional: PATCHWORK_MANAGED_RELAY=https://your-own-broker.example
 Restart=always
 User=patchwork
 
@@ -254,8 +268,10 @@ patchwork-relay --data-dir /var/lib/patchwork --invite   # mint an admin invite
 |---|---|---|
 | `--data-dir` | `PATCHWORK_DATA_DIR` | platform data dir `/patchwork-relay` |
 | `--port` | `PATCHWORK_PORT` | `7727` |
-| `--bind` | `PATCHWORK_BIND` | `0.0.0.0` |
-| `--public-url` | `PATCHWORK_PUBLIC_URL` | `http://127.0.0.1:<port>` |
+| `--bind` | `PATCHWORK_BIND` | `127.0.0.1` |
+| `--public-url` | `PATCHWORK_PUBLIC_URL` | managed URL, or `http://127.0.0.1:<port>` in direct mode |
+| `--managed-relay` | `PATCHWORK_MANAGED_RELAY` | `https://relay.patchwork.sh` |
+| `--direct` | - | disable managed ingress and listen directly |
 | `--invite` | - | print a fresh admin invite and exit |
 | `--workspace` | - | which workspace `--invite` belongs to |
 
@@ -293,6 +309,7 @@ the execution machine.
 | `client` | Wire types and the HTTP client, shared by every TypeScript client |
 | `desktop` | Tauri app: React UI plus this machine's execution host |
 | `mobile` | Expo app for iOS and Android: collaboration and agent control on the go |
+| `cloudflare-relay` | Open-source managed ingress Worker and Durable Object used by `relay.patchwork.sh` |
 
 `mobile` follows the workspace in realtime with chat, DMs, threads, inbox,
 tasks, agents and runs, steering, automations, members, search and offline

@@ -275,7 +275,10 @@ class Session {
         this.set({ sections: event.sections });
         break;
       case "member_updated":
-        this.set({ members: upsert(this.data.members, event.member) });
+        this.set({
+          me: this.data.me?.id === event.member.id ? event.member : this.data.me,
+          members: upsert(this.data.members, event.member),
+        });
         break;
       case "member_removed":
         this.set({
@@ -284,6 +287,10 @@ class Session {
         break;
       case "presence_changed":
         this.set({
+          me:
+            this.data.me?.id === event.member_id
+              ? { ...this.data.me, presence: event.presence }
+              : this.data.me,
           members: this.data.members.map((m) =>
             m.id === event.member_id ? { ...m, presence: event.presence } : m,
           ),

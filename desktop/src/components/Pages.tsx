@@ -76,9 +76,44 @@ function useHostSignature(hosts: Host[]): string {
 
 export function AgentsPage() {
   const app = useApp();
+  const api = useApi();
   const [editing, setEditing] = useState<Member | null>(null);
   const [creating, setCreating] = useState(false);
+  const [addingManager, setAddingManager] = useState(false);
+  const [error, setError] = useState("");
   const agents = app.members.filter((member) => member.kind === "agent");
+
+  const addManager = async () => {
+    const relay = app.hosts.find((host) => host.kind === "relay" && host.online);
+    const runtimes = relay?.capabilities.runtimes.filter(
+      (runtime) => runtime.available && runtime.id !== "custom",
+    );
+    const runtime =
+      runtimes?.find((candidate) => candidate.id === "codex") ?? runtimes?.[0];
+    setAddingManager(true);
+    setError("");
+    try {
+      await api.createAgent({
+        display_name: "Manager",
+        is_admin: app.me?.is_admin ?? false,
+        profile: {
+          description:
+            "Manages the workspace, triages requests, coordinates agents, and keeps tasks moving.",
+          runtime: runtime?.id ?? "codex",
+          location: relay ? "relay" : "auto",
+          host_id: relay?.id,
+          dm_enabled: true,
+          default_participation: "mention",
+          channel_participation: {},
+          model: runtime?.default_model,
+        },
+      });
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    } finally {
+      setAddingManager(false);
+    }
+  };
 
   return (
     <Page
@@ -95,9 +130,18 @@ export function AgentsPage() {
           title="No agents yet"
           hint="An agent is a teammate: a name, a description that defines what it owns, a runtime, and where it runs."
           action={
-            <button className="button primary" onClick={() => setCreating(true)}>
-              Create the first agent
-            </button>
+            <div className="field-row">
+              <button
+                className="button primary"
+                disabled={addingManager}
+                onClick={() => void addManager()}
+              >
+                {addingManager ? "Adding…" : "Add Manager (recommended)"}
+              </button>
+              <button className="button" onClick={() => setCreating(true)}>
+                Create a custom agent
+              </button>
+            </div>
           }
         />
       ) : (
@@ -111,6 +155,7 @@ export function AgentsPage() {
                 {agent.agent?.description ? ` · ${agent.agent.description}` : ""}
               </span>
             </span>
+            {agent.is_admin && <Chip>admin</Chip>}
             <Chip>{agent.agent?.runtime}</Chip>
             <Chip tone={agent.presence === "working" ? "accent" : ""}>
               {locationLabel(agent.agent)}
@@ -118,6 +163,8 @@ export function AgentsPage() {
           </button>
         ))
       )}
+
+      {error && <div className="error-text">{error}</div>}
 
       {(creating || editing) && (
         <AgentModal
@@ -374,6 +421,7 @@ export function AgentModal({
   const app = useApp();
   const api = useApi();
   const [name, setName] = useState(agent?.display_name ?? "");
+  const [isAdmin, setIsAdmin] = useState(agent?.is_admin ?? false);
   const [profile, setProfile] = useState<AgentProfile>(
     agent?.agent ?? {
       description: "",
@@ -515,9 +563,13 @@ export function AgentModal({
     setError("");
     try {
       if (agent) {
-        await api.updateAgent(agent.id, { display_name: name, profile });
+        await api.updateAgent(agent.id, {
+          display_name: name,
+          is_admin: isAdmin,
+          profile,
+        });
       } else {
-        await api.createAgent({ display_name: name, profile });
+        await api.createAgent({ display_name: name, is_admin: isAdmin, profile });
       }
       onClose();
     } catch (err) {
@@ -718,6 +770,15 @@ export function AgentModal({
         label="Available in direct messages"
         help="Shows up under Direct messages for everyone."
       />
+
+      {app.me?.is_admin && (
+        <Toggle
+          checked={isAdmin}
+          onChange={setIsAdmin}
+          label="Workspace administrator"
+          help="Can change workspace settings, invite or remove members, and delete tasks or projects."
+        />
+      )}
 
       {app.channels.some((channel) => channel.kind === "channel") && (
         <Section title="Per-channel participation">
@@ -1169,10 +1230,11 @@ export function MembersPage() {
   );
 }
 
-/// An invite is a code somebody pastes into their own copy of the app, so the
-/// only useful thing this dialog can do is make the code easy to hand over.
+/// One copyable invitation: the recipient should not have to ask which URL a
+/// code belongs to or configure any networking before they can use it.
 export function InviteModal({ onClose }: { onClose: () => void }) {
   const api = useApi();
+  const relayUrl = api.baseUrl.replace(/\/w\/[^/]+\/?$/, "");
   const [code, setCode] = useState<string>();
   const [admin, setAdmin] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -1194,8 +1256,8 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
       title={code ? "Invite code" : "Invite someone"}
       subtitle={
         code
-          ? "They enter this and your relay URL in Patchwork Desktop."
-          : "Anyone with the code and your relay URL can join this workspace."
+          ? "Send both connection details. They can paste them into Patchwork Desktop."
+          : "Create one invitation containing the relay URL and a one-use code."
       }
       onClose={onClose}
       actions={
@@ -1217,16 +1279,16 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
     >
       {code ? (
         <div className="invite-code">
-          <code>{code}</code>
+          <code style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{`Relay URL: ${relayUrl}\nInvite code: ${code}`}</code>
           <button
             className="button quiet"
             onClick={() => {
-              void navigator.clipboard.writeText(code);
+              void navigator.clipboard.writeText(`Relay URL: ${relayUrl}\nInvite code: ${code}`);
               setCopied(true);
             }}
           >
             {copied ? <CheckIcon size={15} /> : null}
-            {copied ? "Copied" : "Copy"}
+            {copied ? "Copied" : "Copy invitation"}
           </button>
         </div>
       ) : (
@@ -1896,9 +1958,29 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const api = useApi();
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
+  const [icon, setIcon] = useState(app.workspace?.icon ?? "");
   const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
+  const [updateStatus, setUpdateStatus] = useState("");
+
+  const checkForUpdate = async () => {
+    setUpdateStatus("Checking…");
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (!update) {
+        setUpdateStatus("Patchwork is up to date");
+        return;
+      }
+      setUpdateStatus(`Installing ${update.version}…`);
+      await update.downloadAndInstall();
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (err) {
+      setUpdateStatus(String((err as Error).message ?? err));
+    }
+  };
 
   const hostSignature = useHostSignature(app.hosts);
   useEffect(() => {
@@ -1912,6 +1994,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     info?.settings.workspaces.find(
       (workspace) => workspace.id === app.workspace?.id,
     )?.relay_url ?? "";
+  const managedRelay = relayUrl.startsWith("https://relay.patchwork.sh/r/");
 
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so
@@ -1969,6 +2052,12 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
       <Section title="Workspace">
         <Field label="Name" value={name} onChange={setName} />
         <Field
+          label="Icon"
+          value={icon}
+          onChange={(value) => setIcon([...value].slice(0, 8).join(""))}
+          placeholder="🚀"
+        />
+        <Field
           label="Task prefix"
           value={prefix}
           onChange={(value) => setPrefix(value.toUpperCase().slice(0, 6))}
@@ -1984,11 +2073,13 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           style={{ marginTop: 10 }}
           disabled={
             (!name.trim() || name === app.workspace?.name) &&
+            icon === (app.workspace?.icon ?? "") &&
             (!prefix.trim() || prefix === app.workspace?.task_prefix)
           }
           onClick={async () => {
             await api.updateWorkspace({
               name: name.trim() || undefined,
+              icon: icon.trim(),
               task_prefix: prefix.trim() || undefined,
             });
             setSaved(true);
@@ -2146,7 +2237,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             <span className="name">{relayUrl}</span>
             <span className="sub">
               {info?.hosting_relay
-                ? `served by this machine · ${app.live ? "connected" : "reconnecting…"}`
+                ? `${managedRelay ? "shared securely through Patchwork Relay" : "served by this machine"} · ${app.live ? "connected" : "reconnecting…"}`
                 : app.live
                   ? "connected"
                   : "reconnecting…"}
@@ -2161,6 +2252,26 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           </button>
         </div>
       </Section>
+
+      {inTauri && (
+        <Section title="Updates">
+          <div className="row">
+            <span className="grow">
+              <span className="name">Patchwork Desktop</span>
+              <span className="sub">
+                {updateStatus || "Signed updates from GitHub Releases"}
+              </span>
+            </span>
+            <button
+              className="button"
+              disabled={updateStatus === "Checking…" || updateStatus.startsWith("Installing ")}
+              onClick={() => void checkForUpdate()}
+            >
+              Check for updates
+            </button>
+          </div>
+        </Section>
+      )}
 
       <Section title="Account">
         <button

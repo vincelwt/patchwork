@@ -77,6 +77,12 @@ const BROWSER_KEY = "patchwork.settings";
 
 export const inTauri = "__TAURI_INTERNALS__" in window;
 
+export function parseInviteDetails(text: string): { relayUrl: string; code: string } | null {
+  const relayUrl = /Relay URL:\s*(https?:\/\/\S+)/i.exec(text)?.[1];
+  const code = /Invite code:\s*(\S+)/i.exec(text)?.[1];
+  return relayUrl && code ? { relayUrl, code } : null;
+}
+
 // Started at module load rather than at the first call: the very first thing
 // the app does is invoke a command, and fetching this chunk only then puts a
 // module round trip in front of it.

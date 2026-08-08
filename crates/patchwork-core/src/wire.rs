@@ -278,6 +278,8 @@ pub struct AnswerQuestion {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateAgent {
     pub display_name: String,
+    #[serde(default)]
+    pub is_admin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,6 +292,8 @@ pub struct CreateAgent {
 pub struct UpdateAgent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_admin: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

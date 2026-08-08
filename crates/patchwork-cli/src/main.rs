@@ -64,6 +64,20 @@ enum Command {
     Preview(PreviewArgs),
     /// Link a pull request to the current task.
     Pr { url: String },
+    /// Read and change workspace settings.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+    /// Create and manage agents.
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    /// Invite people to the workspace.
+    #[command(subcommand)]
+    Invite(InviteCommand),
+    /// Read and create channels.
+    #[command(subcommand)]
+    Channel(ChannelCommand),
+    /// Call any relay API endpoint.
+    Api(ApiArgs),
     /// Read and change tasks.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -154,6 +168,116 @@ struct PreviewArgs {
 }
 
 #[derive(Subcommand)]
+enum WorkspaceCommand {
+    Show,
+    Update {
+        #[arg(long)]
+        name: Option<String>,
+        /// A short label or emoji.
+        #[arg(long)]
+        icon: Option<String>,
+        #[arg(long)]
+        task_prefix: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    List,
+    Create {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long, default_value = "codex")]
+        runtime: String,
+        #[arg(long, default_value = "auto")]
+        location: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        thinking: Option<String>,
+        #[arg(long)]
+        admin: bool,
+    },
+    Update {
+        /// Id, @handle, or display name.
+        reference: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        runtime: Option<String>,
+        #[arg(long)]
+        location: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        thinking: Option<String>,
+        /// `true` to grant workspace administration, `false` to revoke it.
+        #[arg(long)]
+        admin: Option<bool>,
+    },
+    Delete {
+        /// Id, @handle, or display name.
+        reference: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InviteCommand {
+    List,
+    Create {
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        admin: bool,
+    },
+}
+
+#[derive(Args)]
+struct ApiArgs {
+    /// GET, POST, PATCH, or DELETE.
+    method: String,
+    /// Relay path, for example `/api/projects`.
+    path: String,
+    /// JSON, `@file.json`, or `-` for stdin.
+    #[arg(long)]
+    body: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ChannelCommand {
+    List,
+    Create {
+        name: String,
+        /// Section name. It is created when it does not exist.
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long, default_value = "")]
+        topic: String,
+    },
+    Update {
+        /// Id, #slug, or name.
+        reference: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long)]
+        topic: Option<String>,
+    },
+    Archive {
+        /// Id, #slug, or name.
+        reference: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TaskCommand {
     List {
         #[arg(long)]
@@ -207,6 +331,12 @@ enum TaskCommand {
         due: Option<String>,
         #[arg(long)]
         pr: Option<String>,
+        /// File proving the work is ready to review.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+    Delete {
+        reference: String,
     },
 }
 
@@ -348,6 +478,7 @@ async fn parse<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("unexpected response: {text}"))
 }
 
+#[derive(Clone)]
 struct RunContext {
     run_id: Option<String>,
     task_id: Option<String>,
@@ -408,6 +539,11 @@ async fn run() -> Result<()> {
         Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
         Command::Pr { url } => link_pr(&client, &ctx, url).await,
+        Command::Workspace(command) => workspace(&client, command).await,
+        Command::Agent(command) => agent(&client, command).await,
+        Command::Invite(command) => invite(&client, command).await,
+        Command::Channel(command) => channel(&client, command).await,
+        Command::Api(args) => raw_api(&client, args).await,
         Command::Task(command) => task(&client, &ctx, command).await,
         Command::Automation(command) => automation(&client, &ctx, command).await,
     }
@@ -483,6 +619,329 @@ fn channel_label(channel: &Channel) -> String {
         ChannelKind::Dm => format!("DM: {}", channel.name),
         ChannelKind::Task => channel.name.clone(),
     }
+}
+
+async fn workspace(client: &Client, command: WorkspaceCommand) -> Result<()> {
+    match command {
+        WorkspaceCommand::Show => {
+            let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+            client.print(&bootstrap.workspace, || {
+                println!("{}", bootstrap.workspace.name)
+            });
+        }
+        WorkspaceCommand::Update {
+            name,
+            icon,
+            task_prefix,
+        } => {
+            let updated: Workspace = client
+                .patch(
+                    "/api/workspace",
+                    json!({ "name": name, "icon": icon, "task_prefix": task_prefix }),
+                )
+                .await?;
+            client.print(&updated, || println!("workspace updated"));
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_agent(client: &Client, reference: &str) -> Result<Member> {
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    let wanted = reference.trim_start_matches('@');
+    bootstrap
+        .members
+        .into_iter()
+        .find(|member| {
+            member.kind == MemberKind::Agent
+                && (member.id == reference
+                    || member.handle.eq_ignore_ascii_case(wanted)
+                    || member.display_name.eq_ignore_ascii_case(wanted))
+        })
+        .ok_or_else(|| anyhow!("no agent called {reference}"))
+}
+
+fn location(value: &str) -> Result<&str> {
+    match value {
+        "auto" | "relay" | "desktop" => Ok(value),
+        _ => bail!("location must be auto, relay, or desktop"),
+    }
+}
+
+fn optional_value(value: String) -> Value {
+    if value.eq_ignore_ascii_case("none") {
+        Value::Null
+    } else {
+        Value::String(value)
+    }
+}
+
+async fn agent(client: &Client, command: AgentCommand) -> Result<()> {
+    match command {
+        AgentCommand::List => {
+            let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+            let agents: Vec<_> = bootstrap
+                .members
+                .into_iter()
+                .filter(|member| member.kind == MemberKind::Agent)
+                .collect();
+            client.print(&agents, || {
+                for agent in &agents {
+                    println!(
+                        "@{}{} — {}",
+                        agent.handle,
+                        if agent.is_admin { " (admin)" } else { "" },
+                        agent.agent.as_ref().map(|p| p.runtime.as_str()).unwrap_or("")
+                    );
+                }
+            });
+        }
+        AgentCommand::Create {
+            name,
+            description,
+            runtime,
+            location: place,
+            host,
+            model,
+            thinking,
+            admin,
+        } => {
+            let created: Member = client
+                .post(
+                    "/api/agents",
+                    json!({
+                        "display_name": name,
+                        "is_admin": admin,
+                        "profile": {
+                            "description": description,
+                            "runtime": runtime,
+                            "location": location(&place)?,
+                            "host_id": host,
+                            "dm_enabled": true,
+                            "default_participation": "mention",
+                            "channel_participation": {},
+                            "model": model,
+                            "thinking": thinking
+                        }
+                    }),
+                )
+                .await?;
+            client.print(&created, || println!("created @{}", created.handle));
+        }
+        AgentCommand::Update {
+            reference,
+            name,
+            description,
+            runtime,
+            location: place,
+            host,
+            model,
+            thinking,
+            admin,
+        } => {
+            let current = resolve_agent(client, &reference).await?;
+            let mut profile = serde_json::to_value(current.agent.unwrap_or_default())?;
+            if let Some(value) = description {
+                profile["description"] = json!(value);
+            }
+            if let Some(value) = runtime {
+                profile["runtime"] = json!(value);
+            }
+            if let Some(value) = place {
+                profile["location"] = json!(location(&value)?);
+            }
+            if let Some(value) = host {
+                profile["host_id"] = optional_value(value);
+            }
+            if let Some(value) = model {
+                profile["model"] = optional_value(value);
+            }
+            if let Some(value) = thinking {
+                profile["thinking"] = optional_value(value);
+            }
+            let updated: Member = client
+                .patch(
+                    &format!("/api/agents/{}", current.id),
+                    json!({ "display_name": name, "is_admin": admin, "profile": profile }),
+                )
+                .await?;
+            client.print(&updated, || println!("updated @{}", updated.handle));
+        }
+        AgentCommand::Delete { reference } => {
+            let agent = resolve_agent(client, &reference).await?;
+            let _: Value = client
+                .delete(&format!("/api/members/{}", agent.id))
+                .await?;
+            client.print(&json!({ "deleted": agent.id }), || {
+                println!("removed @{}", agent.handle)
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn invite(client: &Client, command: InviteCommand) -> Result<()> {
+    match command {
+        InviteCommand::List => {
+            let invites: Vec<Invite> = client.get("/api/invites").await?;
+            client.print(&invites, || {
+                for invite in &invites {
+                    println!(
+                        "{}{}{}",
+                        invite.code,
+                        invite
+                            .email
+                            .as_ref()
+                            .map(|email| format!(" — {email}"))
+                            .unwrap_or_default(),
+                        if invite.is_admin { " (admin)" } else { "" }
+                    );
+                }
+            });
+        }
+        InviteCommand::Create { email, admin } => {
+            let created: Invite = client
+                .post(
+                    "/api/invites",
+                    json!({ "email": email, "is_admin": admin }),
+                )
+                .await?;
+            client.print(&created, || {
+                let relay = client.base.split("/w/").next().unwrap_or(&client.base);
+                println!("Relay URL: {relay}\nInvite code: {}", created.code);
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn raw_api(client: &Client, args: ApiArgs) -> Result<()> {
+    use std::io::Read;
+
+    let path = if args.path.starts_with('/') {
+        args.path
+    } else {
+        format!("/{}", args.path)
+    };
+    let body = match args.body {
+        Some(value) if value == "-" => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            serde_json::from_str(&input)?
+        }
+        Some(value) if value.starts_with('@') => {
+            serde_json::from_str(&std::fs::read_to_string(&value[1..])?)?
+        }
+        Some(value) => serde_json::from_str(&value)?,
+        None => json!({}),
+    };
+    let result: Value = match args.method.to_ascii_uppercase().as_str() {
+        "GET" => client.get(&path).await?,
+        "POST" => client.post(&path, body).await?,
+        "PATCH" => client.patch(&path, body).await?,
+        "DELETE" => client.delete(&path).await?,
+        _ => bail!("method must be GET, POST, PATCH, or DELETE"),
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn resolve_public_channel(client: &Client, reference: &str) -> Result<Channel> {
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    let wanted = reference.trim_start_matches('#');
+    bootstrap
+        .channels
+        .into_iter()
+        .find(|channel| {
+            channel.kind == ChannelKind::Channel
+                && (channel.id == reference
+                    || channel.slug == wanted
+                    || channel.name.eq_ignore_ascii_case(wanted))
+        })
+        .ok_or_else(|| anyhow!("no channel called {reference}"))
+}
+
+async fn section_id(client: &Client, name: &str) -> Result<String> {
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    if let Some(section) = bootstrap
+        .sections
+        .into_iter()
+        .find(|section| section.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(section.id);
+    }
+    let section: Section = client
+        .post("/api/sections", json!({ "name": name }))
+        .await?;
+    Ok(section.id)
+}
+
+async fn channel(client: &Client, command: ChannelCommand) -> Result<()> {
+    match command {
+        ChannelCommand::List => {
+            let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+            let channels: Vec<_> = bootstrap
+                .channels
+                .iter()
+                .filter(|channel| channel.kind == ChannelKind::Channel)
+                .cloned()
+                .collect();
+            client.print(&channels, || {
+                for channel in &channels {
+                    let section = channel
+                        .section_id
+                        .as_ref()
+                        .and_then(|id| bootstrap.sections.iter().find(|section| &section.id == id))
+                        .map(|section| format!(" ({})", section.name))
+                        .unwrap_or_default();
+                    println!("#{}{}", channel.slug, section);
+                }
+            });
+        }
+        ChannelCommand::Create {
+            name,
+            section,
+            topic,
+        } => {
+            let created: Channel = client
+                .post(
+                    "/api/channels",
+                    json!({ "name": name, "section_name": section, "topic": topic }),
+                )
+                .await?;
+            client.print(&created, || println!("created #{}", created.slug));
+        }
+        ChannelCommand::Update {
+            reference,
+            name,
+            section,
+            topic,
+        } => {
+            let channel = resolve_public_channel(client, &reference).await?;
+            let section_id = match section {
+                Some(value) if value.eq_ignore_ascii_case("none") => Some(String::new()),
+                Some(value) => Some(section_id(client, &value).await?),
+                None => None,
+            };
+            let updated: Channel = client
+                .patch(
+                    &format!("/api/channels/{}", channel.id),
+                    json!({ "name": name, "section_id": section_id, "topic": topic }),
+                )
+                .await?;
+            client.print(&updated, || println!("updated #{}", updated.slug));
+        }
+        ChannelCommand::Archive { reference } => {
+            let channel = resolve_public_channel(client, &reference).await?;
+            let _: Value = client
+                .delete(&format!("/api/channels/{}", channel.id))
+                .await?;
+            client.print(&json!({ "archived": channel.id }), || {
+                println!("archived #{}", channel.slug)
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A conversation by whatever an agent is likely to have: `#deploys`, the
@@ -828,23 +1287,26 @@ async fn ask(client: &Client, ctx: &RunContext, args: AskArgs) -> Result<()> {
     Ok(())
 }
 
-async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<()> {
-    let bytes = tokio::fs::read(&args.path)
+async fn upload_attachment(
+    client: &Client,
+    ctx: &RunContext,
+    path: &str,
+    caption: &str,
+) -> Result<Attachment> {
+    let bytes = tokio::fs::read(path)
         .await
-        .with_context(|| format!("cannot read {}", args.path))?;
-    let file_name = std::path::Path::new(&args.path)
+        .with_context(|| format!("cannot read {path}"))?;
+    let file_name = std::path::Path::new(path)
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-
     let mut form = reqwest::multipart::Form::new().part(
         "file",
-        reqwest::multipart::Part::bytes(bytes).file_name(file_name.clone()),
+        reqwest::multipart::Part::bytes(bytes).file_name(file_name),
     );
     if let Some(task_id) = &ctx.task_id {
         form = form.text("task_id", task_id.clone());
     }
-
     let response = client
         .http
         .post(client.url("/api/files"))
@@ -853,21 +1315,24 @@ async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<(
         .send()
         .await?;
     let attachment: Attachment = parse(response).await?;
-
     if let Some(channel_id) = &ctx.channel_id {
         let _: Message = client
             .post(
                 &format!("/api/channels/{channel_id}/messages"),
                 json!({
-                    "body": args.caption,
+                    "body": caption,
                     "kind": "card",
-                    "card": { "type": "artifact", "attachment_id": attachment.id, "caption": args.caption },
+                    "card": { "type": "artifact", "attachment_id": attachment.id, "caption": caption },
                     "run_id": ctx.run_id,
                 }),
             )
             .await?;
     }
+    Ok(attachment)
+}
 
+async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<()> {
+    let attachment = upload_attachment(client, ctx, &args.path, &args.caption).await?;
     client.print(&attachment, || {
         println!(
             "attached {} ({} bytes)",
@@ -998,11 +1463,27 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             project,
             due,
             pr,
+            evidence,
         } => {
             let owner_id = match owner {
                 Some(handle) => Some(resolve_member(client, &handle).await?),
                 None => None,
             };
+            if let Some(path) = evidence {
+                let detail: TaskDetail = client
+                    .get(&format!("/api/tasks/{reference}"))
+                    .await?;
+                let mut evidence_ctx = ctx.clone();
+                evidence_ctx.task_id = Some(detail.task.id);
+                evidence_ctx.channel_id = Some(detail.task.discussion_channel_id);
+                upload_attachment(
+                    client,
+                    &evidence_ctx,
+                    &path,
+                    "Review evidence",
+                )
+                .await?;
+            }
             let updated: Task = client
                 .patch(
                     &format!("/api/tasks/{reference}"),
@@ -1020,6 +1501,10 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             client.print(&updated, || {
                 println!("{} is now {}", updated.key, updated.status.as_str())
             });
+        }
+        TaskCommand::Delete { reference } => {
+            let _: Value = client.delete(&format!("/api/tasks/{reference}")).await?;
+            client.print(&json!({ "deleted": reference }), || println!("task deleted"));
         }
     }
     Ok(())
@@ -1247,6 +1732,57 @@ mod tests {
     fn queries_are_encoded_for_urls() {
         assert_eq!(urlencode("checkout totals"), "checkout+totals");
         assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn a_channel_can_create_its_section() {
+        let cli = Cli::try_parse_from([
+            "patchwork",
+            "channel",
+            "create",
+            "dev",
+            "--section",
+            "Product",
+        ])
+        .unwrap();
+        let Command::Channel(ChannelCommand::Create { name, section, .. }) = cli.command else {
+            panic!("channel create was not parsed");
+        };
+        assert_eq!(name, "dev");
+        assert_eq!(section.as_deref(), Some("Product"));
+    }
+
+    #[test]
+    fn admin_commands_are_discoverable() {
+        let cli = Cli::try_parse_from([
+            "patchwork",
+            "workspace",
+            "update",
+            "--icon",
+            "🚀",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Workspace(WorkspaceCommand::Update { icon: Some(_), .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "patchwork",
+            "agent",
+            "update",
+            "@manager",
+            "--admin",
+            "true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Agent(AgentCommand::Update {
+                admin: Some(true),
+                ..
+            })
+        ));
     }
 
     #[test]

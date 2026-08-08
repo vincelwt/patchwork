@@ -7,6 +7,8 @@ use anyhow::Result;
 use clap::Parser;
 use patchwork_relay::{default_data_dir, mint_invite, start, Config};
 
+const DEFAULT_MANAGED_RELAY: &str = "https://relay.patchwork.sh";
+
 #[derive(Parser, Debug)]
 #[command(name = "patchwork-relay", version, about = "The Patchwork relay")]
 struct Args {
@@ -18,7 +20,7 @@ struct Args {
     #[arg(long, env = "PATCHWORK_PORT", default_value_t = 7727)]
     port: u16,
 
-    #[arg(long, env = "PATCHWORK_BIND", default_value = "0.0.0.0")]
+    #[arg(long, env = "PATCHWORK_BIND", default_value = "127.0.0.1")]
     bind: String,
 
     /// The URL desktops and agents should call back on.
@@ -28,6 +30,14 @@ struct Args {
     /// Name used the first time a workspace is created.
     #[arg(long, default_value = "Patchwork")]
     workspace_name: String,
+
+    /// Hosted ingress that avoids domains, certificates and inbound ports.
+    #[arg(long, env = "PATCHWORK_MANAGED_RELAY", default_value = DEFAULT_MANAGED_RELAY)]
+    managed_relay: String,
+
+    /// Listen directly instead of using the hosted ingress.
+    #[arg(long)]
+    direct: bool,
 
     /// Print a fresh admin invite code and exit.
     #[arg(long)]
@@ -57,6 +67,7 @@ async fn main() -> Result<()> {
         // A standalone relay inherits its own environment, so agents it runs
         // read the keys it was started with.
         agent_env: Vec::new(),
+        managed_relay: (!args.direct && args.public_url.is_none()).then_some(args.managed_relay),
     };
 
     // `--invite` never takes the port: it is normally run while the relay it
