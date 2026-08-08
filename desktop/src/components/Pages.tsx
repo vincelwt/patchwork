@@ -59,7 +59,7 @@ import type {
   Project,
   RuntimeInstallation,
   RuntimeOption,
-} from "../lib/types";
+} from "@client/types";
 
 /// A string that changes when the machine list meaningfully changes — a host
 /// appearing, disappearing, or going up or down — and stays put through the

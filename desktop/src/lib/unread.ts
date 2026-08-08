@@ -8,7 +8,7 @@
 // cannot support.
 
 import { useSyncExternalStore } from "react";
-import type { Channel, Id } from "./types";
+import type { Channel, Id } from "@client/types";
 
 const KEY = "patchwork.seen";
 

@@ -290,13 +290,21 @@ the execution machine.
 | `crates/patchwork-agent` | ACP client, runtime detection, worktrees, previews, run distillation |
 | `crates/patchwork-relay` | The relay binary |
 | `crates/patchwork-cli` | The `patchwork` CLI agents use |
+| `client` | Wire types and the HTTP client, shared by every TypeScript client |
 | `desktop` | Tauri app: React UI plus this machine's execution host |
+| `mobile` | Expo app for iOS and Android: a paired phone looking in |
+
+`mobile` is an early scaffold. A phone never hosts agents. Desktop will pair
+it with a device-specific key stored in the keychain; that pairing flow is not
+built yet.
 
 ```bash
-cargo test --workspace          # Rust tests
-cd desktop && npx tsc --noEmit  # frontend typecheck
-cargo run -p patchwork-relay    # run the relay
-cd desktop && npm run tauri dev # run Desktop against it
+cargo test --workspace           # Rust tests
+cd desktop && npx tsc --noEmit   # desktop typecheck
+cd mobile && npm run typecheck   # mobile typecheck
+cargo run -p patchwork-relay     # run the relay
+cd desktop && npm run tauri dev  # run Desktop against it
+cd mobile && npm start           # run the phone app against it
 ```
 
 ## License

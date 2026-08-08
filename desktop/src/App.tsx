@@ -60,7 +60,7 @@ import {
   TasksIcon,
 } from "./components/icons";
 import type { Inspector as InspectorState, View } from "./components/common";
-import type { Channel, Id, SearchResults } from "./lib/types";
+import type { Channel, Id, SearchResults } from "@client/types";
 
 export default function App() {
   const settings = useSettings();

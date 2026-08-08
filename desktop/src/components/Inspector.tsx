@@ -27,7 +27,7 @@ import {
   useAttachments,
   useHandles,
 } from "./Chat";
-import type { Id, Member, Run, RunEvent } from "../lib/types";
+import type { Id, Member, Run, RunEvent } from "@client/types";
 
 /// An optional side panel — threads, run detail, task detail. The layout never
 /// forces a permanent third column.

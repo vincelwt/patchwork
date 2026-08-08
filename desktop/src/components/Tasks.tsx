@@ -35,8 +35,8 @@ import {
 import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
-import { TASK_STATUSES } from "../lib/types";
-import type { Attachment, Id, Member, Task, TaskStatus } from "../lib/types";
+import { TASK_STATUSES } from "@client/types";
+import type { Attachment, Id, Member, Task, TaskStatus } from "@client/types";
 
 /// Everything that can be done to a task, in one place. The task page, the
 /// board card and the inspector all call this, so "Start" means the same thing

@@ -23,7 +23,7 @@ import type {
   Section,
   Task,
   Workspace,
-} from "./types";
+} from "@client/types";
 
 export interface AppData {
   status: "loading" | "ready" | "error" | "disconnected";

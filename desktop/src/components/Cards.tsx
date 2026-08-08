@@ -13,7 +13,7 @@ import {
   RunIcon,
   TasksIcon,
 } from "./icons";
-import type { MessageCard, QuestionAnswer } from "../lib/types";
+import type { MessageCard, QuestionAnswer } from "@client/types";
 
 /// Cards are how tasks, runs, questions, artifacts, previews and pull requests
 /// appear inline in a conversation — the same objects the rest of the app

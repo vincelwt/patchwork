@@ -5,7 +5,7 @@ import { markSeen } from "../lib/unread";
 import { Avatar, Chip, useNavigation } from "./common";
 import { Empty, Page } from "./ui";
 import { CheckIcon } from "./icons";
-import type { Channel, InboxItem, InboxKind, Task } from "../lib/types";
+import type { Channel, InboxItem, InboxKind, Task } from "@client/types";
 
 const LABELS: Record<InboxKind, string> = {
   mention: "Mention",
