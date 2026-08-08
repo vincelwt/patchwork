@@ -663,7 +663,10 @@ async fn apply_session_preferences(
     if let Some(level) = spec.thinking.as_deref().filter(|m| !m.is_empty()) {
         if opened.current_thinking.as_deref() == Some(level) {
             // Already what was asked for.
-        } else if let Err(err) = conn.set_thinking(session_id, level).await {
+        } else if let Err(err) = conn
+            .set_thinking(session_id, level, opened.thinking_config_id.as_deref())
+            .await
+        {
             note(format!("could not think `{level}`: {err:#}"));
         } else {
             note(format!("thinking: {level}"));
@@ -693,8 +696,9 @@ async fn apply_session_preferences(
 /// Anything unrecognised is left alone: OpenCode's `build`/`plan` are a
 /// different question, and picking one of them at random is not an answer.
 fn most_permissive(modes: &[patchwork_core::models::RuntimeOption]) -> Option<String> {
-    const WIDEST: [&str; 6] = [
+    const WIDEST: [&str; 7] = [
         "bypassPermissions",
+        "agent-full-access",
         "full-access",
         "dontAsk",
         "yolo",
@@ -1292,6 +1296,10 @@ mod tests {
         assert_eq!(
             most_permissive(&modes(&["read-only", "auto", "full-access"])),
             Some("full-access".into())
+        );
+        assert_eq!(
+            most_permissive(&modes(&["read-only", "agent", "agent-full-access"])),
+            Some("agent-full-access".into())
         );
         // Build or plan is a different question, and neither answer is "wider".
         assert_eq!(most_permissive(&modes(&["build", "plan"])), None);
