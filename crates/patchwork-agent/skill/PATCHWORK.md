@@ -18,11 +18,6 @@ patchwork search "checkout totals"   # past conversations, tasks and outcomes
 Context is available by reference: fetch what you need instead of assuming the
 prompt contained everything.
 
-Say that you tested, ran or verified something only after a matching command
-succeeds in this run. Attribute pasted or earlier evidence to its source. Test
-authentication through the tool's harmless status or read command; a wrapper
-may deliberately keep credentials out of the parent shell.
-
 ## Talk to your teammates
 
 ```bash
