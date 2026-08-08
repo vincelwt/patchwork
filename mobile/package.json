@@ -8,9 +8,12 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types ../client/mobile-store-reducer.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-community/netinfo": "12.0.1",
     "expo": "~57.0.11",
     "expo-constants": "~57.0.9",
     "expo-linking": "~57.0.5",

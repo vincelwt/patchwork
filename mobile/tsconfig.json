@@ -13,5 +13,6 @@
     "../client/**/*.ts",
     ".expo/types/**/*.ts",
     "expo-env.d.ts"
-  ]
+  ],
+  "exclude": ["../client/mobile-store-reducer.test.ts"]
 }
