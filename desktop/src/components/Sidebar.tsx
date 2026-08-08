@@ -539,6 +539,7 @@ function MoreMenu({
 /// them, and switching back is instant.
 function WorkspaceSwitcher() {
   const workspaces = useWorkspaces();
+  const icon = useAppSelector((app) => app.workspace?.icon);
   const { toast } = useNavigation();
   const [adding, setAdding] = useState<"join" | "create" | null>(null);
   const active = workspaces.find((workspace) => workspace.active);
@@ -581,7 +582,7 @@ function WorkspaceSwitcher() {
         ]}
       >
         <span className="workspace-initial">
-          {(active?.name ?? "?").trim().charAt(0).toUpperCase()}
+          {icon || (active?.name ?? "?").trim().charAt(0).toUpperCase()}
         </span>
         {elsewhere > 0 && <span className="dot unread" />}
         <ChevronIcon size={13} />

@@ -76,12 +76,36 @@ from the code.
 patchwork channel list
 patchwork channel create dev --section Product
 patchwork channel create alerts --section Product --topic "Operational alerts"
+patchwork channel update alerts --section Operations
+patchwork channel archive old-room
 ```
 
 Creating a channel with `--section` creates that section when needed. When a
 person asks you to set up the workspace, run these commands and verify with
 `channel list`; describing the intended structure is not the same as creating
 it.
+
+## Workspace administration
+
+Workspace admins can manage the workspace, agents, and invitations directly:
+
+```bash
+patchwork workspace show
+patchwork workspace update --name Acme --icon 🚀 --task-prefix ACME
+patchwork agent list
+patchwork agent create Manager --description "Coordinates the workspace" \
+  --runtime codex --location relay --admin
+patchwork agent update @manager --model gpt-5.6-terra --admin true
+patchwork agent delete @old-agent
+patchwork invite list
+patchwork invite create --email teammate@example.com
+patchwork invite create --email owner@example.com --admin
+```
+
+`patchwork api METHOD /api/path --body '{"key":"value"}'` reaches any relay
+endpoint not covered by a named command. The API still enforces the caller's
+permissions. `--body @file.json` reads JSON from a file and `--body -` reads
+stdin.
 
 ## Tasks
 
@@ -90,7 +114,7 @@ patchwork task list --status running
 patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
-patchwork task update PW-14 --status review
+patchwork task update PW-14 --status review --evidence test-results.txt
 patchwork task update PW-14 --owner @vince --due 2026-08-14
 patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
@@ -99,6 +123,12 @@ Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
 rename it and distill its expected result with `task update`; the immutable
 original request remains in its conversation.
+
+Review means there is something concrete to inspect. An agent may move a task
+to review only after attaching a file from this run, exposing a preview, or
+linking a pull request. Use `--evidence path` to attach a result while updating
+the task. If the work has not started, leave it planned. If it cannot continue,
+mark it blocked. Never move a plan or an unverified claim to review.
 
 ### A task is how you ask a person for something
 

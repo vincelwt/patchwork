@@ -307,7 +307,7 @@ export class Api {
     return this.get<SearchResults>(`/api/search?q=${encodeURIComponent(query)}`);
   }
 
-  updateWorkspace(input: { name?: string; task_prefix?: string }) {
+  updateWorkspace(input: { name?: string; icon?: string; task_prefix?: string }) {
     return this.patch<Workspace>("/api/workspace", input);
   }
 

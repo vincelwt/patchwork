@@ -974,6 +974,9 @@ pub enum PreviewStatus {
 pub struct Workspace {
     pub id: Id,
     pub name: String,
+    /// A short label or emoji shown in the workspace switcher.
+    #[serde(default)]
+    pub icon: String,
     pub created_at: Millis,
     /// What task keys start with: `PW` gives `PW-14`.
     #[serde(default = "default_task_prefix")]

@@ -76,9 +76,44 @@ function useHostSignature(hosts: Host[]): string {
 
 export function AgentsPage() {
   const app = useApp();
+  const api = useApi();
   const [editing, setEditing] = useState<Member | null>(null);
   const [creating, setCreating] = useState(false);
+  const [addingManager, setAddingManager] = useState(false);
+  const [error, setError] = useState("");
   const agents = app.members.filter((member) => member.kind === "agent");
+
+  const addManager = async () => {
+    const relay = app.hosts.find((host) => host.kind === "relay" && host.online);
+    const runtimes = relay?.capabilities.runtimes.filter(
+      (runtime) => runtime.available && runtime.id !== "custom",
+    );
+    const runtime =
+      runtimes?.find((candidate) => candidate.id === "codex") ?? runtimes?.[0];
+    setAddingManager(true);
+    setError("");
+    try {
+      await api.createAgent({
+        display_name: "Manager",
+        is_admin: app.me?.is_admin ?? false,
+        profile: {
+          description:
+            "Manages the workspace, triages requests, coordinates agents, and keeps tasks moving.",
+          runtime: runtime?.id ?? "codex",
+          location: relay ? "relay" : "auto",
+          host_id: relay?.id,
+          dm_enabled: true,
+          default_participation: "mention",
+          channel_participation: {},
+          model: runtime?.default_model,
+        },
+      });
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    } finally {
+      setAddingManager(false);
+    }
+  };
 
   return (
     <Page
@@ -95,9 +130,18 @@ export function AgentsPage() {
           title="No agents yet"
           hint="An agent is a teammate: a name, a description that defines what it owns, a runtime, and where it runs."
           action={
-            <button className="button primary" onClick={() => setCreating(true)}>
-              Create the first agent
-            </button>
+            <div className="field-row">
+              <button
+                className="button primary"
+                disabled={addingManager}
+                onClick={() => void addManager()}
+              >
+                {addingManager ? "Adding…" : "Add Manager (recommended)"}
+              </button>
+              <button className="button" onClick={() => setCreating(true)}>
+                Create a custom agent
+              </button>
+            </div>
           }
         />
       ) : (
@@ -119,6 +163,8 @@ export function AgentsPage() {
           </button>
         ))
       )}
+
+      {error && <div className="error-text">{error}</div>}
 
       {(creating || editing) && (
         <AgentModal
@@ -1912,6 +1958,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const api = useApi();
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
+  const [icon, setIcon] = useState(app.workspace?.icon ?? "");
   const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
@@ -2005,6 +2052,12 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
       <Section title="Workspace">
         <Field label="Name" value={name} onChange={setName} />
         <Field
+          label="Icon"
+          value={icon}
+          onChange={(value) => setIcon([...value].slice(0, 8).join(""))}
+          placeholder="🚀"
+        />
+        <Field
           label="Task prefix"
           value={prefix}
           onChange={(value) => setPrefix(value.toUpperCase().slice(0, 6))}
@@ -2020,11 +2073,13 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           style={{ marginTop: 10 }}
           disabled={
             (!name.trim() || name === app.workspace?.name) &&
+            icon === (app.workspace?.icon ?? "") &&
             (!prefix.trim() || prefix === app.workspace?.task_prefix)
           }
           onClick={async () => {
             await api.updateWorkspace({
               name: name.trim() || undefined,
+              icon: icon.trim(),
               task_prefix: prefix.trim() || undefined,
             });
             setSaved(true);

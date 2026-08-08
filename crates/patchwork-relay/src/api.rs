@@ -920,6 +920,11 @@ async fn create_task(
     if input.title.trim().is_empty() && input.outcome.trim().is_empty() {
         return Err(ApiError::bad_request("a task needs an expected result"));
     }
+    if caller.is_agent() && input.status == Some(TaskStatus::Review) {
+        return Err(ApiError::bad_request(
+            "an agent cannot create a task in review without review evidence",
+        ));
+    }
     if let Some(channel_id) = &input.source_channel_id {
         require_channel_access(&state, &caller, channel_id)?;
     }
@@ -968,6 +973,26 @@ async fn update_task(
         .store
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
+    if caller.is_agent() && input.status == Some(TaskStatus::Review) {
+        let run_id = caller.run_id.as_deref();
+        let has_evidence = input.pr_url.as_deref().is_some_and(|url| !url.is_empty())
+            || task.pr_url.is_some()
+            || state
+                .store
+                .task_attachments(&task.id)?
+                .iter()
+                .any(|attachment| attachment.run_id.as_deref() == run_id)
+            || state
+                .store
+                .task_previews(&task.id)?
+                .iter()
+                .any(|preview| preview.run_id.as_deref() == run_id);
+        if !has_evidence {
+            return Err(ApiError::bad_request(
+                "review needs evidence from this run: attach a file, expose a preview, or link a pull request; otherwise leave the task planned or blocked",
+            ));
+        }
+    }
     Ok(Json(
         orchestrator::update_task(&state, &caller.member.id, &task.id, input).await?,
     ))
@@ -1981,6 +2006,8 @@ async fn download_file(
 struct WorkspaceInput {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
     /// What task keys start with. Letters and digits, upper-cased.
     #[serde(default)]
     task_prefix: Option<String>,
@@ -1997,6 +2024,11 @@ async fn rename_workspace(
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty());
+    let icon = input
+        .icon
+        .as_deref()
+        .map(str::trim)
+        .map(|value| value.chars().take(8).collect::<String>());
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw
@@ -2012,7 +2044,9 @@ async fn rename_workspace(
         }
         None => None,
     };
-    let workspace = state.store.update_workspace(name, prefix.as_deref())?;
+    let workspace = state
+        .store
+        .update_workspace(name, icon.as_deref(), prefix.as_deref())?;
     state.emit(Event::WorkspaceUpdated {
         workspace: workspace.clone(),
     });
@@ -2146,6 +2180,74 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn an_agent_needs_evidence_before_review() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Offline,
+        };
+        store.insert_member(&agent).unwrap();
+        let token = auth::generate_token();
+        store
+            .insert_token(
+                &auth::hash_token(&token),
+                &agent.id,
+                "run",
+                Some("run"),
+                None,
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let task = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "Do it".into(),
+                outcome: "A result exists".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/tasks/{}", task.id))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"status":"review"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Planned
+        );
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
