@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useApp, useAppSelector } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
-import { Avatar, Chip, useNavigation } from "./common";
+import { Avatar, Chip, proseText, useNavigation } from "./common";
 import { Empty } from "./ui";
 import { Card } from "./Cards";
 import { Markdown } from "./Markdown";
@@ -27,7 +27,6 @@ import {
   useAttachments,
   useHandles,
 } from "./Chat";
-import { proseText } from "./common";
 import type { Id, Member, Run, RunEvent } from "../lib/types";
 
 /// An optional side panel — threads, run detail, task detail. The layout never
@@ -242,7 +241,7 @@ function SteerBox({ run, agent }: { run: Run; agent?: Member }) {
   const empty = !text.trim() && files.pending.length === 0;
 
   const send = async (mode: "queue" | "interrupt") => {
-    if (empty || busy) return;
+    if (empty || busy || files.uploading > 0) return;
     setBusy(true);
     setError("");
     try {
@@ -290,11 +289,10 @@ function SteerBox({ run, agent }: { run: Run; agent?: Member }) {
         />
         <div className="composer-row">
           <AttachButton onFiles={(picked) => void files.attach(picked)} />
-          <span className="composer-hint">↵ queues · ⌘↵ interrupts</span>
           <span className="spacer" />
           <button
             className="button quiet"
-            disabled={busy || empty}
+            disabled={busy || empty || files.uploading > 0}
             title="Stop what it is doing and hand it this now"
             onClick={() => void send("interrupt")}
           >
@@ -302,7 +300,7 @@ function SteerBox({ run, agent }: { run: Run; agent?: Member }) {
           </button>
           <button
             className="button primary"
-            disabled={busy || empty}
+            disabled={busy || empty || files.uploading > 0}
             title="Wait for the end of the current turn"
             onClick={() => void send("queue")}
           >

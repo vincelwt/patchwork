@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
+import { useFileUrl } from "../lib/file";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
 import { readTask } from "../lib/task";
@@ -565,10 +566,12 @@ function RunMeta({ run }: { run: Run }) {
 /// An image someone dropped in should be visible without a download step.
 export function Attached({ attachment }: { attachment: Attachment }) {
   const api = useApi();
-  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
+  const image = attachment.mime.startsWith("image/");
+  const url = useFileUrl(image ? attachment.url : "");
   const [broken, setBroken] = useState(false);
 
-  if (attachment.mime.startsWith("image/") && !broken) {
+  if (image && !broken) {
+    if (!url) return <span className="attachment-chip">Loading image…</span>;
     return (
       <a href={url} target="_blank" rel="noreferrer noopener" className="image-attachment">
         <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
@@ -579,7 +582,7 @@ export function Attached({ attachment }: { attachment: Attachment }) {
     <AttachmentRow
       fileName={attachment.file_name}
       size={attachment.size}
-      url={url}
+      onOpen={() => void api.openFile(attachment.url)}
     />
   );
 }
@@ -689,7 +692,7 @@ function busyWord(status: string) {
 /// Files on their way into a message: uploaded the moment they are chosen, so
 /// sending is only ever a list of ids.
 ///
-/// Shared by the message composer and the run control box — one upload path,
+/// Shared by the message composer and the run control box: one upload path,
 /// one row of chips, one place that knows what to do with a paste.
 export function useAttachments({
   incoming,
@@ -763,6 +766,7 @@ export function useAttachments({
 
   return {
     pending,
+    uploading,
     attach,
     strip,
     clear: useCallback(() => setPending([]), []),
@@ -839,7 +843,7 @@ export function Composer({
   }, []);
 
   const send = async () => {
-    if (!text.trim() && files.pending.length === 0) return;
+    if (files.uploading > 0 || (!text.trim() && files.pending.length === 0)) return;
     setBusy(true);
     try {
       await api.send(channel.id, {
@@ -895,6 +899,8 @@ export function Composer({
         return `Feedback for ${state.owner.display_name}`;
       case "review":
         return "Request changes";
+      case "done":
+        return "Message this completed task";
       default:
         return `Send and resume ${state.owner.display_name}`;
     }
@@ -988,7 +994,9 @@ export function Composer({
           <span className="spacer" />
           <button
             className="send-button"
-            disabled={busy || (!text.trim() && files.pending.length === 0)}
+            disabled={
+              busy || files.uploading > 0 || (!text.trim() && files.pending.length === 0)
+            }
             onClick={send}
             title="Send"
           >
@@ -1010,14 +1018,13 @@ function PendingAttachment({
   attachment: Attachment;
   onRemove: () => void;
 }) {
-  const api = useApi();
-  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
   const isImage = attachment.mime.startsWith("image/");
+  const url = useFileUrl(isImage ? attachment.url : "");
 
   return (
     <span className={`pending-attachment${isImage ? " image" : ""}`}>
       {isImage ? (
-        <img src={url} alt={attachment.file_name} />
+        url ? <img src={url} alt={attachment.file_name} /> : <Spinner size={13} />
       ) : (
         <span className="file">
           <span className="name">{attachment.file_name}</span>

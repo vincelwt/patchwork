@@ -33,6 +33,7 @@ pub struct RunnerConfig {
 pub struct RunHandle {
     control: mpsc::UnboundedSender<RelayToHost>,
     task: tokio::task::JoinHandle<()>,
+    accepting: bool,
 }
 
 pub struct Runner {
@@ -77,10 +78,25 @@ impl Runner {
                     token_usage: None,
                 });
             }
-            RelayToHost::AnswerQuestion { ref run_id, .. }
-            | RelayToHost::FollowUp { ref run_id, .. } => {
+            RelayToHost::AnswerQuestion { ref run_id, .. } => {
                 if let Some(h) = self.running.lock().await.get(run_id) {
                     let _ = h.control.send(msg.clone());
+                }
+            }
+            RelayToHost::FollowUp {
+                ref run_id,
+                ref control_id,
+                ..
+            } => {
+                let running = self.running.lock().await;
+                if let Some(h) = running.get(run_id).filter(|handle| handle.accepting) {
+                    let _ = h.control.send(msg.clone());
+                } else {
+                    self.emit(HostToRelay::RunControlStatus {
+                        run_id: run_id.clone(),
+                        control_id: control_id.clone(),
+                        state: RunControlState::Rejected,
+                    });
                 }
             }
             RelayToHost::StartPreview {
@@ -145,8 +161,15 @@ impl Runner {
             RunHandle {
                 control: control_tx,
                 task,
+                accepting: true,
             },
         );
+    }
+
+    async fn set_accepting(&self, run_id: &str, accepting: bool) {
+        if let Some(handle) = self.running.lock().await.get_mut(run_id) {
+            handle.accepting = accepting;
+        }
     }
 
     fn emit(&self, msg: HostToRelay) {
@@ -187,7 +210,7 @@ const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(14
 struct QueuedControl {
     control_id: Id,
     prompt: String,
-    files: Vec<RunFile>,
+    files: Vec<String>,
 }
 
 /// Interrupting feedback goes next; ordinary feedback keeps arrival order.
@@ -204,6 +227,16 @@ fn queue_control(
     } else {
         pending.push_back(control);
         false
+    }
+}
+
+fn reject_pending(pending: &mut VecDeque<QueuedControl>, run_id: &str, out: &Sink) {
+    for control in pending.drain(..) {
+        let _ = out.send(HostToRelay::RunControlStatus {
+            run_id: run_id.to_string(),
+            control_id: control.control_id,
+            state: RunControlState::Rejected,
+        });
     }
 }
 
@@ -433,6 +466,7 @@ async fn execute(
                 result = &mut prompt_call => break result,
                 cmd = control.recv() => match cmd {
                     Some(RelayToHost::FollowUp { control_id, prompt, mode, files, .. }) => {
+                        let files = fetch_files(&prepared.path, &files).await;
                         emit(HostToRelay::RunControlStatus {
                             run_id: run_id.clone(),
                             control_id: control_id.clone(),
@@ -474,6 +508,17 @@ async fn execute(
             Ok(reason) => reason,
             Err(_) if interrupted => "cancelled".to_string(),
             Err(err) => {
+                runner.set_accepting(&run_id, false).await;
+                reject_pending(&mut pending, &run_id, &out);
+                while let Ok(cmd) = control.try_recv() {
+                    if let RelayToHost::FollowUp { control_id, .. } = cmd {
+                        emit(HostToRelay::RunControlStatus {
+                            run_id: run_id.clone(),
+                            control_id,
+                            state: RunControlState::Rejected,
+                        });
+                    }
+                }
                 let detail = {
                     let s = state.lock().await;
                     if s.stderr.is_empty() {
@@ -495,6 +540,12 @@ async fn execute(
             data: None,
         });
 
+        let closed = pending.is_empty();
+        if closed {
+            // Close under the same lock used by `handle`, then drain anything
+            // accepted just before the close. Nothing can now land unread.
+            runner.set_accepting(&run_id, false).await;
+        }
         let mut between_turns = false;
         while let Ok(cmd) = control.try_recv() {
             match cmd {
@@ -505,6 +556,7 @@ async fn execute(
                     files,
                     ..
                 } => {
+                    let files = fetch_files(&prepared.path, &files).await;
                     emit(HostToRelay::RunControlStatus {
                         run_id: run_id.clone(),
                         control_id: control_id.clone(),
@@ -526,14 +578,17 @@ async fn execute(
             }
         }
         if stop_run {
+            reject_pending(&mut pending, &run_id, &out);
             break;
         }
 
         if let Some(queued) = pending.pop_front() {
-            let paths = fetch_files(&prepared.path, &queued.files).await;
+            if closed {
+                runner.set_accepting(&run_id, true).await;
+            }
             next = Some((
                 Some(queued.control_id),
-                compose_follow_up(&queued.prompt, &paths),
+                compose_follow_up(&queued.prompt, &queued.files),
             ));
         }
     }
@@ -1091,7 +1146,13 @@ async fn fetch_files(cwd: &str, files: &[RunFile]) -> Vec<String> {
         let name = unique_name(&mut taken, &file.file_name);
         let path = dir.join(&name);
         let bytes = match client.get(&file.url).send().await {
-            Ok(response) => response.bytes().await.ok(),
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response.bytes().await.ok(),
+                Err(err) => {
+                    tracing::warn!(?err, file = %file.file_name, "could not fetch a task file");
+                    None
+                }
+            },
             Err(err) => {
                 tracing::warn!(?err, file = %file.file_name, "could not fetch a task file");
                 None

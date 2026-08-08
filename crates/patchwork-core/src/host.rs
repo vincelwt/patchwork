@@ -118,6 +118,7 @@ pub enum RunControlMode {
 pub enum RunControlState {
     Queued,
     Started,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

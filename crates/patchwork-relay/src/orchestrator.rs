@@ -461,6 +461,52 @@ async fn trigger_agents(
         None => -1,
     };
 
+    // Ownership can change while work is running. Feedback belongs to the
+    // task's actual writer first, not whoever currently owns the card.
+    if author.kind == MemberKind::Human
+        && message.mentions.is_empty()
+        && channel.kind == ChannelKind::Task
+    {
+        let active = channel
+            .task_id
+            .as_deref()
+            .and_then(|id| state.store.task(id).ok().flatten())
+            .and_then(|task| task.current_run_id)
+            .and_then(|id| state.store.run(&id).ok().flatten())
+            .filter(|run| !run.status.is_terminal());
+        if let Some(active) = active {
+            talk_where(state, &active.id, message).await;
+            let attachment_ids = message
+                .attachments
+                .iter()
+                .map(|attachment| attachment.id.clone())
+                .collect::<Vec<_>>();
+            let prompt = format!(
+                "{} just said:\n\n{}",
+                display_name_of(members, &message.author_id),
+                message.body
+            );
+            if let Err(err) = deliver_control(
+                state,
+                &active,
+                new_id(),
+                prompt,
+                RunControlMode::Queue,
+                run_files(state, &attachment_ids)?,
+            )
+            .await
+            {
+                let _ = post_system(
+                    state,
+                    &channel.id,
+                    &format!("Could not deliver that feedback: {err}"),
+                )
+                .await;
+            }
+            return Ok(());
+        }
+    }
+
     // Who you are plainly still talking to.
     //
     // A person answers the agent that just answered them without saying its
@@ -672,8 +718,8 @@ fn run_files(state: &Shared, attachment_ids: &[Id]) -> Result<Vec<RunFile>> {
             .attachment(id)?
             .ok_or_else(|| anyhow!("attachment not found"))?;
         files.push(RunFile {
-            file_name: attachment.file_name,
-            url: format!("{}{}", state.public_url, attachment.url),
+            file_name: attachment.file_name.clone(),
+            url: state.grant_file(&attachment),
         });
     }
     Ok(files)
@@ -757,6 +803,17 @@ fn post_control_note(
     Ok(stored)
 }
 
+fn run_conversation(state: &Shared, run: &Run) -> Result<Id> {
+    match &run.task_id {
+        Some(task_id) => state
+            .store
+            .task(task_id)?
+            .map(|task| task.discussion_channel_id)
+            .ok_or_else(|| anyhow!("task not found")),
+        None => Ok(run.channel_id.clone()),
+    }
+}
+
 /// Prompt an exact active ACP run, independent of where either run is talking.
 pub async fn steer_run(
     state: &Shared,
@@ -791,33 +848,6 @@ pub async fn steer_run(
                 .run(id)?
                 .filter(|run| !run.status.is_terminal() && run.agent_id == author_id)
                 .ok_or_else(|| anyhow!("the source run is not active"))?;
-            let direct: Vec<_> = state
-                .store
-                .run_events(id, 0)?
-                .into_iter()
-                .filter(|event| {
-                    event
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("target_run_id"))
-                        .is_some()
-                })
-                .collect();
-            if direct.len() >= 16
-                || direct
-                    .iter()
-                    .filter(|event| {
-                        event
-                            .data
-                            .as_ref()
-                            .and_then(|data| data.get("target_run_id"))
-                            == Some(&serde_json::Value::String(target_run_id.to_string()))
-                    })
-                    .count()
-                    >= 4
-            {
-                bail!("this run has reached its cross-session message limit");
-            }
             Some(run)
         }
         None => None,
@@ -828,6 +858,26 @@ pub async fn steer_run(
     let target_name = display_name_of(&members, &target.agent_id);
     let control_id = new_id();
     let summary = if prompt.is_empty() { "Attached file(s)" } else { prompt };
+    if let Some(source) = &source {
+        let mut event = RunEvent {
+            id: new_id(),
+            run_id: source.id.clone(),
+            seq: 0,
+            kind: RunEventKind::Message,
+            text: format!("Message to {target_name}: {summary}"),
+            data: Some(json!({
+                "control_id": control_id.clone(),
+                "target_run_id": target.id.clone(),
+                "mode": input.mode,
+                "direction": "outbound",
+            })),
+            created_at: now_ms(),
+        };
+        state
+            .store
+            .reserve_direct_control(&mut event, &target.id)?;
+        state.emit(Event::RunEventAppended { event });
+    }
     let delivered = if prompt.is_empty() {
         "Review the attached file(s).".to_string()
     } else if source.is_some() {
@@ -837,7 +887,7 @@ pub async fn steer_run(
     } else {
         format!("{sender} sent steering feedback:\n\n{prompt}")
     };
-    deliver_control(
+    if let Err(err) = deliver_control(
         state,
         &target,
         control_id.clone(),
@@ -845,16 +895,29 @@ pub async fn steer_run(
         input.mode,
         run_files(state, &input.attachment_ids)?,
     )
-    .await?;
+    .await
+    {
+        if let Some(source) = &source {
+            append_run_event(
+                state,
+                &source.id,
+                RunEventKind::Error,
+                format!("Could not message {target_name}: {err}"),
+                Some(json!({ "control_id": control_id.clone() })),
+            )?;
+        }
+        return Err(err);
+    }
 
     let note = if source.is_some() {
         format!("{sender} → {target_name}: {summary}")
     } else {
         format!("Feedback for {target_name}: {summary}")
     };
+    let target_channel = run_conversation(state, &target)?;
     let target_note = post_control_note(
         state,
-        &target.channel_id,
+        &target_channel,
         author_id,
         source_run_id,
         note.clone(),
@@ -875,22 +938,11 @@ pub async fn steer_run(
         })),
     )?;
     if let Some(source) = &source {
-        append_run_event(
-            state,
-            &source.id,
-            RunEventKind::Message,
-            format!("Sent to {target_name}: {summary}"),
-            Some(json!({
-                "control_id": control_id.clone(),
-                "target_run_id": target.id.clone(),
-                "mode": input.mode,
-                "direction": "outbound",
-            })),
-        )?;
-        if source.channel_id != target.channel_id {
+        let source_channel = run_conversation(state, source)?;
+        if source_channel != target_channel {
             post_control_note(
                 state,
-                &source.channel_id,
+                &source_channel,
                 author_id,
                 Some(&source.id),
                 note,
@@ -1205,8 +1257,8 @@ fn task_files(state: &Shared, task: &Option<Task>) -> Vec<RunFile> {
         .unwrap_or_default()
         .into_iter()
         .map(|attachment| RunFile {
-            file_name: attachment.file_name,
-            url: format!("{}{}", state.public_url, attachment.url),
+            file_name: attachment.file_name.clone(),
+            url: state.grant_file(&attachment),
         })
         .collect()
 }
@@ -1319,6 +1371,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let label = match control_state {
                 RunControlState::Queued => "Steering queued",
                 RunControlState::Started => "Steering delivered",
+                RunControlState::Rejected => "Steering rejected: the ACP run is no longer active",
             };
             append_run_event(
                 state,
@@ -1608,7 +1661,7 @@ fn discussion_channel(state: &Shared, task_id: &str) -> Result<Id> {
 }
 
 /// A finished run updates the board and the Inbox so nothing silently stalls.
-async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
+pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
     // that is the honest record — but nothing may rewrite it after this.
     if let Some(message_id) = state.streaming_messages.write().await.remove(&run.id) {
@@ -1834,13 +1887,18 @@ async fn create_task_inner(
 
     // A long voice transcript is source material, not the board title. Keep it
     // as the first human message so later title/outcome cleanup cannot erase it.
-    if task.source_message_id.is_none() && !task.outcome.trim().is_empty() {
+    if task.source_message_id.is_none() {
+        let original_request = if task.outcome.trim().is_empty() {
+            task.title.clone()
+        } else {
+            task.outcome.clone()
+        };
         let original = post_message(
             state,
             &task.discussion_channel_id,
             creator_id,
             SendMessage {
-                body: task.outcome.clone(),
+                body: original_request,
                 attachment_ids: input.attachment_ids.clone(),
                 ..Default::default()
             },

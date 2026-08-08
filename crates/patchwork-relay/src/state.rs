@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use patchwork_core::events::{Envelope, Event};
@@ -30,6 +30,8 @@ pub struct AppState {
     /// not read off the run's trigger. Runs do not outlive the process, so
     /// neither does this.
     pub run_threads: RwLock<HashMap<Id, Option<Id>>>,
+    /// Short-lived capabilities for execution hosts fetching attached files.
+    pub file_grants: StdMutex<HashMap<Id, (Id, Millis)>>,
     pub files_dir: PathBuf,
     /// The URL desktops and agents should call back on.
     pub public_url: String,
@@ -50,6 +52,7 @@ impl AppState {
             question_waiters: RwLock::new(HashMap::new()),
             streaming_messages: RwLock::new(HashMap::new()),
             run_threads: RwLock::new(HashMap::new()),
+            file_grants: StdMutex::new(HashMap::new()),
             files_dir,
             public_url,
             relay_host_id,
@@ -93,6 +96,24 @@ impl AppState {
     }
 
     /// Hosts as stored, with live connection state merged in.
+    pub fn grant_file(&self, attachment: &Attachment) -> String {
+        let token = patchwork_core::new_id();
+        let expires = now_ms() + 2 * 60 * 60 * 1000;
+        if let Ok(mut grants) = self.file_grants.lock() {
+            grants.retain(|_, (_, expiry)| *expiry > now_ms());
+            grants.insert(token.clone(), (attachment.id.clone(), expires));
+        }
+        format!("{}{}?grant={token}", self.public_url, attachment.url)
+    }
+
+    pub fn valid_file_grant(&self, attachment_id: &str, token: &str) -> bool {
+        self.file_grants
+            .lock()
+            .ok()
+            .and_then(|grants| grants.get(token).cloned())
+            .is_some_and(|(id, expires)| id == attachment_id && expires > now_ms())
+    }
+
     pub async fn hosts_with_presence(&self) -> Result<Vec<Host>> {
         let online = self.online_host_ids().await;
         let mut hosts = self.store.hosts()?;

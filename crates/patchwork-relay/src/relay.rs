@@ -174,10 +174,10 @@ impl Relay {
             relay_host_id,
         ));
 
+        reconcile_interrupted_runs(&state).await;
         let runner = start_hosted_execution(&state, self.agent_env.clone());
         tokio::spawn(automations::scheduler(state.clone()));
         tokio::spawn(github::watcher(state.clone()));
-        reconcile_interrupted_runs(&state).await;
 
         let router = api::router(state.clone());
         self.mounted.write().await.insert(
@@ -334,7 +334,10 @@ async fn reconcile_interrupted_runs(state: &Shared) {
         if state.store.update_run(&run).is_ok() {
             state.store.revoke_run_tokens(&run.id).ok();
             state.store.cancel_questions_for_run(&run.id).ok();
-            state.emit(Event::RunUpdated { run });
+            state.emit(Event::RunUpdated { run: run.clone() });
+            if let Err(err) = orchestrator::finish_run(state, &run).await {
+                tracing::warn!(?err, run = %run.id, "could not finish interrupted run");
+            }
         }
     }
 }

@@ -612,11 +612,10 @@ export function NewTaskModal({
             ]}
           />
           <DueField value={due} onChange={setDue} />
-          <label className="attach-button" title="Attach an image">
+          <label className="attach-button" title="Attach evidence">
             <AttachIcon size={15} />
             <input
               type="file"
-              accept="image/*"
               multiple
               hidden
               onChange={(event) => {
@@ -704,7 +703,11 @@ function PendingImage({ file, onRemove }: { file: File; onRemove: () => void }) 
 
   return (
     <span className="pending-image">
-      <img src={url} alt={file.name} />
+      {file.type.startsWith("image/") ? (
+        <img src={url} alt={file.name} />
+      ) : (
+        <span className="attachment-chip">{file.name}</span>
+      )}
       <button className="remove" title="Remove" onClick={onRemove}>
         ×
       </button>
@@ -715,7 +718,7 @@ function PendingImage({ file, onRemove }: { file: File; onRemove: () => void }) 
 /// Screenshots and other evidence pinned to a task.
 ///
 /// Files arrive through the discussion composer, which uploads them against
-/// the task as well as the message — one upload, evidence in both places, and
+/// the task as well as the message: one upload, evidence in both places, and
 /// on the machine that runs the task as a file the agent opens by path. So
 /// this strip only has to keep up with the conversation.
 function TaskFiles({ taskId, channelId }: { taskId: Id; channelId: Id }) {
@@ -1166,9 +1169,7 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
             <button
               key={attachment.id}
               className="row"
-              onClick={() =>
-                openExternal(`${api.baseUrl.replace(/\/$/, "")}${attachment.url}`)
-              }
+              onClick={() => void api.openFile(attachment.url)}
             >
               <span className="grow">
                 <span className="name">{attachment.file_name}</span>

@@ -623,10 +623,14 @@ impl Store {
             )?;
         }
         for attachment in &message.attachments {
-            tx.execute(
-                "UPDATE attachments SET message_id = ?2, task_id = COALESCE(task_id, ?3) WHERE id = ?1",
+            let claimed = tx.execute(
+                "UPDATE attachments SET message_id = ?2, task_id = COALESCE(task_id, ?3)
+                 WHERE id = ?1 AND message_id IS NULL",
                 params![attachment.id, message.id, message.task_id],
             )?;
+            if claimed != 1 {
+                return Err(anyhow!("an attachment already belongs to another message"));
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1322,6 +1326,48 @@ impl Store {
             .optional()?)
     }
 
+    /// Reserve one explicit cross-session message and enforce its loop budget
+    /// in the same write transaction, so concurrent sends cannot race it.
+    pub fn reserve_direct_control(
+        &self,
+        event: &mut RunEvent,
+        target_run_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?1
+             AND json_extract(data, '$.direction') = 'outbound'",
+            params![event.run_id],
+            |row| row.get(0),
+        )?;
+        let pair: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?1
+             AND json_extract(data, '$.direction') = 'outbound'
+             AND json_extract(data, '$.target_run_id') = ?2",
+            params![event.run_id, target_run_id],
+            |row| row.get(0),
+        )?;
+        if total >= 16 || pair >= 4 {
+            return Err(anyhow!("this run has reached its cross-session message limit"));
+        }
+        event.seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+            params![event.run_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO run_events (id, run_id, seq, kind, text, data, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                event.id, event.run_id, event.seq,
+                serde_json::to_string(&event.kind).unwrap_or_default().trim_matches('"'),
+                event.text, event.data.as_ref().map(to_json), event.created_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn append_run_event(&self, event: &RunEvent) -> Result<()> {
         self.conn()?.execute(
             "INSERT INTO run_events (id, run_id, seq, kind, text, data, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -1950,6 +1996,44 @@ mod tests {
     }
 
     #[test]
+    fn direct_messages_reserve_their_pair_budget_atomically() {
+        let (store, path) = store();
+        for index in 0..4 {
+            let mut event = RunEvent {
+                id: format!("event-{index}"),
+                run_id: "source".into(),
+                seq: 0,
+                kind: RunEventKind::Message,
+                text: "coordination".into(),
+                data: Some(serde_json::json!({
+                    "direction": "outbound",
+                    "target_run_id": "target",
+                })),
+                created_at: index,
+            };
+            store
+                .reserve_direct_control(&mut event, "target")
+                .unwrap();
+            assert_eq!(event.seq, index + 1);
+        }
+        let mut extra = RunEvent {
+            id: "extra".into(),
+            run_id: "source".into(),
+            seq: 0,
+            kind: RunEventKind::Message,
+            text: "too many".into(),
+            data: Some(serde_json::json!({
+                "direction": "outbound",
+                "target_run_id": "target",
+            })),
+            created_at: 5,
+        };
+        assert!(store.reserve_direct_control(&mut extra, "target").is_err());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn a_task_message_pins_its_attachment_to_both_records() {
         let (store, path) = store();
         store
@@ -2002,6 +2086,19 @@ mod tests {
         let attached = store.attachment("file").unwrap().unwrap().0;
         assert_eq!(attached.message_id.as_deref(), Some("message"));
         assert_eq!(attached.task_id.as_deref(), Some("task"));
+        let mut duplicate = store.message("message").unwrap().unwrap();
+        duplicate.id = "other-message".into();
+        assert!(store.insert_message(&duplicate).is_err());
+        assert_eq!(
+            store
+                .attachment("file")
+                .unwrap()
+                .unwrap()
+                .0
+                .message_id
+                .as_deref(),
+            Some("message")
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
     }

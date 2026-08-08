@@ -83,8 +83,22 @@ export class Api {
     return this.request<T>("DELETE", path);
   }
 
-  fileUrl(attachment: Attachment) {
-    return this.url(attachment.url);
+  async file(path: string) {
+    const response = await fetch(this.url(path), {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    if (!response.ok) throw new ApiError("Could not open that file", response.status);
+    return response.blob();
+  }
+
+  async openFile(path: string) {
+    const url = URL.createObjectURL(await this.file(path));
+    const link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noreferrer noopener";
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
   bootstrap() {

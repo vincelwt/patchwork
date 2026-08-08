@@ -1,7 +1,7 @@
 //! The HTTP API. Desktop, the agent CLI, and any future mobile client all
 //! speak exactly this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
@@ -333,6 +333,17 @@ async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthRes
 
 async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Bootstrap>> {
     let members = state.members_with_presence().await?;
+    let channels = visible_channels(&state, &caller)?;
+    let visible_ids = channels
+        .iter()
+        .map(|channel| channel.id.clone())
+        .collect::<HashSet<_>>();
+    let active_runs = state
+        .store
+        .active_runs()?
+        .into_iter()
+        .filter(|run| visible_ids.contains(&run.channel_id))
+        .collect();
     let me = members
         .iter()
         .find(|m| m.id == caller.member.id)
@@ -344,14 +355,14 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
         me,
         members,
         sections: state.store.sections()?,
-        channels: visible_channels(&state, &caller)?,
+        channels,
         projects: state.store.projects()?,
         hosts: state.hosts_with_presence().await?,
         tasks: state.store.tasks()?,
         inbox: state.store.inbox(&caller.member.id, false)?,
         automations: state.store.automations()?,
         open_questions: state.store.open_questions()?,
-        active_runs: state.store.active_runs()?,
+        active_runs,
         previews: state.store.previews(true)?,
         seq: state.store.latest_seq()?,
     }))
@@ -359,13 +370,50 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
 
 /// Channels and task discussions belong to the workspace — a board everyone can
 /// see would be useless if its conversations were private. Only DMs are.
+fn require_channel_access(state: &Shared, caller: &Caller, channel_id: &str) -> ApiResult<()> {
+    let channel = state
+        .store
+        .channel(channel_id)?
+        .ok_or_else(|| ApiError::not_found("conversation not found"))?;
+    if channel.kind == ChannelKind::Dm && !channel.member_ids.contains(&caller.member.id) {
+        return Err(ApiError::forbidden("that belongs to a private conversation"));
+    }
+    Ok(())
+}
+
+fn require_run_access(state: &Shared, caller: &Caller, run: &Run) -> ApiResult<()> {
+    require_channel_access(state, caller, &run.channel_id)
+}
+
+fn require_attachment_access(
+    state: &Shared,
+    caller: &Caller,
+    attachment: &Attachment,
+) -> ApiResult<()> {
+    if let Some(message_id) = &attachment.message_id {
+        let message = state
+            .store
+            .message(message_id)?
+            .ok_or_else(|| ApiError::not_found("message not found"))?;
+        return require_channel_access(state, caller, &message.channel_id);
+    }
+    if let Some(run_id) = &attachment.run_id {
+        let run = state
+            .store
+            .run(run_id)?
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        return require_run_access(state, caller, &run);
+    }
+    Ok(())
+}
+
 fn visible_channels(state: &Shared, caller: &Caller) -> ApiResult<Vec<Channel>> {
     let channels = state.store.channels()?;
     Ok(channels
         .into_iter()
         .filter(|c| match c.kind {
             ChannelKind::Channel | ChannelKind::Task => true,
-            ChannelKind::Dm => c.member_ids.contains(&caller.member.id) || caller.is_agent(),
+            ChannelKind::Dm => c.member_ids.contains(&caller.member.id),
         })
         .collect())
 }
@@ -843,13 +891,14 @@ struct AfterQuery {
 
 async fn run_detail(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<RunDetail>> {
     let run = state
         .store
         .run(&id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     Ok(Json(RunDetail {
         events: state.store.run_events(&id, 0)?,
         questions: state.store.run_questions(&id)?,
@@ -859,10 +908,15 @@ async fn run_detail(
 
 async fn run_events(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Query(query): Query<AfterQuery>,
 ) -> ApiResult<Json<Vec<RunEvent>>> {
+    let run = state
+        .store
+        .run(&id)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     Ok(Json(state.store.run_events(&id, query.after)?))
 }
 
@@ -872,6 +926,22 @@ async fn steer_run(
     Path(id): Path<Id>,
     Json(input): Json<SteerRun>,
 ) -> ApiResult<Json<SteerRunResponse>> {
+    let target = state
+        .store
+        .run(&id)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &target)?;
+    for attachment_id in &input.attachment_ids {
+        let attachment = state
+            .store
+            .attachment(attachment_id)?
+            .map(|(attachment, _)| attachment)
+            .ok_or_else(|| ApiError::not_found("attachment not found"))?;
+        require_attachment_access(&state, &caller, &attachment)?;
+        if attachment.message_id.is_some() {
+            return Err(ApiError::conflict("that attachment was already sent"));
+        }
+    }
     if caller.is_agent() && input.mode == patchwork_core::host::RunControlMode::Interrupt {
         return Err(ApiError::forbidden(
             "agents may queue messages, not interrupt another run",
@@ -890,13 +960,14 @@ async fn steer_run(
 
 async fn cancel_run(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
     let run = state
         .store
         .run(&id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     if let Some(host_id) = &run.host_id {
         state
             .send_to_host(host_id, RelayToHost::CancelRun { run_id: id.clone() })
@@ -1627,15 +1698,36 @@ async fn upload_file(
     Ok(Json(attachment))
 }
 
+#[derive(Deserialize, Default)]
+struct FileQuery {
+    #[serde(default)]
+    grant: Option<String>,
+}
+
 async fn download_file(
     State(state): State<Shared>,
     Path(id): Path<Id>,
+    Query(query): Query<FileQuery>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
+    let member = bearer(&headers)
+        .ok()
+        .and_then(|token| auth::authenticate(&state, &token));
+    let granted = query
+        .grant
+        .as_deref()
+        .is_some_and(|token| state.valid_file_grant(&id, token));
+    if member.is_none() && !granted {
+        return Err(ApiError::unauthorized("a valid file grant or workspace token is required"));
+    }
     let (attachment, path) = state
         .store
         .attachment(&id)?
         .ok_or_else(|| ApiError::not_found("file not found"))?;
+    if let Some(caller) = &member {
+        require_attachment_access(&state, caller, &attachment)?;
+    }
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| ApiError::not_found("file is no longer on disk"))?;

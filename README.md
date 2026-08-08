@@ -268,6 +268,8 @@ token scoped to that run and revoked when it ends.
 
 ```bash
 patchwork status "Reproduced with a Europe/Berlin fixture"
+patchwork runs
+patchwork tell MER-41 "The API field is now display_name"
 patchwork ask --question "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
 patchwork task update MER-41 --status review
