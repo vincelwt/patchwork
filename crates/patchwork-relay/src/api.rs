@@ -974,20 +974,12 @@ async fn update_task(
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     if caller.is_agent() && input.status == Some(TaskStatus::Review) {
-        let run_id = caller.run_id.as_deref();
-        let has_evidence = input.pr_url.as_deref().is_some_and(|url| !url.is_empty())
-            || task.pr_url.is_some()
-            || state
-                .store
-                .task_attachments(&task.id)?
-                .iter()
-                .any(|attachment| attachment.run_id.as_deref() == run_id)
-            || state
-                .store
-                .task_previews(&task.id)?
-                .iter()
-                .any(|preview| preview.run_id.as_deref() == run_id);
-        if !has_evidence {
+        if !orchestrator::has_review_evidence(
+            &state,
+            &task,
+            caller.run_id.as_deref(),
+            input.pr_url.as_deref(),
+        )? {
             return Err(ApiError::bad_request(
                 "review needs evidence from this run: attach a file, expose a preview, or link a pull request; otherwise leave the task planned or blocked",
             ));
@@ -1004,8 +996,12 @@ async fn delete_task(
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
     caller.require_admin()?;
-    state.store.delete_task(&id)?;
-    state.emit(Event::TaskDeleted { task_id: id });
+    let task = state
+        .store
+        .task_by_ref(&id)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    state.store.delete_task(&task.id)?;
+    state.emit(Event::TaskDeleted { task_id: task.id });
     Ok(Json(Ok::default()))
 }
 
@@ -2194,7 +2190,7 @@ mod tests {
             display_name: "Agent".into(),
             email: None,
             avatar: None,
-            is_admin: false,
+            is_admin: true,
             created_at: 1,
             agent: Some(AgentProfile::default()),
             presence: Presence::Offline,
@@ -2245,6 +2241,59 @@ mod tests {
             store.task(&task.id).unwrap().unwrap().status,
             TaskStatus::Planned
         );
+
+        let mut running = store.task(&task.id).unwrap().unwrap();
+        running.status = TaskStatus::Running;
+        running.current_run_id = Some("run".into());
+        store.update_task(&running).unwrap();
+        orchestrator::finish_run(
+            &state,
+            &Run {
+                id: "run".into(),
+                agent_id: agent.id.clone(),
+                status: RunStatus::Succeeded,
+                trigger: RunTrigger::Manual {
+                    by: "person".into(),
+                },
+                channel_id: task.discussion_channel_id.clone(),
+                task_id: Some(task.id.clone()),
+                host_id: None,
+                project_id: None,
+                worktree_id: None,
+                cwd: None,
+                automation_id: None,
+                session_id: None,
+                runtime: "test".into(),
+                prompt: String::new(),
+                headline: "Done".into(),
+                error: None,
+                token_usage: None,
+                created_at: 1,
+                started_at: Some(1),
+                ended_at: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Planned,
+            "a successful run without evidence must not auto-promote itself",
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tasks/{}", task.key))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(store.task(&task.id).unwrap().is_none());
         drop(state);
         drop(store);
         let _ = std::fs::remove_file(path);
