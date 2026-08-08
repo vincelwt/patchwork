@@ -1772,19 +1772,23 @@ button.row:hover,
 
 .invite-code {
   display: flex;
-  align-items: center;
-  gap: 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   margin-top: 16px;
   padding: 14px 16px;
   background: var(--surface-sunken);
   border-radius: var(--radius-card);
 }
 .invite-code code {
-  flex: 1;
   background: none;
   padding: 0;
-  font-size: 17px;
-  letter-spacing: 0.04em;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.invite-code .button {
+  align-self: flex-end;
 }
 
 .code-block {

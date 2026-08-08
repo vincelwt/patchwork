@@ -24,7 +24,8 @@ Sessions live in `src/lib/session.ts`. Pair from Desktop with its short-lived
 QR code; the relay exchanges it once for a separate, revocable mobile token.
 Only `savePairedSession({ baseUrl, token })` writes that credential, and it
 lives in SecureStore. A physical phone needs the workspace relay at a public
-HTTPS/WSS URL. An embedded `127.0.0.1` relay is reachable only from that Mac.
+HTTPS/WSS URL. Patchwork Relay supplies that URL automatically for the default
+setup; direct self-hosters provide their own TLS endpoint.
 
 The client covers chat and DMs, threads, reactions and images; inbox questions;
 tasks and discussions; agents, hosts and runs; steering/cancellation;

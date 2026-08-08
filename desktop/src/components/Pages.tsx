@@ -1169,10 +1169,11 @@ export function MembersPage() {
   );
 }
 
-/// An invite is a code somebody pastes into their own copy of the app, so the
-/// only useful thing this dialog can do is make the code easy to hand over.
+/// One copyable invitation: the recipient should not have to ask which URL a
+/// code belongs to or configure any networking before they can use it.
 export function InviteModal({ onClose }: { onClose: () => void }) {
   const api = useApi();
+  const relayUrl = api.baseUrl.replace(/\/w\/[^/]+\/?$/, "");
   const [code, setCode] = useState<string>();
   const [admin, setAdmin] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -1194,8 +1195,8 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
       title={code ? "Invite code" : "Invite someone"}
       subtitle={
         code
-          ? "They enter this and your relay URL in Patchwork Desktop."
-          : "Anyone with the code and your relay URL can join this workspace."
+          ? "Send both connection details. They can paste them into Patchwork Desktop."
+          : "Create one invitation containing the relay URL and a one-use code."
       }
       onClose={onClose}
       actions={
@@ -1217,16 +1218,16 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
     >
       {code ? (
         <div className="invite-code">
-          <code>{code}</code>
+          <code style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{`Relay URL: ${relayUrl}\nInvite code: ${code}`}</code>
           <button
             className="button quiet"
             onClick={() => {
-              void navigator.clipboard.writeText(code);
+              void navigator.clipboard.writeText(`Relay URL: ${relayUrl}\nInvite code: ${code}`);
               setCopied(true);
             }}
           >
             {copied ? <CheckIcon size={15} /> : null}
-            {copied ? "Copied" : "Copy"}
+            {copied ? "Copied" : "Copy invitation"}
           </button>
         </div>
       ) : (
@@ -1912,6 +1913,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     info?.settings.workspaces.find(
       (workspace) => workspace.id === app.workspace?.id,
     )?.relay_url ?? "";
+  const managedRelay = relayUrl.startsWith("https://relay.patchwork.sh/r/");
 
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so
@@ -2146,7 +2148,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             <span className="name">{relayUrl}</span>
             <span className="sub">
               {info?.hosting_relay
-                ? `served by this machine · ${app.live ? "connected" : "reconnecting…"}`
+                ? `${managedRelay ? "shared securely through Patchwork Relay" : "served by this machine"} · ${app.live ? "connected" : "reconnecting…"}`
                 : app.live
                   ? "connected"
                   : "reconnecting…"}

@@ -42,6 +42,7 @@ export function PairDeviceModal({ onClose }: { onClose: () => void }) {
       title="Pair phone or tablet"
       subtitle="The code expires after five minutes and gives the new device its own revocable key."
       onClose={onClose}
+      wide
       actions={
         <>
           <button className="button quiet" onClick={() => void create()}>
@@ -53,20 +54,20 @@ export function PairDeviceModal({ onClose }: { onClose: () => void }) {
         </>
       }
     >
-      <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 24, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "232px minmax(0, 1fr)", gap: 20, alignItems: "start" }}>
         <div style={{ textAlign: "center" }}>
           {qr ? (
             <img
               src={qr}
-              width={264}
-              height={264}
+              width={232}
+              height={232}
               alt="Pairing QR code"
               style={{ borderRadius: 12, background: "white", padding: 6 }}
             />
           ) : (
             <div className="notice">Creating a code…</div>
           )}
-          {pairing && <div className="form-help">Expires {relative(pairing.expires_at)}</div>}
+          {pairing && <div className="form-help">Scan before this code expires</div>}
           {link && (
             <button
               className="button quiet"
@@ -80,7 +81,7 @@ export function PairDeviceModal({ onClose }: { onClose: () => void }) {
             </button>
           )}
         </div>
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div className="section-head">
             <span className="section-title">Your devices</span>
           </div>
@@ -109,7 +110,7 @@ export function PairDeviceModal({ onClose }: { onClose: () => void }) {
             </div>
           ))}
           <div className="notice" style={{ marginTop: 12 }}>
-            Pairing requires a relay reachable over HTTPS. “Use this Mac” stays local to this Mac and cannot be paired to a phone.
+            Patchwork Relay gives this workspace a secure HTTPS connection automatically. No network setup is needed on either device.
           </div>
         </div>
       </div>

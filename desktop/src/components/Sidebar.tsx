@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { store, useApi, useApp, useAppSelector, useWorkspaces } from "../lib/store";
 import { create, join, switchTo } from "../lib/session";
+import { parseInviteDetails } from "../lib/desktop";
 import { hasUnseen, useSeen } from "../lib/unread";
 import { Avatar, Field, Modal, useNavigation } from "./common";
 import { Menu, MenuButton } from "./ui";
@@ -612,7 +613,20 @@ function JoinWorkspaceModal({
       }
     >
       <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} />
-      <Field label="Invite code" value={code} onChange={setCode} autoFocus />
+      <Field
+        label="Invite code or copied invitation"
+        value={code}
+        onChange={(value) => {
+          const invite = parseInviteDetails(value);
+          if (invite) {
+            setRelayUrl(invite.relayUrl);
+            setCode(invite.code);
+          } else {
+            setCode(value);
+          }
+        }}
+        autoFocus
+      />
       <Field label="Your name" value={displayName} onChange={setDisplayName} />
       {error && <div className="error-text">{error}</div>}
     </Modal>

@@ -17,10 +17,12 @@ use tokio::sync::Mutex;
 
 /// 7717 belongs to an older, unrelated Patchwork; stay off it.
 pub const PORT: u16 = 7727;
+const DEFAULT_MANAGED_RELAY: &str = "https://relay.patchwork.sh";
 
 pub struct Hosted {
     data_dir: PathBuf,
     port: u16,
+    managed_relay: Option<String>,
     handle: Arc<Mutex<Option<patchwork_relay::Handle>>>,
 }
 
@@ -28,15 +30,25 @@ impl Default for Hosted {
     fn default() -> Self {
         // The same directory the standalone binary uses, so moving between
         // the two is a matter of which one you start.
-        Self::new(patchwork_relay::default_data_dir(), PORT)
+        let managed = std::env::var("PATCHWORK_MANAGED_RELAY")
+            .ok()
+            .filter(|value| !value.eq_ignore_ascii_case("off"))
+            .or_else(|| Some(DEFAULT_MANAGED_RELAY.into()));
+        Self::with_managed(patchwork_relay::default_data_dir(), PORT, managed)
     }
 }
 
 impl Hosted {
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf, port: u16) -> Self {
+        Self::with_managed(data_dir, port, None)
+    }
+
+    fn with_managed(data_dir: PathBuf, port: u16, managed_relay: Option<String>) -> Self {
         Self {
             data_dir,
             port,
+            managed_relay,
             handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -57,6 +69,7 @@ impl Hosted {
             // the same model provider keys the local host hands out. They
             // still never travel: this relay *is* the machine.
             agent_env: crate::settings::load().provider_env(),
+            managed_relay: self.managed_relay.clone(),
         })
         .await
         .context("could not start the relay on this device")?;

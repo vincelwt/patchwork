@@ -11,6 +11,7 @@ mod auth;
 mod automations;
 mod error;
 mod github;
+mod managed;
 mod orchestrator;
 mod preview_proxy;
 mod visibility;
@@ -44,16 +45,20 @@ pub struct Config {
     /// Environment for agents this relay runs itself — model provider keys,
     /// mostly. An embedder has them; a relay on a VPS reads its own.
     pub agent_env: Vec<(String, String)>,
+    /// Optional hosted ingress. The relay connects out and receives a public
+    /// HTTPS URL without exposing its own port.
+    pub managed_relay: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
-            bind: "0.0.0.0".into(),
+            bind: "127.0.0.1".into(),
             port: 7727,
             public_url: None,
             agent_env: Vec::new(),
+            managed_relay: None,
         }
     }
 }
@@ -66,10 +71,14 @@ pub struct Handle {
     pub public_url: String,
     pub port: u16,
     server: tokio::task::JoinHandle<()>,
+    connector: Option<managed::Connector>,
 }
 
 impl Handle {
     pub async fn shutdown(self) {
+        if let Some(connector) = self.connector {
+            connector.stop();
+        }
         self.server.abort();
         self.relay.shutdown().await;
     }
@@ -79,10 +88,25 @@ impl Handle {
 /// port is bound, so a caller can talk to it straight away.
 pub async fn start(config: Config) -> Result<Handle> {
     std::fs::create_dir_all(&config.data_dir)?;
-    let public_url = config
-        .public_url
-        .clone()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", config.port));
+    let addr: SocketAddr = format!("{}:{}", config.bind, config.port)
+        .parse()
+        .context("invalid bind address")?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("could not listen on {addr}"))?;
+    let port = listener.local_addr()?.port();
+    let local_url = format!("http://127.0.0.1:{port}");
+    let connector = match config.managed_relay.as_deref() {
+        Some(broker) => {
+            Some(managed::Connector::start(&config.data_dir, broker, local_url.clone()).await?)
+        }
+        None => None,
+    };
+    let public_url = connector
+        .as_ref()
+        .map(|connector| connector.public_url.clone())
+        .or(config.public_url.clone())
+        .unwrap_or_else(|| local_url.clone());
     let relay = Relay::open(
         config.data_dir.clone(),
         public_url.clone(),
@@ -96,15 +120,7 @@ pub async fn start(config: Config) -> Result<Handle> {
             .allow_methods(Any)
             .allow_headers(Any),
     );
-
-    let addr: SocketAddr = format!("{}:{}", config.bind, config.port)
-        .parse()
-        .context("invalid bind address")?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("could not listen on {addr}"))?;
-    let port = listener.local_addr()?.port();
-    tracing::info!("relay listening on http://{addr} (public: {public_url})");
+    tracing::info!("relay listening on {local_url} (public: {public_url})");
 
     let server = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -117,6 +133,7 @@ pub async fn start(config: Config) -> Result<Handle> {
         public_url,
         port,
         server,
+        connector,
     })
 }
 
@@ -137,9 +154,7 @@ pub fn mint_invite(data_dir: &std::path::Path, workspace_id: Option<&str>) -> Re
                     oldest = Some((created_at, store));
                 }
             }
-            oldest
-                .context("this relay has no workspace yet")?
-                .1
+            oldest.context("this relay has no workspace yet")?.1
         }
     };
 

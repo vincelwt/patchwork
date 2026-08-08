@@ -18,7 +18,7 @@ import {
 } from "./lib/session";
 import { markSeen } from "./lib/unread";
 import { toggleDictation } from "./lib/dictation";
-import { inTauri } from "./lib/desktop";
+import { inTauri, parseInviteDetails } from "./lib/desktop";
 import logo from "./assets/logo.png";
 import { chord, combo, isTyping } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
@@ -87,7 +87,7 @@ export function Onboarding() {
   const [mode, setMode] = useState<"here" | "join">(
     canHostRelay ? "here" : "join",
   );
-  const [relayUrl, setRelayUrl] = useState("http://127.0.0.1:7727");
+  const [relayUrl, setRelayUrl] = useState("");
   const [inviteCode, setInviteCode] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [workspaceName, setWorkspaceName] = useState("Patchwork");
@@ -115,24 +115,24 @@ export function Onboarding() {
               className={mode === "here" ? "active" : ""}
               onClick={() => setMode("here")}
             >
-              Use this Mac
+              Start a workspace
             </button>
             <button
               className={mode === "join" ? "active" : ""}
               onClick={() => setMode("join")}
             >
-              Join a relay
+              Join with invite
             </button>
           </div>
         )}
 
         {mode === "here" ? (
           <>
-            <h1>Start a workspace here</h1>
+            <h1>Start your workspace</h1>
             <p>
-              This app runs the relay itself, on this machine, for as long as it
-              is open. Nothing to install, and you can move to a server later
-              without changing anything else.
+              Patchwork runs everything on this machine and gives it a secure
+              public connection through Patchwork Relay. Phones and teammates
+              can join without domains, certificates, or port forwarding.
             </p>
             <Field
               label="Workspace name"
@@ -166,14 +166,22 @@ export function Onboarding() {
           <>
             <h1>Join a workspace</h1>
             <p>
-              Your relay prints an invite code the first time it starts. Paste
-              both here.
+              Paste the relay URL and invite code shared by a workspace admin.
+              Your copy stays connected alongside every workspace you join.
             </p>
-            <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} />
+            <Field label="Relay URL" value={relayUrl} onChange={setRelayUrl} placeholder="https://relay.patchwork.sh/r/…" />
             <Field
-              label="Invite code"
+              label="Invite code or copied invitation"
               value={inviteCode}
-              onChange={setInviteCode}
+              onChange={(value) => {
+                const invite = parseInviteDetails(value);
+                if (invite) {
+                  setRelayUrl(invite.relayUrl);
+                  setInviteCode(invite.code);
+                } else {
+                  setInviteCode(value);
+                }
+              }}
               autoFocus
             />
             <Field
@@ -185,7 +193,7 @@ export function Onboarding() {
             <button
               className="button primary"
               style={{ marginTop: 16, width: "100%", justifyContent: "center" }}
-              disabled={busy || !inviteCode.trim() || !displayName.trim()}
+              disabled={busy || !relayUrl.trim() || !inviteCode.trim() || !displayName.trim()}
               onClick={() =>
                 run(() =>
                   join({

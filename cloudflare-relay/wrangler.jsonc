@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "patchwork-managed-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-08",
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAYS", "class_name": "ManagedRelay" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ManagedRelay"] }
+  ],
+  "routes": [
+    { "pattern": "relay.patchwork.sh", "custom_domain": true }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": false }
+  }
+}
