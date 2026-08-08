@@ -177,6 +177,15 @@ export class Api {
     return this.post(`/api/runs/${id}/cancel`);
   }
 
+  /// Say something to a run that is already going: `queue` waits for the end
+  /// of the current turn, `interrupt` stops it and delivers the note now.
+  steerRun(
+    id: Id,
+    input: { prompt: string; mode: "queue" | "interrupt"; attachment_ids: Id[] },
+  ) {
+    return this.post<{ control_id: string }>(`/api/runs/${id}/steer`, input);
+  }
+
   question(id: Id) {
     return this.get<Question>(`/api/questions/${id}`);
   }
