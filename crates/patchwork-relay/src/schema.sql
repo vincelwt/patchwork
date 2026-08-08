@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 CREATE INDEX IF NOT EXISTS tokens_member ON tokens(member_id);
 
+-- One-use handoff from an existing human device to a new one. Only hashes
+-- reach disk; a successful claim deletes the row in the same transaction that
+-- creates the new device token.
+CREATE TABLE IF NOT EXISTS pairings (
+  secret_hash TEXT PRIMARY KEY,
+  member_id   TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  created_at  INTEGER NOT NULL,
+  expires_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pairings_expiry ON pairings(expires_at);
+
 CREATE TABLE IF NOT EXISTS invites (
   code       TEXT PRIMARY KEY,
   created_by TEXT,

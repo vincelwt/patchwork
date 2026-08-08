@@ -26,6 +26,40 @@ pub struct AuthResponse {
     pub workspace: Workspace,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreatePairing {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingResponse {
+    pub secret: String,
+    pub expires_at: Millis,
+    pub workspace_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimPairing {
+    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimPairingResponse {
+    pub token: String,
+    pub member: Member,
+    pub workspace: Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Device {
+    pub id: Id,
+    pub label: String,
+    pub created_at: Millis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<Millis>,
+    pub current: bool,
+}
+
 /// One request that gives a freshly connected client everything the shell needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bootstrap {

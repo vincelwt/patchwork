@@ -167,11 +167,16 @@ async fn join(
 pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/pair", post(claim_pairing))
         .route("/api/webhooks/{token}", post(webhook));
 
     let api = Router::new()
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/events", get(events_since))
+        .route("/api/pairings", post(create_pairing))
+        .route("/api/devices", get(list_devices))
+        .route("/api/devices/current", delete(revoke_current_device))
+        .route("/api/devices/{id}", delete(revoke_device))
         // channels and messages
         .route("/api/sections", get(list_sections).post(create_section))
         .route("/api/channels", get(list_channels).post(create_channel))
@@ -325,6 +330,102 @@ async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthRes
         member,
         workspace: state.store.workspace()?,
     })
+}
+
+const PAIRING_LIFETIME_MS: i64 = 5 * 60 * 1000;
+
+async fn create_pairing(
+    State(state): State<Shared>,
+    caller: Caller,
+    _input: Option<Json<CreatePairing>>,
+) -> ApiResult<Json<PairingResponse>> {
+    caller.require_device()?;
+    let secret = auth::generate_token();
+    let expires_at = now_ms() + PAIRING_LIFETIME_MS;
+    state
+        .store
+        .insert_pairing(&auth::hash_token(&secret), &caller.member.id, expires_at)?;
+    Ok(Json(PairingResponse {
+        secret,
+        expires_at,
+        workspace_url: state.public_url.clone(),
+    }))
+}
+
+async fn claim_pairing(
+    State(state): State<Shared>,
+    Json(input): Json<ClaimPairing>,
+) -> ApiResult<Json<ClaimPairingResponse>> {
+    let secret = input.secret.trim();
+    if secret.is_empty() || secret.len() > 256 {
+        return Err(ApiError::bad_request("invalid pairing secret"));
+    }
+    let label = input
+        .device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    if label.is_some_and(|label| label.chars().count() > 100) {
+        return Err(ApiError::bad_request("device name is too long"));
+    }
+
+    let token = auth::generate_token();
+    let member_id = state
+        .store
+        .claim_pairing(
+            &auth::hash_token(secret),
+            &auth::hash_token(&token),
+            label,
+            now_ms(),
+        )?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "invalid_pairing",
+                "that pairing has expired or was already used",
+            )
+        })?;
+    let member = state
+        .store
+        .member(&member_id)?
+        .ok_or_else(|| ApiError::unauthorized("member is no longer active"))?;
+    Ok(Json(ClaimPairingResponse {
+        token,
+        member,
+        workspace: state.store.workspace()?,
+    }))
+}
+
+async fn list_devices(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Vec<Device>>> {
+    caller.require_device()?;
+    Ok(Json(
+        state.store.devices(&caller.member.id, &caller.token_hash)?,
+    ))
+}
+
+async fn revoke_device(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Ok>> {
+    caller.require_device()?;
+    if id == caller.token_hash {
+        return Err(ApiError::conflict(
+            "use /api/devices/current to sign out this device",
+        ));
+    }
+    if !state.store.revoke_device(&caller.member.id, &id)? {
+        return Err(ApiError::not_found("device not found"));
+    }
+    Ok(Json(Ok::default()))
+}
+
+async fn revoke_current_device(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Ok>> {
+    caller.require_device()?;
+    state
+        .store
+        .revoke_device(&caller.member.id, &caller.token_hash)?;
+    Ok(Json(Ok::default()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,12 +1277,14 @@ async fn mark_read(
     caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
-    state.store.mark_inbox_read(&id)?;
-    if let Some(item) = state.store.inbox_item(&id)? {
-        if item.member_id == caller.member.id {
-            state.emit(Event::InboxItemUpdated { item });
-        }
-    }
+    let item = state
+        .store
+        .inbox_item(&id)?
+        .filter(|item| item.member_id == caller.member.id)
+        .ok_or_else(|| ApiError::not_found("inbox item not found"))?;
+    state.store.mark_inbox_read(&id, &caller.member.id)?;
+    let item = state.store.inbox_item(&id)?.unwrap_or(item);
+    state.emit(Event::InboxItemUpdated { item });
     Ok(Json(Ok::default()))
 }
 
@@ -1913,5 +2016,60 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn current_device_only_logs_out_through_the_current_route() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let member = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        };
+        store.insert_member(&member).unwrap();
+        let token = auth::generate_token();
+        let token_hash = auth::hash_token(&token);
+        store
+            .insert_token(&token_hash, &member.id, "device", None, None)
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+
+        let request = |uri: String| {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = router(state.clone())
+            .oneshot(request(format!("/api/devices/{token_hash}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert!(auth::authenticate(&state, &token).is_some());
+
+        let response = router(state.clone())
+            .oneshot(request("/api/devices/current".into()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(auth::authenticate(&state, &token).is_none());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }
