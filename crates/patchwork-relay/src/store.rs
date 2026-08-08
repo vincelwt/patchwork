@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
+use patchwork_core::wire::Device;
 use patchwork_core::{now_ms, Id};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
@@ -273,8 +274,15 @@ impl Store {
     }
 
     pub fn deactivate_member(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("UPDATE members SET active = 0 WHERE id = ?1", params![id])?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE members SET active = 0 WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE tokens SET revoked = 1 WHERE member_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM pairings WHERE member_id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -296,12 +304,14 @@ impl Store {
         Ok(())
     }
 
-    /// Returns `(member_id, kind, run_id)`.
+    /// Returns `(member_id, kind, run_id)` for an active member.
     pub fn lookup_token(&self, token_hash: &str) -> Result<Option<(Id, String, Option<Id>)>> {
         let conn = self.conn()?;
         let found = conn
             .query_row(
-                "SELECT member_id, kind, run_id FROM tokens WHERE token_hash = ?1 AND revoked = 0",
+                "SELECT tokens.member_id, tokens.kind, tokens.run_id
+                 FROM tokens JOIN members ON members.id = tokens.member_id
+                 WHERE tokens.token_hash = ?1 AND tokens.revoked = 0 AND members.active = 1",
                 params![token_hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -313,6 +323,86 @@ impl Store {
             )?;
         }
         Ok(found)
+    }
+
+    pub fn insert_pairing(
+        &self,
+        secret_hash: &str,
+        member_id: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM pairings WHERE expires_at <= ?1",
+            params![now_ms()],
+        )?;
+        conn.execute(
+            "INSERT INTO pairings (secret_hash, member_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![secret_hash, member_id, now_ms(), expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Consume a valid pairing and mint its device token in one transaction.
+    pub fn claim_pairing(
+        &self,
+        secret_hash: &str,
+        token_hash: &str,
+        label: Option<&str>,
+        at: i64,
+    ) -> Result<Option<Id>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let member_id: Option<Id> = tx
+            .query_row(
+                "DELETE FROM pairings
+                 WHERE secret_hash = ?1 AND expires_at > ?2
+                   AND EXISTS (SELECT 1 FROM members
+                               WHERE id = pairings.member_id AND kind = 'human' AND active = 1)
+                 RETURNING member_id",
+                params![secret_hash, at],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(member_id) = &member_id {
+            tx.execute(
+                "INSERT INTO tokens (token_hash, member_id, kind, label, created_at)
+                 VALUES (?1, ?2, 'mobile', ?3, ?4)",
+                params![token_hash, member_id, label, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(member_id)
+    }
+
+    pub fn devices(&self, member_id: &str, current_token_hash: &str) -> Result<Vec<Device>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT token_hash, COALESCE(NULLIF(label, ''), 'Device'), created_at, last_used
+             FROM tokens
+             WHERE member_id = ?1 AND kind IN ('device', 'mobile') AND revoked = 0
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![member_id], |row| {
+            let id: Id = row.get(0)?;
+            Ok(Device {
+                current: id == current_token_hash,
+                id,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used: row.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn revoke_device(&self, member_id: &str, id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tokens SET revoked = 1
+             WHERE token_hash = ?1 AND member_id = ?2 AND kind IN ('device', 'mobile') AND revoked = 0",
+            params![id, member_id],
+        )? == 1)
     }
 
     pub fn revoke_run_tokens(&self, run_id: &str) -> Result<()> {
@@ -1590,10 +1680,11 @@ impl Store {
             .optional()?)
     }
 
-    pub fn mark_inbox_read(&self, id: &str) -> Result<()> {
+    pub fn mark_inbox_read(&self, id: &str, member_id: &str) -> Result<()> {
         self.conn()?.execute(
-            "UPDATE inbox SET read_at = ?2 WHERE id = ?1 AND read_at IS NULL",
-            params![id, now_ms()],
+            "UPDATE inbox SET read_at = ?3
+             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL",
+            params![id, member_id, now_ms()],
         )?;
         Ok(())
     }
@@ -1957,6 +2048,21 @@ mod tests {
         (Store::open(&path).unwrap(), path)
     }
 
+    fn human(id: &str) -> Member {
+        Member {
+            id: id.into(),
+            kind: MemberKind::Human,
+            handle: id.into(),
+            display_name: id.into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        }
+    }
+
     fn run(id: &str, task_id: &str) -> Run {
         Run {
             id: id.into(),
@@ -1980,6 +2086,153 @@ mod tests {
             started_at: Some(1),
             ended_at: None,
         }
+    }
+
+    #[test]
+    fn pairing_issues_a_separate_device_for_the_same_member() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let secret = "raw-pairing-secret";
+        let token = "new-device-token";
+        store
+            .insert_pairing(&crate::auth::hash_token(secret), "human", now_ms() + 1_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pairings WHERE secret_hash = ?1",
+                    params![secret],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .claim_pairing(
+                    &crate::auth::hash_token(secret),
+                    &crate::auth::hash_token(token),
+                    Some("Phone"),
+                    now_ms(),
+                )
+                .unwrap()
+                .as_deref(),
+            Some("human")
+        );
+        let issued = store
+            .lookup_token(&crate::auth::hash_token(token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(issued.0, "human");
+        assert_eq!(issued.1, "mobile");
+        assert_eq!(store.members().unwrap().len(), 1);
+        let devices = store
+            .devices("human", &crate::auth::hash_token(token))
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].label, "Phone");
+        assert!(devices[0].current);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pairings_expire_and_are_single_use() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let at = now_ms();
+        store.insert_pairing("expired", "human", at).unwrap();
+        assert!(store
+            .claim_pairing("expired", "expired-token", None, at)
+            .unwrap()
+            .is_none());
+
+        store.insert_pairing("once", "human", at + 1_000).unwrap();
+        assert!(store
+            .claim_pairing("once", "first-token", None, at)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .claim_pairing("once", "second-token", None, at)
+            .unwrap()
+            .is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_member_cannot_revoke_another_members_device() {
+        let (store, path) = store();
+        store.insert_member(&human("one")).unwrap();
+        store.insert_member(&human("two")).unwrap();
+        store
+            .insert_token("one-token", "one", "device", None, None)
+            .unwrap();
+        store
+            .insert_token("two-token", "two", "device", None, None)
+            .unwrap();
+        assert!(!store.revoke_device("one", "two-token").unwrap());
+        assert!(store.lookup_token("two-token").unwrap().is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deactivated_members_no_longer_authenticate() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let token = crate::auth::generate_token();
+        store
+            .insert_token(
+                &crate::auth::hash_token(&token),
+                "human",
+                "device",
+                None,
+                None,
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        assert!(crate::auth::authenticate(&state, &token).is_some());
+        store.deactivate_member("human").unwrap();
+        assert!(crate::auth::authenticate(&state, &token).is_none());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_read_is_scoped_to_its_owner() {
+        let (store, path) = store();
+        store
+            .insert_inbox(&InboxItem {
+                id: "item".into(),
+                member_id: "two".into(),
+                kind: InboxKind::Mention,
+                title: "Mention".into(),
+                preview: String::new(),
+                actor_id: None,
+                channel_id: None,
+                message_id: None,
+                task_id: None,
+                run_id: None,
+                automation_id: None,
+                created_at: 1,
+                read_at: None,
+            })
+            .unwrap();
+        store.mark_inbox_read("item", "one").unwrap();
+        assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_none());
+        store.mark_inbox_read("item", "two").unwrap();
+        assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

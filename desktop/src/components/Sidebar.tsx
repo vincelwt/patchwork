@@ -20,7 +20,7 @@ import {
   Spinner,
   TasksIcon,
 } from "./icons";
-import type { Channel, Id, Member } from "../lib/types";
+import type { Channel, Id, Member } from "@client/types";
 import type { View as NavView } from "./common";
 
 export type Creatable =

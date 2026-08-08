@@ -22,7 +22,7 @@ import {
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
-import type { Attachment, Channel, Id, Member, Message, Run } from "../lib/types";
+import type { Attachment, Channel, Id, Member, Message, Run } from "@client/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const { channel, messages } = useAppSelector((data) => ({

@@ -56,10 +56,19 @@ pub async fn handler(
     let Some(caller) = auth::authenticate(&state, &query.token) else {
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
-    ws.on_upgrade(move |socket| connection(socket, state, caller.member.id, query.since))
+    let can_host = caller.can_host();
+    ws.on_upgrade(move |socket| {
+        connection(socket, state, caller.member.id, query.since, can_host)
+    })
 }
 
-async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Option<i64>) {
+async fn connection(
+    socket: WebSocket,
+    state: Shared,
+    member_id: Id,
+    since: Option<i64>,
+    can_host: bool,
+) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
@@ -69,7 +78,9 @@ async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Opti
         if since > 0 && since < latest {
             if let Ok(missed) = state.store.events_since(since, 2000) {
                 for envelope in missed {
-                    let _ = tx.send(ServerMsg::Event { envelope });
+                    if crate::visibility::event(&state.store, &member_id, &envelope) {
+                        let _ = tx.send(ServerMsg::Event { envelope });
+                    }
                 }
             }
         }
@@ -78,11 +89,15 @@ async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Opti
 
     let mut bus = state.bus.subscribe();
     let bus_tx = tx.clone();
+    let bus_state = state.clone();
+    let bus_member_id = member_id.clone();
     let bus_task = tokio::spawn(async move {
         loop {
             match bus.recv().await {
                 Ok(envelope) => {
-                    if bus_tx.send(ServerMsg::Event { envelope }).is_err() {
+                    if crate::visibility::event(&bus_state.store, &bus_member_id, &envelope)
+                        && bus_tx.send(ServerMsg::Event { envelope }).is_err()
+                    {
                         break;
                     }
                 }
@@ -139,20 +154,32 @@ async fn connection(socket: WebSocket, state: Shared, member_id: Id, since: Opti
             ClientMsg::Resume { since } => {
                 if let Ok(missed) = state.store.events_since(since, 2000) {
                     for envelope in missed {
-                        let _ = tx.send(ServerMsg::Event { envelope });
+                        if crate::visibility::event(&state.store, &member_id, &envelope) {
+                            let _ = tx.send(ServerMsg::Event { envelope });
+                        }
                     }
                 }
             }
             ClientMsg::Typing { channel_id } => {
-                state.emit_transient(Event::Typing {
-                    channel_id,
-                    member_id: member_id.clone(),
-                });
+                if crate::visibility::channel(&state.store, &member_id, &channel_id)
+                    .unwrap_or(false)
+                {
+                    state.emit_transient(Event::Typing {
+                        channel_id,
+                        member_id: member_id.clone(),
+                    });
+                }
             }
             ClientMsg::Presence { presence } => {
                 state.set_presence(&member_id, presence).await;
             }
             ClientMsg::Host { msg } => {
+                if !can_host {
+                    let _ = tx.send(ServerMsg::Error {
+                        message: "this device cannot execute agents".into(),
+                    });
+                    continue;
+                }
                 if let HostToRelay::Register { registration } = &msg {
                     let host_id = registration.host_id.clone();
                     let mut capabilities = registration.capabilities.clone();

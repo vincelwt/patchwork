@@ -14,7 +14,8 @@
     "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "paths": { "@client/*": ["../client/*"] }
   },
-  "include": ["src"]
+  "include": ["src", "../client"]
 }

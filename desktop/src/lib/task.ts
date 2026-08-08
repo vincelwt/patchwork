@@ -7,7 +7,7 @@
 // board card and the inspector all offer the same next move, and none of them
 // can quietly disagree about what is going on.
 
-import type { Member, Question, Run, Task } from "./types";
+import type { Member, Question, Run, Task } from "@client/types";
 
 export type Situation =
   | "unassigned"

@@ -1,0 +1,55 @@
+{
+  "expo": {
+    "name": "Patchwork",
+    "slug": "patchwork",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "patchwork",
+    "userInterfaceStyle": "automatic",
+    "platforms": ["ios", "android"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "sh.patchwork.app"
+    },
+    "android": {
+      "package": "sh.patchwork.app"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Patchwork to scan a short-lived device pairing code."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Patchwork to attach images to messages, tasks, and agent feedback."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Patchwork to dictate text using the microphone.",
+          "speechRecognitionPermission": "Allow Patchwork to transcribe dictation on this device."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/icon.png",
+          "imageWidth": 112,
+          "backgroundColor": "#ffffff",
+          "dark": { "backgroundColor": "#1a1a1a" }
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}

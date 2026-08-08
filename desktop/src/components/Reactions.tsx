@@ -10,7 +10,7 @@ import { createPortal } from "react-dom";
 import { useApi, useAppSelector } from "../lib/store";
 import { SearchIcon } from "./icons";
 import { plainText } from "./common";
-import type { Message, Reaction } from "../lib/types";
+import type { Message, Reaction } from "@client/types";
 
 /// Small on purpose. A full Unicode set needs a data file and an index; this
 /// covers what a working conversation reaches for, and search makes it usable.
