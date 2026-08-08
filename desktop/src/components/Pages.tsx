@@ -111,6 +111,7 @@ export function AgentsPage() {
                 {agent.agent?.description ? ` · ${agent.agent.description}` : ""}
               </span>
             </span>
+            {agent.is_admin && <Chip>admin</Chip>}
             <Chip>{agent.agent?.runtime}</Chip>
             <Chip tone={agent.presence === "working" ? "accent" : ""}>
               {locationLabel(agent.agent)}
@@ -374,6 +375,7 @@ export function AgentModal({
   const app = useApp();
   const api = useApi();
   const [name, setName] = useState(agent?.display_name ?? "");
+  const [isAdmin, setIsAdmin] = useState(agent?.is_admin ?? false);
   const [profile, setProfile] = useState<AgentProfile>(
     agent?.agent ?? {
       description: "",
@@ -515,9 +517,13 @@ export function AgentModal({
     setError("");
     try {
       if (agent) {
-        await api.updateAgent(agent.id, { display_name: name, profile });
+        await api.updateAgent(agent.id, {
+          display_name: name,
+          is_admin: isAdmin,
+          profile,
+        });
       } else {
-        await api.createAgent({ display_name: name, profile });
+        await api.createAgent({ display_name: name, is_admin: isAdmin, profile });
       }
       onClose();
     } catch (err) {
@@ -718,6 +724,15 @@ export function AgentModal({
         label="Available in direct messages"
         help="Shows up under Direct messages for everyone."
       />
+
+      {app.me?.is_admin && (
+        <Toggle
+          checked={isAdmin}
+          onChange={setIsAdmin}
+          label="Workspace administrator"
+          help="Can change workspace settings, invite or remove members, and delete tasks or projects."
+        />
+      )}
 
       {app.channels.some((channel) => channel.kind === "channel") && (
         <Section title="Per-channel participation">

@@ -64,6 +64,9 @@ enum Command {
     Preview(PreviewArgs),
     /// Link a pull request to the current task.
     Pr { url: String },
+    /// Read and create channels.
+    #[command(subcommand)]
+    Channel(ChannelCommand),
     /// Read and change tasks.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -151,6 +154,19 @@ struct PreviewArgs {
     command: String,
     #[arg(long)]
     label: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum ChannelCommand {
+    List,
+    Create {
+        name: String,
+        /// Section name. It is created when it does not exist.
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long, default_value = "")]
+        topic: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -408,6 +424,7 @@ async fn run() -> Result<()> {
         Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
         Command::Pr { url } => link_pr(&client, &ctx, url).await,
+        Command::Channel(command) => channel(&client, command).await,
         Command::Task(command) => task(&client, &ctx, command).await,
         Command::Automation(command) => automation(&client, &ctx, command).await,
     }
@@ -483,6 +500,45 @@ fn channel_label(channel: &Channel) -> String {
         ChannelKind::Dm => format!("DM: {}", channel.name),
         ChannelKind::Task => channel.name.clone(),
     }
+}
+
+async fn channel(client: &Client, command: ChannelCommand) -> Result<()> {
+    match command {
+        ChannelCommand::List => {
+            let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+            let channels: Vec<_> = bootstrap
+                .channels
+                .iter()
+                .filter(|channel| channel.kind == ChannelKind::Channel)
+                .cloned()
+                .collect();
+            client.print(&channels, || {
+                for channel in &channels {
+                    let section = channel
+                        .section_id
+                        .as_ref()
+                        .and_then(|id| bootstrap.sections.iter().find(|section| &section.id == id))
+                        .map(|section| format!(" ({})", section.name))
+                        .unwrap_or_default();
+                    println!("#{}{}", channel.slug, section);
+                }
+            });
+        }
+        ChannelCommand::Create {
+            name,
+            section,
+            topic,
+        } => {
+            let created: Channel = client
+                .post(
+                    "/api/channels",
+                    json!({ "name": name, "section_name": section, "topic": topic }),
+                )
+                .await?;
+            client.print(&created, || println!("created #{}", created.slug));
+        }
+    }
+    Ok(())
 }
 
 /// A conversation by whatever an agent is likely to have: `#deploys`, the
@@ -1247,6 +1303,24 @@ mod tests {
     fn queries_are_encoded_for_urls() {
         assert_eq!(urlencode("checkout totals"), "checkout+totals");
         assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn a_channel_can_create_its_section() {
+        let cli = Cli::try_parse_from([
+            "patchwork",
+            "channel",
+            "create",
+            "dev",
+            "--section",
+            "Product",
+        ])
+        .unwrap();
+        let Command::Channel(ChannelCommand::Create { name, section, .. }) = cli.command else {
+            panic!("channel create was not parsed");
+        };
+        assert_eq!(name, "dev");
+        assert_eq!(section.as_deref(), Some("Product"));
     }
 
     #[test]

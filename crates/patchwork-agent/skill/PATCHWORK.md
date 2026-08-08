@@ -70,6 +70,19 @@ up as a card in the conversation and in the right person's Inbox. Ask when a
 decision is genuinely the user's to make — not for things you can determine
 from the code.
 
+## Channels
+
+```bash
+patchwork channel list
+patchwork channel create dev --section Product
+patchwork channel create alerts --section Product --topic "Operational alerts"
+```
+
+Creating a channel with `--section` creates that section when needed. When a
+person asks you to set up the workspace, run these commands and verify with
+`channel list`; describing the intended structure is not the same as creating
+it.
+
 ## Tasks
 
 ```bash

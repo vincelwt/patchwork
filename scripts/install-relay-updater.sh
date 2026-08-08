@@ -7,6 +7,7 @@ fi
 
 user=${PATCHWORK_USER:-${SUDO_USER:-patchwork}}
 bin=${PATCHWORK_BIN:-/home/$user/.local/bin/patchwork-relay}
+cli=${PATCHWORK_CLI:-/home/$user/.local/bin/patchwork}
 service=${PATCHWORK_SERVICE:-patchwork.service}
 repo=${PATCHWORK_REPOSITORY:-vincelwt/patchwork}
 
@@ -16,6 +17,7 @@ cat >/usr/local/sbin/patchwork-relay-update <<EOF
 set -eu
 repo='$repo'
 bin='$bin'
+cli='$cli'
 service='$service'
 state=/var/lib/patchwork-relay-update/version
 release=\$(curl -fsSL --retry 3 "https://api.github.com/repos/\$repo/releases/latest" | jq -r .tag_name)
@@ -25,10 +27,15 @@ tmp=\$(mktemp -d)
 trap 'rm -rf "\$tmp"' EXIT
 base="https://github.com/\$repo/releases/download/\$release"
 curl -fsSL --retry 3 "\$base/patchwork-relay-linux-x86_64" -o "\$tmp/patchwork-relay"
-curl -fsSL --retry 3 "\$base/patchwork-relay-linux-x86_64.sha256" -o "\$tmp/checksum"
-(cd "\$tmp" && sed 's/patchwork-relay-linux-x86_64/patchwork-relay/' checksum | sha256sum -c -)
+curl -fsSL --retry 3 "\$base/patchwork-relay-linux-x86_64.sha256" -o "\$tmp/relay-checksum"
+curl -fsSL --retry 3 "\$base/patchwork-linux-x86_64" -o "\$tmp/patchwork"
+curl -fsSL --retry 3 "\$base/patchwork-linux-x86_64.sha256" -o "\$tmp/cli-checksum"
+(cd "\$tmp" && sed 's/patchwork-relay-linux-x86_64/patchwork-relay/' relay-checksum | sha256sum -c -)
+(cd "\$tmp" && sed 's/patchwork-linux-x86_64/patchwork/' cli-checksum | sha256sum -c -)
 install -m 755 -o '$user' -g '$user' "\$tmp/patchwork-relay" "\$bin.next"
+install -m 755 -o '$user' -g '$user' "\$tmp/patchwork" "\$cli.next"
 mv -f "\$bin.next" "\$bin"
+mv -f "\$cli.next" "\$cli"
 systemctl restart "\$service"
 printf '%s\n' "\$release" >"\$state"
 EOF
@@ -60,4 +67,4 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now patchwork-relay-update.timer
-printf 'Patchwork relay updates enabled for %s\n' "$bin"
+printf 'Patchwork relay and CLI updates enabled for %s and %s\n' "$bin" "$cli"

@@ -47,10 +47,12 @@ jobs:
           cp target/release/patchwork-relay patchwork-relay-linux-x86_64
           cp target/release/patchwork patchwork-linux-x86_64
           sha256sum patchwork-relay-linux-x86_64 > patchwork-relay-linux-x86_64.sha256
+          sha256sum patchwork-linux-x86_64 > patchwork-linux-x86_64.sha256
           gh release upload "$GITHUB_REF_NAME" \
             patchwork-relay-linux-x86_64 \
             patchwork-relay-linux-x86_64.sha256 \
             patchwork-linux-x86_64 \
+            patchwork-linux-x86_64.sha256 \
             --clobber
         env:
           GH_TOKEN: ${{ github.token }}

@@ -711,7 +711,9 @@ async fn archive_channel(
         .channel(&id)?
         .ok_or_else(|| ApiError::not_found("channel not found"))?;
     if channel.kind != ChannelKind::Channel {
-        return Err(ApiError::forbidden("only workspace channels can be archived"));
+        return Err(ApiError::forbidden(
+            "only workspace channels can be archived",
+        ));
     }
     state.store.archive_channel(&id)?;
     state.emit(Event::ChannelDeleted { channel_id: id });
@@ -1439,11 +1441,14 @@ async fn remove_member(
 
 async fn create_agent(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Json(input): Json<CreateAgent>,
 ) -> ApiResult<Json<Member>> {
     if input.display_name.trim().is_empty() {
         return Err(ApiError::bad_request("an agent needs a name"));
+    }
+    if input.is_admin {
+        caller.require_admin()?;
     }
     let handle = state.store.unique_handle(
         input
@@ -1458,7 +1463,7 @@ async fn create_agent(
         display_name: input.display_name.trim().to_string(),
         email: None,
         avatar: input.avatar.clone(),
-        is_admin: false,
+        is_admin: input.is_admin,
         created_at: now_ms(),
         agent: Some(input.profile.clone()),
         presence: Presence::Offline,
@@ -1472,7 +1477,7 @@ async fn create_agent(
 
 async fn update_agent(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Json(input): Json<UpdateAgent>,
 ) -> ApiResult<Json<Member>> {
@@ -1484,6 +1489,12 @@ async fn update_agent(
     if let Some(name) = input.display_name {
         if !name.trim().is_empty() {
             member.display_name = name.trim().to_string();
+        }
+    }
+    if let Some(is_admin) = input.is_admin {
+        if is_admin != member.is_admin {
+            caller.require_admin()?;
+            member.is_admin = is_admin;
         }
     }
     if let Some(avatar) = input.avatar {
@@ -1935,7 +1946,9 @@ async fn download_file(
         .as_deref()
         .is_some_and(|token| state.valid_file_grant(&id, token));
     if member.is_none() && !granted {
-        return Err(ApiError::unauthorized("a valid file grant or workspace token is required"));
+        return Err(ApiError::unauthorized(
+            "a valid file grant or workspace token is required",
+        ));
     }
     let (attachment, path) = state
         .store
@@ -2133,6 +2146,66 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_cannot_promote_an_agent() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let human = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        };
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Offline,
+        };
+        store.insert_member(&human).unwrap();
+        store.insert_member(&agent).unwrap();
+        let token = auth::generate_token();
+        store
+            .insert_token(&auth::hash_token(&token), &human.id, "device", None, None)
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/agents/agent")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"is_admin":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(!store.member("agent").unwrap().unwrap().is_admin);
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

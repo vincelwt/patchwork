@@ -221,8 +221,8 @@ cargo build --release -p patchwork-relay -p patchwork-cli
 scp target/release/patchwork-relay target/release/patchwork root@your-vps:/usr/local/bin/
 ```
 
-Release tags build Desktop and Linux relay assets automatically. On a systemd
-relay, enable hourly updates from the latest release with:
+Release tags build Desktop, Linux relay, and CLI assets automatically. On a
+systemd relay, enable hourly relay and CLI updates from the latest release with:
 
 ```bash
 PATCHWORK_USER=patchwork sudo -E scripts/install-relay-updater.sh
