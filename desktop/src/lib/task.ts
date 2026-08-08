@@ -7,7 +7,7 @@
 // board card and the inspector all offer the same next move, and none of them
 // can quietly disagree about what is going on.
 
-import type { Member, Question, Run, Task } from "./types";
+import type { Member, Question, Run, Task } from "@client/types";
 
 export type Situation =
   | "unassigned"
@@ -108,10 +108,10 @@ export function readTask(
         : run?.headline,
       run,
       owner,
+      // No "Send back": a button cannot say what was wrong with the work, and
+      // an empty run only wastes a turn finding out. Changes are asked for in
+      // the task conversation, which starts the agent with the reason in hand.
       action: { label: "Mark done", kind: "complete", tone: "primary" },
-      secondary: ownerIsAgent
-        ? { label: "Send back", kind: "start", tone: "quiet" }
-        : undefined,
     };
   }
 

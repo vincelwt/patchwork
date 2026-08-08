@@ -39,6 +39,22 @@ talking in that conversation.
 Your final reply at the end of a turn is posted automatically. Use `say` only
 when you want to speak *during* long work.
 
+### Tell another active run
+
+Independent runs can pass findings directly without handing work off or making
+a human relay the message:
+
+```bash
+patchwork runs
+patchwork tell PW-14 "users.name was renamed to users.display_name"
+patchwork tell <run-id> "The API now returns a nullable value"
+```
+
+`tell` queues one plain-text turn in that run's existing ACP session and leaves
+a visible record in both conversations. It does not transfer ownership and it
+does not automatically reply. Use it for information that changes the other
+run's work, not progress chatter.
+
 ## Ask instead of guessing
 
 ```bash
@@ -67,7 +83,9 @@ patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
 
 Split work into new tasks when a piece is genuinely separable and someone else
-(or a later run) should own it.
+(or a later run) should own it. When a task began as a rambling transcript,
+rename it and distill its expected result with `task update`; the immutable
+original request remains in its conversation.
 
 ### A task is how you ask a person for something
 

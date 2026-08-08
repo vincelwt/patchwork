@@ -2,7 +2,7 @@
 // machine's execution host. In a plain browser (vite dev without Tauri) these
 // degrade to localStorage so the UI is still workable.
 
-import type { HostCapabilities } from "./types";
+import type { HostCapabilities } from "@client/types";
 
 export type AwakePolicy = "never" | "while_running" | "while_open";
 

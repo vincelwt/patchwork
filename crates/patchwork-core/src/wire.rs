@@ -26,6 +26,40 @@ pub struct AuthResponse {
     pub workspace: Workspace,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreatePairing {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingResponse {
+    pub secret: String,
+    pub expires_at: Millis,
+    pub workspace_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimPairing {
+    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimPairingResponse {
+    pub token: String,
+    pub member: Member,
+    pub workspace: Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Device {
+    pub id: Id,
+    pub label: String,
+    pub created_at: Millis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<Millis>,
+    pub current: bool,
+}
+
 /// One request that gives a freshly connected client everything the shell needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bootstrap {
@@ -143,6 +177,10 @@ pub struct CreateTask {
     /// this key is returned instead of a second one being created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once_key: Option<String>,
+    /// Files uploaded before the task exists. They become evidence on the
+    /// immutable original request.
+    #[serde(default)]
+    pub attachment_ids: Vec<Id>,
     /// Start the owning agent immediately.
     #[serde(default)]
     pub start: bool,
@@ -203,6 +241,21 @@ pub struct RunDetail {
     pub run: Run,
     pub events: Vec<RunEvent>,
     pub questions: Vec<Question>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SteerRun {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub mode: crate::host::RunControlMode,
+    #[serde(default)]
+    pub attachment_ids: Vec<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerRunResponse {
+    pub control_id: Id,
 }
 
 // --- questions --------------------------------------------------------------

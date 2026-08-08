@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp, useAppSelector } from "../lib/store";
 import {
   dateInputToMillis,
@@ -35,8 +35,8 @@ import {
 import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
-import { TASK_STATUSES } from "../lib/types";
-import type { Attachment, Id, Member, Task, TaskStatus } from "../lib/types";
+import { TASK_STATUSES } from "@client/types";
+import type { Attachment, Id, Member, Task, TaskStatus } from "@client/types";
 
 /// Everything that can be done to a task, in one place. The task page, the
 /// board card and the inspector all call this, so "Start" means the same thing
@@ -70,11 +70,6 @@ function useTaskActions(task: Task) {
           break;
         case "start":
         case "retry":
-          // Sending work back from review means it is in progress again, and
-          // the board should say so before the agent gets going.
-          if (state.situation === "review") {
-            await api.updateTask(task.id, { status: "running" });
-          }
           await start();
           break;
         case "stop":
@@ -491,17 +486,21 @@ export function NewTaskModal({
     setError("");
     try {
       localStorage.setItem(LAST_OWNER, owner);
+      // Uploaded before the task exists, then handed over on create: the relay
+      // writes the request message with its screenshots already attached, so
+      // the agent's first read is the whole question rather than half of it.
+      const attachmentIds: Id[] = [];
+      for (const file of images) attachmentIds.push((await api.upload(file)).id);
       const task = await api.createTask({
         outcome,
         owner_id: owner || undefined,
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
         due_at: dateInputToMillis(due) || undefined,
-        // Wait for the files: an agent that starts before its screenshot
-        // lands is an agent working from half the question.
+        attachment_ids: attachmentIds,
+        // The relay writes the first message; the agent starts after it exists.
         start: false,
       });
-      for (const file of images) await api.upload(file, task.id);
       if (start && owner && ownerIsAgent) {
         await api.runTask(task.id, { agent_id: owner });
       }
@@ -613,11 +612,10 @@ export function NewTaskModal({
             ]}
           />
           <DueField value={due} onChange={setDue} />
-          <label className="attach-button" title="Attach an image">
+          <label className="attach-button" title="Attach evidence">
             <AttachIcon size={15} />
             <input
               type="file"
-              accept="image/*"
               multiple
               hidden
               onChange={(event) => {
@@ -705,7 +703,11 @@ function PendingImage({ file, onRemove }: { file: File; onRemove: () => void }) 
 
   return (
     <span className="pending-image">
-      <img src={url} alt={file.name} />
+      {file.type.startsWith("image/") ? (
+        <img src={url} alt={file.name} />
+      ) : (
+        <span className="attachment-chip">{file.name}</span>
+      )}
       <button className="remove" title="Remove" onClick={onRemove}>
         ×
       </button>
@@ -715,50 +717,28 @@ function PendingImage({ file, onRemove }: { file: File; onRemove: () => void }) 
 
 /// Screenshots and other evidence pinned to a task.
 ///
-/// Paste an image anywhere on the task and it lands here — and on the machine
-/// that runs the task, as a file the agent opens by path. A prompt is a bad
-/// place to put a PNG.
-function TaskFiles({ taskId }: { taskId: Id }) {
+/// Files arrive through the discussion composer, which uploads them against
+/// the task as well as the message: one upload, evidence in both places, and
+/// on the machine that runs the task as a file the agent opens by path. So
+/// this strip only has to keep up with the conversation.
+function TaskFiles({ taskId, channelId }: { taskId: Id; channelId: Id }) {
   const api = useApi();
-  const { toast } = useNavigation();
   const [files, setFiles] = useState<Attachment[]>([]);
-  const [busy, setBusy] = useState(0);
+  const messageCount = useAppSelector(
+    (data) => data.messages[channelId]?.length ?? 0,
+  );
 
-  const reload = useCallback(() => {
-    void api.task(taskId).then((detail) => setFiles(detail.attachments));
-  }, [api, taskId]);
-
-  useEffect(reload, [reload]);
-
-  // The paste lands wherever the cursor happens to be, including the title and
-  // the description, so it is caught once for the whole page.
   useEffect(() => {
-    const onPaste = async (event: ClipboardEvent) => {
-      const images = [...(event.clipboardData?.files ?? [])];
-      if (images.length === 0) return;
-      event.preventDefault();
-      setBusy((n) => n + images.length);
-      try {
-        for (const file of images) await api.upload(file, taskId);
-        reload();
-      } catch (err) {
-        toast(String((err as Error).message ?? err));
-      } finally {
-        setBusy(0);
-      }
-    };
-    window.addEventListener("paste", onPaste);
-    return () => window.removeEventListener("paste", onPaste);
-  }, [api, taskId, reload, toast]);
+    void api.task(taskId).then((detail) => setFiles(detail.attachments));
+  }, [api, taskId, messageCount]);
 
-  if (files.length === 0 && busy === 0) return null;
+  if (files.length === 0) return null;
 
   return (
     <div className="task-files">
       {files.map((attachment) => (
         <Attached key={attachment.id} attachment={attachment} />
       ))}
-      {busy > 0 && <span className="composer-hint">Attaching…</span>}
     </div>
   );
 }
@@ -955,7 +935,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
           onCommit={(outcome) => void api.updateTask(task.id, { outcome })}
         />
 
-        <TaskFiles taskId={task.id} />
+        <TaskFiles taskId={task.id} channelId={task.discussion_channel_id} />
 
         <div className="task-rail">
           {TASK_STEPS.map((entry, index) => (
@@ -1189,9 +1169,7 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
             <button
               key={attachment.id}
               className="row"
-              onClick={() =>
-                openExternal(`${api.baseUrl.replace(/\/$/, "")}${attachment.url}`)
-              }
+              onClick={() => void api.openFile(attachment.url)}
             >
               <span className="grow">
                 <span className="name">{attachment.file_name}</span>

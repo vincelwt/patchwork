@@ -1,4 +1,4 @@
-import type { Member, Millis, RunStatus, TaskStatus } from "./types";
+import type { Member, Millis, RunStatus, TaskStatus } from "@client/types";
 
 // Locale formatting is the expensive part of drawing a transcript: every
 // message carries a time, and a channel's day markers are recomputed whenever

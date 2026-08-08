@@ -10,9 +10,10 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
+use patchwork_core::wire::Device;
 use patchwork_core::{now_ms, Id};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value as Json;
 
 pub type Pool = r2d2::Pool<SqliteConnectionManager>;
@@ -133,7 +134,11 @@ impl Store {
         Ok(ws)
     }
 
-    pub fn update_workspace(&self, name: Option<&str>, task_prefix: Option<&str>) -> Result<Workspace> {
+    pub fn update_workspace(
+        &self,
+        name: Option<&str>,
+        task_prefix: Option<&str>,
+    ) -> Result<Workspace> {
         let conn = self.conn()?;
         if let Some(name) = name {
             conn.execute("UPDATE workspace SET name = ?1", params![name])?;
@@ -269,11 +274,17 @@ impl Store {
     }
 
     pub fn deactivate_member(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("UPDATE members SET active = 0 WHERE id = ?1", params![id])?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE members SET active = 0 WHERE id = ?1", params![id])?;
+        tx.execute(
+            "UPDATE tokens SET revoked = 1 WHERE member_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM pairings WHERE member_id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
-
 
     // -- tokens and invites -------------------------------------------------
 
@@ -293,12 +304,14 @@ impl Store {
         Ok(())
     }
 
-    /// Returns `(member_id, kind, run_id)`.
+    /// Returns `(member_id, kind, run_id)` for an active member.
     pub fn lookup_token(&self, token_hash: &str) -> Result<Option<(Id, String, Option<Id>)>> {
         let conn = self.conn()?;
         let found = conn
             .query_row(
-                "SELECT member_id, kind, run_id FROM tokens WHERE token_hash = ?1 AND revoked = 0",
+                "SELECT tokens.member_id, tokens.kind, tokens.run_id
+                 FROM tokens JOIN members ON members.id = tokens.member_id
+                 WHERE tokens.token_hash = ?1 AND tokens.revoked = 0 AND members.active = 1",
                 params![token_hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -310,6 +323,86 @@ impl Store {
             )?;
         }
         Ok(found)
+    }
+
+    pub fn insert_pairing(
+        &self,
+        secret_hash: &str,
+        member_id: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM pairings WHERE expires_at <= ?1",
+            params![now_ms()],
+        )?;
+        conn.execute(
+            "INSERT INTO pairings (secret_hash, member_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![secret_hash, member_id, now_ms(), expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Consume a valid pairing and mint its device token in one transaction.
+    pub fn claim_pairing(
+        &self,
+        secret_hash: &str,
+        token_hash: &str,
+        label: Option<&str>,
+        at: i64,
+    ) -> Result<Option<Id>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let member_id: Option<Id> = tx
+            .query_row(
+                "DELETE FROM pairings
+                 WHERE secret_hash = ?1 AND expires_at > ?2
+                   AND EXISTS (SELECT 1 FROM members
+                               WHERE id = pairings.member_id AND kind = 'human' AND active = 1)
+                 RETURNING member_id",
+                params![secret_hash, at],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(member_id) = &member_id {
+            tx.execute(
+                "INSERT INTO tokens (token_hash, member_id, kind, label, created_at)
+                 VALUES (?1, ?2, 'mobile', ?3, ?4)",
+                params![token_hash, member_id, label, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(member_id)
+    }
+
+    pub fn devices(&self, member_id: &str, current_token_hash: &str) -> Result<Vec<Device>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT token_hash, COALESCE(NULLIF(label, ''), 'Device'), created_at, last_used
+             FROM tokens
+             WHERE member_id = ?1 AND kind IN ('device', 'mobile') AND revoked = 0
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![member_id], |row| {
+            let id: Id = row.get(0)?;
+            Ok(Device {
+                current: id == current_token_hash,
+                id,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used: row.get(3)?,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn revoke_device(&self, member_id: &str, id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tokens SET revoked = 1
+             WHERE token_hash = ?1 AND member_id = ?2 AND kind IN ('device', 'mobile') AND revoked = 0",
+            params![id, member_id],
+        )? == 1)
     }
 
     pub fn revoke_run_tokens(&self, run_id: &str) -> Result<()> {
@@ -334,7 +427,9 @@ impl Store {
         let rows = stmt.query_map([], |r| {
             Ok(Invite {
                 code: r.get("code")?,
-                created_by: r.get::<_, Option<String>>("created_by")?.unwrap_or_default(),
+                created_by: r
+                    .get::<_, Option<String>>("created_by")?
+                    .unwrap_or_default(),
                 created_at: r.get("created_at")?,
                 email: r.get("email")?,
                 is_admin: r.get::<_, i64>("is_admin")? != 0,
@@ -354,7 +449,9 @@ impl Store {
                 |r| {
                     Ok(Invite {
                         code: r.get("code")?,
-                        created_by: r.get::<_, Option<String>>("created_by")?.unwrap_or_default(),
+                        created_by: r
+                            .get::<_, Option<String>>("created_by")?
+                            .unwrap_or_default(),
                         created_at: r.get("created_at")?,
                         email: r.get("email")?,
                         is_admin: r.get::<_, i64>("is_admin")? != 0,
@@ -426,7 +523,8 @@ impl Store {
 
     fn hydrate_channel_members(&self, channels: &mut [Channel]) -> Result<()> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
         for ch in channels.iter_mut() {
             if ch.kind == ChannelKind::Channel {
                 continue;
@@ -517,8 +615,10 @@ impl Store {
     }
 
     pub fn archive_channel(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("UPDATE channels SET archived = 1 WHERE id = ?1", params![id])?;
+        self.conn()?.execute(
+            "UPDATE channels SET archived = 1 WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -574,8 +674,9 @@ impl Store {
     }
 
     pub fn insert_message(&self, message: &Message) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, run_id, task_id, mentions, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
@@ -597,26 +698,31 @@ impl Store {
                 message.created_at,
             ],
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO message_search (message_id, channel_id, body) VALUES (?1, ?2, ?3)",
             params![message.id, message.channel_id, message.body],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE channels SET last_message_at = ?2 WHERE id = ?1",
             params![message.channel_id, message.created_at],
         )?;
         if let Some(parent) = &message.parent_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE messages SET reply_count = reply_count + 1, last_reply_at = ?2 WHERE id = ?1",
                 params![parent, message.created_at],
             )?;
         }
-        for id in &message.attachments.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
-            conn.execute(
-                "UPDATE attachments SET message_id = ?2 WHERE id = ?1",
-                params![id, message.id],
+        for attachment in &message.attachments {
+            let claimed = tx.execute(
+                "UPDATE attachments SET message_id = ?2, task_id = COALESCE(task_id, ?3)
+                 WHERE id = ?1 AND message_id IS NULL",
+                params![attachment.id, message.id, message.task_id],
             )?;
+            if claimed != 1 {
+                return Err(anyhow!("an attachment already belongs to another message"));
+            }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -740,9 +846,8 @@ impl Store {
     /// conversation context.
     pub fn recent_messages(&self, channel_id: &str, limit: usize) -> Result<Vec<Message>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![channel_id, limit as i64], |r| {
             Self::message_from_row(r)
         })?;
@@ -756,8 +861,8 @@ impl Store {
             return Ok(());
         }
         let conn = self.conn()?;
-        let mut reactions = conn
-            .prepare("SELECT member_id, emoji FROM reactions WHERE message_id = ?1")?;
+        let mut reactions =
+            conn.prepare("SELECT member_id, emoji FROM reactions WHERE message_id = ?1")?;
         let mut attachments = conn.prepare("SELECT * FROM attachments WHERE message_id = ?1")?;
         for m in messages.iter_mut() {
             let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -826,11 +931,7 @@ impl Store {
         })
     }
 
-    pub fn insert_attachment(
-        &self,
-        attachment: &Attachment,
-        path: &str,
-    ) -> Result<()> {
+    pub fn insert_attachment(&self, attachment: &Attachment, path: &str) -> Result<()> {
         self.conn()?.execute(
             "INSERT INTO attachments (id, file_name, mime, size, path, message_id, task_id, run_id, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -853,9 +954,11 @@ impl Store {
     pub fn attachment(&self, id: &str) -> Result<Option<(Attachment, String)>> {
         let conn = self.conn()?;
         Ok(conn
-            .query_row("SELECT * FROM attachments WHERE id = ?1", params![id], |r| {
-                Ok((Self::attachment_from_row(r)?, r.get::<_, String>("path")?))
-            })
+            .query_row(
+                "SELECT * FROM attachments WHERE id = ?1",
+                params![id],
+                |r| Ok((Self::attachment_from_row(r)?, r.get::<_, String>("path")?)),
+            )
             .optional()?)
     }
 
@@ -914,7 +1017,9 @@ impl Store {
     }
 
     pub fn update_task(&self, task: &Task) -> Result<()> {
-        self.conn()?.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
                               position=?13, updated_at=?14 WHERE id=?1",
@@ -924,6 +1029,15 @@ impl Store {
                 task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms()
             ],
         )?;
+        tx.execute(
+            "UPDATE channels SET name = ?2, topic = ?3 WHERE id = ?1",
+            params![
+                task.discussion_channel_id,
+                format!("{}: {}", task.key, task.title),
+                task.outcome,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -937,6 +1051,25 @@ impl Store {
     }
 
     /// Accepts an id or a human key like `PW-14`.
+    pub fn set_task_source_message(&self, task_id: &str, message_id: &str) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE tasks SET source_message_id = ?2 WHERE id = ?1",
+            params![task_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn task_by_source_message(&self, message_id: &str) -> Result<Option<Task>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM tasks WHERE source_message_id = ?1 LIMIT 1",
+                params![message_id],
+                |row| Self::task_from_row(row),
+            )
+            .optional()?)
+    }
+
     pub fn task_by_ref(&self, reference: &str) -> Result<Option<Task>> {
         if let Some(task) = self.task(reference)? {
             return Ok(Some(task));
@@ -950,7 +1083,6 @@ impl Store {
             )
             .optional()?)
     }
-
 
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn()?;
@@ -1140,9 +1272,7 @@ impl Store {
             id: row.get("id")?,
             agent_id: row.get("agent_id")?,
             status: RunStatus::parse(&status).unwrap_or(RunStatus::Queued),
-            trigger: json_col(row, "trigger").unwrap_or(RunTrigger::Manual {
-                by: String::new(),
-            }),
+            trigger: json_col(row, "trigger").unwrap_or(RunTrigger::Manual { by: String::new() }),
             channel_id: row.get("channel_id")?,
             task_id: row.get("task_id")?,
             host_id: row.get("host_id")?,
@@ -1163,7 +1293,20 @@ impl Store {
     }
 
     pub fn insert_run(&self, run: &Run, depth: i32) -> Result<()> {
-        self.conn()?.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task_id) = &run.task_id {
+            let busy: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE task_id = ?1
+                 AND status IN ('queued','dispatched','running','waiting'))",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            if busy {
+                return Err(anyhow!("this task already has an active run"));
+            }
+        }
+        tx.execute(
             "INSERT INTO runs (id, agent_id, status, trigger, channel_id, task_id, host_id, project_id,
                                worktree_id, cwd, automation_id, session_id, runtime, prompt, headline,
                                error, token_usage, depth, created_at, started_at, ended_at)
@@ -1175,6 +1318,7 @@ impl Store {
                 run.token_usage.as_ref().map(to_json), depth, run.created_at, run.started_at, run.ended_at
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1242,7 +1386,11 @@ impl Store {
     /// A run already working in this project, on a different task. Only
     /// interesting for projects with no repository, where every task shares
     /// the one folder.
-    pub fn project_active_run(&self, project_id: &str, task_id: Option<&str>) -> Result<Option<Run>> {
+    pub fn project_active_run(
+        &self,
+        project_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Option<Run>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
@@ -1266,6 +1414,48 @@ impl Store {
                 |r| Self::run_from_row(r),
             )
             .optional()?)
+    }
+
+    /// Reserve one explicit cross-session message and enforce its loop budget
+    /// in the same write transaction, so concurrent sends cannot race it.
+    pub fn reserve_direct_control(
+        &self,
+        event: &mut RunEvent,
+        target_run_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?1
+             AND json_extract(data, '$.direction') = 'outbound'",
+            params![event.run_id],
+            |row| row.get(0),
+        )?;
+        let pair: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ?1
+             AND json_extract(data, '$.direction') = 'outbound'
+             AND json_extract(data, '$.target_run_id') = ?2",
+            params![event.run_id, target_run_id],
+            |row| row.get(0),
+        )?;
+        if total >= 16 || pair >= 4 {
+            return Err(anyhow!("this run has reached its cross-session message limit"));
+        }
+        event.seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+            params![event.run_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO run_events (id, run_id, seq, kind, text, data, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                event.id, event.run_id, event.seq,
+                serde_json::to_string(&event.kind).unwrap_or_default().trim_matches('"'),
+                event.text, event.data.as_ref().map(to_json), event.created_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn append_run_event(&self, event: &RunEvent) -> Result<()> {
@@ -1301,8 +1491,7 @@ impl Store {
                 id: r.get("id")?,
                 run_id: r.get("run_id")?,
                 seq: r.get("seq")?,
-                kind: serde_json::from_value(Json::String(kind))
-                    .unwrap_or(RunEventKind::Lifecycle),
+                kind: serde_json::from_value(Json::String(kind)).unwrap_or(RunEventKind::Lifecycle),
                 text: r.get("text")?,
                 data: json_col(r, "data"),
                 created_at: r.get("created_at")?,
@@ -1491,10 +1680,11 @@ impl Store {
             .optional()?)
     }
 
-    pub fn mark_inbox_read(&self, id: &str) -> Result<()> {
+    pub fn mark_inbox_read(&self, id: &str, member_id: &str) -> Result<()> {
         self.conn()?.execute(
-            "UPDATE inbox SET read_at = ?2 WHERE id = ?1 AND read_at IS NULL",
-            params![id, now_ms()],
+            "UPDATE inbox SET read_at = ?3
+             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL",
+            params![id, member_id, now_ms()],
         )?;
         Ok(())
     }
@@ -1588,16 +1778,19 @@ impl Store {
     pub fn automation(&self, id: &str) -> Result<Option<Automation>> {
         let conn = self.conn()?;
         Ok(conn
-            .query_row("SELECT * FROM automations WHERE id = ?1", params![id], |r| {
-                Self::automation_from_row(r)
-            })
+            .query_row(
+                "SELECT * FROM automations WHERE id = ?1",
+                params![id],
+                |r| Self::automation_from_row(r),
+            )
             .optional()?)
     }
 
     pub fn automation_by_webhook(&self, token: &str) -> Result<Option<Automation>> {
-        Ok(self.automations()?.into_iter().find(|a| {
-            matches!(&a.trigger, AutomationTrigger::Webhook { token: t } if t == token)
-        }))
+        Ok(self
+            .automations()?
+            .into_iter()
+            .find(|a| matches!(&a.trigger, AutomationTrigger::Webhook { token: t } if t == token)))
     }
 
     pub fn delete_automation(&self, id: &str) -> Result<()> {
@@ -1775,8 +1968,8 @@ impl Store {
 
     pub fn events_since(&self, seq: i64, limit: usize) -> Result<Vec<Envelope>> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT seq, at, payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let mut stmt = conn
+            .prepare("SELECT seq, at, payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
         let rows = stmt.query_map(params![seq, limit as i64], |r| {
             let payload: String = r.get(2)?;
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, payload))
@@ -1843,5 +2036,323 @@ impl Store {
         )?;
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use patchwork_core::new_id;
+
+    fn store() -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("patchwork-store-{}.sqlite", new_id()));
+        (Store::open(&path).unwrap(), path)
+    }
+
+    fn human(id: &str) -> Member {
+        Member {
+            id: id.into(),
+            kind: MemberKind::Human,
+            handle: id.into(),
+            display_name: id.into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        }
+    }
+
+    fn run(id: &str, task_id: &str) -> Run {
+        Run {
+            id: id.into(),
+            agent_id: "agent".into(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: "channel".into(),
+            task_id: Some(task_id.into()),
+            host_id: Some("host".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            prompt: String::new(),
+            headline: String::new(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn pairing_issues_a_separate_device_for_the_same_member() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let secret = "raw-pairing-secret";
+        let token = "new-device-token";
+        store
+            .insert_pairing(&crate::auth::hash_token(secret), "human", now_ms() + 1_000)
+            .unwrap();
+        assert_eq!(
+            store
+                .conn()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM pairings WHERE secret_hash = ?1",
+                    params![secret],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .claim_pairing(
+                    &crate::auth::hash_token(secret),
+                    &crate::auth::hash_token(token),
+                    Some("Phone"),
+                    now_ms(),
+                )
+                .unwrap()
+                .as_deref(),
+            Some("human")
+        );
+        let issued = store
+            .lookup_token(&crate::auth::hash_token(token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(issued.0, "human");
+        assert_eq!(issued.1, "mobile");
+        assert_eq!(store.members().unwrap().len(), 1);
+        let devices = store
+            .devices("human", &crate::auth::hash_token(token))
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].label, "Phone");
+        assert!(devices[0].current);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pairings_expire_and_are_single_use() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let at = now_ms();
+        store.insert_pairing("expired", "human", at).unwrap();
+        assert!(store
+            .claim_pairing("expired", "expired-token", None, at)
+            .unwrap()
+            .is_none());
+
+        store.insert_pairing("once", "human", at + 1_000).unwrap();
+        assert!(store
+            .claim_pairing("once", "first-token", None, at)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .claim_pairing("once", "second-token", None, at)
+            .unwrap()
+            .is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_member_cannot_revoke_another_members_device() {
+        let (store, path) = store();
+        store.insert_member(&human("one")).unwrap();
+        store.insert_member(&human("two")).unwrap();
+        store
+            .insert_token("one-token", "one", "device", None, None)
+            .unwrap();
+        store
+            .insert_token("two-token", "two", "device", None, None)
+            .unwrap();
+        assert!(!store.revoke_device("one", "two-token").unwrap());
+        assert!(store.lookup_token("two-token").unwrap().is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn deactivated_members_no_longer_authenticate() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let token = crate::auth::generate_token();
+        store
+            .insert_token(
+                &crate::auth::hash_token(&token),
+                "human",
+                "device",
+                None,
+                None,
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        assert!(crate::auth::authenticate(&state, &token).is_some());
+        store.deactivate_member("human").unwrap();
+        assert!(crate::auth::authenticate(&state, &token).is_none());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn inbox_read_is_scoped_to_its_owner() {
+        let (store, path) = store();
+        store
+            .insert_inbox(&InboxItem {
+                id: "item".into(),
+                member_id: "two".into(),
+                kind: InboxKind::Mention,
+                title: "Mention".into(),
+                preview: String::new(),
+                actor_id: None,
+                channel_id: None,
+                message_id: None,
+                task_id: None,
+                run_id: None,
+                automation_id: None,
+                created_at: 1,
+                read_at: None,
+            })
+            .unwrap();
+        store.mark_inbox_read("item", "one").unwrap();
+        assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_none());
+        store.mark_inbox_read("item", "two").unwrap();
+        assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_task_has_one_active_writer() {
+        let (store, path) = store();
+        let mut first = run("r1", "task");
+        store.insert_run(&first, 0).unwrap();
+        assert!(store.insert_run(&run("r2", "task"), 0).is_err());
+        first.status = RunStatus::Succeeded;
+        store.update_run(&first).unwrap();
+        store.insert_run(&run("r2", "task"), 0).unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn direct_messages_reserve_their_pair_budget_atomically() {
+        let (store, path) = store();
+        for index in 0..4 {
+            let mut event = RunEvent {
+                id: format!("event-{index}"),
+                run_id: "source".into(),
+                seq: 0,
+                kind: RunEventKind::Message,
+                text: "coordination".into(),
+                data: Some(serde_json::json!({
+                    "direction": "outbound",
+                    "target_run_id": "target",
+                })),
+                created_at: index,
+            };
+            store
+                .reserve_direct_control(&mut event, "target")
+                .unwrap();
+            assert_eq!(event.seq, index + 1);
+        }
+        let mut extra = RunEvent {
+            id: "extra".into(),
+            run_id: "source".into(),
+            seq: 0,
+            kind: RunEventKind::Message,
+            text: "too many".into(),
+            data: Some(serde_json::json!({
+                "direction": "outbound",
+                "target_run_id": "target",
+            })),
+            created_at: 5,
+        };
+        assert!(store.reserve_direct_control(&mut extra, "target").is_err());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_task_message_pins_its_attachment_to_both_records() {
+        let (store, path) = store();
+        store
+            .insert_channel(&Channel {
+                id: "channel".into(),
+                kind: ChannelKind::Task,
+                section_id: None,
+                slug: String::new(),
+                name: "Task".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: Some("task".into()),
+                last_message_at: 0,
+            })
+            .unwrap();
+        let attachment = Attachment {
+            id: "file".into(),
+            file_name: "screen.png".into(),
+            mime: "image/png".into(),
+            size: 1,
+            url: "/api/files/file".into(),
+            message_id: None,
+            task_id: None,
+            run_id: None,
+            created_at: 1,
+        };
+        store.insert_attachment(&attachment, "/tmp/screen.png").unwrap();
+        store
+            .insert_message(&Message {
+                id: "message".into(),
+                channel_id: "channel".into(),
+                author_id: "human".into(),
+                kind: MessageKind::Text,
+                body: String::new(),
+                card: None,
+                parent_id: None,
+                reply_count: 0,
+                last_reply_at: 0,
+                run_id: None,
+                task_id: Some("task".into()),
+                mentions: Vec::new(),
+                attachments: vec![attachment],
+                reactions: Vec::new(),
+                created_at: 1,
+                edited_at: None,
+            })
+            .unwrap();
+        let attached = store.attachment("file").unwrap().unwrap().0;
+        assert_eq!(attached.message_id.as_deref(), Some("message"));
+        assert_eq!(attached.task_id.as_deref(), Some("task"));
+        let mut duplicate = store.message("message").unwrap().unwrap();
+        duplicate.id = "other-message".into();
+        assert!(store.insert_message(&duplicate).is_err());
+        assert_eq!(
+            store
+                .attachment("file")
+                .unwrap()
+                .unwrap()
+                .0
+                .message_id
+                .as_deref(),
+            Some("message")
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }

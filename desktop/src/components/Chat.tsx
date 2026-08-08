@@ -2,8 +2,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
+import { useFileUrl } from "../lib/file";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
+import { readTask } from "../lib/task";
 import {
   AttachIcon,
   CloseIcon,
@@ -20,7 +22,7 @@ import {
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
-import type { Attachment, Channel, Id, Member, Message, Run } from "../lib/types";
+import type { Attachment, Channel, Id, Member, Message, Run } from "@client/types";
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const { channel, messages } = useAppSelector((data) => ({
@@ -124,11 +126,20 @@ export function Timeline({
   channelId: Id;
   messages: Message[];
 }) {
-  const { members, runs, hasMore } = useAppSelector((data) => ({
-    members: data.members,
-    runs: data.runs,
-    hasMore: !!data.hasMore[channelId],
-  }));
+  const { members, runs, hasMore, sourceMessageId } = useAppSelector((data) => {
+    const channel = data.channels.find((candidate) => candidate.id === channelId);
+    const task = channel?.task_id
+      ? data.tasks.find((candidate) => candidate.id === channel.task_id)
+      : undefined;
+    return {
+      members: data.members,
+      runs: data.runs,
+      hasMore: !!data.hasMore[channelId],
+      /// The request as it was first written, which the discussion should keep
+      /// legible however far the conversation has moved on.
+      sourceMessageId: task?.source_message_id,
+    };
+  });
   const handles = useHandles();
   const scroller = useRef<HTMLDivElement>(null);
   const inner = useRef<HTMLDivElement>(null);
@@ -287,6 +298,7 @@ export function Timeline({
                 author={authorOf.get(message.author_id)}
                 handles={handles}
                 run={run}
+                original={message.id === sourceMessageId}
                 streaming={
                   message.kind === "text" &&
                   !!run &&
@@ -391,6 +403,7 @@ export const MessageRow = memo(function MessageRow({
   handles,
   run,
   streaming = false,
+  original = false,
 }: {
   message: Message;
   grouped: boolean;
@@ -400,6 +413,8 @@ export const MessageRow = memo(function MessageRow({
   run?: Run;
   /// The reply the relay is still writing into.
   streaming?: boolean;
+  /// The immutable request this task started from.
+  original?: boolean;
 }) {
   const api = useApi();
   const { inspect } = useNavigation();
@@ -459,8 +474,19 @@ export const MessageRow = memo(function MessageRow({
         )}
         {message.body && (
           <div className="message-body">
-            <Markdown body={message.body} handles={handles} />
-            {streaming && <span className="caret" />}
+            {original ? (
+              // Kept whole and kept where it was written. A long brief folds so
+              // that reopening the task does not mean scrolling past it again.
+              <details className="original-request" open={message.body.length < 500}>
+                <summary>Original request</summary>
+                <Markdown body={message.body} handles={handles} />
+              </details>
+            ) : (
+              <>
+                <Markdown body={message.body} handles={handles} />
+                {streaming && <span className="caret" />}
+              </>
+            )}
           </div>
         )}
         {message.card && <Card card={message.card} body={message.body} />}
@@ -540,10 +566,12 @@ function RunMeta({ run }: { run: Run }) {
 /// An image someone dropped in should be visible without a download step.
 export function Attached({ attachment }: { attachment: Attachment }) {
   const api = useApi();
-  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
+  const image = attachment.mime.startsWith("image/");
+  const url = useFileUrl(image ? attachment.url : "");
   const [broken, setBroken] = useState(false);
 
-  if (attachment.mime.startsWith("image/") && !broken) {
+  if (image && !broken) {
+    if (!url) return <span className="attachment-chip">Loading image…</span>;
     return (
       <a href={url} target="_blank" rel="noreferrer noopener" className="image-attachment">
         <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
@@ -554,7 +582,7 @@ export function Attached({ attachment }: { attachment: Attachment }) {
     <AttachmentRow
       fileName={attachment.file_name}
       size={attachment.size}
-      url={url}
+      onOpen={() => void api.openFile(attachment.url)}
     />
   );
 }
@@ -661,6 +689,108 @@ function busyWord(status: string) {
   return status === "waiting" ? "is waiting for you" : "is working";
 }
 
+/// Files on their way into a message: uploaded the moment they are chosen, so
+/// sending is only ever a list of ids.
+///
+/// Shared by the message composer and the run control box: one upload path,
+/// one row of chips, one place that knows what to do with a paste.
+export function useAttachments({
+  incoming,
+  onConsumed,
+  taskId,
+}: {
+  /// Files dropped anywhere in the surrounding surface, not just on the box.
+  incoming?: File[];
+  onConsumed?: () => void;
+  /// A screenshot dropped in a task discussion is evidence for the task as
+  /// well as for the message, and one upload should be both.
+  taskId?: Id;
+} = {}) {
+  const api = useApi();
+  const [pending, setPending] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(0);
+
+  const attach = useCallback(
+    async (files: FileList | File[]) => {
+      const list = Array.from(files);
+      if (list.length === 0) return;
+      setUploading((n) => n + list.length);
+      try {
+        for (const file of list) {
+          try {
+            const uploaded = await api.upload(file, taskId);
+            setPending((current) => [...current, uploaded]);
+          } finally {
+            setUploading((n) => n - 1);
+          }
+        }
+      } catch {
+        setUploading(0);
+      }
+    },
+    [api, taskId],
+  );
+
+  // Keyed on the array's identity, not its contents: a re-render for any other
+  // reason must not upload the same drop a second time.
+  const handled = useRef<File[] | null>(null);
+  useEffect(() => {
+    if (!incoming || incoming.length === 0 || handled.current === incoming) return;
+    handled.current = incoming;
+    void attach(incoming);
+    onConsumed?.();
+  }, [incoming, attach, onConsumed]);
+
+  const strip =
+    pending.length > 0 || uploading > 0 ? (
+      <div className="composer-attachments">
+        {pending.map((attachment) => (
+          <PendingAttachment
+            key={attachment.id}
+            attachment={attachment}
+            onRemove={() =>
+              setPending((current) =>
+                current.filter((item) => item.id !== attachment.id),
+              )
+            }
+          />
+        ))}
+        {uploading > 0 && (
+          <span className="attachment-chip">
+            <Spinner size={13} />
+            Uploading {uploading}
+          </span>
+        )}
+      </div>
+    ) : null;
+
+  return {
+    pending,
+    uploading,
+    attach,
+    strip,
+    clear: useCallback(() => setPending([]), []),
+  };
+}
+
+/// The paperclip, wherever files can be added.
+export function AttachButton({ onFiles }: { onFiles: (files: FileList) => void }) {
+  return (
+    <label className="icon-button" title="Attach files">
+      <AttachIcon size={17} />
+      <input
+        type="file"
+        multiple
+        hidden
+        onChange={(event) => {
+          if (event.target.files) onFiles(event.target.files);
+          event.target.value = "";
+        }}
+      />
+    </label>
+  );
+}
+
 export function Composer({
   channel,
   parentId,
@@ -681,9 +811,8 @@ export function Composer({
     me: data.me,
   }));
   const [text, setText] = useState("");
-  const [pending, setPending] = useState<Attachment[]>([]);
+  const files = useAttachments({ incoming, onConsumed, taskId: channel.task_id });
   const [busy, setBusy] = useState(false);
-  const [uploading, setUploading] = useState(0);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const box = useRef<HTMLTextAreaElement>(null);
@@ -713,48 +842,17 @@ export function Composer({
     };
   }, []);
 
-  const attach = useCallback(
-    async (files: FileList | File[]) => {
-      const list = Array.from(files);
-      if (list.length === 0) return;
-      setUploading((n) => n + list.length);
-      try {
-        for (const file of list) {
-          try {
-            const uploaded = await api.upload(file);
-            setPending((current) => [...current, uploaded]);
-          } finally {
-            setUploading((n) => n - 1);
-          }
-        }
-      } catch {
-        setUploading(0);
-      }
-    },
-    [api],
-  );
-
-  // Keyed on the array's identity, not its contents: a re-render for any other
-  // reason must not upload the same drop a second time.
-  const handled = useRef<File[] | null>(null);
-  useEffect(() => {
-    if (!incoming || incoming.length === 0 || handled.current === incoming) return;
-    handled.current = incoming;
-    void attach(incoming);
-    onConsumed?.();
-  }, [incoming, attach, onConsumed]);
-
   const send = async () => {
-    if (!text.trim() && pending.length === 0) return;
+    if (files.uploading > 0 || (!text.trim() && files.pending.length === 0)) return;
     setBusy(true);
     try {
       await api.send(channel.id, {
         body: text.trim(),
         parent_id: parentId,
-        attachment_ids: pending.map((attachment) => attachment.id),
+        attachment_ids: files.pending.map((attachment) => attachment.id),
       } as never);
       setText("");
-      setPending([]);
+      files.clear();
     } finally {
       setBusy(false);
     }
@@ -785,12 +883,35 @@ export function Composer({
     store.typing(channel.id);
   };
 
+  // The same Return does a different thing depending on where the task is:
+  // it feeds a live run, wakes an idle agent, or asks a person. The box says
+  // which before it is pressed, and still sends an ordinary message.
+  const taskLabel = useAppSelector((data) => {
+    if (channel.kind !== "task" || !channel.task_id) return "";
+    const task = data.tasks.find((candidate) => candidate.id === channel.task_id);
+    if (!task) return "";
+    const state = readTask(task, data.members, data.runs, data.questions);
+    if (state.owner?.kind !== "agent") return "";
+    switch (state.situation) {
+      case "working":
+      case "queued":
+      case "asking":
+        return `Feedback for ${state.owner.display_name}`;
+      case "review":
+        return "Request changes";
+      case "done":
+        return "Message this completed task";
+      default:
+        return `Send and resume ${state.owner.display_name}`;
+    }
+  });
+
   const label =
     placeholder ??
     (channel.kind === "channel"
       ? `Message #${channel.name}`
       : channel.kind === "task"
-        ? "Message this task"
+        ? taskLabel || "Message this task"
         : `Message ${channel.name}`);
 
   return (
@@ -820,25 +941,7 @@ export function Composer({
       )}
 
       <div className="composer">
-        {(pending.length > 0 || uploading > 0) && (
-          <div className="composer-attachments">
-            {pending.map((attachment) => (
-              <PendingAttachment
-                key={attachment.id}
-                attachment={attachment}
-                onRemove={() =>
-                  setPending(pending.filter((item) => item.id !== attachment.id))
-                }
-              />
-            ))}
-            {uploading > 0 && (
-              <span className="attachment-chip">
-                <Spinner size={13} />
-                Uploading {uploading}
-              </span>
-            )}
-          </div>
-        )}
+        {files.strip}
         <textarea
           ref={box}
           rows={1}
@@ -876,33 +979,24 @@ export function Composer({
             }
           }}
           onPaste={(event) => {
-            const files = Array.from(event.clipboardData.files);
-            if (files.length === 0) return;
+            const pasted = Array.from(event.clipboardData.files);
+            if (pasted.length === 0) return;
             event.preventDefault();
-            void attach(files);
+            void files.attach(pasted);
           }}
         />
         <DictateButton value={text} onText={onChange} />
         <div className="composer-row">
-          <label className="icon-button" title="Attach files">
-            <AttachIcon size={17} />
-            <input
-              type="file"
-              multiple
-              hidden
-              onChange={(event) => {
-                if (event.target.files) void attach(event.target.files);
-                event.target.value = "";
-              }}
-            />
-          </label>
+          <AttachButton onFiles={(picked) => void files.attach(picked)} />
           <span className="composer-hint">
             {text.includes("\n") ? "⇧↵ for a new line" : ""}
           </span>
           <span className="spacer" />
           <button
             className="send-button"
-            disabled={busy || (!text.trim() && pending.length === 0)}
+            disabled={
+              busy || files.uploading > 0 || (!text.trim() && files.pending.length === 0)
+            }
             onClick={send}
             title="Send"
           >
@@ -924,14 +1018,13 @@ function PendingAttachment({
   attachment: Attachment;
   onRemove: () => void;
 }) {
-  const api = useApi();
-  const url = `${api.baseUrl.replace(/\/$/, "")}${attachment.url}`;
   const isImage = attachment.mime.startsWith("image/");
+  const url = useFileUrl(isImage ? attachment.url : "");
 
   return (
     <span className={`pending-attachment${isImage ? " image" : ""}`}>
       {isImage ? (
-        <img src={url} alt={attachment.file_name} />
+        url ? <img src={url} alt={attachment.file_name} /> : <Spinner size={13} />
       ) : (
         <span className="file">
           <span className="name">{attachment.file_name}</span>

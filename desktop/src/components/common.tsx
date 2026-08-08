@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { avatarStyle, initials } from "../lib/format";
-import type { Id, Member, Presence } from "../lib/types";
+import type { Id, Member, Presence } from "@client/types";
 
 export type View =
   | { kind: "inbox" }

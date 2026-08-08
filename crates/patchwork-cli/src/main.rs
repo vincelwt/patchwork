@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use patchwork_core::host::RunControlMode;
 use patchwork_core::models::*;
 use patchwork_core::wire::*;
 use serde::de::DeserializeOwned;
@@ -49,6 +50,10 @@ enum Command {
     Say(SayArgs),
     /// Post a concise progress note.
     Status(SayArgs),
+    /// List ACP runs that can receive a direct message.
+    Runs,
+    /// Send information directly to another active ACP run.
+    Tell(TellArgs),
     /// Ask the user a question and wait for the answer.
     Ask(AskArgs),
     /// Attach a file as evidence.
@@ -90,6 +95,14 @@ struct SayArgs {
     /// Post somewhere else: `#deploys`, a channel name, or a channel id.
     #[arg(long)]
     channel: Option<String>,
+}
+
+#[derive(Args)]
+struct TellArgs {
+    /// Active run id or task key, e.g. PW-14.
+    target: String,
+    /// Plain-text information for that independent run.
+    text: Vec<String>,
 }
 
 #[derive(Args)]
@@ -388,6 +401,8 @@ async fn run() -> Result<()> {
         Command::Search(args) => search(&client, args).await,
         Command::Say(args) => say(&client, &ctx, args, MessageKind::Text).await,
         Command::Status(args) => say(&client, &ctx, args, MessageKind::Status).await,
+        Command::Runs => active_runs(&client).await,
+        Command::Tell(args) => tell(&client, args).await,
         Command::Ask(args) => ask(&client, &ctx, args).await,
         Command::Attach(args) => attach(&client, &ctx, args).await,
         Command::Chart(args) => chart(&client, &ctx, args).await,
@@ -403,7 +418,11 @@ async fn run() -> Result<()> {
 async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
     let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
     let task = match &ctx.task_id {
-        Some(id) => Some(client.get::<TaskDetail>(&format!("/api/tasks/{id}")).await?),
+        Some(id) => Some(
+            client
+                .get::<TaskDetail>(&format!("/api/tasks/{id}"))
+                .await?,
+        ),
         None => None,
     };
 
@@ -418,7 +437,10 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
     });
 
     client.print(&payload, || {
-        println!("You are {} (@{})", bootstrap.me.display_name, bootstrap.me.handle);
+        println!(
+            "You are {} (@{})",
+            bootstrap.me.display_name, bootstrap.me.handle
+        );
         println!("Workspace: {}", bootstrap.workspace.name);
         if let Some(channel) = bootstrap
             .channels
@@ -488,7 +510,11 @@ fn parse_due(value: &str) -> Result<i64> {
         .timestamp_millis())
 }
 
-async fn resolve_channel(client: &Client, ctx: &RunContext, given: Option<String>) -> Result<String> {
+async fn resolve_channel(
+    client: &Client,
+    ctx: &RunContext,
+    given: Option<String>,
+) -> Result<String> {
     let Some(reference) = given else {
         return ctx
             .channel_id
@@ -513,9 +539,11 @@ async fn resolve_channel(client: &Client, ctx: &RunContext, given: Option<String
         m.handle.eq_ignore_ascii_case(wanted) || m.display_name.eq_ignore_ascii_case(wanted)
     });
     if let Some(partner) = partner {
-        if let Some(channel) = bootstrap.channels.iter().find(|c| {
-            c.kind == ChannelKind::Dm && c.member_ids.contains(&partner.id)
-        }) {
+        if let Some(channel) = bootstrap
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Dm && c.member_ids.contains(&partner.id))
+        {
             return Ok(channel.id.clone());
         }
         let channel: Channel = client
@@ -595,13 +623,80 @@ async fn search(client: &Client, args: SearchArgs) -> Result<()> {
         if !results.messages.is_empty() {
             println!("Messages:");
             for hit in &results.messages {
-                println!("  {} in {}: {}", hit.author_name, hit.channel_name, hit.snippet);
+                println!(
+                    "  {} in {}: {}",
+                    hit.author_name, hit.channel_name, hit.snippet
+                );
             }
         }
         if results.tasks.is_empty() && results.messages.is_empty() {
             println!("nothing found");
         }
     });
+    Ok(())
+}
+
+async fn active_runs(client: &Client) -> Result<()> {
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    client.print(&bootstrap.active_runs, || {
+        for run in &bootstrap.active_runs {
+            let agent = bootstrap
+                .members
+                .iter()
+                .find(|member| member.id == run.agent_id)
+                .map(|member| member.display_name.as_str())
+                .unwrap_or("agent");
+            let task = run
+                .task_id
+                .as_deref()
+                .and_then(|id| bootstrap.tasks.iter().find(|task| task.id == id));
+            match task {
+                Some(task) => println!("{}  {}  {}: {}", run.id, agent, task.key, task.title),
+                None => println!("{}  {}  {}", run.id, agent, run.headline),
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn tell(client: &Client, args: TellArgs) -> Result<()> {
+    let prompt = args.text.join(" ");
+    if prompt.trim().is_empty() {
+        bail!("nothing to tell the other run");
+    }
+    let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
+    let run_id = if let Some(run) = bootstrap
+        .active_runs
+        .iter()
+        .find(|run| run.id == args.target)
+    {
+        run.id.clone()
+    } else if let Some(task) = bootstrap
+        .tasks
+        .iter()
+        .find(|task| task.key.eq_ignore_ascii_case(&args.target))
+    {
+        task.current_run_id
+            .clone()
+            .filter(|id| bootstrap.active_runs.iter().any(|run| run.id == *id))
+            .ok_or_else(|| anyhow!("{} has no active run", task.key))?
+    } else {
+        bail!(
+            "no active run or task called `{}`; use `patchwork runs`",
+            args.target
+        );
+    };
+    let response: SteerRunResponse = client
+        .post(
+            &format!("/api/runs/{run_id}/steer"),
+            serde_json::to_value(SteerRun {
+                prompt,
+                mode: RunControlMode::Queue,
+                attachment_ids: Vec::new(),
+            })?,
+        )
+        .await?;
+    client.print(&response, || println!("sent"));
     Ok(())
 }
 
@@ -631,8 +726,7 @@ async fn chart(client: &Client, ctx: &RunContext, args: ChartArgs) -> Result<()>
         std::io::stdin().read_to_string(&mut buffer)?;
         buffer
     } else {
-        std::fs::read_to_string(&args.spec)
-            .with_context(|| format!("cannot read {}", args.spec))?
+        std::fs::read_to_string(&args.spec).with_context(|| format!("cannot read {}", args.spec))?
     };
 
     // Charts ride inside a message row. A spec big enough to matter here is a
@@ -647,7 +741,11 @@ async fn chart(client: &Client, ctx: &RunContext, args: ChartArgs) -> Result<()>
     }
 
     let spec: Value = serde_json::from_str(&raw).context("the chart spec is not valid JSON")?;
-    if spec.get("chart_spec").and_then(|s| s.get("chartType")).is_none() {
+    if spec
+        .get("chart_spec")
+        .and_then(|s| s.get("chartType"))
+        .is_none()
+    {
         bail!("a chart spec needs `chart_spec.chartType` (see the Flint chart format)");
     }
     if spec.get("data").is_none() {
@@ -771,7 +869,10 @@ async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<(
     }
 
     client.print(&attachment, || {
-        println!("attached {} ({} bytes)", attachment.file_name, attachment.size)
+        println!(
+            "attached {} ({} bytes)",
+            attachment.file_name, attachment.size
+        )
     });
     Ok(())
 }
@@ -1001,7 +1102,10 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
         AutomationCommand::Run { id } => {
             let automation = resolve_automation(client, &id).await?;
             let run: AutomationRun = client
-                .post(&format!("/api/automations/{}/run", automation.id), json!({}))
+                .post(
+                    &format!("/api/automations/{}/run", automation.id),
+                    json!({}),
+                )
                 .await?;
             client.print(&run, || println!("automation fired"));
         }
@@ -1014,7 +1118,11 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 println!(
                     "{} [{}] {}",
                     debug.automation.name,
-                    if debug.automation.enabled { "on" } else { "off" },
+                    if debug.automation.enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
                     debug.automation.description
                 );
                 if !debug.automation.instructions.trim().is_empty() {

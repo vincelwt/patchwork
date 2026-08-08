@@ -1995,6 +1995,36 @@ details[open] > summary::before {
   border-radius: 8px;
 }
 
+/* Talking to a run while it works: the composer's own box, sitting under the
+   log rather than floating over it. */
+.run-steer {
+  flex: none;
+  padding: 6px 16px 14px;
+}
+.steer-target {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  padding: 0 4px 6px;
+}
+.run-steer .composer {
+  padding-left: 12px;
+}
+
+/* The request as it was first written, quoted rather than repeated. */
+.original-request {
+  border-left: 2px solid var(--line);
+  padding-left: 11px;
+}
+.original-request > summary {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+  margin-bottom: 3px;
+}
+.original-request > summary:hover {
+  color: var(--text-muted);
+}
+
 .task-list {
   overflow-y: auto;
   padding: 6px 22px 28px;

@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { store, useApi, useApp, useAppSelector } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
-import { Avatar, Chip, useNavigation } from "./common";
+import { Avatar, Chip, proseText, useNavigation } from "./common";
 import { Empty } from "./ui";
 import { Card } from "./Cards";
 import { Markdown } from "./Markdown";
@@ -19,8 +19,15 @@ import {
   ThreadIcon,
   WarningIcon,
 } from "./icons";
-import { Composer, DropZone, MessageRow, useHandles } from "./Chat";
-import type { Id, RunEvent } from "../lib/types";
+import {
+  AttachButton,
+  Composer,
+  DropZone,
+  MessageRow,
+  useAttachments,
+  useHandles,
+} from "./Chat";
+import type { Id, Member, Run, RunEvent } from "@client/types";
 
 /// An optional side panel — threads, run detail, task detail. The layout never
 /// forces a permanent third column.
@@ -149,65 +156,160 @@ export function RunPanel({
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
 
   return (
-    <div
-      className={embedded ? "" : "inspector-body"}
-      ref={embedded ? undefined : log}
-      onScroll={
-        embedded
-          ? undefined
-          : (event) => {
-              const element = event.currentTarget;
-              pinned.current =
-                element.scrollHeight - element.scrollTop - element.clientHeight < 60;
-            }
-      }
-    >
-      {!embedded && (
-        <>
-          <div className="run-summary">
-            <Avatar member={agent} size={30} />
-            <span className="grow">
-              <span className="name">{agent?.display_name}</span>
-              <span className="sub">{run.headline || statusLabel(run.status)}</span>
-            </span>
-            {active && (
-              <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
-                Stop
-              </button>
-            )}
-          </div>
-          <div className="card-row">
-            <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
-            <Chip>{run.runtime}</Chip>
-            {host && <Chip>{host.name}</Chip>}
-            <Chip>{duration(run.started_at, run.ended_at)}</Chip>
-          </div>
-          {run.cwd && (
-            <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
-              {run.cwd}
+    <>
+      <div
+        className={embedded ? "" : "inspector-body"}
+        ref={embedded ? undefined : log}
+        onScroll={
+          embedded
+            ? undefined
+            : (event) => {
+                const element = event.currentTarget;
+                pinned.current =
+                  element.scrollHeight - element.scrollTop - element.clientHeight < 60;
+              }
+        }
+      >
+        {!embedded && (
+          <>
+            <div className="run-summary">
+              <Avatar member={agent} size={30} />
+              <span className="grow">
+                <span className="name">{agent?.display_name}</span>
+                <span className="sub">{run.headline || statusLabel(run.status)}</span>
+              </span>
+              {active && (
+                <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
+                  Stop
+                </button>
+              )}
             </div>
-          )}
-        </>
-      )}
-      {run.error && (
-        <div className="error-text" style={{ whiteSpace: "pre-wrap" }}>
-          {run.error}
+            <div className="card-row">
+              <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
+              <Chip>{run.runtime}</Chip>
+              {host && <Chip>{host.name}</Chip>}
+              <Chip>{duration(run.started_at, run.ended_at)}</Chip>
+            </div>
+            {run.cwd && (
+              <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
+                {run.cwd}
+              </div>
+            )}
+          </>
+        )}
+        {run.error && (
+          <div className="error-text" style={{ whiteSpace: "pre-wrap" }}>
+            {run.error}
+          </div>
+        )}
+
+        {/* The question belongs where the person looking at the run is, not only
+            in a transcript they may have scrolled away from. */}
+        {question && <Card card={{ type: "question", question_id: question.id }} />}
+
+        <div className="section-head">
+          <span className="section-title">Activity</span>
+          {active && <Spinner size={12} />}
         </div>
-      )}
-
-      {/* The question belongs where the person looking at the run is, not only
-          in a transcript they may have scrolled away from. */}
-      {question && <Card card={{ type: "question", question_id: question.id }} />}
-
-      <div className="section-head">
-        <span className="section-title">Activity</span>
-        {active && <Spinner size={12} />}
+        {!events?.length && <div className="card-sub">Nothing recorded yet.</div>}
+        {events?.map((event) => (
+          <RunEventRow key={event.id} event={event} />
+        ))}
       </div>
-      {!events?.length && <div className="card-sub">Nothing recorded yet.</div>}
-      {events?.map((event) => (
-        <RunEventRow key={event.id} event={event} />
-      ))}
-    </div>
+      {active && <SteerBox run={run} agent={agent} />}
+    </>
+  );
+}
+
+/// Talking to a run while it is still running.
+///
+/// The task conversation is where feedback belongs when it is also a record.
+/// This is the direct line for whoever is watching the log: queue a note for
+/// the end of the current turn, or interrupt and say it now.
+function SteerBox({ run, agent }: { run: Run; agent?: Member }) {
+  const api = useApi();
+  const [text, setText] = useState("");
+  const [dropped, setDropped] = useState<File[]>([]);
+  const clearDropped = useCallback(() => setDropped([]), []);
+  const files = useAttachments({
+    incoming: dropped,
+    onConsumed: clearDropped,
+    taskId: run.task_id,
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const empty = !text.trim() && files.pending.length === 0;
+
+  const send = async (mode: "queue" | "interrupt") => {
+    if (empty || busy || files.uploading > 0) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.steerRun(run.id, {
+        prompt: text.trim(),
+        mode,
+        attachment_ids: files.pending.map((attachment) => attachment.id),
+      });
+      setText("");
+      files.clear();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <DropZone className="run-steer" onFiles={setDropped}>
+      {/* Which agent, and which of the two things it can hear. A control box
+          that does not name its target is a message sent into the dark. */}
+      <div className="steer-target">
+        Straight to {agent?.display_name ?? "this agent"} in this run
+      </div>
+      <div className="composer">
+        {files.strip}
+        <textarea
+          rows={1}
+          {...proseText}
+          spellCheck
+          placeholder={`Tell ${agent?.display_name ?? "the agent"} something…`}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.shiftKey) return;
+            event.preventDefault();
+            void send(event.metaKey || event.ctrlKey ? "interrupt" : "queue");
+          }}
+          onPaste={(event) => {
+            const pasted = Array.from(event.clipboardData.files);
+            if (pasted.length === 0) return;
+            event.preventDefault();
+            void files.attach(pasted);
+          }}
+        />
+        <div className="composer-row">
+          <AttachButton onFiles={(picked) => void files.attach(picked)} />
+          <span className="spacer" />
+          <button
+            className="button quiet"
+            disabled={busy || empty || files.uploading > 0}
+            title="Stop what it is doing and hand it this now"
+            onClick={() => void send("interrupt")}
+          >
+            Interrupt
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || empty || files.uploading > 0}
+            title="Wait for the end of the current turn"
+            onClick={() => void send("queue")}
+          >
+            Queue
+          </button>
+        </div>
+      </div>
+      {error && <div className="error-text">{error}</div>}
+    </DropZone>
   );
 }
 

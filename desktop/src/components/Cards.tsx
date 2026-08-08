@@ -4,6 +4,7 @@ import type { EChartsType } from "echarts";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
+import { useFileUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
 import {
   ExternalIcon,
@@ -12,7 +13,7 @@ import {
   RunIcon,
   TasksIcon,
 } from "./icons";
-import type { MessageCard, QuestionAnswer } from "../lib/types";
+import type { MessageCard, QuestionAnswer } from "@client/types";
 
 /// Cards are how tasks, runs, questions, artifacts, previews and pull requests
 /// appear inline in a conversation — the same objects the rest of the app
@@ -289,7 +290,8 @@ function ArtifactCard({
   caption?: string;
 }) {
   const api = useApi();
-  const url = `${api.baseUrl.replace(/\/$/, "")}/api/files/${attachmentId}`;
+  const path = `/api/files/${attachmentId}`;
+  const url = useFileUrl(path);
   const [broken, setBroken] = useState(false);
 
   if (broken) {
@@ -298,13 +300,14 @@ function ArtifactCard({
         <div className="card-head">
           <span>Attached</span>
         </div>
-        <button className="button" onClick={() => openExternal(url)}>
+        <button className="button" onClick={() => void api.openFile(path)}>
           Open file
         </button>
         {caption && <div className="card-sub">{caption}</div>}
       </div>
     );
   }
+  if (!url) return <div className="card-sub">Loading attachment…</div>;
 
   // No frame around a picture: a border, a header and a caption stacked
   // around an image say nothing the image does not.
@@ -474,14 +477,14 @@ function PullRequestCard({ url, taskId }: { url: string; taskId?: string }) {
 export function AttachmentRow({
   fileName,
   size,
-  url,
+  onOpen,
 }: {
   fileName: string;
   size: number;
-  url: string;
+  onOpen: () => void;
 }) {
   return (
-    <button className="attachment-chip" onClick={() => openExternal(url)}>
+    <button className="attachment-chip" onClick={onOpen}>
       {fileName}
       <span style={{ color: "var(--text-faint)" }}>{bytes(size)}</span>
     </button>

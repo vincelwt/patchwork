@@ -1,20 +1,20 @@
 //! The HTTP API. Desktop, the agent CLI, and any future mobile client all
 //! speak exactly this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use tower::ServiceExt;
 use patchwork_core::events::Event;
 use patchwork_core::host::RelayToHost;
 use patchwork_core::models::*;
 use patchwork_core::wire::*;
 use patchwork_core::{new_id, now_ms, Id};
 use serde::Deserialize;
+use tower::ServiceExt;
 
 use crate::auth::{self, Caller};
 use crate::error::{ApiError, ApiResult};
@@ -29,7 +29,10 @@ use crate::{automations, preview_proxy};
 pub fn relay_router(relay: Arc<Relay>) -> Router {
     Router::new()
         .route("/api/health", get(relay_health))
-        .route("/api/workspaces", get(list_workspaces).post(create_workspace))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
         .route("/api/auth/join", post(join))
         .fallback(dispatch)
         .with_state(relay)
@@ -164,11 +167,16 @@ async fn join(
 pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/pair", post(claim_pairing))
         .route("/api/webhooks/{token}", post(webhook));
 
     let api = Router::new()
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/events", get(events_since))
+        .route("/api/pairings", post(create_pairing))
+        .route("/api/devices", get(list_devices))
+        .route("/api/devices/current", delete(revoke_current_device))
+        .route("/api/devices/{id}", delete(revoke_device))
         // channels and messages
         .route("/api/sections", get(list_sections).post(create_section))
         .route("/api/channels", get(list_channels).post(create_channel))
@@ -181,7 +189,10 @@ pub fn router(state: Shared) -> Router {
             "/api/channels/{id}/messages",
             get(list_messages).post(send_message),
         )
-        .route("/api/messages/{id}", patch(edit_message).delete(delete_message))
+        .route(
+            "/api/messages/{id}",
+            patch(edit_message).delete(delete_message),
+        )
         .route("/api/messages/{id}/thread", get(thread))
         .route("/api/messages/{id}/reactions", post(react))
         // tasks
@@ -195,6 +206,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/runs", post(start_run))
         .route("/api/runs/{id}", get(run_detail))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/steer", post(steer_run))
         .route("/api/runs/{id}/events", get(run_events))
         // questions
         .route("/api/questions", get(list_questions).post(ask_question))
@@ -274,7 +286,13 @@ async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthRes
     let invite = state
         .store
         .claim_invite(input.invite_code.trim(), "pending")
-        .map_err(|e| ApiError::new(axum::http::StatusCode::FORBIDDEN, "invalid_invite", e.to_string()))?;
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "invalid_invite",
+                e.to_string(),
+            )
+        })?;
 
     let member = Member {
         id: new_id(),
@@ -314,12 +332,119 @@ async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthRes
     })
 }
 
+const PAIRING_LIFETIME_MS: i64 = 5 * 60 * 1000;
+
+async fn create_pairing(
+    State(state): State<Shared>,
+    caller: Caller,
+    _input: Option<Json<CreatePairing>>,
+) -> ApiResult<Json<PairingResponse>> {
+    caller.require_device()?;
+    let secret = auth::generate_token();
+    let expires_at = now_ms() + PAIRING_LIFETIME_MS;
+    state
+        .store
+        .insert_pairing(&auth::hash_token(&secret), &caller.member.id, expires_at)?;
+    Ok(Json(PairingResponse {
+        secret,
+        expires_at,
+        workspace_url: state.public_url.clone(),
+    }))
+}
+
+async fn claim_pairing(
+    State(state): State<Shared>,
+    Json(input): Json<ClaimPairing>,
+) -> ApiResult<Json<ClaimPairingResponse>> {
+    let secret = input.secret.trim();
+    if secret.is_empty() || secret.len() > 256 {
+        return Err(ApiError::bad_request("invalid pairing secret"));
+    }
+    let label = input
+        .device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    if label.is_some_and(|label| label.chars().count() > 100) {
+        return Err(ApiError::bad_request("device name is too long"));
+    }
+
+    let token = auth::generate_token();
+    let member_id = state
+        .store
+        .claim_pairing(
+            &auth::hash_token(secret),
+            &auth::hash_token(&token),
+            label,
+            now_ms(),
+        )?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "invalid_pairing",
+                "that pairing has expired or was already used",
+            )
+        })?;
+    let member = state
+        .store
+        .member(&member_id)?
+        .ok_or_else(|| ApiError::unauthorized("member is no longer active"))?;
+    Ok(Json(ClaimPairingResponse {
+        token,
+        member,
+        workspace: state.store.workspace()?,
+    }))
+}
+
+async fn list_devices(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Vec<Device>>> {
+    caller.require_device()?;
+    Ok(Json(
+        state.store.devices(&caller.member.id, &caller.token_hash)?,
+    ))
+}
+
+async fn revoke_device(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Ok>> {
+    caller.require_device()?;
+    if id == caller.token_hash {
+        return Err(ApiError::conflict(
+            "use /api/devices/current to sign out this device",
+        ));
+    }
+    if !state.store.revoke_device(&caller.member.id, &id)? {
+        return Err(ApiError::not_found("device not found"));
+    }
+    Ok(Json(Ok::default()))
+}
+
+async fn revoke_current_device(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Ok>> {
+    caller.require_device()?;
+    state
+        .store
+        .revoke_device(&caller.member.id, &caller.token_hash)?;
+    Ok(Json(Ok::default()))
+}
+
 // ---------------------------------------------------------------------------
 // bootstrap
 // ---------------------------------------------------------------------------
 
 async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Bootstrap>> {
     let members = state.members_with_presence().await?;
+    let channels = visible_channels(&state, &caller)?;
+    let visible_ids = channels
+        .iter()
+        .map(|channel| channel.id.clone())
+        .collect::<HashSet<_>>();
+    let active_runs = state
+        .store
+        .active_runs()?
+        .into_iter()
+        .filter(|run| visible_ids.contains(&run.channel_id))
+        .collect();
     let me = members
         .iter()
         .find(|m| m.id == caller.member.id)
@@ -331,14 +456,27 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
         me,
         members,
         sections: state.store.sections()?,
-        channels: visible_channels(&state, &caller)?,
+        channels,
         projects: state.store.projects()?,
         hosts: state.hosts_with_presence().await?,
         tasks: state.store.tasks()?,
         inbox: state.store.inbox(&caller.member.id, false)?,
-        automations: state.store.automations()?,
-        open_questions: state.store.open_questions()?,
-        active_runs: state.store.active_runs()?,
+        automations: state
+            .store
+            .automations()?
+            .into_iter()
+            .filter(|automation| {
+                crate::visibility::automation(&state.store, &caller.member.id, automation)
+                    .unwrap_or(false)
+            })
+            .collect(),
+        open_questions: state
+            .store
+            .open_questions()?
+            .into_iter()
+            .filter(|question| visible_ids.contains(&question.channel_id))
+            .collect(),
+        active_runs,
         previews: state.store.previews(true)?,
         seq: state.store.latest_seq()?,
     }))
@@ -346,13 +484,63 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
 
 /// Channels and task discussions belong to the workspace — a board everyone can
 /// see would be useless if its conversations were private. Only DMs are.
+fn require_channel_access(state: &Shared, caller: &Caller, channel_id: &str) -> ApiResult<()> {
+    if crate::visibility::channel(&state.store, &caller.member.id, channel_id)? {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "that belongs to a private conversation",
+        ))
+    }
+}
+
+fn require_run_access(state: &Shared, caller: &Caller, run: &Run) -> ApiResult<()> {
+    require_channel_access(state, caller, &run.channel_id)
+}
+
+fn require_automation_access(
+    state: &Shared,
+    caller: &Caller,
+    automation: &Automation,
+) -> ApiResult<()> {
+    if crate::visibility::automation(&state.store, &caller.member.id, automation)? {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "that automation belongs to a private conversation",
+        ))
+    }
+}
+
+fn require_attachment_access(
+    state: &Shared,
+    caller: &Caller,
+    attachment: &Attachment,
+) -> ApiResult<()> {
+    if let Some(message_id) = &attachment.message_id {
+        let message = state
+            .store
+            .message(message_id)?
+            .ok_or_else(|| ApiError::not_found("message not found"))?;
+        return require_channel_access(state, caller, &message.channel_id);
+    }
+    if let Some(run_id) = &attachment.run_id {
+        let run = state
+            .store
+            .run(run_id)?
+            .ok_or_else(|| ApiError::not_found("run not found"))?;
+        return require_run_access(state, caller, &run);
+    }
+    Ok(())
+}
+
 fn visible_channels(state: &Shared, caller: &Caller) -> ApiResult<Vec<Channel>> {
     let channels = state.store.channels()?;
     Ok(channels
         .into_iter()
         .filter(|c| match c.kind {
             ChannelKind::Channel | ChannelKind::Task => true,
-            ChannelKind::Dm => c.member_ids.contains(&caller.member.id) || caller.is_agent(),
+            ChannelKind::Dm => c.member_ids.contains(&caller.member.id),
         })
         .collect())
 }
@@ -365,10 +553,17 @@ struct SinceQuery {
 
 async fn events_since(
     State(state): State<Shared>,
-    _caller: Caller,
+    caller: Caller,
     Query(query): Query<SinceQuery>,
 ) -> ApiResult<Json<Vec<patchwork_core::events::Envelope>>> {
-    Ok(Json(state.store.events_since(query.since, 500)?))
+    Ok(Json(
+        state
+            .store
+            .events_since(query.since, 500)?
+            .into_iter()
+            .filter(|envelope| crate::visibility::event(&state.store, &caller.member.id, envelope))
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +596,10 @@ async fn create_section(
     Ok(Json(section))
 }
 
-async fn list_channels(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Vec<Channel>>> {
+async fn list_channels(
+    State(state): State<Shared>,
+    caller: Caller,
+) -> ApiResult<Json<Vec<Channel>>> {
     Ok(Json(visible_channels(&state, &caller)?))
 }
 
@@ -416,7 +614,9 @@ async fn create_channel(
     }
     let slug = patchwork_core::ids::slugify(name);
     if state.store.channel_by_slug(&slug)?.is_some() {
-        return Err(ApiError::conflict("a channel with that name already exists"));
+        return Err(ApiError::conflict(
+            "a channel with that name already exists",
+        ));
     }
 
     let section_id = match (&input.section_id, &input.section_name) {
@@ -463,14 +663,18 @@ async fn create_channel(
 
 async fn update_channel(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Json(input): Json<UpdateChannel>,
 ) -> ApiResult<Json<Channel>> {
+    require_channel_access(&state, &caller, &id)?;
     let mut channel = state
         .store
         .channel(&id)?
         .ok_or_else(|| ApiError::not_found("channel not found"))?;
+    if channel.kind != ChannelKind::Channel {
+        return Err(ApiError::forbidden("only workspace channels can be edited"));
+    }
     if let Some(name) = input.name {
         let slug = patchwork_core::ids::slugify(name.trim_start_matches('#'));
         channel.name = slug.clone();
@@ -498,9 +702,17 @@ async fn update_channel(
 
 async fn archive_channel(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
+    require_channel_access(&state, &caller, &id)?;
+    let channel = state
+        .store
+        .channel(&id)?
+        .ok_or_else(|| ApiError::not_found("channel not found"))?;
+    if channel.kind != ChannelKind::Channel {
+        return Err(ApiError::forbidden("only workspace channels can be archived"));
+    }
     state.store.archive_channel(&id)?;
     state.emit(Event::ChannelDeleted { channel_id: id });
     Ok(Json(Ok::default()))
@@ -516,8 +728,10 @@ async fn open_dm(
     }
     let other = state
         .store
-        .member(&input.member_id)?
-        .ok_or_else(|| ApiError::not_found("no such member"))?;
+        .members()?
+        .into_iter()
+        .find(|member| member.id == input.member_id)
+        .ok_or_else(|| ApiError::not_found("no such active member"))?;
 
     if let Some(existing) = state.store.find_dm(&caller.member.id, &other.id)? {
         return Ok(Json(existing));
@@ -553,10 +767,11 @@ struct MessageQuery {
 
 async fn list_messages(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Query(query): Query<MessageQuery>,
 ) -> ApiResult<Json<MessagePage>> {
+    require_channel_access(&state, &caller, &id)?;
     let (messages, has_more) =
         state
             .store
@@ -577,6 +792,7 @@ async fn send_message(
     if input.body.trim().is_empty() && input.card.is_none() && input.attachment_ids.is_empty() {
         return Err(ApiError::bad_request("nothing to post"));
     }
+    require_channel_access(&state, &caller, &id)?;
     let message = orchestrator::post_message(
         &state,
         &id,
@@ -606,6 +822,12 @@ async fn edit_message(
         .store
         .message(&id)?
         .ok_or_else(|| ApiError::not_found("message not found"))?;
+    require_channel_access(&state, &caller, &message.channel_id)?;
+    if state.store.task_by_source_message(&id)?.is_some() {
+        return Err(ApiError::forbidden(
+            "the original task request is preserved",
+        ));
+    }
     if message.author_id != caller.member.id {
         return Err(ApiError::forbidden("you can only edit your own messages"));
     }
@@ -626,6 +848,12 @@ async fn delete_message(
         .store
         .message(&id)?
         .ok_or_else(|| ApiError::not_found("message not found"))?;
+    require_channel_access(&state, &caller, &message.channel_id)?;
+    if state.store.task_by_source_message(&id)?.is_some() {
+        return Err(ApiError::forbidden(
+            "the original task request is preserved",
+        ));
+    }
     if message.author_id != caller.member.id && !caller.member.is_admin {
         return Err(ApiError::forbidden("you can only delete your own messages"));
     }
@@ -639,9 +867,14 @@ async fn delete_message(
 
 async fn thread(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Vec<Message>>> {
+    let root = state
+        .store
+        .message(&id)?
+        .ok_or_else(|| ApiError::not_found("message not found"))?;
+    require_channel_access(&state, &caller, &root.channel_id)?;
     Ok(Json(state.store.thread(&id)?))
 }
 
@@ -651,6 +884,11 @@ async fn react(
     Path(id): Path<Id>,
     Json(input): Json<ReactionRequest>,
 ) -> ApiResult<Json<Message>> {
+    let existing = state
+        .store
+        .message(&id)?
+        .ok_or_else(|| ApiError::not_found("message not found"))?;
+    require_channel_access(&state, &caller, &existing.channel_id)?;
     state
         .store
         .toggle_reaction(&id, &caller.member.id, &input.emoji)?;
@@ -679,6 +917,16 @@ async fn create_task(
 ) -> ApiResult<Json<Task>> {
     if input.title.trim().is_empty() && input.outcome.trim().is_empty() {
         return Err(ApiError::bad_request("a task needs an expected result"));
+    }
+    if let Some(channel_id) = &input.source_channel_id {
+        require_channel_access(&state, &caller, channel_id)?;
+    }
+    if let Some(message_id) = &input.source_message_id {
+        let message = state
+            .store
+            .message(message_id)?
+            .ok_or_else(|| ApiError::not_found("source message not found"))?;
+        require_channel_access(&state, &caller, &message.channel_id)?;
     }
     Ok(Json(
         orchestrator::create_task(&state, &caller.member.id, input).await?,
@@ -786,6 +1034,7 @@ async fn start_run(
             .ok_or_else(|| ApiError::not_found("task not found"))?,
         _ => return Err(ApiError::bad_request("a channel or task is required")),
     };
+    require_channel_access(&state, &caller, &channel_id)?;
 
     let run = orchestrator::start_run(
         &state,
@@ -815,13 +1064,14 @@ struct AfterQuery {
 
 async fn run_detail(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<RunDetail>> {
     let run = state
         .store
         .run(&id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     Ok(Json(RunDetail {
         events: state.store.run_events(&id, 0)?,
         questions: state.store.run_questions(&id)?,
@@ -831,22 +1081,66 @@ async fn run_detail(
 
 async fn run_events(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Query(query): Query<AfterQuery>,
 ) -> ApiResult<Json<Vec<RunEvent>>> {
+    let run = state
+        .store
+        .run(&id)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     Ok(Json(state.store.run_events(&id, query.after)?))
+}
+
+async fn steer_run(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<SteerRun>,
+) -> ApiResult<Json<SteerRunResponse>> {
+    let target = state
+        .store
+        .run(&id)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &target)?;
+    for attachment_id in &input.attachment_ids {
+        let attachment = state
+            .store
+            .attachment(attachment_id)?
+            .map(|(attachment, _)| attachment)
+            .ok_or_else(|| ApiError::not_found("attachment not found"))?;
+        require_attachment_access(&state, &caller, &attachment)?;
+        if attachment.message_id.is_some() {
+            return Err(ApiError::conflict("that attachment was already sent"));
+        }
+    }
+    if caller.is_agent() && input.mode == patchwork_core::host::RunControlMode::Interrupt {
+        return Err(ApiError::forbidden(
+            "agents may queue messages, not interrupt another run",
+        ));
+    }
+    let control_id = orchestrator::steer_run(
+        &state,
+        &caller.member.id,
+        caller.run_id.as_deref(),
+        &id,
+        input,
+    )
+    .await?;
+    Ok(Json(SteerRunResponse { control_id }))
 }
 
 async fn cancel_run(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
     let run = state
         .store
         .run(&id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     if let Some(host_id) = &run.host_id {
         state
             .send_to_host(host_id, RelayToHost::CancelRun { run_id: id.clone() })
@@ -861,21 +1155,32 @@ async fn cancel_run(
 
 async fn list_questions(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
 ) -> ApiResult<Json<Vec<Question>>> {
-    Ok(Json(state.store.open_questions()?))
+    Ok(Json(
+        state
+            .store
+            .open_questions()?
+            .into_iter()
+            .filter(|question| {
+                crate::visibility::channel(&state.store, &caller.member.id, &question.channel_id)
+                    .unwrap_or(false)
+            })
+            .collect(),
+    ))
 }
 
 async fn get_question(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Question>> {
-    state
+    let question = state
         .store
         .question(&id)?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("question not found"))
+        .ok_or_else(|| ApiError::not_found("question not found"))?;
+    require_channel_access(&state, &caller, &question.channel_id)?;
+    Ok(Json(question))
 }
 
 /// An agent asks. The card lands in the conversation and the right Inboxes.
@@ -891,6 +1196,7 @@ async fn ask_question(
         .store
         .run(&input.run_id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
+    require_run_access(&state, &caller, &run)?;
     if caller.is_agent() && run.agent_id != caller.member.id {
         return Err(ApiError::forbidden("that is not your run"));
     }
@@ -932,7 +1238,9 @@ async fn ask_question(
         },
     )
     .await?;
-    state.store.set_question_message(&question.id, &message.id)?;
+    state
+        .store
+        .set_question_message(&question.id, &message.id)?;
 
     // The run is visibly waiting, and the people who can answer are told.
     let mut run = run;
@@ -994,6 +1302,11 @@ async fn answer_question(
     Path(id): Path<Id>,
     Json(input): Json<AnswerQuestion>,
 ) -> ApiResult<Json<Question>> {
+    let question = state
+        .store
+        .question(&id)?
+        .ok_or_else(|| ApiError::not_found("question not found"))?;
+    require_channel_access(&state, &caller, &question.channel_id)?;
     Ok(Json(
         orchestrator::answer_question(&state, &id, input.answers, &caller.member.id).await?,
     ))
@@ -1003,13 +1316,14 @@ async fn answer_question(
 /// answers, so the run genuinely continues in context.
 async fn wait_for_answer(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Question>> {
     let question = state
         .store
         .question(&id)?
         .ok_or_else(|| ApiError::not_found("question not found"))?;
+    require_channel_access(&state, &caller, &question.channel_id)?;
     if question.status != QuestionStatus::Open {
         return Ok(Json(question));
     }
@@ -1025,12 +1339,11 @@ async fn wait_for_answer(
     match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
         Ok(Result::Ok(answered)) => Ok(Json(answered)),
         // A timeout is not an error: the caller polls again.
-        _ => Ok(Json(
-            state
-                .store
-                .question(&id)?
-                .ok_or_else(|| ApiError::not_found("question not found"))?,
-        )),
+        _ => {
+            Ok(Json(state.store.question(&id)?.ok_or_else(|| {
+                ApiError::not_found("question not found")
+            })?))
+        }
     }
 }
 
@@ -1057,12 +1370,14 @@ async fn mark_read(
     caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
-    state.store.mark_inbox_read(&id)?;
-    if let Some(item) = state.store.inbox_item(&id)? {
-        if item.member_id == caller.member.id {
-            state.emit(Event::InboxItemUpdated { item });
-        }
-    }
+    let item = state
+        .store
+        .inbox_item(&id)?
+        .filter(|item| item.member_id == caller.member.id)
+        .ok_or_else(|| ApiError::not_found("inbox item not found"))?;
+    state.store.mark_inbox_read(&id, &caller.member.id)?;
+    let item = state.store.inbox_item(&id)?.unwrap_or(item);
+    state.emit(Event::InboxItemUpdated { item });
     Ok(Json(Ok::default()))
 }
 
@@ -1205,7 +1520,10 @@ async fn create_project(
         name: input.name.trim().to_string(),
         description: input.description.clone(),
         repo_url: input.repo_url.clone(),
-        default_branch: input.default_branch.clone().unwrap_or_else(|| "main".into()),
+        default_branch: input
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| "main".into()),
         paths: input.paths.clone(),
         created_at: now_ms(),
     };
@@ -1265,9 +1583,19 @@ async fn list_hosts(State(state): State<Shared>, _c: Caller) -> ApiResult<Json<V
 
 async fn list_automations(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
 ) -> ApiResult<Json<Vec<Automation>>> {
-    Ok(Json(state.store.automations()?))
+    Ok(Json(
+        state
+            .store
+            .automations()?
+            .into_iter()
+            .filter(|automation| {
+                crate::visibility::automation(&state.store, &caller.member.id, automation)
+                    .unwrap_or(false)
+            })
+            .collect(),
+    ))
 }
 
 async fn create_automation(
@@ -1301,6 +1629,7 @@ async fn create_automation(
         },
         failure_count: 0,
     };
+    require_automation_access(&state, &caller, &automation)?;
     state.store.upsert_automation(&automation)?;
     state.emit(Event::AutomationUpdated {
         automation: automation.clone(),
@@ -1310,7 +1639,7 @@ async fn create_automation(
 
 async fn update_automation(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
     Json(input): Json<CreateAutomation>,
 ) -> ApiResult<Json<Automation>> {
@@ -1318,6 +1647,7 @@ async fn update_automation(
         .store
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
+    require_automation_access(&state, &caller, &automation)?;
     automation.name = input.name.trim().to_string();
     automation.description = input.description.clone();
     automation.enabled = input.enabled;
@@ -1333,6 +1663,7 @@ async fn update_automation(
     if let AutomationTrigger::Schedule { every_seconds, .. } = &automation.trigger {
         automation.next_run_at = Some(now_ms() + every_seconds * 1000);
     }
+    require_automation_access(&state, &caller, &automation)?;
     state.store.upsert_automation(&automation)?;
     state.emit(Event::AutomationUpdated {
         automation: automation.clone(),
@@ -1342,9 +1673,14 @@ async fn update_automation(
 
 async fn delete_automation(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
+    let automation = state
+        .store
+        .automation(&id)?
+        .ok_or_else(|| ApiError::not_found("automation not found"))?;
+    require_automation_access(&state, &caller, &automation)?;
     state.store.delete_automation(&id)?;
     state.emit(Event::AutomationDeleted { automation_id: id });
     Ok(Json(Ok::default()))
@@ -1359,6 +1695,7 @@ async fn run_automation(
         .store
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
+    require_automation_access(&state, &caller, &automation)?;
     Ok(Json(
         automations::run_now(&state, &automation, &caller.member.display_name).await?,
     ))
@@ -1366,13 +1703,14 @@ async fn run_automation(
 
 async fn automation_debug(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<AutomationDebug>> {
     let automation = state
         .store
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
+    require_automation_access(&state, &caller, &automation)?;
     Ok(Json(AutomationDebug {
         runs: state.store.automation_runs(&id, 50)?,
         automation,
@@ -1576,15 +1914,36 @@ async fn upload_file(
     Ok(Json(attachment))
 }
 
+#[derive(Deserialize, Default)]
+struct FileQuery {
+    #[serde(default)]
+    grant: Option<String>,
+}
+
 async fn download_file(
     State(state): State<Shared>,
     Path(id): Path<Id>,
+    Query(query): Query<FileQuery>,
+    headers: axum::http::HeaderMap,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
+    let member = bearer(&headers)
+        .ok()
+        .and_then(|token| auth::authenticate(&state, &token));
+    let granted = query
+        .grant
+        .as_deref()
+        .is_some_and(|token| state.valid_file_grant(&id, token));
+    if member.is_none() && !granted {
+        return Err(ApiError::unauthorized("a valid file grant or workspace token is required"));
+    }
     let (attachment, path) = state
         .store
         .attachment(&id)?
         .ok_or_else(|| ApiError::not_found("file not found"))?;
+    if let Some(caller) = &member {
+        require_attachment_access(&state, caller, &attachment)?;
+    }
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| ApiError::not_found("file is no longer on disk"))?;
@@ -1620,7 +1979,11 @@ async fn rename_workspace(
     Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
-    let name = input.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw
@@ -1676,7 +2039,7 @@ struct SearchQuery {
 
 async fn search(
     State(state): State<Shared>,
-    _c: Caller,
+    caller: Caller,
     Query(query): Query<SearchQuery>,
 ) -> ApiResult<Json<SearchResults>> {
     let needle = query.q.trim();
@@ -1696,6 +2059,10 @@ async fn search(
     let channels: BTreeMap<Id, String> = state.store.channel_names()?;
     let hits = messages
         .into_iter()
+        .filter(|message| {
+            crate::visibility::channel(&state.store, &caller.member.id, &message.channel_id)
+                .unwrap_or(false)
+        })
         .map(|message| SearchHit {
             snippet: snippet(&message.body, needle),
             channel_name: channels
@@ -1766,5 +2133,60 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn current_device_only_logs_out_through_the_current_route() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let member = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        };
+        store.insert_member(&member).unwrap();
+        let token = auth::generate_token();
+        let token_hash = auth::hash_token(&token);
+        store
+            .insert_token(&token_hash, &member.id, "device", None, None)
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+
+        let request = |uri: String| {
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = router(state.clone())
+            .oneshot(request(format!("/api/devices/{token_hash}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert!(auth::authenticate(&state, &token).is_some());
+
+        let response = router(state.clone())
+            .oneshot(request("/api/devices/current".into()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(auth::authenticate(&state, &token).is_none());
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

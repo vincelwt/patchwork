@@ -105,6 +105,22 @@ pub struct RunFile {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunControlMode {
+    #[default]
+    Queue,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunControlState {
+    Queued,
+    Started,
+    Rejected,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostRegistration {
     pub host_id: Id,
@@ -132,10 +148,15 @@ pub enum RelayToHost {
         question_id: Id,
         answers: Vec<QuestionAnswer>,
     },
-    /// The user said something else while the run was still active.
+    /// Another prompt for the run's existing ACP session.
     FollowUp {
         run_id: Id,
+        control_id: Id,
         prompt: String,
+        #[serde(default)]
+        mode: RunControlMode,
+        #[serde(default)]
+        files: Vec<RunFile>,
     },
     StartPreview {
         preview_id: Id,
@@ -174,6 +195,11 @@ pub enum HostToRelay {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<Json>,
+    },
+    RunControlStatus {
+        run_id: Id,
+        control_id: Id,
+        state: RunControlState,
     },
     RunStatus {
         run_id: Id,

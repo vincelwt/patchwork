@@ -268,6 +268,8 @@ token scoped to that run and revoked when it ends.
 
 ```bash
 patchwork status "Reproduced with a Europe/Berlin fixture"
+patchwork runs
+patchwork tell MER-41 "The API field is now display_name"
 patchwork ask --question "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
 patchwork task update MER-41 --status review
@@ -288,13 +290,24 @@ the execution machine.
 | `crates/patchwork-agent` | ACP client, runtime detection, worktrees, previews, run distillation |
 | `crates/patchwork-relay` | The relay binary |
 | `crates/patchwork-cli` | The `patchwork` CLI agents use |
+| `client` | Wire types and the HTTP client, shared by every TypeScript client |
 | `desktop` | Tauri app: React UI plus this machine's execution host |
+| `mobile` | Expo app for iOS and Android: collaboration and agent control on the go |
+
+`mobile` follows the workspace in realtime with chat, DMs, threads, inbox,
+tasks, agents and runs, steering, automations, members, search and offline
+caching. Pair it from Desktop with a one-use QR code; the resulting revocable
+device token stays in the phone keychain. A physical phone needs the relay at
+a public HTTPS/WSS URL. Mobile tokens can control agents on Desktop or the
+relay, but can never register the phone as an execution host.
 
 ```bash
-cargo test --workspace          # Rust tests
-cd desktop && npx tsc --noEmit  # frontend typecheck
-cargo run -p patchwork-relay    # run the relay
-cd desktop && npm run tauri dev # run Desktop against it
+cargo test --workspace           # Rust tests
+cd desktop && npx tsc --noEmit   # desktop typecheck
+cd mobile && npm run typecheck   # mobile typecheck
+cargo run -p patchwork-relay     # run the relay
+cd desktop && npm run tauri dev  # run Desktop against it
+cd mobile && npm start           # run the phone app against it
 ```
 
 ## License
