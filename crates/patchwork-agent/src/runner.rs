@@ -4,11 +4,13 @@
 //! the agent's own prose, plus short status notes when something material
 //! happens. Nobody should have to read execution logs to follow the work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use patchwork_core::host::{HostToRelay, RelayToHost, RunSpec, WorktreeSpec};
+use patchwork_core::host::{
+    HostToRelay, RelayToHost, RunControlMode, RunControlState, RunFile, RunSpec, WorktreeSpec,
+};
 use patchwork_core::models::{MessageKind, RunEventKind, RunStatus};
 use patchwork_core::Id;
 use serde_json::{json, Value};
@@ -138,10 +140,13 @@ impl Runner {
             this.running.lock().await.remove(&run_id);
         });
 
-        self.running
-            .lock()
-            .await
-            .insert(run_id, RunHandle { control: control_tx, task });
+        self.running.lock().await.insert(
+            run_id,
+            RunHandle {
+                control: control_tx,
+                task,
+            },
+        );
     }
 
     fn emit(&self, msg: HostToRelay) {
@@ -177,6 +182,30 @@ struct TurnState {
 /// Long enough that a chatty model does not flood the relay, short enough that
 /// the reply still reads as if it is being typed.
 const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(140);
+
+#[derive(Debug)]
+struct QueuedControl {
+    control_id: Id,
+    prompt: String,
+    files: Vec<RunFile>,
+}
+
+/// Interrupting feedback goes next; ordinary feedback keeps arrival order.
+fn queue_control(
+    pending: &mut VecDeque<QueuedControl>,
+    interrupted: &mut bool,
+    control: QueuedControl,
+    mode: RunControlMode,
+) -> bool {
+    if mode == RunControlMode::Interrupt && !*interrupted {
+        pending.push_front(control);
+        *interrupted = true;
+        true
+    } else {
+        pending.push_back(control);
+        false
+    }
+}
 
 async fn execute(
     runner: Arc<Runner>,
@@ -245,7 +274,7 @@ async fn execute(
     // 3. Environment: the agent's native access to Patchwork.
     let env = build_env(&runner.cfg, &spec, &prepared.path);
     write_skill(&prepared.path).await;
-    let files = fetch_files(&prepared.path, &spec).await;
+    let files = fetch_files(&prepared.path, &spec.files).await;
     if !files.is_empty() {
         emit(HostToRelay::RunEvent {
             run_id: run_id.clone(),
@@ -380,30 +409,70 @@ async fn execute(
         })
     };
 
-    // 5. Prompt turns. The first carries identity and context; later turns are
-    //    follow-ups the user typed while the run was still going.
-    let mut next_prompt = Some(compose_first_prompt(&spec, &files));
+    // 5. Prompt turns. ACP accepts one prompt at a time, so steering is either
+    //    queued for the next turn or cancels only the current turn first.
+    let mut pending = VecDeque::new();
+    let mut next = Some((None::<Id>, compose_first_prompt(&spec, &files)));
     let mut turns = 0usize;
+    let mut stop_run = false;
 
-    loop {
-        let Some(prompt) = next_prompt.take() else {
-            break;
-        };
+    while let Some((control_id, prompt)) = next.take() {
         turns += 1;
+        if let Some(control_id) = &control_id {
+            emit(HostToRelay::RunControlStatus {
+                run_id: run_id.clone(),
+                control_id: control_id.clone(),
+                state: RunControlState::Started,
+            });
+        }
 
-        let stop_reason = tokio::select! {
-            result = conn.prompt(&session_id, &prompt) => result,
-            cmd = wait_for_cancel(&mut control) => {
-                conn.cancel(&session_id);
-                let _ = cmd;
-                Ok("cancelled".to_string())
+        let mut prompt_call = Box::pin(conn.prompt(&session_id, &prompt));
+        let mut interrupted = false;
+        let stop_reason = loop {
+            tokio::select! {
+                result = &mut prompt_call => break result,
+                cmd = control.recv() => match cmd {
+                    Some(RelayToHost::FollowUp { control_id, prompt, mode, files, .. }) => {
+                        emit(HostToRelay::RunControlStatus {
+                            run_id: run_id.clone(),
+                            control_id: control_id.clone(),
+                            state: RunControlState::Queued,
+                        });
+                        if queue_control(
+                            &mut pending,
+                            &mut interrupted,
+                            QueuedControl { control_id, prompt, files },
+                            mode,
+                        ) {
+                            conn.cancel(&session_id);
+                        }
+                    }
+                    Some(RelayToHost::CancelRun { .. }) => {
+                        stop_run = true;
+                        conn.cancel(&session_id);
+                        break Ok("cancelled".to_string());
+                    }
+                    Some(RelayToHost::AnswerQuestion { .. }) => {
+                        // `patchwork ask` receives its answer through HTTP.
+                    }
+                    Some(_) => {}
+                    None => break (&mut prompt_call).await,
+                }
             }
         };
 
+        if interrupted {
+            let mut turn = state.lock().await;
+            if !turn.message.trim().is_empty() {
+                turn.message
+                    .push_str("\n\n_(Interrupted by new feedback.)_");
+            }
+        }
         flush_message(&run_id, &out, &state, &spec).await;
 
         let stop_reason = match stop_reason {
             Ok(reason) => reason,
+            Err(_) if interrupted => "cancelled".to_string(),
             Err(err) => {
                 let detail = {
                     let s = state.lock().await;
@@ -426,30 +495,54 @@ async fn execute(
             data: None,
         });
 
-        if stop_reason == "cancelled" {
+        let mut between_turns = false;
+        while let Ok(cmd) = control.try_recv() {
+            match cmd {
+                RelayToHost::FollowUp {
+                    control_id,
+                    prompt,
+                    mode,
+                    files,
+                    ..
+                } => {
+                    emit(HostToRelay::RunControlStatus {
+                        run_id: run_id.clone(),
+                        control_id: control_id.clone(),
+                        state: RunControlState::Queued,
+                    });
+                    queue_control(
+                        &mut pending,
+                        &mut between_turns,
+                        QueuedControl {
+                            control_id,
+                            prompt,
+                            files,
+                        },
+                        mode,
+                    );
+                }
+                RelayToHost::CancelRun { .. } => stop_run = true,
+                _ => {}
+            }
+        }
+        if stop_run {
             break;
         }
 
-        // Drain anything queued while the turn was running.
-        while let Ok(cmd) = control.try_recv() {
-            match cmd {
-                RelayToHost::FollowUp { prompt, .. } => {
-                    next_prompt = Some(prompt);
-                }
-                RelayToHost::AnswerQuestion { .. } => {
-                    // Answers reach the agent through the blocking
-                    // `patchwork ask` call it made; nothing to inject here.
-                }
-                RelayToHost::CancelRun { .. } => {
-                    next_prompt = None;
-                    break;
-                }
-                _ => {}
-            }
+        if let Some(queued) = pending.pop_front() {
+            let paths = fetch_files(&prepared.path, &queued.files).await;
+            next = Some((
+                Some(queued.control_id),
+                compose_follow_up(&queued.prompt, &paths),
+            ));
         }
     }
 
     pump.abort();
+    if stop_run {
+        conn.shutdown().await;
+        return Ok(());
+    }
 
     // 6. Wrap up: report what changed so review has something concrete.
     if !prepared.branch.is_empty() {
@@ -502,7 +595,10 @@ async fn apply_session_preferences(
     if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty()) {
         if opened.current_model.as_deref() == Some(model) {
             // Already what was asked for.
-        } else if let Err(err) = conn.set_model(session_id, model, opened.config_options).await {
+        } else if let Err(err) = conn
+            .set_model(session_id, model, opened.config_options)
+            .await
+        {
             note(format!("could not select model `{model}`: {err:#}"));
         } else {
             note(format!("model: {model}"));
@@ -526,7 +622,10 @@ async fn apply_session_preferences(
     // permission at all.
     if let Some(mode) = most_permissive(&opened.modes) {
         if opened.current_mode.as_deref() != Some(mode.as_str()) {
-            if let Err(err) = conn.set_mode(session_id, &mode, opened.config_options).await {
+            if let Err(err) = conn
+                .set_mode(session_id, &mode, opened.config_options)
+                .await
+            {
                 note(format!("could not select mode `{mode}`: {err:#}"));
             } else {
                 note(format!("mode: {mode}"));
@@ -609,29 +708,7 @@ fn non_interactive_auth_method(conn: &AcpConnection) -> Option<String> {
     })
 }
 
-async fn wait_for_cancel(control: &mut mpsc::UnboundedReceiver<RelayToHost>) -> Option<RelayToHost> {
-    loop {
-        match control.recv().await {
-            Some(RelayToHost::CancelRun { run_id }) => {
-                return Some(RelayToHost::CancelRun { run_id })
-            }
-            Some(_) => continue,
-            None => {
-                // No more control messages will arrive; park forever so the
-                // prompt branch of the select decides the outcome.
-                futures::future::pending::<()>().await;
-                return None;
-            }
-        }
-    }
-}
-
-async fn handle_update(
-    run_id: &str,
-    update: Value,
-    out: &Sink,
-    state: &Arc<Mutex<TurnState>>,
-) {
+async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mutex<TurnState>>) {
     let kind = update
         .get("sessionUpdate")
         .and_then(|v| v.as_str())
@@ -744,7 +821,10 @@ async fn handle_update(
             let text = entries
                 .iter()
                 .map(|e| {
-                    let status = e.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                    let status = e
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending");
                     let mark = match status {
                         "completed" => "x",
                         "in_progress" => "~",
@@ -826,7 +906,10 @@ async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, 
         s.streamed_at = None;
         s.streaming = false;
         s.interrupted = false;
-        (std::mem::take(&mut s.message), std::mem::take(&mut s.thought))
+        (
+            std::mem::take(&mut s.message),
+            std::mem::take(&mut s.thought),
+        )
     };
     if !thought.trim().is_empty() {
         let _ = out.send(HostToRelay::RunEvent {
@@ -876,7 +959,9 @@ fn resolve_command(spec: &RunSpec) -> Result<Vec<String>> {
             .custom_command
             .clone()
             .filter(|c| !c.is_empty())
-            .ok_or_else(|| anyhow!("this agent uses a custom runtime but no command is configured"));
+            .ok_or_else(|| {
+                anyhow!("this agent uses a custom runtime but no command is configured")
+            });
     }
     detect::runtime_command(&spec.runtime).ok_or_else(|| {
         anyhow!(
@@ -944,9 +1029,10 @@ pub fn project_env(project_name: Option<&str>) -> Vec<(String, String)> {
 }
 
 pub fn project_env_path(project_name: &str) -> std::path::PathBuf {
-    worktree::work_root()
-        .join("env")
-        .join(format!("{}.env", worktree::sanitize(&project_name.to_lowercase())))
+    worktree::work_root().join("env").join(format!(
+        "{}.env",
+        worktree::sanitize(&project_name.to_lowercase())
+    ))
 }
 
 /// `KEY=value`, `export KEY=value`, `#` comments, optional quotes. Deliberately
@@ -989,8 +1075,8 @@ async fn write_skill(cwd: &str) {
 /// An agent that can read a file does not need it pasted into its prompt: a
 /// screenshot is a path, and every runtime here can open one. Failures are
 /// not fatal — a missing screenshot is worth less than the run.
-async fn fetch_files(cwd: &str, spec: &RunSpec) -> Vec<String> {
-    if spec.files.is_empty() {
+async fn fetch_files(cwd: &str, files: &[RunFile]) -> Vec<String> {
+    if files.is_empty() {
         return Vec::new();
     }
     let dir = std::path::Path::new(cwd).join(".patchwork").join("files");
@@ -1001,7 +1087,7 @@ async fn fetch_files(cwd: &str, spec: &RunSpec) -> Vec<String> {
     let client = reqwest::Client::new();
     let mut taken: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
-    for file in &spec.files {
+    for file in files {
         let name = unique_name(&mut taken, &file.file_name);
         let path = dir.join(&name);
         let bytes = match client.get(&file.url).send().await {
@@ -1039,6 +1125,20 @@ fn unique_name(taken: &mut HashMap<String, usize>, file_name: &str) -> String {
         Some((stem, extension)) => format!("{stem}-{seen}.{extension}"),
         None => format!("{clean}-{seen}"),
     }
+}
+
+fn compose_follow_up(prompt: &str, files: &[String]) -> String {
+    if files.is_empty() {
+        return prompt.to_string();
+    }
+    format!(
+        "{prompt}\n\nFiles attached to this message:\n{}\nRead them from disk.",
+        files
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 fn compose_first_prompt(spec: &RunSpec, files: &[String]) -> String {
@@ -1120,7 +1220,12 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            most_permissive(&modes(&["default", "acceptEdits", "plan", "bypassPermissions"])),
+            most_permissive(&modes(&[
+                "default",
+                "acceptEdits",
+                "plan",
+                "bypassPermissions"
+            ])),
             Some("bypassPermissions".into())
         );
         assert_eq!(
@@ -1186,6 +1291,42 @@ mod tests {
         assert_eq!(resolve_command(&s).unwrap(), vec!["my-agent", "--acp"]);
     }
 
+    #[test]
+    fn steering_keeps_queue_order_and_puts_the_first_interrupt_next() {
+        let control = |id: &str| QueuedControl {
+            control_id: id.into(),
+            prompt: id.into(),
+            files: Vec::new(),
+        };
+        let mut queue = VecDeque::new();
+        let mut interrupted = false;
+        assert!(!queue_control(
+            &mut queue,
+            &mut interrupted,
+            control("later"),
+            RunControlMode::Queue,
+        ));
+        assert!(queue_control(
+            &mut queue,
+            &mut interrupted,
+            control("now"),
+            RunControlMode::Interrupt,
+        ));
+        assert!(!queue_control(
+            &mut queue,
+            &mut interrupted,
+            control("after"),
+            RunControlMode::Interrupt,
+        ));
+        assert_eq!(
+            queue
+                .into_iter()
+                .map(|item| item.control_id)
+                .collect::<Vec<_>>(),
+            vec!["now", "later", "after"]
+        );
+    }
+
     #[tokio::test]
     async fn tool_calls_go_to_the_run_log_not_the_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1238,7 +1379,10 @@ mod tests {
         assert_eq!(early_messages, 0, "chunks must not post the message itself");
         // Each delta carries the whole reply so far, never just the newest
         // fragment — that is what makes a dropped frame harmless.
-        assert!(!deltas.is_empty(), "a reply should stream while it is written");
+        assert!(
+            !deltas.is_empty(),
+            "a reply should stream while it is written"
+        );
         for delta in &deltas {
             assert!("Fixed the test.".starts_with(delta.as_str()));
         }
@@ -1257,9 +1401,7 @@ mod tests {
     async fn work_between_two_sentences_becomes_a_paragraph_break() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(TurnState::default()));
-        let chunk = |text: &str| {
-            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } })
-        };
+        let chunk = |text: &str| json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } });
 
         handle_update("r1", chunk("Let me check the PATH."), &tx, &state).await;
         handle_update(
@@ -1289,9 +1431,7 @@ mod tests {
     async fn a_new_turn_starts_a_new_draft() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(TurnState::default()));
-        let chunk = |text: &str| {
-            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } })
-        };
+        let chunk = |text: &str| json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } });
 
         handle_update("r1", chunk("first"), &tx, &state).await;
         flush_message("r1", &tx, &state, &spec()).await;

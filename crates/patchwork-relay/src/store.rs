@@ -12,7 +12,7 @@ use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
 use patchwork_core::{now_ms, Id};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value as Json;
 
 pub type Pool = r2d2::Pool<SqliteConnectionManager>;
@@ -133,7 +133,11 @@ impl Store {
         Ok(ws)
     }
 
-    pub fn update_workspace(&self, name: Option<&str>, task_prefix: Option<&str>) -> Result<Workspace> {
+    pub fn update_workspace(
+        &self,
+        name: Option<&str>,
+        task_prefix: Option<&str>,
+    ) -> Result<Workspace> {
         let conn = self.conn()?;
         if let Some(name) = name {
             conn.execute("UPDATE workspace SET name = ?1", params![name])?;
@@ -274,7 +278,6 @@ impl Store {
         Ok(())
     }
 
-
     // -- tokens and invites -------------------------------------------------
 
     pub fn insert_token(
@@ -334,7 +337,9 @@ impl Store {
         let rows = stmt.query_map([], |r| {
             Ok(Invite {
                 code: r.get("code")?,
-                created_by: r.get::<_, Option<String>>("created_by")?.unwrap_or_default(),
+                created_by: r
+                    .get::<_, Option<String>>("created_by")?
+                    .unwrap_or_default(),
                 created_at: r.get("created_at")?,
                 email: r.get("email")?,
                 is_admin: r.get::<_, i64>("is_admin")? != 0,
@@ -354,7 +359,9 @@ impl Store {
                 |r| {
                     Ok(Invite {
                         code: r.get("code")?,
-                        created_by: r.get::<_, Option<String>>("created_by")?.unwrap_or_default(),
+                        created_by: r
+                            .get::<_, Option<String>>("created_by")?
+                            .unwrap_or_default(),
                         created_at: r.get("created_at")?,
                         email: r.get("email")?,
                         is_admin: r.get::<_, i64>("is_admin")? != 0,
@@ -426,7 +433,8 @@ impl Store {
 
     fn hydrate_channel_members(&self, channels: &mut [Channel]) -> Result<()> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
         for ch in channels.iter_mut() {
             if ch.kind == ChannelKind::Channel {
                 continue;
@@ -517,8 +525,10 @@ impl Store {
     }
 
     pub fn archive_channel(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("UPDATE channels SET archived = 1 WHERE id = ?1", params![id])?;
+        self.conn()?.execute(
+            "UPDATE channels SET archived = 1 WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -574,8 +584,9 @@ impl Store {
     }
 
     pub fn insert_message(&self, message: &Message) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, run_id, task_id, mentions, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
@@ -597,26 +608,27 @@ impl Store {
                 message.created_at,
             ],
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO message_search (message_id, channel_id, body) VALUES (?1, ?2, ?3)",
             params![message.id, message.channel_id, message.body],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE channels SET last_message_at = ?2 WHERE id = ?1",
             params![message.channel_id, message.created_at],
         )?;
         if let Some(parent) = &message.parent_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE messages SET reply_count = reply_count + 1, last_reply_at = ?2 WHERE id = ?1",
                 params![parent, message.created_at],
             )?;
         }
-        for id in &message.attachments.iter().map(|a| a.id.clone()).collect::<Vec<_>>() {
-            conn.execute(
-                "UPDATE attachments SET message_id = ?2 WHERE id = ?1",
-                params![id, message.id],
+        for attachment in &message.attachments {
+            tx.execute(
+                "UPDATE attachments SET message_id = ?2, task_id = COALESCE(task_id, ?3) WHERE id = ?1",
+                params![attachment.id, message.id, message.task_id],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -740,9 +752,8 @@ impl Store {
     /// conversation context.
     pub fn recent_messages(&self, channel_id: &str, limit: usize) -> Result<Vec<Message>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT * FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2")?;
         let rows = stmt.query_map(params![channel_id, limit as i64], |r| {
             Self::message_from_row(r)
         })?;
@@ -756,8 +767,8 @@ impl Store {
             return Ok(());
         }
         let conn = self.conn()?;
-        let mut reactions = conn
-            .prepare("SELECT member_id, emoji FROM reactions WHERE message_id = ?1")?;
+        let mut reactions =
+            conn.prepare("SELECT member_id, emoji FROM reactions WHERE message_id = ?1")?;
         let mut attachments = conn.prepare("SELECT * FROM attachments WHERE message_id = ?1")?;
         for m in messages.iter_mut() {
             let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -826,11 +837,7 @@ impl Store {
         })
     }
 
-    pub fn insert_attachment(
-        &self,
-        attachment: &Attachment,
-        path: &str,
-    ) -> Result<()> {
+    pub fn insert_attachment(&self, attachment: &Attachment, path: &str) -> Result<()> {
         self.conn()?.execute(
             "INSERT INTO attachments (id, file_name, mime, size, path, message_id, task_id, run_id, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -853,9 +860,11 @@ impl Store {
     pub fn attachment(&self, id: &str) -> Result<Option<(Attachment, String)>> {
         let conn = self.conn()?;
         Ok(conn
-            .query_row("SELECT * FROM attachments WHERE id = ?1", params![id], |r| {
-                Ok((Self::attachment_from_row(r)?, r.get::<_, String>("path")?))
-            })
+            .query_row(
+                "SELECT * FROM attachments WHERE id = ?1",
+                params![id],
+                |r| Ok((Self::attachment_from_row(r)?, r.get::<_, String>("path")?)),
+            )
             .optional()?)
     }
 
@@ -914,7 +923,9 @@ impl Store {
     }
 
     pub fn update_task(&self, task: &Task) -> Result<()> {
-        self.conn()?.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
                               position=?13, updated_at=?14 WHERE id=?1",
@@ -924,6 +935,15 @@ impl Store {
                 task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms()
             ],
         )?;
+        tx.execute(
+            "UPDATE channels SET name = ?2, topic = ?3 WHERE id = ?1",
+            params![
+                task.discussion_channel_id,
+                format!("{}: {}", task.key, task.title),
+                task.outcome,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -937,6 +957,25 @@ impl Store {
     }
 
     /// Accepts an id or a human key like `PW-14`.
+    pub fn set_task_source_message(&self, task_id: &str, message_id: &str) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE tasks SET source_message_id = ?2 WHERE id = ?1",
+            params![task_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn task_by_source_message(&self, message_id: &str) -> Result<Option<Task>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM tasks WHERE source_message_id = ?1 LIMIT 1",
+                params![message_id],
+                |row| Self::task_from_row(row),
+            )
+            .optional()?)
+    }
+
     pub fn task_by_ref(&self, reference: &str) -> Result<Option<Task>> {
         if let Some(task) = self.task(reference)? {
             return Ok(Some(task));
@@ -950,7 +989,6 @@ impl Store {
             )
             .optional()?)
     }
-
 
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let conn = self.conn()?;
@@ -1140,9 +1178,7 @@ impl Store {
             id: row.get("id")?,
             agent_id: row.get("agent_id")?,
             status: RunStatus::parse(&status).unwrap_or(RunStatus::Queued),
-            trigger: json_col(row, "trigger").unwrap_or(RunTrigger::Manual {
-                by: String::new(),
-            }),
+            trigger: json_col(row, "trigger").unwrap_or(RunTrigger::Manual { by: String::new() }),
             channel_id: row.get("channel_id")?,
             task_id: row.get("task_id")?,
             host_id: row.get("host_id")?,
@@ -1163,7 +1199,20 @@ impl Store {
     }
 
     pub fn insert_run(&self, run: &Run, depth: i32) -> Result<()> {
-        self.conn()?.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(task_id) = &run.task_id {
+            let busy: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE task_id = ?1
+                 AND status IN ('queued','dispatched','running','waiting'))",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            if busy {
+                return Err(anyhow!("this task already has an active run"));
+            }
+        }
+        tx.execute(
             "INSERT INTO runs (id, agent_id, status, trigger, channel_id, task_id, host_id, project_id,
                                worktree_id, cwd, automation_id, session_id, runtime, prompt, headline,
                                error, token_usage, depth, created_at, started_at, ended_at)
@@ -1175,6 +1224,7 @@ impl Store {
                 run.token_usage.as_ref().map(to_json), depth, run.created_at, run.started_at, run.ended_at
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1242,7 +1292,11 @@ impl Store {
     /// A run already working in this project, on a different task. Only
     /// interesting for projects with no repository, where every task shares
     /// the one folder.
-    pub fn project_active_run(&self, project_id: &str, task_id: Option<&str>) -> Result<Option<Run>> {
+    pub fn project_active_run(
+        &self,
+        project_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Option<Run>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
@@ -1301,8 +1355,7 @@ impl Store {
                 id: r.get("id")?,
                 run_id: r.get("run_id")?,
                 seq: r.get("seq")?,
-                kind: serde_json::from_value(Json::String(kind))
-                    .unwrap_or(RunEventKind::Lifecycle),
+                kind: serde_json::from_value(Json::String(kind)).unwrap_or(RunEventKind::Lifecycle),
                 text: r.get("text")?,
                 data: json_col(r, "data"),
                 created_at: r.get("created_at")?,
@@ -1588,16 +1641,19 @@ impl Store {
     pub fn automation(&self, id: &str) -> Result<Option<Automation>> {
         let conn = self.conn()?;
         Ok(conn
-            .query_row("SELECT * FROM automations WHERE id = ?1", params![id], |r| {
-                Self::automation_from_row(r)
-            })
+            .query_row(
+                "SELECT * FROM automations WHERE id = ?1",
+                params![id],
+                |r| Self::automation_from_row(r),
+            )
             .optional()?)
     }
 
     pub fn automation_by_webhook(&self, token: &str) -> Result<Option<Automation>> {
-        Ok(self.automations()?.into_iter().find(|a| {
-            matches!(&a.trigger, AutomationTrigger::Webhook { token: t } if t == token)
-        }))
+        Ok(self
+            .automations()?
+            .into_iter()
+            .find(|a| matches!(&a.trigger, AutomationTrigger::Webhook { token: t } if t == token)))
     }
 
     pub fn delete_automation(&self, id: &str) -> Result<()> {
@@ -1775,8 +1831,8 @@ impl Store {
 
     pub fn events_since(&self, seq: i64, limit: usize) -> Result<Vec<Envelope>> {
         let conn = self.conn()?;
-        let mut stmt =
-            conn.prepare("SELECT seq, at, payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let mut stmt = conn
+            .prepare("SELECT seq, at, payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
         let rows = stmt.query_map(params![seq, limit as i64], |r| {
             let payload: String = r.get(2)?;
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, payload))
@@ -1843,5 +1899,110 @@ impl Store {
         )?;
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use patchwork_core::new_id;
+
+    fn store() -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("patchwork-store-{}.sqlite", new_id()));
+        (Store::open(&path).unwrap(), path)
+    }
+
+    fn run(id: &str, task_id: &str) -> Run {
+        Run {
+            id: id.into(),
+            agent_id: "agent".into(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: "channel".into(),
+            task_id: Some(task_id.into()),
+            host_id: Some("host".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            prompt: String::new(),
+            headline: String::new(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn one_task_has_one_active_writer() {
+        let (store, path) = store();
+        let mut first = run("r1", "task");
+        store.insert_run(&first, 0).unwrap();
+        assert!(store.insert_run(&run("r2", "task"), 0).is_err());
+        first.status = RunStatus::Succeeded;
+        store.update_run(&first).unwrap();
+        store.insert_run(&run("r2", "task"), 0).unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_task_message_pins_its_attachment_to_both_records() {
+        let (store, path) = store();
+        store
+            .insert_channel(&Channel {
+                id: "channel".into(),
+                kind: ChannelKind::Task,
+                section_id: None,
+                slug: String::new(),
+                name: "Task".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: Some("task".into()),
+                last_message_at: 0,
+            })
+            .unwrap();
+        let attachment = Attachment {
+            id: "file".into(),
+            file_name: "screen.png".into(),
+            mime: "image/png".into(),
+            size: 1,
+            url: "/api/files/file".into(),
+            message_id: None,
+            task_id: None,
+            run_id: None,
+            created_at: 1,
+        };
+        store.insert_attachment(&attachment, "/tmp/screen.png").unwrap();
+        store
+            .insert_message(&Message {
+                id: "message".into(),
+                channel_id: "channel".into(),
+                author_id: "human".into(),
+                kind: MessageKind::Text,
+                body: String::new(),
+                card: None,
+                parent_id: None,
+                reply_count: 0,
+                last_reply_at: 0,
+                run_id: None,
+                task_id: Some("task".into()),
+                mentions: Vec::new(),
+                attachments: vec![attachment],
+                reactions: Vec::new(),
+                created_at: 1,
+                edited_at: None,
+            })
+            .unwrap();
+        let attached = store.attachment("file").unwrap().unwrap().0;
+        assert_eq!(attached.message_id.as_deref(), Some("message"));
+        assert_eq!(attached.task_id.as_deref(), Some("task"));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }

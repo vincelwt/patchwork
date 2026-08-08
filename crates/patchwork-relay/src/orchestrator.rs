@@ -5,12 +5,15 @@
 //! the running agents never disagree with each other.
 
 use anyhow::{anyhow, bail, Context, Result};
-use patchwork_core::events::Event;
-use patchwork_core::host::{HostToRelay, RelayToHost, RunFile, RunSpec, WorktreeSpec};
-use patchwork_core::models::*;
-use patchwork_core::wire::SendMessage;
-use patchwork_core::{new_id, now_ms, Id, Millis};
 use patchwork_agent::worktree::branch_for;
+use patchwork_core::events::Event;
+use patchwork_core::host::{
+    HostToRelay, RelayToHost, RunControlMode, RunControlState, RunFile, RunSpec, WorktreeSpec,
+};
+use patchwork_core::models::*;
+use patchwork_core::wire::{SendMessage, SteerRun};
+use patchwork_core::{new_id, now_ms, Id, Millis};
+use serde_json::json;
 
 use crate::auth;
 use crate::state::Shared;
@@ -49,7 +52,9 @@ pub fn post_message<'a>(
     input: SendMessage,
     options: PostOptions,
 ) -> futures::future::BoxFuture<'a, Result<Message>> {
-    Box::pin(post_message_inner(state, channel_id, author_id, input, options))
+    Box::pin(post_message_inner(
+        state, channel_id, author_id, input, options,
+    ))
 }
 
 async fn post_message_inner(
@@ -172,12 +177,7 @@ async fn talk_where(state: &Shared, run_id: &str, message: &Message) {
 /// A reply that is still being written: posted on the first delta so the reader
 /// watches it arrive, then rewritten in place by every delta after it.
 async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> {
-    let existing = state
-        .streaming_messages
-        .read()
-        .await
-        .get(run_id)
-        .cloned();
+    let existing = state.streaming_messages.read().await.get(run_id).cloned();
 
     if let Some(message_id) = existing {
         state.store.stream_message_body(&message_id, body)?;
@@ -242,7 +242,9 @@ async fn finish_posted_message(state: &Shared, message: &Message) -> Result<()> 
     state.emit(Event::MessageUpdated {
         message: settled.clone(),
     });
-    state.emit(Event::ChannelUpdated { channel: channel.clone() });
+    state.emit(Event::ChannelUpdated {
+        channel: channel.clone(),
+    });
 
     follow_through(state, &settled, &channel, &members, true).await
 }
@@ -280,11 +282,7 @@ pub fn parse_mentions(body: &str, members: &[Member]) -> Vec<Id> {
 /// recently, only if it was answering *this* person, and only when the new
 /// message does not name somebody else instead — say `@other-agent` and you
 /// meant that one, not the one still on screen.
-fn continuation_target(
-    state: &Shared,
-    message: &Message,
-    author: &Member,
-) -> Result<Option<Id>> {
+fn continuation_target(state: &Shared, message: &Message, author: &Member) -> Result<Option<Id>> {
     if author.kind != MemberKind::Human || !message.mentions.is_empty() {
         return Ok(None);
     }
@@ -361,10 +359,10 @@ async fn notify_inbox(
     let mut notified: Vec<Id> = Vec::new();
 
     let push = |state: &Shared,
-                    member_id: &str,
-                    kind: InboxKind,
-                    title: String,
-                    notified: &mut Vec<Id>|
+                member_id: &str,
+                kind: InboxKind,
+                title: String,
+                notified: &mut Vec<Id>|
      -> Result<()> {
         if member_id == message.author_id || notified.contains(&member_id.to_string()) {
             return Ok(());
@@ -471,6 +469,25 @@ async fn trigger_agents(
     // add, and the reply you were waiting for never comes. The reader is left
     // with a working app that simply ignored them.
     let continuing = continuation_target(state, message, &author)?;
+    // A task is already addressed: its owner is the recipient. Ordinary room
+    // chat keeps the narrower recent-reply heuristic.
+    let task_owner = if author.kind == MemberKind::Human
+        && message.mentions.is_empty()
+        && channel.kind == ChannelKind::Task
+    {
+        channel
+            .task_id
+            .as_deref()
+            .and_then(|id| state.store.task(id).ok().flatten())
+            .and_then(|task| (task.status != TaskStatus::Done).then_some(task.owner_id).flatten())
+            .filter(|id| {
+                members
+                    .iter()
+                    .any(|member| member.id == *id && member.kind == MemberKind::Agent)
+            })
+    } else {
+        None
+    };
 
     for agent in members.iter().filter(|m| m.kind == MemberKind::Agent) {
         if agent.id == message.author_id {
@@ -494,10 +511,11 @@ async fn trigger_agents(
             }
         }
 
-        let addressed = mentioned || continuing.as_deref() == Some(agent.id.as_str());
+        let owns_task = task_owner.as_deref() == Some(agent.id.as_str());
+        let addressed = mentioned || owns_task || continuing.as_deref() == Some(agent.id.as_str());
 
         let should_run = if addressed {
-            participation != Participation::Off || in_dm
+            participation != Participation::Off || in_dm || owns_task
         } else if in_dm {
             profile.dm_enabled
         } else {
@@ -536,15 +554,29 @@ async fn trigger_agents(
                 display_name_of(members, &message.author_id),
                 message.body
             );
-            state
-                .send_to_host(
-                    active.host_id.as_deref().unwrap_or(&state.relay_host_id),
-                    RelayToHost::FollowUp {
-                        run_id: active.id.clone(),
-                        prompt,
-                    },
+            let attachment_ids = message
+                .attachments
+                .iter()
+                .map(|attachment| attachment.id.clone())
+                .collect::<Vec<_>>();
+            if let Err(err) = deliver_control(
+                state,
+                &active,
+                new_id(),
+                prompt,
+                RunControlMode::Queue,
+                run_files(state, &attachment_ids)?,
+            )
+            .await
+            {
+                tracing::warn!(?err, run = %active.id, "could not steer active run");
+                let _ = post_system(
+                    state,
+                    &channel.id,
+                    &format!("Could not deliver that feedback: {err}"),
                 )
                 .await;
+            }
             continue;
         }
 
@@ -611,6 +643,264 @@ fn system_member_id(state: &Shared) -> Result<Id> {
 // Runs
 // ---------------------------------------------------------------------------
 
+fn append_run_event(
+    state: &Shared,
+    run_id: &str,
+    kind: RunEventKind,
+    text: String,
+    data: Option<serde_json::Value>,
+) -> Result<()> {
+    let event = RunEvent {
+        id: new_id(),
+        run_id: run_id.to_string(),
+        seq: state.store.next_run_event_seq(run_id)?,
+        kind,
+        text,
+        data,
+        created_at: now_ms(),
+    };
+    state.store.append_run_event(&event)?;
+    state.emit(Event::RunEventAppended { event });
+    Ok(())
+}
+
+fn run_files(state: &Shared, attachment_ids: &[Id]) -> Result<Vec<RunFile>> {
+    let mut files = Vec::new();
+    for id in attachment_ids {
+        let (attachment, _) = state
+            .store
+            .attachment(id)?
+            .ok_or_else(|| anyhow!("attachment not found"))?;
+        files.push(RunFile {
+            file_name: attachment.file_name,
+            url: format!("{}{}", state.public_url, attachment.url),
+        });
+    }
+    Ok(files)
+}
+
+async fn deliver_control(
+    state: &Shared,
+    run: &Run,
+    control_id: Id,
+    prompt: String,
+    mode: RunControlMode,
+    files: Vec<RunFile>,
+) -> Result<()> {
+    let host_id = run
+        .host_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("the target run has no execution host"))?;
+    if !state
+        .send_to_host(
+            host_id,
+            RelayToHost::FollowUp {
+                run_id: run.id.clone(),
+                control_id,
+                prompt,
+                mode,
+                files,
+            },
+        )
+        .await
+    {
+        bail!("the target run's execution host is offline");
+    }
+    Ok(())
+}
+
+/// A durable note that does not recursively wake agents or automations.
+fn post_control_note(
+    state: &Shared,
+    channel_id: &str,
+    author_id: &str,
+    source_run_id: Option<&str>,
+    body: String,
+    attachment_ids: &[Id],
+) -> Result<Message> {
+    let channel = state
+        .store
+        .channel(channel_id)?
+        .ok_or_else(|| anyhow!("channel not found"))?;
+    let mut attachments = Vec::new();
+    for id in attachment_ids {
+        if let Some((attachment, _)) = state.store.attachment(id)? {
+            attachments.push(attachment);
+        }
+    }
+    let message = Message {
+        id: new_id(),
+        channel_id: channel.id.clone(),
+        author_id: author_id.to_string(),
+        kind: MessageKind::Status,
+        body,
+        card: None,
+        parent_id: None,
+        reply_count: 0,
+        last_reply_at: 0,
+        run_id: source_run_id.map(str::to_string),
+        task_id: channel.task_id,
+        mentions: Vec::new(),
+        attachments,
+        reactions: Vec::new(),
+        created_at: now_ms(),
+        edited_at: None,
+    };
+    state.store.insert_message(&message)?;
+    let stored = state.store.message(&message.id)?.unwrap_or(message);
+    state.emit(Event::MessageCreated {
+        message: stored.clone(),
+    });
+    if let Some(channel) = state.store.channel(channel_id)? {
+        state.emit(Event::ChannelUpdated { channel });
+    }
+    Ok(stored)
+}
+
+/// Prompt an exact active ACP run, independent of where either run is talking.
+pub async fn steer_run(
+    state: &Shared,
+    author_id: &str,
+    source_run_id: Option<&str>,
+    target_run_id: &str,
+    input: SteerRun,
+) -> Result<Id> {
+    let prompt = input.prompt.trim();
+    if prompt.is_empty() && input.attachment_ids.is_empty() {
+        bail!("say what the run should know");
+    }
+    if prompt.chars().count() > 32_000 {
+        bail!("that steering message is too long");
+    }
+    if input.attachment_ids.len() > 16 {
+        bail!("a steering message can attach at most 16 files");
+    }
+    let target = state
+        .store
+        .run(target_run_id)?
+        .filter(|run| !run.status.is_terminal())
+        .ok_or_else(|| anyhow!("the target run is not active"))?;
+
+    let source = match source_run_id {
+        Some(id) => {
+            if id == target_run_id {
+                bail!("a run cannot steer itself");
+            }
+            let run = state
+                .store
+                .run(id)?
+                .filter(|run| !run.status.is_terminal() && run.agent_id == author_id)
+                .ok_or_else(|| anyhow!("the source run is not active"))?;
+            let direct: Vec<_> = state
+                .store
+                .run_events(id, 0)?
+                .into_iter()
+                .filter(|event| {
+                    event
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("target_run_id"))
+                        .is_some()
+                })
+                .collect();
+            if direct.len() >= 16
+                || direct
+                    .iter()
+                    .filter(|event| {
+                        event
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("target_run_id"))
+                            == Some(&serde_json::Value::String(target_run_id.to_string()))
+                    })
+                    .count()
+                    >= 4
+            {
+                bail!("this run has reached its cross-session message limit");
+            }
+            Some(run)
+        }
+        None => None,
+    };
+
+    let members = state.store.members()?;
+    let sender = display_name_of(&members, author_id);
+    let target_name = display_name_of(&members, &target.agent_id);
+    let control_id = new_id();
+    let summary = if prompt.is_empty() { "Attached file(s)" } else { prompt };
+    let delivered = if prompt.is_empty() {
+        "Review the attached file(s).".to_string()
+    } else if source.is_some() {
+        format!(
+            "{sender} sent a message from another active Patchwork run:\n\n{prompt}\n\nUse this information in your current work. Reply only if coordination requires it."
+        )
+    } else {
+        format!("{sender} sent steering feedback:\n\n{prompt}")
+    };
+    deliver_control(
+        state,
+        &target,
+        control_id.clone(),
+        delivered,
+        input.mode,
+        run_files(state, &input.attachment_ids)?,
+    )
+    .await?;
+
+    let note = if source.is_some() {
+        format!("{sender} → {target_name}: {summary}")
+    } else {
+        format!("Feedback for {target_name}: {summary}")
+    };
+    let target_note = post_control_note(
+        state,
+        &target.channel_id,
+        author_id,
+        source_run_id,
+        note.clone(),
+        &input.attachment_ids,
+    )?;
+    talk_where(state, &target.id, &target_note).await;
+
+    append_run_event(
+        state,
+        &target.id,
+        RunEventKind::Message,
+        format!("Steering from {sender}: {summary}"),
+        Some(json!({
+            "control_id": control_id.clone(),
+            "source_run_id": source_run_id,
+            "mode": input.mode,
+            "direction": "inbound",
+        })),
+    )?;
+    if let Some(source) = &source {
+        append_run_event(
+            state,
+            &source.id,
+            RunEventKind::Message,
+            format!("Sent to {target_name}: {summary}"),
+            Some(json!({
+                "control_id": control_id.clone(),
+                "target_run_id": target.id.clone(),
+                "mode": input.mode,
+                "direction": "outbound",
+            })),
+        )?;
+        if source.channel_id != target.channel_id {
+            post_control_note(
+                state,
+                &source.channel_id,
+                author_id,
+                Some(&source.id),
+                note,
+                &[],
+            )?;
+        }
+    }
+    Ok(control_id)
+}
+
 pub struct StartRunParams {
     pub agent_id: Id,
     pub channel_id: Id,
@@ -661,10 +951,9 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
     // into this more than once.
     if let Some(project) = &project {
         if project.repo_url.is_none() {
-            if let Some(busy) =
-                state
-                    .store
-                    .project_active_run(&project.id, params.task_id.as_deref())?
+            if let Some(busy) = state
+                .store
+                .project_active_run(&project.id, params.task_id.as_deref())?
             {
                 let who = state
                     .store
@@ -770,7 +1059,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     if let Some(task) = &task {
         let mut task = task.clone();
         task.current_run_id = Some(run.id.clone());
-        if task.status == TaskStatus::Planned {
+        if task.status != TaskStatus::Done {
             task.status = TaskStatus::Running;
         }
         state.store.update_task(&task)?;
@@ -803,7 +1092,11 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     Ok(run)
 }
 
-fn resume_session_for(state: &Shared, agent_id: &str, task_id: &Option<Id>) -> Result<Option<String>> {
+fn resume_session_for(
+    state: &Shared,
+    agent_id: &str,
+    task_id: &Option<Id>,
+) -> Result<Option<String>> {
     let Some(task_id) = task_id else {
         return Ok(None);
     };
@@ -833,7 +1126,12 @@ async fn choose_host(
         ExecutionLocation::Desktop => profile.host_id.clone().into_iter().collect(),
         ExecutionLocation::Auto => {
             let mut ids = vec![state.relay_host_id.clone()];
-            ids.extend(online.iter().filter(|id| **id != state.relay_host_id).cloned());
+            ids.extend(
+                online
+                    .iter()
+                    .filter(|id| **id != state.relay_host_id)
+                    .cloned(),
+            );
             ids
         }
     };
@@ -847,10 +1145,7 @@ async fn choose_host(
             return Ok(id.clone());
         }
         if !project.paths.is_empty() {
-            bail!(
-                "no connected machine has `{}` checked out",
-                project.name
-            );
+            bail!("no connected machine has `{}` checked out", project.name);
         }
     }
 
@@ -919,10 +1214,7 @@ fn task_files(state: &Shared, task: &Option<Task>) -> Vec<RunFile> {
 fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTrigger) -> String {
     let mut prompt = String::new();
     if let Some(task) = task {
-        prompt.push_str(&format!(
-            "You own task {} — {}.\n",
-            task.key, task.title
-        ));
+        prompt.push_str(&format!("You own task {}: {}.\n", task.key, task.title));
         if !task.outcome.trim().is_empty() {
             prompt.push_str(&format!("Expected result: {}\n", task.outcome.trim()));
         }
@@ -983,9 +1275,7 @@ async fn build_context(state: &Shared, run: &Run, task: &Option<Task>) -> Result
         }
     }
 
-    out.push_str(
-        "\nUse `patchwork history` and `patchwork search` if you need more than this.\n",
-    );
+    out.push_str("\nUse `patchwork history` and `patchwork search` if you need more than this.\n");
     Ok(out)
 }
 
@@ -1019,19 +1309,24 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             kind,
             text,
             data,
+        } => append_run_event(state, &run_id, kind, text, data)?,
+
+        HostToRelay::RunControlStatus {
+            run_id,
+            control_id,
+            state: control_state,
         } => {
-            let seq = state.store.next_run_event_seq(&run_id)?;
-            let event = RunEvent {
-                id: new_id(),
-                run_id: run_id.clone(),
-                seq,
-                kind,
-                text,
-                data,
-                created_at: now_ms(),
+            let label = match control_state {
+                RunControlState::Queued => "Steering queued",
+                RunControlState::Started => "Steering delivered",
             };
-            state.store.append_run_event(&event)?;
-            state.emit(Event::RunEventAppended { event });
+            append_run_event(
+                state,
+                &run_id,
+                RunEventKind::Lifecycle,
+                label.to_string(),
+                Some(json!({ "control_id": control_id, "state": control_state })),
+            )?;
         }
 
         HostToRelay::RunStatus {
@@ -1149,7 +1444,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
 
             // An ambient agent that has nothing to add says so, and we stay quiet.
             let quiet = matches!(run.trigger, RunTrigger::Ambient { .. })
-                && body.trim().trim_matches(|c: char| !c.is_alphanumeric())
+                && body
+                    .trim()
+                    .trim_matches(|c: char| !c.is_alphanumeric())
                     .eq_ignore_ascii_case("NOTHING");
             if quiet {
                 // It streamed something before deciding to stay out of it.
@@ -1376,12 +1673,7 @@ async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     Ok(())
 }
 
-pub fn notify_task(
-    state: &Shared,
-    task: &Task,
-    kind: InboxKind,
-    title: String,
-) -> Result<()> {
+pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) -> Result<()> {
     let mut targets: Vec<Id> = Vec::new();
     if let Some(owner) = &task.owner_id {
         targets.push(owner.clone());
@@ -1479,7 +1771,7 @@ async fn create_task_inner(
         kind: ChannelKind::Task,
         section_id: None,
         slug: String::new(),
-        name: format!("{key} — {title}"),
+        name: format!("{key}: {title}"),
         topic: input.outcome.clone(),
         position: 0.0,
         created_at: now,
@@ -1497,7 +1789,7 @@ async fn create_task_inner(
     };
     state.store.insert_channel(&discussion)?;
 
-    let task = Task {
+    let mut task = Task {
         id: new_id(),
         key: key.clone(),
         title,
@@ -1539,6 +1831,31 @@ async fn create_task_inner(
         channel: discussion.clone(),
     });
     state.emit(Event::TaskCreated { task: task.clone() });
+
+    // A long voice transcript is source material, not the board title. Keep it
+    // as the first human message so later title/outcome cleanup cannot erase it.
+    if task.source_message_id.is_none() && !task.outcome.trim().is_empty() {
+        let original = post_message(
+            state,
+            &task.discussion_channel_id,
+            creator_id,
+            SendMessage {
+                body: task.outcome.clone(),
+                attachment_ids: input.attachment_ids.clone(),
+                ..Default::default()
+            },
+            PostOptions {
+                trigger_agents: false,
+                run_id: None,
+            },
+        )
+        .await?;
+        task.source_message_id = Some(original.id.clone());
+        state
+            .store
+            .set_task_source_message(&task.id, &original.id)?;
+        state.emit(Event::TaskUpdated { task: task.clone() });
+    }
 
     // The task card belongs in the conversation it came from.
     if let Some(channel_id) = &input.source_channel_id {
@@ -1652,7 +1969,11 @@ pub async fn update_task(
         };
     }
     if let Some(pr_url) = input.pr_url {
-        task.pr_url = if pr_url.is_empty() { None } else { Some(pr_url) };
+        task.pr_url = if pr_url.is_empty() {
+            None
+        } else {
+            Some(pr_url)
+        };
     }
     // 0 is how a client says "no date": there is no such instant in practice,
     // and `null` cannot be told apart from "not mentioned" in a patch.
@@ -1665,6 +1986,11 @@ pub async fn update_task(
 
     state.store.update_task(&task)?;
     state.emit(Event::TaskUpdated { task: task.clone() });
+    if previous.title != task.title || previous.outcome != task.outcome {
+        if let Some(channel) = state.store.channel(&task.discussion_channel_id)? {
+            state.emit(Event::ChannelUpdated { channel });
+        }
+    }
 
     // A moved date is a new promise, so it gets to be announced again.
     if previous.due_at != task.due_at {
@@ -1673,7 +1999,9 @@ pub async fn update_task(
 
     if previous.owner_id != task.owner_id {
         if let Some(owner) = &task.owner_id {
-            state.store.add_channel_member(&task.discussion_channel_id, owner)?;
+            state
+                .store
+                .add_channel_member(&task.discussion_channel_id, owner)?;
             if state.store.member(owner)?.map(|m| m.kind) == Some(MemberKind::Human) {
                 notify_task(
                     state,
@@ -1817,11 +2145,17 @@ mod tests {
 
     #[test]
     fn titles_come_from_the_first_line() {
-        assert_eq!(title_from("Ship the billing page."), "Ship the billing page");
+        assert_eq!(
+            title_from("Ship the billing page."),
+            "Ship the billing page"
+        );
         assert_eq!(title_from("  Fix login\nmore detail here"), "Fix login");
         assert_eq!(title_from(""), "Untitled task");
         let long = title_from(&"alpha beta gamma delta epsilon zeta eta".repeat(3));
-        assert!(long.ends_with('\u{2026}') && long.chars().count() <= 61, "{long}");
+        assert!(
+            long.ends_with('\u{2026}') && long.chars().count() <= 61,
+            "{long}"
+        );
     }
 
     fn member(id: &str, handle: &str, kind: MemberKind) -> Member {

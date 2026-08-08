@@ -8,13 +8,13 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use tower::ServiceExt;
 use patchwork_core::events::Event;
 use patchwork_core::host::RelayToHost;
 use patchwork_core::models::*;
 use patchwork_core::wire::*;
 use patchwork_core::{new_id, now_ms, Id};
 use serde::Deserialize;
+use tower::ServiceExt;
 
 use crate::auth::{self, Caller};
 use crate::error::{ApiError, ApiResult};
@@ -29,7 +29,10 @@ use crate::{automations, preview_proxy};
 pub fn relay_router(relay: Arc<Relay>) -> Router {
     Router::new()
         .route("/api/health", get(relay_health))
-        .route("/api/workspaces", get(list_workspaces).post(create_workspace))
+        .route(
+            "/api/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
         .route("/api/auth/join", post(join))
         .fallback(dispatch)
         .with_state(relay)
@@ -181,7 +184,10 @@ pub fn router(state: Shared) -> Router {
             "/api/channels/{id}/messages",
             get(list_messages).post(send_message),
         )
-        .route("/api/messages/{id}", patch(edit_message).delete(delete_message))
+        .route(
+            "/api/messages/{id}",
+            patch(edit_message).delete(delete_message),
+        )
         .route("/api/messages/{id}/thread", get(thread))
         .route("/api/messages/{id}/reactions", post(react))
         // tasks
@@ -195,6 +201,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/runs", post(start_run))
         .route("/api/runs/{id}", get(run_detail))
         .route("/api/runs/{id}/cancel", post(cancel_run))
+        .route("/api/runs/{id}/steer", post(steer_run))
         .route("/api/runs/{id}/events", get(run_events))
         // questions
         .route("/api/questions", get(list_questions).post(ask_question))
@@ -274,7 +281,13 @@ async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthRes
     let invite = state
         .store
         .claim_invite(input.invite_code.trim(), "pending")
-        .map_err(|e| ApiError::new(axum::http::StatusCode::FORBIDDEN, "invalid_invite", e.to_string()))?;
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                "invalid_invite",
+                e.to_string(),
+            )
+        })?;
 
     let member = Member {
         id: new_id(),
@@ -401,7 +414,10 @@ async fn create_section(
     Ok(Json(section))
 }
 
-async fn list_channels(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Vec<Channel>>> {
+async fn list_channels(
+    State(state): State<Shared>,
+    caller: Caller,
+) -> ApiResult<Json<Vec<Channel>>> {
     Ok(Json(visible_channels(&state, &caller)?))
 }
 
@@ -416,7 +432,9 @@ async fn create_channel(
     }
     let slug = patchwork_core::ids::slugify(name);
     if state.store.channel_by_slug(&slug)?.is_some() {
-        return Err(ApiError::conflict("a channel with that name already exists"));
+        return Err(ApiError::conflict(
+            "a channel with that name already exists",
+        ));
     }
 
     let section_id = match (&input.section_id, &input.section_name) {
@@ -606,6 +624,11 @@ async fn edit_message(
         .store
         .message(&id)?
         .ok_or_else(|| ApiError::not_found("message not found"))?;
+    if state.store.task_by_source_message(&id)?.is_some() {
+        return Err(ApiError::forbidden(
+            "the original task request is preserved",
+        ));
+    }
     if message.author_id != caller.member.id {
         return Err(ApiError::forbidden("you can only edit your own messages"));
     }
@@ -626,6 +649,11 @@ async fn delete_message(
         .store
         .message(&id)?
         .ok_or_else(|| ApiError::not_found("message not found"))?;
+    if state.store.task_by_source_message(&id)?.is_some() {
+        return Err(ApiError::forbidden(
+            "the original task request is preserved",
+        ));
+    }
     if message.author_id != caller.member.id && !caller.member.is_admin {
         return Err(ApiError::forbidden("you can only delete your own messages"));
     }
@@ -838,6 +866,28 @@ async fn run_events(
     Ok(Json(state.store.run_events(&id, query.after)?))
 }
 
+async fn steer_run(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<SteerRun>,
+) -> ApiResult<Json<SteerRunResponse>> {
+    if caller.is_agent() && input.mode == patchwork_core::host::RunControlMode::Interrupt {
+        return Err(ApiError::forbidden(
+            "agents may queue messages, not interrupt another run",
+        ));
+    }
+    let control_id = orchestrator::steer_run(
+        &state,
+        &caller.member.id,
+        caller.run_id.as_deref(),
+        &id,
+        input,
+    )
+    .await?;
+    Ok(Json(SteerRunResponse { control_id }))
+}
+
 async fn cancel_run(
     State(state): State<Shared>,
     _c: Caller,
@@ -859,10 +909,7 @@ async fn cancel_run(
 // questions
 // ---------------------------------------------------------------------------
 
-async fn list_questions(
-    State(state): State<Shared>,
-    _c: Caller,
-) -> ApiResult<Json<Vec<Question>>> {
+async fn list_questions(State(state): State<Shared>, _c: Caller) -> ApiResult<Json<Vec<Question>>> {
     Ok(Json(state.store.open_questions()?))
 }
 
@@ -932,7 +979,9 @@ async fn ask_question(
         },
     )
     .await?;
-    state.store.set_question_message(&question.id, &message.id)?;
+    state
+        .store
+        .set_question_message(&question.id, &message.id)?;
 
     // The run is visibly waiting, and the people who can answer are told.
     let mut run = run;
@@ -1025,12 +1074,11 @@ async fn wait_for_answer(
     match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
         Ok(Result::Ok(answered)) => Ok(Json(answered)),
         // A timeout is not an error: the caller polls again.
-        _ => Ok(Json(
-            state
-                .store
-                .question(&id)?
-                .ok_or_else(|| ApiError::not_found("question not found"))?,
-        )),
+        _ => {
+            Ok(Json(state.store.question(&id)?.ok_or_else(|| {
+                ApiError::not_found("question not found")
+            })?))
+        }
     }
 }
 
@@ -1205,7 +1253,10 @@ async fn create_project(
         name: input.name.trim().to_string(),
         description: input.description.clone(),
         repo_url: input.repo_url.clone(),
-        default_branch: input.default_branch.clone().unwrap_or_else(|| "main".into()),
+        default_branch: input
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| "main".into()),
         paths: input.paths.clone(),
         created_at: now_ms(),
     };
@@ -1620,7 +1671,11 @@ async fn rename_workspace(
     Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
-    let name = input.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw

@@ -143,6 +143,10 @@ pub struct CreateTask {
     /// this key is returned instead of a second one being created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once_key: Option<String>,
+    /// Files uploaded before the task exists. They become evidence on the
+    /// immutable original request.
+    #[serde(default)]
+    pub attachment_ids: Vec<Id>,
     /// Start the owning agent immediately.
     #[serde(default)]
     pub start: bool,
@@ -203,6 +207,21 @@ pub struct RunDetail {
     pub run: Run,
     pub events: Vec<RunEvent>,
     pub questions: Vec<Question>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SteerRun {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub mode: crate::host::RunControlMode,
+    #[serde(default)]
+    pub attachment_ids: Vec<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteerRunResponse {
+    pub control_id: Id,
 }
 
 // --- questions --------------------------------------------------------------
