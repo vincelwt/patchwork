@@ -1900,6 +1900,25 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
+  const [updateStatus, setUpdateStatus] = useState("");
+
+  const checkForUpdate = async () => {
+    setUpdateStatus("Checking…");
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (!update) {
+        setUpdateStatus("Patchwork is up to date");
+        return;
+      }
+      setUpdateStatus(`Installing ${update.version}…`);
+      await update.downloadAndInstall();
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (err) {
+      setUpdateStatus(String((err as Error).message ?? err));
+    }
+  };
 
   const hostSignature = useHostSignature(app.hosts);
   useEffect(() => {
@@ -2163,6 +2182,26 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           </button>
         </div>
       </Section>
+
+      {inTauri && (
+        <Section title="Updates">
+          <div className="row">
+            <span className="grow">
+              <span className="name">Patchwork Desktop</span>
+              <span className="sub">
+                {updateStatus || "Signed updates from GitHub Releases"}
+              </span>
+            </span>
+            <button
+              className="button"
+              disabled={updateStatus === "Checking…" || updateStatus.startsWith("Installing ")}
+              onClick={() => void checkForUpdate()}
+            >
+              Check for updates
+            </button>
+          </div>
+        </Section>
+      )}
 
       <Section title="Account">
         <button

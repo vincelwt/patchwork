@@ -183,6 +183,8 @@ git clone https://github.com/vincelwt/patchwork
 cd patchwork/desktop && npm install && npm run tauri dev
 ```
 
+Installed Desktop builds can fetch signed releases from **Settings → Updates**.
+
 On the first screen, **Start a workspace**: the app contains the relay and
 serves one itself for as long as it is open. It connects out to the hosted
 Patchwork Relay by default, so phones and teammates get a stable HTTPS address
@@ -217,6 +219,13 @@ on a laptop moves to a server by copying its directory.
 ```bash
 cargo build --release -p patchwork-relay -p patchwork-cli
 scp target/release/patchwork-relay target/release/patchwork root@your-vps:/usr/local/bin/
+```
+
+Release tags build Desktop and Linux relay assets automatically. On a systemd
+relay, enable hourly updates from the latest release with:
+
+```bash
+PATCHWORK_USER=patchwork sudo -E scripts/install-relay-updater.sh
 ```
 
 By default the binary opens an outbound connection to the open-source broker
