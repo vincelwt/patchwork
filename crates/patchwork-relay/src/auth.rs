@@ -45,8 +45,14 @@ impl Caller {
         self.member.kind == MemberKind::Agent
     }
 
+    pub fn can_host(&self) -> bool {
+        self.token_kind != "mobile"
+    }
+
     pub fn require_device(&self) -> Result<(), ApiError> {
-        if self.member.kind == MemberKind::Human && self.token_kind == "device" {
+        if self.member.kind == MemberKind::Human
+            && matches!(self.token_kind.as_str(), "device" | "mobile")
+        {
             Ok(())
         } else {
             Err(ApiError::forbidden("only a human device can do that"))
@@ -127,5 +133,13 @@ mod tests {
             token_kind: "run".into(),
         };
         assert!(caller.require_device().is_err());
+        assert!(caller.can_host());
+
+        let mut mobile = caller;
+        mobile.member.kind = MemberKind::Human;
+        mobile.token_kind = "mobile".into();
+        mobile.run_id = None;
+        assert!(mobile.require_device().is_ok());
+        assert!(!mobile.can_host());
     }
 }

@@ -200,6 +200,11 @@ export class MobileWorkspaceStore {
     this.scheduleCache();
   }
 
+  sendTyping(channelId: Id) {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify({ t: "typing", channel_id: channelId }));
+  }
+
   async mutate<T>(
     operation: (api: Api) => Promise<T>,
     refresh = true,

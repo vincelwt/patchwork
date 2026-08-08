@@ -46,6 +46,7 @@ import {
   TrashIcon,
 } from "./icons";
 import { RuntimeIcon } from "./RuntimeIcon";
+import { PairDeviceModal } from "./PairDeviceModal";
 import { describeCron, PRESETS, presetFor, WEEKDAYS } from "../lib/schedule";
 import type {
   AgentProfile,
@@ -1053,6 +1054,7 @@ export function MembersPage() {
   const api = useApi();
   const { toast } = useNavigation();
   const [inviting, setInviting] = useState(false);
+  const [pairing, setPairing] = useState(false);
   const [removing, setRemoving] = useState<Member | null>(null);
   const humans = app.members.filter((member) => member.kind === "human");
   const iAmAdmin = app.me?.is_admin ?? false;
@@ -1062,10 +1064,15 @@ export function MembersPage() {
       title="Members"
       subtitle={`${humans.length} ${humans.length === 1 ? "person" : "people"}`}
       actions={
-        <button className="button" onClick={() => setInviting(true)}>
-          <PlusIcon size={15} />
-          Invite someone
-        </button>
+        <>
+          <button className="button quiet" onClick={() => setPairing(true)}>
+            Pair phone or tablet
+          </button>
+          <button className="button" onClick={() => setInviting(true)}>
+            <PlusIcon size={15} />
+            Invite someone
+          </button>
+        </>
       }
     >
       {humans.map((member) => (
@@ -1120,6 +1127,7 @@ export function MembersPage() {
       )}
 
       {inviting && <InviteModal onClose={() => setInviting(false)} />}
+      {pairing && <PairDeviceModal onClose={() => setPairing(false)} />}
 
       {removing && (
         <Modal

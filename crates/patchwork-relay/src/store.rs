@@ -368,7 +368,7 @@ impl Store {
         if let Some(member_id) = &member_id {
             tx.execute(
                 "INSERT INTO tokens (token_hash, member_id, kind, label, created_at)
-                 VALUES (?1, ?2, 'device', ?3, ?4)",
+                 VALUES (?1, ?2, 'mobile', ?3, ?4)",
                 params![token_hash, member_id, label, at],
             )?;
         }
@@ -381,7 +381,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT token_hash, COALESCE(NULLIF(label, ''), 'Device'), created_at, last_used
              FROM tokens
-             WHERE member_id = ?1 AND kind = 'device' AND revoked = 0
+             WHERE member_id = ?1 AND kind IN ('device', 'mobile') AND revoked = 0
              ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![member_id], |row| {
@@ -400,7 +400,7 @@ impl Store {
     pub fn revoke_device(&self, member_id: &str, id: &str) -> Result<bool> {
         Ok(self.conn()?.execute(
             "UPDATE tokens SET revoked = 1
-             WHERE token_hash = ?1 AND member_id = ?2 AND kind = 'device' AND revoked = 0",
+             WHERE token_hash = ?1 AND member_id = ?2 AND kind IN ('device', 'mobile') AND revoked = 0",
             params![id, member_id],
         )? == 1)
     }
@@ -2126,7 +2126,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(issued.0, "human");
-        assert_eq!(issued.1, "device");
+        assert_eq!(issued.1, "mobile");
         assert_eq!(store.members().unwrap().len(), 1);
         let devices = store
             .devices("human", &crate::auth::hash_token(token))

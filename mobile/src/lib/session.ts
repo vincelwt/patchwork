@@ -1,11 +1,4 @@
-// What this phone is allowed to reach, and nothing else.
-//
-// A phone is paired from Desktop and receives its own device token. Whatever
-// that pairing flow looks like, it ends here: `savePairedSession` is the only
-// writer of credentials in the app, and the token lives in the keychain, never
-// in a link, a preference file, or a text field.
-
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import * as SecureStore from "expo-secure-store";
 import { Api } from "@client/api";
 
@@ -14,65 +7,83 @@ const KEY = "patchwork.session";
 export interface PairedSession {
   /// One workspace's own base, `{relay}/w/{workspace_id}`.
   baseUrl: string;
-  /// The member token Desktop issued for this device.
+  /// A separately revocable token issued to this device.
   token: string;
 }
 
-/// The single door into a signed-in app. A pairing flow calls this once it has
-/// proof from Desktop; there is deliberately no other way in.
-export async function savePairedSession(session: PairedSession): Promise<void> {
-  await SecureStore.setItemAsync(KEY, JSON.stringify(session), {
-    // Readable only on this device, only while it is unlocked, and never
-    // carried to a new phone by a backup.
-    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-  });
+type Snapshot = PairedSession | null | undefined;
+let snapshot: Snapshot;
+let loading: Promise<void> | undefined;
+const listeners = new Set<() => void>();
+
+function publish(next: Snapshot) {
+  snapshot = next;
+  listeners.forEach((listener) => listener());
 }
 
-export async function loadPairedSession(): Promise<PairedSession | null> {
-  const raw = await SecureStore.getItemAsync(KEY);
-  if (!raw) return null;
+function validSession(value: unknown): PairedSession | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<PairedSession>;
+  if (typeof candidate.baseUrl !== "string" || typeof candidate.token !== "string") {
+    return null;
+  }
+  const token = candidate.token.trim();
   try {
-    const saved = JSON.parse(raw) as Partial<PairedSession>;
-    if (!saved.baseUrl || !saved.token) return null;
-    return { baseUrl: saved.baseUrl, token: saved.token };
+    const url = new URL(candidate.baseUrl);
+    if (url.protocol !== "https:" && !__DEV__) return null;
+    if (!token) return null;
+    return { baseUrl: url.toString().replace(/\/$/, ""), token };
   } catch {
-    // Unreadable is the same as not paired: pair again rather than guess.
     return null;
   }
 }
 
+async function hydrate() {
+  if (loading) return loading;
+  loading = SecureStore.getItemAsync(KEY)
+    .then((raw) => publish(raw ? validSession(JSON.parse(raw)) : null))
+    .catch(() => publish(null));
+  return loading;
+}
+
+export async function savePairedSession(input: PairedSession): Promise<void> {
+  const session = validSession(input);
+  if (!session) throw new Error("That pairing response is not valid.");
+  await SecureStore.setItemAsync(KEY, JSON.stringify(session), {
+    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  });
+  publish(session);
+}
+
+export async function loadPairedSession(): Promise<PairedSession | null> {
+  await hydrate();
+  return snapshot ?? null;
+}
+
 export async function clearPairedSession(): Promise<void> {
   await SecureStore.deleteItemAsync(KEY);
+  publish(null);
 }
 
 export function apiFor(session: PairedSession): Api {
   return new Api(session.baseUrl, session.token);
 }
 
-/// `undefined` while the keychain is still being read. The difference between
-/// "not paired" and "not known yet" is the difference between showing the
-/// sign-in screen and flashing it at someone who is signed in.
 export function usePairedSession() {
-  const [session, setSession] = useState<PairedSession | null | undefined>(
-    undefined,
-  );
-
   useEffect(() => {
-    let current = true;
-    loadPairedSession()
-      .catch(() => null)
-      .then((loaded) => {
-        if (current) setSession(loaded);
-      });
-    return () => {
-      current = false;
-    };
+    void hydrate();
   }, []);
-
-  const signOut = useCallback(async () => {
-    await clearPairedSession();
-    setSession(null);
-  }, []);
-
-  return { session, signOut };
+  const session = useSyncExternalStore(
+    (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    () => snapshot,
+    () => undefined,
+  );
+  return {
+    session,
+    pair: savePairedSession,
+    signOut: clearPairedSession,
+  };
 }

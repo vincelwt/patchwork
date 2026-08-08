@@ -292,11 +292,14 @@ the execution machine.
 | `crates/patchwork-cli` | The `patchwork` CLI agents use |
 | `client` | Wire types and the HTTP client, shared by every TypeScript client |
 | `desktop` | Tauri app: React UI plus this machine's execution host |
-| `mobile` | Expo app for iOS and Android: a paired phone looking in |
+| `mobile` | Expo app for iOS and Android: collaboration and agent control on the go |
 
-`mobile` is an early scaffold. A phone never hosts agents. Desktop will pair
-it with a device-specific key stored in the keychain; that pairing flow is not
-built yet.
+`mobile` follows the workspace in realtime with chat, DMs, threads, inbox,
+tasks, agents and runs, steering, automations, members, search and offline
+caching. Pair it from Desktop with a one-use QR code; the resulting revocable
+device token stays in the phone keychain. A physical phone needs the relay at
+a public HTTPS/WSS URL. Mobile tokens can control agents on Desktop or the
+relay, but can never register the phone as an execution host.
 
 ```bash
 cargo test --workspace           # Rust tests

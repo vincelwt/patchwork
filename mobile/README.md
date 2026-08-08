@@ -6,7 +6,9 @@ a workspace it has been paired into and stays out of the way.
 ```bash
 npm install
 npm run typecheck   # tsc, including ../client
-npm start           # then press i or a
+npm run ios         # generate/build the native iOS development app
+npm run android     # generate/build the native Android development app
+npm start           # reconnect an installed development build to Metro
 npm run export      # bundle both platforms, no simulator needed
 ```
 
@@ -18,7 +20,15 @@ Two things are not obvious:
 - `ios/` and `android/` are generated (`npx expo prebuild`) and git-ignored.
   Configure native details in `app.json`, not in the generated projects.
 
-Sessions live in `src/lib/session.ts`. A pairing flow will call
-`savePairedSession({ baseUrl, token })` with what Desktop hands over, and that
-is the only writer of credentials in the app. Until pairing exists the app
-opens on the signed-out screen.
+Sessions live in `src/lib/session.ts`. Pair from Desktop with its short-lived
+QR code; the relay exchanges it once for a separate, revocable mobile token.
+Only `savePairedSession({ baseUrl, token })` writes that credential, and it
+lives in SecureStore. A physical phone needs the workspace relay at a public
+HTTPS/WSS URL. An embedded `127.0.0.1` relay is reachable only from that Mac.
+
+The client covers chat and DMs, threads, reactions and images; inbox questions;
+tasks and discussions; agents, hosts and runs; steering/cancellation;
+automations and history; members, invites and paired devices. It caches the
+last workspace and drafts in AsyncStorage, reconnects with event sequence
+resume, and rejects mutations while offline. Mobile tokens cannot register an
+execution host, so a phone can control work but never run an agent.

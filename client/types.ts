@@ -441,6 +441,20 @@ export interface Workspace {
   task_seq: number;
 }
 
+export interface Device {
+  id: Id;
+  label: string;
+  created_at: Millis;
+  last_used?: Millis;
+  current: boolean;
+}
+
+export interface PairingResponse {
+  secret: string;
+  expires_at: Millis;
+  workspace_url: string;
+}
+
 export interface Bootstrap {
   workspace: Workspace;
   me: Member;

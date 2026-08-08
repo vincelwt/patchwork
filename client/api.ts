@@ -10,12 +10,14 @@ import type {
   AutomationRun,
   Bootstrap,
   Channel,
+  Device,
   Host,
   Id,
   InboxItem,
   Member,
   Message,
   MessagePage,
+  PairingResponse,
   Preview,
   Project,
   Question,
@@ -94,6 +96,22 @@ export class Api {
 
   bootstrap() {
     return this.get<Bootstrap>("/api/bootstrap");
+  }
+
+  createPairing() {
+    return this.post<PairingResponse>("/api/pairings");
+  }
+
+  devices() {
+    return this.get<Device[]>("/api/devices");
+  }
+
+  revokeDevice(id: Id) {
+    return this.delete(`/api/devices/${encodeURIComponent(id)}`);
+  }
+
+  revokeCurrentDevice() {
+    return this.delete("/api/devices/current");
   }
 
   messages(channelId: Id, before?: Id) {
@@ -211,6 +229,10 @@ export class Api {
 
   members() {
     return this.get<Member[]>("/api/members");
+  }
+
+  updateMe(input: { display_name?: string; avatar?: string }) {
+    return this.patch<Member>("/api/members/me", input);
   }
 
   createAgent(input: Record<string, unknown>) {

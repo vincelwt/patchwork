@@ -13,6 +13,7 @@ mod error;
 mod github;
 mod orchestrator;
 mod preview_proxy;
+mod visibility;
 mod ws;
 
 pub mod relay;
