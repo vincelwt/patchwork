@@ -226,6 +226,33 @@ pub fn workspace_db(data_dir: &std::path::Path, id: &str) -> PathBuf {
     data_dir.join("workspaces").join(id).join("patchwork.db")
 }
 
+pub(crate) fn preserve_runtime_options(
+    fresh: &mut HostCapabilities,
+    known: &HostCapabilities,
+) {
+    for runtime in &mut fresh.runtimes {
+        let Some(known) = known
+            .runtimes
+            .iter()
+            .find(|candidate| candidate.id == runtime.id)
+        else {
+            continue;
+        };
+        if runtime.models.is_empty() {
+            runtime.models = known.models.clone();
+            runtime.default_model = known.default_model.clone();
+        }
+        if runtime.thinking.is_empty() {
+            runtime.thinking = known.thinking.clone();
+            runtime.default_thinking = known.default_thinking.clone();
+        }
+        if runtime.modes.is_empty() {
+            runtime.modes = known.modes.clone();
+            runtime.default_mode = known.default_mode.clone();
+        }
+    }
+}
+
 fn ensure_relay_host(store: &Store) -> Result<Id> {
     if let Some(existing) = store.hosts()?.into_iter().find(|h| h.kind == HostKind::Relay) {
         return Ok(existing.id);
@@ -290,24 +317,7 @@ fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Run
             if let Ok(Some(mut host)) = state.store.host(&state.relay_host_id) {
                 // Detection cannot know what a runtime can *run* — only opening
                 // a session tells us that — so carry forward what we learned.
-                for runtime in &mut capabilities.runtimes {
-                    let Some(known) = host
-                        .capabilities
-                        .runtimes
-                        .iter()
-                        .find(|candidate| candidate.id == runtime.id)
-                    else {
-                        continue;
-                    };
-                    if runtime.models.is_empty() {
-                        runtime.models = known.models.clone();
-                        runtime.default_model = known.default_model.clone();
-                    }
-                    if runtime.modes.is_empty() {
-                        runtime.modes = known.modes.clone();
-                        runtime.default_mode = known.default_mode.clone();
-                    }
-                }
+                preserve_runtime_options(&mut capabilities, &host.capabilities);
                 host.capabilities = capabilities;
                 host.last_seen = now_ms();
                 host.online = true;
@@ -381,4 +391,41 @@ fn seed(store: &Store) -> Result<()> {
     };
     store.insert_channel(&general)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_refresh_keeps_every_learned_runtime_option() {
+        let mut fresh: HostCapabilities = serde_json::from_value(serde_json::json!({
+            "runtimes": [{
+                "id": "codex", "label": "Codex", "available": true,
+                "models": [{ "id": "fresh", "name": "Fresh" }],
+                "default_model": "fresh"
+            }]
+        }))
+        .unwrap();
+        let known: HostCapabilities = serde_json::from_value(serde_json::json!({
+            "runtimes": [{
+                "id": "codex", "label": "Codex", "available": true,
+                "models": [{ "id": "old", "name": "Old" }],
+                "thinking": [{ "id": "xhigh", "name": "Xhigh" }],
+                "modes": [{ "id": "agent-full-access", "name": "Full access" }],
+                "default_model": "old", "default_thinking": "xhigh",
+                "default_mode": "agent-full-access"
+            }]
+        }))
+        .unwrap();
+
+        preserve_runtime_options(&mut fresh, &known);
+        let runtime = &fresh.runtimes[0];
+        assert_eq!(runtime.models[0].id, "fresh");
+        assert_eq!(runtime.default_model.as_deref(), Some("fresh"));
+        assert_eq!(runtime.thinking[0].id, "xhigh");
+        assert_eq!(runtime.default_thinking.as_deref(), Some("xhigh"));
+        assert_eq!(runtime.modes[0].id, "agent-full-access");
+        assert_eq!(runtime.default_mode.as_deref(), Some("agent-full-access"));
+    }
 }

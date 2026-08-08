@@ -189,24 +189,10 @@ async fn connection(
                     // that away — a reconnect would otherwise empty every model
                     // picker in the workspace until the next run.
                     if let Ok(Some(previous)) = state.store.host(&host_id) {
-                        for runtime in &mut capabilities.runtimes {
-                            let Some(known) = previous
-                                .capabilities
-                                .runtimes
-                                .iter()
-                                .find(|candidate| candidate.id == runtime.id)
-                            else {
-                                continue;
-                            };
-                            if runtime.models.is_empty() {
-                                runtime.models = known.models.clone();
-                                runtime.default_model = known.default_model.clone();
-                            }
-                            if runtime.modes.is_empty() {
-                                runtime.modes = known.modes.clone();
-                                runtime.default_mode = known.default_mode.clone();
-                            }
-                        }
+                        crate::relay::preserve_runtime_options(
+                            &mut capabilities,
+                            &previous.capabilities,
+                        );
                     }
                     let host = Host {
                         id: host_id.clone(),

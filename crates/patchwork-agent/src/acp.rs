@@ -172,6 +172,24 @@ fn config_id(option: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn restore_method(capabilities: &Value) -> Option<&'static str> {
+    if capabilities
+        .get("sessionCapabilities")
+        .and_then(|v| v.get("resume"))
+        .is_some()
+    {
+        Some("session/resume")
+    } else if capabilities
+        .get("loadSession")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        Some("session/load")
+    } else {
+        None
+    }
+}
+
 /// Read a `session/new` result in either dialect.
 fn describe_session(session_id: String, res: &Value) -> NewSession {
     let model = config_option(res, "model");
@@ -211,6 +229,7 @@ pub struct AcpConnection {
     child: Mutex<Option<Child>>,
     stdin_tx: mpsc::UnboundedSender<String>,
     pending: Arc<Pending>,
+    suppressed_updates: Arc<Mutex<Option<String>>>,
     next_id: AtomicI64,
     pub agent_capabilities: Value,
     pub auth_methods: Vec<Value>,
@@ -278,6 +297,7 @@ impl AcpConnection {
         });
 
         let pending = Arc::new(Pending(Mutex::new(HashMap::new())));
+        let suppressed_updates = Arc::new(Mutex::new(None));
         let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
         // stdout: responses to our requests, plus the agent's notifications
@@ -286,6 +306,7 @@ impl AcpConnection {
             let pending = pending.clone();
             let event_tx = event_tx.clone();
             let stdin_tx = stdin_tx.clone();
+            let suppressed_updates = suppressed_updates.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -297,7 +318,7 @@ impl AcpConnection {
                         tracing::debug!(%line, "non-JSON line from agent");
                         continue;
                     };
-                    dispatch(msg, &pending, &event_tx, &stdin_tx).await;
+                    dispatch(msg, &pending, &event_tx, &stdin_tx, &suppressed_updates).await;
                 }
             });
         }
@@ -319,6 +340,7 @@ impl AcpConnection {
             child: Mutex::new(Some(child)),
             stdin_tx,
             pending,
+            suppressed_updates,
             next_id: AtomicI64::new(1),
             agent_capabilities: Value::Null,
             auth_methods: Vec::new(),
@@ -355,11 +377,8 @@ impl AcpConnection {
         Ok((conn, event_rx))
     }
 
-    pub fn supports_load_session(&self) -> bool {
-        self.agent_capabilities
-            .get("loadSession")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+    pub fn supports_restore_session(&self) -> bool {
+        restore_method(&self.agent_capabilities).is_some()
     }
 
     /// Setup calls get a deadline; a runtime that never answers must fail the
@@ -440,13 +459,20 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn load_session(&self, session_id: &str, cwd: &str) -> Result<()> {
-        self.setup_request(
-            "session/load",
-            json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
-        )
-        .await?;
-        Ok(())
+    pub async fn restore_session(&self, session_id: &str, cwd: &str) -> Result<NewSession> {
+        let method = restore_method(&self.agent_capabilities)
+            .ok_or_else(|| anyhow!("runtime cannot restore sessions"))?;
+        if method == "session/load" {
+            *self.suppressed_updates.lock().await = Some(session_id.to_string());
+        }
+        let result = self
+            .setup_request(
+                method,
+                json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+            )
+            .await;
+        *self.suppressed_updates.lock().await = None;
+        Ok(describe_session(session_id.to_string(), &result?))
     }
 
     pub async fn authenticate(&self, method_id: &str) -> Result<()> {
@@ -564,6 +590,7 @@ async fn dispatch(
     pending: &Arc<Pending>,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     stdin_tx: &mpsc::UnboundedSender<String>,
+    suppressed_updates: &Arc<Mutex<Option<String>>>,
 ) {
     let method = msg.get("method").and_then(|v| v.as_str());
     let has_id = msg.get("id").is_some();
@@ -596,6 +623,9 @@ async fn dispatch(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+                if suppressed_updates.lock().await.as_deref() == Some(session_id.as_str()) {
+                    return;
+                }
                 let update = params.get("update").cloned().unwrap_or(Value::Null);
                 let _ = event_tx.send(AgentEvent::SessionUpdate { session_id, update });
             }
@@ -788,6 +818,45 @@ mod tests {
         assert!(!session.config_options);
         assert_eq!(session.models[0].id, "gpt-5.6");
         assert_eq!(session.current_model.as_deref(), Some("gpt-5.6"));
+    }
+
+    #[test]
+    fn resume_is_preferred_over_history_replaying_load() {
+        assert_eq!(
+            restore_method(&json!({
+                "loadSession": true,
+                "sessionCapabilities": { "resume": {} }
+            })),
+            Some("session/resume")
+        );
+        assert_eq!(
+            restore_method(&json!({ "loadSession": true })),
+            Some("session/load")
+        );
+        assert_eq!(restore_method(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_load_history_is_not_forwarded_as_a_new_answer() {
+        let pending = Arc::new(Pending(Mutex::new(HashMap::new())));
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (stdin_tx, _stdin) = mpsc::unbounded_channel::<String>();
+        let suppressed = Arc::new(Mutex::new(Some("s1".to_string())));
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": "s1", "update": { "sessionUpdate": "agent_message_chunk" } }
+        });
+
+        dispatch(update.clone(), &pending, &event_tx, &stdin_tx, &suppressed).await;
+        assert!(events.try_recv().is_err());
+
+        *suppressed.lock().await = None;
+        dispatch(update, &pending, &event_tx, &stdin_tx, &suppressed).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AgentEvent::SessionUpdate { session_id, .. }) if session_id == "s1"
+        ));
     }
 
     #[test]
