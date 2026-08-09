@@ -81,6 +81,14 @@ export function Sidebar({
     inbox: data.inbox,
     automations: data.automations,
   }));
+  // Presence is global; only a run in this DM should spin its row.
+  // An array of ids rather than the runs map avoids unrelated redraws.
+  const busyChannels = useAppSelector((data) =>
+    Object.values(data.runs)
+      .filter((run) => ["queued", "dispatched", "running"].includes(run.status))
+      .map((run) => run.channel_id)
+      .sort(),
+  );
   const api = useApi();
   const seen = useSeen();
   const { view, go } = useNavigation();
@@ -379,6 +387,7 @@ export function Sidebar({
                   key={channel.id}
                   member={partner}
                   fallback={channel.name}
+                  busy={busyChannels.includes(channel.id)}
                   {...signals(channel)}
                   onClick={() => go({ kind: "channel", id: channel.id })}
                 />
@@ -874,16 +883,19 @@ function MemberRow({
   active,
   unseen,
   waiting,
+  busy = false,
   onClick,
 }: RowSignals & {
   member?: Member;
   fallback?: string;
+  /// A run is going *in this conversation*. Not the same as the member being
+  /// busy somewhere else in the workspace.
+  busy?: boolean;
   onClick: () => void;
 }) {
   // One line. The second line used to spell out the runtime and the presence
   // in words, which doubled the height of the whole list to say something the
   // dot already says — and the runtime is a property of the agent, not news.
-  const busy = member?.presence === "working" || member?.presence === "thinking";
   return (
     <button
       className={`nav-item${active ? " active" : ""}${unseen ? " unseen" : ""}`}

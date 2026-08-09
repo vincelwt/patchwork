@@ -87,6 +87,7 @@ class Session {
   private reconnectTimer?: number;
   private retryDelay = 1000;
   private loadingChannels = new Set<Id>();
+  private loadingThreads = new Set<Id>();
   private notifying = false;
   /// Events that arrived on the socket before the bootstrap they belong after.
   private queued?: Envelope[];
@@ -374,11 +375,11 @@ class Session {
   private upsertMessage(message: Message, replaceOnly = false) {
     if (message.parent_id) {
       const thread = this.data.threads[message.parent_id];
-      if (thread) {
+      if (thread || this.loadingThreads.has(message.parent_id)) {
         this.set({
           threads: {
             ...this.data.threads,
-            [message.parent_id]: upsert(thread, message),
+            [message.parent_id]: mergeMessages(thread ?? [], [message]),
           },
         });
       }
@@ -400,26 +401,42 @@ class Session {
     }
 
     const list = this.data.messages[message.channel_id];
-    if (!list) return;
+    // A channel nobody has opened has no list to add to. One whose first page
+    // is still in flight does: `loadChannel` merges rather than replaces, so
+    // a message that overtakes its own page is kept instead of dropped.
+    if (!list && !this.loadingChannels.has(message.channel_id)) return;
     this.set({
       messages: {
         ...this.data.messages,
-        [message.channel_id]: upsert(list, message),
+        [message.channel_id]: mergeMessages(list ?? [], [message]),
       },
     });
   }
 
   async loadChannel(channelId: Id, force = false) {
     if (!this.api) return;
-    if (!force && (this.data.messages[channelId] || this.loadingChannels.has(channelId)))
-      return;
+    const loaded = this.data.messages[channelId];
+    if (!force && (loaded || this.loadingChannels.has(channelId))) return;
     this.loadingChannels.add(channelId);
     try {
       const page = await this.api.messages(channelId);
+      // Anything that arrived on the socket while the page was in flight is
+      // already here and post-dates it, so it wins the merge.
       this.set({
-        messages: { ...this.data.messages, [channelId]: page.messages },
+        messages: {
+          ...this.data.messages,
+          [channelId]: mergeMessages(page.messages, this.data.messages[channelId] ?? []),
+        },
         hasMore: { ...this.data.hasMore, [channelId]: page.has_more },
       });
+    } catch (error) {
+      // Do not let a partial realtime list masquerade as a loaded channel.
+      if (!loaded && this.data.messages[channelId]) {
+        const messages = { ...this.data.messages };
+        delete messages[channelId];
+        this.set({ messages });
+      }
+      throw error;
     } finally {
       this.loadingChannels.delete(channelId);
     }
@@ -433,16 +450,34 @@ class Session {
     this.set({
       messages: {
         ...this.data.messages,
-        [channelId]: [...page.messages, ...list],
+        [channelId]: mergeMessages(page.messages, this.data.messages[channelId] ?? list),
       },
       hasMore: { ...this.data.hasMore, [channelId]: page.has_more },
     });
   }
 
   async loadThread(messageId: Id) {
-    if (!this.api) return;
-    const replies = await this.api.thread(messageId);
-    this.set({ threads: { ...this.data.threads, [messageId]: replies } });
+    if (!this.api || this.loadingThreads.has(messageId)) return;
+    const loaded = this.data.threads[messageId];
+    this.loadingThreads.add(messageId);
+    try {
+      const replies = await this.api.thread(messageId);
+      this.set({
+        threads: {
+          ...this.data.threads,
+          [messageId]: mergeMessages(replies, this.data.threads[messageId] ?? []),
+        },
+      });
+    } catch (error) {
+      if (!loaded && this.data.threads[messageId]) {
+        const threads = { ...this.data.threads };
+        delete threads[messageId];
+        this.set({ threads });
+      }
+      throw error;
+    } finally {
+      this.loadingThreads.delete(messageId);
+    }
   }
 
   async loadRun(runId: Id) {
@@ -458,8 +493,8 @@ class Session {
     });
   }
 
-  async loadQuestion(questionId: Id) {
-    if (!this.api || this.data.questions[questionId]) return;
+  async loadQuestion(questionId: Id, force = false) {
+    if (!this.api || (!force && this.data.questions[questionId])) return;
     const question = await this.api.question(questionId);
     this.set({
       questions: { ...this.data.questions, [questionId]: question },
@@ -482,6 +517,16 @@ class Session {
       this.socket.send(JSON.stringify({ t: "typing", channel_id: channelId }));
     }
   }
+}
+
+/// Dedupe messages with the newest copy winning, then restore UUIDv7 order.
+/// Realtime delivery can overtake the page it belongs in.
+function mergeMessages(...lists: Message[][]): Message[] {
+  const byId = new Map<Id, Message>();
+  for (const list of lists) {
+    for (const message of list) byId.set(message.id, message);
+  }
+  return [...byId.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function upsert<T extends { id: string }>(list: T[], item: T): T[] {
@@ -636,8 +681,8 @@ class Workspaces {
   loadRun(runId: Id) {
     return this.session?.loadRun(runId);
   }
-  loadQuestion(questionId: Id) {
-    return this.session?.loadQuestion(questionId);
+  loadQuestion(questionId: Id, force = false) {
+    return this.session?.loadQuestion(questionId, force) ?? Promise.resolve();
   }
   loadPreview(previewId: Id) {
     return this.session?.loadPreview(previewId);

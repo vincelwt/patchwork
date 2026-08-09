@@ -1159,16 +1159,32 @@ async fn cancel_run(
     caller: Caller,
     Path(id): Path<Id>,
 ) -> ApiResult<Json<Ok>> {
+    caller.require_device()?;
     let run = state
         .store
         .run(&id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     require_run_access(&state, &caller, &run)?;
+    if run.status.is_terminal() {
+        return Ok(Json(Ok::default()));
+    }
     if let Some(host_id) = &run.host_id {
         state
             .send_to_host(host_id, RelayToHost::CancelRun { run_id: id.clone() })
             .await;
     }
+
+    // Stop is durable immediately. A host acknowledgement may never arrive.
+    let mut run = run;
+    run.status = RunStatus::Cancelled;
+    run.headline = "Cancelled".into();
+    run.ended_at = Some(now_ms());
+    state.store.revoke_run_tokens(&run.id).ok();
+    state.store.update_run(&run)?;
+    state.emit(Event::RunUpdated { run: run.clone() });
+    orchestrator::cancel_questions_for_run(&state, &run.id).await?;
+    state.set_presence(&run.agent_id, Presence::Online).await;
+    orchestrator::finish_run(&state, &run).await?;
     Ok(Json(Ok::default()))
 }
 
@@ -1220,11 +1236,17 @@ async fn ask_question(
         .run(&input.run_id)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     require_run_access(&state, &caller, &run)?;
-    if caller.is_agent() && run.agent_id != caller.member.id {
-        return Err(ApiError::forbidden("that is not your run"));
+    if !caller.is_agent()
+        || caller.member.id != run.agent_id
+        || caller.run_id.as_deref() != Some(run.id.as_str())
+    {
+        return Err(ApiError::forbidden("only this run's agent can ask"));
+    }
+    if run.status.is_terminal() {
+        return Err(ApiError::conflict("that run has already ended"));
     }
 
-    let question = Question {
+    let mut question = Question {
         id: new_id(),
         run_id: run.id.clone(),
         agent_id: run.agent_id.clone(),
@@ -1239,7 +1261,7 @@ async fn ask_question(
         created_at: now_ms(),
         answered_at: None,
     };
-    state.store.insert_question(&question)?;
+    orchestrator::finish_streamed_reply(&state, &run.id).await?;
 
     let message = orchestrator::post_message(
         &state,
@@ -1261,9 +1283,7 @@ async fn ask_question(
         },
     )
     .await?;
-    state
-        .store
-        .set_question_message(&question.id, &message.id)?;
+    question.message_id = Some(message.id.clone());
 
     // The run is visibly waiting, and the people who can answer are told.
     let mut run = run;
@@ -1273,15 +1293,13 @@ async fn ask_question(
     } else {
         question.headline.clone()
     };
-    state.store.update_run(&run)?;
-    state.emit(Event::RunUpdated { run: run.clone() });
-    state.set_presence(&run.agent_id, Presence::Waiting).await;
 
     let agent_name = state
         .store
         .member(&run.agent_id)?
         .map(|m| m.display_name)
         .unwrap_or_else(|| "An agent".into());
+    let mut inbox_items = Vec::new();
     for member_id in state.store.channel_audience(&run.channel_id)? {
         let Some(member) = state.store.member(&member_id)? else {
             continue;
@@ -1308,11 +1326,37 @@ async fn ask_question(
             created_at: now_ms(),
             read_at: None,
         };
-        state.store.insert_inbox(&item)?;
-        state.emit(Event::InboxItemCreated { item });
+        inbox_items.push(item);
     }
 
-    let question = state.store.question(&question.id)?.unwrap();
+    // Nothing is answerable until the card, waiting run and every Inbox row
+    // are durable. A concurrent Stop wins without leaving an open question.
+    if !state
+        .store
+        .commit_question_waiting(&question, &run, &inbox_items)?
+    {
+        state.store.delete_message(&message.id)?;
+        state.emit(Event::MessageDeleted {
+            channel_id: run.channel_id.clone(),
+            message_id: message.id,
+        });
+        return Err(ApiError::conflict("that run has already ended"));
+    }
+    state.emit(Event::RunUpdated { run: run.clone() });
+    state.set_presence(&run.agent_id, Presence::Waiting).await;
+    for item in inbox_items {
+        state.emit(Event::InboxItemCreated { item });
+    }
+    if let Some(host_id) = &run.host_id {
+        state
+            .send_to_host(
+                host_id,
+                RelayToHost::QuestionAsked {
+                    run_id: run.id.clone(),
+                },
+            )
+            .await;
+    }
     state.emit(Event::QuestionUpdated {
         question: question.clone(),
     });
@@ -1325,11 +1369,15 @@ async fn answer_question(
     Path(id): Path<Id>,
     Json(input): Json<AnswerQuestion>,
 ) -> ApiResult<Json<Question>> {
+    caller.require_device()?;
     let question = state
         .store
         .question(&id)?
         .ok_or_else(|| ApiError::not_found("question not found"))?;
     require_channel_access(&state, &caller, &question.channel_id)?;
+    if question.status != QuestionStatus::Open {
+        return Err(ApiError::conflict("that question is no longer waiting for an answer"));
+    }
     Ok(Json(
         orchestrator::answer_question(&state, &id, input.answers, &caller.member.id).await?,
     ))
@@ -1347,6 +1395,12 @@ async fn wait_for_answer(
         .question(&id)?
         .ok_or_else(|| ApiError::not_found("question not found"))?;
     require_channel_access(&state, &caller, &question.channel_id)?;
+    if !caller.is_agent()
+        || caller.member.id != question.agent_id
+        || caller.run_id.as_deref() != Some(question.run_id.as_str())
+    {
+        return Err(ApiError::forbidden("only the asking run can wait for this answer"));
+    }
     if question.status != QuestionStatus::Open {
         return Ok(Json(question));
     }
@@ -2176,6 +2230,292 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn only_the_scoped_agent_asks_and_only_a_human_answers() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let human = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: true,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Online,
+        };
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Working,
+        };
+        store.insert_member(&human).unwrap();
+        store.insert_member(&agent).unwrap();
+        store
+            .insert_channel(&Channel {
+                id: "channel".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "channel".into(),
+                name: "Channel".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+        let make_run = |id: &str| Run {
+            id: id.into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual {
+                by: human.id.clone(),
+            },
+            channel_id: "channel".into(),
+            task_id: None,
+            host_id: Some("host-one".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            prompt: String::new(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&make_run("run-one"), 0).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let human_caller = || Caller {
+            member: human.clone(),
+            run_id: None,
+            token_hash: "human-token".into(),
+            token_kind: "device".into(),
+        };
+        let agent_caller = |run_id: &str| Caller {
+            member: agent.clone(),
+            run_id: Some(run_id.into()),
+            token_hash: "agent-token".into(),
+            token_kind: "run".into(),
+        };
+        let ask = |run_id: &str| AskQuestion {
+            run_id: run_id.into(),
+            headline: "Approval".into(),
+            items: vec![QuestionItem {
+                id: "choice".into(),
+                header: String::new(),
+                question: "Continue?".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+                multi_select: false,
+            }],
+        };
+
+        orchestrator::handle_host_message(
+            &state,
+            "host-two",
+            patchwork_core::host::HostToRelay::RunStatus {
+                run_id: "run-one".into(),
+                status: RunStatus::Failed,
+                headline: Some("Spoofed".into()),
+                session_id: None,
+                error: None,
+                token_usage: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            store.run("run-one").unwrap().unwrap().status,
+            RunStatus::Running
+        );
+
+        assert_eq!(
+            ask_question(
+                State(state.clone()),
+                human_caller(),
+                Json(ask("run-one")),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ask_question(
+                State(state.clone()),
+                agent_caller("another-run"),
+                Json(ask("run-one")),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+
+        let question = ask_question(
+            State(state.clone()),
+            agent_caller("run-one"),
+            Json(ask("run-one")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(question.message_id.is_some());
+        assert!(store
+            .inbox(&human.id, false)
+            .unwrap()
+            .iter()
+            .any(|item| item.run_id.as_deref() == Some("run-one")));
+        assert_eq!(
+            answer_question(
+                State(state.clone()),
+                agent_caller("run-one"),
+                Path(question.id.clone()),
+                Json(AnswerQuestion { answers: Vec::new() }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            wait_for_answer(
+                State(state.clone()),
+                agent_caller("another-run"),
+                Path(question.id.clone()),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        let second = ask_question(
+            State(state.clone()),
+            agent_caller("run-one"),
+            Json(ask("run-one")),
+        )
+        .await
+        .unwrap()
+        .0;
+        let _ = answer_question(
+            State(state.clone()),
+            human_caller(),
+            Path(question.id),
+            Json(AnswerQuestion { answers: Vec::new() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.run("run-one").unwrap().unwrap().status,
+            RunStatus::Waiting
+        );
+        assert_eq!(
+            store.question(&second.id).unwrap().unwrap().status,
+            QuestionStatus::Open
+        );
+        assert_eq!(
+            store
+                .inbox(&human.id, false)
+                .unwrap()
+                .iter()
+                .filter(|item| item.run_id.as_deref() == Some("run-one"))
+                .count(),
+            1
+        );
+        let _ = answer_question(
+            State(state.clone()),
+            human_caller(),
+            Path(second.id),
+            Json(AnswerQuestion { answers: Vec::new() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.run("run-one").unwrap().unwrap().status,
+            RunStatus::Running
+        );
+
+        store.insert_run(&make_run("run-two"), 0).unwrap();
+        store
+            .insert_token("run-two-token", &agent.id, "run", Some("run-two"), None)
+            .unwrap();
+        let waiting = ask_question(
+            State(state.clone()),
+            agent_caller("run-two"),
+            Json(ask("run-two")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            cancel_run(
+                State(state.clone()),
+                agent_caller("run-two"),
+                Path("run-two".into()),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        let _ = cancel_run(
+            State(state.clone()),
+            human_caller(),
+            Path("run-two".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.run("run-two").unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        assert!(store.lookup_token("run-two-token").unwrap().is_none());
+        assert_eq!(
+            store.question(&waiting.id).unwrap().unwrap().status,
+            QuestionStatus::Cancelled
+        );
+        assert_eq!(
+            ask_question(
+                State(state.clone()),
+                agent_caller("run-two"),
+                Json(ask("run-two")),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert!(store
+            .inbox(&human.id, false)
+            .unwrap()
+            .iter()
+            .all(|item| item.run_id.as_deref() != Some("run-two")));
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

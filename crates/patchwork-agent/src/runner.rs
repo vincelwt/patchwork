@@ -78,7 +78,8 @@ impl Runner {
                     token_usage: None,
                 });
             }
-            RelayToHost::AnswerQuestion { ref run_id, .. } => {
+            RelayToHost::QuestionAsked { ref run_id }
+            | RelayToHost::AnswerQuestion { ref run_id, .. } => {
                 if let Some(h) = self.running.lock().await.get(run_id) {
                     let _ = h.control.send(msg.clone());
                 }
@@ -239,6 +240,14 @@ fn reject_pending(pending: &mut VecDeque<QueuedControl>, run_id: &str, out: &Sin
             state: RunControlState::Rejected,
         });
     }
+}
+
+async fn begin_message_after_question(state: &Arc<Mutex<TurnState>>) {
+    let mut turn = state.lock().await;
+    turn.message.clear();
+    turn.message_phase = None;
+    turn.streamed_at = None;
+    turn.interrupted = false;
 }
 
 async fn execute(
@@ -487,8 +496,13 @@ async fn execute(
                         conn.cancel(&session_id);
                         break Ok("cancelled".to_string());
                     }
+                    Some(RelayToHost::QuestionAsked { .. }) => {
+                        begin_message_after_question(&state).await;
+                    }
                     Some(RelayToHost::AnswerQuestion { .. }) => {
-                        // `patchwork ask` receives its answer through HTTP.
+                        // The HTTP long-poll carries the value; this signal
+                        // preserves the message boundary if the earlier one was lost.
+                        begin_message_after_question(&state).await;
                     }
                     Some(_) => {}
                     None => break (&mut prompt_call).await,
@@ -1334,6 +1348,31 @@ mod tests {
         assert!(needs_break("Here is what I found:"));
         assert!(!needs_break(""));
         assert!(!needs_break("Done.\n"));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_question_starts_a_new_transcript_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        let chunk = |text: &str| {
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            })
+        };
+
+        handle_update("r1", chunk("Before."), &tx, &state).await;
+        begin_message_after_question(&state).await;
+        assert!(state.lock().await.message.is_empty());
+
+        handle_update("r1", chunk("After."), &tx, &state).await;
+        let deltas = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                HostToRelay::RunMessageDelta { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.last().map(String::as_str), Some("After."));
     }
 
     #[test]

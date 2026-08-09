@@ -142,6 +142,10 @@ pub enum RelayToHost {
     CancelRun {
         run_id: Id,
     },
+    /// The relay committed a question card. Prose after this belongs below it.
+    QuestionAsked {
+        run_id: Id,
+    },
     /// A user answered the agent's question; resume the waiting turn.
     AnswerQuestion {
         run_id: Id,
