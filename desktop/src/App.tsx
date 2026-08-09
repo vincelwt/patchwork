@@ -48,6 +48,7 @@ import {
   NavigationContext,
   proseText,
   useNavigation,
+  WorkspaceMark,
 } from "./components/common";
 import { Empty, KeyHint, MenuButton, Page } from "./components/ui";
 import { Markdown } from "./components/Markdown";
@@ -1124,6 +1125,14 @@ function CommandPalette({
             : workspace.live
               ? "Connected"
               : "Offline",
+        icon: (
+          <WorkspaceMark
+            name={workspace.name}
+            icon={workspace.icon}
+            image={workspace.iconImage}
+            size={20}
+          />
+        ),
         run: () => {
           onClose();
           if (!workspace.active) void switchTo(workspace.id);

@@ -551,6 +551,8 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
 export interface WorkspaceHandle {
   id: Id;
   name: string;
+  icon: string;
+  iconImage?: string;
   unread: number;
   live: boolean;
   active: boolean;
@@ -655,7 +657,7 @@ class Workspaces {
     // A background workspace only ever changes the switcher, so it only wakes
     // the app when what the switcher shows actually moved.
     const data = session.getSnapshot();
-    const badge = `${data.workspace?.name ?? ""}·${unreadOf(data)}·${data.live}`;
+    const badge = `${data.workspace?.name ?? ""}·${data.workspace?.icon ?? ""}·${data.workspace?.icon_image ?? ""}·${unreadOf(data)}·${data.live}`;
     if (this.badges.get(session.id) === badge) return;
     this.badges.set(session.id, badge);
     this.notify();
@@ -670,6 +672,11 @@ class Workspaces {
         {
           id,
           name: data.workspace?.name ?? this.names.get(id) ?? "Workspace",
+          icon: data.workspace?.icon ?? "",
+          iconImage:
+            data.workspace?.icon_image && session.api
+              ? `${session.api.baseUrl.replace(/\/$/, "")}${data.workspace.icon_image}`
+              : undefined,
           unread: unreadOf(data),
           live: data.live,
           active: id === this.activeId,
