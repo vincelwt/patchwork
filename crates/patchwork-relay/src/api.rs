@@ -2874,6 +2874,7 @@ mod tests {
             current_run_id: Some("run-one".into()),
             pr_url: None,
             pr_state: None,
+            review_action: None,
             created_by: human.id.clone(),
             due_at: None,
             once_key: None,

@@ -2459,6 +2459,7 @@ mod tests {
             current_run_id: None,
             pr_url: None,
             pr_state: None,
+            review_action: None,
             created_by: "human".into(),
             due_at: None,
             once_key: Some("posthog:image-proxy:403".into()),
