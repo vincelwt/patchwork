@@ -120,6 +120,7 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
+const TASK_DRAFT_PREFIX = "patchwork.taskDraft.";
 
 /// Who a new task should belong to: whoever you gave the last one to, and
 /// yourself before you have given anyone anything. Guessing an agent for you
@@ -465,7 +466,12 @@ export function NewTaskModal({
   const app = useApp();
   const api = useApi();
   const { go } = useNavigation();
-  const [outcome, setOutcome] = useState("");
+  const draftKey = `${TASK_DRAFT_PREFIX}${app.workspace?.id ?? ""}.${
+    app.me?.id ?? ""
+  }.${sourceChannelId ?? ""}`;
+  const [outcome, setOutcome] = useState(
+    () => localStorage.getItem(draftKey) ?? "",
+  );
   const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.me));
   const [project, setProject] = useState(() => {
     const agent = app.members.find((member) => member.id === owner);
@@ -481,6 +487,11 @@ export function NewTaskModal({
   const [error, setError] = useState("");
   const [justCreated, setJustCreated] = useState("");
   const outcomeField = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (outcome) localStorage.setItem(draftKey, outcome);
+    else localStorage.removeItem(draftKey);
+  }, [draftKey, outcome]);
 
   const add = (files: FileList | File[] | null | undefined) => {
     const picked = [...(files ?? [])].filter((file) => file.size > 0);
@@ -513,6 +524,7 @@ export function NewTaskModal({
       if (start && owner && ownerIsAgent) {
         await api.runTask(task.id, { agent_id: owner });
       }
+      localStorage.removeItem(draftKey);
       if (another) {
         setOutcome("");
         setImages([]);
@@ -593,68 +605,71 @@ export function NewTaskModal({
         )}
 
         <div className="task-composer-attributes">
-          <Dropdown
-            quiet
-            value={owner}
-            onChange={setOwner}
-            placeholder="Nobody yet"
-            options={[
-              { value: "", label: "Nobody yet" },
-              ...app.members.map((member) => ({
-                value: member.id,
-                label: member.display_name,
-                hint: member.kind === "agent" ? member.agent?.runtime : "person",
-              })),
-            ]}
-          />
-          <Dropdown
-            quiet
-            value={project}
-            onChange={setProject}
-            placeholder="No project"
-            options={[
-              { value: "", label: "No project" },
-              ...app.projects.map((candidate) => ({
-                value: candidate.id,
-                label: candidate.name,
-              })),
-            ]}
-          />
-          <DueField value={due} onChange={setDue} />
-          <label className="attach-button" title="Attach evidence">
-            <AttachIcon size={15} />
-            <input
-              type="file"
-              multiple
-              hidden
-              onChange={(event) => {
-                add(event.target.files);
-                event.target.value = "";
-              }}
+          <div className="task-composer-fields">
+            <Dropdown
+              quiet
+              value={owner}
+              onChange={setOwner}
+              placeholder="Nobody yet"
+              options={[
+                { value: "", label: "Nobody yet" },
+                ...app.members.map((member) => ({
+                  value: member.id,
+                  label: member.display_name,
+                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
+                })),
+              ]}
             />
-          </label>
-          <span className="spacer" />
-          {justCreated && (
-            <span className="composer-hint">{justCreated} created</span>
-          )}
-          {ownerIsAgent && (
-            <Toggle checked={start} onChange={setStart} label="Start now" />
-          )}
-          <button
-            className="button quiet"
-            disabled={!outcome.trim() || busy}
-            title="Create this one and keep the box open (⌘⇧↵)"
-            onClick={() => void create(true)}
-          >
-            Another
-          </button>
-          <button
-            className="button primary"
-            disabled={!outcome.trim() || busy}
-            onClick={() => void create()}
-          >
-            {ownerIsAgent && start ? "Create and start" : "Create"}
-          </button>
+            <Dropdown
+              quiet
+              value={project}
+              onChange={setProject}
+              placeholder="No project"
+              options={[
+                { value: "", label: "No project" },
+                ...app.projects.map((candidate) => ({
+                  value: candidate.id,
+                  label: candidate.name,
+                })),
+              ]}
+            />
+            <DueField value={due} onChange={setDue} />
+            <label className="attach-button" title="Attach evidence">
+              <AttachIcon size={15} />
+              <input
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => {
+                  add(event.target.files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <div className="task-composer-actions">
+            {justCreated && (
+              <span className="composer-hint">{justCreated} created</span>
+            )}
+            {ownerIsAgent && (
+              <Toggle checked={start} onChange={setStart} label="Start now" />
+            )}
+            <button
+              className="button quiet"
+              disabled={!outcome.trim() || busy}
+              title="Create this one and keep the box open (⌘⇧↵)"
+              onClick={() => void create(true)}
+            >
+              Another
+            </button>
+            <button
+              className="button primary"
+              disabled={!outcome.trim() || busy}
+              onClick={() => void create()}
+            >
+              {ownerIsAgent && start ? "Create and start" : "Create"}
+            </button>
+          </div>
         </div>
       </div>
       {error && <div className="error-text">{error}</div>}
