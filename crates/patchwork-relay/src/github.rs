@@ -27,7 +27,7 @@ pub async fn watcher(state: Shared) {
         };
         for task in tasks
             .into_iter()
-            .filter(|t| t.pr_url.is_some() && t.status != TaskStatus::Done)
+            .filter(|t| t.pr_url.is_some() && !t.status.is_terminal())
         {
             if let Err(err) = poll_task(&state, &task).await {
                 tracing::debug!(?err, task = %task.key, "pull request poll failed");

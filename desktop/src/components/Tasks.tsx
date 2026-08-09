@@ -36,7 +36,7 @@ import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
-import { TASK_STATUSES } from "@client/types";
+import { isTerminalTaskStatus, TASK_STATUSES } from "@client/types";
 import type {
   Attachment,
   Id,
@@ -169,6 +169,7 @@ export function TasksBoard() {
   );
 
   const needsYou = tasks.filter((task) => {
+    if (isTerminalTaskStatus(task.status)) return false;
     const state = readTask(task, app.members, app.runs, app.questions);
     return state.situation === "asking" || state.situation === "review";
   }).length;
@@ -328,7 +329,7 @@ function TaskList({ tasks }: { tasks: Task[] }) {
                   <span className="name">{task.title}</span>
                   <span className="sub">{state.headline}</span>
                 </span>
-                {due && task.status !== "done" && (
+                {due && !isTerminalTaskStatus(task.status) && (
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
                 )}
                 {project && <Chip>{project.name}</Chip>}
@@ -356,6 +357,8 @@ function emptyColumn(status: TaskStatus) {
       return "Nothing is stuck";
     case "review":
       return "Nothing to review";
+    case "canceled":
+      return "Nothing canceled";
     default:
       return "Nothing finished yet";
   }
@@ -414,7 +417,7 @@ function TaskCard({
       )}
 
       <div className="meta">
-        {due && task.status !== "done" && (
+        {due && !isTerminalTaskStatus(task.status) && (
           <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
         )}
         {project && <Chip>{project.name}</Chip>}
@@ -1244,7 +1247,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
                 })
               }
             />
-            {due && task.status !== "done" && (
+            {due && !isTerminalTaskStatus(task.status) && (
               <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
             )}
           </Fact>
