@@ -71,6 +71,8 @@ pub struct NewSession {
     pub model_config_id: Option<String>,
     pub thinking_config_id: Option<String>,
     pub mode_config_id: Option<String>,
+    /// Runtime-authored setup text that is also sent as an agent message.
+    pub startup_message: Option<String>,
     /// The runtime described itself with `configOptions` rather than the older
     /// `models`/`modes` groups, so changing one goes through
     /// `session/set_config_option`.
@@ -195,6 +197,10 @@ fn restore_method(capabilities: &Value) -> Option<&'static str> {
 
 /// Read a `session/new` result in either dialect.
 fn describe_session(session_id: String, res: &Value) -> NewSession {
+    let startup_message = res
+        .pointer("/_meta/piAcp/startupInfo")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let model = config_option(res, "model");
     let thinking = config_option(res, "thought_level");
     let mode = config_option(res, "mode");
@@ -210,6 +216,7 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
             model_config_id: model.and_then(config_id),
             thinking_config_id: thinking.and_then(config_id),
             mode_config_id: mode.and_then(config_id),
+            startup_message,
             config_options: true,
         };
     }
@@ -226,6 +233,7 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
         model_config_id: None,
         thinking_config_id: None,
         mode_config_id: None,
+        startup_message,
         config_options: false,
     }
 }
@@ -794,6 +802,7 @@ mod tests {
     fn a_session_describes_itself_in_either_dialect() {
         let modern = json!({
             "sessionId": "s1",
+            "_meta": { "piAcp": { "startupInfo": "pi v0.84.1\n" } },
             "configOptions": [
                 {
                     "type": "select", "id": "model", "category": "model",
@@ -819,6 +828,7 @@ mod tests {
             Some("reasoning_effort")
         );
         assert_eq!(session.current_thinking.as_deref(), Some("medium"));
+        assert_eq!(session.startup_message.as_deref(), Some("pi v0.84.1\n"));
 
         let legacy = json!({
             "sessionId": "s2",
