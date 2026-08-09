@@ -333,24 +333,19 @@ fn merge_project_paths(
 
 /// The relay's own execution host: hosted agents keep working when every
 /// laptop is closed.
-pub fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost>) {
+pub async fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost>) {
     let host_id = state.relay_host_id.clone();
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            state
-                .hosts
-                .write()
-                .await
-                .insert(host_id.clone(), HostConn { tx });
-            if let Ok(Some(mut host)) = state.store.host(&host_id) {
-                host.online = true;
-                host.last_seen = now_ms();
-                let _ = state.store.upsert_host(&host);
-                state.emit(Event::HostUpdated { host });
-            }
-        }
-    });
+    state
+        .hosts
+        .write()
+        .await
+        .insert(host_id.clone(), HostConn { tx });
+    if let Ok(Some(mut host)) = state.store.host(&host_id) {
+        host.online = true;
+        host.last_seen = now_ms();
+        let _ = state.store.upsert_host(&host);
+        state.emit(Event::HostUpdated { host });
+    }
 }
 
 #[cfg(test)]

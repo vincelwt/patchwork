@@ -1168,6 +1168,92 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     Ok(run)
 }
 
+/// Redispatch an interrupted relay-hosted run without creating a second run
+/// card or losing its task/worktree identity. The fresh token replaces the
+/// unrecoverable plaintext token that was held only by the stopped process.
+pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<()> {
+    let agent = state
+        .store
+        .member(&run.agent_id)?
+        .filter(|member| member.kind == MemberKind::Agent)
+        .ok_or_else(|| anyhow!("the run's agent no longer exists"))?;
+    let profile = agent.agent.clone().unwrap_or_default();
+    let task = match &run.task_id {
+        Some(id) => state.store.task(id)?,
+        None => None,
+    };
+    let project = match &run.project_id {
+        Some(id) => state.store.project(id)?,
+        None => None,
+    };
+    let worktree = if let Some(path) = run.cwd.clone() {
+        WorktreeSpec::Existing { path }
+    } else {
+        resolve_worktree(state, &task, &project, &state.relay_host_id)?.0
+    };
+
+    state.store.revoke_run_tokens(&run.id)?;
+    let token = auth::generate_token();
+    state.store.insert_token(
+        &auth::hash_token(&token),
+        &agent.id,
+        "run",
+        Some(&run.id),
+        Some("run"),
+    )?;
+
+    // An answer routed to the old process cannot be applied to the restored
+    // turn. Cancel it so the resumed agent can ask again if it still needs it.
+    cancel_questions_for_run(state, &run.id).await?;
+
+    let spec = RunSpec {
+        run_id: run.id.clone(),
+        agent_id: agent.id.clone(),
+        agent_handle: agent.handle.clone(),
+        agent_name: agent.display_name.clone(),
+        agent_description: profile.description.clone(),
+        runtime: profile.runtime.clone(),
+        provider: profile.provider.clone(),
+        model: profile.model.clone(),
+        thinking: profile.thinking.clone(),
+        custom_command: profile.custom_command.clone(),
+        channel_id: run.channel_id.clone(),
+        task_id: run.task_id.clone(),
+        project_id: run.project_id.clone(),
+        project_name: project.as_ref().map(|project| project.name.clone()),
+        automation_id: run.automation_id.clone(),
+        worktree,
+        prompt: run.prompt.clone(),
+        context: build_context(state, run, &task).await?,
+        files: task_files(state, &task),
+        api_base: state.public_url.clone(),
+        api_token: token,
+        resume_session_id: run.session_id.clone(),
+        env: Vec::new(),
+    };
+
+    let mut resumed = run.clone();
+    resumed.status = RunStatus::Dispatched;
+    resumed.headline = "Restarting".into();
+    resumed.error = None;
+    resumed.ended_at = None;
+    state.store.update_run(&resumed)?;
+
+    if !state
+        .send_to_host(
+            &state.relay_host_id,
+            RelayToHost::StartRun {
+                spec: Box::new(spec),
+            },
+        )
+        .await
+    {
+        bail!("the relay execution host is not registered");
+    }
+    state.emit(Event::RunUpdated { run: resumed });
+    Ok(())
+}
+
 fn resume_session_for(
     state: &Shared,
     agent_id: &str,
@@ -2687,6 +2773,70 @@ pub async fn cancel_questions_for_run(state: &Shared, run_id: &str) -> Result<()
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn interrupted_relay_run_is_redispatched_with_its_session_and_identity() {
+        let path = std::env::temp_dir().join(format!("patchwork-resume-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let mut agent = member("agent", "developer", MemberKind::Agent);
+        agent.agent.as_mut().unwrap().runtime = "codex".into();
+        store.insert_member(&agent).unwrap();
+        let run = Run {
+            id: "run".into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: "channel".into(),
+            task_id: None,
+            host_id: Some("relay".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: Some("/tmp/existing-worktree".into()),
+            automation_id: None,
+            session_id: Some("session".into()),
+            runtime: "codex".into(),
+            prompt: "Finish the interrupted work".into(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&run, 0).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx });
+
+        resume_interrupted_run(&state, &run).await.unwrap();
+
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected the interrupted run to be dispatched");
+        };
+        assert_eq!(spec.run_id, "run");
+        assert_eq!(spec.resume_session_id.as_deref(), Some("session"));
+        assert_eq!(spec.prompt, "Finish the interrupted work");
+        assert!(matches!(
+            spec.worktree,
+            WorktreeSpec::Existing { ref path } if path == "/tmp/existing-worktree"
+        ));
+        let stored = store.run("run").unwrap().unwrap();
+        assert_eq!(stored.status, RunStatus::Dispatched);
+        assert_eq!(stored.headline, "Restarting");
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn titles_come_from_the_first_line() {
         assert_eq!(
@@ -2892,6 +3042,7 @@ mod tests {
             current_run_id: None,
             pr_url: None,
             pr_state: None,
+            review_action: None,
             created_by: "vince".into(),
             due_at: None,
             once_key: None,

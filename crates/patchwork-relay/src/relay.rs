@@ -193,8 +193,8 @@ impl Relay {
             relay_host_id,
         ));
 
+        let runner = start_hosted_execution(&state, self.agent_env.clone()).await;
         reconcile_interrupted_runs(&state).await;
-        let runner = start_hosted_execution(&state, self.agent_env.clone());
         tokio::spawn(automations::scheduler(state.clone()));
         tokio::spawn(github::watcher(state.clone()));
 
@@ -270,7 +270,7 @@ fn ensure_relay_host(store: &Store) -> Result<Id> {
 
 /// The relay is itself an execution host: hosted agents keep working when
 /// every laptop is closed.
-fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Runner> {
+async fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Runner> {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     tokio::spawn(patchwork_agent::report_runtime_options(
         out_tx.clone(),
@@ -303,7 +303,7 @@ fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Run
         });
     }
 
-    ws::register_relay_host(state, in_tx);
+    ws::register_relay_host(state, in_tx).await;
 
     // Report what this machine can do, so setup problems are visible in the UI.
     {
@@ -344,13 +344,22 @@ fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Run
     runner
 }
 
-/// A run that was in flight when the relay stopped is never left claiming to
-/// be running.
+/// Resume relay-hosted work after the in-process host has been registered.
+/// Runs owned by another machine cannot be redispatched safely: that runtime
+/// may still be alive and reconnecting, so retain the conservative failure
+/// behavior for those runs.
 async fn reconcile_interrupted_runs(state: &Shared) {
     let Ok(runs) = state.store.active_runs() else {
         return;
     };
     for mut run in runs {
+        if run.host_id.as_deref() == Some(&state.relay_host_id) {
+            if let Err(err) = orchestrator::resume_interrupted_run(state, &run).await {
+                tracing::warn!(?err, run = %run.id, "could not resume interrupted run");
+            } else {
+                continue;
+            }
+        }
         run.status = RunStatus::Failed;
         run.error = Some("the relay restarted while this run was in flight".into());
         run.ended_at = Some(now_ms());
