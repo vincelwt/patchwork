@@ -749,6 +749,9 @@ function NewChannelModal({
         topic: topic.trim() || undefined,
         section_id: section || undefined,
       });
+      // The realtime event can arrive after navigation. Reconcile the HTTP
+      // result immediately so the sidebar and channel view render together.
+      store.upsertChannel(channel);
       onClose();
       go({ kind: "channel", id: channel.id });
     } catch (err) {
