@@ -5,7 +5,7 @@ import { useRouter } from "expo-router";
 import type { Task, TaskStatus } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
 import { TaskEditor } from "@/components/TaskEditor";
-import { Avatar, Badge, Button, ChoiceField, Empty, PageHeader, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, ChoiceField, Empty, Icon, PageHeader, Sheet } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -45,7 +45,9 @@ export default function TasksScreen() {
                 <Text style={[styles.groupTitle, { color: theme.faint }]}>{taskStatusLabel(group)}</Text>
                 <Badge tone={statusTone(group)}>{items.length}</Badge>
               </View>
-              {items.map((task) => <TaskRow key={task.id} task={task} />)}
+              <View style={[styles.groupList, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+                {items.map((task) => <TaskRow key={task.id} task={task} />)}
+              </View>
             </View>
           );
         })}
@@ -82,6 +84,7 @@ function TaskRow({ task }: { task: Task }) {
         </Text>
       </View>
       {owner ? <Avatar member={owner} size={28} /> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
+      <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={15} />
     </Pressable>
   );
 }
@@ -100,9 +103,10 @@ const styles = StyleSheet.create({
   filter: { flex: 1 },
   scroll: { padding: 14, paddingBottom: 30 },
   group: { marginBottom: 20 },
-  groupHead: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
+  groupHead: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 4 },
   groupTitle: { fontSize: 12, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.7 },
-  row: { minHeight: 67, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 9 },
+  groupList: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, overflow: "hidden" },
+  row: { minHeight: 70, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingVertical: 9 },
   key: { width: 58, fontSize: 12, fontWeight: "700" },
   main: { flex: 1, minWidth: 0 },
   title: { fontSize: 15, fontWeight: "600", lineHeight: 20 },

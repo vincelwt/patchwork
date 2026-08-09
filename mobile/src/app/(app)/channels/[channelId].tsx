@@ -3,7 +3,7 @@ import { StyleSheet, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 
 import { Conversation } from "@/components/Message";
-import { Button, ErrorNotice, PageHeader, Sheet, TextField } from "@/components/ui";
+import { Button, ChoiceField, ErrorNotice, PageHeader, Sheet, TextField } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 
 export default function ChannelScreen() {
@@ -15,13 +15,14 @@ export default function ChannelScreen() {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(channel?.name ?? "");
   const [topic, setTopic] = useState(channel?.topic ?? "");
+  const [sectionId, setSectionId] = useState(channel?.section_id ?? "");
   const [error, setError] = useState("");
 
   if (!channel) return <View style={styles.fill}><PageHeader title="Conversation" back /></View>;
 
   const save = async () => {
     try {
-      await store.mutate((api) => api.updateChannel(channel.id, { name, topic }));
+      await store.mutate((api) => api.updateChannel(channel.id, { name, topic, section_id: sectionId }));
       setEditing(false);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -41,6 +42,17 @@ export default function ChannelScreen() {
         <View style={styles.form}>
           <TextField label="Name" value={name} onChangeText={setName} autoCapitalize="none" />
           <TextField label="Topic" value={topic} onChangeText={setTopic} multiline />
+          {workspace.bootstrap?.sections.length ? (
+            <ChoiceField
+              label="Section"
+              value={sectionId}
+              options={[
+                { value: "", label: "No section" },
+                ...workspace.bootstrap.sections.map((section) => ({ value: section.id, label: section.name })),
+              ]}
+              onChange={setSectionId}
+            />
+          ) : null}
           <ErrorNotice message={error} />
           <Button label="Save" disabled={!name.trim()} onPress={() => void save()} />
           <Button

@@ -2,7 +2,7 @@ import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "rea
 import { useRouter } from "expo-router";
 
 import type { InboxItem } from "@client/types";
-import { Avatar, Badge, Button, Empty, PageHeader, Screen } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, Icon, PageHeader, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -45,7 +45,7 @@ export default function InboxScreen() {
               onPress={() => void open(item)}
               style={({ pressed }) => [
                 styles.row,
-                { backgroundColor: item.read_at ? theme.bg : theme.accentSoft, borderBottomColor: theme.line },
+                { backgroundColor: item.read_at ? theme.raised : theme.accentSoft, borderColor: theme.line },
                 pressed && { opacity: 0.6 },
               ]}
             >
@@ -58,6 +58,7 @@ export default function InboxScreen() {
                 {item.preview ? <Text numberOfLines={2} style={[styles.preview, { color: theme.muted }]}>{item.preview}</Text> : null}
                 <Text style={[styles.time, { color: theme.faint }]}>{relative(item.created_at)}</Text>
               </View>
+              <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={15} />
             </Pressable>
           );
         }}
@@ -73,9 +74,9 @@ function label(item: InboxItem) {
 }
 
 const styles = StyleSheet.create({
-  list: { paddingBottom: 24 },
+  list: { paddingVertical: 6, paddingBottom: 24 },
   empty: { flexGrow: 1, justifyContent: "center" },
-  row: { flexDirection: "row", gap: 11, padding: 14, borderBottomWidth: StyleSheet.hairlineWidth },
+  row: { flexDirection: "row", alignItems: "center", gap: 11, marginHorizontal: 12, marginVertical: 5, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14 },
   main: { flex: 1, gap: 4 },
   head: { flexDirection: "row", alignItems: "center", gap: 8 },
   title: { flex: 1, fontSize: 15, fontWeight: "700" },
