@@ -89,8 +89,6 @@ class Session {
   private loadingChannels = new Set<Id>();
   private loadingThreads = new Set<Id>();
   private notifying = false;
-  /// Events that arrived on the socket before the bootstrap they belong after.
-  private queued?: Envelope[];
   api?: Api;
 
   constructor(readonly id: Id) {}
@@ -118,31 +116,27 @@ class Session {
   }
 
   async connect(baseUrl: string, token: string) {
-    this.api = new Api(baseUrl, token);
+    const api = new Api(baseUrl, token, (task) => {
+      // Ignore a response from a request that outlived a sign-out or token
+      // replacement. It belongs to the old session, not the new one.
+      if (this.api !== api) return;
+      this.set({ tasks: upsert(this.data.tasks, task) });
+    });
+    this.api = api;
     if (this.data.status !== "ready") {
       this.set({ status: "loading", error: undefined });
     }
     try {
-      // The socket handshake and the bootstrap fetch do not depend on each
-      // other, so they happen at the same time and the app is live a whole
-      // round trip sooner. Anything the socket delivers in the meantime is
-      // held back and replayed once the bootstrap it post-dates is in place.
-      this.queued = [];
-      this.openSocket();
+      // Bootstrap establishes the exact sequence the socket resumes from.
+      // Opening the socket with an older sequence while this request is in
+      // flight creates a startup gap for mutations absent from the snapshot.
       const bootstrap = await this.api.bootstrap();
       this.retryDelay = 1000;
       this.applyBootstrap(bootstrap);
-      const pending = this.queued ?? [];
-      this.queued = undefined;
-      for (const envelope of pending) {
-        if (envelope.seq === 0 || envelope.seq > bootstrap.seq) {
-          this.applyEvent(envelope);
-        }
-      }
+      this.openSocket();
     } catch (err) {
       // A relay restart is routine — keep trying rather than stranding the app
       // behind a button nobody is there to press.
-      this.queued = undefined;
       this.closeSocket();
       this.set({ status: "error", error: String((err as Error).message ?? err) });
       this.scheduleReconnect();
@@ -152,7 +146,6 @@ class Session {
   disconnect() {
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-    this.queued = undefined;
     this.closeSocket();
     this.data = EMPTY;
     this.api = undefined;
@@ -202,10 +195,7 @@ class Session {
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data as string);
       if (payload.t !== "event") return;
-      const envelope = payload.envelope as Envelope;
-      // Still waiting on the bootstrap this event comes after.
-      if (this.queued) this.queued.push(envelope);
-      else this.applyEvent(envelope);
+      this.applyEvent(payload.envelope as Envelope);
     };
     socket.onclose = () => {
       this.set({ live: false });
