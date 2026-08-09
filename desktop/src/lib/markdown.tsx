@@ -22,11 +22,12 @@ type Block =
 
 interface ListItem {
   blocks: Block[];
-  /// `- [x] done` — a checkbox the agent ticked, not a literal bracket.
-  checked?: boolean;
+  /// `- [x] done` — a checklist state, not a literal bracket.
+  task?: TaskState;
 }
 
 type Align = "left" | "center" | "right";
+type TaskState = "unchecked" | "checked" | "progress";
 
 const FENCE = /^(\s*)(`{3,}|~{3,})\s*([\w+-]*)\s*$/;
 const HEADING = /^(#{1,6})\s+(.*)$/;
@@ -34,7 +35,17 @@ const RULE = /^\s{0,3}([-*_])\s*(\1\s*){2,}$/;
 const BULLET = /^(\s*)([-*+])\s+(.*)$/;
 const NUMBER = /^(\s*)(\d{1,9})[.)]\s+(.*)$/;
 const QUOTE = /^\s{0,3}>\s?(.*)$/;
-const TASK = /^\[([ xX])\]\s+(.*)$/;
+const TASK = /^\[([ xX~])\]\s+(.*)$/;
+// Agent plans often omit the redundant dash and write `[x] done` directly.
+// Treat consecutive lines in that form as a checklist without changing
+// bracketed prose elsewhere (or examples inside fenced code blocks).
+const BARE_TASK = /^(\s*)\[([ xX~])\]\s+(.*)$/;
+
+function taskState(marker: string): TaskState {
+  if (marker.toLowerCase() === "x") return "checked";
+  if (marker === "~") return "progress";
+  return "unchecked";
+}
 
 export function parseBlocks(source: string): Block[] {
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
@@ -130,6 +141,14 @@ function parseLines(lines: string[]): Block[] {
       continue;
     }
 
+    if (BARE_TASK.test(line)) {
+      flush();
+      const [list, next] = parseBareTaskList(lines, index);
+      blocks.push(list);
+      index = next;
+      continue;
+    }
+
     if (BULLET.test(line) || NUMBER.test(line)) {
       flush();
       const [list, next] = parseList(lines, index);
@@ -152,6 +171,61 @@ function parseLines(lines: string[]): Block[] {
 
   flush();
   return blocks;
+}
+
+/// A compact checklist without bullet prefixes. Agents commonly use this form
+/// for progress plans, including `[~]` for the item currently in progress.
+function parseBareTaskList(lines: string[], start: number): [Block, number] {
+  const first = lines[start].match(BARE_TASK)!;
+  const baseIndent = first[1].length;
+  const items: ListItem[] = [];
+  let index = start;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const match = line.match(BARE_TASK);
+
+    if (!match || match[1].length !== baseIndent) {
+      // Allow blank lines between checklist items, but do not absorb the next
+      // paragraph into the list.
+      if (!line.trim()) {
+        const following = lines[index + 1]?.match(BARE_TASK);
+        if (following?.[1].length === baseIndent) {
+          index += 1;
+          continue;
+        }
+      }
+      break;
+    }
+
+    const own: string[] = [match[3]];
+    index += 1;
+    const contentIndent = match[0].length - match[3].length;
+    while (index < lines.length) {
+      const candidate = lines[index];
+      if (!candidate.trim()) {
+        const following = lines[index + 1] ?? "";
+        const indent = following.length - following.trimStart().length;
+        if (following.trim() && indent >= contentIndent) {
+          own.push("");
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      const indent = candidate.length - candidate.trimStart().length;
+      if (indent < contentIndent) break;
+      own.push(candidate.slice(contentIndent));
+      index += 1;
+    }
+
+    items.push({
+      blocks: parseLines(own),
+      task: taskState(match[2]),
+    });
+  }
+
+  return [{ type: "list", ordered: false, start: 1, items }, index];
 }
 
 /// One list, consuming every sibling item and everything indented under them.
@@ -212,7 +286,7 @@ function parseList(lines: string[], start: number): [Block, number] {
     if (task) own[0] = task[2];
     items.push({
       blocks: parseLines(own),
-      checked: task ? task[1].toLowerCase() === "x" : undefined,
+      task: task ? taskState(task[1]) : undefined,
     });
   }
 

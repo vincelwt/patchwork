@@ -177,6 +177,10 @@ pub struct CreateTask {
     /// this key is returned instead of a second one being created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once_key: Option<String>,
+    /// Confirm creation after the relay found a similar open or recent task.
+    /// Exact `once_key` matches are still reused.
+    #[serde(default)]
+    pub allow_similar: bool,
     /// Files uploaded before the task exists. They become evidence on the
     /// immutable original request.
     #[serde(default)]

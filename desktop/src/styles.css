@@ -2121,7 +2121,7 @@ details[open] > summary::before {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 16px;
-  width: 480px;
+  width: min(480px, calc(100vw - 48px));
   max-height: 86vh;
   display: flex;
   flex-direction: column;
@@ -2129,7 +2129,7 @@ details[open] > summary::before {
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.3);
 }
 .modal.wide {
-  width: 620px;
+  width: min(620px, calc(100vw - 48px));
 }
 
 /* The task composer: the sentence is the dialog, and what it needs to know
@@ -2191,10 +2191,24 @@ details[open] > summary::before {
 }
 .task-composer-attributes {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 8px;
   padding: 8px 0 2px;
   border-top: 1px solid var(--line);
+}
+.task-composer-fields,
+.task-composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.task-composer-actions {
+  justify-content: flex-end;
+  margin-left: auto;
 }
 .task-composer-attributes .button,
 .task-composer-attributes .dropdown,
@@ -2209,7 +2223,7 @@ details[open] > summary::before {
   font-size: 13px;
   max-width: 150px;
 }
-.task-composer-attributes .check-row .label {
+.task-composer-attributes .toggle-row .name {
   font-size: 13px;
 }
 .chip-button {
@@ -2221,7 +2235,11 @@ details[open] > summary::before {
 .chip-button:hover {
   background: var(--tint);
 }
-.task-composer-attributes .check-row {
+.task-composer-attributes .toggle-row {
+  flex: none;
+  width: auto;
+  padding: 5px;
+  gap: 8px;
   margin-top: 0;
 }
 .date-input.quiet {
@@ -2369,9 +2387,20 @@ details[open] > summary::before {
   margin-top: 4px;
   color: var(--bg);
 }
-.md-check.on {
+.md-check.checked {
   background: var(--positive);
   border-color: var(--positive);
+}
+.md-check.progress {
+  background: var(--caution);
+  border-color: var(--caution);
+}
+.md-check.progress::after {
+  content: "";
+  width: 7px;
+  height: 1.5px;
+  border-radius: 999px;
+  background: var(--bg);
 }
 .md li.task .md-item {
   min-width: 0;
@@ -2985,6 +3014,10 @@ details[open] > summary::before {
 }
 .column-dot.done {
   background: var(--positive);
+  opacity: 1;
+}
+.column-dot.canceled {
+  background: var(--text-faint);
   opacity: 1;
 }
 

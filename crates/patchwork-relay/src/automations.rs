@@ -194,7 +194,9 @@ pub async fn fire(
         created_at: now_ms(),
         ended_at: None,
     };
-    state.store.upsert_automation_run(&record)?;
+    if let Some(existing) = state.store.reserve_automation_run(&record)? {
+        return Ok(existing);
+    }
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });
@@ -585,10 +587,10 @@ fn announce_due_tasks(state: &Shared) {
     }
 }
 
-/// Due, and still worth saying so. Finishing a task is the way to stop it
+/// Due, and still worth saying so. Closing a task is the way to stop it
 /// nagging, whatever its date says.
 fn is_due(task: &Task, now: Millis) -> bool {
-    matches!(task.due_at, Some(at) if at <= now) && task.status != TaskStatus::Done
+    matches!(task.due_at, Some(at) if at <= now) && !task.status.is_terminal()
 }
 
 /// The next firing after `after`, in the relay's local time.
@@ -630,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_done() {
+    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_closed() {
         let mut task = Task {
             id: "t".into(),
             key: "PW-1".into(),
@@ -661,6 +663,9 @@ mod tests {
         assert!(is_due(&task, 2_000));
 
         task.status = TaskStatus::Done;
+        assert!(!is_due(&task, 9_999));
+
+        task.status = TaskStatus::Canceled;
         assert!(!is_due(&task, 9_999));
     }
 

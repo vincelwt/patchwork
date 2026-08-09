@@ -21,6 +21,7 @@ import {
   Spinner,
   TasksIcon,
 } from "./icons";
+import { isTerminalTaskStatus } from "@client/types";
 import type { Channel, Id, Member } from "@client/types";
 import type { View as NavView } from "./common";
 
@@ -111,7 +112,7 @@ export function Sidebar({
   }, [hidden]);
 
   const unread = app.inbox.filter((item) => !item.read_at).length;
-  const openTasks = app.tasks.filter((task) => task.status !== "done").length;
+  const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
   const liveAutomations = app.automations.filter((a) => a.enabled).length;
   const failingAutomations = app.automations.filter(
     (a) => a.enabled && a.failure_count > 0,

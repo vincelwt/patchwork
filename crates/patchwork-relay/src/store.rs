@@ -24,6 +24,11 @@ pub struct Store {
     pool: Pool,
 }
 
+pub enum InsertTaskResult {
+    Inserted,
+    Existing(Task),
+}
+
 fn json_col<T: serde::de::DeserializeOwned>(row: &Row, idx: &str) -> Option<T> {
     row.get::<_, Option<String>>(idx)
         .ok()
@@ -91,6 +96,45 @@ impl Store {
         ] {
             let _ = conn.execute(statement, []);
         }
+
+        // Canonicalize legacy keys before enforcing one open task per key.
+        // Keep the newest of any pre-existing duplicates; no task is deleted.
+        conn.execute_batch(
+            "UPDATE tasks
+                SET once_key = NULLIF(lower(trim(once_key)), '')
+              WHERE once_key IS NOT NULL;
+             UPDATE tasks AS older
+                SET once_key = NULL
+              WHERE older.once_key IS NOT NULL
+                AND older.status NOT IN ('done', 'canceled')
+                AND EXISTS (
+                    SELECT 1 FROM tasks AS newer
+                     WHERE newer.once_key = older.once_key COLLATE NOCASE
+                       AND newer.status NOT IN ('done', 'canceled')
+                       AND (newer.created_at > older.created_at
+                            OR (newer.created_at = older.created_at AND newer.id > older.id))
+                );
+             CREATE UNIQUE INDEX IF NOT EXISTS tasks_open_once
+                ON tasks(once_key COLLATE NOCASE)
+             WHERE once_key IS NOT NULL AND status NOT IN ('done', 'canceled');
+             UPDATE automation_runs
+                SET once_key = NULLIF(trim(once_key), '')
+              WHERE once_key IS NOT NULL;
+             UPDATE automation_runs AS newer
+                SET once_key = NULL
+              WHERE newer.once_key IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM automation_runs AS older
+                     WHERE older.automation_id = newer.automation_id
+                       AND older.once_key = newer.once_key
+                       AND (older.created_at < newer.created_at
+                            OR (older.created_at = newer.created_at AND older.id < newer.id))
+                );
+             CREATE UNIQUE INDEX IF NOT EXISTS automation_runs_once_unique
+                ON automation_runs(automation_id, once_key)
+             WHERE once_key IS NOT NULL;",
+        )
+        .context("failed to enforce task idempotency")?;
 
         Ok(Self { pool })
     }
@@ -162,9 +206,9 @@ impl Store {
     /// the series is not rewriting history.
     pub fn next_task_key(&self) -> Result<String> {
         let conn = self.conn()?;
-        conn.execute("UPDATE workspace SET task_seq = task_seq + 1", [])?;
         let (prefix, seq): (String, i64) = conn.query_row(
-            "SELECT task_prefix, task_seq FROM workspace LIMIT 1",
+            "UPDATE workspace SET task_seq = task_seq + 1
+             RETURNING task_prefix, task_seq",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -1027,6 +1071,71 @@ impl Store {
         Ok(())
     }
 
+    /// Insert a task and its discussion under one SQLite write lock. The
+    /// in-transaction lookup closes the read-before-write race for `once_key`.
+    pub fn insert_task_with_channel(
+        &self,
+        task: &Task,
+        channel: &Channel,
+    ) -> Result<InsertTaskResult> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(key) = task.once_key.as_deref() {
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM tasks
+                     WHERE once_key = ?1 COLLATE NOCASE AND status NOT IN ('done', 'canceled')
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![key],
+                    Self::task_from_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                tx.rollback()?;
+                return Ok(InsertTaskResult::Existing(existing));
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO channels (id, kind, section_id, slug, name, topic, position, task_id, last_message_at, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                channel.id,
+                match channel.kind { ChannelKind::Dm => "dm", ChannelKind::Task => "task", ChannelKind::Channel => "channel" },
+                channel.section_id,
+                channel.slug,
+                channel.name,
+                channel.topic,
+                channel.position,
+                task.id,
+                channel.last_message_at,
+                channel.created_at,
+            ],
+        )?;
+        for member_id in &channel.member_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, member_id) VALUES (?1, ?2)",
+                params![channel.id, member_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
+                                discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
+                                pr_state, created_by, due_at, once_key, position, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![
+                task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
+                task.source_channel_id, task.source_message_id, task.discussion_channel_id,
+                task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
+                task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.once_key,
+                task.position, task.created_at, task.updated_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(InsertTaskResult::Inserted)
+    }
+
     pub fn update_task(&self, task: &Task) -> Result<()> {
         self.update_task_inner(task, false)
     }
@@ -1119,13 +1228,14 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// The open task an agent already made about this, if it made one. Done is
-    /// not open: the same thing going wrong again is a new task, not a ghost.
+    /// The open task an agent already made about this, if it made one. Terminal
+    /// tasks are not open: the same thing recurring is new work, not a ghost.
     pub fn task_by_once_key(&self, key: &str) -> Result<Option<Task>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
-                "SELECT * FROM tasks WHERE once_key = ?1 AND status != 'done'
+                "SELECT * FROM tasks WHERE once_key = ?1 COLLATE NOCASE
+                   AND status NOT IN ('done', 'canceled')
                  ORDER BY created_at DESC LIMIT 1",
                 params![key],
                 |r| Self::task_from_row(r),
@@ -2003,6 +2113,42 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve a keyed delivery before dispatch. `Some` means another caller
+    /// already reserved it and owns the work.
+    pub fn reserve_automation_run(&self, run: &AutomationRun) -> Result<Option<AutomationRun>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(key) = run.once_key.as_deref() {
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM automation_runs
+                     WHERE automation_id = ?1 AND once_key = ?2
+                     ORDER BY id LIMIT 1",
+                    params![run.automation_id, key],
+                    Self::automation_run_from_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                tx.rollback()?;
+                return Ok(Some(existing));
+            }
+        }
+        tx.execute(
+            "INSERT INTO automation_runs (id, automation_id, run_id, trigger_summary, trigger_payload,
+                                          selection, context_preview, status, error, task_id, created_at, ended_at,
+                                          once_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                run.id, run.automation_id, run.run_id, run.trigger_summary,
+                run.trigger_payload.as_ref().map(to_json), run.selection.as_ref().map(to_json),
+                run.context_preview, run.status.as_str(), run.error, run.task_id,
+                run.created_at, run.ended_at, run.once_key
+            ],
+        )?;
+        tx.commit()?;
+        Ok(None)
+    }
+
     /// Has this automation already acted on this key? The guard that makes a
     /// webhook safe to retry.
     pub fn automation_run_by_once_key(
@@ -2271,6 +2417,158 @@ mod tests {
             created_at: 1,
             answered_at: None,
         }
+    }
+
+    fn idempotent_task(id: &str, key: &str) -> Task {
+        Task {
+            id: id.into(),
+            key: key.into(),
+            title: "Image proxy is returning 403".into(),
+            outcome: "Restore image delivery".into(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: format!("channel-{id}"),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            created_by: "human".into(),
+            due_at: None,
+            once_key: Some("posthog:image-proxy:403".into()),
+            created_at: 1,
+            updated_at: 1,
+            position: 1.0,
+        }
+    }
+
+    fn task_channel(task: &Task) -> Channel {
+        Channel {
+            id: task.discussion_channel_id.clone(),
+            kind: ChannelKind::Task,
+            section_id: None,
+            slug: String::new(),
+            name: task.title.clone(),
+            topic: task.outcome.clone(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: vec!["human".into()],
+            task_id: Some(task.id.clone()),
+            last_message_at: 1,
+        }
+    }
+
+    #[test]
+    fn concurrent_once_keys_create_one_task_and_one_discussion() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for (id, key) in [("one", "PW-1"), ("two", "PW-2")] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let task = idempotent_task(id, key);
+                let channel = task_channel(&task);
+                barrier.wait();
+                store.insert_task_with_channel(&task, &channel).unwrap()
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, InsertTaskResult::Inserted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, InsertTaskResult::Existing(_)))
+                .count(),
+            1
+        );
+        assert_eq!(store.tasks().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .channels()
+                .unwrap()
+                .into_iter()
+                .filter(|channel| channel.kind == ChannelKind::Task)
+                .count(),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_keeps_tasks_but_claims_a_legacy_key_once() {
+        let (store, path) = store();
+        store
+            .conn()
+            .unwrap()
+            .execute("DROP INDEX tasks_open_once", [])
+            .unwrap();
+        let first = idempotent_task("one", "PW-1");
+        let mut second = idempotent_task("two", "PW-2");
+        second.once_key = Some("POSTHOG:IMAGE-PROXY:403".into());
+        store.insert_task(&first).unwrap();
+        store.insert_task(&second).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let tasks = reopened.tasks().unwrap();
+        assert_eq!(tasks.len(), 2, "migration never deletes a task");
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.once_key.as_deref() == Some("posthog:image-proxy:403"))
+                .count(),
+            1
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_webhook_keys_reserve_one_automation_run() {
+        let (store, path) = store();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for id in ["one", "two"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let run = AutomationRun {
+                    id: id.into(),
+                    automation_id: "automation".into(),
+                    run_id: None,
+                    trigger_summary: "Incoming webhook".into(),
+                    trigger_payload: None,
+                    selection: None,
+                    context_preview: String::new(),
+                    status: RunStatus::Queued,
+                    error: None,
+                    task_id: None,
+                    once_key: Some("delivery-123".into()),
+                    created_at: 1,
+                    ended_at: None,
+                };
+                barrier.wait();
+                store.reserve_automation_run(&run).unwrap()
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|existing| existing.is_none()).count(), 1);
+        assert_eq!(results.iter().filter(|existing| existing.is_some()).count(), 1);
+        assert_eq!(store.automation_runs("automation", 10).unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1,9 +1,13 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  HEARTBEAT_FRAME,
   MAX_BODY_BYTES,
   MAX_CONNECTIONS,
   REQUEST_TIMEOUT_MS,
   SOCKET_TIMEOUT_MS,
+  clientConnection,
+  clientHeartbeat,
+  clientToken,
   decodeBase64,
   encodeBase64,
   equalFixed,
@@ -24,7 +28,10 @@ interface Env {
 
 type Attachment =
   | { role: "host" }
-  | { role: "client"; id: string };
+  | { role: "client"; id: string; key?: string; connection?: string; preview?: true; heartbeat?: true; lastSeen?: number };
+
+const SOCKET_SWEEP_MS = 30_000;
+const SOCKET_STALE_MS = 90_000;
 
 type Pending<T> = {
   resolve: (value: T) => void;
@@ -70,6 +77,7 @@ export class ManagedRelay extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(HEARTBEAT_FRAME, HEARTBEAT_FRAME));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -78,7 +86,7 @@ export class ManagedRelay extends DurableObject<Env> {
     if (!destination) return json(404, "No such Patchwork relay.");
     return destination.role === "host"
       ? this.connectHost(request)
-      : this.proxyClient(request, destination.localPath);
+      : this.proxyClient(request, destination.localPath, destination.preview ?? false);
   }
 
   private async connectHost(request: Request): Promise<Response> {
@@ -101,17 +109,17 @@ export class ManagedRelay extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async proxyClient(request: Request, localPath: string): Promise<Response> {
+  private async proxyClient(request: Request, localPath: string, preview: boolean): Promise<Response> {
     const host = this.host();
     if (!host) return json(503, "This Patchwork relay is offline.");
-    if (this.ctx.getWebSockets().length >= MAX_CONNECTIONS || this.pendingRequests.size >= MAX_CONNECTIONS) {
-      return json(429, "This Patchwork relay has too many connections.");
-    }
 
     const url = new URL(request.url);
     const path = `${localPath}${url.search}`;
     if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      return this.openSocket(host, path, request.headers);
+      return this.openSocket(host, path, request.headers, preview);
+    }
+    if (this.pendingRequests.size >= MAX_CONNECTIONS) {
+      return json(429, "This Patchwork relay has too many connections.");
     }
 
     const declared = Number(request.headers.get("content-length") ?? "0");
@@ -152,7 +160,22 @@ export class ManagedRelay extends DurableObject<Env> {
     }
   }
 
-  private async openSocket(host: WebSocket, path: string, headers: Headers): Promise<Response> {
+  private async openSocket(host: WebSocket, path: string, headers: Headers, preview: boolean): Promise<Response> {
+    const token = clientToken(path, preview);
+    const connection = clientConnection(path, preview);
+    const key = token && connection ? await tokenHash(`${connection}:${token}`) : undefined;
+    const heartbeat = !!token && clientHeartbeat(path, preview);
+    const clients = this.ctx.getWebSockets("client");
+    const replaced = key ? clients.filter((socket) => {
+      const attachment = socket.deserializeAttachment() as Attachment | null;
+      return attachment?.role === "client" && !attachment.preview &&
+        (!attachment.connection || attachment.key === key);
+    }) : [];
+    for (const socket of replaced) socket.close(1012, "Client reconnected");
+    if (clients.length - replaced.length >= MAX_CONNECTIONS) {
+      return json(429, "This Patchwork relay has too many connections.");
+    }
+
     const id = randomId();
     const ready = new Promise<SocketReady>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -164,8 +187,17 @@ export class ManagedRelay extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.serializeAttachment({ role: "client", id } satisfies Attachment);
+    server.serializeAttachment({
+      role: "client",
+      id,
+      key,
+      connection: connection ?? undefined,
+      preview: preview || undefined,
+      heartbeat: heartbeat || undefined,
+      lastSeen: heartbeat ? Date.now() : undefined,
+    } satisfies Attachment);
     this.ctx.acceptWebSocket(server, ["client", `client:${id}`]);
+    if (heartbeat) await this.scheduleSocketSweep();
 
     try {
       host.send(JSON.stringify({ type: "socket_open", id, path, headers: proxyHeaders(headers) }));
@@ -190,11 +222,31 @@ export class ManagedRelay extends DurableObject<Env> {
     }
   }
 
+  async alarm(): Promise<void> {
+    const cutoff = Date.now() - SOCKET_STALE_MS;
+    let active = false;
+    for (const socket of this.ctx.getWebSockets("client")) {
+      const attachment = socket.deserializeAttachment() as Attachment | null;
+      if (attachment?.role !== "client" || !attachment.heartbeat) continue;
+      const automatic = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime() ?? 0;
+      if (Math.max(automatic, attachment.lastSeen ?? 0) < cutoff) {
+        socket.close(1001, "Heartbeat timeout");
+      } else {
+        active = true;
+      }
+    }
+    if (active) await this.ctx.storage.setAlarm(Date.now() + SOCKET_SWEEP_MS);
+  }
+
   async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
     const attachment = socket.deserializeAttachment() as Attachment | null;
     if (!attachment) return socket.close(1003, "Missing socket identity");
 
     if (attachment.role === "client") {
+      if (attachment.heartbeat) {
+        attachment.lastSeen = Date.now();
+        socket.serializeAttachment(attachment);
+      }
       const size = typeof frame === "string" ? new TextEncoder().encode(frame).byteLength : frame.byteLength;
       if (size > MAX_BODY_BYTES) return socket.close(1009, "Preview frame is too large");
       this.sendHost({
@@ -297,6 +349,12 @@ export class ManagedRelay extends DurableObject<Env> {
 
   private client(id: string): WebSocket | undefined {
     return this.ctx.getWebSockets(`client:${id}`)[0];
+  }
+
+  private async scheduleSocketSweep() {
+    const due = Date.now() + SOCKET_SWEEP_MS;
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (scheduled === null || scheduled > due) await this.ctx.storage.setAlarm(due);
   }
 
   private config(key: string): string | null {

@@ -24,6 +24,7 @@ use crate::state::{HostConn, Shared};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ClientMsg {
+    Heartbeat,
     /// Catch up on everything after `since`, then stream live.
     Resume { since: i64 },
     Typing { channel_id: Id },
@@ -35,6 +36,7 @@ enum ClientMsg {
 #[derive(Debug, Serialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ServerMsg {
+    Heartbeat,
     Ready { seq: i64 },
     Event { envelope: Envelope },
     Host { msg: RelayToHost },
@@ -72,12 +74,18 @@ async fn connection(
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    // Catch-up before live events, so nothing is missed across a reconnect.
+    // Subscribe before taking the replay boundary. A durable event can land at
+    // any point during the handshake; the log supplies everything through
+    // `latest`, and the receiver already holds everything after it.
+    let mut bus = state.bus.subscribe();
     let latest = state.store.latest_seq().unwrap_or(0);
     if let Some(since) = since {
-        if since > 0 && since < latest {
-            if let Ok(missed) = state.store.events_since(since, 2000) {
-                for envelope in missed {
+        if since < latest {
+            // The log is retained at roughly 5,000 events, so the upper bound
+            // covers the complete catch-up window (including a workspace whose
+            // first bootstrap legitimately returned sequence zero).
+            if let Ok(missed) = state.store.events_since(since, 10_000) {
+                for envelope in missed.into_iter().filter(|event| event.seq <= latest) {
                     if crate::visibility::event(&state.store, &member_id, &envelope) {
                         let _ = tx.send(ServerMsg::Event { envelope });
                     }
@@ -87,7 +95,6 @@ async fn connection(
     }
     let _ = tx.send(ServerMsg::Ready { seq: latest });
 
-    let mut bus = state.bus.subscribe();
     let bus_tx = tx.clone();
     let bus_state = state.clone();
     let bus_member_id = member_id.clone();
@@ -95,6 +102,12 @@ async fn connection(
         loop {
             match bus.recv().await {
                 Ok(envelope) => {
+                    // Events at or below the boundary were just replayed from
+                    // the durable log. Transient events have a negative seq and
+                    // are never in that log, so they still pass through.
+                    if envelope.seq > 0 && envelope.seq <= latest {
+                        continue;
+                    }
                     if crate::visibility::event(&bus_state.store, &bus_member_id, &envelope)
                         && bus_tx.send(ServerMsg::Event { envelope }).is_err()
                     {
@@ -151,6 +164,9 @@ async fn connection(
         };
 
         match msg {
+            ClientMsg::Heartbeat => {
+                let _ = tx.send(ServerMsg::Heartbeat);
+            }
             ClientMsg::Resume { since } => {
                 if let Ok(missed) = state.store.events_since(since, 2000) {
                     for envelope in missed {
@@ -321,4 +337,21 @@ pub fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_wire_shape_is_stable() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"heartbeat"}"#).unwrap(),
+            ClientMsg::Heartbeat
+        ));
+        assert_eq!(
+            serde_json::to_string(&ServerMsg::Heartbeat).unwrap(),
+            r#"{"t":"heartbeat"}"#
+        );
+    }
 }
