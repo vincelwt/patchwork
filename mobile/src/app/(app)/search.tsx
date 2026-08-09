@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Alert, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { router } from "expo-router";
 import type { SearchResults } from "@client/types";
+import { PullRequestLink } from "@/components/pull-request-link";
 import { Empty, Loading, PageHeader, ScrollScreen } from "@/components/ui";
 import { useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -69,7 +70,10 @@ export default function SearchScreen() {
               style={[styles.result, { borderColor: colors.line }]}
             >
               <Text style={[styles.title, { color: colors.text }]}>{task.key} · {task.title || task.outcome}</Text>
-              <Text style={{ color: colors.muted }}>{task.status.replace("_", " ")}</Text>
+              <View style={styles.taskMeta}>
+                <Text style={{ color: colors.muted }}>{task.status.replace("_", " ")}</Text>
+                <PullRequestLink task={task} />
+              </View>
             </Pressable>
           ))}
           {!results.tasks.length ? <Empty title="No matching tasks" /> : null}
@@ -86,5 +90,6 @@ const styles = StyleSheet.create({
   buttonText: { fontWeight: "700" },
   result: { borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 14, gap: 4 },
   title: { fontWeight: "600" },
+  taskMeta: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
   section: { fontSize: 12, fontWeight: "700", letterSpacing: 0.7, marginTop: 20, textTransform: "uppercase" },
 });
