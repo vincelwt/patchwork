@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::auth;
 use crate::state::Shared;
-use crate::store::InsertTaskResult;
+use crate::store::{InsertTaskResult, Store};
 
 /// How much conversation an agent gets by default. Deeper history stays
 /// retrievable through the CLI rather than being pasted into every prompt.
@@ -293,18 +293,37 @@ pub fn parse_mentions(body: &str, members: &[Member]) -> Vec<Id> {
     found
 }
 
+/// A threaded message sees its root and replies, never unrelated channel chat.
+fn conversation_messages(store: &Store, message: &Message, limit: usize) -> Result<Vec<Message>> {
+    let Some(parent_id) = &message.parent_id else {
+        return store.recent_messages(&message.channel_id, limit);
+    };
+    let Some(parent) = store.message(parent_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut messages = store.thread(parent_id)?;
+    let keep = limit.saturating_sub(1);
+    if messages.len() > keep {
+        messages.drain(..messages.len() - keep);
+    }
+    if limit > 0 {
+        messages.insert(0, parent);
+    }
+    Ok(messages)
+}
+
 /// The agent a message is plainly a reply to, if any.
 ///
 /// Deliberately narrow. Only the agent that spoke last, only if it spoke
 /// recently, only if it was answering *this* person, and only when the new
-/// message does not name somebody else instead — say `@other-agent` and you
+/// message does not name somebody else instead. Say `@other-agent` and you
 /// meant that one, not the one still on screen.
 fn continuation_target(state: &Shared, message: &Message, author: &Member) -> Result<Option<Id>> {
     if author.kind != MemberKind::Human || !message.mentions.is_empty() {
         return Ok(None);
     }
 
-    let recent = state.store.recent_messages(&message.channel_id, 6)?;
+    let recent = conversation_messages(&state.store, message, 6)?;
     let Some(previous) = recent
         .iter()
         .rev()
@@ -1478,9 +1497,19 @@ async fn build_context(state: &Shared, run: &Run, task: &Option<Task>) -> Result
         out.push('\n');
     }
 
-    let messages = state
-        .store
-        .recent_messages(&run.channel_id, CONTEXT_MESSAGES)?;
+    let messages = match &run.trigger {
+        RunTrigger::Mention { message_id }
+        | RunTrigger::DirectMessage { message_id }
+        | RunTrigger::Ambient { message_id } => match state.store.message(message_id)? {
+            Some(message) => conversation_messages(&state.store, &message, CONTEXT_MESSAGES)?,
+            None => state
+                .store
+                .recent_messages(&run.channel_id, CONTEXT_MESSAGES)?,
+        },
+        _ => state
+            .store
+            .recent_messages(&run.channel_id, CONTEXT_MESSAGES)?,
+    };
     if !messages.is_empty() {
         out.push_str("Recent messages (oldest first):\n");
         for message in messages {
@@ -3074,6 +3103,47 @@ mod tests {
             created_at: at,
             edited_at: None,
         }
+    }
+
+    #[test]
+    fn thread_context_excludes_other_channel_messages() {
+        let path = std::env::temp_dir().join(format!("patchwork-thread-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store
+            .insert_channel(&Channel {
+                id: "c".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "general".into(),
+                name: "General".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 0,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+
+        let root = message_at("m1", "agent", 1, Some("r1"));
+        let unrelated = message_at("m2", "agent", 2, Some("r2"));
+        let mut reply = message_at("m3", "vince", 3, None);
+        reply.parent_id = Some(root.id.clone());
+        for message in [&root, &unrelated, &reply] {
+            store.insert_message(message).unwrap();
+        }
+
+        let messages = conversation_messages(&store, &reply, CONTEXT_MESSAGES).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m3"]
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     fn run_by(agent: &str) -> Run {
