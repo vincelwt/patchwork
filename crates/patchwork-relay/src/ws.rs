@@ -26,11 +26,19 @@ use crate::state::{HostConn, Shared};
 enum ClientMsg {
     Heartbeat,
     /// Catch up on everything after `since`, then stream live.
-    Resume { since: i64 },
-    Typing { channel_id: Id },
-    Presence { presence: Presence },
+    Resume {
+        since: i64,
+    },
+    Typing {
+        channel_id: Id,
+    },
+    Presence {
+        presence: Presence,
+    },
     /// This connection is also an execution host.
-    Host { msg: HostToRelay },
+    Host {
+        msg: HostToRelay,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -59,9 +67,7 @@ pub async fn handler(
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
     let can_host = caller.can_host();
-    ws.on_upgrade(move |socket| {
-        connection(socket, state, caller.member.id, query.since, can_host)
-    })
+    ws.on_upgrade(move |socket| connection(socket, state, caller.member.id, query.since, can_host))
 }
 
 async fn connection(
@@ -284,7 +290,10 @@ fn fail_host_previews(state: &Shared, host_id: &str) {
     let Ok(previews) = state.store.previews(true) else {
         return;
     };
-    for mut preview in previews.into_iter().filter(|preview| preview.host_id == host_id) {
+    for mut preview in previews
+        .into_iter()
+        .filter(|preview| preview.host_id == host_id)
+    {
         preview.status = PreviewStatus::Failed;
         preview.stopped_at = Some(now_ms());
         if state.store.upsert_preview(&preview).is_ok() {
@@ -295,7 +304,11 @@ fn fail_host_previews(state: &Shared, host_id: &str) {
 
 /// A desktop tells us where each project lives on it; that is how "run it
 /// wherever the project is available" can work at all.
-fn merge_project_paths(state: &Shared, host_id: &str, paths: &std::collections::BTreeMap<Id, String>) {
+fn merge_project_paths(
+    state: &Shared,
+    host_id: &str,
+    paths: &std::collections::BTreeMap<Id, String>,
+) {
     if paths.is_empty() {
         return;
     }
@@ -325,10 +338,11 @@ pub fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost
     tokio::spawn({
         let state = state.clone();
         async move {
-            state.hosts.write().await.insert(
-                host_id.clone(),
-                HostConn { tx },
-            );
+            state
+                .hosts
+                .write()
+                .await
+                .insert(host_id.clone(), HostConn { tx });
             if let Ok(Some(mut host)) = state.store.host(&host_id) {
                 host.online = true;
                 host.last_seen = now_ms();

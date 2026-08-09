@@ -196,6 +196,10 @@ export class Api {
     return this.post<Run>(`/api/tasks/${id}/run`, input ?? {});
   }
 
+  approveTask(id: Id) {
+    return this.post<Run>(`/api/tasks/${id}/approve`, {});
+  }
+
   run(id: Id) {
     return this.get<RunDetail>(`/api/runs/${id}`);
   }

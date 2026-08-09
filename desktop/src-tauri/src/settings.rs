@@ -67,7 +67,8 @@ impl Settings {
     }
 
     pub fn active_workspace(&self) -> Option<&WorkspaceSettings> {
-        self.workspace(&self.active).or_else(|| self.workspaces.first())
+        self.workspace(&self.active)
+            .or_else(|| self.workspaces.first())
     }
 
     /// Adding the same workspace twice replaces the old token rather than
@@ -97,8 +98,7 @@ impl Settings {
             .filter(|(_, key)| !key.is_empty())
             .filter_map(|(id, key)| {
                 let provider = patchwork_agent::providers::provider(id)?;
-                (!provider.env_var.is_empty())
-                    .then(|| (provider.env_var.to_string(), key.clone()))
+                (!provider.env_var.is_empty()).then(|| (provider.env_var.to_string(), key.clone()))
             })
             .collect()
     }

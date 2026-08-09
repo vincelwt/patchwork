@@ -542,7 +542,11 @@ async fn trigger_agents(
             .task_id
             .as_deref()
             .and_then(|id| state.store.task(id).ok().flatten())
-            .and_then(|task| (!task.status.is_terminal()).then_some(task.owner_id).flatten())
+            .and_then(|task| {
+                (!task.status.is_terminal())
+                    .then_some(task.owner_id)
+                    .flatten()
+            })
             .filter(|id| {
                 members
                     .iter()
@@ -874,7 +878,11 @@ pub async fn steer_run(
     let sender = display_name_of(&members, author_id);
     let target_name = display_name_of(&members, &target.agent_id);
     let control_id = new_id();
-    let summary = if prompt.is_empty() { "Attached file(s)" } else { prompt };
+    let summary = if prompt.is_empty() {
+        "Attached file(s)"
+    } else {
+        prompt
+    };
     if let Some(source) = &source {
         let mut event = RunEvent {
             id: new_id(),
@@ -890,9 +898,7 @@ pub async fn steer_run(
             })),
             created_at: now_ms(),
         };
-        state
-            .store
-            .reserve_direct_control(&mut event, &target.id)?;
+        state.store.reserve_direct_control(&mut event, &target.id)?;
         state.emit(Event::RunEventAppended { event });
     }
     let delivered = if prompt.is_empty() {
@@ -1128,6 +1134,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     if let Some(task) = &task {
         let mut task = task.clone();
         task.current_run_id = Some(run.id.clone());
+        task.review_action = None;
         if !task.status.is_terminal() {
             task.status = TaskStatus::Running;
         }
@@ -1915,6 +1922,10 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
         _ => {}
     }
 
+    if task.status != TaskStatus::Review {
+        task.review_action = None;
+    }
+
     state.store.update_task(&task)?;
     state.emit(Event::TaskUpdated { task });
     Ok(())
@@ -1986,12 +1997,63 @@ const RECENT_TASK_WINDOW_MS: Millis = 14 * 24 * 60 * 60 * 1_000;
 
 fn task_words(text: &str) -> BTreeSet<String> {
     const NOISE: &[&str] = &[
-        "add", "after", "alert", "and", "are", "before", "create", "created", "duplicate",
-        "ensure", "failed", "failing", "failure", "fix", "fixed", "follow", "following", "for",
-        "from", "had", "has", "have", "implement", "incident", "into", "issue", "make", "new",
-        "not", "problem", "production", "report", "reported", "restore", "safe", "should", "spike",
-        "task", "that", "the", "their", "this", "update", "use", "used", "using", "was", "were",
-        "what", "when", "where", "which", "will", "with", "work", "would", "your",
+        "add",
+        "after",
+        "alert",
+        "and",
+        "are",
+        "before",
+        "create",
+        "created",
+        "duplicate",
+        "ensure",
+        "failed",
+        "failing",
+        "failure",
+        "fix",
+        "fixed",
+        "follow",
+        "following",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "implement",
+        "incident",
+        "into",
+        "issue",
+        "make",
+        "new",
+        "not",
+        "problem",
+        "production",
+        "report",
+        "reported",
+        "restore",
+        "safe",
+        "should",
+        "spike",
+        "task",
+        "that",
+        "the",
+        "their",
+        "this",
+        "update",
+        "use",
+        "used",
+        "using",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "will",
+        "with",
+        "work",
+        "would",
+        "your",
     ];
 
     text.split(|c: char| !c.is_alphanumeric())
@@ -2147,6 +2209,7 @@ async fn create_task_inner(
         current_run_id: None,
         pr_url: None,
         pr_state: None,
+        review_action: None,
         created_by: creator_id.to_string(),
         due_at: input.due_at.filter(|at| *at > 0),
         once_key: input
@@ -2290,6 +2353,12 @@ pub async fn update_task(
     if let Some(status) = input.status {
         task.status = status;
     }
+    if let Some(review_action) = input.review_action {
+        task.review_action = match review_action.trim() {
+            "" => None,
+            action => Some(action.to_string()),
+        };
+    }
     if let Some(owner_id) = input.owner_id {
         task.owner_id = if owner_id.is_empty() {
             None
@@ -2325,6 +2394,9 @@ pub async fn update_task(
     }
     if let Some(position) = input.position {
         task.position = position;
+    }
+    if task.status != TaskStatus::Review {
+        task.review_action = None;
     }
 
     if has_explicit_status {
@@ -2377,6 +2449,15 @@ pub async fn update_task(
         )
         .await;
         if task.status.is_terminal() {
+            resolve_inbox(state, Some(&task.id), None, None)?;
+        } else if task.status == TaskStatus::Review {
+            notify_task(
+                state,
+                &task,
+                InboxKind::ReviewReady,
+                format!("{} is ready for review", task.key),
+            )?;
+        } else if previous.status == TaskStatus::Review {
             resolve_inbox(state, Some(&task.id), None, None)?;
         }
     }
@@ -2457,6 +2538,52 @@ pub async fn run_task(
     .context("could not start the run")
 }
 
+/// Execute the action an agent put behind the review gate. Claiming the task
+/// before dispatch makes the approval single-use; a failed dispatch restores
+/// the exact gate so the person can try again after the host recovers.
+pub async fn approve_task(state: &Shared, actor_id: &str, task_id: &str) -> Result<Option<Run>> {
+    let task = state
+        .store
+        .task(task_id)?
+        .ok_or_else(|| anyhow!("task not found"))?;
+    let Some(action) = task.review_action.clone() else {
+        return Ok(None);
+    };
+    if task.status != TaskStatus::Review || !state.store.claim_review_action(&task.id, &action)? {
+        return Ok(None);
+    }
+
+    let actor = state
+        .store
+        .member(actor_id)?
+        .map(|member| member.display_name)
+        .unwrap_or_else(|| "A workspace member".into());
+    let prompt = format!(
+        "{actor} approved the requested review action:\n\n{action}\n\nCarry out the approved action now. Ask again only if its scope or risk has materially changed."
+    );
+
+    match run_task(state, actor_id, &task.id, None, Some(prompt)).await {
+        Ok(run) => {
+            resolve_inbox(state, Some(&task.id), None, None)?;
+            let _ = post_system(
+                state,
+                &task.discussion_channel_id,
+                &format!("{actor} approved: {action}"),
+            )
+            .await;
+            Ok(Some(run))
+        }
+        Err(err) => {
+            if state.store.restore_review_action(&task.id, &action)? {
+                if let Some(task) = state.store.task(&task.id)? {
+                    state.emit(Event::TaskUpdated { task });
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 /// Answering a question un-blocks the run that asked it.
 pub async fn answer_question(
     state: &Shared,
@@ -2535,10 +2662,9 @@ fn resolve_inbox(
     question_run_id: Option<&str>,
     question_message_id: Option<&str>,
 ) -> Result<()> {
-    for item in
-        state
-            .store
-            .resolve_inbox_for(task_id, question_run_id, question_message_id)?
+    for item in state
+        .store
+        .resolve_inbox_for(task_id, question_run_id, question_message_id)?
     {
         state.emit(Event::InboxItemUpdated { item });
     }
@@ -2617,8 +2743,8 @@ mod tests {
             task_similarity(
                 "PostHog image proxy invalid-content spike",
                 "Throttle scheduled database maintenance IO",
-             ) < 0.42
-         );
+            ) < 0.42
+        );
     }
 
     fn member(id: &str, handle: &str, kind: MemberKind) -> Member {

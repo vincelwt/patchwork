@@ -59,9 +59,17 @@ async fn poll_task(state: &Shared, task: &Task) -> anyhow::Result<()> {
     state.emit(Event::TaskUpdated { task: task.clone() });
 
     let review_arrived = fresh.review == "CHANGES_REQUESTED"
-        && previous.as_ref().map(|p| p.review.clone()).unwrap_or_default() != "CHANGES_REQUESTED";
+        && previous
+            .as_ref()
+            .map(|p| p.review.clone())
+            .unwrap_or_default()
+            != "CHANGES_REQUESTED";
     let checks_failed = fresh.checks == "FAILURE"
-        && previous.as_ref().map(|p| p.checks.clone()).unwrap_or_default() != "FAILURE";
+        && previous
+            .as_ref()
+            .map(|p| p.checks.clone())
+            .unwrap_or_default()
+            != "FAILURE";
 
     if fresh.state == "MERGED" {
         let _ = orchestrator::post_system(
@@ -163,9 +171,10 @@ async fn fetch(url: &str) -> anyhow::Result<Option<PullRequestState>> {
         .get("statusCheckRollup")
         .and_then(|v| v.as_array())
         .map(|checks| {
-            if checks.iter().any(|c| {
-                c.get("conclusion").and_then(|v| v.as_str()) == Some("FAILURE")
-            }) {
+            if checks
+                .iter()
+                .any(|c| c.get("conclusion").and_then(|v| v.as_str()) == Some("FAILURE"))
+            {
                 "FAILURE"
             } else if checks.iter().any(|c| {
                 matches!(

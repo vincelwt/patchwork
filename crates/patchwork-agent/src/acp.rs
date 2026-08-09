@@ -76,7 +76,11 @@ pub struct NewSession {
 /// `{ "models": { "availableModels": [ { modelId, name, description } ] } }`.
 /// The id key differs per group (`modelId` / `id`), so take whichever is there.
 fn options_of(res: &Value, group: &str, list: &str) -> Vec<RuntimeOption> {
-    let Some(items) = res.get(group).and_then(|g| g.get(list)).and_then(|v| v.as_array()) else {
+    let Some(items) = res
+        .get(group)
+        .and_then(|g| g.get(list))
+        .and_then(|v| v.as_array())
+    else {
         return Vec::new();
     };
     items
@@ -591,7 +595,9 @@ async fn dispatch(
                 "session/request_permission" => {
                     let options = params
                         .get("options")
-                        .and_then(|v| serde_json::from_value::<Vec<PermissionOption>>(v.clone()).ok())
+                        .and_then(|v| {
+                            serde_json::from_value::<Vec<PermissionOption>>(v.clone()).ok()
+                        })
                         .unwrap_or_default();
                     let _ = event_tx.send(AgentEvent::PermissionRequest {
                         request_id: id,

@@ -23,6 +23,7 @@ import {
   AgentIcon,
   AttachIcon,
   ChevronIcon,
+  CheckIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -88,6 +89,16 @@ function useTaskActions(task: Task) {
         case "answer":
           if (state.run) inspect({ kind: "run", runId: state.run.id });
           break;
+        case "approve": {
+          setBusy(true);
+          try {
+            const run = await api.approveTask(task.id);
+            inspect({ kind: "run", runId: run.id });
+          } finally {
+            setBusy(false);
+          }
+          break;
+        }
         case "complete":
           await api.updateTask(task.id, { status: "done" });
           toast("Task closed");
@@ -113,6 +124,8 @@ function actionIcon(kind: NextAction["kind"]) {
       return <StopIcon size={13} />;
     case "answer":
       return <QuestionIcon size={14} />;
+    case "approve":
+      return <CheckIcon size={14} />;
     default:
       return null;
   }

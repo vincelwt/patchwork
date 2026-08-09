@@ -135,7 +135,14 @@ impl Relay {
     /// relay-wide only if a relay ever carries enough workspaces to notice.
     pub async fn router_for_preview(&self, preview_id: &str) -> Option<Router> {
         for mounted in self.mounted.read().await.values() {
-            if mounted.state.store.preview(preview_id).ok().flatten().is_some() {
+            if mounted
+                .state
+                .store
+                .preview(preview_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return Some(mounted.router.clone());
             }
         }
@@ -239,7 +246,11 @@ pub fn workspace_db(data_dir: &std::path::Path, id: &str) -> PathBuf {
 }
 
 fn ensure_relay_host(store: &Store) -> Result<Id> {
-    if let Some(existing) = store.hosts()?.into_iter().find(|h| h.kind == HostKind::Relay) {
+    if let Some(existing) = store
+        .hosts()?
+        .into_iter()
+        .find(|h| h.kind == HostKind::Relay)
+    {
         return Ok(existing.id);
     }
     let host = Host {

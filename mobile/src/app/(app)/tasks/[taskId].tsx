@@ -45,6 +45,19 @@ export default function TaskScreen() {
     }
   };
 
+  const approve = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const run = await store.mutate((api) => api.approveTask(task.id));
+      router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const active = activeRun && !["succeeded", "failed", "cancelled"].includes(activeRun.status);
 
   return (
@@ -68,6 +81,25 @@ export default function TaskScreen() {
               <Button label="Run details" compact tone="secondary" onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: activeRun.id } })} />
               <Button label="Stop" compact tone="danger" busy={busy} onPress={() => void store.mutate((api) => api.cancelRun(activeRun.id))} />
             </>
+          ) : task.status === "review" ? (
+            <>
+              <Button
+                label={task.review_action ?? "Complete"}
+                compact
+                busy={busy}
+                onPress={() =>
+                  task.review_action
+                    ? void approve()
+                    : void store.mutate((api) => api.updateTask(task.id, { status: "done" }))
+                }
+              />
+              <Button
+                label="Back to planning"
+                compact
+                tone="secondary"
+                onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))}
+              />
+            </>
           ) : !isTerminalTaskStatus(task.status) ? (
             <Button
               label={activeRun?.status === "failed" ? "Retry" : "Start"}
@@ -78,7 +110,7 @@ export default function TaskScreen() {
           ) : (
             <Button label="Reopen" compact tone="secondary" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))} />
           )}
-          {!isTerminalTaskStatus(task.status) && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
+          {!isTerminalTaskStatus(task.status) && task.status !== "review" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
         </View>
         <ErrorNotice message={error} />
       </Card>

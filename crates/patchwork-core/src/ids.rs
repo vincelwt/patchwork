@@ -55,7 +55,10 @@ mod tests {
 
     #[test]
     fn slugify_handles_punctuation() {
-        assert_eq!(slugify("Vince's developer agent"), "vince-s-developer-agent");
+        assert_eq!(
+            slugify("Vince's developer agent"),
+            "vince-s-developer-agent"
+        );
         assert_eq!(slugify("  # infra  "), "infra");
         assert_eq!(slugify("!!!"), "item");
     }

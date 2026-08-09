@@ -219,6 +219,7 @@ pub fn router(state: Shared) -> Router {
             get(task_detail).patch(update_task).delete(delete_task),
         )
         .route("/api/tasks/{id}/run", post(run_task))
+        .route("/api/tasks/{id}/approve", post(approve_task))
         // runs
         .route("/api/runs", post(start_run))
         .route("/api/runs/{id}", get(run_detail))
@@ -1034,6 +1035,20 @@ async fn update_task(
     {
         input.status = Some(TaskStatus::Review);
     }
+    if let Some(action) = input.review_action.as_deref() {
+        let action = action.trim();
+        if action.chars().any(char::is_control) || action.chars().count() > 80 {
+            return Err(ApiError::bad_request(
+                "a review action must be one line of at most 80 characters",
+            ));
+        }
+        let resulting_status = input.status.unwrap_or(task.status);
+        if !action.is_empty() && resulting_status != TaskStatus::Review {
+            return Err(ApiError::bad_request(
+                "a review action can only be set while the task is in review",
+            ));
+        }
+    }
     if caller.is_agent() && input.status == Some(TaskStatus::Review) {
         if !orchestrator::has_review_evidence(
             &state,
@@ -1062,7 +1077,10 @@ async fn delete_task(
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
     for preview in state.store.task_previews(&task.id)? {
-        if matches!(preview.status, PreviewStatus::Starting | PreviewStatus::Live) {
+        if matches!(
+            preview.status,
+            PreviewStatus::Starting | PreviewStatus::Live
+        ) {
             state
                 .send_to_host(
                     &preview.host_id,
@@ -1086,7 +1104,11 @@ async fn delete_task(
         files
     };
     let files = state.store.delete_task(&task.id)?;
-    for path in files.into_iter().map(std::path::PathBuf::from).chain(pending_files) {
+    for path in files
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .chain(pending_files)
+    {
         let _ = tokio::fs::remove_file(path).await;
     }
     state.emit(Event::TaskDeleted { task_id: task.id });
@@ -1122,6 +1144,32 @@ async fn run_task(
         )
         .await?,
     ))
+}
+
+async fn approve_task(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Run>> {
+    caller.require_device()?;
+    let task = state
+        .store
+        .task_by_ref(&id)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    if task.status != TaskStatus::Review || task.review_action.is_none() {
+        return Err(ApiError::conflict(
+            "this task no longer has an action awaiting approval",
+        ));
+    }
+    if task.current_run_id.is_some() {
+        return Err(ApiError::conflict(
+            "the agent is still finishing its review handoff",
+        ));
+    }
+    let run = orchestrator::approve_task(&state, &caller.member.id, &task.id)
+        .await?
+        .ok_or_else(|| ApiError::conflict("this review action was already handled"))?;
+    Ok(Json(run))
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,9 +1467,10 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    let (committed, blocked_task) = state
-        .store
-        .commit_question_waiting(&question, &run, &inbox_items)?;
+    let (committed, blocked_task) =
+        state
+            .store
+            .commit_question_waiting(&question, &run, &inbox_items)?;
     if !committed {
         state.store.delete_message(&message.id)?;
         state.emit(Event::MessageDeleted {
@@ -1467,7 +1516,9 @@ async fn answer_question(
         .ok_or_else(|| ApiError::not_found("question not found"))?;
     require_channel_access(&state, &caller, &question.channel_id)?;
     if question.status != QuestionStatus::Open {
-        return Err(ApiError::conflict("that question is no longer waiting for an answer"));
+        return Err(ApiError::conflict(
+            "that question is no longer waiting for an answer",
+        ));
     }
     Ok(Json(
         orchestrator::answer_question(&state, &id, input.answers, &caller.member.id).await?,
@@ -1490,7 +1541,9 @@ async fn wait_for_answer(
         || caller.member.id != question.agent_id
         || caller.run_id.as_deref() != Some(question.run_id.as_str())
     {
-        return Err(ApiError::forbidden("only the asking run can wait for this answer"));
+        return Err(ApiError::forbidden(
+            "only the asking run can wait for this answer",
+        ));
     }
     if question.status != QuestionStatus::Open {
         return Ok(Json(question));
@@ -2399,7 +2452,10 @@ async fn download_file(
         .header(axum::http::header::CONTENT_LENGTH, length)
         .header(
             axum::http::header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{}\"", attachment.file_name.replace('"', "")),
+            format!(
+                "inline; filename=\"{}\"",
+                attachment.file_name.replace('"', "")
+            ),
         );
     if status == axum::http::StatusCode::PARTIAL_CONTENT {
         response = response.header(
@@ -2879,14 +2935,10 @@ mod tests {
         );
 
         assert_eq!(
-            ask_question(
-                State(state.clone()),
-                human_caller(),
-                Json(ask("run-one")),
-            )
-            .await
-            .unwrap_err()
-            .status,
+            ask_question(State(state.clone()), human_caller(), Json(ask("run-one")),)
+                .await
+                .unwrap_err()
+                .status,
             axum::http::StatusCode::FORBIDDEN
         );
         assert_eq!(
@@ -2924,7 +2976,9 @@ mod tests {
                 State(state.clone()),
                 agent_caller("run-one"),
                 Path(question.id.clone()),
-                Json(AnswerQuestion { answers: Vec::new() }),
+                Json(AnswerQuestion {
+                    answers: Vec::new()
+                }),
             )
             .await
             .unwrap_err()
@@ -2954,7 +3008,9 @@ mod tests {
             State(state.clone()),
             human_caller(),
             Path(question.id),
-            Json(AnswerQuestion { answers: Vec::new() }),
+            Json(AnswerQuestion {
+                answers: Vec::new(),
+            }),
         )
         .await
         .unwrap();
@@ -2984,7 +3040,9 @@ mod tests {
             State(state.clone()),
             human_caller(),
             Path(second.id),
-            Json(AnswerQuestion { answers: Vec::new() }),
+            Json(AnswerQuestion {
+                answers: Vec::new(),
+            }),
         )
         .await
         .unwrap();
@@ -3020,7 +3078,9 @@ mod tests {
             State(state.clone()),
             human_caller(),
             Path(explicit_block.id),
-            Json(AnswerQuestion { answers: Vec::new() }),
+            Json(AnswerQuestion {
+                answers: Vec::new(),
+            }),
         )
         .await
         .unwrap();
@@ -3053,13 +3113,9 @@ mod tests {
             .status,
             axum::http::StatusCode::FORBIDDEN
         );
-        let _ = cancel_run(
-            State(state.clone()),
-            human_caller(),
-            Path("run-two".into()),
-        )
-        .await
-        .unwrap();
+        let _ = cancel_run(State(state.clone()), human_caller(), Path("run-two".into()))
+            .await
+            .unwrap();
         assert_eq!(
             store.run("run-two").unwrap().unwrap().status,
             RunStatus::Cancelled
@@ -3108,7 +3164,20 @@ mod tests {
             agent: Some(AgentProfile::default()),
             presence: Presence::Offline,
         };
+        let human = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: true,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Online,
+        };
         store.insert_member(&agent).unwrap();
+        store.insert_member(&human).unwrap();
         let token = auth::generate_token();
         store
             .insert_token(
@@ -3116,6 +3185,16 @@ mod tests {
                 &agent.id,
                 "run",
                 Some("run"),
+                None,
+            )
+            .unwrap();
+        let human_token = auth::generate_token();
+        store
+            .insert_token(
+                &auth::hash_token(&human_token),
+                &human.id,
+                "device",
+                None,
                 None,
             )
             .unwrap();
@@ -3131,6 +3210,7 @@ mod tests {
             CreateTask {
                 title: "Do it".into(),
                 outcome: "A result exists".into(),
+                owner_id: Some(agent.id.clone()),
                 ..Default::default()
             },
         )
@@ -3376,6 +3456,118 @@ mod tests {
                 .unwrap(),
             b"abcdef"
         );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/tasks/{}", task.id))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"review","review_action":"Approve and deploy app"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            store
+                .task(&task.id)
+                .unwrap()
+                .unwrap()
+                .review_action
+                .as_deref(),
+            Some("Approve and deploy app")
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/approve", task.id))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/approve", task.id))
+                    .header("authorization", format!("Bearer {human_token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let restored = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Review);
+        assert_eq!(
+            restored.review_action.as_deref(),
+            Some("Approve and deploy app")
+        );
+
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("host".into(), crate::state::HostConn { tx: host_tx });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/approve", task.id))
+                    .header("authorization", format!("Bearer {human_token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let approved: Run = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let dispatched = host_rx.recv().await.unwrap();
+        let RelayToHost::StartRun { spec } = dispatched else {
+            panic!("approval did not dispatch a run")
+        };
+        assert_eq!(spec.run_id, approved.id);
+        assert!(spec.prompt.contains("Human approved"));
+        assert!(spec.prompt.contains("Approve and deploy app"));
+        let approved_task = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(approved_task.status, TaskStatus::Running);
+        assert!(approved_task.review_action.is_none());
+        assert_eq!(
+            approved_task.current_run_id.as_deref(),
+            Some(approved.id.as_str())
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{}/approve", task.id))
+                    .header("authorization", format!("Bearer {human_token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
 
         let response = router(state.clone())
             .oneshot(
