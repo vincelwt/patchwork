@@ -449,6 +449,10 @@ class Session {
     }
   }
 
+  upsertChannel(channel: Channel) {
+    this.set({ channels: upsert(this.data.channels, channel) });
+  }
+
   async loadOlder(channelId: Id) {
     if (!this.api) return;
     const list = this.data.messages[channelId];
@@ -678,6 +682,9 @@ class Workspaces {
   // What the app calls on the workspace it is looking at.
   loadChannel(channelId: Id, force = false) {
     return this.session?.loadChannel(channelId, force);
+  }
+  upsertChannel(channel: Channel) {
+    this.session?.upsertChannel(channel);
   }
   loadOlder(channelId: Id) {
     return this.session?.loadOlder(channelId) ?? Promise.resolve();
