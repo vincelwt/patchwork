@@ -284,8 +284,9 @@ export function Sheet({
     <Modal
       visible={visible}
       animationType="slide"
-      presentationStyle={Platform.OS === "ios" ? "pageSheet" : "fullScreen"}
+      presentationStyle={Platform.OS === "ios" ? "formSheet" : "fullScreen"}
       allowSwipeDismissal
+      onDismiss={onClose}
       onRequestClose={onClose}
     >
       <SafeAreaView style={[styles.modalSafe, { backgroundColor: theme.bg }]} edges={["top", "bottom"]}>

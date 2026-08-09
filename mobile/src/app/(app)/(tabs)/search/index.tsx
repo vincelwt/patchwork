@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { router } from "expo-router";
+import { router, Stack } from "expo-router";
 
 import type { SearchResults } from "@client/types";
-import { Badge, ErrorNotice, Icon, PageHeader, Screen } from "@/components/ui";
+import { Badge, ErrorNotice, Icon, Screen } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
 import { useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -16,6 +16,7 @@ export default function SearchScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const request = useRef(0);
+  const nativeSearch = process.env.EXPO_OS === "ios";
 
   useEffect(() => {
     const value = query.trim();
@@ -48,34 +49,51 @@ export default function SearchScreen() {
   const total = (results?.messages.length ?? 0) + (results?.tasks.length ?? 0);
 
   return (
-    <Screen>
-      <PageHeader back title="Search" />
-      <View style={[styles.searchWrap, { backgroundColor: theme.raised, borderBottomColor: theme.line }]}>
-        <View style={[styles.searchBar, { backgroundColor: theme.input, borderColor: theme.line }]}>
-          <Icon name={{ ios: "magnifyingglass", android: "search", web: "search" }} color={theme.faint} size={19} />
-          <TextInput
-            accessibilityLabel="Search workspace"
-            autoCapitalize="none"
-            autoCorrect={false}
-            autoFocus
-            onChangeText={setQuery}
-            placeholder="Messages and tasks"
-            placeholderTextColor={theme.faint}
-            returnKeyType="search"
-            selectionColor={theme.accent}
-            style={[styles.input, { color: theme.text }]}
-            value={query}
-          />
-          {loading ? <ActivityIndicator color={theme.accent} size="small" /> : null}
-          {query && !loading ? (
-            <Pressable accessibilityRole="button" accessibilityLabel="Clear search" hitSlop={8} onPress={() => setQuery("")}>
-              <Icon name={{ ios: "xmark.circle.fill", android: "cancel", web: "cancel" }} color={theme.faint} size={19} />
-            </Pressable>
-          ) : null}
+    <Screen style={{ backgroundColor: theme.surface }}>
+      <Stack.Screen
+        options={{
+          headerSearchBarOptions: nativeSearch
+            ? {
+                autoCapitalize: "none",
+                hideNavigationBar: false,
+                hideWhenScrolling: false,
+                onCancelButtonPress: () => setQuery(""),
+                onChangeText: (event) => setQuery(event.nativeEvent.text),
+                placeholder: "Messages and tasks",
+                placement: "automatic",
+              }
+            : undefined,
+        }}
+      />
+      {!nativeSearch ? (
+        <View style={[styles.searchWrap, { backgroundColor: theme.surface, borderBottomColor: theme.line }]}>
+          <View style={[styles.searchBar, { backgroundColor: theme.input, borderColor: theme.line }]}>
+            <Icon name={{ ios: "magnifyingglass", android: "search", web: "search" }} color={theme.faint} size={19} />
+            <TextInput
+              accessibilityLabel="Search workspace"
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoFocus
+              onChangeText={setQuery}
+              placeholder="Messages and tasks"
+              placeholderTextColor={theme.faint}
+              returnKeyType="search"
+              selectionColor={theme.accent}
+              style={[styles.input, { color: theme.text }]}
+              value={query}
+            />
+            {loading ? <ActivityIndicator color={theme.accent} size="small" /> : null}
+            {query && !loading ? (
+              <Pressable accessibilityRole="button" accessibilityLabel="Clear search" hitSlop={8} onPress={() => setQuery("")}>
+                <Icon name={{ ios: "xmark.circle.fill", android: "cancel", web: "cancel" }} color={theme.faint} size={19} />
+              </Pressable>
+            ) : null}
+          </View>
         </View>
-      </View>
+      ) : null}
 
       <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.scroll}
         keyboardDismissMode="on-drag"
         keyboardShouldPersistTaps="handled"
@@ -98,15 +116,15 @@ export default function SearchScreen() {
             {results.messages.length ? (
               <View style={styles.section}>
                 <SectionTitle title="Messages" count={results.messages.length} />
-                <View style={[styles.resultGroup, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+                <View style={styles.resultGroup}>
                   {results.messages.map((hit) => (
                     <Pressable
                       accessibilityRole="button"
                       key={hit.message.id}
-                      onPress={() => router.push({ pathname: "/(app)/channels/[channelId]", params: { channelId: hit.message.channel_id } })}
+                      onPress={() => router.push({ pathname: "/channels/[channelId]", params: { channelId: hit.message.channel_id } })}
                       style={({ pressed }) => [styles.result, { borderBottomColor: theme.line }, pressed && styles.pressed]}
                     >
-                      <View style={[styles.resultIcon, { backgroundColor: theme.accentSoft }]}>
+                      <View style={styles.resultIcon}>
                         <Icon name={{ ios: "bubble.left", android: "chat_bubble", web: "chat_bubble" }} color={theme.accent} size={18} />
                       </View>
                       <View style={styles.main}>
@@ -124,15 +142,15 @@ export default function SearchScreen() {
             {results.tasks.length ? (
               <View style={styles.section}>
                 <SectionTitle title="Tasks" count={results.tasks.length} />
-                <View style={[styles.resultGroup, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+                <View style={styles.resultGroup}>
                   {results.tasks.map((task) => (
                     <Pressable
                       accessibilityRole="button"
                       key={task.id}
-                      onPress={() => router.push({ pathname: "/(app)/tasks/[taskId]", params: { taskId: task.id } })}
+                      onPress={() => router.push({ pathname: "/tasks/[taskId]", params: { taskId: task.id } })}
                       style={({ pressed }) => [styles.result, { borderBottomColor: theme.line }, pressed && styles.pressed]}
                     >
-                      <View style={[styles.resultIcon, { backgroundColor: theme.positiveSoft }]}>
+                      <View style={styles.resultIcon}>
                         <Icon name={{ ios: "checkmark.circle", android: "task_alt", web: "task_alt" }} color={theme.positive} size={19} />
                       </View>
                       <View style={styles.main}>
@@ -179,14 +197,14 @@ const styles = StyleSheet.create({
   searchWrap: { paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth },
   searchBar: { minHeight: 44, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, flexDirection: "row", alignItems: "center", gap: 9, paddingHorizontal: 12 },
   input: { flex: 1, minHeight: 42, paddingVertical: 8, fontSize: 16 },
-  scroll: { flexGrow: 1, padding: 16, paddingBottom: 40 },
+  scroll: { flexGrow: 1, paddingBottom: 40 },
   section: { marginBottom: 22 },
-  sectionTitleRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 4 },
+  sectionTitleRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 16 },
   sectionTitle: { fontSize: 12, fontWeight: "700", letterSpacing: 0.7, textTransform: "uppercase" },
   sectionCount: { fontSize: 12, fontWeight: "600" },
-  resultGroup: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, overflow: "hidden" },
-  result: { minHeight: 76, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 12, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth },
-  resultIcon: { width: 34, height: 34, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+  resultGroup: { overflow: "hidden" },
+  result: { minHeight: 76, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 16, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth },
+  resultIcon: { width: 26, alignItems: "center", justifyContent: "center" },
   main: { flex: 1, minWidth: 0, gap: 4 },
   title: { fontSize: 15, fontWeight: "600", lineHeight: 20 },
   snippet: { fontSize: 14, lineHeight: 19 },

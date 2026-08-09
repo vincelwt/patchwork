@@ -15,10 +15,10 @@ export default function AgentsScreen() {
   const agents = data?.members.filter((member) => member.kind === "agent") ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Agents" subtitle={`${agents.length} teammates`} action={<Button label="New agent" compact onPress={() => setCreating(true)} />} />
+      <PageHeader title="Agents" subtitle={`${agents.length} teammates`} back action={<Button label="New agent" compact onPress={() => setCreating(true)} />} />
       <ScrollView contentContainerStyle={styles.scroll}>
         {agents.length ? (
-          <View style={[styles.group, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+          <View style={styles.group}>
             {agents.map((agent) => {
               const host = data?.hosts.find((item) => item.id === agent.agent?.host_id);
               return (
@@ -58,9 +58,9 @@ export default function AgentsScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  scroll: { padding: 14, paddingBottom: 30 },
-  group: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, overflow: "hidden" },
-  row: { minHeight: 78, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingVertical: 11 },
+  scroll: { paddingBottom: 30 },
+  group: { overflow: "hidden" },
+  row: { minHeight: 78, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 11 },
   main: { flex: 1, minWidth: 0 },
   name: { fontSize: 16, fontWeight: "700", marginBottom: 3 },
   description: { fontSize: 13, lineHeight: 18 },

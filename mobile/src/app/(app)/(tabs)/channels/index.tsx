@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
 import type { Channel } from "@client/types";
-import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, PageHeader, Sheet, TextField } from "@/components/ui";
+import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -22,7 +22,7 @@ export default function ChannelsScreen() {
   const data = workspace.bootstrap;
   if (!data) return <Empty title="No workspace data yet" />;
 
-  const open = (channel: Channel) => router.push({ pathname: "/(app)/channels/[channelId]", params: { channelId: channel.id } });
+  const open = (channel: Channel) => router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
   const create = async () => {
     setError("");
     try {
@@ -43,13 +43,22 @@ export default function ChannelsScreen() {
   const unsectioned = channels.filter((channel) => !channel.section_id || !sectionIds.has(channel.section_id));
 
   return (
-    <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader
-        title="Chat"
-        subtitle={`${channels.length} channels · ${dms.length} direct`}
-        action={<View style={styles.actions}><Button label="DM" compact tone="quiet" onPress={() => setNewDm(true)} /><Button label="New" compact onPress={() => setNewChannel(true)} /></View>}
+    <View style={[styles.fill, { backgroundColor: theme.surface }]}>
+      <Stack.Screen
+        options={{
+          headerRight: () => (
+            <View style={styles.actions}>
+              <Pressable accessibilityRole="button" accessibilityLabel="New direct message" hitSlop={8} onPress={() => setNewDm(true)}>
+                <Icon name={{ ios: "person.badge.plus", android: "person_add", web: "person_add" }} color={theme.accent} size={21} />
+              </Pressable>
+              <Pressable accessibilityRole="button" accessibilityLabel="New channel" hitSlop={8} onPress={() => setNewChannel(true)}>
+                <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />
+              </Pressable>
+            </View>
+          ),
+        }}
       />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
         {unsectioned.length || !data.sections.length ? (
           <ChannelGroup title={data.sections.length ? "Other channels" : "Channels"} channels={unsectioned} onOpen={open} />
         ) : null}
@@ -129,7 +138,7 @@ function ChannelGroup({
         <Text style={[styles.count, { color: theme.faint }]}>{channels.length}</Text>
       </View>
       {channels.length ? (
-        <View style={[styles.channelGroup, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+        <View style={styles.channelGroup}>
           {channels.map((channel) => <ChannelRow key={channel.id} channel={channel} onPress={() => onOpen(channel)} />)}
         </View>
       ) : (
@@ -143,7 +152,7 @@ function ChannelRow({ channel, onPress }: { channel: Channel; onPress: () => voi
   const theme = useTheme();
   return (
     <Pressable onPress={onPress} style={({ pressed }) => [styles.channel, { borderBottomColor: theme.line }, pressed && { opacity: 0.6 }]}>
-      <View style={[styles.channelIcon, { backgroundColor: theme.accentSoft }]}>
+      <View style={styles.channelIcon}>
         <Icon
           name={channel.kind === "dm" ? { ios: "person.crop.circle", android: "person", web: "person" } : { ios: "number", android: "tag", web: "tag" }}
           color={theme.accent}
@@ -162,18 +171,18 @@ function ChannelRow({ channel, onPress }: { channel: Channel; onPress: () => voi
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  actions: { flexDirection: "row", gap: 6 },
-  scroll: { padding: 16, paddingBottom: 30 },
+  actions: { flexDirection: "row", alignItems: "center", gap: 18 },
+  scroll: { paddingBottom: 30 },
   group: { marginBottom: 18 },
-  sectionHead: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 4 },
+  sectionHead: { minHeight: 34, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 16 },
   section: { fontSize: 12, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.7 },
   count: { fontSize: 12, fontWeight: "600" },
-  channelGroup: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, overflow: "hidden" },
-  channel: { minHeight: 66, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingVertical: 9 },
-  channelIcon: { width: 34, height: 34, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+  channelGroup: { overflow: "hidden" },
+  channel: { minHeight: 66, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 9 },
+  channelIcon: { width: 28, alignItems: "center", justifyContent: "center" },
   channelName: { fontSize: 16, fontWeight: "600", marginBottom: 2 },
   time: { fontSize: 11 },
-  groupEmpty: { paddingHorizontal: 4, paddingVertical: 9, fontSize: 13 },
+  groupEmpty: { paddingHorizontal: 16, paddingVertical: 9, fontSize: 13 },
   form: { padding: 16, gap: 14 },
   memberRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 11, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
 });

@@ -90,7 +90,7 @@ export default function AutomationScreen() {
           {debug?.runs.map((run) => (
             <Pressable
               key={run.id}
-              onPress={() => run.run_id ? router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }) : run.task_id ? router.push({ pathname: "/(app)/tasks/[taskId]", params: { taskId: run.task_id } }) : undefined}
+              onPress={() => run.run_id ? router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }) : run.task_id ? router.push({ pathname: "/tasks/[taskId]", params: { taskId: run.task_id } }) : undefined}
               style={[styles.runRow, { borderBottomColor: theme.line }]}
             >
               <View style={styles.grow}>

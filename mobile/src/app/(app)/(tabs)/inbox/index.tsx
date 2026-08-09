@@ -1,8 +1,8 @@
 import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
 import type { InboxItem } from "@client/types";
-import { Avatar, Badge, Button, Empty, Icon, PageHeader, Screen } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, Icon, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -21,20 +21,23 @@ export default function InboxScreen() {
       const question = workspace.bootstrap?.open_questions.find((candidate) => candidate.run_id === item.run_id);
       if (question) return router.push({ pathname: "/(app)/questions/[questionId]", params: { questionId: question.id } });
     }
-    if (item.task_id) return router.push({ pathname: "/(app)/tasks/[taskId]", params: { taskId: item.task_id } });
+    if (item.task_id) return router.push({ pathname: "/tasks/[taskId]", params: { taskId: item.task_id } });
     if (item.run_id) return router.push({ pathname: "/(app)/runs/[runId]", params: { runId: item.run_id } });
-    if (item.channel_id) return router.push({ pathname: "/(app)/channels/[channelId]", params: { channelId: item.channel_id } });
+    if (item.channel_id) return router.push({ pathname: "/channels/[channelId]", params: { channelId: item.channel_id } });
     if (item.automation_id) return router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: item.automation_id } });
   };
 
   return (
-    <Screen>
-      <PageHeader
-        title="Inbox"
-        subtitle={unread ? `${unread} unread` : "You are caught up"}
-        action={unread ? <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} /> : undefined}
+    <Screen style={{ backgroundColor: theme.surface }}>
+      <Stack.Screen
+        options={{
+          headerRight: unread
+            ? () => <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} />
+            : undefined,
+        }}
       />
       <FlatList
+        contentInsetAdjustmentBehavior="automatic"
         data={items}
         keyExtractor={(item) => item.id}
         contentContainerStyle={items.length ? styles.list : styles.empty}
@@ -45,7 +48,7 @@ export default function InboxScreen() {
               onPress={() => void open(item)}
               style={({ pressed }) => [
                 styles.row,
-                { backgroundColor: item.read_at ? theme.raised : theme.accentSoft, borderColor: theme.line },
+                { backgroundColor: item.read_at ? theme.surface : theme.accentSoft, borderBottomColor: theme.line },
                 pressed && { opacity: 0.6 },
               ]}
             >
@@ -74,9 +77,9 @@ function label(item: InboxItem) {
 }
 
 const styles = StyleSheet.create({
-  list: { paddingVertical: 6, paddingBottom: 24 },
+  list: { paddingBottom: 24 },
   empty: { flexGrow: 1, justifyContent: "center" },
-  row: { flexDirection: "row", alignItems: "center", gap: 11, marginHorizontal: 12, marginVertical: 5, padding: 12, borderWidth: StyleSheet.hairlineWidth, borderRadius: 14 },
+  row: { minHeight: 76, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 16, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth },
   main: { flex: 1, gap: 4 },
   head: { flexDirection: "row", alignItems: "center", gap: 8 },
   title: { flex: 1, fontSize: 15, fontWeight: "700" },
