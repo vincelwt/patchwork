@@ -1356,6 +1356,12 @@ textarea.field {
   resize: vertical;
   min-height: 76px;
 }
+.skill-instructions textarea.field {
+  min-height: 220px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
 select.field {
   cursor: pointer;
 }

@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { avatarStyle, initials } from "../lib/format";
 import type { Id, Member, Presence } from "@client/types";
@@ -9,6 +9,7 @@ export type View =
   | { kind: "channel"; id: Id }
   | { kind: "task"; id: Id }
   | { kind: "agents" }
+  | { kind: "skills" }
   | { kind: "projects" }
   | { kind: "members" }
   | { kind: "automations" }
@@ -203,11 +204,13 @@ export function Field({
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   type?: string;
 }) {
+  const id = useId();
   return (
     <div className="form-row">
-      <label>{label}</label>
+      <label htmlFor={id}>{label}</label>
       {textarea ? (
         <textarea
+          id={id}
           className="field"
           {...proseText}
           ref={inputRef}
@@ -218,6 +221,7 @@ export function Field({
         />
       ) : (
         <input
+          id={id}
           className="field"
           {...plainText}
           type={type}

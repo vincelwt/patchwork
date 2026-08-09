@@ -39,6 +39,8 @@ import {
   ProjectModal,
   ProjectsPage,
   SettingsPage,
+  SkillModal,
+  SkillsPage,
 } from "./components/Pages";
 import {
   Avatar,
@@ -758,6 +760,8 @@ function CreateSomething({
       return <NewSectionModal onClose={onClose} />;
     case "agent":
       return <AgentModal agent={null} onClose={onClose} />;
+    case "skill":
+      return <SkillModal skill={null} onClose={onClose} />;
     case "project":
       return <ProjectModal project={null} onClose={onClose} />;
     case "invite":
@@ -907,6 +911,8 @@ function MainView({ view, onSignOut }: { view: View; onSignOut: () => void }) {
       return <TaskPage taskId={view.id} />;
     case "agents":
       return <AgentsPage />;
+    case "skills":
+      return <SkillsPage />;
     case "projects":
       return <ProjectsPage />;
     case "members":

@@ -1000,6 +1000,18 @@ pub enum PreviewStatus {
 // Workspace
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSkill {
+    pub id: Id,
+    pub name: String,
+    /// When this shared instruction is useful.
+    #[serde(default)]
+    pub description: String,
+    pub instructions: String,
+    pub created_at: Millis,
+    pub updated_at: Millis,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Id,

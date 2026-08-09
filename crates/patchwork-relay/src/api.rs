@@ -21,6 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::orchestrator::{self, PostOptions, StartRunParams};
 use crate::relay::Relay;
 use crate::state::Shared;
+use crate::store::SaveWorkspaceSkillResult;
 use crate::{automations, preview_proxy};
 
 /// The relay itself: what is true before you have picked a workspace.
@@ -241,6 +242,9 @@ pub fn router(state: Shared) -> Router {
         .route("/api/members/{id}", delete(remove_member))
         .route("/api/agents", post(create_agent))
         .route("/api/agents/{id}", patch(update_agent))
+        // workspace skills
+        .route("/api/skills", get(list_skills).post(create_skill))
+        .route("/api/skills/{id}", patch(update_skill).delete(delete_skill))
         // projects and hosts
         .route("/api/projects", get(list_projects).post(create_project))
         .route(
@@ -487,6 +491,7 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
         members,
         sections: state.store.sections()?,
         channels,
+        skills: state.store.workspace_skills()?,
         projects: state.store.projects()?,
         hosts: state.hosts_with_presence().await?,
         tasks: state.store.tasks()?,
@@ -1740,6 +1745,130 @@ async fn update_agent(
 }
 
 // ---------------------------------------------------------------------------
+// workspace skills
+// ---------------------------------------------------------------------------
+
+const MAX_SKILL_NAME_BYTES: usize = 100;
+const MAX_SKILL_DESCRIPTION_BYTES: usize = 500;
+const MAX_SKILL_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+const MAX_WORKSPACE_SKILLS_BYTES: usize = 64 * 1024;
+
+fn validated_skill(input: UpsertWorkspaceSkill) -> ApiResult<(String, String, String)> {
+    let name = input.name.trim().to_string();
+    let description = input.description.trim().to_string();
+    let instructions = input.instructions.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a skill needs a name"));
+    }
+    if name.contains('\n') || name.contains('\r') {
+        return Err(ApiError::bad_request("the skill name must be one line"));
+    }
+    if instructions.is_empty() {
+        return Err(ApiError::bad_request("a skill needs instructions"));
+    }
+    if name.len() > MAX_SKILL_NAME_BYTES {
+        return Err(ApiError::bad_request("the skill name is too long"));
+    }
+    if description.len() > MAX_SKILL_DESCRIPTION_BYTES {
+        return Err(ApiError::bad_request("the skill description is too long"));
+    }
+    if instructions.len() > MAX_SKILL_INSTRUCTIONS_BYTES {
+        return Err(ApiError::bad_request("the skill instructions are too long"));
+    }
+    Ok((name, description, instructions))
+}
+
+fn save_skill(
+    state: &Shared,
+    skill: WorkspaceSkill,
+    must_exist: bool,
+) -> ApiResult<WorkspaceSkill> {
+    match state
+        .store
+        .save_workspace_skill(skill, must_exist, MAX_WORKSPACE_SKILLS_BYTES)?
+    {
+        SaveWorkspaceSkillResult::Saved(skill) => Ok(skill),
+        SaveWorkspaceSkillResult::Missing => Err(ApiError::not_found("no such skill")),
+        SaveWorkspaceSkillResult::TooLarge => Err(ApiError::bad_request(
+            "workspace skills are limited to 64 KB in total",
+        )),
+    }
+}
+
+fn emit_skills(state: &Shared) -> ApiResult<()> {
+    state.emit(Event::WorkspaceSkillsUpdated {
+        skills: state.store.workspace_skills()?,
+    });
+    Ok(())
+}
+
+async fn list_skills(
+    State(state): State<Shared>,
+    _caller: Caller,
+) -> ApiResult<Json<Vec<WorkspaceSkill>>> {
+    Ok(Json(state.store.workspace_skills()?))
+}
+
+async fn create_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Json(input): Json<UpsertWorkspaceSkill>,
+) -> ApiResult<Json<WorkspaceSkill>> {
+    let (name, description, instructions) = validated_skill(input)?;
+    let now = now_ms();
+    let skill = save_skill(
+        &state,
+        WorkspaceSkill {
+            id: new_id(),
+            name,
+            description,
+            instructions,
+            created_at: now,
+            updated_at: now,
+        },
+        false,
+    )?;
+    emit_skills(&state)?;
+    Ok(Json(skill))
+}
+
+async fn update_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<UpsertWorkspaceSkill>,
+) -> ApiResult<Json<WorkspaceSkill>> {
+    let (name, description, instructions) = validated_skill(input)?;
+    let now = now_ms();
+    let skill = save_skill(
+        &state,
+        WorkspaceSkill {
+            id,
+            name,
+            description,
+            instructions,
+            created_at: now,
+            updated_at: now,
+        },
+        true,
+    )?;
+    emit_skills(&state)?;
+    Ok(Json(skill))
+}
+
+async fn delete_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Ok>> {
+    if !state.store.delete_workspace_skill(&id)? {
+        return Err(ApiError::not_found("no such skill"));
+    }
+    emit_skills(&state)?;
+    Ok(Json(Ok::default()))
+}
+
+// ---------------------------------------------------------------------------
 // projects and hosts
 // ---------------------------------------------------------------------------
 
@@ -2751,6 +2880,74 @@ mod tests {
             byte_range("bytes=0-", DOWNLOAD_CHUNK_SIZE * 2),
             Some((0, DOWNLOAD_CHUNK_SIZE - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_skills_are_shared_without_per_member_access() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let member = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Online,
+        };
+        store.insert_member(&member).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let caller = Caller {
+            member,
+            run_id: None,
+            token_hash: "token".into(),
+            token_kind: "device".into(),
+        };
+
+        let skill = create_skill(
+            State(state.clone()),
+            caller.clone(),
+            Json(UpsertWorkspaceSkill {
+                name: "Release checks".into(),
+                description: "Before shipping".into(),
+                instructions: "Run the smoke test.".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            list_skills(State(state.clone()), caller.clone())
+                .await
+                .unwrap()
+                .0,
+            [skill]
+        );
+
+        let too_large = create_skill(
+            State(state.clone()),
+            caller,
+            Json(UpsertWorkspaceSkill {
+                name: "Too large".into(),
+                description: String::new(),
+                instructions: "x".repeat(MAX_SKILL_INSTRUCTIONS_BYTES + 1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(too_large.status, axum::http::StatusCode::BAD_REQUEST);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -449,6 +449,15 @@ export interface Preview {
   stopped_at?: Millis;
 }
 
+export interface WorkspaceSkill {
+  id: Id;
+  name: string;
+  description: string;
+  instructions: string;
+  created_at: Millis;
+  updated_at: Millis;
+}
+
 export interface Workspace {
   id: Id;
   name: string;
@@ -479,6 +488,7 @@ export interface Bootstrap {
   members: Member[];
   sections: Section[];
   channels: Channel[];
+  skills: WorkspaceSkill[];
   projects: Project[];
   hosts: Host[];
   tasks: Task[];
@@ -536,6 +546,7 @@ export type Event =
   | { kind: "channel_updated"; channel: Channel }
   | { kind: "channel_deleted"; channel_id: Id }
   | { kind: "sections_updated"; sections: Section[] }
+  | { kind: "workspace_skills_updated"; skills: WorkspaceSkill[] }
   | { kind: "member_updated"; member: Member }
   | { kind: "member_removed"; member_id: Id }
   | { kind: "presence_changed"; member_id: Id; presence: Presence }
