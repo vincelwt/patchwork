@@ -58,6 +58,9 @@ enum Command {
     Ask(AskArgs),
     /// Attach a file as evidence.
     Attach(AttachArgs),
+    /// List or remove evidence attached to the current task.
+    #[command(subcommand)]
+    Evidence(EvidenceCommand),
     /// Post a chart from a Flint chart spec.
     Chart(ChartArgs),
     /// Expose a dev server you started as a task preview.
@@ -143,6 +146,17 @@ struct AttachArgs {
     path: String,
     #[arg(long, default_value = "")]
     caption: String,
+    /// Replace an earlier evidence attachment (its id) with this file.
+    #[arg(long)]
+    replace: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// List evidence attached to the current task.
+    List,
+    /// Remove an attachment from the current task's review evidence.
+    Remove { attachment_id: String },
 }
 
 #[derive(Args)]
@@ -542,6 +556,7 @@ async fn run() -> Result<()> {
         Command::Tell(args) => tell(&client, args).await,
         Command::Ask(args) => ask(&client, &ctx, args).await,
         Command::Attach(args) => attach(&client, &ctx, args).await,
+        Command::Evidence(command) => evidence(&client, &ctx, command).await,
         Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
         Command::Pr { url } => link_pr(&client, &ctx, url).await,
@@ -1381,13 +1396,57 @@ async fn upload_attachment(
 }
 
 async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<()> {
+    if let Some(replaced) = &args.replace {
+        let task_id = ctx
+            .task_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("replacement evidence belongs to a task; this run has none"))?;
+        let detail: TaskDetail = client.get(&format!("/api/tasks/{task_id}")).await?;
+        if !detail.attachments.iter().any(|item| item.id == *replaced) {
+            bail!("attachment {replaced} is not evidence on this task");
+        }
+    }
     let attachment = upload_attachment(client, ctx, &args.path, &args.caption).await?;
+    if let Some(replaced) = &args.replace {
+        let _: Attachment = client
+            .delete(&format!("/api/files/{replaced}/evidence"))
+            .await?;
+    }
     client.print(&attachment, || {
         println!(
             "attached {} ({} bytes)",
             attachment.file_name, attachment.size
         )
     });
+    Ok(())
+}
+
+async fn evidence(client: &Client, ctx: &RunContext, command: EvidenceCommand) -> Result<()> {
+    match command {
+        EvidenceCommand::List => {
+            let task_id = ctx
+                .task_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("evidence belongs to a task; this run has none"))?;
+            let detail: TaskDetail = client.get(&format!("/api/tasks/{task_id}")).await?;
+            client.print(&detail.attachments, || {
+                for attachment in &detail.attachments {
+                    println!(
+                        "{}\t{}\t{}",
+                        attachment.id, attachment.file_name, attachment.caption
+                    );
+                }
+            });
+        }
+        EvidenceCommand::Remove { attachment_id } => {
+            let attachment: Attachment = client
+                .delete(&format!("/api/files/{attachment_id}/evidence"))
+                .await?;
+            client.print(&attachment, || {
+                println!("removed {} from review evidence", attachment.file_name)
+            });
+        }
+    }
     Ok(())
 }
 

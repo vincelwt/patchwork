@@ -270,6 +270,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/files", post(upload_file))
         .route("/api/files/{id}", get(download_file))
         .route("/api/files/{id}/grant", post(grant_file))
+        .route("/api/files/{id}/evidence", delete(remove_file_evidence))
         // workspace admin
         .route("/api/workspace", patch(rename_workspace))
         .route("/api/invites", get(list_invites).post(create_invite))
@@ -2384,6 +2385,41 @@ async fn grant_file(
     Ok(Json(GrantedUrl {
         url: state.grant_file(&attachment),
     }))
+}
+
+async fn remove_file_evidence(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Attachment>> {
+    let (attachment, _) = state
+        .store
+        .attachment(&id)?
+        .ok_or_else(|| ApiError::not_found("file not found"))?;
+    require_attachment_access(&state, &caller, &attachment)?;
+    let task_id = attachment
+        .task_id
+        .as_deref()
+        .ok_or_else(|| ApiError::conflict("that file is not task evidence"))?;
+    if caller.is_agent() {
+        let run_id = caller
+            .run_id
+            .as_deref()
+            .ok_or_else(|| ApiError::forbidden("evidence can only be changed from a task run"))?;
+        let run = state
+            .store
+            .run(run_id)?
+            .ok_or_else(|| ApiError::forbidden("evidence can only be changed from a task run"))?;
+        if run.task_id.as_deref() != Some(task_id) {
+            return Err(ApiError::forbidden(
+                "an agent can only change evidence on its current task",
+            ));
+        }
+    }
+    if !state.store.remove_task_attachment(&id, task_id)? {
+        return Err(ApiError::conflict("that file is no longer task evidence"));
+    }
+    Ok(Json(attachment))
 }
 
 #[derive(Deserialize, Default)]
