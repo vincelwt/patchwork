@@ -1,11 +1,29 @@
 // The shared client plus calls that only a browser can make.
 
 import { Api as SharedApi, ApiError } from "@client/api";
-import type { Attachment, Id } from "@client/types";
+import type { Attachment, Id, Task } from "@client/types";
 
 export { ApiError };
 
 export class Api extends SharedApi {
+  constructor(
+    baseUrl: string,
+    token: string,
+    private readonly onTaskCreated?: (task: Task) => void,
+  ) {
+    super(baseUrl, token);
+  }
+
+  override async createTask(input: Record<string, unknown>) {
+    const task = await super.createTask(input);
+    // The POST response is already authoritative. Publish it immediately
+    // instead of making the creating window wait for its own realtime echo;
+    // that echo remains useful to every other connected client and is an
+    // idempotent upsert here when it arrives.
+    this.onTaskCreated?.(task);
+    return task;
+  }
+
   async file(path: string) {
     const chunks: Blob[] = [];
     const chunkSize = 8 * 1024 * 1024;

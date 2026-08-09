@@ -23,7 +23,7 @@ export default function MembersScreen() {
 
   const dm = async (member: Member) => {
     const channel = await store.mutate((api) => api.openDm(member.id));
-    router.push({ pathname: "/(app)/channels/[channelId]", params: { channelId: channel.id } });
+    router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
   };
 
   return (

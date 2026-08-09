@@ -8,7 +8,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types ../client/mobile-store-reducer.test.ts src/lib/format.test.ts",
+    "test": "node --test --experimental-strip-types ../client/mobile-store-reducer.test.ts ../client/scroll.test.ts src/lib/format.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {
@@ -27,6 +27,7 @@
     "expo-speech-recognition": "^56.0.1",
     "expo-splash-screen": "~57.0.5",
     "expo-status-bar": "~57.0.1",
+    "expo-symbols": "~57.0.2",
     "expo-system-ui": "~57.0.2",
     "react": "19.2.3",
     "react-dom": "19.2.3",

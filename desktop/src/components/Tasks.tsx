@@ -22,6 +22,8 @@ import {
 import {
   AgentIcon,
   AttachIcon,
+  ChevronIcon,
+  CheckIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -36,7 +38,7 @@ import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
-import { TASK_STATUSES } from "@client/types";
+import { isTerminalTaskStatus, TASK_STATUSES } from "@client/types";
 import type {
   Attachment,
   Id,
@@ -87,6 +89,16 @@ function useTaskActions(task: Task) {
         case "answer":
           if (state.run) inspect({ kind: "run", runId: state.run.id });
           break;
+        case "approve": {
+          setBusy(true);
+          try {
+            const run = await api.approveTask(task.id);
+            inspect({ kind: "run", runId: run.id });
+          } finally {
+            setBusy(false);
+          }
+          break;
+        }
         case "complete":
           await api.updateTask(task.id, { status: "done" });
           toast("Task closed");
@@ -112,6 +124,8 @@ function actionIcon(kind: NextAction["kind"]) {
       return <StopIcon size={13} />;
     case "answer":
       return <QuestionIcon size={14} />;
+    case "approve":
+      return <CheckIcon size={14} />;
     default:
       return null;
   }
@@ -120,6 +134,8 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
+const DONE_COLLAPSED = "patchwork.tasksDoneCollapsed";
+const TASK_DRAFT_PREFIX = "patchwork.taskDraft.";
 
 /// Who a new task should belong to: whoever you gave the last one to, and
 /// yourself before you have given anyone anything. Guessing an agent for you
@@ -147,6 +163,9 @@ export function TasksBoard() {
   const [dragging, setDragging] = useState<string | null>(null);
   const [dropColumn, setDropColumn] = useState<TaskStatus | null>(null);
   const [creating, setCreating] = useState(false);
+  const [doneCollapsed, setDoneCollapsed] = useState(
+    () => localStorage.getItem(DONE_COLLAPSED) !== "false",
+  );
   // Two ways to look at the same tasks, remembered: a board is for moving work
   // along, a list is for reading it. Which one you want is a habit, not a
   // per-visit decision.
@@ -156,6 +175,11 @@ export function TasksBoard() {
   const setLayoutAndRemember = (next: "board" | "list") => {
     setLayout(next);
     localStorage.setItem("patchwork.taskLayout", next);
+  };
+  const toggleDone = () => {
+    const collapsed = !doneCollapsed;
+    setDoneCollapsed(collapsed);
+    localStorage.setItem(DONE_COLLAPSED, String(collapsed));
   };
 
   const tasks = useMemo(
@@ -169,6 +193,7 @@ export function TasksBoard() {
   );
 
   const needsYou = tasks.filter((task) => {
+    if (isTerminalTaskStatus(task.status)) return false;
     const state = readTask(task, app.members, app.runs, app.questions);
     return state.situation === "asking" || state.situation === "review";
   }).length;
@@ -227,15 +252,20 @@ export function TasksBoard() {
       </div>
 
       {layout === "list" ? (
-        <TaskList tasks={tasks} />
+        <TaskList
+          tasks={tasks}
+          doneCollapsed={doneCollapsed}
+          onToggleDone={toggleDone}
+        />
       ) : (
       <div className="board">
         {TASK_STATUSES.map((status) => {
           const column = tasks.filter((task) => task.status === status);
+          const collapsed = status === "done" && doneCollapsed;
           return (
             <div
               key={status}
-              className={`board-column${dropColumn === status ? " drop-target" : ""}`}
+              className={`board-column${collapsed ? " collapsed" : ""}${dropColumn === status ? " drop-target" : ""}`}
               onDragOver={(event) => {
                 event.preventDefault();
                 setDropColumn(status);
@@ -247,24 +277,40 @@ export function TasksBoard() {
                 setDragging(null);
               }}
             >
-              <div className="board-column-head">
-                <span className={`column-dot ${status}`} />
-                <span>{statusLabel(status)}</span>
-                {column.length > 0 && <span className="count">{column.length}</span>}
-              </div>
-              <div className="board-column-body">
-                {column.map((task) => (
-                  <TaskCard
-                    key={task.id}
-                    task={task}
-                    onDragStart={() => setDragging(task.id)}
-                    onClick={() => go({ kind: "task", id: task.id })}
-                  />
-                ))}
-                {column.length === 0 && (
-                  <div className="board-empty">{emptyColumn(status)}</div>
-                )}
-              </div>
+              {status === "done" ? (
+                <button
+                  className="board-column-head collapsible"
+                  aria-expanded={!collapsed}
+                  title={collapsed ? "Show done tasks" : "Hide done tasks"}
+                  onClick={toggleDone}
+                >
+                  <span className={`column-dot ${status}`} />
+                  <span>{statusLabel(status)}</span>
+                  {column.length > 0 && <span className="count">{column.length}</span>}
+                  <ChevronIcon size={13} open={!collapsed} />
+                </button>
+              ) : (
+                <div className="board-column-head">
+                  <span className={`column-dot ${status}`} />
+                  <span>{statusLabel(status)}</span>
+                  {column.length > 0 && <span className="count">{column.length}</span>}
+                </div>
+              )}
+              {!collapsed && (
+                <div className="board-column-body">
+                  {column.map((task) => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      onDragStart={() => setDragging(task.id)}
+                      onClick={() => go({ kind: "task", id: task.id })}
+                    />
+                  ))}
+                  {column.length === 0 && (
+                    <div className="board-empty">{emptyColumn(status)}</div>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -279,7 +325,15 @@ export function TasksBoard() {
 /// The same tasks as rows, grouped by status, with the empty statuses left
 /// out: a board shows you that Blocked is empty because the column is part of
 /// the shape; a list saying "Blocked (0)" is just noise to scroll past.
-function TaskList({ tasks }: { tasks: Task[] }) {
+function TaskList({
+  tasks,
+  doneCollapsed,
+  onToggleDone,
+}: {
+  tasks: Task[];
+  doneCollapsed: boolean;
+  onToggleDone: () => void;
+}) {
   const app = useApp();
   const { go } = useNavigation();
 
@@ -306,12 +360,25 @@ function TaskList({ tasks }: { tasks: Task[] }) {
     <div className="task-list">
       {groups.map((group) => (
         <div key={group.status}>
-          <div className="section-head">
-            <span className={`column-dot ${group.status}`} />
-            <span className="section-title">{statusLabel(group.status)}</span>
-            <span className="count">{group.items.length}</span>
-          </div>
-          {group.items.map((task) => {
+          {group.status === "done" ? (
+            <button
+              className="section-head collapsible"
+              aria-expanded={!doneCollapsed}
+              onClick={onToggleDone}
+            >
+              <ChevronIcon size={13} open={!doneCollapsed} />
+              <span className={`column-dot ${group.status}`} />
+              <span className="section-title">{statusLabel(group.status)}</span>
+              <span className="count">{group.items.length}</span>
+            </button>
+          ) : (
+            <div className="section-head">
+              <span className={`column-dot ${group.status}`} />
+              <span className="section-title">{statusLabel(group.status)}</span>
+              <span className="count">{group.items.length}</span>
+            </div>
+          )}
+          {(!doneCollapsed || group.status !== "done") && group.items.map((task) => {
             const state = readTask(task, app.members, app.runs, app.questions);
             const project = app.projects.find(
               (candidate) => candidate.id === task.project_id,
@@ -328,7 +395,7 @@ function TaskList({ tasks }: { tasks: Task[] }) {
                   <span className="name">{task.title}</span>
                   <span className="sub">{state.headline}</span>
                 </span>
-                {due && task.status !== "done" && (
+                {due && !isTerminalTaskStatus(task.status) && (
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
                 )}
                 {project && <Chip>{project.name}</Chip>}
@@ -356,6 +423,8 @@ function emptyColumn(status: TaskStatus) {
       return "Nothing is stuck";
     case "review":
       return "Nothing to review";
+    case "canceled":
+      return "Nothing canceled";
     default:
       return "Nothing finished yet";
   }
@@ -414,7 +483,7 @@ function TaskCard({
       )}
 
       <div className="meta">
-        {due && task.status !== "done" && (
+        {due && !isTerminalTaskStatus(task.status) && (
           <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
         )}
         {project && <Chip>{project.name}</Chip>}
@@ -452,8 +521,8 @@ function TaskCard({
 /// The task composer: one big box you type into, with everything else
 /// underneath it.
 ///
-/// A task is a sentence and sometimes a screenshot. Owner, project and date
-/// are answers to questions the sentence raises, so they sit below it as
+/// A task is a sentence and sometimes a screenshot. Owner and project are
+/// answers to questions the sentence raises, so they sit below it as
 /// small controls rather than as a form the sentence has to get through.
 export function NewTaskModal({
   onClose,
@@ -464,15 +533,19 @@ export function NewTaskModal({
 }) {
   const app = useApp();
   const api = useApi();
-  const { go } = useNavigation();
-  const [outcome, setOutcome] = useState("");
+  const { go, toast } = useNavigation();
+  const draftKey = `${TASK_DRAFT_PREFIX}${app.workspace?.id ?? ""}.${
+    app.me?.id ?? ""
+  }.${sourceChannelId ?? ""}`;
+  const [outcome, setOutcome] = useState(
+    () => localStorage.getItem(draftKey) ?? "",
+  );
   const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.me));
   const [project, setProject] = useState(() => {
     const agent = app.members.find((member) => member.id === owner);
     return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
   });
   const [start, setStart] = useState(true);
-  const [due, setDue] = useState("");
   // Held, not uploaded: there is no task to attach them to until you save,
   // and a dialog you close should leave nothing behind.
   const [images, setImages] = useState<File[]>([]);
@@ -482,6 +555,11 @@ export function NewTaskModal({
   const [justCreated, setJustCreated] = useState("");
   const outcomeField = useRef<HTMLTextAreaElement>(null);
 
+  useEffect(() => {
+    if (outcome) localStorage.setItem(draftKey, outcome);
+    else localStorage.removeItem(draftKey);
+  }, [draftKey, outcome]);
+
   const add = (files: FileList | File[] | null | undefined) => {
     const picked = [...(files ?? [])].filter((file) => file.size > 0);
     if (picked.length > 0) setImages((held) => [...held, ...picked]);
@@ -489,8 +567,8 @@ export function NewTaskModal({
   };
 
   /// Linear's habit: most tasks arrive in threes. `another` keeps the box
-  /// open with the owner, project and date you just chose.
-  const create = async (another = false) => {
+  /// open with the owner and project you just chose.
+  const create = async (after: "open" | "dismiss" | "another" = "open") => {
     setBusy(true);
     setError("");
     try {
@@ -505,7 +583,6 @@ export function NewTaskModal({
         owner_id: owner || undefined,
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
-        due_at: dateInputToMillis(due) || undefined,
         attachment_ids: attachmentIds,
         // The relay writes the first message; the agent starts after it exists.
         start: false,
@@ -513,7 +590,8 @@ export function NewTaskModal({
       if (start && owner && ownerIsAgent) {
         await api.runTask(task.id, { agent_id: owner });
       }
-      if (another) {
+      localStorage.removeItem(draftKey);
+      if (after === "another") {
         setOutcome("");
         setImages([]);
         setBusy(false);
@@ -522,7 +600,14 @@ export function NewTaskModal({
         return;
       }
       onClose();
-      go({ kind: "task", id: task.id });
+      if (after === "dismiss") {
+        toast(`${task.key} created`, {
+          label: "Open",
+          onClick: () => go({ kind: "task", id: task.id }),
+        });
+      } else {
+        go({ kind: "task", id: task.id });
+      }
     } catch (err) {
       setError(String((err as Error).message ?? err));
       setBusy(false);
@@ -536,12 +621,16 @@ export function NewTaskModal({
     const onKey = (event: KeyboardEvent) => {
       if (
         event.key === "Enter" &&
-        (event.metaKey || event.ctrlKey) &&
-        event.shiftKey
+        (event.metaKey || event.ctrlKey)
       ) {
         event.preventDefault();
         event.stopPropagation();
-        if (outcome.trim() && !busy) void create(true);
+        // Modal listens on window too. Stop its primary-button shortcut so one
+        // keypress cannot take both the in-place and open-task paths.
+        event.stopImmediatePropagation();
+        if (outcome.trim() && !busy) {
+          void create(event.shiftKey ? "another" : "dismiss");
+        }
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -593,109 +682,75 @@ export function NewTaskModal({
         )}
 
         <div className="task-composer-attributes">
-          <Dropdown
-            quiet
-            value={owner}
-            onChange={setOwner}
-            placeholder="Nobody yet"
-            options={[
-              { value: "", label: "Nobody yet" },
-              ...app.members.map((member) => ({
-                value: member.id,
-                label: member.display_name,
-                hint: member.kind === "agent" ? member.agent?.runtime : "person",
-              })),
-            ]}
-          />
-          <Dropdown
-            quiet
-            value={project}
-            onChange={setProject}
-            placeholder="No project"
-            options={[
-              { value: "", label: "No project" },
-              ...app.projects.map((candidate) => ({
-                value: candidate.id,
-                label: candidate.name,
-              })),
-            ]}
-          />
-          <DueField value={due} onChange={setDue} />
-          <label className="attach-button" title="Attach evidence">
-            <AttachIcon size={15} />
-            <input
-              type="file"
-              multiple
-              hidden
-              onChange={(event) => {
-                add(event.target.files);
-                event.target.value = "";
-              }}
+          <div className="task-composer-fields">
+            <Dropdown
+              quiet
+              value={owner}
+              onChange={setOwner}
+              placeholder="Nobody yet"
+              options={[
+                { value: "", label: "Nobody yet" },
+                ...app.members.map((member) => ({
+                  value: member.id,
+                  label: member.display_name,
+                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
+                  icon: <Avatar member={member} size={18} />,
+                })),
+              ]}
             />
-          </label>
-          <span className="spacer" />
-          {justCreated && (
-            <span className="composer-hint">{justCreated} created</span>
-          )}
-          {ownerIsAgent && (
-            <Toggle checked={start} onChange={setStart} label="Start now" />
-          )}
-          <button
-            className="button quiet"
-            disabled={!outcome.trim() || busy}
-            title="Create this one and keep the box open (⌘⇧↵)"
-            onClick={() => void create(true)}
-          >
-            Another
-          </button>
-          <button
-            className="button primary"
-            disabled={!outcome.trim() || busy}
-            onClick={() => void create()}
-          >
-            {ownerIsAgent && start ? "Create and start" : "Create"}
-          </button>
+            <Dropdown
+              quiet
+              value={project}
+              onChange={setProject}
+              placeholder="No project"
+              options={[
+                { value: "", label: "No project" },
+                ...app.projects.map((candidate) => ({
+                  value: candidate.id,
+                  label: candidate.name,
+                })),
+              ]}
+            />
+            <label className="attach-button" title="Attach evidence">
+              <AttachIcon size={15} />
+              <input
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => {
+                  add(event.target.files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <div className="task-composer-actions">
+            {justCreated && (
+              <span className="composer-hint">{justCreated} created</span>
+            )}
+            {ownerIsAgent && (
+              <Toggle checked={start} onChange={setStart} label="Start now" />
+            )}
+            <button
+              className="button quiet"
+              disabled={!outcome.trim() || busy}
+              title="Create this one and keep the box open (⌘⇧↵)"
+              onClick={() => void create("another")}
+            >
+              Another
+            </button>
+            <button
+              className="button primary"
+              disabled={!outcome.trim() || busy}
+              onClick={() => void create("open")}
+            >
+              {ownerIsAgent && start ? "Create and start" : "Create"}
+            </button>
+          </div>
         </div>
       </div>
       {error && <div className="error-text">{error}</div>}
     </Modal>
-  );
-}
-
-/// A date takes as much room as its placeholder, and `mm/dd/yyyy` is three
-/// times the width of the word "Due". So it is a word until it is a date.
-function DueField({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const label = value ? dueLabel(dateInputToMillis(value))?.text : undefined;
-
-  if (!editing && !value) {
-    return (
-      <button
-        className="chip-button"
-        title="Due date"
-        onClick={() => setEditing(true)}
-      >
-        Due
-      </button>
-    );
-  }
-
-  return (
-    <input
-      className="date-input quiet"
-      type="date"
-      title={label ?? "Due date"}
-      autoFocus={editing}
-      value={value}
-      onBlur={() => setEditing(false)}
-      onChange={(event) => onChange(event.target.value)}
-    />
   );
 }
 
@@ -1244,7 +1299,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
                 })
               }
             />
-            {due && task.status !== "done" && (
+            {due && !isTerminalTaskStatus(task.status) && (
               <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
             )}
           </Fact>

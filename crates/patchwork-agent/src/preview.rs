@@ -147,7 +147,10 @@ impl PreviewManager {
                 if !running.lock().await.contains_key(&preview_id) {
                     return;
                 }
-                if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+                {
                     misses = 0;
                     continue;
                 }
@@ -326,7 +329,9 @@ impl PreviewManager {
                 tokio_tungstenite::tungstenite::http::HeaderValue::try_from(value),
             ) {
                 let value = local_header_value(&lower, value.to_str().unwrap_or_default(), port);
-                if let Ok(value) = tokio_tungstenite::tungstenite::http::HeaderValue::try_from(value) {
+                if let Ok(value) =
+                    tokio_tungstenite::tungstenite::http::HeaderValue::try_from(value)
+                {
                     request.headers_mut().insert(name, value);
                 }
             }
@@ -342,13 +347,10 @@ impl PreviewManager {
             }
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        self.sockets.lock().await.insert(
-            socket_id.clone(),
-            PreviewSocket {
-                preview_id,
-                tx,
-            },
-        );
+        self.sockets
+            .lock()
+            .await
+            .insert(socket_id.clone(), PreviewSocket { preview_id, tx });
         let _ = self.out.send(HostToRelay::PreviewSocketReady {
             socket_id: socket_id.clone(),
             error: None,
@@ -451,7 +453,10 @@ async fn kill_child(child: &mut Child) {
 }
 
 async fn bounded_body(response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
-    if response.content_length().is_some_and(|size| size > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
         anyhow::bail!("preview response exceeds 20 MB");
     }
     let mut bytes = Vec::new();
@@ -469,7 +474,10 @@ async fn bounded_body(response: reqwest::Response, limit: usize) -> anyhow::Resu
 async fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -482,12 +490,18 @@ async fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
 /// Pick a free port for a preview, starting from the project's preferred one.
 pub async fn pick_port(preferred: Option<u16>) -> u16 {
     if let Some(p) = preferred {
-        if tokio::net::TcpListener::bind(("127.0.0.1", p)).await.is_ok() {
+        if tokio::net::TcpListener::bind(("127.0.0.1", p))
+            .await
+            .is_ok()
+        {
             return p;
         }
     }
     for port in 4300u16..4400 {
-        if tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return port;
         }
     }

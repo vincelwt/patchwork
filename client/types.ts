@@ -4,6 +4,9 @@
 export type Id = string;
 export type Millis = number;
 
+export const REALTIME_HEARTBEAT = '{"t":"heartbeat"}';
+export const REALTIME_HEARTBEAT_MS = 20_000;
+
 export type MemberKind = "human" | "agent";
 export type Presence =
   | "offline"
@@ -122,7 +125,13 @@ export interface Message {
   edited_at?: Millis;
 }
 
-export type TaskStatus = "planned" | "running" | "blocked" | "review" | "done";
+export type TaskStatus =
+  | "planned"
+  | "running"
+  | "blocked"
+  | "review"
+  | "done"
+  | "canceled";
 
 export const TASK_STATUSES: TaskStatus[] = [
   "planned",
@@ -130,7 +139,12 @@ export const TASK_STATUSES: TaskStatus[] = [
   "blocked",
   "review",
   "done",
+  "canceled",
 ];
+
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status === "done" || status === "canceled";
+}
 
 export interface PullRequestState {
   number: number;
@@ -157,6 +171,8 @@ export interface Task {
   current_run_id?: Id;
   pr_url?: string;
   pr_state?: PullRequestState;
+  /// Exact action the owning agent will take if a person approves this review.
+  review_action?: string;
   created_by: Id;
   /// When this is meant to be done. The Inbox says so on the day.
   due_at?: Millis;

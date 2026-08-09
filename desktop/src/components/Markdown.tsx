@@ -64,10 +64,23 @@ function BlockView({ block, options }: { block: Block; options: InlineOptions })
 
     case "list": {
       const items = block.items.map((item, index) => (
-        <li key={index} className={item.checked === undefined ? "" : "task"}>
-          {item.checked !== undefined && (
-            <span className={`md-check${item.checked ? " on" : ""}`}>
-              {item.checked && <CheckIcon size={11} />}
+        <li key={index} className={item.task ? "task" : ""}>
+          {item.task && (
+            <span
+              className={`md-check ${item.task}`}
+              role="checkbox"
+              aria-checked={
+                item.task === "progress" ? "mixed" : item.task === "checked"
+              }
+              aria-label={`${
+                item.task === "checked"
+                  ? "Completed"
+                  : item.task === "progress"
+                    ? "In-progress"
+                    : "Incomplete"
+              } checklist item`}
+            >
+              {item.task === "checked" && <CheckIcon size={11} />}
             </span>
           )}
           <span className="md-item">

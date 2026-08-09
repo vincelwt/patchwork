@@ -27,7 +27,12 @@ interface Navigation {
   go: (view: View) => void;
   inspector: Inspector;
   inspect: (inspector: Inspector) => void;
-  toast: (message: string) => void;
+  toast: (message: string, action?: ToastAction) => void;
+}
+
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
 }
 
 export const NavigationContext = createContext<Navigation>({

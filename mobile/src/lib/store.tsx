@@ -20,6 +20,7 @@ import {
   touchChannel,
   type WorkspaceData,
 } from "@client/mobile-store-reducer";
+import { REALTIME_HEARTBEAT, REALTIME_HEARTBEAT_MS } from "@client/types";
 import type { Envelope, Id, Message, RunDetail } from "@client/types";
 import {
   apiFor,
@@ -56,8 +57,8 @@ export class MobileWorkspaceStore {
   private api?: Api;
   private cacheKey?: string;
   private socket?: WebSocket;
-  private queued?: Envelope[];
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
   private cacheTimer?: ReturnType<typeof setTimeout>;
   private retryDelay = 1_000;
   private generation = 0;
@@ -226,8 +227,6 @@ export class MobileWorkspaceStore {
     const api = this.api;
     this.clearReconnect();
     this.patch({ connection: "connecting", error: undefined });
-    this.queued = [];
-    this.openSocket(generation, attempt, api);
 
     const task = (async () => {
       try {
@@ -256,13 +255,12 @@ export class MobileWorkspaceStore {
         );
         if (!this.isCurrent(generation, attempt)) return;
 
-        const queued = this.queued ?? [];
-        this.queued = undefined;
-        let data: WorkspaceData = this.snapshot;
-        for (const envelope of queued) data = applyEnvelope(data, envelope);
+        // Start realtime from the boundary returned by bootstrap. The relay
+        // replays mutations that happened while the snapshot and recent
+        // message pages were loading, without an ambiguous startup window.
+        this.openSocket(generation, attempt, api);
         this.replace({
           ...this.snapshot,
-          ...data,
           lastSyncAt: Date.now(),
           error: undefined,
           connection:
@@ -272,7 +270,6 @@ export class MobileWorkspaceStore {
         this.scheduleCache();
       } catch (error) {
         if (!this.isCurrent(generation, attempt) || !this.api) return;
-        this.queued = undefined;
         this.closeSocket();
         this.patch({
           connection: this.reachable ? "error" : "offline",
@@ -296,11 +293,17 @@ export class MobileWorkspaceStore {
     );
     url.searchParams.set("token", api.token);
     url.searchParams.set("since", String(this.snapshot.seq));
+    url.searchParams.set("heartbeat", "1");
+    url.searchParams.set("connection", "mobile");
     const socket = new WebSocket(url.toString());
     this.socket = socket;
 
     socket.onopen = () => {
       if (!this.isCurrent(generation, attempt) || socket !== this.socket) return;
+      this.stopHeartbeat();
+      this.heartbeatTimer = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(REALTIME_HEARTBEAT);
+      }, REALTIME_HEARTBEAT_MS);
       this.retryDelay = 1_000;
       this.patch({ connection: "live", error: undefined });
     };
@@ -312,14 +315,11 @@ export class MobileWorkspaceStore {
           envelope?: Envelope;
         };
         if (payload.t !== "event" || !payload.envelope) return;
-        if (this.queued) this.queued.push(payload.envelope);
-        else {
-          const next = applyEnvelope(this.snapshot, payload.envelope);
-          if (next !== this.snapshot) {
-            this.replaceData(next);
-            this.patch({ lastSyncAt: Date.now() });
-            this.scheduleCache();
-          }
+        const next = applyEnvelope(this.snapshot, payload.envelope);
+        if (next !== this.snapshot) {
+          this.replaceData(next);
+          this.patch({ lastSyncAt: Date.now() });
+          this.scheduleCache();
         }
       } catch {
         socket.close();
@@ -328,6 +328,7 @@ export class MobileWorkspaceStore {
     socket.onerror = () => socket.close();
     socket.onclose = () => {
       if (!this.isCurrent(generation, attempt) || socket !== this.socket) return;
+      this.stopHeartbeat();
       this.socket = undefined;
       if (!this.canConnect()) {
         this.patch({ connection: "offline" });
@@ -399,11 +400,11 @@ export class MobileWorkspaceStore {
     ++this.attempt;
     this.connecting = undefined;
     this.clearReconnect();
-    this.queued = undefined;
     this.closeSocket();
   }
 
   private closeSocket() {
+    this.stopHeartbeat();
     const socket = this.socket;
     if (!socket) return;
     this.socket = undefined;
@@ -412,6 +413,11 @@ export class MobileWorkspaceStore {
     socket.onerror = null;
     socket.onclose = null;
     socket.close();
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
   }
 
   private clearReconnect() {

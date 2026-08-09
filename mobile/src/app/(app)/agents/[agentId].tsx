@@ -30,7 +30,7 @@ export default function AgentScreen() {
 
   const message = async () => {
     const channel = await store.mutate((api) => api.openDm(agent.id));
-    router.push({ pathname: "/(app)/channels/[channelId]", params: { channelId: channel.id } });
+    router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
   };
 
   return (

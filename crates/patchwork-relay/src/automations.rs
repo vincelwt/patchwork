@@ -66,8 +66,8 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
     for automation in automations.into_iter().filter(|a| a.enabled) {
         let should_fire = match &automation.trigger {
             AutomationTrigger::TaskStatus { status, project_id } => {
-                let entered = previous.map(|p| p.status != *status).unwrap_or(true)
-                    && task.status == *status;
+                let entered =
+                    previous.map(|p| p.status != *status).unwrap_or(true) && task.status == *status;
                 let project_matches = project_id
                     .as_ref()
                     .map(|p| task.project_id.as_ref() == Some(p))
@@ -88,9 +88,17 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
         }
 
         let summary = format!("Task {} entered {}", task.key, task.status.as_str());
-        let payload = json!({ "task_id": task.id, "key": task.key, "status": task.status.as_str() });
-        if let Err(err) =
-            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        let payload =
+            json!({ "task_id": task.id, "key": task.key, "status": task.status.as_str() });
+        if let Err(err) = fire(
+            state,
+            &automation,
+            summary,
+            payload,
+            Some(task.id.clone()),
+            None,
+        )
+        .await
         {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
@@ -119,8 +127,15 @@ pub async fn on_pull_request(state: &Shared, task: &Task, kind: &str, detail: &s
         }
         let summary = format!("Pull request {kind} on {}", task.key);
         let payload = json!({ "task_id": task.id, "kind": kind, "detail": detail });
-        if let Err(err) =
-            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        if let Err(err) = fire(
+            state,
+            &automation,
+            summary,
+            payload,
+            Some(task.id.clone()),
+            None,
+        )
+        .await
         {
             tracing::warn!(?err, "pull request automation failed");
         }
@@ -194,7 +209,9 @@ pub async fn fire(
         created_at: now_ms(),
         ended_at: None,
     };
-    state.store.upsert_automation_run(&record)?;
+    if let Some(existing) = state.store.reserve_automation_run(&record)? {
+        return Ok(existing);
+    }
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });
@@ -579,16 +596,17 @@ fn announce_due_tasks(state: &Shared) {
             continue;
         }
         let title = format!("{} is due", task.key);
-        if let Err(err) = crate::orchestrator::notify_task(state, &task, InboxKind::TaskDue, title) {
+        if let Err(err) = crate::orchestrator::notify_task(state, &task, InboxKind::TaskDue, title)
+        {
             tracing::warn!(?err, task = %task.key, "could not announce a due task");
         }
     }
 }
 
-/// Due, and still worth saying so. Finishing a task is the way to stop it
+/// Due, and still worth saying so. Closing a task is the way to stop it
 /// nagging, whatever its date says.
 fn is_due(task: &Task, now: Millis) -> bool {
-    matches!(task.due_at, Some(at) if at <= now) && task.status != TaskStatus::Done
+    matches!(task.due_at, Some(at) if at <= now) && !task.status.is_terminal()
 }
 
 /// The next firing after `after`, in the relay's local time.
@@ -607,10 +625,7 @@ pub fn next_cron_after(expression: &str, after: i64) -> Option<i64> {
     };
     let schedule = cron::Schedule::from_str(&normalised).ok()?;
     let from = chrono::Local.timestamp_millis_opt(after).single()?;
-    schedule
-        .after(&from)
-        .next()
-        .map(|at| at.timestamp_millis())
+    schedule.after(&from).next().map(|at| at.timestamp_millis())
 }
 
 #[cfg(test)]
@@ -630,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_done() {
+    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_closed() {
         let mut task = Task {
             id: "t".into(),
             key: "PW-1".into(),
@@ -647,6 +662,7 @@ mod tests {
             current_run_id: None,
             pr_url: None,
             pr_state: None,
+            review_action: None,
             created_by: "m".into(),
             due_at: None,
             once_key: None,
@@ -661,6 +677,9 @@ mod tests {
         assert!(is_due(&task, 2_000));
 
         task.status = TaskStatus::Done;
+        assert!(!is_due(&task, 9_999));
+
+        task.status = TaskStatus::Canceled;
         assert!(!is_due(&task, 9_999));
     }
 
