@@ -2699,7 +2699,10 @@ mod tests {
         }
         let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
         assert_eq!(
-            results.iter().filter(|(_, status)| status.is_some()).count(),
+            results
+                .iter()
+                .filter(|(_, status)| status.is_some())
+                .count(),
             1
         );
         let winner = results

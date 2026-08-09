@@ -1137,11 +1137,10 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     };
 
     let previous_task_status = if let Some(task_id) = &run.task_id {
-        match state.store.activate_task_run(
-            task_id,
-            &run.id,
-            params.required_task_status,
-        )? {
+        match state
+            .store
+            .activate_task_run(task_id, &run.id, params.required_task_status)?
+        {
             Some(status) => Some(status),
             None => {
                 let mut cancelled = run.clone();
@@ -2571,11 +2570,10 @@ pub async fn update_task(
         bail!("only a person can reopen a completed or canceled task");
     }
     if actor_is_agent {
-        if !state.store.update_task_if_unchanged(
-            &task,
-            previous.updated_at,
-            has_explicit_status,
-        )? {
+        if !state
+            .store
+            .update_task_if_unchanged(&task, previous.updated_at, has_explicit_status)?
+        {
             bail!("the task changed while the agent was updating it; reload it and try again");
         }
     } else if has_explicit_status {

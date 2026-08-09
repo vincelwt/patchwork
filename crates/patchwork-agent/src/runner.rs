@@ -386,12 +386,9 @@ async fn execute(
     let conn = Arc::new(conn);
 
     let opened = match spec.resume_session_id.as_deref() {
-        Some(sid) if conn.supports_load_session() => {
-            match conn.load_session(sid, &prepared.path).await {
-                Ok(()) => NewSession {
-                    session_id: sid.to_string(),
-                    ..Default::default()
-                },
+        Some(sid) if conn.supports_restore_session() => {
+            match conn.restore_session(sid, &prepared.path).await {
+                Ok(session) => session,
                 // A stale session id must not strand the task.
                 Err(err) => {
                     tracing::debug!(?err, "could not resume session; starting a fresh one");
@@ -755,8 +752,9 @@ async fn apply_session_preferences(
 /// Anything unrecognised is left alone: OpenCode's `build`/`plan` are a
 /// different question, and picking one of them at random is not an answer.
 fn most_permissive(modes: &[patchwork_core::models::RuntimeOption]) -> Option<String> {
-    const WIDEST: [&str; 6] = [
+    const WIDEST: [&str; 7] = [
         "bypassPermissions",
+        "agent-full-access",
         "full-access",
         "dontAsk",
         "yolo",
@@ -1390,6 +1388,10 @@ mod tests {
         assert_eq!(
             most_permissive(&modes(&["read-only", "auto", "full-access"])),
             Some("full-access".into())
+        );
+        assert_eq!(
+            most_permissive(&modes(&["read-only", "agent", "agent-full-access"])),
+            Some("agent-full-access".into())
         );
         // Build or plan is a different question, and neither answer is "wider".
         assert_eq!(most_permissive(&modes(&["build", "plan"])), None);

@@ -29,7 +29,11 @@ struct WatchEvent {
 
 fn parse_watch_events(stdout: &str) -> Option<Vec<WatchEvent>> {
     let mut events = Vec::new();
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let mut event: WatchEvent = serde_json::from_str(line).ok()?;
         event.event_key = event.event_key.trim().to_string();
         event.condition_key = event.condition_key.trim().to_string();
@@ -456,8 +460,7 @@ async fn dispatch(
     {
         Ok(run) => run,
         Err(error)
-            if required_task_status.is_some()
-                && error.is::<orchestrator::TaskUnavailable>() =>
+            if required_task_status.is_some() && error.is::<orchestrator::TaskUnavailable>() =>
         {
             if let Some(selection) = record.selection.as_mut() {
                 selection["started"] = json!(false);
@@ -896,10 +899,9 @@ mod tests {
     #[test]
     fn ordinary_watch_output_stays_legacy() {
         assert!(parse_watch_events("one finding\nmore detail").is_none());
-        assert!(parse_watch_events(
-            "{\"event_key\":\"missing the other required fields\"}"
-        )
-        .is_none());
+        assert!(
+            parse_watch_events("{\"event_key\":\"missing the other required fields\"}").is_none()
+        );
     }
 
     #[test]

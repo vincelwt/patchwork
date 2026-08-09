@@ -2732,13 +2732,19 @@ mod tests {
 
     #[test]
     fn only_a_deliberate_reopen_leaves_a_terminal_state() {
-        assert!(reopens_terminal(TaskStatus::Done, Some(TaskStatus::Planned)));
+        assert!(reopens_terminal(
+            TaskStatus::Done,
+            Some(TaskStatus::Planned)
+        ));
         assert!(reopens_terminal(
             TaskStatus::Canceled,
             Some(TaskStatus::Running)
         ));
         assert!(!reopens_terminal(TaskStatus::Done, Some(TaskStatus::Done)));
-        assert!(!reopens_terminal(TaskStatus::Review, Some(TaskStatus::Planned)));
+        assert!(!reopens_terminal(
+            TaskStatus::Review,
+            Some(TaskStatus::Planned)
+        ));
         assert!(!reopens_terminal(TaskStatus::Done, None));
     }
 
