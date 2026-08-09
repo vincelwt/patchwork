@@ -15,6 +15,7 @@ import type { Id, Message, MessageCard, Run } from "@client/types";
 import { dayLabel, runStatusLabel, timeOfDay } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
+import { useBottomAnchoredList } from "@/lib/scroll";
 import { AttachmentView } from "./Attachment";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
@@ -29,6 +30,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
   const messages = workspace.messages[channelId] ?? [];
   const [refreshing, setRefreshing] = useState(false);
+  const anchor = useBottomAnchoredList<Message>(channelId, messages.length);
 
   useEffect(() => {
     void store.loadMessages(channelId);
@@ -45,6 +47,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
   return (
     <View style={styles.conversation}>
       <FlatList
+        ref={anchor.listRef}
         data={messages}
         keyExtractor={(message) => message.id}
         contentContainerStyle={messages.length ? styles.list : styles.emptyList}
@@ -67,6 +70,14 @@ export function Conversation({ channelId }: { channelId: Id }) {
           />
         ) : null}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
+        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+        onContentSizeChange={anchor.onContentSizeChange}
+        onScroll={anchor.onScroll}
+        onScrollBeginDrag={anchor.onScrollBeginDrag}
+        onScrollEndDrag={anchor.onScrollEndDrag}
+        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
+        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
+        scrollEventThrottle={16}
         initialNumToRender={20}
         windowSize={9}
       />

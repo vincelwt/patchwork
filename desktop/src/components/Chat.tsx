@@ -9,6 +9,7 @@ import {
 import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
+import { useBottomAnchor } from "../lib/scroll";
 import { useFileUrl } from "../lib/file";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
@@ -148,45 +149,20 @@ export function Timeline({
     };
   });
   const handles = useHandles();
-  const scroller = useRef<HTMLDivElement>(null);
-  const inner = useRef<HTMLDivElement>(null);
-  const atBottom = useRef(true);
-  const window_ = useVirtualWindow(scroller, messages.length);
-
-  // Following the conversation means following the last message as it *grows*,
-  // not only when a new one arrives: a streamed reply adds no rows to the list.
-  const tail = messages[messages.length - 1];
-  const pin = useCallback(() => {
-    const element = scroller.current;
-    if (element && atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [scroller]);
-
-  useEffect(pin, [messages.length, tail?.body.length, channelId, pin]);
-
-  // Images decode, code blocks reflow and measured rows settle *after* the
-  // first paint, so a single scrollTop assignment lands short of the bottom.
-  // Watching the content box is the only version that ends up in the right
-  // place regardless of what is still arriving.
-  useEffect(() => {
-    const element = inner.current;
-    if (!element) return;
-    const observer = new ResizeObserver(pin);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [pin]);
+  const { scrollerRef, contentRef, updatePinned } = useBottomAnchor(channelId);
+  const window_ = useVirtualWindow(scrollerRef, messages.length);
 
   const onScroll = () => {
-    const element = scroller.current;
+    const element = scrollerRef.current;
     if (!element) return;
-    atBottom.current =
-      element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+    updatePinned();
     if (element.scrollTop < 60 && hasMore) {
       const previousHeight = element.scrollHeight;
       void store.loadOlder(channelId).then(() => {
         requestAnimationFrame(() => {
-          if (scroller.current) {
-            scroller.current.scrollTop =
-              scroller.current.scrollHeight - previousHeight;
+          if (scrollerRef.current) {
+            scrollerRef.current.scrollTop =
+              scrollerRef.current.scrollHeight - previousHeight;
           }
         });
       });
@@ -256,8 +232,8 @@ export function Timeline({
   }, [messages]);
 
   return (
-    <div className="timeline" ref={scroller} onScroll={onScroll}>
-      <div className="timeline-inner" ref={inner}>
+    <div className="timeline" ref={scrollerRef} onScroll={onScroll}>
+      <div className="timeline-inner" ref={contentRef}>
         {messages.length === 0 && (
           <div className="empty">
             Nothing here yet. Say something, or bring an agent in with @.
