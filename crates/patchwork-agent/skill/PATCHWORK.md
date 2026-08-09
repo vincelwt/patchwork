@@ -151,8 +151,8 @@ approval recorded. They can always send the task back to planning instead. If
 the work has not started, leave it planned. If it cannot continue, mark it
 blocked. Never move a plan or an unverified claim to review. Review and blocked
 tasks do not restart merely because the same condition recurs. Agents never
-reopen done or canceled work and never mark their own task done: Done is the
-requester's confirmation after review.
+reopen done or canceled work. Once the agreed outcome is achieved and no
+approval or other human action remains, mark the task done.
 
 ### A task is how you ask a person for something
 
