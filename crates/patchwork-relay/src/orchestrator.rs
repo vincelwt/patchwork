@@ -4,6 +4,8 @@
 //! all funnel through here so that the conversation, the board, the Inbox and
 //! the running agents never disagree with each other.
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use patchwork_agent::worktree::branch_for;
 use patchwork_core::events::Event;
@@ -17,6 +19,7 @@ use serde_json::json;
 
 use crate::auth;
 use crate::state::Shared;
+use crate::store::InsertTaskResult;
 
 /// How much conversation an agent gets by default. Deeper history stays
 /// retrievable through the CLI rather than being pasted into every prompt.
@@ -1873,7 +1876,7 @@ pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) 
 // ---------------------------------------------------------------------------
 
 /// First line of the expected result, trimmed to something a board row can show.
-fn title_from(outcome: &str) -> String {
+pub(crate) fn title_from(outcome: &str) -> String {
     let line = outcome
         .trim()
         .lines()
@@ -1893,6 +1896,103 @@ fn title_from(outcome: &str) -> String {
         _ => head.as_str(),
     };
     format!("{}\u{2026}", head.trim_end())
+}
+
+const RECENT_TASK_WINDOW_MS: Millis = 14 * 24 * 60 * 60 * 1_000;
+
+fn task_words(text: &str) -> BTreeSet<String> {
+    const NOISE: &[&str] = &[
+        "add", "after", "alert", "and", "are", "before", "create", "created", "duplicate",
+        "ensure", "failed", "failing", "failure", "fix", "fixed", "follow", "following", "for",
+        "from", "had", "has", "have", "implement", "incident", "into", "issue", "make", "new",
+        "not", "problem", "production", "report", "reported", "restore", "safe", "should", "spike",
+        "task", "that", "the", "their", "this", "update", "use", "used", "using", "was", "were",
+        "what", "when", "where", "which", "will", "with", "work", "would", "your",
+    ];
+
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|word| {
+            let mut word = word.to_lowercase();
+            if NOISE.contains(&word.as_str()) {
+                return None;
+            }
+            if word.len() > 5 && word.ends_with("ing") {
+                word.truncate(word.len() - 3);
+            } else if word.len() > 4 && word.ends_with("ed") {
+                word.truncate(word.len() - 2);
+            } else if word.len() > 4 && word.ends_with("ies") {
+                word.truncate(word.len() - 3);
+                word.push('y');
+            } else if word.len() > 4
+                && ["sses", "xes", "zes", "ches", "shes"]
+                    .iter()
+                    .any(|suffix| word.ends_with(suffix))
+            {
+                word.truncate(word.len() - 2);
+            } else if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+                word.pop();
+            }
+            (word.len() >= 3 && !NOISE.contains(&word.as_str())).then_some(word)
+        })
+        .collect()
+}
+
+fn task_similarity(left: &str, right: &str) -> f32 {
+    let left = task_words(left);
+    let right = task_words(right);
+    if left.len() < 3 || right.len() < 3 {
+        return 0.0;
+    }
+    let shared: Vec<&String> = left.intersection(&right).collect();
+    if shared.len() < 2 {
+        return 0.0;
+    }
+    let overlap = shared.len() as f32 / left.len().min(right.len()) as f32;
+    let union = left.union(&right).count();
+    let jaccard = shared.len() as f32 / union as f32;
+    let stable_identifier = shared
+        .iter()
+        .any(|word| word.len() >= 7 || word.chars().any(|c| c.is_ascii_digit()));
+    0.6 * overlap + 0.4 * jaccard + if stable_identifier { 0.1 } else { 0.0 }
+}
+
+/// Best open or recently completed task whose wording looks related. This is
+/// only a warning signal: callers can confirm that distinct work should exist.
+pub(crate) fn similar_task(
+    state: &Shared,
+    title: &str,
+    outcome: &str,
+    project_id: Option<&str>,
+) -> Result<Option<Task>> {
+    let title = if title.trim().is_empty() {
+        title_from(outcome)
+    } else {
+        title.trim().to_string()
+    };
+    let incoming = format!("{title} {outcome}");
+    let recent_after = now_ms() - RECENT_TASK_WINDOW_MS;
+    Ok(state
+        .store
+        .tasks()?
+        .into_iter()
+        .filter(|task| !task.status.is_terminal() || task.updated_at >= recent_after)
+        .filter(|task| {
+            project_id
+                .map(|project| task.project_id.as_deref() == Some(project))
+                .unwrap_or(true)
+        })
+        .filter_map(|task| {
+            let score = task_similarity(&title, &task.title).max(task_similarity(
+                &incoming,
+                &format!("{} {}", task.title, task.outcome),
+            ));
+            (score >= 0.42).then_some((task, score))
+        })
+        .max_by(|(left_task, left), (right_task, right)| {
+            left.total_cmp(right)
+                .then_with(|| left_task.updated_at.cmp(&right_task.updated_at))
+        })
+        .map(|(task, _)| task))
 }
 
 /// Boxed: creating a task can fire an automation that creates a task.
@@ -1947,8 +2047,6 @@ async fn create_task_inner(
         task_id: None,
         last_message_at: now,
     };
-    state.store.insert_channel(&discussion)?;
-
     let mut task = Task {
         id: new_id(),
         key: key.clone(),
@@ -1972,20 +2070,18 @@ async fn create_task_inner(
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty())
-            .map(str::to_string),
+            .map(str::to_lowercase),
         created_at: now,
         updated_at: now,
         position: now as f64,
     };
-    state.store.insert_task(&task)?;
+    match state.store.insert_task_with_channel(&task, &discussion)? {
+        InsertTaskResult::Existing(existing) => return Ok(existing),
+        InsertTaskResult::Inserted => {}
+    }
 
-    // Link the discussion back to its task now that the task exists.
     let mut discussion = discussion;
     discussion.task_id = Some(task.id.clone());
-    state.store.conn()?.execute(
-        "UPDATE channels SET task_id = ?2 WHERE id = ?1",
-        rusqlite::params![discussion.id, task.id],
-    )?;
 
     state.emit(Event::ChannelCreated {
         channel: discussion.clone(),
@@ -2388,6 +2484,32 @@ mod tests {
         assert!(
             long.ends_with('\u{2026}') && long.chars().count() <= 61,
             "{long}"
+        );
+    }
+
+    #[test]
+    fn differently_worded_incidents_trigger_a_similarity_warning() {
+        assert!(
+            task_similarity(
+                "PostHog image proxy invalid-content spike",
+                "PostHog: headless images fetch 403 spike",
+            ) >= 0.42
+        );
+        assert!(
+            task_similarity(
+                "Fund production-safe Hyperbrowser fallback capacity",
+                "Restore headless-image fallback capacity",
+            ) >= 0.42
+        );
+    }
+
+    #[test]
+    fn unrelated_incidents_do_not_trigger_a_similarity_warning() {
+        assert!(
+            task_similarity(
+                "PostHog image proxy invalid-content spike",
+                "Throttle scheduled database maintenance IO",
+            ) < 0.42
         );
     }
 

@@ -194,7 +194,9 @@ pub async fn fire(
         created_at: now_ms(),
         ended_at: None,
     };
-    state.store.upsert_automation_run(&record)?;
+    if let Some(existing) = state.store.reserve_automation_run(&record)? {
+        return Ok(existing);
+    }
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });

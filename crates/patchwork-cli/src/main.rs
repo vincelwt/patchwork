@@ -310,6 +310,9 @@ enum TaskCommand {
         /// same key returns the open task instead of making a second one.
         #[arg(long)]
         once: Option<String>,
+        /// Create after reviewing the relay's possible-duplicate warning.
+        #[arg(long)]
+        allow_similar: bool,
         /// Start the owning agent right away.
         #[arg(long)]
         start: bool,
@@ -1485,6 +1488,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             project,
             due,
             once,
+            allow_similar,
             start,
         } => {
             let owner_id = match owner {
@@ -1502,6 +1506,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "once_key": once,
+                        "allow_similar": allow_similar,
                         "source_channel_id": ctx.channel_id,
                         "start": start,
                     }),
