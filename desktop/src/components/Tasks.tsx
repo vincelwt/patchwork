@@ -15,8 +15,10 @@ import {
   Dropdown,
   EditableText,
   FormSelect,
+  Menu,
   MenuButton,
   Section,
+  type MenuItem,
   Toggle,
 } from "./ui";
 import {
@@ -107,8 +109,10 @@ function useTaskActions(task: Task) {
           await api.updateTask(task.id, { status: "planned" });
           break;
       }
+      return true;
     } catch (err) {
       setError(String((err as Error).message ?? err));
+      return false;
     }
   };
 
@@ -163,6 +167,12 @@ export function TasksBoard() {
   const [dragging, setDragging] = useState<string | null>(null);
   const [dropColumn, setDropColumn] = useState<TaskStatus | null>(null);
   const [creating, setCreating] = useState(false);
+  const [menuFor, setMenuFor] = useState<{
+    task: Task;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [assigning, setAssigning] = useState<Task | null>(null);
   const [doneCollapsed, setDoneCollapsed] = useState(
     () => localStorage.getItem(DONE_COLLAPSED) !== "false",
   );
@@ -256,6 +266,7 @@ export function TasksBoard() {
           tasks={tasks}
           doneCollapsed={doneCollapsed}
           onToggleDone={toggleDone}
+          onMenu={(task, x, y) => setMenuFor({ task, x, y })}
         />
       ) : (
       <div className="board">
@@ -304,6 +315,7 @@ export function TasksBoard() {
                       task={task}
                       onDragStart={() => setDragging(task.id)}
                       onClick={() => go({ kind: "task", id: task.id })}
+                      onMenu={(x, y) => setMenuFor({ task, x, y })}
                     />
                   ))}
                   {column.length === 0 && (
@@ -318,6 +330,17 @@ export function TasksBoard() {
       )}
 
       {creating && <NewTaskModal onClose={() => setCreating(false)} />}
+      {menuFor && (
+        <TaskContextMenu
+          task={menuFor.task}
+          at={menuFor}
+          onClose={() => setMenuFor(null)}
+          onAssign={() => setAssigning(menuFor.task)}
+        />
+      )}
+      {assigning && (
+        <AssignModal task={assigning} onClose={() => setAssigning(null)} />
+      )}
     </div>
   );
 }
@@ -329,10 +352,12 @@ function TaskList({
   tasks,
   doneCollapsed,
   onToggleDone,
+  onMenu,
 }: {
   tasks: Task[];
   doneCollapsed: boolean;
   onToggleDone: () => void;
+  onMenu: (task: Task, x: number, y: number) => void;
 }) {
   const app = useApp();
   const { go } = useNavigation();
@@ -389,6 +414,10 @@ function TaskList({
                 key={task.id}
                 className="row hoverable"
                 onClick={() => go({ kind: "task", id: task.id })}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onMenu(task, event.clientX, event.clientY);
+                }}
               >
                 <span className="task-key">{task.key}</span>
                 <span className="grow">
@@ -434,10 +463,12 @@ function TaskCard({
   task,
   onClick,
   onDragStart,
+  onMenu,
 }: {
   task: Task;
   onClick: () => void;
   onDragStart: () => void;
+  onMenu: (x: number, y: number) => void;
 }) {
   const app = useApp();
   const project = app.projects.find((candidate) => candidate.id === task.project_id);
@@ -457,6 +488,10 @@ function TaskCard({
       draggable
       onDragStart={onDragStart}
       onClick={onClick}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        onMenu(event.clientX, event.clientY);
+      }}
     >
       <div className="head">
         <span className="key">{task.key}</span>
@@ -513,6 +548,81 @@ function TaskCard({
         </div>
       )}
     </div>
+  );
+}
+
+function taskManagementItems(
+  task: Task,
+  api: ReturnType<typeof useApi>,
+  onAssign: () => void,
+  onDelete: () => void,
+  movePrefix = "",
+): (MenuItem | "separator")[] {
+  return [
+    ...TASK_STATUSES.map((status) => ({
+      key: status,
+      label: `${movePrefix}${statusLabel(status)}`,
+      disabled: status === task.status,
+      onSelect: () => void api.updateTask(task.id, { status }),
+    })),
+    "separator",
+    {
+      key: "assign",
+      label: "Reassign…",
+      icon: <AgentIcon size={15} />,
+      onSelect: onAssign,
+    },
+    {
+      key: "delete",
+      label: "Delete task",
+      icon: <TrashIcon size={15} />,
+      danger: true,
+      onSelect: onDelete,
+    },
+  ];
+}
+
+function TaskContextMenu({
+  task,
+  at,
+  onClose,
+  onAssign,
+}: {
+  task: Task;
+  at: { x: number; y: number };
+  onClose: () => void;
+  onAssign: () => void;
+}) {
+  const api = useApi();
+  const { go, toast } = useNavigation();
+
+  return (
+    <Menu
+      at={at}
+      header={task.key}
+      onClose={onClose}
+      items={[
+        {
+          key: "open",
+          label: "Open task",
+          onSelect: () => go({ kind: "task", id: task.id }),
+        },
+        "separator",
+        ...taskManagementItems(
+          task,
+          api,
+          onAssign,
+          async () => {
+            try {
+              await api.deleteTask(task.id);
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+          },
+          "Move to ",
+        ),
+      ]}
+    />
   );
 }
 
@@ -1126,6 +1236,21 @@ export function TaskPage({ taskId }: { taskId: string }) {
   );
   const step = stepIndex(task);
   const due = dueLabel(task.due_at);
+  const performTopAction = async (action: NextAction) => {
+    const succeeded = await actions.perform(action, state);
+    if (
+      !succeeded ||
+      task.status !== "review" ||
+      !["approve", "complete", "reopen"].includes(action.kind)
+    ) {
+      return;
+    }
+    const index = app.tasks.findIndex((candidate) => candidate.id === task.id);
+    const next = [...app.tasks.slice(index + 1), ...app.tasks.slice(0, index)].find(
+      (candidate) => candidate.status === "review",
+    );
+    go(next ? { kind: "task", id: next.id } : { kind: "tasks" });
+  };
 
   return (
     <div className="column">
@@ -1151,35 +1276,19 @@ export function TaskPage({ taskId }: { taskId: string }) {
           align="right"
           title="More"
           header="Move to"
-          items={[
-            ...TASK_STATUSES.map((status) => ({
-              key: status,
-              label: statusLabel(status),
-              onSelect: () => void api.updateTask(task.id, { status }),
-              disabled: status === task.status,
-            })),
-            "separator" as const,
-            {
-              key: "assign",
-              label: "Reassign…",
-              icon: <AgentIcon size={15} />,
-              onSelect: () => actions.setAssigning(true),
+          items={taskManagementItems(
+            task,
+            api,
+            () => actions.setAssigning(true),
+            async () => {
+              try {
+                await api.deleteTask(task.id);
+                go({ kind: "tasks" });
+              } catch (err) {
+                toast(String((err as Error).message ?? err));
+              }
             },
-            {
-              key: "delete",
-              label: "Delete task",
-              icon: <TrashIcon size={15} />,
-              danger: true,
-              onSelect: async () => {
-                try {
-                  await api.deleteTask(task.id);
-                  go({ kind: "tasks" });
-                } catch (err) {
-                  toast(String((err as Error).message ?? err));
-                }
-              },
-            },
-          ]}
+          )}
         >
           <MoreIcon size={17} />
         </MenuButton>
@@ -1235,7 +1344,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
           {state.secondary && (
             <button
               className="button quiet"
-              onClick={() => void actions.perform(state.secondary!, state)}
+              onClick={() => void performTopAction(state.secondary!)}
             >
               {state.secondary.label}
             </button>
@@ -1250,7 +1359,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
                     : ""
               }`}
               disabled={actions.busy}
-              onClick={() => void actions.perform(state.action!, state)}
+              onClick={() => void performTopAction(state.action!)}
             >
               {actionIcon(state.action.kind)}
               {state.action.label}

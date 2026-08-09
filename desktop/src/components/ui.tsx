@@ -442,13 +442,20 @@ export function Menu({
   }, [onClose, active, selectable.length]);
 
   const anchored = useAnchored(anchor ?? empty, !!anchor, align, 216);
+  const above = !anchor && (at?.y ?? 0) > window.innerHeight / 2;
   const style: React.CSSProperties = anchor
     ? (anchored ?? { position: "fixed", visibility: "hidden" })
     : {
         position: "fixed",
         zIndex: 80,
-        left: Math.min(at?.x ?? 0, window.innerWidth - 240),
-        top: Math.min(at?.y ?? 0, window.innerHeight - 200),
+        left: Math.max(8, Math.min(at?.x ?? 0, window.innerWidth - 240)),
+        top: above ? "auto" : Math.max(8, at?.y ?? 0),
+        bottom: above ? Math.max(8, window.innerHeight - (at?.y ?? 0)) : "auto",
+        maxHeight: Math.max(
+          140,
+          above ? (at?.y ?? 0) - 16 : window.innerHeight - (at?.y ?? 0) - 16,
+        ),
+        overflowY: "auto",
       };
 
   return createPortal(
