@@ -819,4 +819,36 @@ mod tests {
         let options = vec![opt("no", "reject_once"), opt("once", "allow_once")];
         assert_eq!(choose_permission(&options).as_deref(), Some("once"));
     }
+
+    #[tokio::test]
+    async fn thinking_uses_the_runtime_advertised_config_id() {
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(Pending(Mutex::new(HashMap::new())));
+        let conn = AcpConnection {
+            child: Mutex::new(None),
+            stdin_tx,
+            pending: pending.clone(),
+            next_id: AtomicI64::new(1),
+            agent_capabilities: Value::Null,
+            auth_methods: Vec::new(),
+        };
+
+        let runtime = tokio::spawn(async move {
+            let line = stdin_rx.recv().await.expect("configuration request");
+            let request: Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            assert_eq!(request["method"], "session/set_config_option");
+            assert_eq!(request["params"]["sessionId"], "codex-session");
+            assert_eq!(request["params"]["configId"], "reasoning_effort");
+            assert_eq!(request["params"]["value"], "xhigh");
+
+            let id = request["id"].as_i64().expect("numeric request id");
+            let sender = pending.0.lock().await.remove(&id).expect("pending request");
+            sender.send(Ok(json!({}))).expect("request receiver alive");
+        });
+
+        conn.set_thinking("codex-session", "reasoning_effort", "xhigh")
+            .await
+            .expect("Codex thinking configuration accepted");
+        runtime.await.expect("mock Codex runtime completed");
+    }
 }
