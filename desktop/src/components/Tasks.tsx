@@ -468,7 +468,7 @@ export function NewTaskModal({
 }) {
   const app = useApp();
   const api = useApi();
-  const { go } = useNavigation();
+  const { go, toast } = useNavigation();
   const draftKey = `${TASK_DRAFT_PREFIX}${app.workspace?.id ?? ""}.${
     app.me?.id ?? ""
   }.${sourceChannelId ?? ""}`;
@@ -503,7 +503,7 @@ export function NewTaskModal({
 
   /// Linear's habit: most tasks arrive in threes. `another` keeps the box
   /// open with the owner and project you just chose.
-  const create = async (another = false) => {
+  const create = async (after: "open" | "dismiss" | "another" = "open") => {
     setBusy(true);
     setError("");
     try {
@@ -526,7 +526,7 @@ export function NewTaskModal({
         await api.runTask(task.id, { agent_id: owner });
       }
       localStorage.removeItem(draftKey);
-      if (another) {
+      if (after === "another") {
         setOutcome("");
         setImages([]);
         setBusy(false);
@@ -535,7 +535,14 @@ export function NewTaskModal({
         return;
       }
       onClose();
-      go({ kind: "task", id: task.id });
+      if (after === "dismiss") {
+        toast(`${task.key} created`, {
+          label: "Open",
+          onClick: () => go({ kind: "task", id: task.id }),
+        });
+      } else {
+        go({ kind: "task", id: task.id });
+      }
     } catch (err) {
       setError(String((err as Error).message ?? err));
       setBusy(false);
@@ -549,12 +556,16 @@ export function NewTaskModal({
     const onKey = (event: KeyboardEvent) => {
       if (
         event.key === "Enter" &&
-        (event.metaKey || event.ctrlKey) &&
-        event.shiftKey
+        (event.metaKey || event.ctrlKey)
       ) {
         event.preventDefault();
         event.stopPropagation();
-        if (outcome.trim() && !busy) void create(true);
+        // Modal listens on window too. Stop its primary-button shortcut so one
+        // keypress cannot take both the in-place and open-task paths.
+        event.stopImmediatePropagation();
+        if (outcome.trim() && !busy) {
+          void create(event.shiftKey ? "another" : "dismiss");
+        }
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -659,14 +670,14 @@ export function NewTaskModal({
               className="button quiet"
               disabled={!outcome.trim() || busy}
               title="Create this one and keep the box open (⌘⇧↵)"
-              onClick={() => void create(true)}
+              onClick={() => void create("another")}
             >
               Another
             </button>
             <button
               className="button primary"
               disabled={!outcome.trim() || busy}
-              onClick={() => void create()}
+              onClick={() => void create("open")}
             >
               {ownerIsAgent && start ? "Create and start" : "Create"}
             </button>
