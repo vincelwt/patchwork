@@ -235,6 +235,10 @@ struct TurnState {
     /// Runtime-specific message phase, when exposed. Codex marks temporary
     /// commentary separately from the final answer.
     message_phase: Option<String>,
+    /// Runtime-specific id for the message currently being streamed. Codex
+    /// gives every commentary update a new id while all of that update's token
+    /// chunks share it, so it is the boundary between replacement drafts.
+    message_id: Option<String>,
     /// The agent did something between two pieces of prose. The next chunk
     /// starts a new paragraph rather than running into the last sentence.
     interrupted: bool,
@@ -282,6 +286,7 @@ async fn begin_message_after_question(state: &Arc<Mutex<TurnState>>) {
     let mut turn = state.lock().await;
     turn.message.clear();
     turn.message_phase = None;
+    turn.message_id = None;
     turn.streamed_at = None;
     turn.interrupted = false;
 }
@@ -826,18 +831,27 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
                 let phase = update
                     .pointer("/_meta/codex/phase")
                     .and_then(|value| value.as_str());
+                let message_id = update.get("messageId").and_then(|value| value.as_str());
                 let mut s = state.lock().await;
-                // Codex commentary is useful while work is happening, but the
-                // final answer replaces it rather than preserving the preamble.
-                if phase == Some("final_answer")
-                    && s.message_phase.as_deref() != Some("final_answer")
-                {
+                // Codex commentary is useful while work is happening, but
+                // each new update replaces the previous one. The final answer
+                // then replaces the last update rather than preserving it as
+                // a preamble. Chunks with the same id still build one message.
+                let new_commentary = phase == Some("commentary")
+                    && message_id.is_some()
+                    && s.message_id.as_deref() != message_id;
+                let starting_final = phase == Some("final_answer")
+                    && s.message_phase.as_deref() != Some("final_answer");
+                if new_commentary || starting_final {
                     s.message.clear();
                     s.streamed_at = None;
                     s.interrupted = false;
                 }
                 if let Some(phase) = phase {
                     s.message_phase = Some(phase.to_string());
+                }
+                if let Some(message_id) = message_id {
+                    s.message_id = Some(message_id.to_string());
                 }
                 // "Let me check the PATH." <tool runs> "Yes, it is at /usr/bin."
                 // are two things the agent said, not one sentence. But a tool
@@ -1037,6 +1051,7 @@ async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, 
         let mut s = state.lock().await;
         s.streamed_at = None;
         s.message_phase = None;
+        s.message_id = None;
         s.interrupted = false;
         (
             std::mem::take(&mut s.message),
@@ -1561,14 +1576,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_commentary_message_replaces_the_previous_draft() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        let commentary = |message_id: &str, text: &str| {
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id,
+                "content": { "type": "text", "text": text },
+                "_meta": { "codex": { "phase": "commentary" } }
+            })
+        };
+
+        handle_update("r1", commentary("progress-1", "Checking "), &tx, &state).await;
+        handle_update("r1", commentary("progress-1", "the tests."), &tx, &state).await;
+        handle_update(
+            "r1",
+            json!({ "sessionUpdate": "tool_call", "title": "bash", "status": "pending" }),
+            &tx,
+            &state,
+        )
+        .await;
+        handle_update("r1", commentary("progress-2", "Tests "), &tx, &state).await;
+        handle_update("r1", commentary("progress-2", "passed."), &tx, &state).await;
+        handle_update(
+            "r1",
+            json!({ "sessionUpdate": "tool_call", "title": "bash", "status": "pending" }),
+            &tx,
+            &state,
+        )
+        .await;
+
+        let deltas = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|message| match message {
+                HostToRelay::RunMessageDelta { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(deltas.iter().any(|body| body == "Checking the tests."));
+        assert_eq!(deltas.last().map(String::as_str), Some("Tests passed."));
+
+        flush_message("r1", &tx, &state, &spec()).await;
+        let body = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|message| match message {
+            HostToRelay::RunMessage { body, .. } => Some(body),
+            _ => None,
+        });
+        assert_eq!(body.as_deref(), Some("Tests passed."));
+    }
+
+    #[tokio::test]
     async fn final_answer_replaces_a_complete_progress_draft() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(TurnState::default()));
-        let commentary = |text: &str| json!({
-            "sessionUpdate": "agent_message_chunk",
-            "content": { "type": "text", "text": text },
-            "_meta": { "codex": { "phase": "commentary" } }
-        });
+        let commentary = |text: &str| {
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "progress-1",
+                "content": { "type": "text", "text": text },
+                "_meta": { "codex": { "phase": "commentary" } }
+            })
+        };
 
         handle_update("r1", commentary("I'm "), &tx, &state).await;
         handle_update("r1", commentary("checking now."), &tx, &state).await;
@@ -1592,6 +1659,7 @@ mod tests {
             "r1",
             json!({
                 "sessionUpdate": "agent_message_chunk",
+                "messageId": "final-1",
                 "content": { "type": "text", "text": "Done." },
                 "_meta": { "codex": { "phase": "final_answer" } }
             }),
@@ -1599,6 +1667,13 @@ mod tests {
             &state,
         )
         .await;
+        let final_delta =
+            std::iter::from_fn(|| rx.try_recv().ok()).find_map(|message| match message {
+                HostToRelay::RunMessageDelta { body, .. } => Some(body),
+                _ => None,
+            });
+        assert_eq!(final_delta.as_deref(), Some("Done."));
+
         flush_message("r1", &tx, &state, &spec()).await;
 
         let mut bodies = Vec::new();
