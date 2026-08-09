@@ -453,8 +453,8 @@ function TaskCard({
 /// The task composer: one big box you type into, with everything else
 /// underneath it.
 ///
-/// A task is a sentence and sometimes a screenshot. Owner, project and date
-/// are answers to questions the sentence raises, so they sit below it as
+/// A task is a sentence and sometimes a screenshot. Owner and project are
+/// answers to questions the sentence raises, so they sit below it as
 /// small controls rather than as a form the sentence has to get through.
 export function NewTaskModal({
   onClose,
@@ -478,7 +478,6 @@ export function NewTaskModal({
     return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
   });
   const [start, setStart] = useState(true);
-  const [due, setDue] = useState("");
   // Held, not uploaded: there is no task to attach them to until you save,
   // and a dialog you close should leave nothing behind.
   const [images, setImages] = useState<File[]>([]);
@@ -500,7 +499,7 @@ export function NewTaskModal({
   };
 
   /// Linear's habit: most tasks arrive in threes. `another` keeps the box
-  /// open with the owner, project and date you just chose.
+  /// open with the owner and project you just chose.
   const create = async (another = false) => {
     setBusy(true);
     setError("");
@@ -516,7 +515,6 @@ export function NewTaskModal({
         owner_id: owner || undefined,
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
-        due_at: dateInputToMillis(due) || undefined,
         attachment_ids: attachmentIds,
         // The relay writes the first message; the agent starts after it exists.
         start: false,
@@ -617,6 +615,7 @@ export function NewTaskModal({
                   value: member.id,
                   label: member.display_name,
                   hint: member.kind === "agent" ? member.agent?.runtime : "person",
+                  icon: <Avatar member={member} size={18} />,
                 })),
               ]}
             />
@@ -633,7 +632,6 @@ export function NewTaskModal({
                 })),
               ]}
             />
-            <DueField value={due} onChange={setDue} />
             <label className="attach-button" title="Attach evidence">
               <AttachIcon size={15} />
               <input
@@ -674,43 +672,6 @@ export function NewTaskModal({
       </div>
       {error && <div className="error-text">{error}</div>}
     </Modal>
-  );
-}
-
-/// A date takes as much room as its placeholder, and `mm/dd/yyyy` is three
-/// times the width of the word "Due". So it is a word until it is a date.
-function DueField({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const label = value ? dueLabel(dateInputToMillis(value))?.text : undefined;
-
-  if (!editing && !value) {
-    return (
-      <button
-        className="chip-button"
-        title="Due date"
-        onClick={() => setEditing(true)}
-      >
-        Due
-      </button>
-    );
-  }
-
-  return (
-    <input
-      className="date-input quiet"
-      type="date"
-      title={label ?? "Due date"}
-      autoFocus={editing}
-      value={value}
-      onBlur={() => setEditing(false)}
-      onChange={(event) => onChange(event.target.value)}
-    />
   );
 }
 
