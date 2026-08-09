@@ -1101,13 +1101,13 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// The open task an agent already made about this, if it made one. Done is
-    /// not open: the same thing going wrong again is a new task, not a ghost.
+    /// The open task an agent already made about this, if it made one. Terminal
+    /// tasks are not open: the same thing recurring is new work, not a ghost.
     pub fn task_by_once_key(&self, key: &str) -> Result<Option<Task>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
-                "SELECT * FROM tasks WHERE once_key = ?1 AND status != 'done'
+                "SELECT * FROM tasks WHERE once_key = ?1 AND status NOT IN ('done', 'canceled')
                  ORDER BY created_at DESC LIMIT 1",
                 params![key],
                 |r| Self::task_from_row(r),

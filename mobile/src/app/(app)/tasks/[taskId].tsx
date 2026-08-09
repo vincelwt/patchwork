@@ -9,6 +9,7 @@ import { Avatar, Badge, Button, Card, ErrorNotice, PageHeader, Sheet } from "@/c
 import { taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
+import { isTerminalTaskStatus } from "@client/types";
 
 export default function TaskScreen() {
   const { taskId } = useLocalSearchParams<{ taskId: string }>();
@@ -52,13 +53,13 @@ export default function TaskScreen() {
       <Card style={styles.summary}>
         <View style={styles.titleRow}>
           <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
-          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : "accent"}>{taskStatusLabel(task.status)}</Badge>
+          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : task.status === "canceled" ? "neutral" : "accent"}>{taskStatusLabel(task.status)}</Badge>
         </View>
         {task.outcome ? <Text style={[styles.outcome, { color: theme.muted }]} numberOfLines={5}>{task.outcome}</Text> : null}
         <View style={styles.meta}>
           {owner ? <View style={styles.person}><Avatar member={owner} size={25} /><Text style={{ color: theme.text }}>{owner.display_name}</Text></View> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
           {project ? <Badge>{project.name}</Badge> : null}
-          {task.due_at ? <Badge tone={task.due_at < Date.now() && task.status !== "done" ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
+          {task.due_at ? <Badge tone={task.due_at < Date.now() && !isTerminalTaskStatus(task.status) ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
           <PullRequestLink task={task} />
         </View>
         <View style={styles.actions}>
@@ -67,7 +68,7 @@ export default function TaskScreen() {
               <Button label="Run details" compact tone="secondary" onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: activeRun.id } })} />
               <Button label="Stop" compact tone="danger" busy={busy} onPress={() => void store.mutate((api) => api.cancelRun(activeRun.id))} />
             </>
-          ) : task.status !== "done" ? (
+          ) : !isTerminalTaskStatus(task.status) ? (
             <Button
               label={activeRun?.status === "failed" ? "Retry" : "Start"}
               compact
@@ -77,7 +78,7 @@ export default function TaskScreen() {
           ) : (
             <Button label="Reopen" compact tone="secondary" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))} />
           )}
-          {task.status !== "done" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
+          {!isTerminalTaskStatus(task.status) && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
         </View>
         <ErrorNotice message={error} />
       </Card>

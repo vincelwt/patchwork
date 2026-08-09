@@ -910,6 +910,8 @@ function ComposerBox({
         return "Request changes";
       case "done":
         return "Message this completed task";
+      case "canceled":
+        return "Message this canceled task";
       default:
         return `Send and resume ${state.owner.display_name}`;
     }

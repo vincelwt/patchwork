@@ -36,7 +36,7 @@ import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
-import { TASK_STATUSES } from "@client/types";
+import { isTerminalTaskStatus, TASK_STATUSES } from "@client/types";
 import type {
   Attachment,
   Id,
@@ -120,6 +120,7 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
+const TASK_DRAFT_PREFIX = "patchwork.taskDraft.";
 
 /// Who a new task should belong to: whoever you gave the last one to, and
 /// yourself before you have given anyone anything. Guessing an agent for you
@@ -169,6 +170,7 @@ export function TasksBoard() {
   );
 
   const needsYou = tasks.filter((task) => {
+    if (isTerminalTaskStatus(task.status)) return false;
     const state = readTask(task, app.members, app.runs, app.questions);
     return state.situation === "asking" || state.situation === "review";
   }).length;
@@ -328,7 +330,7 @@ function TaskList({ tasks }: { tasks: Task[] }) {
                   <span className="name">{task.title}</span>
                   <span className="sub">{state.headline}</span>
                 </span>
-                {due && task.status !== "done" && (
+                {due && !isTerminalTaskStatus(task.status) && (
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
                 )}
                 {project && <Chip>{project.name}</Chip>}
@@ -356,6 +358,8 @@ function emptyColumn(status: TaskStatus) {
       return "Nothing is stuck";
     case "review":
       return "Nothing to review";
+    case "canceled":
+      return "Nothing canceled";
     default:
       return "Nothing finished yet";
   }
@@ -414,7 +418,7 @@ function TaskCard({
       )}
 
       <div className="meta">
-        {due && task.status !== "done" && (
+        {due && !isTerminalTaskStatus(task.status) && (
           <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
         )}
         {project && <Chip>{project.name}</Chip>}
@@ -452,8 +456,8 @@ function TaskCard({
 /// The task composer: one big box you type into, with everything else
 /// underneath it.
 ///
-/// A task is a sentence and sometimes a screenshot. Owner, project and date
-/// are answers to questions the sentence raises, so they sit below it as
+/// A task is a sentence and sometimes a screenshot. Owner and project are
+/// answers to questions the sentence raises, so they sit below it as
 /// small controls rather than as a form the sentence has to get through.
 export function NewTaskModal({
   onClose,
@@ -465,14 +469,18 @@ export function NewTaskModal({
   const app = useApp();
   const api = useApi();
   const { go } = useNavigation();
-  const [outcome, setOutcome] = useState("");
+  const draftKey = `${TASK_DRAFT_PREFIX}${app.workspace?.id ?? ""}.${
+    app.me?.id ?? ""
+  }.${sourceChannelId ?? ""}`;
+  const [outcome, setOutcome] = useState(
+    () => localStorage.getItem(draftKey) ?? "",
+  );
   const [owner, setOwner] = useState(() => suggestedOwner(app.members, app.me));
   const [project, setProject] = useState(() => {
     const agent = app.members.find((member) => member.id === owner);
     return agent?.agent?.default_project_id ?? app.projects[0]?.id ?? "";
   });
   const [start, setStart] = useState(true);
-  const [due, setDue] = useState("");
   // Held, not uploaded: there is no task to attach them to until you save,
   // and a dialog you close should leave nothing behind.
   const [images, setImages] = useState<File[]>([]);
@@ -482,6 +490,11 @@ export function NewTaskModal({
   const [justCreated, setJustCreated] = useState("");
   const outcomeField = useRef<HTMLTextAreaElement>(null);
 
+  useEffect(() => {
+    if (outcome) localStorage.setItem(draftKey, outcome);
+    else localStorage.removeItem(draftKey);
+  }, [draftKey, outcome]);
+
   const add = (files: FileList | File[] | null | undefined) => {
     const picked = [...(files ?? [])].filter((file) => file.size > 0);
     if (picked.length > 0) setImages((held) => [...held, ...picked]);
@@ -489,7 +502,7 @@ export function NewTaskModal({
   };
 
   /// Linear's habit: most tasks arrive in threes. `another` keeps the box
-  /// open with the owner, project and date you just chose.
+  /// open with the owner and project you just chose.
   const create = async (another = false) => {
     setBusy(true);
     setError("");
@@ -505,7 +518,6 @@ export function NewTaskModal({
         owner_id: owner || undefined,
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
-        due_at: dateInputToMillis(due) || undefined,
         attachment_ids: attachmentIds,
         // The relay writes the first message; the agent starts after it exists.
         start: false,
@@ -513,6 +525,7 @@ export function NewTaskModal({
       if (start && owner && ownerIsAgent) {
         await api.runTask(task.id, { agent_id: owner });
       }
+      localStorage.removeItem(draftKey);
       if (another) {
         setOutcome("");
         setImages([]);
@@ -593,109 +606,75 @@ export function NewTaskModal({
         )}
 
         <div className="task-composer-attributes">
-          <Dropdown
-            quiet
-            value={owner}
-            onChange={setOwner}
-            placeholder="Nobody yet"
-            options={[
-              { value: "", label: "Nobody yet" },
-              ...app.members.map((member) => ({
-                value: member.id,
-                label: member.display_name,
-                hint: member.kind === "agent" ? member.agent?.runtime : "person",
-              })),
-            ]}
-          />
-          <Dropdown
-            quiet
-            value={project}
-            onChange={setProject}
-            placeholder="No project"
-            options={[
-              { value: "", label: "No project" },
-              ...app.projects.map((candidate) => ({
-                value: candidate.id,
-                label: candidate.name,
-              })),
-            ]}
-          />
-          <DueField value={due} onChange={setDue} />
-          <label className="attach-button" title="Attach evidence">
-            <AttachIcon size={15} />
-            <input
-              type="file"
-              multiple
-              hidden
-              onChange={(event) => {
-                add(event.target.files);
-                event.target.value = "";
-              }}
+          <div className="task-composer-fields">
+            <Dropdown
+              quiet
+              value={owner}
+              onChange={setOwner}
+              placeholder="Nobody yet"
+              options={[
+                { value: "", label: "Nobody yet" },
+                ...app.members.map((member) => ({
+                  value: member.id,
+                  label: member.display_name,
+                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
+                  icon: <Avatar member={member} size={18} />,
+                })),
+              ]}
             />
-          </label>
-          <span className="spacer" />
-          {justCreated && (
-            <span className="composer-hint">{justCreated} created</span>
-          )}
-          {ownerIsAgent && (
-            <Toggle checked={start} onChange={setStart} label="Start now" />
-          )}
-          <button
-            className="button quiet"
-            disabled={!outcome.trim() || busy}
-            title="Create this one and keep the box open (⌘⇧↵)"
-            onClick={() => void create(true)}
-          >
-            Another
-          </button>
-          <button
-            className="button primary"
-            disabled={!outcome.trim() || busy}
-            onClick={() => void create()}
-          >
-            {ownerIsAgent && start ? "Create and start" : "Create"}
-          </button>
+            <Dropdown
+              quiet
+              value={project}
+              onChange={setProject}
+              placeholder="No project"
+              options={[
+                { value: "", label: "No project" },
+                ...app.projects.map((candidate) => ({
+                  value: candidate.id,
+                  label: candidate.name,
+                })),
+              ]}
+            />
+            <label className="attach-button" title="Attach evidence">
+              <AttachIcon size={15} />
+              <input
+                type="file"
+                multiple
+                hidden
+                onChange={(event) => {
+                  add(event.target.files);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <div className="task-composer-actions">
+            {justCreated && (
+              <span className="composer-hint">{justCreated} created</span>
+            )}
+            {ownerIsAgent && (
+              <Toggle checked={start} onChange={setStart} label="Start now" />
+            )}
+            <button
+              className="button quiet"
+              disabled={!outcome.trim() || busy}
+              title="Create this one and keep the box open (⌘⇧↵)"
+              onClick={() => void create(true)}
+            >
+              Another
+            </button>
+            <button
+              className="button primary"
+              disabled={!outcome.trim() || busy}
+              onClick={() => void create()}
+            >
+              {ownerIsAgent && start ? "Create and start" : "Create"}
+            </button>
+          </div>
         </div>
       </div>
       {error && <div className="error-text">{error}</div>}
     </Modal>
-  );
-}
-
-/// A date takes as much room as its placeholder, and `mm/dd/yyyy` is three
-/// times the width of the word "Due". So it is a word until it is a date.
-function DueField({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const label = value ? dueLabel(dateInputToMillis(value))?.text : undefined;
-
-  if (!editing && !value) {
-    return (
-      <button
-        className="chip-button"
-        title="Due date"
-        onClick={() => setEditing(true)}
-      >
-        Due
-      </button>
-    );
-  }
-
-  return (
-    <input
-      className="date-input quiet"
-      type="date"
-      title={label ?? "Due date"}
-      autoFocus={editing}
-      value={value}
-      onBlur={() => setEditing(false)}
-      onChange={(event) => onChange(event.target.value)}
-    />
   );
 }
 
@@ -1244,7 +1223,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
                 })
               }
             />
-            {due && task.status !== "done" && (
+            {due && !isTerminalTaskStatus(task.status) && (
               <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
             )}
           </Fact>

@@ -455,6 +455,12 @@ async fn revoke_current_device(State(state): State<Shared>, caller: Caller) -> A
 // ---------------------------------------------------------------------------
 
 async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Bootstrap>> {
+    // This is the snapshot boundary. Every durable mutation after it has a
+    // larger sequence number and will be replayed over the socket, including a
+    // mutation that lands between two of the reads below. Reading the sequence
+    // at the end can claim an event is already represented by an earlier read
+    // (tasks in particular) and make the client discard that event.
+    let seq = state.store.latest_seq()?;
     let members = state.members_with_presence().await?;
     let channels = visible_channels(&state, &caller)?;
     let visible_ids = channels
@@ -500,7 +506,7 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
             .collect(),
         active_runs,
         previews: state.store.previews(true)?,
-        seq: state.store.latest_seq()?,
+        seq,
     }))
 }
 

@@ -9,6 +9,7 @@
     "core:window:allow-set-badge-count",
     "dialog:allow-open",
     "opener:allow-open-url",
+    "opener:allow-default-urls",
     "process:allow-restart",
     "updater:default"
   ]
