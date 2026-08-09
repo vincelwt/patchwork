@@ -232,17 +232,6 @@ export function Timeline({
     return out;
   }, [messages]);
 
-  // Which message a run is currently writing into. Working this out inside
-  // each row meant every visible row scanning the whole channel on every
-  // event — quadratic, in the one place that updates most often.
-  const lastOfRun = useMemo(() => {
-    const map = new Map<Id, Id>();
-    for (const message of messages) {
-      if (message.run_id) map.set(message.run_id, message.id);
-    }
-    return map;
-  }, [messages]);
-
   const authorOf = useMemo(() => {
     const map = new Map<Id, Member>();
     for (const member of members) map.set(member.id, member);
@@ -299,12 +288,6 @@ export function Timeline({
                 handles={handles}
                 run={run}
                 original={message.id === sourceMessageId}
-                streaming={
-                  message.kind === "text" &&
-                  !!run &&
-                  lastOfRun.get(run.id) === message.id &&
-                  (run.status === "running" || run.status === "dispatched")
-                }
               />
               )}
             </div>
@@ -402,7 +385,6 @@ export const MessageRow = memo(function MessageRow({
   author,
   handles,
   run,
-  streaming = false,
   original = false,
 }: {
   message: Message;
@@ -411,8 +393,6 @@ export const MessageRow = memo(function MessageRow({
   handles?: Set<string>;
   /// The run that produced this message, summarised in its header.
   run?: Run;
-  /// The reply the relay is still writing into.
-  streaming?: boolean;
   /// The immutable request this task started from.
   original?: boolean;
 }) {
@@ -482,10 +462,7 @@ export const MessageRow = memo(function MessageRow({
                 <Markdown body={message.body} handles={handles} />
               </details>
             ) : (
-              <>
-                <Markdown body={message.body} handles={handles} />
-                {streaming && <span className="caret" />}
-              </>
+              <Markdown body={message.body} handles={handles} />
             )}
           </div>
         )}
