@@ -4,6 +4,9 @@
 export type Id = string;
 export type Millis = number;
 
+export const REALTIME_HEARTBEAT = '{"t":"heartbeat"}';
+export const REALTIME_HEARTBEAT_MS = 20_000;
+
 export type MemberKind = "human" | "agent";
 export type Presence =
   | "offline"

@@ -24,6 +24,7 @@ use crate::state::{HostConn, Shared};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ClientMsg {
+    Heartbeat,
     /// Catch up on everything after `since`, then stream live.
     Resume { since: i64 },
     Typing { channel_id: Id },
@@ -35,6 +36,7 @@ enum ClientMsg {
 #[derive(Debug, Serialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ServerMsg {
+    Heartbeat,
     Ready { seq: i64 },
     Event { envelope: Envelope },
     Host { msg: RelayToHost },
@@ -162,6 +164,9 @@ async fn connection(
         };
 
         match msg {
+            ClientMsg::Heartbeat => {
+                let _ = tx.send(ServerMsg::Heartbeat);
+            }
             ClientMsg::Resume { since } => {
                 if let Ok(missed) = state.store.events_since(since, 2000) {
                     for envelope in missed {
@@ -332,4 +337,21 @@ pub fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_wire_shape_is_stable() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"heartbeat"}"#).unwrap(),
+            ClientMsg::Heartbeat
+        ));
+        assert_eq!(
+            serde_json::to_string(&ServerMsg::Heartbeat).unwrap(),
+            r#"{"t":"heartbeat"}"#
+        );
+    }
 }

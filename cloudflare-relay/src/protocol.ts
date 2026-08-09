@@ -2,6 +2,7 @@ export const MAX_BODY_BYTES = 20 * 1024 * 1024;
 export const MAX_CONNECTIONS = 32;
 export const REQUEST_TIMEOUT_MS = 60_000;
 export const SOCKET_TIMEOUT_MS = 10_000;
+export const HEARTBEAT_FRAME = '{"t":"heartbeat"}';
 
 const idPattern = /^[a-f0-9]{32}$/;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
@@ -133,6 +134,16 @@ export function clientToken(path: string, preview = false): string | null {
   if (preview) return null;
   const url = new URL(path, "https://relay.invalid");
   return url.pathname.endsWith("/ws") ? url.searchParams.get("token") : null;
+}
+
+export function clientConnection(path: string, preview = false): string | null {
+  if (preview) return null;
+  const value = new URL(path, "https://relay.invalid").searchParams.get("connection");
+  return value && /^[a-z0-9_-]{1,32}$/.test(value) ? value : null;
+}
+
+export function clientHeartbeat(path: string, preview = false): boolean {
+  return !preview && new URL(path, "https://relay.invalid").searchParams.get("heartbeat") === "1";
 }
 
 export function proxyHeaders(headers: Headers): [string, string][] {

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  clientConnection,
+  clientHeartbeat,
   clientToken,
   compactId,
   decodeBase64,
@@ -37,9 +39,14 @@ test("routes one opaque installation without exposing an origin", () => {
 });
 
 test("only app sockets expose a device token for reconnection", () => {
-  const path = "/w/one/ws?token=device-token&since=4";
+  const path = "/w/one/ws?token=device-token&since=4&heartbeat=1&connection=mobile";
   assert.equal(clientToken(path), "device-token");
+  assert.equal(clientConnection(path), "mobile");
+  assert.equal(clientHeartbeat(path), true);
   assert.equal(clientToken(path, true), null);
+  assert.equal(clientConnection(path, true), null);
+  assert.equal(clientConnection("/w/one/ws?connection=not%20valid"), null);
+  assert.equal(clientHeartbeat(path, true), false);
   assert.equal(clientToken("/w/one/api/bootstrap?token=device-token"), null);
 });
 

@@ -4,6 +4,7 @@
 
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import { Api } from "./api";
+import { REALTIME_HEARTBEAT, REALTIME_HEARTBEAT_MS } from "@client/types";
 import type {
   Automation,
   Bootstrap,
@@ -85,6 +86,7 @@ class Session {
   private listeners = new Set<Listener>();
   private socket?: WebSocket;
   private reconnectTimer?: number;
+  private heartbeatTimer?: number;
   private retryDelay = 1000;
   private loadingChannels = new Set<Id>();
   private loadingThreads = new Set<Id>();
@@ -187,17 +189,26 @@ class Session {
     );
     url.searchParams.set("token", this.api.token);
     url.searchParams.set("since", String(this.data.seq));
+    url.searchParams.set("heartbeat", "1");
+    url.searchParams.set("connection", "ui");
 
     const socket = new WebSocket(url.toString());
     this.socket = socket;
 
-    socket.onopen = () => this.set({ live: true });
+    socket.onopen = () => {
+      this.stopHeartbeat();
+      this.heartbeatTimer = window.setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(REALTIME_HEARTBEAT);
+      }, REALTIME_HEARTBEAT_MS);
+      this.set({ live: true });
+    };
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data as string);
       if (payload.t !== "event") return;
       this.applyEvent(payload.envelope as Envelope);
     };
     socket.onclose = () => {
+      this.stopHeartbeat();
       this.set({ live: false });
       this.scheduleReconnect();
     };
@@ -206,6 +217,7 @@ class Session {
 
   /// Close a socket we are done with without it looking like a disconnection.
   private closeSocket() {
+    this.stopHeartbeat();
     const socket = this.socket;
     if (!socket) return;
     this.socket = undefined;
@@ -214,6 +226,11 @@ class Session {
     socket.onmessage = null;
     socket.onopen = null;
     socket.close();
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
   }
 
   private scheduleReconnect() {
