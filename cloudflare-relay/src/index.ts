@@ -4,6 +4,7 @@ import {
   MAX_CONNECTIONS,
   REQUEST_TIMEOUT_MS,
   SOCKET_TIMEOUT_MS,
+  clientToken,
   decodeBase64,
   encodeBase64,
   equalFixed,
@@ -24,7 +25,7 @@ interface Env {
 
 type Attachment =
   | { role: "host" }
-  | { role: "client"; id: string };
+  | { role: "client"; id: string; key?: string; preview?: true };
 
 type Pending<T> = {
   resolve: (value: T) => void;
@@ -78,7 +79,7 @@ export class ManagedRelay extends DurableObject<Env> {
     if (!destination) return json(404, "No such Patchwork relay.");
     return destination.role === "host"
       ? this.connectHost(request)
-      : this.proxyClient(request, destination.localPath);
+      : this.proxyClient(request, destination.localPath, destination.preview ?? false);
   }
 
   private async connectHost(request: Request): Promise<Response> {
@@ -101,17 +102,17 @@ export class ManagedRelay extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  private async proxyClient(request: Request, localPath: string): Promise<Response> {
+  private async proxyClient(request: Request, localPath: string, preview: boolean): Promise<Response> {
     const host = this.host();
     if (!host) return json(503, "This Patchwork relay is offline.");
-    if (this.ctx.getWebSockets().length >= MAX_CONNECTIONS || this.pendingRequests.size >= MAX_CONNECTIONS) {
-      return json(429, "This Patchwork relay has too many connections.");
-    }
 
     const url = new URL(request.url);
     const path = `${localPath}${url.search}`;
     if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      return this.openSocket(host, path, request.headers);
+      return this.openSocket(host, path, request.headers, preview);
+    }
+    if (this.pendingRequests.size >= MAX_CONNECTIONS) {
+      return json(429, "This Patchwork relay has too many connections.");
     }
 
     const declared = Number(request.headers.get("content-length") ?? "0");
@@ -152,7 +153,19 @@ export class ManagedRelay extends DurableObject<Env> {
     }
   }
 
-  private async openSocket(host: WebSocket, path: string, headers: Headers): Promise<Response> {
+  private async openSocket(host: WebSocket, path: string, headers: Headers, preview: boolean): Promise<Response> {
+    const token = clientToken(path, preview);
+    const key = token ? await tokenHash(token) : undefined;
+    const clients = this.ctx.getWebSockets("client");
+    const replaced = key ? clients.filter((socket) => {
+      const attachment = socket.deserializeAttachment() as Attachment | null;
+      return attachment?.role === "client" && !attachment.preview && (!attachment.key || attachment.key === key);
+    }) : [];
+    for (const socket of replaced) socket.close(1012, "Client reconnected");
+    if (clients.length - replaced.length >= MAX_CONNECTIONS) {
+      return json(429, "This Patchwork relay has too many connections.");
+    }
+
     const id = randomId();
     const ready = new Promise<SocketReady>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -164,7 +177,7 @@ export class ManagedRelay extends DurableObject<Env> {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.serializeAttachment({ role: "client", id } satisfies Attachment);
+    server.serializeAttachment({ role: "client", id, key, preview: preview || undefined } satisfies Attachment);
     this.ctx.acceptWebSocket(server, ["client", `client:${id}`]);
 
     try {

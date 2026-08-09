@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  clientToken,
   compactId,
   decodeBase64,
   encodeBase64,
@@ -33,6 +34,13 @@ test("routes one opaque installation without exposing an origin", () => {
     },
   );
   assert.equal(route("/", `p-${"z".repeat(25)}-1.patchwork.sh`), null);
+});
+
+test("only app sockets expose a device token for reconnection", () => {
+  const path = "/w/one/ws?token=device-token&since=4";
+  assert.equal(clientToken(path), "device-token");
+  assert.equal(clientToken(path, true), null);
+  assert.equal(clientToken("/w/one/api/bootstrap?token=device-token"), null);
 });
 
 test("proxy headers keep auth and content type but drop transport metadata", () => {

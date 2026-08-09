@@ -129,6 +129,12 @@ export function headerPairs(value: unknown): value is [string, string][] {
   );
 }
 
+export function clientToken(path: string, preview = false): string | null {
+  if (preview) return null;
+  const url = new URL(path, "https://relay.invalid");
+  return url.pathname.endsWith("/ws") ? url.searchParams.get("token") : null;
+}
+
 export function proxyHeaders(headers: Headers): [string, string][] {
   const blocked = new Set([
     "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
