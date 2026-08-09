@@ -176,9 +176,15 @@ async fn talk_where(state: &Shared, run_id: &str, message: &Message) {
 
 /// A reply that is still being written: posted on the first delta so the reader
 /// watches it arrive, then rewritten in place by every delta after it.
-async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> {
-    let existing = state.streaming_messages.read().await.get(run_id).cloned();
+async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str) -> Result<()> {
+    let Some(run) = state.store.run(run_id)? else {
+        return Ok(());
+    };
+    if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+        return Ok(());
+    }
 
+    let existing = state.streaming_messages.read().await.get(run_id).cloned();
     if let Some(message_id) = existing {
         state.store.stream_message_body(&message_id, body)?;
         if let Some(message) = state.store.message(&message_id)? {
@@ -187,9 +193,6 @@ async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> 
         return Ok(());
     }
 
-    let Some(run) = state.store.run(run_id)? else {
-        return Ok(());
-    };
     // Ambient agents are allowed to decide they have nothing to say, and that
     // decision only arrives at the end. Let them finish before taking the floor.
     if matches!(run.trigger, RunTrigger::Ambient { .. }) {
@@ -247,6 +250,17 @@ async fn finish_posted_message(state: &Shared, message: &Message) -> Result<()> 
     });
 
     follow_through(state, &settled, &channel, &members, true).await
+}
+
+/// A question is a transcript boundary. Text after the human answers must get
+/// a newer message id so it appears below the question card.
+pub(crate) async fn finish_streamed_reply(state: &Shared, run_id: &str) -> Result<()> {
+    if let Some(message_id) = state.streaming_messages.write().await.remove(run_id) {
+        if let Some(message) = state.store.message(&message_id)? {
+            finish_posted_message(state, &message).await?;
+        }
+    }
+    Ok(())
 }
 
 /// `@handle` mentions, resolved against real members so unknown handles are
@@ -1341,6 +1355,13 @@ pub async fn handle_host_message(state: &Shared, host_id: &str, msg: HostToRelay
     }
 }
 
+fn run_belongs_to_host(state: &Shared, run_id: &str, host_id: &str) -> Result<bool> {
+    Ok(state
+        .store
+        .run(run_id)?
+        .is_some_and(|run| run.host_id.as_deref() == Some(host_id)))
+}
+
 async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRelay) -> Result<()> {
     match msg {
         HostToRelay::Register { .. } | HostToRelay::Heartbeat { .. } | HostToRelay::Pong { .. } => {
@@ -1349,6 +1370,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
 
         HostToRelay::RunAccepted { run_id, cwd } => {
             if let Some(mut run) = state.store.run(&run_id)? {
+                if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                    return Ok(());
+                }
                 run.status = RunStatus::Running;
                 run.cwd = cwd.or(run.cwd);
                 state.store.update_run(&run)?;
@@ -1361,13 +1385,20 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             kind,
             text,
             data,
-        } => append_run_event(state, &run_id, kind, text, data)?,
+        } => {
+            if run_belongs_to_host(state, &run_id, host_id)? {
+                append_run_event(state, &run_id, kind, text, data)?;
+            }
+        }
 
         HostToRelay::RunControlStatus {
             run_id,
             control_id,
             state: control_state,
         } => {
+            if !run_belongs_to_host(state, &run_id, host_id)? {
+                return Ok(());
+            }
             let label = match control_state {
                 RunControlState::Queued => "Steering queued",
                 RunControlState::Started => "Steering delivered",
@@ -1393,7 +1424,14 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let Some(mut run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
-            // A run waiting on a question stays waiting until it is answered.
+            if run.host_id.as_deref() != Some(host_id) {
+                return Ok(());
+            }
+            // The first terminal state wins. A late host cannot revive a run
+            // that was cancelled while it was disconnected.
+            if run.status.is_terminal() {
+                return Ok(());
+            }
             run.status = status;
             if let Some(headline) = headline {
                 run.headline = headline;
@@ -1410,9 +1448,15 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             if status.is_terminal() {
                 run.ended_at = Some(now_ms());
                 state.store.revoke_run_tokens(&run_id).ok();
-                state.store.cancel_questions_for_run(&run_id).ok();
             }
+            // Persist terminal status before settling questions so a concurrent
+            // `patchwork ask` cannot recreate waiting work in between.
             state.store.update_run(&run)?;
+            if status.is_terminal() {
+                if let Err(err) = cancel_questions_for_run(state, &run_id).await {
+                    tracing::warn!(?err, run = %run_id, "could not cancel run questions");
+                }
+            }
             state.emit(Event::RunUpdated { run: run.clone() });
 
             state
@@ -1486,13 +1530,16 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         }
 
         HostToRelay::RunMessageDelta { run_id, body } => {
-            stream_message(state, &run_id, &body).await?;
+            stream_message(state, host_id, &run_id, &body).await?;
         }
 
         HostToRelay::RunMessage { run_id, kind, body } => {
             let Some(run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
+            if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                return Ok(());
+            }
             let draft = state.streaming_messages.write().await.remove(&run_id);
 
             // An ambient agent that has nothing to add says so, and we stay quiet.
@@ -1559,6 +1606,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let Some(mut run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
+            if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                return Ok(());
+            }
             let Some(task_id) = run.task_id.clone() else {
                 return Ok(());
             };
@@ -1602,6 +1652,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let Some(mut preview) = state.store.preview(&preview_id)? else {
                 return Ok(());
             };
+            if preview.host_id != host_id {
+                return Ok(());
+            }
             preview.status = status;
             if let Some(url) = url {
                 // A relay-hosted preview is reachable through the relay; a
@@ -1684,11 +1737,7 @@ pub(crate) fn has_review_evidence(
 pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
     // that is the honest record — but nothing may rewrite it after this.
-    if let Some(message_id) = state.streaming_messages.write().await.remove(&run.id) {
-        if let Some(message) = state.store.message(&message_id)? {
-            finish_posted_message(state, &message).await?;
-        }
-    }
+    finish_streamed_reply(state, &run.id).await?;
     state.run_threads.write().await.remove(&run.id);
 
     if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
@@ -2112,7 +2161,7 @@ pub async fn update_task(
         )
         .await;
         if task.status == TaskStatus::Done {
-            state.store.resolve_inbox_for(Some(&task.id), None)?;
+            resolve_inbox(state, Some(&task.id), None, None)?;
         }
     }
 
@@ -2203,22 +2252,90 @@ pub async fn answer_question(
     state.emit(Event::QuestionUpdated {
         question: question.clone(),
     });
-    state.resolve_question(&question).await;
-    state
-        .store
-        .resolve_inbox_for(None, Some(&question.run_id))?;
 
+    let run = state.store.run(&question.run_id)?;
+    if let Some(run) = &run {
+        if let Some(host_id) = &run.host_id {
+            state
+                .send_to_host(
+                    host_id,
+                    RelayToHost::AnswerQuestion {
+                        run_id: run.id.clone(),
+                        question_id: question.id.clone(),
+                        answers: answers.clone(),
+                    },
+                )
+                .await;
+        }
+    }
+    // Reset the transcript boundary before the long-poll lets the CLI return.
+    state.resolve_question(&question).await;
+    resolve_inbox(state, None, None, question.message_id.as_deref())?;
+
+    // The host send above yields, so cancellation may have won meanwhile.
     if let Some(mut run) = state.store.run(&question.run_id)? {
-        if run.status == RunStatus::Waiting {
+        let has_open = state
+            .store
+            .run_questions(&run.id)?
+            .iter()
+            .any(|question| question.status == QuestionStatus::Open);
+        let mut changed = false;
+        if has_open && !run.status.is_terminal() && run.status != RunStatus::Waiting {
+            run.status = RunStatus::Waiting;
+            run.headline = "Waiting for an answer".into();
+            changed = true;
+        } else if !has_open && run.status == RunStatus::Waiting {
             run.status = RunStatus::Running;
             run.headline = "Working".into();
+            changed = true;
+        }
+        if changed {
             state.store.update_run(&run)?;
             state.emit(Event::RunUpdated { run: run.clone() });
         }
-        state.set_presence(&run.agent_id, Presence::Working).await;
+        state
+            .set_presence(
+                &run.agent_id,
+                if run.status.is_terminal() {
+                    Presence::Online
+                } else if has_open {
+                    Presence::Waiting
+                } else {
+                    Presence::Working
+                },
+            )
+            .await;
     }
 
     Ok(question)
+}
+
+fn resolve_inbox(
+    state: &Shared,
+    task_id: Option<&str>,
+    question_run_id: Option<&str>,
+    question_message_id: Option<&str>,
+) -> Result<()> {
+    for item in
+        state
+            .store
+            .resolve_inbox_for(task_id, question_run_id, question_message_id)?
+    {
+        state.emit(Event::InboxItemUpdated { item });
+    }
+    Ok(())
+}
+
+/// Settle every outstanding question when its run ends, including the card,
+/// Inbox badge and any long-polling `patchwork ask` process.
+pub async fn cancel_questions_for_run(state: &Shared, run_id: &str) -> Result<()> {
+    for question in state.store.cancel_questions_for_run(run_id)? {
+        state.emit(Event::QuestionUpdated {
+            question: question.clone(),
+        });
+        state.resolve_question(&question).await;
+    }
+    resolve_inbox(state, None, Some(run_id), None)
 }
 
 #[cfg(test)]

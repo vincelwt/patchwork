@@ -1545,12 +1545,48 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_question_message(&self, id: &str, message_id: &str) -> Result<()> {
-        self.conn()?.execute(
-            "UPDATE questions SET message_id = ?2 WHERE id = ?1",
-            params![id, message_id],
+    /// Make the question, waiting run and Inbox rows visible as one state.
+    /// A terminal run wins the race and commits none of them.
+    pub fn commit_question_waiting(
+        &self,
+        question: &Question,
+        run: &Run,
+        inbox: &[InboxItem],
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE runs SET status='waiting', headline=?2
+             WHERE id=?1 AND status NOT IN ('succeeded','failed','cancelled')",
+            params![run.id, run.headline],
         )?;
-        Ok(())
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO questions (id, run_id, agent_id, channel_id, task_id, message_id, headline, items, status, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',?9)",
+            params![
+                question.id, question.run_id, question.agent_id, question.channel_id,
+                question.task_id, question.message_id, question.headline,
+                to_json(&question.items), question.created_at
+            ],
+        )?;
+        for item in inbox {
+            tx.execute(
+                "INSERT INTO inbox (id, member_id, kind, title, preview, actor_id, channel_id, message_id,
+                                    task_id, run_id, automation_id, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    item.id, item.member_id,
+                    serde_json::to_string(&item.kind).unwrap_or_default().trim_matches('"'),
+                    item.title, item.preview, item.actor_id, item.channel_id, item.message_id,
+                    item.task_id, item.run_id, item.automation_id, item.created_at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn answer_question(
@@ -1559,21 +1595,37 @@ impl Store {
         answers: &[QuestionAnswer],
         by: &str,
     ) -> Result<Question> {
-        self.conn()?.execute(
+        let changed = self.conn()?.execute(
             "UPDATE questions SET status='answered', answers=?2, answered_by=?3, answered_at=?4
              WHERE id=?1 AND status='open'",
             params![id, to_json(&answers), by, now_ms()],
         )?;
+        if changed == 0 {
+            return Err(anyhow!("question is no longer open"));
+        }
         self.question(id)?
             .ok_or_else(|| anyhow!("question not found"))
     }
 
-    pub fn cancel_questions_for_run(&self, run_id: &str) -> Result<()> {
-        self.conn()?.execute(
+    pub fn cancel_questions_for_run(&self, run_id: &str) -> Result<Vec<Question>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut questions = {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM questions WHERE run_id=?1 AND status='open' ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![run_id], Self::question_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
             "UPDATE questions SET status='cancelled' WHERE run_id=?1 AND status='open'",
             params![run_id],
         )?;
-        Ok(())
+        tx.commit()?;
+        for question in &mut questions {
+            question.status = QuestionStatus::Cancelled;
+        }
+        Ok(questions)
     }
 
     pub fn question(&self, id: &str) -> Result<Option<Question>> {
@@ -1690,7 +1742,7 @@ impl Store {
     pub fn mark_inbox_read(&self, id: &str, member_id: &str) -> Result<()> {
         self.conn()?.execute(
             "UPDATE inbox SET read_at = ?3
-             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL",
+             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL AND kind != 'question'",
             params![id, member_id, now_ms()],
         )?;
         Ok(())
@@ -1698,28 +1750,47 @@ impl Store {
 
     pub fn mark_all_inbox_read(&self, member_id: &str) -> Result<()> {
         self.conn()?.execute(
-            "UPDATE inbox SET read_at = ?2 WHERE member_id = ?1 AND read_at IS NULL",
+            "UPDATE inbox SET read_at = ?2
+             WHERE member_id = ?1 AND read_at IS NULL AND kind != 'question'",
             params![member_id, now_ms()],
         )?;
         Ok(())
     }
 
-    /// Resolving an item that points at a task or run, once it is handled.
-    pub fn resolve_inbox_for(&self, task_id: Option<&str>, run_id: Option<&str>) -> Result<()> {
+    /// Resolve ordinary task notices, every question cancelled with a run, or
+    /// one answered question. The three scopes deliberately do not overlap.
+    pub fn resolve_inbox_for(
+        &self,
+        task_id: Option<&str>,
+        question_run_id: Option<&str>,
+        question_message_id: Option<&str>,
+    ) -> Result<Vec<InboxItem>> {
         let conn = self.conn()?;
-        if let Some(task_id) = task_id {
-            conn.execute(
-                "UPDATE inbox SET read_at = ?2 WHERE task_id = ?1 AND read_at IS NULL",
-                params![task_id, now_ms()],
+        let mut items = {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM inbox WHERE read_at IS NULL AND
+                 ((?1 IS NOT NULL AND task_id = ?1 AND kind != 'question') OR
+                  (?2 IS NOT NULL AND run_id = ?2 AND kind = 'question') OR
+                  (?3 IS NOT NULL AND message_id = ?3 AND kind = 'question'))",
             )?;
-        }
-        if let Some(run_id) = run_id {
-            conn.execute(
-                "UPDATE inbox SET read_at = ?2 WHERE run_id = ?1 AND read_at IS NULL",
-                params![run_id, now_ms()],
+            let rows = stmt.query_map(
+                params![task_id, question_run_id, question_message_id],
+                Self::inbox_from_row,
             )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let at = now_ms();
+        conn.execute(
+            "UPDATE inbox SET read_at = ?4 WHERE read_at IS NULL AND
+             ((?1 IS NOT NULL AND task_id = ?1 AND kind != 'question') OR
+              (?2 IS NOT NULL AND run_id = ?2 AND kind = 'question') OR
+              (?3 IS NOT NULL AND message_id = ?3 AND kind = 'question'))",
+            params![task_id, question_run_id, question_message_id, at],
+        )?;
+        for item in &mut items {
+            item.read_at = Some(at);
         }
-        Ok(())
+        Ok(items)
     }
 
     // -- automations --------------------------------------------------------
@@ -2010,8 +2081,8 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// Members who can see a channel: everyone for open channels, the listed
-    /// participants for DMs, and for a task discussion its owner and creator.
+    /// Members who can see a channel: everyone for workspace-visible channels
+    /// and task discussions, and only the listed participants for DMs.
     pub fn channel_audience(&self, channel_id: &str) -> Result<Vec<Id>> {
         let conn = self.conn()?;
         let kind: Option<String> = conn
@@ -2022,7 +2093,7 @@ impl Store {
             )
             .optional()?;
         match kind.as_deref() {
-            Some("dm") | Some("task") => {
+            Some("dm") => {
                 let mut stmt =
                     conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
                 let rows = stmt.query_map(params![channel_id], |r| r.get::<_, String>(0))?;
@@ -2092,6 +2163,24 @@ mod tests {
             created_at: 1,
             started_at: Some(1),
             ended_at: None,
+        }
+    }
+
+    fn question(id: &str, run_id: &str) -> Question {
+        Question {
+            id: id.into(),
+            run_id: run_id.into(),
+            agent_id: "agent".into(),
+            channel_id: "channel".into(),
+            task_id: Some("task".into()),
+            message_id: None,
+            headline: String::new(),
+            items: Vec::new(),
+            status: QuestionStatus::Open,
+            answers: None,
+            answered_by: None,
+            created_at: 1,
+            answered_at: None,
         }
     }
 
@@ -2238,6 +2327,135 @@ mod tests {
         assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_none());
         store.mark_inbox_read("item", "two").unwrap();
         assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn questions_resolve_independently_without_reading_other_run_items() {
+        let (store, path) = store();
+        let item = |id: &str, kind: InboxKind, message_id: Option<&str>| InboxItem {
+            id: id.into(),
+            member_id: "human".into(),
+            kind,
+            title: "Inbox item".into(),
+            preview: String::new(),
+            actor_id: None,
+            channel_id: Some("channel".into()),
+            message_id: message_id.map(str::to_string),
+            task_id: Some("task".into()),
+            run_id: Some("run".into()),
+            automation_id: None,
+            created_at: 1,
+            read_at: None,
+        };
+        store
+            .insert_inbox(&item(
+                "question-one",
+                InboxKind::Question,
+                Some("message-one"),
+            ))
+            .unwrap();
+        store
+            .insert_inbox(&item(
+                "question-two",
+                InboxKind::Question,
+                Some("message-two"),
+            ))
+            .unwrap();
+
+        store.mark_inbox_read("question-one", "human").unwrap();
+        store.mark_all_inbox_read("human").unwrap();
+        assert!(store
+            .resolve_inbox_for(Some("task"), None, None)
+            .unwrap()
+            .is_empty());
+
+        let mut mention = item("mention", InboxKind::Mention, Some("other-message"));
+        mention.task_id = None;
+        store.insert_inbox(&mention).unwrap();
+        let changed = store
+            .resolve_inbox_for(None, None, Some("message-one"))
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "question-one");
+        assert!(store
+            .inbox_item("question-two")
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none());
+
+        let changed = store.resolve_inbox_for(None, Some("run"), None).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "question-two");
+        assert!(store.inbox_item("mention").unwrap().unwrap().read_at.is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn question_transitions_are_single_use() {
+        let (store, path) = store();
+        store.insert_question(&question("answered", "run-a")).unwrap();
+        assert_eq!(
+            store
+                .answer_question("answered", &[], "human")
+                .unwrap()
+                .status,
+            QuestionStatus::Answered
+        );
+        assert!(store.answer_question("answered", &[], "human").is_err());
+
+        store.insert_question(&question("cancelled", "run-b")).unwrap();
+        let cancelled = store.cancel_questions_for_run("run-b").unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].status, QuestionStatus::Cancelled);
+        assert!(store.answer_question("cancelled", &[], "human").is_err());
+
+        let mut ended = run("ended-run", "ended-task");
+        ended.status = RunStatus::Cancelled;
+        store.insert_run(&ended, 0).unwrap();
+        let pending = question("too-late", "ended-run");
+        assert!(!store
+            .commit_question_waiting(&pending, &ended, &[])
+            .unwrap());
+        assert!(store.question(&pending.id).unwrap().is_none());
+        assert_eq!(
+            store.run(&ended.id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_questions_reach_every_human_who_can_see_the_task() {
+        let (store, path) = store();
+        store.insert_member(&human("one")).unwrap();
+        store.insert_member(&human("two")).unwrap();
+        for (id, kind) in [("task", ChannelKind::Task), ("dm", ChannelKind::Dm)] {
+            store
+                .insert_channel(&Channel {
+                    id: id.into(),
+                    kind,
+                    section_id: None,
+                    slug: String::new(),
+                    name: id.into(),
+                    topic: String::new(),
+                    position: 0.0,
+                    created_at: 1,
+                    member_ids: vec!["one".into()],
+                    task_id: None,
+                    last_message_at: 0,
+                })
+                .unwrap();
+        }
+
+        let mut task_audience = store.channel_audience("task").unwrap();
+        task_audience.sort();
+        assert_eq!(task_audience, ["one", "two"]);
+        assert_eq!(store.channel_audience("dm").unwrap(), ["one"]);
         drop(store);
         let _ = std::fs::remove_file(path);
     }

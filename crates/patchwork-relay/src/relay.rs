@@ -333,7 +333,9 @@ async fn reconcile_interrupted_runs(state: &Shared) {
         run.ended_at = Some(now_ms());
         if state.store.update_run(&run).is_ok() {
             state.store.revoke_run_tokens(&run.id).ok();
-            state.store.cancel_questions_for_run(&run.id).ok();
+            if let Err(err) = orchestrator::cancel_questions_for_run(state, &run.id).await {
+                tracing::warn!(?err, run = %run.id, "could not cancel interrupted run questions");
+            }
             state.emit(Event::RunUpdated { run: run.clone() });
             if let Err(err) = orchestrator::finish_run(state, &run).await {
                 tracing::warn!(?err, run = %run.id, "could not finish interrupted run");

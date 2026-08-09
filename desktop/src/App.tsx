@@ -7,7 +7,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
-import { store, useApi, useApp, useAppSelector } from "./lib/store";
+import { store, useApi, useApp, useAppSelector, useWorkspaces } from "./lib/store";
 import {
   boot,
   canHostRelay,
@@ -73,11 +73,20 @@ export default function App() {
     void boot().then(() => setLoading(false));
   }, []);
 
-  if (loading) return <div className="empty">Starting Patchwork…</div>;
+  const content = loading ? (
+    <div className="empty">Starting Patchwork…</div>
+  ) : !settings?.workspaces.length ? (
+    <Onboarding />
+  ) : (
+    <Workspace onSignOut={() => void signOutOfEverything()} />
+  );
 
-  if (!settings?.workspaces.length) return <Onboarding />;
-
-  return <Workspace onSignOut={() => void signOutOfEverything()} />;
+  return (
+    <>
+      <UnreadBadge />
+      {content}
+    </>
+  );
 }
 
 /// Two ways in, and the first one needs no server: this machine can *be* the
@@ -396,6 +405,34 @@ function useRememberedView(
       (workspaceId && remembered.current[workspaceId]) || { kind: "inbox" },
     );
   }, [workspaceId, view, setView, setInspector]);
+}
+
+/// The number on the app icon: everything waiting for you, in every workspace
+/// you have joined, not just the one on screen.
+///
+/// Its own component and drawing nothing, for the same reason as `MarkAsSeen`:
+/// it watches counts that move on every event, and the root of the tree must
+/// not.
+function UnreadBadge() {
+  const total = useWorkspaces().reduce(
+    (sum, workspace) => sum + workspace.unread,
+    0,
+  );
+
+  useEffect(() => {
+    if (!inTauri) return;
+    let cancelled = false;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        if (!cancelled) return getCurrentWindow().setBadgeCount(total || undefined);
+      })
+      .catch((error) => console.warn("Could not update the app badge", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [total]);
+
+  return null;
 }
 
 /// Opening a conversation is what "I have seen this" means.

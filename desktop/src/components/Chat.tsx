@@ -1,4 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
@@ -768,26 +775,45 @@ export function AttachButton({ onFiles }: { onFiles: (files: FileList) => void }
   );
 }
 
-export function Composer({
-  channel,
-  parentId,
-  placeholder,
-  incoming,
-  onConsumed,
-}: {
+interface ComposerProps {
   channel: Channel;
   parentId?: Id;
   placeholder?: string;
   /// Files dropped anywhere in the conversation, not just on the text box.
   incoming?: File[];
   onConsumed?: () => void;
-}) {
+}
+
+/// Drafts belong to one workspace, channel and optional thread. Attachments
+/// stay ephemeral because an upload id cannot safely outlive the app.
+const DRAFT_PREFIX = "patchwork.draft.";
+
+export function Composer(props: ComposerProps) {
+  const { workspaceId, memberId } = useAppSelector((data) => ({
+    workspaceId: data.workspace?.id,
+    memberId: data.me?.id,
+  }));
+  const draftKey = `${DRAFT_PREFIX}${workspaceId ?? ""}.${memberId ?? ""}.${
+    props.channel.id
+  }.${props.parentId ?? ""}`;
+  // Remounting prevents one channel's or person's text using the next key.
+  return <ComposerBox key={draftKey} draftKey={draftKey} {...props} />;
+}
+
+function ComposerBox({
+  draftKey,
+  channel,
+  parentId,
+  placeholder,
+  incoming,
+  onConsumed,
+}: ComposerProps & { draftKey: string }) {
   const api = useApi();
   const { members, me } = useAppSelector((data) => ({
     members: data.members,
     me: data.me,
   }));
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => localStorage.getItem(draftKey) ?? "");
   const files = useAttachments({ incoming, onConsumed, taskId: channel.task_id });
   const [busy, setBusy] = useState(false);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -801,6 +827,12 @@ export function Composer({
     element.style.height = "auto";
     element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
   }, [text]);
+
+  // Typing, dictation and mention completion all update this same value.
+  useEffect(() => {
+    if (text) localStorage.setItem(draftKey, text);
+    else localStorage.removeItem(draftKey);
+  }, [draftKey, text]);
 
   // The composer floats over the transcript, so the scroller behind it has to
   // know how tall it currently is — it grows with text, attachments and the
