@@ -22,6 +22,7 @@ import {
 import {
   AgentIcon,
   AttachIcon,
+  ChevronIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -120,6 +121,7 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
+const DONE_COLLAPSED = "patchwork.tasksDoneCollapsed";
 
 /// Who a new task should belong to: whoever you gave the last one to, and
 /// yourself before you have given anyone anything. Guessing an agent for you
@@ -147,6 +149,9 @@ export function TasksBoard() {
   const [dragging, setDragging] = useState<string | null>(null);
   const [dropColumn, setDropColumn] = useState<TaskStatus | null>(null);
   const [creating, setCreating] = useState(false);
+  const [doneCollapsed, setDoneCollapsed] = useState(
+    () => localStorage.getItem(DONE_COLLAPSED) !== "false",
+  );
   // Two ways to look at the same tasks, remembered: a board is for moving work
   // along, a list is for reading it. Which one you want is a habit, not a
   // per-visit decision.
@@ -156,6 +161,11 @@ export function TasksBoard() {
   const setLayoutAndRemember = (next: "board" | "list") => {
     setLayout(next);
     localStorage.setItem("patchwork.taskLayout", next);
+  };
+  const toggleDone = () => {
+    const collapsed = !doneCollapsed;
+    setDoneCollapsed(collapsed);
+    localStorage.setItem(DONE_COLLAPSED, String(collapsed));
   };
 
   const tasks = useMemo(
@@ -227,15 +237,20 @@ export function TasksBoard() {
       </div>
 
       {layout === "list" ? (
-        <TaskList tasks={tasks} />
+        <TaskList
+          tasks={tasks}
+          doneCollapsed={doneCollapsed}
+          onToggleDone={toggleDone}
+        />
       ) : (
       <div className="board">
         {TASK_STATUSES.map((status) => {
           const column = tasks.filter((task) => task.status === status);
+          const collapsed = status === "done" && doneCollapsed;
           return (
             <div
               key={status}
-              className={`board-column${dropColumn === status ? " drop-target" : ""}`}
+              className={`board-column${collapsed ? " collapsed" : ""}${dropColumn === status ? " drop-target" : ""}`}
               onDragOver={(event) => {
                 event.preventDefault();
                 setDropColumn(status);
@@ -247,24 +262,40 @@ export function TasksBoard() {
                 setDragging(null);
               }}
             >
-              <div className="board-column-head">
-                <span className={`column-dot ${status}`} />
-                <span>{statusLabel(status)}</span>
-                {column.length > 0 && <span className="count">{column.length}</span>}
-              </div>
-              <div className="board-column-body">
-                {column.map((task) => (
-                  <TaskCard
-                    key={task.id}
-                    task={task}
-                    onDragStart={() => setDragging(task.id)}
-                    onClick={() => go({ kind: "task", id: task.id })}
-                  />
-                ))}
-                {column.length === 0 && (
-                  <div className="board-empty">{emptyColumn(status)}</div>
-                )}
-              </div>
+              {status === "done" ? (
+                <button
+                  className="board-column-head collapsible"
+                  aria-expanded={!collapsed}
+                  title={collapsed ? "Show done tasks" : "Hide done tasks"}
+                  onClick={toggleDone}
+                >
+                  <span className={`column-dot ${status}`} />
+                  <span>{statusLabel(status)}</span>
+                  {column.length > 0 && <span className="count">{column.length}</span>}
+                  <ChevronIcon size={13} open={!collapsed} />
+                </button>
+              ) : (
+                <div className="board-column-head">
+                  <span className={`column-dot ${status}`} />
+                  <span>{statusLabel(status)}</span>
+                  {column.length > 0 && <span className="count">{column.length}</span>}
+                </div>
+              )}
+              {!collapsed && (
+                <div className="board-column-body">
+                  {column.map((task) => (
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      onDragStart={() => setDragging(task.id)}
+                      onClick={() => go({ kind: "task", id: task.id })}
+                    />
+                  ))}
+                  {column.length === 0 && (
+                    <div className="board-empty">{emptyColumn(status)}</div>
+                  )}
+                </div>
+              )}
             </div>
           );
         })}
@@ -279,7 +310,15 @@ export function TasksBoard() {
 /// The same tasks as rows, grouped by status, with the empty statuses left
 /// out: a board shows you that Blocked is empty because the column is part of
 /// the shape; a list saying "Blocked (0)" is just noise to scroll past.
-function TaskList({ tasks }: { tasks: Task[] }) {
+function TaskList({
+  tasks,
+  doneCollapsed,
+  onToggleDone,
+}: {
+  tasks: Task[];
+  doneCollapsed: boolean;
+  onToggleDone: () => void;
+}) {
   const app = useApp();
   const { go } = useNavigation();
 
@@ -306,12 +345,25 @@ function TaskList({ tasks }: { tasks: Task[] }) {
     <div className="task-list">
       {groups.map((group) => (
         <div key={group.status}>
-          <div className="section-head">
-            <span className={`column-dot ${group.status}`} />
-            <span className="section-title">{statusLabel(group.status)}</span>
-            <span className="count">{group.items.length}</span>
-          </div>
-          {group.items.map((task) => {
+          {group.status === "done" ? (
+            <button
+              className="section-head collapsible"
+              aria-expanded={!doneCollapsed}
+              onClick={onToggleDone}
+            >
+              <ChevronIcon size={13} open={!doneCollapsed} />
+              <span className={`column-dot ${group.status}`} />
+              <span className="section-title">{statusLabel(group.status)}</span>
+              <span className="count">{group.items.length}</span>
+            </button>
+          ) : (
+            <div className="section-head">
+              <span className={`column-dot ${group.status}`} />
+              <span className="section-title">{statusLabel(group.status)}</span>
+              <span className="count">{group.items.length}</span>
+            </div>
+          )}
+          {(!doneCollapsed || group.status !== "done") && group.items.map((task) => {
             const state = readTask(task, app.members, app.runs, app.questions);
             const project = app.projects.find(
               (candidate) => candidate.id === task.project_id,

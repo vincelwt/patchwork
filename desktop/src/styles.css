@@ -1529,6 +1529,9 @@ select.field {
   flex-direction: column;
   min-height: 0;
 }
+.board-column.collapsed {
+  width: 116px;
+}
 .board-column-head {
   display: flex;
   align-items: center;
@@ -1536,6 +1539,17 @@ select.field {
   padding: 4px 4px 10px;
   font-size: 13px;
   color: var(--text-faint);
+}
+.board-column-head.collapsible {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.board-column-head.collapsible:hover {
+  color: var(--text-muted);
+}
+.board-column-head.collapsible svg {
+  margin-left: auto;
 }
 .board-column-body {
   display: flex;
@@ -2020,6 +2034,15 @@ details[open] > summary::before {
 }
 .task-list .section-head {
   gap: 7px;
+}
+.task-list .section-head.collapsible {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.task-list .section-head.collapsible:hover .section-title,
+.task-list .section-head.collapsible:hover svg {
+  color: var(--text-muted);
 }
 .task-list .task-key {
   font-size: 12px;

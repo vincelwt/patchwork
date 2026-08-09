@@ -1284,6 +1284,9 @@ fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTri
         if !task.outcome.trim().is_empty() {
             prompt.push_str(&format!("Expected result: {}\n", task.outcome.trim()));
         }
+        prompt.push_str(
+            "Leave finished work in Review for a person to approve; do not mark the task Done yourself.\n",
+        );
         prompt.push('\n');
     }
     if matches!(trigger, RunTrigger::Ambient { .. }) {
@@ -1749,20 +1752,101 @@ pub(crate) fn has_review_evidence(
     run_id: Option<&str>,
     pending_pr_url: Option<&str>,
 ) -> Result<bool> {
-    Ok(pending_pr_url.is_some_and(|url| !url.is_empty())
+    let artifact = pending_pr_url.is_some_and(|url| !url.is_empty())
         || task.pr_url.as_deref().is_some_and(|url| !url.is_empty())
         || state
             .store
             .task_attachments(&task.id)?
             .iter()
             .any(|attachment| attachment.run_id.as_deref() == run_id)
-        || state
-            .store
-            .task_previews(&task.id)?
-            .iter()
-            .any(|preview| {
-                preview.run_id.as_deref() == run_id && preview.status == PreviewStatus::Live
-            }))
+        || state.store.task_previews(&task.id)?.iter().any(|preview| {
+            preview.run_id.as_deref() == run_id && preview.status == PreviewStatus::Live
+        });
+    if artifact {
+        return Ok(true);
+    }
+
+    // A recommendation or answer is itself the thing a person reviews. The
+    // immutable original request tells us that this is an inquiry even when
+    // the agent later distils the task title/outcome into its conclusion.
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    Ok(task_expects_written_answer(state, task)?
+        && state.store.run_events(run_id, 0)?.iter().any(|event| {
+            event.kind == RunEventKind::Message
+                && event.data.is_none()
+                && !event.text.trim().is_empty()
+        }))
+}
+
+pub(crate) fn task_expects_written_answer(state: &Shared, task: &Task) -> Result<bool> {
+    let original = task
+        .source_message_id
+        .as_deref()
+        .map(|id| state.store.message(id))
+        .transpose()?
+        .flatten();
+    Ok(asks_for_written_answer(
+        original
+            .as_ref()
+            .map(|message| message.body.as_str())
+            .unwrap_or(task.outcome.as_str()),
+    ))
+}
+
+fn asks_for_written_answer(request: &str) -> bool {
+    // Only classify the opening line. Implementation requests often contain a
+    // later checklist item phrased as a question, but their expected result is
+    // still a changed product rather than a written answer.
+    let opening = request
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    if opening.contains('?') {
+        return true;
+    }
+
+    let normalized = opening
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    let first = normalized.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first,
+        "who"
+            | "what"
+            | "when"
+            | "where"
+            | "why"
+            | "how"
+            | "which"
+            | "can"
+            | "could"
+            | "should"
+            | "would"
+            | "is"
+            | "are"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "has"
+            | "have"
+    ) || [
+        "decide whether",
+        "find out whether",
+        "help me decide",
+        "i am unsure",
+        "i'm unsure",
+        "i am not sure",
+        "i'm not sure",
+        "recommend whether",
+        "tell me whether",
+        "unsure whether",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
 }
 
 /// A finished run updates the board and the Inbox so nothing silently stalls.
@@ -2062,10 +2146,7 @@ async fn create_task_inner(
                     agent_id: owner,
                     channel_id: task.discussion_channel_id.clone(),
                     task_id: Some(task.id.clone()),
-                    prompt: format!(
-                        "Take this task from Planned to done.\n\n{}",
-                        task.outcome.trim()
-                    ),
+                    prompt: format!("Work on this task.\n\n{}", task.outcome.trim()),
                     trigger: RunTrigger::TaskAssignment {
                         task_id: task.id.clone(),
                     },
@@ -2389,6 +2470,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn written_answer_requests_are_distinct_from_implementation_questions() {
+        assert!(asks_for_written_answer(
+            "Should we add QMD for CLI search? or not"
+        ));
+        assert!(asks_for_written_answer(
+            "Decide whether relay search needs semantic retrieval"
+        ));
+        assert!(asks_for_written_answer(
+            "I'm unsure whether this belongs in the relay"
+        ));
+        assert!(!asks_for_written_answer(
+            "Fix the Expo app\n- should the sheet use a native modal?"
+        ));
+        assert!(!asks_for_written_answer(
+            "Ensure every task view renders its pull request"
+        ));
+    }
+
     fn member(id: &str, handle: &str, kind: MemberKind) -> Member {
         Member {
             id: id.into(),
@@ -2514,5 +2614,46 @@ mod tests {
         let prompt = compose_prompt(&params, &None, &params.trigger);
         assert!(prompt.contains("NOTHING"));
         assert!(prompt.contains("deploy is failing"));
+    }
+
+    #[test]
+    fn task_runs_leave_human_confirmation_to_review() {
+        let task = Task {
+            id: "task".into(),
+            key: "PW-1".into(),
+            title: "Answer it".into(),
+            outcome: "What is the answer?".into(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            created_by: "vince".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        let params = StartRunParams {
+            agent_id: "a".into(),
+            channel_id: "c".into(),
+            task_id: Some(task.id.clone()),
+            prompt: "Work on it".into(),
+            trigger: RunTrigger::Manual { by: "vince".into() },
+            automation_id: None,
+            depth: 0,
+            host_id: None,
+            project_id: None,
+        };
+        let prompt = compose_prompt(&params, &Some(task), &params.trigger);
+        assert!(prompt.contains("Leave finished work in Review"));
+        assert!(prompt.contains("do not mark the task Done yourself"));
     }
 }

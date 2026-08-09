@@ -126,9 +126,12 @@ original request remains in its conversation.
 
 Review means there is something concrete to inspect. An agent may move a task
 to review only after attaching a file from this run, exposing a preview, or
-linking a pull request. Use `--evidence path` to attach a result while updating
-the task. If the work has not started, leave it planned. If it cannot continue,
-mark it blocked. Never move a plan or an unverified claim to review.
+linking a pull request. A written answer or recommendation is itself reviewable
+evidence when that is what the original task asked for. Use `--evidence path`
+to attach a file result while updating the task. If the work has not started,
+leave it planned. If it cannot continue, mark it blocked. Never move a plan or
+an unverified claim to review, and never mark your own task done: Done is the
+requester's confirmation after review.
 
 ### A task is how you ask a person for something
 
