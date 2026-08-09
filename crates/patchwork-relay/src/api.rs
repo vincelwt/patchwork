@@ -963,6 +963,31 @@ async fn create_task(
             .ok_or_else(|| ApiError::not_found("source message not found"))?;
         require_channel_access(&state, &caller, &message.channel_id)?;
     }
+    let exact_once_match = input
+        .once_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| state.store.task_by_once_key(key.trim()))
+        .transpose()?
+        .flatten()
+        .is_some();
+    if caller.is_agent() && !input.allow_similar && !exact_once_match {
+        if let Some(existing) = orchestrator::similar_task(
+            &state,
+            &input.title,
+            &input.outcome,
+            input.project_id.as_deref(),
+        )? {
+            return Err(ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "similar_task",
+                format!(
+                    "possible duplicate {}: \"{}\". Continue that task if this is the same incident; otherwise rerun with --allow-similar",
+                    existing.key, existing.title
+                ),
+            ));
+        }
+    }
     Ok(Json(
         orchestrator::create_task(&state, &caller.member.id, input).await?,
     ))
@@ -2596,6 +2621,105 @@ mod tests {
             byte_range("bytes=0-", DOWNLOAD_CHUNK_SIZE * 2),
             Some((0, DOWNLOAD_CHUNK_SIZE - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn agents_must_confirm_similar_tasks_but_exact_keys_are_reused() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Working,
+        };
+        store.insert_member(&agent).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let caller = || Caller {
+            member: agent.clone(),
+            run_id: None,
+            token_hash: "agent-token".into(),
+            token_kind: "run".into(),
+        };
+
+        let first = create_task(
+            State(state.clone()),
+            caller(),
+            Json(CreateTask {
+                title: "PostHog image proxy invalid-content spike".into(),
+                outcome: "Image proxy requests are failing".into(),
+                once_key: Some("posthog:image-proxy:403".into()),
+                allow_similar: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let warning = create_task(
+            State(state.clone()),
+            caller(),
+            Json(CreateTask {
+                title: "PostHog headless images fetch 403 spike".into(),
+                outcome: "Headless image fetches now return forbidden".into(),
+                once_key: Some("posthog:headless-fetch:403".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(warning.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(warning.code, "similar_task");
+        assert!(warning.message.contains(&first.key));
+
+        let repeated = create_task(
+            State(state.clone()),
+            caller(),
+            Json(CreateTask {
+                title: "Another wording for the same delivery".into(),
+                outcome: "This exact source event was delivered again".into(),
+                once_key: Some("POSTHOG:IMAGE-PROXY:403".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(repeated.id, first.id);
+
+        let distinct = create_task(
+            State(state.clone()),
+            caller(),
+            Json(CreateTask {
+                title: "PostHog headless images fetch 403 spike".into(),
+                outcome: "A separate environment is returning forbidden".into(),
+                once_key: Some("posthog:staging-headless-fetch:403".into()),
+                allow_similar: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_ne!(distinct.id, first.id);
+        assert_eq!(store.tasks().unwrap().len(), 2);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
