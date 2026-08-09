@@ -40,20 +40,21 @@ const json = (status: number, message: string) => cors(new Response(JSON.stringi
 const cors = (response: Response) => {
   const next = new Response(response.body, response);
   next.headers.set("access-control-allow-origin", "*");
-  next.headers.set("access-control-allow-headers", "authorization, content-type");
+  next.headers.set("access-control-allow-headers", "authorization, content-type, range");
   next.headers.set("access-control-allow-methods", "GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS");
+  next.headers.set("access-control-expose-headers", "accept-ranges, content-length, content-range");
   return next;
 };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/api/health") {
+    const destination = route(url.pathname, url.hostname);
+    if (!destination && url.pathname === "/api/health") {
       return cors(Response.json({ ok: true, service: "patchwork-managed-relay" }));
     }
-    const destination = route(url.pathname);
     if (!destination) return json(404, "No such Patchwork relay.");
-    if (destination.role === "client" && request.method === "OPTIONS") {
+    if (destination.role === "client" && !destination.preview && request.method === "OPTIONS") {
       return cors(new Response(null, { status: 204 }));
     }
     return env.RELAYS.getByName(destination.relayId).fetch(request);
@@ -72,7 +73,8 @@ export class ManagedRelay extends DurableObject<Env> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const destination = route(new URL(request.url).pathname);
+    const url = new URL(request.url);
+    const destination = route(url.pathname, url.hostname);
     if (!destination) return json(404, "No such Patchwork relay.");
     return destination.role === "host"
       ? this.connectHost(request)
@@ -172,7 +174,12 @@ export class ManagedRelay extends DurableObject<Env> {
         server.close(1008, opened.error ?? "Local relay refused the connection");
         return json(opened.status ?? 502, opened.error ?? "Local relay refused the connection.");
       }
-      return new Response(null, { status: 101, webSocket: client });
+      const protocol = headers.get("sec-websocket-protocol")?.split(",")[0]?.trim();
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+        headers: protocol ? { "sec-websocket-protocol": protocol } : undefined,
+      });
     } catch (error) {
       server.close(1013, "Relay unavailable");
       return json(504, error instanceof Error ? error.message : "The Patchwork relay did not answer.");
@@ -185,12 +192,20 @@ export class ManagedRelay extends DurableObject<Env> {
 
   async webSocketMessage(socket: WebSocket, frame: string | ArrayBuffer): Promise<void> {
     const attachment = socket.deserializeAttachment() as Attachment | null;
-    if (!attachment || typeof frame !== "string") return socket.close(1003, "Text frames only");
+    if (!attachment) return socket.close(1003, "Missing socket identity");
 
     if (attachment.role === "client") {
-      this.sendHost({ type: "socket_data", id: attachment.id, data: frame });
+      const size = typeof frame === "string" ? new TextEncoder().encode(frame).byteLength : frame.byteLength;
+      if (size > MAX_BODY_BYTES) return socket.close(1009, "Preview frame is too large");
+      this.sendHost({
+        type: "socket_data",
+        id: attachment.id,
+        data: typeof frame === "string" ? frame : encodeBase64(new Uint8Array(frame)),
+        binary: typeof frame !== "string",
+      });
       return;
     }
+    if (typeof frame !== "string") return socket.close(1003, "Invalid host frame");
 
     let parsed: unknown;
     try {
@@ -221,7 +236,15 @@ export class ManagedRelay extends DurableObject<Env> {
         return;
       }
       case "socket_data": {
-        this.client(message.id)?.send(message.data);
+        const client = this.client(message.id);
+        if (!client) return;
+        if (message.binary) {
+          const data = decodeBase64(message.data);
+          if (!data) return client.close(1007, "Invalid binary frame");
+          client.send(data);
+        } else {
+          client.send(message.data);
+        }
         return;
       }
       case "socket_close": {

@@ -289,6 +289,8 @@ pub struct Attachment {
     pub file_name: String,
     pub mime: String,
     pub size: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
     /// Relay-relative download path.
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -12,7 +12,8 @@
     { "tag": "v1", "new_sqlite_classes": ["ManagedRelay"] }
   ],
   "routes": [
-    { "pattern": "relay.patchwork.sh", "custom_domain": true }
+    { "pattern": "relay.patchwork.sh", "custom_domain": true },
+    { "pattern": "*.patchwork.sh/*", "zone_name": "patchwork.sh" }
   ],
   "observability": {
     "enabled": true,

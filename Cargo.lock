@@ -2884,6 +2884,7 @@ name = "patchwork-agent"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
  "futures",
  "libc",
@@ -2892,6 +2893,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "uuid",
  "which",

@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use patchwork_core::events::Event;
 use patchwork_core::host::RelayToHost;
 use patchwork_core::models::*;
 use patchwork_core::wire::*;
 use patchwork_core::{new_id, now_ms, Id};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
 use crate::auth::{self, Caller};
@@ -48,14 +48,31 @@ fn split_workspace(path: &str) -> Option<(&str, &str)> {
     (!workspace_id.is_empty()).then_some((workspace_id, tail))
 }
 
-/// Hand the request to the workspace named in its path.
+fn split_preview(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/preview/")?;
+    let (preview_id, tail) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    (!preview_id.is_empty()).then_some((preview_id, tail))
+}
+
+/// Hand the request to the workspace named in its path. Isolated preview
+/// origins carry only relay + preview ids, so those resolve by preview id.
 async fn dispatch(State(relay): State<Arc<Relay>>, mut request: Request) -> Response {
     let path = request.uri().path().to_string();
-    let Some((workspace_id, tail)) = split_workspace(&path) else {
+    let (router, tail) = if let Some((workspace_id, tail)) = split_workspace(&path) {
+        let Some(router) = relay.router(workspace_id).await else {
+            return ApiError::not_found("no such workspace").into_response();
+        };
+        (router, tail.to_string())
+    } else if let Some((preview_id, rest)) = split_preview(&path) {
+        let Some(router) = relay.router_for_preview(preview_id).await else {
+            return ApiError::not_found("no such preview").into_response();
+        };
+        (router, format!("/preview/{preview_id}{rest}"))
+    } else {
         return ApiError::not_found("no such endpoint").into_response();
-    };
-    let Some(router) = relay.router(workspace_id).await else {
-        return ApiError::not_found("no such workspace").into_response();
     };
 
     let query = request
@@ -244,9 +261,14 @@ pub fn router(state: Shared) -> Router {
         // previews
         .route("/api/previews", get(list_previews).post(start_preview))
         .route("/api/previews/{id}/stop", post(stop_preview))
+        .route("/api/previews/{id}/grant", post(grant_preview))
         // files
+        .route("/api/uploads", post(create_upload))
+        .route("/api/uploads/{id}", put(upload_chunk))
+        .route("/api/uploads/{id}/complete", post(complete_upload))
         .route("/api/files", post(upload_file))
         .route("/api/files/{id}", get(download_file))
+        .route("/api/files/{id}/grant", post(grant_file))
         // workspace admin
         .route("/api/workspace", patch(rename_workspace))
         .route("/api/invites", get(list_invites).post(create_invite))
@@ -257,8 +279,8 @@ pub fn router(state: Shared) -> Router {
         .merge(public)
         .merge(api)
         .route("/ws", get(crate::ws::handler))
-        .route("/preview/{id}/", get(preview_proxy::proxy_root))
-        .route("/preview/{id}/{*path}", get(preview_proxy::proxy))
+        .route("/preview/{id}/", any(preview_proxy::proxy_root))
+        .route("/preview/{id}/{*path}", any(preview_proxy::proxy))
         .with_state(state)
 }
 
@@ -1000,7 +1022,34 @@ async fn delete_task(
         .store
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
-    state.store.delete_task(&task.id)?;
+    for preview in state.store.task_previews(&task.id)? {
+        if matches!(preview.status, PreviewStatus::Starting | PreviewStatus::Live) {
+            state
+                .send_to_host(
+                    &preview.host_id,
+                    RelayToHost::StopPreview {
+                        preview_id: preview.id,
+                    },
+                )
+                .await;
+        }
+    }
+    let pending_files = {
+        let mut uploads = state.uploads.lock().await;
+        let mut files = Vec::new();
+        uploads.retain(|_, upload| {
+            let keep = upload.task_id.as_deref() != Some(&task.id);
+            if !keep {
+                files.push(upload.path.clone());
+            }
+            keep
+        });
+        files
+    };
+    let files = state.store.delete_task(&task.id)?;
+    for path in files.into_iter().map(std::path::PathBuf::from).chain(pending_files) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
     state.emit(Event::TaskDeleted { task_id: task.id });
     Ok(Json(Ok::default()))
 }
@@ -1792,10 +1841,12 @@ async fn start_preview(
         Some(id) => state.store.project(id)?,
         None => None,
     };
-    let command = input
-        .command
-        .clone()
-        .ok_or_else(|| ApiError::bad_request("what should I run? pass --command"))?;
+    if input.command.is_none() && input.port.is_none() {
+        return Err(ApiError::bad_request(
+            "pass --port for a server that is already running, or --command to start one",
+        ));
+    }
+    let command = input.command.clone();
     let host_id = task
         .host_id
         .clone()
@@ -1811,6 +1862,7 @@ async fn start_preview(
                 .as_ref()
                 .and_then(|p| p.paths.get(&host_id).cloned())
         })
+        .or_else(|| input.command.is_none().then(String::new))
         .ok_or_else(|| ApiError::bad_request("this task has no folder to run in"))?;
 
     let port = input.port.unwrap_or(4321);
@@ -1824,7 +1876,7 @@ async fn start_preview(
         port,
         url: String::new(),
         status: PreviewStatus::Starting,
-        local_only: host_id != state.relay_host_id,
+        local_only: false,
         created_at: now_ms(),
         stopped_at: None,
     };
@@ -1847,6 +1899,11 @@ async fn start_preview(
         )
         .await;
     if !sent {
+        let mut failed = preview;
+        failed.status = PreviewStatus::Failed;
+        failed.stopped_at = Some(now_ms());
+        state.store.upsert_preview(&failed)?;
+        state.emit(Event::PreviewUpdated { preview: failed });
         return Err(ApiError::bad_request(
             "the machine that owns this task is offline",
         ));
@@ -1863,20 +1920,235 @@ async fn stop_preview(
         .store
         .preview(&id)?
         .ok_or_else(|| ApiError::not_found("preview not found"))?;
-    state
+    if !state
         .send_to_host(
             &preview.host_id,
             RelayToHost::StopPreview {
                 preview_id: preview.id.clone(),
             },
         )
-        .await;
+        .await
+    {
+        let mut stopped = preview;
+        stopped.status = PreviewStatus::Stopped;
+        stopped.stopped_at = Some(now_ms());
+        state.store.upsert_preview(&stopped)?;
+        state.emit(Event::PreviewUpdated { preview: stopped });
+    }
     Ok(Json(Ok::default()))
+}
+
+#[derive(Serialize)]
+struct GrantedUrl {
+    url: String,
+}
+
+async fn grant_preview(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<GrantedUrl>> {
+    let preview = state
+        .store
+        .preview(&id)?
+        .ok_or_else(|| ApiError::not_found("preview not found"))?;
+    if preview.status != PreviewStatus::Live {
+        return Err(ApiError::bad_request("preview is not live"));
+    }
+    let grant = state.grant_preview(&preview.id);
+    Ok(Json(GrantedUrl {
+        url: state.preview_url(&preview.id, &grant),
+    }))
 }
 
 // ---------------------------------------------------------------------------
 // files
 // ---------------------------------------------------------------------------
+
+const UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const MAX_UPLOAD_SIZE: i64 = 512 * 1024 * 1024;
+const UPLOAD_TTL: i64 = 24 * 60 * 60 * 1000;
+const MAX_PENDING_UPLOADS: usize = 4;
+
+async fn create_upload(
+    State(state): State<Shared>,
+    caller: Caller,
+    Json(input): Json<CreateUpload>,
+) -> ApiResult<Json<UploadSession>> {
+    if input.file_name.trim().is_empty() || input.size < 0 || input.size > MAX_UPLOAD_SIZE {
+        return Err(ApiError::bad_request(
+            "a file needs a name and must be no larger than 512 MB",
+        ));
+    }
+    let task_id = match input.task_id {
+        Some(reference) => Some(
+            state
+                .store
+                .task_by_ref(&reference)?
+                .ok_or_else(|| ApiError::not_found("task not found"))?
+                .id,
+        ),
+        None => None,
+    };
+    let now = now_ms();
+    let mut stale = Vec::new();
+    let too_many = {
+        let mut uploads = state.uploads.lock().await;
+        uploads.retain(|_, upload| {
+            let keep = upload.created_at + UPLOAD_TTL > now;
+            if !keep {
+                stale.push(upload.path.clone());
+            }
+            keep
+        });
+        uploads
+            .values()
+            .filter(|upload| upload.member_id == caller.member.id)
+            .count()
+            >= MAX_PENDING_UPLOADS
+    };
+    for path in stale {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    if too_many {
+        return Err(ApiError::conflict("finish or wait for an existing upload"));
+    }
+
+    let id = new_id();
+    let upload_dir = state.files_dir.join(".uploads");
+    tokio::fs::create_dir_all(&upload_dir)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let path = upload_dir.join(&id);
+    tokio::fs::File::create(&path)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let mime = if input.mime.trim().is_empty() {
+        mime_guess::from_path(&input.file_name)
+            .first_or_octet_stream()
+            .to_string()
+    } else {
+        input.mime
+    };
+    let pending = crate::state::PendingUpload {
+        id: id.clone(),
+        member_id: caller.member.id,
+        run_id: caller.run_id,
+        task_id,
+        file_name: input.file_name,
+        mime,
+        caption: input.caption,
+        size: input.size,
+        received: 0,
+        created_at: now_ms(),
+        path: path.clone(),
+    };
+    let mut uploads = state.uploads.lock().await;
+    if uploads
+        .values()
+        .filter(|upload| upload.member_id == pending.member_id)
+        .count()
+        >= MAX_PENDING_UPLOADS
+    {
+        drop(uploads);
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(ApiError::conflict("finish or wait for an existing upload"));
+    }
+    uploads.insert(id.clone(), pending);
+    Ok(Json(UploadSession {
+        id,
+        chunk_size: UPLOAD_CHUNK_SIZE,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct UploadQuery {
+    #[serde(default)]
+    offset: i64,
+}
+
+async fn upload_chunk(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Query(query): Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<Ok>> {
+    use tokio::io::AsyncWriteExt;
+
+    if body.len() > UPLOAD_CHUNK_SIZE {
+        return Err(ApiError::bad_request("upload chunk exceeds 8 MB"));
+    }
+    let mut uploads = state.uploads.lock().await;
+    let upload = uploads
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::not_found("upload not found"))?;
+    if upload.member_id != caller.member.id {
+        return Err(ApiError::forbidden("this upload belongs to another member"));
+    }
+    if query.offset != upload.received {
+        return Err(ApiError::conflict(format!(
+            "expected upload offset {}, not {}",
+            upload.received, query.offset
+        )));
+    }
+    if upload.received + body.len() as i64 > upload.size {
+        return Err(ApiError::bad_request("upload exceeds its declared size"));
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&upload.path)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    file.write_all(&body)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    upload.received += body.len() as i64;
+    Ok(Json(Ok::default()))
+}
+
+async fn complete_upload(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Attachment>> {
+    let mut uploads = state.uploads.lock().await;
+    let upload = uploads
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found("upload not found"))?;
+    if upload.member_id != caller.member.id {
+        return Err(ApiError::forbidden("this upload belongs to another member"));
+    }
+    if upload.received != upload.size {
+        return Err(ApiError::conflict(format!(
+            "upload has {} of {} bytes",
+            upload.received, upload.size
+        )));
+    }
+    let upload = uploads.remove(&id).unwrap();
+    drop(uploads);
+
+    let path = state.files_dir.join(&upload.id);
+    tokio::fs::rename(&upload.path, &path)
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let attachment = Attachment {
+        id: upload.id,
+        file_name: upload.file_name,
+        mime: upload.mime,
+        size: upload.size,
+        caption: upload.caption,
+        url: format!("/api/files/{id}"),
+        message_id: None,
+        task_id: upload.task_id,
+        run_id: upload.run_id,
+        created_at: upload.created_at,
+    };
+    state
+        .store
+        .insert_attachment(&attachment, &path.to_string_lossy())?;
+    Ok(Json(attachment))
+}
 
 async fn upload_file(
     State(state): State<Shared>,
@@ -1884,6 +2156,7 @@ async fn upload_file(
     mut multipart: Multipart,
 ) -> ApiResult<Json<Attachment>> {
     let mut task_id: Option<Id> = None;
+    let mut caption = String::new();
     let mut stored: Option<Attachment> = None;
 
     while let Some(field) = multipart
@@ -1895,6 +2168,7 @@ async fn upload_file(
             "task_id" => {
                 task_id = field.text().await.ok().filter(|t| !t.is_empty());
             }
+            "caption" => caption = field.text().await.unwrap_or_default(),
             _ => {
                 let file_name = field
                     .file_name()
@@ -1927,6 +2201,7 @@ async fn upload_file(
                     file_name,
                     mime,
                     size: bytes.len() as i64,
+                    caption: String::new(),
                     url: format!("/api/files/{id}"),
                     message_id: None,
                     task_id: None,
@@ -1939,11 +2214,27 @@ async fn upload_file(
 
     let mut attachment = stored.ok_or_else(|| ApiError::bad_request("no file in that upload"))?;
     attachment.task_id = task_id;
+    attachment.caption = caption;
     let path = state.files_dir.join(&attachment.id);
     state
         .store
         .insert_attachment(&attachment, &path.to_string_lossy())?;
     Ok(Json(attachment))
+}
+
+async fn grant_file(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<GrantedUrl>> {
+    let (attachment, _) = state
+        .store
+        .attachment(&id)?
+        .ok_or_else(|| ApiError::not_found("file not found"))?;
+    require_attachment_access(&state, &caller, &attachment)?;
+    Ok(Json(GrantedUrl {
+        url: state.grant_file(&attachment),
+    }))
 }
 
 #[derive(Deserialize, Default)]
@@ -1958,7 +2249,7 @@ async fn download_file(
     Query(query): Query<FileQuery>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<axum::response::Response> {
-    use axum::response::IntoResponse;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let member = bearer(&headers)
         .ok()
         .and_then(|token| auth::authenticate(&state, &token));
@@ -1978,20 +2269,76 @@ async fn download_file(
     if let Some(caller) = &member {
         require_attachment_access(&state, caller, &attachment)?;
     }
-    let bytes = tokio::fs::read(&path)
+    let size = attachment.size.max(0) as u64;
+    let requested_range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let range = requested_range.and_then(|value| byte_range(value, size));
+    if requested_range.is_some() && range.is_none() {
+        return Ok(axum::response::Response::builder()
+            .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))
+            .body(axum::body::Body::empty())
+            .map_err(|error| ApiError::bad_request(error.to_string()))?);
+    }
+    let (start, end, status) = range
+        .map(|(start, end)| (start, end, axum::http::StatusCode::PARTIAL_CONTENT))
+        .unwrap_or((0, size.saturating_sub(1), axum::http::StatusCode::OK));
+    let length = if size == 0 { 0 } else { end - start + 1 };
+    let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| ApiError::not_found("file is no longer on disk"))?;
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, attachment.mime),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{}\"", attachment.file_name),
-            ),
-        ],
-        bytes,
-    )
-        .into_response())
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|_| ApiError::not_found("file is no longer on disk"))?;
+    let mut bytes = vec![0; length as usize];
+    file.read_exact(&mut bytes)
+        .await
+        .map_err(|_| ApiError::not_found("file is no longer on disk"))?;
+
+    let mut response = axum::response::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, attachment.mime)
+        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+        .header(axum::http::header::CONTENT_LENGTH, length)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{}\"", attachment.file_name.replace('"', "")),
+        );
+    if status == axum::http::StatusCode::PARTIAL_CONTENT {
+        response = response.header(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{size}"),
+        );
+    }
+    Ok(response
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?)
+}
+
+const DOWNLOAD_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
+fn byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    if size == 0 || value.contains(',') {
+        return None;
+    }
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?.min(size).min(DOWNLOAD_CHUNK_SIZE);
+        return Some((size - suffix, size - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= size {
+        return None;
+    }
+    let requested_end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+    let end = requested_end.min(start.saturating_add(DOWNLOAD_CHUNK_SIZE - 1));
+    (start <= end).then_some((start, end))
 }
 
 // ---------------------------------------------------------------------------
@@ -2178,6 +2525,19 @@ mod tests {
         assert!(s.len() < 260);
     }
 
+    #[test]
+    fn file_ranges_are_bounded_and_suffixes_work() {
+        assert_eq!(byte_range("bytes=10-19", 100), Some((10, 19)));
+        assert_eq!(byte_range("bytes=90-", 100), Some((90, 99)));
+        assert_eq!(byte_range("bytes=-10", 100), Some((90, 99)));
+        assert_eq!(byte_range("bytes=100-", 100), None);
+        assert_eq!(byte_range("bytes=0-1,4-5", 100), None);
+        assert_eq!(
+            byte_range("bytes=0-", DOWNLOAD_CHUNK_SIZE * 2),
+            Some((0, DOWNLOAD_CHUNK_SIZE - 1))
+        );
+    }
+
     #[tokio::test]
     async fn an_agent_needs_evidence_before_review() {
         let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
@@ -2223,6 +2583,21 @@ mod tests {
         )
         .await
         .unwrap();
+        store
+            .upsert_preview(&Preview {
+                id: "stopped-preview".into(),
+                task_id: task.id.clone(),
+                host_id: "host".into(),
+                run_id: Some("run".into()),
+                label: "Old preview".into(),
+                port: 4321,
+                url: String::new(),
+                status: PreviewStatus::Stopped,
+                local_only: false,
+                created_at: 1,
+                stopped_at: Some(2),
+            })
+            .unwrap();
 
         let response = router(state.clone())
             .oneshot(
@@ -2284,6 +2659,68 @@ mod tests {
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
+                    .method("POST")
+                    .uri("/api/uploads")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"file_name":"proof.mp4","size":6,"caption":"Demo","task_id":"{}"}}"#,
+                        task.id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let upload: UploadSession = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for (offset, bytes) in [(0, "abc"), (3, "def")] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/uploads/{}?offset={offset}", upload.id))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/uploads/{}/complete", upload.id))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attachment: Attachment = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attachment.caption, "Demo");
+        assert_eq!(attachment.run_id.as_deref(), Some("run"));
+        assert_eq!(
+            tokio::fs::read(state.files_dir.join(&attachment.id))
+                .await
+                .unwrap(),
+            b"abcdef"
+        );
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
                     .method("DELETE")
                     .uri(format!("/api/tasks/{}", task.key))
                     .header("authorization", format!("Bearer {token}"))
@@ -2294,9 +2731,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert!(store.task(&task.id).unwrap().is_none());
+        assert!(store.attachment(&attachment.id).unwrap().is_none());
+        assert!(!state.files_dir.join(&attachment.id).exists());
+        let files = state.files_dir.clone();
         drop(state);
         drop(store);
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(files);
     }
 
     #[tokio::test]

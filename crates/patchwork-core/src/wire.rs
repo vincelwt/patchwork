@@ -366,6 +366,26 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+// --- files ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUpload {
+    pub file_name: String,
+    #[serde(default)]
+    pub mime: String,
+    pub size: i64,
+    #[serde(default)]
+    pub caption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSession {
+    pub id: Id,
+    pub chunk_size: usize,
+}
+
 // --- previews ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

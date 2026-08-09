@@ -15,7 +15,9 @@ npm run dev
 
 ## Deploy your own
 
-Change the Worker name and custom domain in `wrangler.jsonc`, authenticate Wrangler, then:
+Change the Worker name and custom domain in `wrangler.jsonc`. Live previews use isolated first-level subdomains so arbitrary development code never shares the authenticated relay origin. Add one proxied wildcard DNS record for your zone and the matching `*.example.com/*` Worker route; Cloudflare Universal SSL covers those first-level names. If the zone already serves first-level names such as `www.example.com`, add more-specific no-script Worker routes for them before enabling the wildcard.
+
+Then authenticate Wrangler and deploy:
 
 ```bash
 npm run deploy

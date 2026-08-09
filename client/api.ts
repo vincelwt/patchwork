@@ -94,6 +94,14 @@ export class Api {
     return this.url(attachment.url);
   }
 
+  grantFile(id: Id) {
+    return this.post<{ url: string }>(`/api/files/${encodeURIComponent(id)}/grant`);
+  }
+
+  grantPreview(id: Id) {
+    return this.post<{ url: string }>(`/api/previews/${encodeURIComponent(id)}/grant`);
+  }
+
   bootstrap() {
     return this.get<Bootstrap>("/api/bootstrap");
   }

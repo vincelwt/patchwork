@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   file_name  TEXT NOT NULL,
   mime       TEXT NOT NULL,
   size       INTEGER NOT NULL,
+  caption    TEXT NOT NULL DEFAULT '',
   path       TEXT NOT NULL,
   message_id TEXT,
   task_id    TEXT,

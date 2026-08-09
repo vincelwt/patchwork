@@ -35,8 +35,17 @@ import {
 import { Attached, ChatView, DictateButton } from "./Chat";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
+import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
 import { TASK_STATUSES } from "@client/types";
-import type { Attachment, Id, Member, Task, TaskStatus } from "@client/types";
+import type {
+  Attachment,
+  Id,
+  Member,
+  Preview,
+  Task,
+  TaskDetail,
+  TaskStatus,
+} from "@client/types";
 
 /// Everything that can be done to a task, in one place. The task page, the
 /// board card and the inspector all call this, so "Start" means the same thing
@@ -840,6 +849,182 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
   );
 }
 
+type ReviewItem =
+  | { kind: "attachment"; attachment: Attachment }
+  | { kind: "preview"; preview: Preview };
+
+function ReviewPanel({ task }: { task: Task }) {
+  const api = useApi();
+  const signal = useAppSelector((app) => ({
+    messages: app.messages[task.discussion_channel_id]?.length ?? 0,
+    previews: Object.values(app.previews)
+      .filter((preview) => preview.task_id === task.id)
+      .map((preview) => `${preview.id}:${preview.status}`)
+      .join(","),
+  }));
+  const [detail, setDetail] = useState<TaskDetail>();
+  const [selected, setSelected] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .task(task.id)
+      .then((next) => {
+        if (!cancelled) setDetail(next);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [api, task.id, signal.messages, signal.previews]);
+
+  const items: ReviewItem[] = [
+    ...(detail?.previews ?? [])
+      .filter((preview) => preview.status === "live")
+      .map((preview) => ({ kind: "preview" as const, preview })),
+    ...(detail?.attachments ?? []).map((attachment) => ({
+      kind: "attachment" as const,
+      attachment,
+    })),
+  ];
+  const idOf = (item: ReviewItem) =>
+    item.kind === "preview" ? item.preview.id : item.attachment.id;
+
+  useEffect(() => {
+    if (items.length > 0 && !items.some((item) => idOf(item) === selected)) {
+      setSelected(idOf(items[0]));
+    }
+  }, [items.map(idOf).join(","), selected]);
+
+  const chosen = items.find((item) => idOf(item) === selected);
+  if (!detail) return <div className="inspector-body"><Spinner size={14} /></div>;
+  if (!chosen) {
+    return (
+      <div className="inspector-body">
+        <div className="empty-title">No visual evidence yet</div>
+        <div className="card-sub">
+          Screenshots, videos, and live previews posted by the run appear here.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="review-panel">
+      <div className="review-picker">
+        {items.map((item) => {
+          const id = idOf(item);
+          const label =
+            item.kind === "preview"
+              ? item.preview.label
+              : item.attachment.caption || item.attachment.file_name;
+          return (
+            <button
+              key={`${item.kind}:${id}`}
+              className={`review-pick${id === selected ? " active" : ""}`}
+              onClick={() => setSelected(id)}
+              title={label}
+            >
+              <span>
+                {item.kind === "preview"
+                  ? statusLabel(item.preview.status as never)
+                  : item.attachment.mime.startsWith("video/")
+                    ? "Video"
+                    : item.attachment.mime.startsWith("image/")
+                      ? "Image"
+                      : "File"}
+              </span>
+              <strong>{label}</strong>
+            </button>
+          );
+        })}
+      </div>
+      <ReviewViewer item={chosen} />
+    </div>
+  );
+}
+
+function ReviewViewer({ item }: { item: ReviewItem }) {
+  return item.kind === "preview" ? (
+    <PreviewViewer preview={item.preview} />
+  ) : (
+    <AttachmentViewer attachment={item.attachment} />
+  );
+}
+
+function PreviewViewer({ preview }: { preview: Preview }) {
+  const api = useApi();
+  const live = preview.status === "live";
+  const url = usePreviewUrl(preview.id, live);
+
+  return (
+    <div className="review-viewer">
+      <div className="review-toolbar">
+        <span className="grow">
+          <span className="name">{preview.label}</span>
+          <span className="sub">port {preview.port} · {statusLabel(preview.status as never)}</span>
+        </span>
+        {url && <button className="button" onClick={() => openExternal(url)}>Open</button>}
+        {live && (
+          <button className="button quiet" onClick={() => void api.stopPreview(preview.id)}>
+            Stop
+          </button>
+        )}
+      </div>
+      {url ? (
+        <iframe
+          className="review-frame"
+          src={url}
+          title={preview.label}
+          sandbox="allow-downloads allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
+          referrerPolicy="no-referrer"
+        />
+      ) : (
+        <div className="review-unavailable">
+          {live ? <Spinner size={14} /> : `Preview is ${preview.status}.`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AttachmentViewer({ attachment }: { attachment: Attachment }) {
+  const api = useApi();
+  const image = attachment.mime.startsWith("image/");
+  const video = attachment.mime.startsWith("video/");
+  const grantedUrl = useGrantedFileUrl(image ? undefined : attachment.id);
+  const imageUrl = useFileUrl(image ? attachment.url : "");
+  const url = image ? imageUrl : grantedUrl;
+
+  return (
+    <div className="review-viewer">
+      <div className="review-toolbar">
+        <span className="grow">
+          <span className="name">{attachment.caption || attachment.file_name}</span>
+          {attachment.caption && <span className="sub">{attachment.file_name}</span>}
+        </span>
+        <button
+          className="button"
+          onClick={() => void api.downloadFile(attachment.url, attachment.file_name)}
+        >
+          Download
+        </button>
+      </div>
+      {!url ? (
+        <div className="review-unavailable"><Spinner size={14} /></div>
+      ) : image ? (
+        <a href={url} target="_blank" rel="noreferrer noopener" className="review-image">
+          <img src={url} alt={attachment.caption || attachment.file_name} />
+        </a>
+      ) : video ? (
+        <video className="review-video" src={url} controls preload="metadata" />
+      ) : (
+        <div className="review-unavailable">Open the attached file to review it.</div>
+      )}
+    </div>
+  );
+}
+
 // --- the task page ----------------------------------------------------------
 
 /// A task page keeps the discussion primary: the conversation is where the work
@@ -850,8 +1035,25 @@ export function TaskPage({ taskId }: { taskId: string }) {
   const api = useApi();
   const { go, toast } = useNavigation();
   const task = app.tasks.find((candidate) => candidate.id === taskId);
-  const [showDetail, setShowDetail] = useState(false);
+  const [panel, setPanel] = useState<"review" | "activity" | null>(null);
+  const previewCount = Object.values(app.previews).filter(
+    (preview) => preview.task_id === taskId,
+  ).length;
+  const previousPreviewCount = useRef(previewCount);
+  const openedReview = useRef(false);
   const actions = useTaskActions(task ?? ({ id: taskId } as Task));
+
+  useEffect(() => {
+    if (previewCount > previousPreviewCount.current) setPanel("review");
+    previousPreviewCount.current = previewCount;
+  }, [previewCount]);
+
+  useEffect(() => {
+    if (task?.status === "review" && !openedReview.current) {
+      openedReview.current = true;
+      setPanel("review");
+    }
+  }, [task?.status]);
 
   if (!task) {
     return (
@@ -878,8 +1080,17 @@ export function TaskPage({ taskId }: { taskId: string }) {
         </button>
         <span className="subtitle">{task.key}</span>
         <span className="spacer" />
-        <button className="button quiet" onClick={() => setShowDetail(!showDetail)}>
-          {showDetail ? "Hide activity" : "Activity"}
+        <button
+          className={`button quiet${panel === "review" ? " active" : ""}`}
+          onClick={() => setPanel(panel === "review" ? null : "review")}
+        >
+          Review
+        </button>
+        <button
+          className={`button quiet${panel === "activity" ? " active" : ""}`}
+          onClick={() => setPanel(panel === "activity" ? null : "activity")}
+        >
+          Activity
         </button>
         <MenuButton
           align="right"
@@ -1048,20 +1259,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
             </Fact>
           )}
           {previews.map((preview) => (
-            <Fact label="Preview" key={preview.id}>
-              <button
-                className="chip accent"
-                onClick={() =>
-                  openExternal(
-                    preview.local_only
-                      ? `http://127.0.0.1:${preview.port}`
-                      : preview.url,
-                  )
-                }
-              >
-                {preview.label}
-              </button>
-            </Fact>
+            <PreviewFact key={preview.id} preview={preview} onOpenReview={() => setPanel("review")} />
           ))}
           <span className="spacer" />
           <span className="composer-hint">updated {relative(task.updated_at)}</span>
@@ -1074,22 +1272,56 @@ export function TaskPage({ taskId }: { taskId: string }) {
         </div>
       )}
 
-      {showDetail ? (
-        <div className="content">
-          <ChatView channelId={task.discussion_channel_id} />
-          <aside className="inspector">
-            <div className="inspector-head">Execution</div>
-            <TaskDetailPanel taskId={task.id} />
-          </aside>
-        </div>
-      ) : (
+      <div className="content">
         <ChatView channelId={task.discussion_channel_id} />
-      )}
+        {panel && (
+          <aside className="inspector task-side-panel">
+            <div className="inspector-head">
+              <button
+                className={panel === "review" ? "active" : ""}
+                onClick={() => setPanel("review")}
+              >
+                Review
+              </button>
+              <button
+                className={panel === "activity" ? "active" : ""}
+                onClick={() => setPanel("activity")}
+              >
+                Activity
+              </button>
+              <span className="spacer" />
+              <button
+                className="icon-button"
+                onClick={() => setPanel(null)}
+                title="Close"
+                aria-label="Close review panel"
+              >
+                ×
+              </button>
+            </div>
+            {panel === "review" ? (
+              <ReviewPanel task={task} />
+            ) : (
+              <TaskDetailPanel taskId={task.id} />
+            )}
+          </aside>
+        )}
+      </div>
 
       {actions.assigning && (
         <AssignModal task={task} onClose={() => actions.setAssigning(false)} />
       )}
     </div>
+  );
+}
+
+function PreviewFact({ preview, onOpenReview }: { preview: Preview; onOpenReview: () => void }) {
+  return (
+    <Fact label="Preview">
+      <button className="chip accent" onClick={onOpenReview}>
+        {preview.label}
+      </button>
+    </Fact>
   );
 }
 

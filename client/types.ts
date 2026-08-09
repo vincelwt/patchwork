@@ -90,6 +90,7 @@ export interface Attachment {
   file_name: string;
   mime: string;
   size: number;
+  caption?: string;
   url: string;
   message_id?: Id;
   task_id?: Id;

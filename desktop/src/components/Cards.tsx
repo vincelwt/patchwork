@@ -4,7 +4,7 @@ import type { EChartsType } from "echarts";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
-import { useFileUrl } from "../lib/file";
+import { useFileUrl, usePreviewUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
 import {
   ExternalIcon,
@@ -406,10 +406,8 @@ function PreviewCard({ previewId }: { previewId: string }) {
     void store.loadPreview(previewId);
   }, [previewId]);
 
+  const url = usePreviewUrl(previewId, preview?.status === "live");
   if (!preview) return null;
-  const url = preview.local_only
-    ? `http://127.0.0.1:${preview.port}`
-    : preview.url;
 
   return (
     <div className="card">
@@ -422,11 +420,10 @@ function PreviewCard({ previewId }: { previewId: string }) {
         <Chip tone={preview.status === "live" ? "positive" : ""}>
           {statusLabel(preview.status as never)}
         </Chip>
-        {preview.local_only && <Chip>on this machine</Chip>}
         <span className="spacer" />
         {preview.status === "live" && (
           <>
-            <button className="button" onClick={() => openExternal(url)}>
+            <button className="button" disabled={!url} onClick={() => openExternal(url)}>
               Open
             </button>
             <button

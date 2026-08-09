@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Linking, Pressable, StyleSheet, Text, View } from "react-native";
 import { Image } from "expo-image";
 import * as ImagePicker from "expo-image-picker";
 
@@ -8,7 +8,7 @@ import { bytes } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useTheme } from "@/lib/theme";
 
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 export interface PendingImage {
   attachment: Attachment;
@@ -22,11 +22,50 @@ async function uploadImage(
   taskId?: Id,
 ): Promise<Attachment> {
   if (asset.fileSize && asset.fileSize > MAX_IMAGE_BYTES) {
-    throw new Error("That image is larger than 25 MB.");
+    throw new Error("That image is larger than 20 MB.");
   }
+  const name = asset.fileName || `image-${Date.now()}.${asset.mimeType?.split("/")[1] || "jpg"}`;
+  if ((asset.fileSize ?? 0) > 8 * 1024 * 1024) {
+    const blob = await (await fetch(asset.uri)).blob();
+    const created = await fetch(`${baseUrl.replace(/\/$/, "")}/api/uploads`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        file_name: name,
+        mime: asset.mimeType || "image/jpeg",
+        size: blob.size,
+        task_id: taskId,
+      }),
+    });
+    if (!created.ok) throw new Error((await created.text()) || "Could not start upload.");
+    const upload = (await created.json()) as { id: Id; chunk_size: number };
+    for (let offset = 0; offset < blob.size; offset += upload.chunk_size) {
+      const response = await fetch(
+        `${baseUrl.replace(/\/$/, "")}/api/uploads/${upload.id}?offset=${offset}`,
+        {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${token}` },
+          body: blob.slice(offset, offset + upload.chunk_size),
+        },
+      );
+      if (!response.ok) throw new Error((await response.text()) || "Could not upload image.");
+    }
+    const completed = await fetch(
+      `${baseUrl.replace(/\/$/, "")}/api/uploads/${upload.id}/complete`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+    if (!completed.ok) throw new Error((await completed.text()) || "Could not finish upload.");
+    return (await completed.json()) as Attachment;
+  }
+
   const form = new FormData();
   if (taskId) form.append("task_id", taskId);
-  const name = asset.fileName || `image-${Date.now()}.${asset.mimeType?.split("/")[1] || "jpg"}`;
   form.append(
     "file",
     {
@@ -133,11 +172,28 @@ export function AttachmentView({ attachment }: { attachment: Attachment }) {
       />
     );
   }
+  const open = async () => {
+    const response = await fetch(
+      `${session.baseUrl.replace(/\/$/, "")}/api/files/${attachment.id}/grant`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session.token}` },
+      },
+    );
+    if (response.ok) await Linking.openURL((await response.json()).url);
+  };
   return (
-    <View style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${attachment.file_name}`}
+      onPress={() => void open()}
+      style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}
+    >
       <Text numberOfLines={1} style={[styles.fileName, { color: theme.text }]}>{attachment.file_name}</Text>
-      <Text style={{ color: theme.muted }}>{bytes(attachment.size)}</Text>
-    </View>
+      <Text style={{ color: theme.muted }}>
+        {attachment.mime.startsWith("video/") ? "Video · " : ""}{bytes(attachment.size)}
+      </Text>
+    </Pressable>
   );
 }
 

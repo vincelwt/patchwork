@@ -544,28 +544,13 @@ body.resizing {
   padding: 0 20px calc(var(--composer-h, 100px) + 10px);
 }
 
-/* A rule with the date sitting on it: the eye finds the boundary without
-   having to read the label. */
 .day-marker {
   display: flex;
   align-items: center;
   justify-content: center;
-  margin: 22px 0 10px;
-  position: relative;
-}
-.day-marker::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  border-top: 1px solid var(--line);
+  margin: 18px 0 10px;
 }
 .day-marker span {
-  position: relative;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 999px;
   padding: 1px 12px;
   font-size: 12.5px;
   font-weight: 550;
@@ -2682,9 +2667,10 @@ details[open] > summary::before {
 /* --- task page ------------------------------------------------------------ */
 
 .task-header {
-  padding: 2px 28px 14px;
-  max-width: 880px;
+  padding: 2px 20px 14px;
+  max-width: 1000px;
   width: 100%;
+  margin: 0 auto;
   flex: none;
 }
 .task-title,
@@ -2815,6 +2801,131 @@ details[open] > summary::before {
   font-size: 12.5px;
   color: var(--text-faint);
   padding-left: 6px;
+}
+
+.column:has(> .content > .task-side-panel) {
+  --task-panel-w: clamp(400px, 48%, 720px);
+}
+.column:has(> .content > .task-side-panel) > .task-header {
+  width: calc(100% - var(--task-panel-w));
+  max-width: none;
+  margin: 0;
+  padding-inline: 28px;
+}
+.column:has(> .content > .task-side-panel) > .content {
+  padding-right: var(--task-panel-w);
+}
+.task-side-panel {
+  position: absolute;
+  z-index: 2;
+  top: 52px;
+  right: 0;
+  bottom: 0;
+  width: var(--task-panel-w);
+}
+.task-side-panel .inspector-head > button:not(.icon-button) {
+  padding: 5px 8px;
+  border-radius: 7px;
+  color: var(--text-muted);
+}
+.task-side-panel .inspector-head > button.active {
+  background: var(--tint);
+  color: var(--text);
+}
+.review-panel,
+.review-viewer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.review-picker {
+  display: flex;
+  gap: 7px;
+  overflow-x: auto;
+  padding: 2px 14px 10px;
+  flex: none;
+}
+.review-pick {
+  width: 144px;
+  flex: none;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  text-align: left;
+}
+.review-pick.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.review-pick span,
+.review-pick strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.review-pick span {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.review-pick strong {
+  margin-top: 2px;
+  font-size: 12.5px;
+  font-weight: 550;
+}
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 14px 10px;
+  flex: none;
+}
+.review-toolbar .name,
+.review-toolbar .sub {
+  display: block;
+}
+.review-toolbar .sub {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+.review-frame,
+.review-image,
+.review-video,
+.review-unavailable {
+  flex: 1;
+  min-height: 0;
+  width: calc(100% - 28px);
+  margin: 0 14px 14px;
+  border-radius: 10px;
+  background: var(--surface-sunken);
+}
+.review-frame {
+  border: 0;
+}
+.review-image {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+.review-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.review-video {
+  object-fit: contain;
+}
+.review-unavailable {
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+  padding: 20px;
+  text-align: center;
 }
 
 .notice {
