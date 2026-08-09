@@ -1018,6 +1018,10 @@ async fn task_detail(
     }))
 }
 
+fn reopens_terminal(from: TaskStatus, to: Option<TaskStatus>) -> bool {
+    from.is_terminal() && to.is_some_and(|status| !status.is_terminal())
+}
+
 async fn update_task(
     State(state): State<Shared>,
     caller: Caller,
@@ -1050,6 +1054,11 @@ async fn update_task(
             ));
         }
     }
+    if caller.is_agent() && reopens_terminal(task.status, input.status) {
+        return Err(ApiError::bad_request(
+            "only a person can reopen a completed or canceled task",
+        ));
+    }
     if caller.is_agent() && input.status == Some(TaskStatus::Review) {
         if !orchestrator::has_review_evidence(
             &state,
@@ -1063,7 +1072,14 @@ async fn update_task(
         }
     }
     Ok(Json(
-        orchestrator::update_task(&state, &caller.member.id, &task.id, input).await?,
+        orchestrator::update_task(
+            &state,
+            &caller.member.id,
+            caller.is_agent(),
+            &task.id,
+            input,
+        )
+        .await?,
     ))
 }
 
@@ -1210,6 +1226,7 @@ async fn start_run(
             depth: 0,
             host_id: input.host_id.clone(),
             project_id: None,
+            required_task_status: None,
         },
     )
     .await?;
@@ -2714,6 +2731,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_deliberate_reopen_leaves_a_terminal_state() {
+        assert!(reopens_terminal(TaskStatus::Done, Some(TaskStatus::Planned)));
+        assert!(reopens_terminal(
+            TaskStatus::Canceled,
+            Some(TaskStatus::Running)
+        ));
+        assert!(!reopens_terminal(TaskStatus::Done, Some(TaskStatus::Done)));
+        assert!(!reopens_terminal(TaskStatus::Review, Some(TaskStatus::Planned)));
+        assert!(!reopens_terminal(TaskStatus::Done, None));
+    }
+
+    #[test]
     fn file_ranges_are_bounded_and_suffixes_work() {
         assert_eq!(byte_range("bytes=10-19", 100), Some((10, 19)));
         assert_eq!(byte_range("bytes=90-", 100), Some((90, 99)));
@@ -2762,7 +2791,8 @@ mod tests {
             caller(),
             Json(CreateTask {
                 title: "PostHog image proxy invalid-content spike".into(),
-                outcome: "Image proxy requests are failing".into(),
+                outcome: "Image proxy requests complete safely".into(),
+                initial_message: Some("The upstream returned invalid content".into()),
                 once_key: Some("posthog:image-proxy:403".into()),
                 allow_similar: true,
                 ..Default::default()
@@ -2771,6 +2801,15 @@ mod tests {
         .await
         .unwrap()
         .0;
+        assert_eq!(first.outcome, "Image proxy requests complete safely");
+        assert_eq!(
+            store
+                .message(first.source_message_id.as_deref().unwrap())
+                .unwrap()
+                .unwrap()
+                .body,
+            "The upstream returned invalid content"
+        );
 
         let warning = create_task(
             State(state.clone()),
@@ -3103,6 +3142,7 @@ mod tests {
         let _ = orchestrator::update_task(
             &state,
             &human.id,
+            false,
             &task.id,
             UpdateTask {
                 status: Some(TaskStatus::Blocked),

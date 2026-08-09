@@ -142,6 +142,7 @@ this worktree, push, and reply with a short summary of what changed.",
         depth: 0,
         host_id: task.host_id.clone(),
         project_id: task.project_id.clone(),
+        required_task_status: None,
     };
     if let Err(err) = orchestrator::start_run(state, params).await {
         tracing::warn!(?err, "could not bring the agent back for review feedback");

@@ -657,6 +657,7 @@ async fn trigger_agents(
             depth: (author_depth + 1).max(0),
             host_id: None,
             project_id: None,
+            required_task_status: None,
         };
         if let Err(err) = start_run(state, params).await {
             tracing::warn!(?err, agent = %agent.handle, "could not start agent run");
@@ -976,6 +977,17 @@ pub async fn steer_run(
     Ok(control_id)
 }
 
+#[derive(Debug)]
+pub struct TaskUnavailable;
+
+impl std::fmt::Display for TaskUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the task is no longer available to start")
+    }
+}
+
+impl std::error::Error for TaskUnavailable {}
+
 pub struct StartRunParams {
     pub agent_id: Id,
     pub channel_id: Id,
@@ -986,6 +998,18 @@ pub struct StartRunParams {
     pub depth: i32,
     pub host_id: Option<Id>,
     pub project_id: Option<Id>,
+    pub required_task_status: Option<TaskStatus>,
+}
+
+fn ensure_task_accepts_run(task: Option<&Task>) -> Result<()> {
+    if let Some(task) = task.filter(|task| task.status.is_terminal()) {
+        bail!(
+            "{} is {}; reopen it before starting more work",
+            task.key,
+            task.status.as_str()
+        );
+    }
+    Ok(())
 }
 
 pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
@@ -1000,6 +1024,7 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         Some(id) => state.store.task(id)?,
         None => None,
     };
+    ensure_task_accepts_run(task.as_ref())?;
     let project_id = params
         .project_id
         .clone()
@@ -1111,6 +1136,28 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         env: Vec::new(),
     };
 
+    let previous_task_status = if let Some(task_id) = &run.task_id {
+        match state.store.activate_task_run(
+            task_id,
+            &run.id,
+            params.required_task_status,
+        )? {
+            Some(status) => Some(status),
+            None => {
+                let mut cancelled = run.clone();
+                cancelled.status = RunStatus::Cancelled;
+                cancelled.error = Some("the task is no longer available to start".into());
+                cancelled.ended_at = Some(now_ms());
+                state.store.update_run(&cancelled)?;
+                state.store.revoke_run_tokens(&run.id).ok();
+                state.emit(Event::RunUpdated { run: cancelled });
+                return Err(TaskUnavailable.into());
+            }
+        }
+    } else {
+        None
+    };
+
     if !state
         .send_to_host(
             &host_id,
@@ -1125,21 +1172,28 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         failed.error = Some(format!("host {host_id} is not connected"));
         failed.ended_at = Some(now_ms());
         state.store.update_run(&failed)?;
+        state.store.revoke_run_tokens(&run.id).ok();
+        if let (Some(task_id), Some(previous_status)) =
+            (run.task_id.as_deref(), previous_task_status)
+        {
+            state
+                .store
+                .restore_task_after_failed_start(task_id, &run.id, previous_status)?;
+            if let Some(task) = state.store.task(task_id)? {
+                state.emit(Event::TaskUpdated { task });
+            }
+        }
         state.emit(Event::RunUpdated { run: failed });
         bail!("the execution host for this agent is offline");
     }
 
     state.emit(Event::RunUpdated { run: run.clone() });
 
-    if let Some(task) = &task {
-        let mut task = task.clone();
-        task.current_run_id = Some(run.id.clone());
-        task.review_action = None;
-        if !task.status.is_terminal() {
-            task.status = TaskStatus::Running;
+    if let Some(task_id) = run.task_id.as_deref() {
+        state.store.finalize_task_run_start(task_id, &run.id)?;
+        if let Some(task) = state.store.task(task_id)? {
+            state.emit(Event::TaskUpdated { task });
         }
-        state.store.update_task(&task)?;
-        state.emit(Event::TaskUpdated { task });
     }
 
     // The run card makes concurrent agent work visible in the conversation.
@@ -2227,12 +2281,25 @@ pub(crate) fn similar_task(
         .map(|(task, _)| task))
 }
 
+pub struct TaskCreation {
+    pub task: Task,
+    pub created: bool,
+}
+
 /// Boxed: creating a task can fire an automation that creates a task.
 pub fn create_task<'a>(
     state: &'a Shared,
     creator_id: &'a str,
     input: patchwork_core::wire::CreateTask,
 ) -> futures::future::BoxFuture<'a, Result<Task>> {
+    Box::pin(async move { Ok(create_task_inner(state, creator_id, input).await?.task) })
+}
+
+pub fn create_task_with_result<'a>(
+    state: &'a Shared,
+    creator_id: &'a str,
+    input: patchwork_core::wire::CreateTask,
+) -> futures::future::BoxFuture<'a, Result<TaskCreation>> {
     Box::pin(create_task_inner(state, creator_id, input))
 }
 
@@ -2240,12 +2307,15 @@ async fn create_task_inner(
     state: &Shared,
     creator_id: &str,
     input: patchwork_core::wire::CreateTask,
-) -> Result<Task> {
+) -> Result<TaskCreation> {
     // Asked twice, one task. An agent that reports the same blocker every two
     // hours should leave one thing on the board, not twelve.
     if let Some(once_key) = input.once_key.as_deref().filter(|k| !k.trim().is_empty()) {
         if let Some(existing) = state.store.task_by_once_key(once_key.trim())? {
-            return Ok(existing);
+            return Ok(TaskCreation {
+                task: existing,
+                created: false,
+            });
         }
     }
 
@@ -2309,7 +2379,12 @@ async fn create_task_inner(
         position: now as f64,
     };
     match state.store.insert_task_with_channel(&task, &discussion)? {
-        InsertTaskResult::Existing(existing) => return Ok(existing),
+        InsertTaskResult::Existing(existing) => {
+            return Ok(TaskCreation {
+                task: existing,
+                created: false,
+            })
+        }
         InsertTaskResult::Inserted => {}
     }
 
@@ -2321,14 +2396,16 @@ async fn create_task_inner(
     });
     state.emit(Event::TaskCreated { task: task.clone() });
 
-    // A long voice transcript is source material, not the board title. Keep it
-    // as the first human message so later title/outcome cleanup cannot erase it.
+    // Source material belongs in the discussion, separate from the stable
+    // result that defines the task as done.
     if task.source_message_id.is_none() {
-        let original_request = if task.outcome.trim().is_empty() {
-            task.title.clone()
-        } else {
-            task.outcome.clone()
-        };
+        let original_request = input.initial_message.clone().unwrap_or_else(|| {
+            if task.outcome.trim().is_empty() {
+                task.title.clone()
+            } else {
+                task.outcome.clone()
+            }
+        });
         let original = post_message(
             state,
             &task.discussion_channel_id,
@@ -2401,6 +2478,7 @@ async fn create_task_inner(
                     depth: 0,
                     host_id: task.host_id.clone(),
                     project_id: task.project_id.clone(),
+                    required_task_status: Some(TaskStatus::Planned),
                 };
                 if let Err(err) = start_run(state, params).await {
                     let _ = post_system(
@@ -2414,12 +2492,16 @@ async fn create_task_inner(
         }
     }
 
-    Ok(task)
+    Ok(TaskCreation {
+        task,
+        created: true,
+    })
 }
 
 pub async fn update_task(
     state: &Shared,
     actor_id: &str,
+    actor_is_agent: bool,
     task_id: &str,
     input: patchwork_core::wire::UpdateTask,
 ) -> Result<Task> {
@@ -2485,11 +2567,26 @@ pub async fn update_task(
         task.review_action = None;
     }
 
-    if has_explicit_status {
+    if actor_is_agent && previous.status.is_terminal() && !task.status.is_terminal() {
+        bail!("only a person can reopen a completed or canceled task");
+    }
+    if actor_is_agent {
+        if !state.store.update_task_if_unchanged(
+            &task,
+            previous.updated_at,
+            has_explicit_status,
+        )? {
+            bail!("the task changed while the agent was updating it; reload it and try again");
+        }
+    } else if has_explicit_status {
         state.store.update_task_with_explicit_status(&task)?;
     } else {
         state.store.update_task(&task)?;
     }
+    task = state
+        .store
+        .task(task_id)?
+        .ok_or_else(|| anyhow!("task was deleted while it was being updated"))?;
     state.emit(Event::TaskUpdated { task: task.clone() });
     if previous.title != task.title || previous.outcome != task.outcome {
         if let Some(channel) = state.store.channel(&task.discussion_channel_id)? {
@@ -2618,6 +2715,7 @@ pub async fn run_task(
             depth: 0,
             host_id: task.host_id.clone(),
             project_id: task.project_id.clone(),
+            required_task_status: None,
         },
     )
     .await
@@ -2913,6 +3011,39 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tasks_must_be_reopened_before_another_run() {
+        let mut task = Task {
+            id: "t".into(),
+            key: "PW-1".into(),
+            title: "Ship it".into(),
+            outcome: "It is shipped".into(),
+            status: TaskStatus::Done,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "human".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        assert!(ensure_task_accepts_run(Some(&task)).is_err());
+        task.status = TaskStatus::Canceled;
+        assert!(ensure_task_accepts_run(Some(&task)).is_err());
+        task.status = TaskStatus::Planned;
+        assert!(ensure_task_accepts_run(Some(&task)).is_ok());
+    }
+
+    #[test]
     fn mentions_need_a_word_boundary() {
         let members = vec![
             member("1", "dev", MemberKind::Agent),
@@ -3018,6 +3149,7 @@ mod tests {
             depth: 0,
             host_id: None,
             project_id: None,
+            required_task_status: None,
         };
         let prompt = compose_prompt(&params, &None, &params.trigger);
         assert!(prompt.contains("NOTHING"));
@@ -3060,6 +3192,7 @@ mod tests {
             depth: 0,
             host_id: None,
             project_id: None,
+            required_task_status: None,
         };
         let prompt = compose_prompt(&params, &Some(task), &params.trigger);
         assert!(prompt.contains("Leave finished work in Review"));
