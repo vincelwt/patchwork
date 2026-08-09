@@ -56,7 +56,6 @@ export class MobileWorkspaceStore {
   private api?: Api;
   private cacheKey?: string;
   private socket?: WebSocket;
-  private queued?: Envelope[];
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private cacheTimer?: ReturnType<typeof setTimeout>;
   private retryDelay = 1_000;
@@ -226,8 +225,6 @@ export class MobileWorkspaceStore {
     const api = this.api;
     this.clearReconnect();
     this.patch({ connection: "connecting", error: undefined });
-    this.queued = [];
-    this.openSocket(generation, attempt, api);
 
     const task = (async () => {
       try {
@@ -256,13 +253,12 @@ export class MobileWorkspaceStore {
         );
         if (!this.isCurrent(generation, attempt)) return;
 
-        const queued = this.queued ?? [];
-        this.queued = undefined;
-        let data: WorkspaceData = this.snapshot;
-        for (const envelope of queued) data = applyEnvelope(data, envelope);
+        // Start realtime from the boundary returned by bootstrap. The relay
+        // replays mutations that happened while the snapshot and recent
+        // message pages were loading, without an ambiguous startup window.
+        this.openSocket(generation, attempt, api);
         this.replace({
           ...this.snapshot,
-          ...data,
           lastSyncAt: Date.now(),
           error: undefined,
           connection:
@@ -272,7 +268,6 @@ export class MobileWorkspaceStore {
         this.scheduleCache();
       } catch (error) {
         if (!this.isCurrent(generation, attempt) || !this.api) return;
-        this.queued = undefined;
         this.closeSocket();
         this.patch({
           connection: this.reachable ? "error" : "offline",
@@ -312,14 +307,11 @@ export class MobileWorkspaceStore {
           envelope?: Envelope;
         };
         if (payload.t !== "event" || !payload.envelope) return;
-        if (this.queued) this.queued.push(payload.envelope);
-        else {
-          const next = applyEnvelope(this.snapshot, payload.envelope);
-          if (next !== this.snapshot) {
-            this.replaceData(next);
-            this.patch({ lastSyncAt: Date.now() });
-            this.scheduleCache();
-          }
+        const next = applyEnvelope(this.snapshot, payload.envelope);
+        if (next !== this.snapshot) {
+          this.replaceData(next);
+          this.patch({ lastSyncAt: Date.now() });
+          this.scheduleCache();
         }
       } catch {
         socket.close();
@@ -399,7 +391,6 @@ export class MobileWorkspaceStore {
     ++this.attempt;
     this.connecting = undefined;
     this.clearReconnect();
-    this.queued = undefined;
     this.closeSocket();
   }
 
