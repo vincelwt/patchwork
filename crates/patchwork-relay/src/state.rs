@@ -225,7 +225,10 @@ impl AppState {
         let presence = self.presence.read().await;
         let mut members = self.store.members()?;
         for member in &mut members {
-            member.presence = presence.get(&member.id).copied().unwrap_or(Presence::Offline);
+            member.presence = presence
+                .get(&member.id)
+                .copied()
+                .unwrap_or(Presence::Offline);
         }
         Ok(members)
     }
@@ -275,12 +278,16 @@ mod tests {
         assert!(format!("p-{relay}-{preview}").len() <= 63);
         assert_eq!(relay, "7mr1nww5f2hub8gu1ppwskftc");
         assert_eq!(preview, "3gnb2cxz3cqcb7oph55d4n26");
-        assert_eq!(compact_id("00000000-0000-0000-0000-000000000001").as_deref(), Some("1"));
+        assert_eq!(
+            compact_id("00000000-0000-0000-0000-000000000001").as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
     fn managed_previews_get_their_own_first_level_origin() {
-        let path = std::env::temp_dir().join(format!("patchwork-state-{}.sqlite", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("patchwork-state-{}.sqlite", uuid::Uuid::new_v4()));
         let store = crate::store::Store::open(&path).unwrap();
         store.create_workspace("workspace", "Test").unwrap();
         let files = path.with_extension("files");

@@ -171,6 +171,8 @@ export interface Task {
   current_run_id?: Id;
   pr_url?: string;
   pr_state?: PullRequestState;
+  /// Exact action the owning agent will take if a person approves this review.
+  review_action?: string;
   created_by: Id;
   /// When this is meant to be done. The Inbox says so on the day.
   due_at?: Millis;

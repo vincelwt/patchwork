@@ -89,6 +89,7 @@ impl Store {
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
+            "ALTER TABLE tasks ADD COLUMN review_action TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
@@ -1045,6 +1046,7 @@ impl Store {
             current_run_id: row.get("current_run_id")?,
             pr_url: row.get("pr_url")?,
             pr_state: json_col(row, "pr_state"),
+            review_action: row.get("review_action")?,
             created_by: row.get("created_by")?,
             due_at: row.get("due_at")?,
             once_key: row.get("once_key")?,
@@ -1058,14 +1060,14 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
-                                pr_state, created_by, due_at, once_key, position, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                                pr_state, review_action, created_by, due_at, once_key, position, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.source_channel_id, task.source_message_id, task.discussion_channel_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.once_key,
-                task.position, task.created_at, task.updated_at
+                task.pr_state.as_ref().map(to_json), task.review_action, task.created_by,
+                task.due_at, task.once_key, task.position, task.created_at, task.updated_at
             ],
         )?;
         Ok(())
@@ -1157,13 +1159,15 @@ impl Store {
                               question_blocked_run_id=CASE
                                 WHEN ?15 OR ?4 != 'blocked' THEN NULL
                                 ELSE question_blocked_run_id
-                              END
+                              END,
+                              review_action=?16
               WHERE id=?1",
             params![
                 task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
                 task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms(),
-                explicit_status
+                explicit_status,
+                task.review_action
             ],
         )?;
         tx.execute(
@@ -1176,6 +1180,28 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Claim a review action exactly once before dispatching the follow-up run.
+    /// The compare-and-set keeps a double click (or two open clients) from
+    /// starting the approved action twice.
+    pub fn claim_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status = 'running', review_action = NULL, updated_at = ?3
+             WHERE id = ?1 AND status = 'review' AND review_action = ?2
+               AND current_run_id IS NULL",
+            params![task_id, action, now_ms()],
+        )? == 1)
+    }
+
+    /// Put an approval back when dispatch failed before a run took ownership.
+    pub fn restore_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status = 'review', review_action = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'running' AND review_action IS NULL
+               AND current_run_id IS NULL",
+            params![task_id, action, now_ms()],
+        )? == 1)
     }
 
     pub fn task(&self, id: &str) -> Result<Option<Task>> {
@@ -1568,11 +1594,7 @@ impl Store {
 
     /// Reserve one explicit cross-session message and enforce its loop budget
     /// in the same write transaction, so concurrent sends cannot race it.
-    pub fn reserve_direct_control(
-        &self,
-        event: &mut RunEvent,
-        target_run_id: &str,
-    ) -> Result<()> {
+    pub fn reserve_direct_control(&self, event: &mut RunEvent, target_run_id: &str) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let total: i64 = tx.query_row(
@@ -1589,7 +1611,9 @@ impl Store {
             |row| row.get(0),
         )?;
         if total >= 16 || pair >= 4 {
-            return Err(anyhow!("this run has reached its cross-session message limit"));
+            return Err(anyhow!(
+                "this run has reached its cross-session message limit"
+            ));
         }
         event.seq = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
@@ -1799,9 +1823,8 @@ impl Store {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut questions = {
-            let mut stmt = tx.prepare(
-                "SELECT * FROM questions WHERE run_id=?1 AND status='open' ORDER BY id",
-            )?;
+            let mut stmt = tx
+                .prepare("SELECT * FROM questions WHERE run_id=?1 AND status='open' ORDER BY id")?;
             let rows = stmt.query_map(params![run_id], Self::question_from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -2564,8 +2587,14 @@ mod tests {
             }));
         }
         let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
-        assert_eq!(results.iter().filter(|existing| existing.is_none()).count(), 1);
-        assert_eq!(results.iter().filter(|existing| existing.is_some()).count(), 1);
+        assert_eq!(
+            results.iter().filter(|existing| existing.is_none()).count(),
+            1
+        );
+        assert_eq!(
+            results.iter().filter(|existing| existing.is_some()).count(),
+            1
+        );
         assert_eq!(store.automation_runs("automation", 10).unwrap().len(), 1);
         drop(store);
         let _ = std::fs::remove_file(path);
@@ -2776,7 +2805,12 @@ mod tests {
         let changed = store.resolve_inbox_for(None, Some("run"), None).unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].id, "question-two");
-        assert!(store.inbox_item("mention").unwrap().unwrap().read_at.is_none());
+        assert!(store
+            .inbox_item("mention")
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none());
         drop(store);
         let _ = std::fs::remove_file(path);
     }
@@ -2784,7 +2818,9 @@ mod tests {
     #[test]
     fn question_transitions_are_single_use() {
         let (store, path) = store();
-        store.insert_question(&question("answered", "run-a")).unwrap();
+        store
+            .insert_question(&question("answered", "run-a"))
+            .unwrap();
         assert_eq!(
             store
                 .answer_question("answered", &[], "human")
@@ -2795,7 +2831,9 @@ mod tests {
         );
         assert!(store.answer_question("answered", &[], "human").is_err());
 
-        store.insert_question(&question("cancelled", "run-b")).unwrap();
+        store
+            .insert_question(&question("cancelled", "run-b"))
+            .unwrap();
         let cancelled = store.cancel_questions_for_run("run-b").unwrap();
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].status, QuestionStatus::Cancelled);
@@ -2805,10 +2843,12 @@ mod tests {
         ended.status = RunStatus::Cancelled;
         store.insert_run(&ended, 0).unwrap();
         let pending = question("too-late", "ended-run");
-        assert!(!store
-            .commit_question_waiting(&pending, &ended, &[])
-            .unwrap()
-            .0);
+        assert!(
+            !store
+                .commit_question_waiting(&pending, &ended, &[])
+                .unwrap()
+                .0
+        );
         assert!(store.question(&pending.id).unwrap().is_none());
         assert_eq!(
             store.run(&ended.id).unwrap().unwrap().status,
@@ -2878,9 +2918,7 @@ mod tests {
                 })),
                 created_at: index,
             };
-            store
-                .reserve_direct_control(&mut event, "target")
-                .unwrap();
+            store.reserve_direct_control(&mut event, "target").unwrap();
             assert_eq!(event.seq, index + 1);
         }
         let mut extra = RunEvent {
@@ -2930,7 +2968,9 @@ mod tests {
             run_id: None,
             created_at: 1,
         };
-        store.insert_attachment(&attachment, "/tmp/screen.png").unwrap();
+        store
+            .insert_attachment(&attachment, "/tmp/screen.png")
+            .unwrap();
         store
             .insert_message(&Message {
                 id: "message".into(),

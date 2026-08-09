@@ -176,9 +176,13 @@ fn on_path(bin: &str) -> Option<String> {
     if let Some(hit) = path_cache().lock().ok().and_then(|c| c.get(bin).cloned()) {
         return hit;
     }
-    let found = which::which_in(bin, Some(search_path()), std::env::current_dir().unwrap_or_default())
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let found = which::which_in(
+        bin,
+        Some(search_path()),
+        std::env::current_dir().unwrap_or_default(),
+    )
+    .ok()
+    .map(|p| p.to_string_lossy().to_string());
     if let Ok(mut cache) = path_cache().lock() {
         cache.insert(bin.to_string(), found.clone());
     }
@@ -224,9 +228,7 @@ fn login_shell_path() -> String {
         .stdin(Stdio::null())
         .output();
     match out {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => String::new(),
     }
 }
@@ -275,11 +277,7 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
 
         let (available, command, problem) = match (&native, &base, has_npx || self_hosted) {
             (Some(path), _, _) => (true, vec![path.clone()], None),
-            (None, Some(_), true) => (
-                true,
-                runtime_command(b.id).unwrap_or_default(),
-                None,
-            ),
+            (None, Some(_), true) => (true, runtime_command(b.id).unwrap_or_default(), None),
             (None, Some(_), false) => (
                 false,
                 vec![],
@@ -315,8 +313,7 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
         });
     }
 
-    let versions =
-        futures::future::join_all(pending.iter().map(|(_, cli)| version_of(cli))).await;
+    let versions = futures::future::join_all(pending.iter().map(|(_, cli)| version_of(cli))).await;
     for ((index, _), version) in pending.into_iter().zip(versions) {
         out[index].version = version;
     }
@@ -346,7 +343,7 @@ pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
         command: vec![],
         version: None,
         problem: None,
-            models: Vec::new(),
+        models: Vec::new(),
         thinking: Vec::new(),
         modes: Vec::new(),
         default_model: None,
@@ -447,8 +444,7 @@ fn capability_cache() -> &'static tokio::sync::RwLock<Option<Cached>> {
 }
 
 fn refresh_in_flight() -> &'static std::sync::atomic::AtomicBool {
-    static IN_FLIGHT: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     &IN_FLIGHT
 }
 

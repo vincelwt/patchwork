@@ -400,6 +400,10 @@ pub struct Task {
     pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_state: Option<PullRequestState>,
+    /// The exact action a person can approve while this task is in review.
+    /// Approval resumes the owning agent with this instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_action: Option<String>,
     pub created_by: Id,
     /// When this is meant to be done. The Inbox says so on the day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -875,7 +879,9 @@ pub enum AutomationTrigger {
         on_checks_failed: bool,
     },
     /// `POST /api/webhooks/{token}`.
-    Webhook { token: String },
+    Webhook {
+        token: String,
+    },
     Manual,
 }
 

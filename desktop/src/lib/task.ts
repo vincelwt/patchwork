@@ -26,7 +26,15 @@ export type Situation =
 export interface NextAction {
   /// What the button says. Imperative, and names the actor where it helps.
   label: string;
-  kind: "start" | "stop" | "answer" | "retry" | "assign" | "complete" | "reopen";
+  kind:
+    | "start"
+    | "stop"
+    | "answer"
+    | "retry"
+    | "assign"
+    | "approve"
+    | "complete"
+    | "reopen";
   tone: "primary" | "normal" | "quiet";
 }
 
@@ -107,13 +115,15 @@ export function readTask(
   if (task.status === "review") {
     return {
       situation: "review",
-      headline: "Ready for you to look at",
+      headline: task.review_action ? "Waiting for your approval" : "Ready for you to look at",
       detail: task.pr_state
         ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
         : run?.headline,
       run,
       owner,
-      action: { label: "Mark done", kind: "complete", tone: "primary" },
+      action: task.review_action
+        ? { label: task.review_action, kind: "approve", tone: "primary" }
+        : { label: "Mark done", kind: "complete", tone: "primary" },
       secondary: { label: "Back to planning", kind: "reopen", tone: "quiet" },
     };
   }

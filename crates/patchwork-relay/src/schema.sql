@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   question_blocked_run_id TEXT,
   pr_url                TEXT,
   pr_state              TEXT,
+  review_action         TEXT,
   created_by            TEXT NOT NULL,
   due_at                INTEGER,
   once_key              TEXT,

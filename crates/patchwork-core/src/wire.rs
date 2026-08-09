@@ -206,6 +206,10 @@ pub struct UpdateTask {
     pub host_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// Exact label and instruction offered to a person in the review state.
+    /// An empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_action: Option<String>,
     /// Epoch millis, or 0 to clear the date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<i64>,
