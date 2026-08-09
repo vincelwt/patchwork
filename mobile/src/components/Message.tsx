@@ -191,7 +191,7 @@ function CardView({ card }: { card: MessageCard }) {
     switch (card.type) {
       case "task": {
         const task = workspace.bootstrap?.tasks.find((item) => item.id === card.task_id);
-        return { title: task?.title ?? "Task", detail: task?.key, press: () => router.push({ pathname: "/(app)/tasks/[taskId]", params: { taskId: card.task_id } }) };
+        return { title: task?.title ?? "Task", detail: task?.key, press: () => router.push({ pathname: "/tasks/[taskId]", params: { taskId: card.task_id } }) };
       }
       case "run":
         return { title: "Agent run", detail: "Open activity", press: () => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: card.run_id } }) };

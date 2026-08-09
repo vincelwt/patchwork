@@ -18,7 +18,7 @@ export default function AutomationsScreen() {
   const automations = workspace.bootstrap?.automations ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Automations" subtitle={`${automations.length} workflows`} action={<Button label="New" compact onPress={() => setCreating(true)} />} />
+      <PageHeader title="Automations" subtitle={`${automations.length} workflows`} back action={<Button label="New" compact onPress={() => setCreating(true)} />} />
       <ScrollView contentContainerStyle={styles.scroll}>
         {automations.map((automation) => <AutomationRow key={automation.id} automation={automation} />)}
         {!automations.length ? <Empty title="No automations yet" detail="Choose what fires, which agent acts, and where the result lands." /> : null}

@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import { Conversation } from "@/components/Message";
 import { PullRequestLink } from "@/components/pull-request-link";
 import { TaskEditor } from "@/components/TaskEditor";
-import { Avatar, Badge, Button, Card, ErrorNotice, PageHeader, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "@/components/ui";
 import { taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -29,7 +29,7 @@ export default function TaskScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  if (!task || !data) return <View style={styles.fill}><PageHeader title="Task" back /></View>;
+  if (!task || !data) return <View style={styles.fill}><Stack.Screen options={{ title: "Task" }} /></View>;
 
   const start = async (agentId?: string) => {
     setBusy(true);
@@ -62,7 +62,13 @@ export default function TaskScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title={task.key} subtitle={task.title} back action={<Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />} />
+      <Stack.Screen
+        options={{
+          title: task.key,
+          headerBackTitle: "Tasks",
+          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
+        }}
+      />
       <Card style={styles.summary}>
         <View style={styles.titleRow}>
           <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
