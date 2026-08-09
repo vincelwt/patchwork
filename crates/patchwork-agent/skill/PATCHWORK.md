@@ -115,6 +115,9 @@ patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
 patchwork task update PW-14 --status review --evidence test-results.txt
+patchwork evidence list
+patchwork evidence remove <attachment-id>
+patchwork attach new-results.txt --replace <attachment-id> --caption "Updated results"
 patchwork task update PW-14 --owner @vince --due 2026-08-14
 patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
@@ -127,7 +130,9 @@ original request remains in its conversation.
 Review means there is something concrete to inspect. An agent may move a task
 to review only after attaching a file from this run, exposing a preview, or
 linking a pull request. Use `--evidence path` to attach a result while updating
-the task. If the work has not started, leave it planned. If it cannot continue,
+the task. Use `patchwork evidence` to list or remove earlier attachments, or
+`patchwork attach --replace` to replace one while preserving its chat history.
+If the work has not started, leave it planned. If it cannot continue,
 mark it blocked. Never move a plan or an unverified claim to review.
 
 ### A task is how you ask a person for something

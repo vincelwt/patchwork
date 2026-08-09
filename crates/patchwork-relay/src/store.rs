@@ -980,6 +980,14 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Unpin evidence while preserving an attachment posted in chat.
+    pub fn remove_task_attachment(&self, id: &str, task_id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE attachments SET task_id = NULL WHERE id = ?1 AND task_id = ?2",
+            params![id, task_id],
+        )? == 1)
+    }
+
     // -- tasks --------------------------------------------------------------
 
     fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
@@ -2580,6 +2588,12 @@ mod tests {
         let attached = store.attachment("file").unwrap().unwrap().0;
         assert_eq!(attached.message_id.as_deref(), Some("message"));
         assert_eq!(attached.task_id.as_deref(), Some("task"));
+        assert!(store.remove_task_attachment("file", "task").unwrap());
+        let unpinned = store.attachment("file").unwrap().unwrap().0;
+        assert_eq!(unpinned.message_id.as_deref(), Some("message"));
+        assert_eq!(unpinned.task_id, None);
+        assert!(store.task_attachments("task").unwrap().is_empty());
+        assert!(!store.remove_task_attachment("file", "task").unwrap());
         let mut duplicate = store.message("message").unwrap().unwrap();
         duplicate.id = "other-message".into();
         assert!(store.insert_message(&duplicate).is_err());
