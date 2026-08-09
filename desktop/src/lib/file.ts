@@ -30,3 +30,47 @@ export function useFileUrl(path: string) {
 
   return url;
 }
+
+export function useGrantedFileUrl(id?: string) {
+  const api = useApi();
+  const [url, setUrl] = useState("");
+
+  useEffect(() => {
+    setUrl("");
+    if (!id) return;
+    let cancelled = false;
+    void api
+      .grantFile(id)
+      .then((granted) => {
+        if (!cancelled) setUrl(granted.url);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [api, id]);
+
+  return url;
+}
+
+export function usePreviewUrl(id?: string, live = false) {
+  const api = useApi();
+  const [url, setUrl] = useState("");
+
+  useEffect(() => {
+    setUrl("");
+    if (!id || !live) return;
+    let cancelled = false;
+    void api
+      .grantPreview(id)
+      .then((granted) => {
+        if (!cancelled) setUrl(granted.url);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [api, id, live]);
+
+  return url;
+}

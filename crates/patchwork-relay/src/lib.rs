@@ -118,7 +118,12 @@ pub async fn start(config: Config) -> Result<Handle> {
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
-            .allow_headers(Any),
+            .allow_headers(Any)
+            .expose_headers([
+                axum::http::header::ACCEPT_RANGES,
+                axum::http::header::CONTENT_LENGTH,
+                axum::http::header::CONTENT_RANGE,
+            ]),
     );
     tracing::info!("relay listening on {local_url} (public: {public_url})");
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  compactId,
   decodeBase64,
   encodeBase64,
   parseHostFrame,
@@ -19,6 +20,19 @@ test("routes one opaque installation without exposing an origin", () => {
   });
   assert.equal(route("/r/not-an-id/api/health"), null);
   assert.equal(route(`/other/${id}`), null);
+
+  const preview = "019fe30c-fe6f-7ff0-8829-931a29a63576";
+  assert.equal(compactId(id), "2fapl4n1azs5kkwzrxa98bn3");
+  assert.deepEqual(
+    route("/checkout", `p-${compactId(id)}-${compactId(preview)}.patchwork.sh`),
+    {
+      role: "client",
+      relayId: id,
+      localPath: `/preview/${preview}/checkout`,
+      preview: true,
+    },
+  );
+  assert.equal(route("/", `p-${"z".repeat(25)}-1.patchwork.sh`), null);
 });
 
 test("proxy headers keep auth and content type but drop transport metadata", () => {
@@ -28,10 +42,13 @@ test("proxy headers keep auth and content type but drop transport metadata", () 
     connection: "keep-alive",
     host: "relay.patchwork.sh",
     "cf-ray": "private-edge-metadata",
+    "sec-websocket-key": "private",
+    "sec-websocket-protocol": "vite-hmr",
   });
   assert.deepEqual(proxyHeaders(headers), [
     ["authorization", "Bearer device"],
     ["content-type", "application/json"],
+    ["sec-websocket-protocol", "vite-hmr"],
   ]);
 });
 

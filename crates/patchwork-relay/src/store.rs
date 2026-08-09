@@ -81,6 +81,7 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             // After the column, never in schema.sql: an index on a column an
@@ -931,6 +932,7 @@ impl Store {
             file_name: row.get("file_name")?,
             mime: row.get("mime")?,
             size: row.get("size")?,
+            caption: row.get("caption")?,
             message_id: row.get("message_id")?,
             task_id: row.get("task_id")?,
             run_id: row.get("run_id")?,
@@ -940,13 +942,14 @@ impl Store {
 
     pub fn insert_attachment(&self, attachment: &Attachment, path: &str) -> Result<()> {
         self.conn()?.execute(
-            "INSERT INTO attachments (id, file_name, mime, size, path, message_id, task_id, run_id, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO attachments (id, file_name, mime, size, caption, path, message_id, task_id, run_id, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 attachment.id,
                 attachment.file_name,
                 attachment.mime,
                 attachment.size,
+                attachment.caption,
                 path,
                 attachment.message_id,
                 attachment.task_id,
@@ -1112,10 +1115,22 @@ impl Store {
             .optional()?)
     }
 
-    pub fn delete_task(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
-        Ok(())
+    pub fn delete_task(&self, id: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let files = {
+            let mut statement = tx.prepare("SELECT path FROM attachments WHERE task_id = ?1")?;
+            let files = statement
+                .query_map(params![id], |row| row.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            files
+        };
+        tx.execute("DELETE FROM attachments WHERE task_id = ?1", params![id])?;
+        tx.execute("DELETE FROM previews WHERE task_id = ?1", params![id])?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(files)
     }
 
     // -- projects, hosts, worktrees ----------------------------------------
@@ -2534,6 +2549,7 @@ mod tests {
             file_name: "screen.png".into(),
             mime: "image/png".into(),
             size: 1,
+            caption: String::new(),
             url: "/api/files/file".into(),
             message_id: None,
             task_id: None,

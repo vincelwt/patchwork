@@ -12,7 +12,7 @@ use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::host::{HostToRelay, RelayToHost};
-use patchwork_core::models::{Host, Presence};
+use patchwork_core::models::{Host, Presence, PreviewStatus};
 use patchwork_core::{now_ms, Id};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -250,6 +250,7 @@ async fn connection(
     // Teardown.
     for host_id in registered {
         state.hosts.write().await.remove(&host_id);
+        fail_host_previews(&state, &host_id);
         if let Ok(Some(mut host)) = state.store.host(&host_id) {
             host.online = false;
             host.last_seen = now_ms();
@@ -261,6 +262,19 @@ async fn connection(
     bus_task.abort();
     host_pump.abort();
     writer.abort();
+}
+
+fn fail_host_previews(state: &Shared, host_id: &str) {
+    let Ok(previews) = state.store.previews(true) else {
+        return;
+    };
+    for mut preview in previews.into_iter().filter(|preview| preview.host_id == host_id) {
+        preview.status = PreviewStatus::Failed;
+        preview.stopped_at = Some(now_ms());
+        if state.store.upsert_preview(&preview).is_ok() {
+            state.emit(Event::PreviewUpdated { preview });
+        }
+    }
 }
 
 /// A desktop tells us where each project lives on it; that is how "run it

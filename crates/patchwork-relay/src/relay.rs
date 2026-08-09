@@ -130,6 +130,18 @@ impl Relay {
         None
     }
 
+    /// Preview hostnames omit workspace ids to stay inside one DNS label.
+    /// ponytail: scan the handful of mounted workspaces; index previews
+    /// relay-wide only if a relay ever carries enough workspaces to notice.
+    pub async fn router_for_preview(&self, preview_id: &str) -> Option<Router> {
+        for mounted in self.mounted.read().await.values() {
+            if mounted.state.store.preview(preview_id).ok().flatten().is_some() {
+                return Some(mounted.router.clone());
+            }
+        }
+        None
+    }
+
     /// Which workspace a device token belongs to. Same scan, same reasoning.
     pub async fn workspace_for_token(&self, token: &str) -> Option<(Shared, crate::auth::Caller)> {
         for state in self.states().await {
@@ -339,6 +351,15 @@ async fn reconcile_interrupted_runs(state: &Shared) {
             state.emit(Event::RunUpdated { run: run.clone() });
             if let Err(err) = orchestrator::finish_run(state, &run).await {
                 tracing::warn!(?err, run = %run.id, "could not finish interrupted run");
+            }
+        }
+    }
+    if let Ok(previews) = state.store.previews(true) {
+        for mut preview in previews {
+            preview.status = PreviewStatus::Failed;
+            preview.stopped_at = Some(now_ms());
+            if state.store.upsert_preview(&preview).is_ok() {
+                state.emit(Event::PreviewUpdated { preview });
             }
         }
     }

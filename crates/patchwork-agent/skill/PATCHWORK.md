@@ -180,6 +180,8 @@ patchwork pr https://github.com/acme/app/pull/42
 
 `preview` exposes a dev server you started so a human can open it. Attach
 screenshots and other evidence to the task when work is ready for review.
+Whenever visual evidence would make the work easier to review, provide a
+screenshot, video, or live preview.
 
 ## Charts
 

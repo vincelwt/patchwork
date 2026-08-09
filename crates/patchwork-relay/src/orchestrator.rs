@@ -1646,7 +1646,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         HostToRelay::PreviewStatus {
             preview_id,
             status,
-            url,
+            url: _,
             error,
         } => {
             let Some(mut preview) = state.store.preview(&preview_id)? else {
@@ -1656,15 +1656,10 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 return Ok(());
             }
             preview.status = status;
-            if let Some(url) = url {
-                // A relay-hosted preview is reachable through the relay; a
-                // desktop preview stays on that machine.
-                preview.url = if host_id == state.relay_host_id {
-                    format!("{}/preview/{}/", state.public_url, preview.id)
-                } else {
-                    url
-                };
-            }
+            // Every host is reached through the workspace relay. Desktops stay
+            // outbound-only and no longer create machine-local previews.
+            preview.url = format!("{}/preview/{}/", state.public_url, preview.id);
+            preview.local_only = false;
             if status == PreviewStatus::Stopped || status == PreviewStatus::Failed {
                 preview.stopped_at = Some(now_ms());
             }
@@ -1701,6 +1696,41 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 .await;
             }
         }
+        HostToRelay::PreviewResponse {
+            request_id,
+            status,
+            headers,
+            body,
+            error,
+        } => {
+            if let Some(waiter) = state.preview_waiters.write().await.remove(&request_id) {
+                let _ = waiter.send(crate::state::PreviewReply {
+                    status,
+                    headers,
+                    body,
+                    error,
+                });
+            }
+        }
+        HostToRelay::PreviewSocketReady { socket_id, error } => {
+            if let Some(socket) = state.preview_sockets.read().await.get(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Ready(error));
+            }
+        }
+        HostToRelay::PreviewSocketData {
+            socket_id,
+            data,
+            binary,
+        } => {
+            if let Some(socket) = state.preview_sockets.read().await.get(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Data { data, binary });
+            }
+        }
+        HostToRelay::PreviewSocketClose { socket_id } => {
+            if let Some(socket) = state.preview_sockets.write().await.remove(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Close);
+            }
+        }
     }
     Ok(())
 }
@@ -1730,7 +1760,9 @@ pub(crate) fn has_review_evidence(
             .store
             .task_previews(&task.id)?
             .iter()
-            .any(|preview| preview.run_id.as_deref() == run_id))
+            .any(|preview| {
+                preview.run_id.as_deref() == run_id && preview.status == PreviewStatus::Live
+            }))
 }
 
 /// A finished run updates the board and the Inbox so nothing silently stalls.

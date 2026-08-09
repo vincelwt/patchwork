@@ -166,9 +166,36 @@ pub enum RelayToHost {
         preview_id: Id,
         task_id: Id,
         cwd: String,
-        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
         port: u16,
         label: String,
+    },
+    PreviewRequest {
+        request_id: Id,
+        preview_id: Id,
+        method: String,
+        path: String,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        body: String,
+    },
+    PreviewSocketOpen {
+        socket_id: Id,
+        preview_id: Id,
+        path: String,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+    },
+    PreviewSocketData {
+        socket_id: Id,
+        data: String,
+        #[serde(default)]
+        binary: bool,
+    },
+    PreviewSocketClose {
+        socket_id: Id,
     },
     StopPreview {
         preview_id: Id,
@@ -283,6 +310,30 @@ pub enum HostToRelay {
         url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    PreviewResponse {
+        request_id: Id,
+        status: u16,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    PreviewSocketReady {
+        socket_id: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    PreviewSocketData {
+        socket_id: Id,
+        data: String,
+        #[serde(default)]
+        binary: bool,
+    },
+    PreviewSocketClose {
+        socket_id: Id,
     },
     Pong {
         at: Millis,

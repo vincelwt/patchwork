@@ -115,6 +115,42 @@ impl Runner {
             RelayToHost::StopPreview { preview_id } => {
                 self.previews.stop(&preview_id).await;
             }
+            RelayToHost::PreviewRequest {
+                request_id,
+                preview_id,
+                method,
+                path,
+                headers,
+                body,
+            } => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.previews
+                        .request(request_id, preview_id, method, path, headers, body)
+                        .await;
+                });
+            }
+            RelayToHost::PreviewSocketOpen {
+                socket_id,
+                preview_id,
+                path,
+                headers,
+            } => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.previews
+                        .open_socket(socket_id, preview_id, path, headers)
+                        .await;
+                });
+            }
+            RelayToHost::PreviewSocketData {
+                socket_id,
+                data,
+                binary,
+            } => self.previews.socket_data(&socket_id, data, binary).await,
+            RelayToHost::PreviewSocketClose { socket_id } => {
+                self.previews.close_socket(&socket_id).await;
+            }
             RelayToHost::Ping => {
                 self.emit(HostToRelay::Pong {
                     at: patchwork_core::now_ms(),

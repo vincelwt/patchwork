@@ -160,9 +160,9 @@ struct ChartArgs {
 struct PreviewArgs {
     #[arg(long)]
     port: Option<u16>,
-    /// Command that starts the dev server.
+    /// Command that starts the dev server. Omit it for an existing server.
     #[arg(long)]
-    command: String,
+    command: Option<String>,
     #[arg(long)]
     label: Option<String>,
 }
@@ -1293,28 +1293,72 @@ async fn upload_attachment(
     path: &str,
     caption: &str,
 ) -> Result<Attachment> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("cannot read {path}"))?;
     let file_name = std::path::Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let mut form = reqwest::multipart::Form::new().part(
-        "file",
-        reqwest::multipart::Part::bytes(bytes).file_name(file_name),
-    );
-    if let Some(task_id) = &ctx.task_id {
-        form = form.text("task_id", task_id.clone());
-    }
-    let response = client
-        .http
-        .post(client.url("/api/files"))
-        .bearer_auth(&client.token)
-        .multipart(form)
-        .send()
-        .await?;
-    let attachment: Attachment = parse(response).await?;
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("cannot read {path}"))?
+        .len();
+    let attachment: Attachment = if size > 8 * 1024 * 1024 {
+        use tokio::io::AsyncReadExt;
+
+        let upload: UploadSession = client
+            .post(
+                "/api/uploads",
+                json!({
+                    "file_name": file_name,
+                    "mime": "",
+                    "size": size,
+                    "caption": caption,
+                    "task_id": ctx.task_id,
+                }),
+            )
+            .await?;
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut offset = 0u64;
+        loop {
+            let mut chunk = vec![0; upload.chunk_size];
+            let read = file.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            chunk.truncate(read);
+            let response = client
+                .http
+                .put(client.url(&format!("/api/uploads/{}?offset={offset}", upload.id)))
+                .bearer_auth(&client.token)
+                .body(chunk)
+                .send()
+                .await?;
+            let _: Value = parse(response).await?;
+            offset += read as u64;
+        }
+        client
+            .post(&format!("/api/uploads/{}/complete", upload.id), json!({}))
+            .await?
+    } else {
+        let bytes = tokio::fs::read(path).await?;
+        let mut form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes).file_name(file_name),
+        );
+        if let Some(task_id) = &ctx.task_id {
+            form = form.text("task_id", task_id.clone());
+        }
+        if !caption.is_empty() {
+            form = form.text("caption", caption.to_string());
+        }
+        let response = client
+            .http
+            .post(client.url("/api/files"))
+            .bearer_auth(&client.token)
+            .multipart(form)
+            .send()
+            .await?;
+        parse(response).await?
+    };
     if let Some(channel_id) = &ctx.channel_id {
         let _: Message = client
             .post(
@@ -1347,7 +1391,7 @@ async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result
         .task_id
         .clone()
         .ok_or_else(|| anyhow!("previews belong to a task; this run has none"))?;
-    let preview: Preview = client
+    let mut preview: Preview = client
         .post(
             "/api/previews",
             json!({
@@ -1358,9 +1402,20 @@ async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result
             }),
         )
         .await?;
-    client.print(&preview, || {
-        println!("preview starting on port {}", preview.port)
-    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
+    while preview.status == PreviewStatus::Starting && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        preview = client
+            .get::<Vec<Preview>>("/api/previews")
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == preview.id)
+            .ok_or_else(|| anyhow!("preview disappeared while starting"))?;
+    }
+    if preview.status != PreviewStatus::Live {
+        bail!("preview did not become live (status: {:?})", preview.status);
+    }
+    client.print(&preview, || println!("preview live on port {}", preview.port));
     Ok(())
 }
 
