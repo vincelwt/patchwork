@@ -1453,7 +1453,7 @@ fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTri
             prompt.push_str(&format!("Expected result: {}\n", task.outcome.trim()));
         }
         prompt.push_str(
-            "Leave finished work in Review for a person to approve; do not mark the task Done yourself.\n",
+            "Leave work in Review when it needs approval. Once the agreed outcome is achieved and no human action remains, mark the task Done.\n",
         );
         prompt.push('\n');
     }
@@ -3225,7 +3225,7 @@ mod tests {
     }
 
     #[test]
-    fn task_runs_leave_human_confirmation_to_review() {
+    fn task_runs_explain_review_and_completion() {
         let task = Task {
             id: "task".into(),
             key: "PW-1".into(),
@@ -3263,7 +3263,8 @@ mod tests {
             required_task_status: None,
         };
         let prompt = compose_prompt(&params, &Some(task), &params.trigger);
-        assert!(prompt.contains("Leave finished work in Review"));
-        assert!(prompt.contains("do not mark the task Done yourself"));
+        assert!(prompt.contains("Leave work in Review when it needs approval"));
+        assert!(prompt.contains("mark the task Done"));
+        assert!(!prompt.contains("do not mark the task Done yourself"));
     }
 }

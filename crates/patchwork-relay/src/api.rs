@@ -1026,20 +1026,12 @@ async fn update_task(
     State(state): State<Shared>,
     caller: Caller,
     Path(id): Path<Id>,
-    Json(mut input): Json<UpdateTask>,
+    Json(input): Json<UpdateTask>,
 ) -> ApiResult<Json<Task>> {
     let task = state
         .store
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
-    // Done is the requester's confirmation, not an agent's assertion. For an
-    // inquiry, the agent's written answer is the reviewable result.
-    if caller.is_agent()
-        && input.status == Some(TaskStatus::Done)
-        && orchestrator::task_expects_written_answer(&state, &task)?
-    {
-        input.status = Some(TaskStatus::Review);
-    }
     if let Some(action) = input.review_action.as_deref() {
         let action = action.trim();
         if action.chars().any(char::is_control) || action.chars().count() > 80 {
@@ -3395,9 +3387,9 @@ mod tests {
             })
             .unwrap();
 
-        // Agents often distil an inquiry into its decision before handing it
-        // back. Classification uses the immutable original request, not these
-        // editable fields, and Done becomes Review for the requester.
+        // Explicit completion wins even for an inquiry. Successful runs still
+        // auto-promote written answers to Review when the agent does not set a
+        // terminal status itself.
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -3414,7 +3406,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let answered = store.task(&answered.id).unwrap().unwrap();
-        assert_eq!(answered.status, TaskStatus::Review);
+        assert_eq!(answered.status, TaskStatus::Done);
         assert_eq!(answered.outcome, "Decision: keep FTS5");
 
         let auto_reviewed = orchestrator::create_task(
