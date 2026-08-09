@@ -2100,12 +2100,22 @@ details[open] > summary::before {
   bottom: 20px;
   left: 50%;
   transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
   background: var(--text);
   color: var(--bg);
   padding: 7px 15px;
   border-radius: 999px;
   font-size: 14px;
   z-index: 50;
+}
+.toast-action {
+  color: inherit;
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .modal-backdrop {
