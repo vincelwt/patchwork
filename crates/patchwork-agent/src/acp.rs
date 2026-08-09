@@ -67,6 +67,10 @@ pub struct NewSession {
     pub current_model: Option<String>,
     pub current_thinking: Option<String>,
     pub current_mode: Option<String>,
+    /// Runtime-defined option IDs. These need not match their categories.
+    pub model_config_id: Option<String>,
+    pub thinking_config_id: Option<String>,
+    pub mode_config_id: Option<String>,
     /// The runtime described itself with `configOptions` rather than the older
     /// `models`/`modes` groups, so changing one goes through
     /// `session/set_config_option`.
@@ -163,6 +167,10 @@ fn config_current(option: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn config_id(option: &Value) -> Option<String> {
+    option.get("id").and_then(|v| v.as_str()).map(str::to_owned)
+}
+
 /// Read a `session/new` result in either dialect.
 fn describe_session(session_id: String, res: &Value) -> NewSession {
     let model = config_option(res, "model");
@@ -177,6 +185,9 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
             current_model: model.and_then(config_current),
             current_thinking: thinking.and_then(config_current),
             current_mode: mode.and_then(config_current),
+            model_config_id: model.and_then(config_id),
+            thinking_config_id: thinking.and_then(config_id),
+            mode_config_id: mode.and_then(config_id),
             config_options: true,
         };
     }
@@ -190,6 +201,9 @@ fn describe_session(session_id: String, res: &Value) -> NewSession {
         current_model: current_of(res, "models", "currentModelId"),
         current_thinking: None,
         current_mode: current_of(res, "modes", "currentModeId"),
+        model_config_id: None,
+        thinking_config_id: None,
+        mode_config_id: None,
         config_options: false,
     }
 }
@@ -379,11 +393,16 @@ impl AcpConnection {
 
     /// Ask for a specific model. A runtime that does not support choosing is
     /// not an error worth failing a run over — the caller logs and carries on.
-    pub async fn set_model(&self, session_id: &str, model_id: &str, config: bool) -> Result<()> {
-        if config {
+    pub async fn set_model(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        config_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(config_id) = config_id {
             self.setup_request(
                 "session/set_config_option",
-                json!({ "sessionId": session_id, "configId": "model", "value": model_id }),
+                json!({ "sessionId": session_id, "configId": config_id, "value": model_id }),
             )
             .await?;
             return Ok(());
@@ -397,20 +416,25 @@ impl AcpConnection {
     }
 
     /// How hard to think. Only the config-option dialect has one.
-    pub async fn set_thinking(&self, session_id: &str, level: &str) -> Result<()> {
+    pub async fn set_thinking(&self, session_id: &str, config_id: &str, level: &str) -> Result<()> {
         self.setup_request(
             "session/set_config_option",
-            json!({ "sessionId": session_id, "configId": "thought_level", "value": level }),
+            json!({ "sessionId": session_id, "configId": config_id, "value": level }),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn set_mode(&self, session_id: &str, mode_id: &str, config: bool) -> Result<()> {
-        if config {
+    pub async fn set_mode(
+        &self,
+        session_id: &str,
+        mode_id: &str,
+        config_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(config_id) = config_id {
             self.setup_request(
                 "session/set_config_option",
-                json!({ "sessionId": session_id, "configId": "mode", "value": mode_id }),
+                json!({ "sessionId": session_id, "configId": config_id, "value": mode_id }),
             )
             .await?;
             return Ok(());
@@ -734,11 +758,18 @@ mod tests {
     fn a_session_describes_itself_in_either_dialect() {
         let modern = json!({
             "sessionId": "s1",
-            "configOptions": [{
-                "type": "select", "id": "model", "category": "model",
-                "currentValue": "openrouter/deepseek/deepseek-v4-flash",
-                "options": [{ "value": "openrouter/deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash" }]
-            }]
+            "configOptions": [
+                {
+                    "type": "select", "id": "model", "category": "model",
+                    "currentValue": "openrouter/deepseek/deepseek-v4-flash",
+                    "options": [{ "value": "openrouter/deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash" }]
+                },
+                {
+                    "type": "select", "id": "reasoning_effort", "category": "thought_level",
+                    "currentValue": "medium",
+                    "options": [{ "value": "xhigh", "name": "Xhigh" }]
+                }
+            ]
         });
         let session = describe_session("s1".into(), &modern);
         assert!(session.config_options);
@@ -747,6 +778,11 @@ mod tests {
             session.current_model.as_deref(),
             Some("openrouter/deepseek/deepseek-v4-flash")
         );
+        assert_eq!(
+            session.thinking_config_id.as_deref(),
+            Some("reasoning_effort")
+        );
+        assert_eq!(session.current_thinking.as_deref(), Some("medium"));
 
         let legacy = json!({
             "sessionId": "s2",

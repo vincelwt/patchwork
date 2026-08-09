@@ -702,7 +702,7 @@ async fn apply_session_preferences(
         if opened.current_model.as_deref() == Some(model) {
             // Already what was asked for.
         } else if let Err(err) = conn
-            .set_model(session_id, model, opened.config_options)
+            .set_model(session_id, model, opened.model_config_id.as_deref())
             .await
         {
             note(format!("could not select model `{model}`: {err:#}"));
@@ -714,10 +714,16 @@ async fn apply_session_preferences(
     if let Some(level) = spec.thinking.as_deref().filter(|m| !m.is_empty()) {
         if opened.current_thinking.as_deref() == Some(level) {
             // Already what was asked for.
-        } else if let Err(err) = conn.set_thinking(session_id, level).await {
-            note(format!("could not think `{level}`: {err:#}"));
+        } else if let Some(config_id) = opened.thinking_config_id.as_deref() {
+            if let Err(err) = conn.set_thinking(session_id, config_id, level).await {
+                note(format!("could not think `{level}`: {err:#}"));
+            } else {
+                note(format!("thinking: {level}"));
+            }
         } else {
-            note(format!("thinking: {level}"));
+            note(format!(
+                "could not think `{level}`: runtime offers no thinking setting"
+            ));
         }
     }
 
@@ -729,7 +735,7 @@ async fn apply_session_preferences(
     if let Some(mode) = most_permissive(&opened.modes) {
         if opened.current_mode.as_deref() != Some(mode.as_str()) {
             if let Err(err) = conn
-                .set_mode(session_id, &mode, opened.config_options)
+                .set_mode(session_id, &mode, opened.mode_config_id.as_deref())
                 .await
             {
                 note(format!("could not select mode `{mode}`: {err:#}"));
