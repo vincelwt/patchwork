@@ -2,6 +2,7 @@ import type {
   AutomationTrigger,
   Millis,
   RunStatus,
+  Task,
   TaskStatus,
 } from "@client/types";
 
@@ -46,6 +47,19 @@ export function bytes(value: number) {
 
 export function taskStatusLabel(status: TaskStatus) {
   return status[0].toUpperCase() + status.slice(1);
+}
+
+export function pullRequestLabel(task: Pick<Task, "pr_url" | "pr_state">) {
+  const number = task.pr_state?.number ?? pullRequestNumber(task.pr_url);
+  const prefix = number ? `PR #${number}` : "Pull request";
+  return task.pr_state?.state
+    ? `${prefix} · ${task.pr_state.state.toLowerCase()}`
+    : prefix;
+}
+
+function pullRequestNumber(url?: string) {
+  const match = url?.match(/\/pull\/(\d+)(?:[/?#]|$)/);
+  return match ? Number(match[1]) : undefined;
 }
 
 export function runStatusLabel(status: RunStatus) {

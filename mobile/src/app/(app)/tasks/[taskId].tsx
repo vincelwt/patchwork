@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 
 import { Conversation } from "@/components/Message";
+import { PullRequestLink } from "@/components/pull-request-link";
 import { TaskEditor } from "@/components/TaskEditor";
 import { Avatar, Badge, Button, Card, ErrorNotice, PageHeader, Sheet } from "@/components/ui";
 import { taskStatusLabel } from "@/lib/format";
@@ -58,6 +59,7 @@ export default function TaskScreen() {
           {owner ? <View style={styles.person}><Avatar member={owner} size={25} /><Text style={{ color: theme.text }}>{owner.display_name}</Text></View> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
           {project ? <Badge>{project.name}</Badge> : null}
           {task.due_at ? <Badge tone={task.due_at < Date.now() && task.status !== "done" ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
+          <PullRequestLink task={task} />
         </View>
         <View style={styles.actions}>
           {active ? (

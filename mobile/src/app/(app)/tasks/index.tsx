@@ -5,6 +5,7 @@ import { useRouter } from "expo-router";
 import type { Task, TaskStatus } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
 import { TaskEditor } from "@/components/TaskEditor";
+import { PullRequestLink } from "@/components/pull-request-link";
 import { Avatar, Badge, Button, ChoiceField, Empty, PageHeader, Sheet } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
 import { useWorkspace } from "@/lib/store";
@@ -77,9 +78,12 @@ function TaskRow({ task }: { task: Task }) {
       <Text style={[styles.key, { color: theme.faint }]}>{task.key}</Text>
       <View style={styles.main}>
         <Text numberOfLines={2} style={[styles.title, { color: theme.text }]}>{task.title}</Text>
-        <Text numberOfLines={1} style={[styles.meta, { color: theme.muted }]}>
-          {[project?.name, task.due_at ? `due ${new Date(task.due_at).toLocaleDateString()}` : "", relative(task.updated_at)].filter(Boolean).join(" · ")}
-        </Text>
+        <View style={styles.metaRow}>
+          <Text numberOfLines={1} style={[styles.meta, { color: theme.muted }]}>
+            {[project?.name, task.due_at ? `due ${new Date(task.due_at).toLocaleDateString()}` : "", relative(task.updated_at)].filter(Boolean).join(" · ")}
+          </Text>
+          <PullRequestLink task={task} />
+        </View>
       </View>
       {owner ? <Avatar member={owner} size={28} /> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
     </Pressable>
@@ -106,5 +110,6 @@ const styles = StyleSheet.create({
   key: { width: 58, fontSize: 12, fontWeight: "700" },
   main: { flex: 1, minWidth: 0 },
   title: { fontSize: 15, fontWeight: "600", lineHeight: 20 },
-  meta: { fontSize: 12, marginTop: 3 },
+  metaRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6, paddingTop: 3 },
+  meta: { flexShrink: 1, fontSize: 12 },
 });
