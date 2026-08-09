@@ -88,6 +88,7 @@ impl Store {
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
+            "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
@@ -1136,16 +1137,33 @@ impl Store {
     }
 
     pub fn update_task(&self, task: &Task) -> Result<()> {
+        self.update_task_inner(task, false)
+    }
+
+    /// Persist a task status chosen outside the question lifecycle. Even if
+    /// the visible status stays `blocked`, a human or agent has taken control
+    /// of it and answering an older question must not silently move it again.
+    pub fn update_task_with_explicit_status(&self, task: &Task) -> Result<()> {
+        self.update_task_inner(task, true)
+    }
+
+    fn update_task_inner(&self, task: &Task, explicit_status: bool) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
-                              position=?13, updated_at=?14 WHERE id=?1",
+                              position=?13, updated_at=?14,
+                              question_blocked_run_id=CASE
+                                WHEN ?15 OR ?4 != 'blocked' THEN NULL
+                                ELSE question_blocked_run_id
+                              END
+              WHERE id=?1",
             params![
                 task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms()
+                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms(),
+                explicit_status
             ],
         )?;
         tx.execute(
@@ -1670,14 +1688,14 @@ impl Store {
         Ok(())
     }
 
-    /// Make the question, waiting run and Inbox rows visible as one state.
-    /// A terminal run wins the race and commits none of them.
+    /// Make the question, waiting run, blocked task and Inbox rows visible as
+    /// one state. A terminal run wins the race and commits none of them.
     pub fn commit_question_waiting(
         &self,
         question: &Question,
         run: &Run,
         inbox: &[InboxItem],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<Task>)> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
@@ -1686,7 +1704,7 @@ impl Store {
             params![run.id, run.headline],
         )?;
         if changed == 0 {
-            return Ok(false);
+            return Ok((false, None));
         }
         tx.execute(
             "INSERT INTO questions (id, run_id, agent_id, channel_id, task_id, message_id, headline, items, status, created_at)
@@ -1710,8 +1728,28 @@ impl Store {
                 ],
             )?;
         }
+        let blocked = if let Some(task_id) = &question.task_id {
+            let changed = tx.execute(
+                "UPDATE tasks
+                 SET status='blocked', question_blocked_run_id=?2, updated_at=?3
+                 WHERE id=?1 AND current_run_id=?2 AND status='running'",
+                params![task_id, run.id, now_ms()],
+            )?;
+            if changed == 0 {
+                None
+            } else {
+                tx.query_row(
+                    "SELECT * FROM tasks WHERE id=?1",
+                    params![task_id],
+                    Self::task_from_row,
+                )
+                .optional()?
+            }
+        } else {
+            None
+        };
         tx.commit()?;
-        Ok(true)
+        Ok((true, blocked))
     }
 
     pub fn answer_question(
@@ -1719,8 +1757,10 @@ impl Store {
         id: &str,
         answers: &[QuestionAnswer],
         by: &str,
-    ) -> Result<Question> {
-        let changed = self.conn()?.execute(
+    ) -> Result<(Question, Option<Task>)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE questions SET status='answered', answers=?2, answered_by=?3, answered_at=?4
              WHERE id=?1 AND status='open'",
             params![id, to_json(&answers), by, now_ms()],
@@ -1728,8 +1768,31 @@ impl Store {
         if changed == 0 {
             return Err(anyhow!("question is no longer open"));
         }
-        self.question(id)?
-            .ok_or_else(|| anyhow!("question not found"))
+        let question = tx
+            .query_row(
+                "SELECT * FROM questions WHERE id=?1",
+                params![id],
+                Self::question_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("question not found"))?;
+        let resumed = tx
+            .query_row(
+                "UPDATE tasks
+                 SET status='running', question_blocked_run_id=NULL, updated_at=?2
+                 WHERE current_run_id=?1
+                   AND status='blocked'
+                   AND question_blocked_run_id=?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM questions WHERE run_id=?1 AND status='open'
+                   )
+                 RETURNING *",
+                params![question.run_id, now_ms()],
+                Self::task_from_row,
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok((question, resumed))
     }
 
     pub fn cancel_questions_for_run(&self, run_id: &str) -> Result<Vec<Question>> {
@@ -1745,6 +1808,17 @@ impl Store {
         tx.execute(
             "UPDATE questions SET status='cancelled' WHERE run_id=?1 AND status='open'",
             params![run_id],
+        )?;
+        // Terminal run handling immediately computes the task's durable final
+        // state. Restore its pre-question status in storage without emitting a
+        // transient Running event between cancellation and that final update.
+        tx.execute(
+            "UPDATE tasks
+             SET status='running', question_blocked_run_id=NULL, updated_at=?2
+             WHERE current_run_id=?1
+               AND status='blocked'
+               AND question_blocked_run_id=?1",
+            params![run_id, now_ms()],
         )?;
         tx.commit()?;
         for question in &mut questions {
@@ -2715,6 +2789,7 @@ mod tests {
             store
                 .answer_question("answered", &[], "human")
                 .unwrap()
+                .0
                 .status,
             QuestionStatus::Answered
         );
@@ -2732,7 +2807,8 @@ mod tests {
         let pending = question("too-late", "ended-run");
         assert!(!store
             .commit_question_waiting(&pending, &ended, &[])
-            .unwrap());
+            .unwrap()
+            .0);
         assert!(store.question(&pending.id).unwrap().is_none());
         assert_eq!(
             store.run(&ended.id).unwrap().unwrap().status,

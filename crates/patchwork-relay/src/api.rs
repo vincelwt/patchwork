@@ -1020,12 +1020,20 @@ async fn update_task(
     State(state): State<Shared>,
     caller: Caller,
     Path(id): Path<Id>,
-    Json(input): Json<UpdateTask>,
+    Json(mut input): Json<UpdateTask>,
 ) -> ApiResult<Json<Task>> {
     let task = state
         .store
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
+    // Done is the requester's confirmation, not an agent's assertion. For an
+    // inquiry, the agent's written answer is the reviewable result.
+    if caller.is_agent()
+        && input.status == Some(TaskStatus::Done)
+        && orchestrator::task_expects_written_answer(&state, &task)?
+    {
+        input.status = Some(TaskStatus::Review);
+    }
     if caller.is_agent() && input.status == Some(TaskStatus::Review) {
         if !orchestrator::has_review_evidence(
             &state,
@@ -1034,7 +1042,7 @@ async fn update_task(
             input.pr_url.as_deref(),
         )? {
             return Err(ApiError::bad_request(
-                "review needs evidence from this run: attach a file, expose a preview, or link a pull request; otherwise leave the task planned or blocked",
+                "review needs evidence from this run: answer the original question, attach a file, expose a preview, or link a pull request; otherwise leave the task planned or blocked",
             ));
         }
     }
@@ -1411,10 +1419,10 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    if !state
+    let (committed, blocked_task) = state
         .store
-        .commit_question_waiting(&question, &run, &inbox_items)?
-    {
+        .commit_question_waiting(&question, &run, &inbox_items)?;
+    if !committed {
         state.store.delete_message(&message.id)?;
         state.emit(Event::MessageDeleted {
             channel_id: run.channel_id.clone(),
@@ -1423,6 +1431,9 @@ async fn ask_question(
         return Err(ApiError::conflict("that run has already ended"));
     }
     state.emit(Event::RunUpdated { run: run.clone() });
+    if let Some(task) = blocked_task {
+        state.emit(Event::TaskUpdated { task });
+    }
     state.set_presence(&run.agent_id, Presence::Waiting).await;
     for item in inbox_items {
         state.emit(Event::InboxItemCreated { item });
@@ -2791,7 +2802,33 @@ mod tests {
             started_at: Some(1),
             ended_at: None,
         };
-        store.insert_run(&make_run("run-one"), 0).unwrap();
+        let task = Task {
+            id: "task".into(),
+            key: "PW-1".into(),
+            title: "Needs a decision".into(),
+            outcome: "Continue after the human decides".into(),
+            status: TaskStatus::Running,
+            owner_id: Some(agent.id.clone()),
+            source_channel_id: Some("channel".into()),
+            source_message_id: None,
+            discussion_channel_id: "channel".into(),
+            project_id: None,
+            host_id: Some("host-one".into()),
+            worktree_id: None,
+            current_run_id: Some("run-one".into()),
+            pr_url: None,
+            pr_state: None,
+            created_by: human.id.clone(),
+            due_at: None,
+            once_key: None,
+            created_at: 1,
+            updated_at: 1,
+            position: 1.0,
+        };
+        store.insert_task(&task).unwrap();
+        let mut first_run = make_run("run-one");
+        first_run.task_id = Some(task.id.clone());
+        store.insert_run(&first_run, 0).unwrap();
         let state = std::sync::Arc::new(crate::state::AppState::new(
             store.clone(),
             path.with_extension("files"),
@@ -2873,6 +2910,10 @@ mod tests {
         .unwrap()
         .0;
         assert!(question.message_id.is_some());
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
         assert!(store
             .inbox(&human.id, false)
             .unwrap()
@@ -2922,6 +2963,11 @@ mod tests {
             RunStatus::Waiting
         );
         assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked,
+            "one answer cannot unblock a task with another open question",
+        );
+        assert_eq!(
             store.question(&second.id).unwrap().unwrap().status,
             QuestionStatus::Open
         );
@@ -2945,6 +2991,43 @@ mod tests {
         assert_eq!(
             store.run("run-one").unwrap().unwrap().status,
             RunStatus::Running
+        );
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+
+        let explicit_block = ask_question(
+            State(state.clone()),
+            agent_caller("run-one"),
+            Json(ask("run-one")),
+        )
+        .await
+        .unwrap()
+        .0;
+        let _ = orchestrator::update_task(
+            &state,
+            &human.id,
+            &task.id,
+            UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let _ = answer_question(
+            State(state.clone()),
+            human_caller(),
+            Path(explicit_block.id),
+            Json(AnswerQuestion { answers: Vec::new() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked,
+            "an explicit Blocked status must outlive the question that first blocked it",
         );
 
         store.insert_run(&make_run("run-two"), 0).unwrap();
@@ -3124,6 +3207,112 @@ mod tests {
             store.task(&task.id).unwrap().unwrap().status,
             TaskStatus::Planned,
             "a successful run without evidence must not auto-promote itself",
+        );
+
+        let answered = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "Should search use QMD?".into(),
+                outcome: "Should we add QMD for powering CLI search? or not".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .append_run_event(&RunEvent {
+                id: "answer-event".into(),
+                run_id: "run".into(),
+                seq: 1,
+                kind: RunEventKind::Message,
+                text: "Recommendation: keep search in the relay.".into(),
+                data: None,
+                created_at: 2,
+            })
+            .unwrap();
+
+        // Agents often distil an inquiry into its decision before handing it
+        // back. Classification uses the immutable original request, not these
+        // editable fields, and Done becomes Review for the requester.
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/tasks/{}", answered.id))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"title":"Keep relay search","outcome":"Decision: keep FTS5","status":"done"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let answered = store.task(&answered.id).unwrap().unwrap();
+        assert_eq!(answered.status, TaskStatus::Review);
+        assert_eq!(answered.outcome, "Decision: keep FTS5");
+
+        let auto_reviewed = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "What does search index?".into(),
+                outcome: "What does CLI search index?".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .append_run_event(&RunEvent {
+                id: "automatic-answer-event".into(),
+                run_id: "answer-run".into(),
+                seq: 1,
+                kind: RunEventKind::Message,
+                text: "It indexes task titles and outcomes.".into(),
+                data: None,
+                created_at: 3,
+            })
+            .unwrap();
+        let mut running = auto_reviewed.clone();
+        running.status = TaskStatus::Running;
+        running.current_run_id = Some("answer-run".into());
+        store.update_task(&running).unwrap();
+        orchestrator::finish_run(
+            &state,
+            &Run {
+                id: "answer-run".into(),
+                agent_id: agent.id.clone(),
+                status: RunStatus::Succeeded,
+                trigger: RunTrigger::Manual {
+                    by: "person".into(),
+                },
+                channel_id: auto_reviewed.discussion_channel_id.clone(),
+                task_id: Some(auto_reviewed.id.clone()),
+                host_id: None,
+                project_id: None,
+                worktree_id: None,
+                cwd: None,
+                automation_id: None,
+                session_id: None,
+                runtime: "test".into(),
+                prompt: String::new(),
+                headline: "Done".into(),
+                error: None,
+                token_usage: None,
+                created_at: 1,
+                started_at: Some(1),
+                ended_at: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.task(&auto_reviewed.id).unwrap().unwrap().status,
+            TaskStatus::Review,
+            "a successful written answer should wait for human review",
         );
 
         let response = router(state.clone())
