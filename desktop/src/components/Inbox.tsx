@@ -51,7 +51,7 @@ interface Group {
 }
 
 /// Inbox is a view onto things that need attention. Opening an item always
-/// lands in the original conversation, task or run — never a parallel thread.
+/// lands in the original conversation or task, never a parallel thread.
 ///
 /// One row per conversation, not one per message: six mentions in the same
 /// channel are one thing to go and deal with, and listing them six times buries
@@ -59,7 +59,7 @@ interface Group {
 export function InboxView() {
   const app = useApp();
   const api = useApi();
-  const { go, inspect } = useNavigation();
+  const { go } = useNavigation();
   const [showRead, setShowRead] = useState(false);
 
   const groups = useMemo(() => {
@@ -106,7 +106,6 @@ export function InboxView() {
     if (item.channel_id) markSeen(item.channel_id);
     if (item.task_id) {
       go({ kind: "task", id: item.task_id });
-      if (item.run_id) inspect({ kind: "run", runId: item.run_id });
       return;
     }
     if (item.channel_id) {

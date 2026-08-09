@@ -63,8 +63,7 @@ function useTaskActions(task: Task) {
     setBusy(true);
     setError("");
     try {
-      const run = await api.runTask(task.id, { agent_id: agentId, prompt });
-      inspect({ kind: "run", runId: run.id });
+      await api.runTask(task.id, { agent_id: agentId, prompt });
     } catch (err) {
       setError(String((err as Error).message ?? err));
     } finally {
@@ -92,8 +91,7 @@ function useTaskActions(task: Task) {
         case "approve": {
           setBusy(true);
           try {
-            const run = await api.approveTask(task.id);
-            inspect({ kind: "run", runId: run.id });
+            await api.approveTask(task.id);
           } finally {
             setBusy(false);
           }
@@ -812,7 +810,6 @@ function TaskFiles({ taskId, channelId }: { taskId: Id; channelId: Id }) {
 export function AssignModal({ task, onClose }: { task: Task; onClose: () => void }) {
   const app = useApp();
   const api = useApi();
-  const { inspect } = useNavigation();
   const [owner, setOwner] = useState(
     task.owner_id || suggestedOwner(app.members, app.me),
   );
@@ -832,11 +829,10 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
         await api.updateTask(task.id, { owner_id: owner });
       }
       if (andStart && isAgent) {
-        const run = await api.runTask(task.id, {
+        await api.runTask(task.id, {
           agent_id: owner,
           prompt: instruction.trim() || undefined,
         });
-        inspect({ kind: "run", runId: run.id });
       }
       onClose();
     } catch (err) {
