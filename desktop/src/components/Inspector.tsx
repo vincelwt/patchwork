@@ -1,10 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { store, useApi, useApp, useAppSelector } from "../lib/store";
 import { duration, relative, statusLabel, statusTone } from "../lib/format";
 import { Avatar, Chip, proseText, useNavigation } from "./common";
 import { Empty } from "./ui";
 import { Card } from "./Cards";
 import { Markdown } from "./Markdown";
+import { useBottomAnchor } from "../lib/scroll";
 import {
   CheckIcon,
   CloseIcon,
@@ -76,6 +77,7 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
     (candidate) => candidate.id === root?.channel_id,
   );
   const authorOf = (id: Id) => app.members.find((member) => member.id === id);
+  const { scrollerRef, contentRef, updatePinned } = useBottomAnchor(messageId, 60);
 
   useEffect(() => {
     void store.loadThread(messageId);
@@ -85,23 +87,25 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
 
   return (
     <DropZone className="thread-pane" onFiles={setDropped}>
-      <div className="inspector-body">
-        <MessageRow
-          message={root}
-          grouped={false}
-          author={authorOf(root.author_id)}
-          handles={handles}
-        />
-        <div style={{ height: 10 }} />
-        {(replies ?? []).map((reply) => (
+      <div className="inspector-body" ref={scrollerRef} onScroll={updatePinned}>
+        <div ref={contentRef}>
           <MessageRow
-            key={reply.id}
-            message={reply}
+            message={root}
             grouped={false}
-            author={authorOf(reply.author_id)}
+            author={authorOf(root.author_id)}
             handles={handles}
           />
-        ))}
+          <div style={{ height: 10 }} />
+          {(replies ?? []).map((reply) => (
+            <MessageRow
+              key={reply.id}
+              message={reply}
+              grouped={false}
+              author={authorOf(reply.author_id)}
+              handles={handles}
+            />
+          ))}
+        </div>
       </div>
       <Composer
         channel={channel}
@@ -138,19 +142,11 @@ export function RunPanel({
     };
   });
   const api = useApi();
-  const log = useRef<HTMLDivElement>(null);
-  const pinned = useRef(true);
+  const { scrollerRef, contentRef, updatePinned } = useBottomAnchor(runId, 60);
 
   useEffect(() => {
     void store.loadRun(runId);
   }, [runId]);
-
-  // A live run should scroll itself, but only while the reader has not gone
-  // back to look at something earlier.
-  useEffect(() => {
-    const element = log.current;
-    if (element && pinned.current) element.scrollTop = element.scrollHeight;
-  }, [events?.length]);
 
   if (!run) return <Empty title="Loading the run" />;
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
@@ -159,62 +155,56 @@ export function RunPanel({
     <>
       <div
         className={embedded ? "" : "inspector-body"}
-        ref={embedded ? undefined : log}
-        onScroll={
-          embedded
-            ? undefined
-            : (event) => {
-                const element = event.currentTarget;
-                pinned.current =
-                  element.scrollHeight - element.scrollTop - element.clientHeight < 60;
-              }
-        }
+        ref={embedded ? undefined : scrollerRef}
+        onScroll={embedded ? undefined : updatePinned}
       >
-        {!embedded && (
-          <>
-            <div className="run-summary">
-              <Avatar member={agent} size={30} />
-              <span className="grow">
-                <span className="name">{agent?.display_name}</span>
-                <span className="sub">{run.headline || statusLabel(run.status)}</span>
-              </span>
-              {active && (
-                <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
-                  Stop
-                </button>
-              )}
-            </div>
-            <div className="card-row">
-              <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
-              <Chip>{run.runtime}</Chip>
-              {host && <Chip>{host.name}</Chip>}
-              <Chip>{duration(run.started_at, run.ended_at)}</Chip>
-            </div>
-            {run.cwd && (
-              <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
-                {run.cwd}
+        <div ref={embedded ? undefined : contentRef}>
+          {!embedded && (
+            <>
+              <div className="run-summary">
+                <Avatar member={agent} size={30} />
+                <span className="grow">
+                  <span className="name">{agent?.display_name}</span>
+                  <span className="sub">{run.headline || statusLabel(run.status)}</span>
+                </span>
+                {active && (
+                  <button className="button quiet" onClick={() => api.cancelRun(run.id)}>
+                    Stop
+                  </button>
+                )}
               </div>
-            )}
-          </>
-        )}
-        {run.error && (
-          <div className="error-text" style={{ whiteSpace: "pre-wrap" }}>
-            {run.error}
+              <div className="card-row">
+                <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
+                <Chip>{run.runtime}</Chip>
+                {host && <Chip>{host.name}</Chip>}
+                <Chip>{duration(run.started_at, run.ended_at)}</Chip>
+              </div>
+              {run.cwd && (
+                <div className="card-sub" style={{ marginTop: 8, wordBreak: "break-all" }}>
+                  {run.cwd}
+                </div>
+              )}
+            </>
+          )}
+          {run.error && (
+            <div className="error-text" style={{ whiteSpace: "pre-wrap" }}>
+              {run.error}
+            </div>
+          )}
+
+          {/* The question belongs where the person looking at the run is, not only
+              in a transcript they may have scrolled away from. */}
+          {question && <Card card={{ type: "question", question_id: question.id }} />}
+
+          <div className="section-head">
+            <span className="section-title">Activity</span>
+            {active && <Spinner size={12} />}
           </div>
-        )}
-
-        {/* The question belongs where the person looking at the run is, not only
-            in a transcript they may have scrolled away from. */}
-        {question && <Card card={{ type: "question", question_id: question.id }} />}
-
-        <div className="section-head">
-          <span className="section-title">Activity</span>
-          {active && <Spinner size={12} />}
+          {!events?.length && <div className="card-sub">Nothing recorded yet.</div>}
+          {events?.map((event) => (
+            <RunEventRow key={event.id} event={event} />
+          ))}
         </div>
-        {!events?.length && <div className="card-sub">Nothing recorded yet.</div>}
-        {events?.map((event) => (
-          <RunEventRow key={event.id} event={event} />
-        ))}
       </div>
       {active && <SteerBox run={run} agent={agent} />}
     </>
