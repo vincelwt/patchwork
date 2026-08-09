@@ -539,7 +539,7 @@ async fn trigger_agents(
             .task_id
             .as_deref()
             .and_then(|id| state.store.task(id).ok().flatten())
-            .and_then(|task| (task.status != TaskStatus::Done).then_some(task.owner_id).flatten())
+            .and_then(|task| (!task.status.is_terminal()).then_some(task.owner_id).flatten())
             .filter(|id| {
                 members
                     .iter()
@@ -1125,7 +1125,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     if let Some(task) = &task {
         let mut task = task.clone();
         task.current_run_id = Some(run.id.clone());
-        if task.status != TaskStatus::Done {
+        if !task.status.is_terminal() {
             task.status = TaskStatus::Running;
         }
         state.store.update_task(&task)?;
@@ -1815,13 +1815,15 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
             }
         }
         RunStatus::Failed => {
-            task.status = TaskStatus::Blocked;
-            notify_task(
-                state,
-                &task,
-                InboxKind::TaskBlocked,
-                format!("{} is blocked", task.key),
-            )?;
+            if task.status == TaskStatus::Running {
+                task.status = TaskStatus::Blocked;
+                notify_task(
+                    state,
+                    &task,
+                    InboxKind::TaskBlocked,
+                    format!("{} is blocked", task.key),
+                )?;
+            }
         }
         _ => {}
     }
@@ -2192,7 +2194,7 @@ pub async fn update_task(
             ),
         )
         .await;
-        if task.status == TaskStatus::Done {
+        if task.status.is_terminal() {
             resolve_inbox(state, Some(&task.id), None, None)?;
         }
     }

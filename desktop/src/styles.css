@@ -2964,6 +2964,10 @@ details[open] > summary::before {
   background: var(--positive);
   opacity: 1;
 }
+.column-dot.canceled {
+  background: var(--text-faint);
+  opacity: 1;
+}
 
 .task-card .head {
   display: flex;

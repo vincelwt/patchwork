@@ -314,15 +314,17 @@ pub enum TaskStatus {
     Blocked,
     Review,
     Done,
+    Canceled,
 }
 
 impl TaskStatus {
-    pub const ALL: [TaskStatus; 5] = [
+    pub const ALL: [TaskStatus; 6] = [
         TaskStatus::Planned,
         TaskStatus::Running,
         TaskStatus::Blocked,
         TaskStatus::Review,
         TaskStatus::Done,
+        TaskStatus::Canceled,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -332,6 +334,7 @@ impl TaskStatus {
             TaskStatus::Blocked => "blocked",
             TaskStatus::Review => "review",
             TaskStatus::Done => "done",
+            TaskStatus::Canceled => "canceled",
         }
     }
 
@@ -342,8 +345,27 @@ impl TaskStatus {
             "blocked" => TaskStatus::Blocked,
             "review" => TaskStatus::Review,
             "done" => TaskStatus::Done,
+            "canceled" => TaskStatus::Canceled,
             _ => return None,
         })
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, TaskStatus::Done | TaskStatus::Canceled)
+    }
+}
+
+#[cfg(test)]
+mod task_status_tests {
+    use super::TaskStatus;
+
+    #[test]
+    fn canceled_is_a_terminal_task_status() {
+        assert_eq!(TaskStatus::parse("canceled"), Some(TaskStatus::Canceled));
+        assert_eq!(TaskStatus::Canceled.as_str(), "canceled");
+        assert!(TaskStatus::Canceled.is_terminal());
+        assert!(TaskStatus::Done.is_terminal());
+        assert!(!TaskStatus::Review.is_terminal());
     }
 }
 

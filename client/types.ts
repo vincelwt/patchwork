@@ -122,7 +122,13 @@ export interface Message {
   edited_at?: Millis;
 }
 
-export type TaskStatus = "planned" | "running" | "blocked" | "review" | "done";
+export type TaskStatus =
+  | "planned"
+  | "running"
+  | "blocked"
+  | "review"
+  | "done"
+  | "canceled";
 
 export const TASK_STATUSES: TaskStatus[] = [
   "planned",
@@ -130,7 +136,12 @@ export const TASK_STATUSES: TaskStatus[] = [
   "blocked",
   "review",
   "done",
+  "canceled",
 ];
+
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status === "done" || status === "canceled";
+}
 
 export interface PullRequestState {
   number: number;
