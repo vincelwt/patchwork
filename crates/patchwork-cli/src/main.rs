@@ -383,8 +383,9 @@ enum AutomationCommand {
         every: Option<i64>,
         /// Shell command for `--trigger watch`. It runs on the relay every
         /// `--every` seconds and only fires the agent when it prints
-        /// something new. `$PATCHWORK_STATE_DIR` is its own directory, kept
-        /// between polls, for whatever it needs to remember.
+        /// something new. One JSON object per line can provide `event_key`,
+        /// `condition_key`, task `title`/`outcome`, and `context`.
+        /// `$PATCHWORK_STATE_DIR` is its own directory, kept between polls.
         #[arg(long)]
         command: Option<String>,
         /// Channel for message triggers and for reporting.

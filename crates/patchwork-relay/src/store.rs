@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
 use patchwork_core::wire::Device;
-use patchwork_core::{now_ms, Id};
+use patchwork_core::{now_ms, Id, Millis};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value as Json;
@@ -1163,7 +1163,7 @@ impl Store {
         tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
-                              position=?13, updated_at=?14,
+                              position=?13, updated_at=MAX(?14, updated_at + 1),
                               question_blocked_run_id=CASE
                                 WHEN ?15 OR ?4 != 'blocked' THEN NULL
                                 ELSE question_blocked_run_id
@@ -1195,7 +1195,8 @@ impl Store {
     /// starting the approved action twice.
     pub fn claim_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
         Ok(self.conn()?.execute(
-            "UPDATE tasks SET status = 'running', review_action = NULL, updated_at = ?3
+            "UPDATE tasks SET status = 'running', review_action = NULL,
+                              updated_at = MAX(?3, updated_at + 1)
              WHERE id = ?1 AND status = 'review' AND review_action = ?2
                AND current_run_id IS NULL",
             params![task_id, action, now_ms()],
@@ -1205,11 +1206,114 @@ impl Store {
     /// Put an approval back when dispatch failed before a run took ownership.
     pub fn restore_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
         Ok(self.conn()?.execute(
-            "UPDATE tasks SET status = 'review', review_action = ?2, updated_at = ?3
+            "UPDATE tasks SET status = 'review', review_action = ?2,
+                              updated_at = MAX(?3, updated_at + 1)
              WHERE id = ?1 AND status = 'running' AND review_action IS NULL
                AND current_run_id IS NULL",
             params![task_id, action, now_ms()],
         )? == 1)
+    }
+
+    pub fn update_task_if_unchanged(
+        &self,
+        task: &Task,
+        expected_updated_at: Millis,
+        explicit_status: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
+                              worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
+                              position=?13, updated_at=MAX(?14, updated_at + 1),
+                              question_blocked_run_id=CASE
+                                WHEN ?15 OR ?4 != 'blocked' THEN NULL
+                                ELSE question_blocked_run_id
+                              END,
+                              review_action=?16
+             WHERE id=?1 AND updated_at=?17",
+            params![
+                task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
+                task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
+                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms(),
+                explicit_status, task.review_action, expected_updated_at
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE channels SET name = ?2, topic = ?3 WHERE id = ?1",
+            params![
+                task.discussion_channel_id,
+                format!("{}: {}", task.key, task.title),
+                task.outcome,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn activate_task_run(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        required_status: Option<TaskStatus>,
+    ) -> Result<Option<TaskStatus>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT status, current_run_id, updated_at FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Millis>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, current_run_id, updated_at)) = current else {
+            return Ok(None);
+        };
+        let status = TaskStatus::parse(&status).unwrap_or(TaskStatus::Planned);
+        if status.is_terminal()
+            || current_run_id.is_some()
+            || required_status.is_some_and(|required| required != status)
+        {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE tasks SET status='running', current_run_id=?2, updated_at=?3 WHERE id=?1",
+            params![task_id, run_id, now_ms().max(updated_at + 1)],
+        )?;
+        tx.commit()?;
+        Ok(Some(status))
+    }
+
+    pub fn finalize_task_run_start(&self, task_id: &str, run_id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET review_action=NULL, question_blocked_run_id=NULL,
+                              updated_at=MAX(?3, updated_at + 1)
+             WHERE id=?1 AND current_run_id=?2",
+            params![task_id, run_id, now_ms()],
+        )? > 0)
+    }
+
+    pub fn restore_task_after_failed_start(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        previous_status: TaskStatus,
+    ) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status=CASE WHEN status='running' THEN ?3 ELSE status END,
+                              current_run_id=NULL, updated_at=MAX(?4, updated_at + 1)
+             WHERE id=?1 AND current_run_id=?2",
+            params![task_id, run_id, previous_status.as_str(), now_ms()],
+        )? > 0)
     }
 
     pub fn task(&self, id: &str) -> Result<Option<Task>> {
@@ -1763,7 +1867,8 @@ impl Store {
         let blocked = if let Some(task_id) = &question.task_id {
             let changed = tx.execute(
                 "UPDATE tasks
-                 SET status='blocked', question_blocked_run_id=?2, updated_at=?3
+                 SET status='blocked', question_blocked_run_id=?2,
+                     updated_at=MAX(?3, updated_at + 1)
                  WHERE id=?1 AND current_run_id=?2 AND status='running'",
                 params![task_id, run.id, now_ms()],
             )?;
@@ -1811,7 +1916,8 @@ impl Store {
         let resumed = tx
             .query_row(
                 "UPDATE tasks
-                 SET status='running', question_blocked_run_id=NULL, updated_at=?2
+                 SET status='running', question_blocked_run_id=NULL,
+                     updated_at=MAX(?2, updated_at + 1)
                  WHERE current_run_id=?1
                    AND status='blocked'
                    AND question_blocked_run_id=?1
@@ -1845,7 +1951,8 @@ impl Store {
         // transient Running event between cancellation and that final update.
         tx.execute(
             "UPDATE tasks
-             SET status='running', question_blocked_run_id=NULL, updated_at=?2
+             SET status='running', question_blocked_run_id=NULL,
+                 updated_at=MAX(?2, updated_at + 1)
              WHERE current_run_id=?1
                AND status='blocked'
                AND question_blocked_run_id=?1",
@@ -2534,6 +2641,101 @@ mod tests {
                 .count(),
             1
         );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_agent_updates_cannot_overwrite_a_newer_task_state() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let mut completed = task.clone();
+        completed.status = TaskStatus::Done;
+        store.update_task(&completed).unwrap();
+
+        let mut stale = task.clone();
+        stale.title = "Stale agent edit".into();
+        assert!(!store
+            .update_task_if_unchanged(&stale, task.updated_at, false)
+            .unwrap());
+        let stored = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+        assert!(stored.updated_at > task.updated_at);
+        assert_ne!(stored.title, stale.title);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_run_activation_claims_the_expected_state_once() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for run_id in ["run-one", "run-two"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let task_id = task.id.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                (
+                    run_id,
+                    store
+                        .activate_task_run(&task_id, run_id, Some(TaskStatus::Planned))
+                        .unwrap(),
+                )
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|(_, status)| status.is_some()).count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find_map(|(run_id, status)| status.map(|_| *run_id))
+            .unwrap();
+        assert!(store
+            .restore_task_after_failed_start(&task.id, winner, TaskStatus::Planned)
+            .unwrap());
+
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, "run-three", Some(TaskStatus::Planned))
+                .unwrap(),
+            Some(TaskStatus::Planned)
+        );
+        let mut reviewed = store.task(&task.id).unwrap().unwrap();
+        reviewed.status = TaskStatus::Review;
+        store.update_task(&reviewed).unwrap();
+        assert!(store
+            .restore_task_after_failed_start(&task.id, "run-three", TaskStatus::Planned)
+            .unwrap());
+        let reviewed = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(reviewed.status, TaskStatus::Review);
+        assert!(reviewed.current_run_id.is_none());
+
+        let mut completed = reviewed;
+        completed.status = TaskStatus::Done;
+        store.update_task(&completed).unwrap();
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, "run-four", Some(TaskStatus::Planned))
+                .unwrap(),
+            None
+        );
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }

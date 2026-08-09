@@ -152,6 +152,10 @@ pub struct CreateTask {
     pub title: String,
     #[serde(default)]
     pub outcome: String,
+    /// Immutable source context for the task discussion. Defaults to the
+    /// outcome, or the title when the outcome is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

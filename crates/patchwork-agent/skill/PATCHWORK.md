@@ -37,7 +37,9 @@ are, not only in the conversation that started your run. Without it you are
 talking in that conversation.
 
 Your final reply at the end of a turn is posted automatically. Use `say` only
-when you want to speak *during* long work.
+when you want to speak *during* long work. When a task card already appears in
+the source or report channel, it is the report; do not post a second channel
+summary that repeats its title or outcome.
 
 ### Tell another active run
 
@@ -123,24 +125,34 @@ patchwork task update PW-14 --owner @vince --due 2026-08-14
 patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
 
+A task is a durable commitment to produce an observable outcome. Its title
+names the work. Its outcome states what will be true, available, or decided
+when the task is complete, using the shortest text that unambiguously defines
+done. The triggering request, context, plan, investigation, progress, result,
+and evidence belong in the discussion or attachments, not in the outcome.
+Change the outcome only when the agreed definition of done changes.
+
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
-rename it and distill its expected result with `task update`; the immutable
-original request remains in its conversation.
+rename it and distill the stable result with `task update`; the immutable
+original request remains in its conversation. If there is no durable result
+for someone to produce, use the conversation rather than creating a task.
 
 Review means there is something concrete to inspect. An agent may move a task
 to review only after attaching a file from this run, exposing a preview, or
- linking a pull request. A written answer or recommendation is itself reviewable
- evidence when that is what the original task asked for. Use `--evidence path`
- to attach a file result while updating the task. Use `patchwork evidence` to
- list or remove earlier attachments, or `patchwork attach --replace` to replace
- one while preserving its chat history. Use `--approval "Approve and merge PR"`
- when approval should resume you to perform a specific next action. The text is the primary button the
- person sees; clicking it starts a continuation with that approval recorded.
- They can always send the task back to planning instead. If the work has not
- started, leave it planned. If it cannot continue, mark it blocked. Never move a
- plan or an unverified claim to review, and never mark your own task done: Done
- is the requester's confirmation after review.
+linking a pull request. A written answer or recommendation is itself reviewable
+evidence when that is what the original task asked for. Use `--evidence path`
+to attach a file result while updating the task. Use `patchwork evidence` to
+list or remove earlier attachments, or `patchwork attach --replace` to replace
+one while preserving its chat history. Use `--approval "Approve and merge PR"`
+when approval should resume you to perform a specific next action. The text is
+the primary button the person sees; clicking it starts a continuation with that
+approval recorded. They can always send the task back to planning instead. If
+the work has not started, leave it planned. If it cannot continue, mark it
+blocked. Never move a plan or an unverified claim to review. Review and blocked
+tasks do not restart merely because the same condition recurs. Agents never
+reopen done or canceled work and never mark their own task done: Done is the
+requester's confirmation after review.
 
 ### A task is how you ask a person for something
 
@@ -275,6 +287,20 @@ either, which is why the obvious one-liner needs no state of its own. When it
 does need state, `$PATCHWORK_STATE_DIR` is a directory kept between polls.
 Write the scan as a script in the project and point the command at it, rather
 than cramming it into one line.
+
+A watch that creates tasks can print one compact JSON object per line:
+
+```json
+{"event_key":"deploy-1842","condition_key":"checkout:deploy","title":"Restore checkout deployment","outcome":"Checkout deploys successfully from main","context":{"status":500}}
+```
+
+`event_key` identifies one exact delivery within the automation and prevents
+replay. `condition_key` identifies the durable condition across the workspace
+and reuses its open task, so namespace it to its project or source. `title`
+names the work, `outcome` defines done, and `context` is preserved in the task discussion.
+Each line becomes one task event. Write diagnostics to stderr: if any non-empty
+stdout line is not a valid structured event, Patchwork treats the whole output
+as one legacy text finding.
 
 Pause, resume and delete take a name as readily as an id, because that is how
 somebody will ask you for it.
