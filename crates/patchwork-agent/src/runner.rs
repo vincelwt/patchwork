@@ -228,6 +228,8 @@ struct TurnState {
     message: String,
     thought: String,
     plan_posted: bool,
+    /// Setup metadata that the adapter repeats as an agent message.
+    startup_message: Option<String>,
     stderr: Vec<String>,
     /// When we last streamed the partial reply, so a fast agent does not turn
     /// every token into a websocket frame.
@@ -423,7 +425,10 @@ async fn execute(
         token_usage: None,
     });
 
-    let state = Arc::new(Mutex::new(TurnState::default()));
+    let state = Arc::new(Mutex::new(TurnState {
+        startup_message: opened.startup_message,
+        ..Default::default()
+    }));
 
     // 4. Pump the runtime's stream into run events, permission answers and
     //    accumulated prose.
@@ -837,6 +842,9 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
                     .and_then(|value| value.as_str());
                 let message_id = update.get("messageId").and_then(|value| value.as_str());
                 let mut s = state.lock().await;
+                if s.startup_message.take().as_deref() == Some(text.as_str()) {
+                    return;
+                }
                 // Codex commentary is useful while work is happening, but
                 // each new update replaces the previous one. The final answer
                 // then replaces the last update rather than preserving it as
@@ -1581,6 +1589,39 @@ mod tests {
             }
         }
         assert_eq!(bodies, vec!["Fixed the test.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_metadata_is_not_posted_as_an_agent_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let startup = "pi v0.84.1\n\n## Skills\n- example/SKILL.md\n";
+        let state = Arc::new(Mutex::new(TurnState {
+            startup_message: Some(startup.into()),
+            ..Default::default()
+        }));
+        let chunk = |text: &str| {
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            })
+        };
+
+        handle_update("r1", chunk(startup), &tx, &state).await;
+        handle_update("r1", chunk("Fixed."), &tx, &state).await;
+        flush_message("r1", &tx, &state, &spec()).await;
+
+        let mut bodies = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                HostToRelay::RunMessageDelta { body, .. }
+                | HostToRelay::RunMessage { body, .. } => bodies.push(body),
+                HostToRelay::RunEvent { text, .. } => assert!(!text.contains(startup)),
+                _ => {}
+            }
+        }
+        assert!(!bodies.is_empty());
+        assert!(bodies.iter().all(|body| !body.contains(startup)));
+        assert_eq!(bodies.last().map(String::as_str), Some("Fixed."));
     }
 
     #[tokio::test]
