@@ -1,12 +1,13 @@
 // What a task needs next.
 //
-// The board has five columns because a board needs columns, but "Planned" is
+// The board has one column per status because a board needs columns, but "Planned" is
 // not an instruction. At any moment a task is in exactly one *situation*, and
 // each situation has one obvious next move — assign it, start it, answer it,
 // look at it, close it. Deriving that in one place means the task page, the
 // board card and the inspector all offer the same next move, and none of them
 // can quietly disagree about what is going on.
 
+import { isTerminalTaskStatus } from "@client/types";
 import type { Member, Question, Run, Task } from "@client/types";
 
 export type Situation =
@@ -19,12 +20,21 @@ export type Situation =
   | "blocked"
   | "review"
   | "waiting-on-person"
-  | "done";
+  | "done"
+  | "canceled";
 
 export interface NextAction {
   /// What the button says. Imperative, and names the actor where it helps.
   label: string;
-  kind: "start" | "stop" | "answer" | "retry" | "assign" | "complete" | "reopen";
+  kind:
+    | "start"
+    | "stop"
+    | "answer"
+    | "retry"
+    | "assign"
+    | "approve"
+    | "complete"
+    | "reopen";
   tone: "primary" | "normal" | "quiet";
 }
 
@@ -59,6 +69,20 @@ export function readTask(
       (candidate.task_id === task.id || (run && candidate.run_id === run.id)),
   );
 
+  // Closed work cannot keep asking for attention because of a stale question,
+  // run, or review signal left over from before it was closed.
+  if (isTerminalTaskStatus(task.status)) {
+    const canceled = task.status === "canceled";
+    return {
+      situation: canceled ? "canceled" : "done",
+      headline: canceled ? "Canceled" : "Done",
+      detail: !canceled && task.pr_state ? `Pull request #${task.pr_state.number}` : undefined,
+      run,
+      owner,
+      action: { label: "Reopen", kind: "reopen", tone: "quiet" },
+    };
+  }
+
   // Something being asked of a person outranks everything else: it is the only
   // state where the task cannot progress without the reader.
   if (question) {
@@ -88,27 +112,18 @@ export function readTask(
     };
   }
 
-  if (task.status === "done") {
-    return {
-      situation: "done",
-      headline: "Done",
-      detail: task.pr_state ? `Pull request #${task.pr_state.number}` : undefined,
-      run,
-      owner,
-      action: { label: "Reopen", kind: "reopen", tone: "quiet" },
-    };
-  }
-
   if (task.status === "review") {
     return {
       situation: "review",
-      headline: "Ready for you to look at",
+      headline: task.review_action ? "Waiting for your approval" : "Ready for you to look at",
       detail: task.pr_state
         ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
         : run?.headline,
       run,
       owner,
-      action: { label: "Mark done", kind: "complete", tone: "primary" },
+      action: task.review_action
+        ? { label: task.review_action, kind: "approve", tone: "primary" }
+        : { label: "Mark done", kind: "complete", tone: "primary" },
       secondary: { label: "Back to planning", kind: "reopen", tone: "quiet" },
     };
   }
@@ -194,6 +209,8 @@ export function stepIndex(task: Task): number {
       return 2;
     case "done":
       return 3;
+    case "canceled":
+      return -1;
   }
 }
 
@@ -211,6 +228,8 @@ export function situationTone(situation: Situation): string {
       return "caution";
     case "done":
       return "positive";
+    case "canceled":
+      return "";
     default:
       return "";
   }

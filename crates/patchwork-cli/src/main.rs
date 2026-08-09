@@ -58,6 +58,9 @@ enum Command {
     Ask(AskArgs),
     /// Attach a file as evidence.
     Attach(AttachArgs),
+    /// List or remove evidence attached to the current task.
+    #[command(subcommand)]
+    Evidence(EvidenceCommand),
     /// Post a chart from a Flint chart spec.
     Chart(ChartArgs),
     /// Expose a dev server you started as a task preview.
@@ -143,6 +146,17 @@ struct AttachArgs {
     path: String,
     #[arg(long, default_value = "")]
     caption: String,
+    /// Replace an earlier evidence attachment (its id) with this file.
+    #[arg(long)]
+    replace: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// List evidence attached to the current task.
+    List,
+    /// Remove an attachment from the current task's review evidence.
+    Remove { attachment_id: String },
 }
 
 #[derive(Args)]
@@ -160,9 +174,9 @@ struct ChartArgs {
 struct PreviewArgs {
     #[arg(long)]
     port: Option<u16>,
-    /// Command that starts the dev server.
+    /// Command that starts the dev server. Omit it for an existing server.
     #[arg(long)]
-    command: String,
+    command: Option<String>,
     #[arg(long)]
     label: Option<String>,
 }
@@ -310,6 +324,9 @@ enum TaskCommand {
         /// same key returns the open task instead of making a second one.
         #[arg(long)]
         once: Option<String>,
+        /// Create after reviewing the relay's possible-duplicate warning.
+        #[arg(long)]
+        allow_similar: bool,
         /// Start the owning agent right away.
         #[arg(long)]
         start: bool,
@@ -334,6 +351,9 @@ enum TaskCommand {
         /// File proving the work is ready to review.
         #[arg(long)]
         evidence: Option<String>,
+        /// Exact action a person can approve in review, e.g. "Approve and merge PR".
+        #[arg(long)]
+        approval: Option<String>,
     },
     Delete {
         reference: String,
@@ -363,8 +383,9 @@ enum AutomationCommand {
         every: Option<i64>,
         /// Shell command for `--trigger watch`. It runs on the relay every
         /// `--every` seconds and only fires the agent when it prints
-        /// something new. `$PATCHWORK_STATE_DIR` is its own directory, kept
-        /// between polls, for whatever it needs to remember.
+        /// something new. One JSON object per line can provide `event_key`,
+        /// `condition_key`, task `title`/`outcome`, and `context`.
+        /// `$PATCHWORK_STATE_DIR` is its own directory, kept between polls.
         #[arg(long)]
         command: Option<String>,
         /// Channel for message triggers and for reporting.
@@ -536,6 +557,7 @@ async fn run() -> Result<()> {
         Command::Tell(args) => tell(&client, args).await,
         Command::Ask(args) => ask(&client, &ctx, args).await,
         Command::Attach(args) => attach(&client, &ctx, args).await,
+        Command::Evidence(command) => evidence(&client, &ctx, command).await,
         Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
         Command::Pr { url } => link_pr(&client, &ctx, url).await,
@@ -691,7 +713,11 @@ async fn agent(client: &Client, command: AgentCommand) -> Result<()> {
                         "@{}{} — {}",
                         agent.handle,
                         if agent.is_admin { " (admin)" } else { "" },
-                        agent.agent.as_ref().map(|p| p.runtime.as_str()).unwrap_or("")
+                        agent
+                            .agent
+                            .as_ref()
+                            .map(|p| p.runtime.as_str())
+                            .unwrap_or("")
                     );
                 }
             });
@@ -769,9 +795,7 @@ async fn agent(client: &Client, command: AgentCommand) -> Result<()> {
         }
         AgentCommand::Delete { reference } => {
             let agent = resolve_agent(client, &reference).await?;
-            let _: Value = client
-                .delete(&format!("/api/members/{}", agent.id))
-                .await?;
+            let _: Value = client.delete(&format!("/api/members/{}", agent.id)).await?;
             client.print(&json!({ "deleted": agent.id }), || {
                 println!("removed @{}", agent.handle)
             });
@@ -801,10 +825,7 @@ async fn invite(client: &Client, command: InviteCommand) -> Result<()> {
         }
         InviteCommand::Create { email, admin } => {
             let created: Invite = client
-                .post(
-                    "/api/invites",
-                    json!({ "email": email, "is_admin": admin }),
-                )
+                .post("/api/invites", json!({ "email": email, "is_admin": admin }))
                 .await?;
             client.print(&created, || {
                 let relay = client.base.split("/w/").next().unwrap_or(&client.base);
@@ -1293,28 +1314,72 @@ async fn upload_attachment(
     path: &str,
     caption: &str,
 ) -> Result<Attachment> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("cannot read {path}"))?;
     let file_name = std::path::Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let mut form = reqwest::multipart::Form::new().part(
-        "file",
-        reqwest::multipart::Part::bytes(bytes).file_name(file_name),
-    );
-    if let Some(task_id) = &ctx.task_id {
-        form = form.text("task_id", task_id.clone());
-    }
-    let response = client
-        .http
-        .post(client.url("/api/files"))
-        .bearer_auth(&client.token)
-        .multipart(form)
-        .send()
-        .await?;
-    let attachment: Attachment = parse(response).await?;
+    let size = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("cannot read {path}"))?
+        .len();
+    let attachment: Attachment = if size > 8 * 1024 * 1024 {
+        use tokio::io::AsyncReadExt;
+
+        let upload: UploadSession = client
+            .post(
+                "/api/uploads",
+                json!({
+                    "file_name": file_name,
+                    "mime": "",
+                    "size": size,
+                    "caption": caption,
+                    "task_id": ctx.task_id,
+                }),
+            )
+            .await?;
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut offset = 0u64;
+        loop {
+            let mut chunk = vec![0; upload.chunk_size];
+            let read = file.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            chunk.truncate(read);
+            let response = client
+                .http
+                .put(client.url(&format!("/api/uploads/{}?offset={offset}", upload.id)))
+                .bearer_auth(&client.token)
+                .body(chunk)
+                .send()
+                .await?;
+            let _: Value = parse(response).await?;
+            offset += read as u64;
+        }
+        client
+            .post(&format!("/api/uploads/{}/complete", upload.id), json!({}))
+            .await?
+    } else {
+        let bytes = tokio::fs::read(path).await?;
+        let mut form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes).file_name(file_name),
+        );
+        if let Some(task_id) = &ctx.task_id {
+            form = form.text("task_id", task_id.clone());
+        }
+        if !caption.is_empty() {
+            form = form.text("caption", caption.to_string());
+        }
+        let response = client
+            .http
+            .post(client.url("/api/files"))
+            .bearer_auth(&client.token)
+            .multipart(form)
+            .send()
+            .await?;
+        parse(response).await?
+    };
     if let Some(channel_id) = &ctx.channel_id {
         let _: Message = client
             .post(
@@ -1332,7 +1397,22 @@ async fn upload_attachment(
 }
 
 async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<()> {
+    if let Some(replaced) = &args.replace {
+        let task_id = ctx
+            .task_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("replacement evidence belongs to a task; this run has none"))?;
+        let detail: TaskDetail = client.get(&format!("/api/tasks/{task_id}")).await?;
+        if !detail.attachments.iter().any(|item| item.id == *replaced) {
+            bail!("attachment {replaced} is not evidence on this task");
+        }
+    }
     let attachment = upload_attachment(client, ctx, &args.path, &args.caption).await?;
+    if let Some(replaced) = &args.replace {
+        let _: Attachment = client
+            .delete(&format!("/api/files/{replaced}/evidence"))
+            .await?;
+    }
     client.print(&attachment, || {
         println!(
             "attached {} ({} bytes)",
@@ -1342,12 +1422,41 @@ async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<(
     Ok(())
 }
 
+async fn evidence(client: &Client, ctx: &RunContext, command: EvidenceCommand) -> Result<()> {
+    match command {
+        EvidenceCommand::List => {
+            let task_id = ctx
+                .task_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("evidence belongs to a task; this run has none"))?;
+            let detail: TaskDetail = client.get(&format!("/api/tasks/{task_id}")).await?;
+            client.print(&detail.attachments, || {
+                for attachment in &detail.attachments {
+                    println!(
+                        "{}\t{}\t{}",
+                        attachment.id, attachment.file_name, attachment.caption
+                    );
+                }
+            });
+        }
+        EvidenceCommand::Remove { attachment_id } => {
+            let attachment: Attachment = client
+                .delete(&format!("/api/files/{attachment_id}/evidence"))
+                .await?;
+            client.print(&attachment, || {
+                println!("removed {} from review evidence", attachment.file_name)
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result<()> {
     let task_id = ctx
         .task_id
         .clone()
         .ok_or_else(|| anyhow!("previews belong to a task; this run has none"))?;
-    let preview: Preview = client
+    let mut preview: Preview = client
         .post(
             "/api/previews",
             json!({
@@ -1358,8 +1467,21 @@ async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result
             }),
         )
         .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(65);
+    while preview.status == PreviewStatus::Starting && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        preview = client
+            .get::<Vec<Preview>>("/api/previews")
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == preview.id)
+            .ok_or_else(|| anyhow!("preview disappeared while starting"))?;
+    }
+    if preview.status != PreviewStatus::Live {
+        bail!("preview did not become live (status: {:?})", preview.status);
+    }
     client.print(&preview, || {
-        println!("preview starting on port {}", preview.port)
+        println!("preview live on port {}", preview.port)
     });
     Ok(())
 }
@@ -1417,6 +1539,9 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 if let Some(pr) = &detail.task.pr_url {
                     println!("Pull request: {pr}");
                 }
+                if let Some(action) = &detail.task.review_action {
+                    println!("Approval: {action}");
+                }
                 for run in detail.runs.iter().take(5) {
                     println!("  run [{}] {}", run.status.as_str(), run.headline);
                 }
@@ -1430,6 +1555,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             project,
             due,
             once,
+            allow_similar,
             start,
         } => {
             let owner_id = match owner {
@@ -1447,6 +1573,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "once_key": once,
+                        "allow_similar": allow_similar,
                         "source_channel_id": ctx.channel_id,
                         "start": start,
                     }),
@@ -1464,25 +1591,18 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             due,
             pr,
             evidence,
+            approval,
         } => {
             let owner_id = match owner {
                 Some(handle) => Some(resolve_member(client, &handle).await?),
                 None => None,
             };
             if let Some(path) = evidence {
-                let detail: TaskDetail = client
-                    .get(&format!("/api/tasks/{reference}"))
-                    .await?;
+                let detail: TaskDetail = client.get(&format!("/api/tasks/{reference}")).await?;
                 let mut evidence_ctx = ctx.clone();
                 evidence_ctx.task_id = Some(detail.task.id);
                 evidence_ctx.channel_id = Some(detail.task.discussion_channel_id);
-                upload_attachment(
-                    client,
-                    &evidence_ctx,
-                    &path,
-                    "Review evidence",
-                )
-                .await?;
+                upload_attachment(client, &evidence_ctx, &path, "Review evidence").await?;
             }
             let updated: Task = client
                 .patch(
@@ -1495,6 +1615,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "pr_url": pr,
+                        "review_action": approval,
                     }),
                 )
                 .await?;
@@ -1504,7 +1625,9 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
         }
         TaskCommand::Delete { reference } => {
             let _: Value = client.delete(&format!("/api/tasks/{reference}")).await?;
-            client.print(&json!({ "deleted": reference }), || println!("task deleted"));
+            client.print(&json!({ "deleted": reference }), || {
+                println!("task deleted")
+            });
         }
     }
     Ok(())
@@ -1754,14 +1877,8 @@ mod tests {
 
     #[test]
     fn admin_commands_are_discoverable() {
-        let cli = Cli::try_parse_from([
-            "patchwork",
-            "workspace",
-            "update",
-            "--icon",
-            "🚀",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["patchwork", "workspace", "update", "--icon", "🚀"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Workspace(WorkspaceCommand::Update { icon: Some(_), .. })

@@ -130,6 +130,25 @@ impl Relay {
         None
     }
 
+    /// Preview hostnames omit workspace ids to stay inside one DNS label.
+    /// ponytail: scan the handful of mounted workspaces; index previews
+    /// relay-wide only if a relay ever carries enough workspaces to notice.
+    pub async fn router_for_preview(&self, preview_id: &str) -> Option<Router> {
+        for mounted in self.mounted.read().await.values() {
+            if mounted
+                .state
+                .store
+                .preview(preview_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Some(mounted.router.clone());
+            }
+        }
+        None
+    }
+
     /// Which workspace a device token belongs to. Same scan, same reasoning.
     pub async fn workspace_for_token(&self, token: &str) -> Option<(Shared, crate::auth::Caller)> {
         for state in self.states().await {
@@ -174,8 +193,8 @@ impl Relay {
             relay_host_id,
         ));
 
+        let runner = start_hosted_execution(&state, self.agent_env.clone()).await;
         reconcile_interrupted_runs(&state).await;
-        let runner = start_hosted_execution(&state, self.agent_env.clone());
         tokio::spawn(automations::scheduler(state.clone()));
         tokio::spawn(github::watcher(state.clone()));
 
@@ -226,10 +245,7 @@ pub fn workspace_db(data_dir: &std::path::Path, id: &str) -> PathBuf {
     data_dir.join("workspaces").join(id).join("patchwork.db")
 }
 
-pub(crate) fn preserve_runtime_options(
-    fresh: &mut HostCapabilities,
-    known: &HostCapabilities,
-) {
+pub(crate) fn preserve_runtime_options(fresh: &mut HostCapabilities, known: &HostCapabilities) {
     for runtime in &mut fresh.runtimes {
         let Some(known) = known
             .runtimes
@@ -254,7 +270,11 @@ pub(crate) fn preserve_runtime_options(
 }
 
 fn ensure_relay_host(store: &Store) -> Result<Id> {
-    if let Some(existing) = store.hosts()?.into_iter().find(|h| h.kind == HostKind::Relay) {
+    if let Some(existing) = store
+        .hosts()?
+        .into_iter()
+        .find(|h| h.kind == HostKind::Relay)
+    {
         return Ok(existing.id);
     }
     let host = Host {
@@ -274,7 +294,7 @@ fn ensure_relay_host(store: &Store) -> Result<Id> {
 
 /// The relay is itself an execution host: hosted agents keep working when
 /// every laptop is closed.
-fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Runner> {
+async fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Runner> {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     tokio::spawn(patchwork_agent::report_runtime_options(
         out_tx.clone(),
@@ -307,7 +327,7 @@ fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Run
         });
     }
 
-    ws::register_relay_host(state, in_tx);
+    ws::register_relay_host(state, in_tx).await;
 
     // Report what this machine can do, so setup problems are visible in the UI.
     {
@@ -331,22 +351,42 @@ fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> Arc<Run
     runner
 }
 
-/// A run that was in flight when the relay stopped is never left claiming to
-/// be running.
+/// Resume relay-hosted work after the in-process host has been registered.
+/// Runs owned by another machine cannot be redispatched safely: that runtime
+/// may still be alive and reconnecting, so retain the conservative failure
+/// behavior for those runs.
 async fn reconcile_interrupted_runs(state: &Shared) {
     let Ok(runs) = state.store.active_runs() else {
         return;
     };
     for mut run in runs {
+        if run.host_id.as_deref() == Some(&state.relay_host_id) {
+            if let Err(err) = orchestrator::resume_interrupted_run(state, &run).await {
+                tracing::warn!(?err, run = %run.id, "could not resume interrupted run");
+            } else {
+                continue;
+            }
+        }
         run.status = RunStatus::Failed;
         run.error = Some("the relay restarted while this run was in flight".into());
         run.ended_at = Some(now_ms());
         if state.store.update_run(&run).is_ok() {
             state.store.revoke_run_tokens(&run.id).ok();
-            state.store.cancel_questions_for_run(&run.id).ok();
+            if let Err(err) = orchestrator::cancel_questions_for_run(state, &run.id).await {
+                tracing::warn!(?err, run = %run.id, "could not cancel interrupted run questions");
+            }
             state.emit(Event::RunUpdated { run: run.clone() });
             if let Err(err) = orchestrator::finish_run(state, &run).await {
                 tracing::warn!(?err, run = %run.id, "could not finish interrupted run");
+            }
+        }
+    }
+    if let Ok(previews) = state.store.previews(true) {
+        for mut preview in previews {
+            preview.status = PreviewStatus::Failed;
+            preview.stopped_at = Some(now_ms());
+            if state.store.upsert_preview(&preview).is_ok() {
+                state.emit(Event::PreviewUpdated { preview });
             }
         }
     }

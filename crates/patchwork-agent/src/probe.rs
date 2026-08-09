@@ -76,13 +76,21 @@ fn runtime_options(
     let discover_modes = runtime.modes.is_empty();
     HostToRelay::RuntimeOptions {
         runtime: runtime.id,
-        models: if discover_models { session.models } else { runtime.models },
+        models: if discover_models {
+            session.models
+        } else {
+            runtime.models
+        },
         thinking: if discover_thinking {
             session.thinking
         } else {
             runtime.thinking
         },
-        modes: if discover_modes { session.modes } else { runtime.modes },
+        modes: if discover_modes {
+            session.modes
+        } else {
+            runtime.modes
+        },
         default_model: if discover_models {
             session.current_model
         } else {

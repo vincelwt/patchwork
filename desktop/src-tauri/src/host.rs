@@ -258,7 +258,7 @@ fn websocket_url(base_url: &str, token: &str) -> String {
     } else {
         format!("ws://{base}")
     };
-    format!("{base}/ws?token={token}")
+    format!("{base}/ws?token={token}&heartbeat=1&connection=host")
 }
 
 /// The bundled `patchwork` CLI, so agents we launch have native access.
@@ -282,11 +282,11 @@ mod tests {
     fn websocket_urls_follow_the_relay_scheme_and_stay_inside_the_workspace() {
         assert_eq!(
             websocket_url("https://relay.example.com/w/ws1/", "abc"),
-            "wss://relay.example.com/w/ws1/ws?token=abc"
+            "wss://relay.example.com/w/ws1/ws?token=abc&heartbeat=1&connection=host"
         );
         assert_eq!(
             websocket_url("http://127.0.0.1:7727/w/ws1", "abc"),
-            "ws://127.0.0.1:7727/w/ws1/ws?token=abc"
+            "ws://127.0.0.1:7727/w/ws1/ws?token=abc&heartbeat=1&connection=host"
         );
     }
 }

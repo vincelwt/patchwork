@@ -4,6 +4,8 @@
 //! all funnel through here so that the conversation, the board, the Inbox and
 //! the running agents never disagree with each other.
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use patchwork_agent::worktree::branch_for;
 use patchwork_core::events::Event;
@@ -17,6 +19,7 @@ use serde_json::json;
 
 use crate::auth;
 use crate::state::Shared;
+use crate::store::InsertTaskResult;
 
 /// How much conversation an agent gets by default. Deeper history stays
 /// retrievable through the CLI rather than being pasted into every prompt.
@@ -176,9 +179,15 @@ async fn talk_where(state: &Shared, run_id: &str, message: &Message) {
 
 /// A reply that is still being written: posted on the first delta so the reader
 /// watches it arrive, then rewritten in place by every delta after it.
-async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> {
-    let existing = state.streaming_messages.read().await.get(run_id).cloned();
+async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str) -> Result<()> {
+    let Some(run) = state.store.run(run_id)? else {
+        return Ok(());
+    };
+    if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+        return Ok(());
+    }
 
+    let existing = state.streaming_messages.read().await.get(run_id).cloned();
     if let Some(message_id) = existing {
         state.store.stream_message_body(&message_id, body)?;
         if let Some(message) = state.store.message(&message_id)? {
@@ -187,9 +196,6 @@ async fn stream_message(state: &Shared, run_id: &str, body: &str) -> Result<()> 
         return Ok(());
     }
 
-    let Some(run) = state.store.run(run_id)? else {
-        return Ok(());
-    };
     // Ambient agents are allowed to decide they have nothing to say, and that
     // decision only arrives at the end. Let them finish before taking the floor.
     if matches!(run.trigger, RunTrigger::Ambient { .. }) {
@@ -247,6 +253,17 @@ async fn finish_posted_message(state: &Shared, message: &Message) -> Result<()> 
     });
 
     follow_through(state, &settled, &channel, &members, true).await
+}
+
+/// A question is a transcript boundary. Text after the human answers must get
+/// a newer message id so it appears below the question card.
+pub(crate) async fn finish_streamed_reply(state: &Shared, run_id: &str) -> Result<()> {
+    if let Some(message_id) = state.streaming_messages.write().await.remove(run_id) {
+        if let Some(message) = state.store.message(&message_id)? {
+            finish_posted_message(state, &message).await?;
+        }
+    }
+    Ok(())
 }
 
 /// `@handle` mentions, resolved against real members so unknown handles are
@@ -525,7 +542,11 @@ async fn trigger_agents(
             .task_id
             .as_deref()
             .and_then(|id| state.store.task(id).ok().flatten())
-            .and_then(|task| (task.status != TaskStatus::Done).then_some(task.owner_id).flatten())
+            .and_then(|task| {
+                (!task.status.is_terminal())
+                    .then_some(task.owner_id)
+                    .flatten()
+            })
             .filter(|id| {
                 members
                     .iter()
@@ -636,6 +657,7 @@ async fn trigger_agents(
             depth: (author_depth + 1).max(0),
             host_id: None,
             project_id: None,
+            required_task_status: None,
         };
         if let Err(err) = start_run(state, params).await {
             tracing::warn!(?err, agent = %agent.handle, "could not start agent run");
@@ -857,7 +879,11 @@ pub async fn steer_run(
     let sender = display_name_of(&members, author_id);
     let target_name = display_name_of(&members, &target.agent_id);
     let control_id = new_id();
-    let summary = if prompt.is_empty() { "Attached file(s)" } else { prompt };
+    let summary = if prompt.is_empty() {
+        "Attached file(s)"
+    } else {
+        prompt
+    };
     if let Some(source) = &source {
         let mut event = RunEvent {
             id: new_id(),
@@ -873,9 +899,7 @@ pub async fn steer_run(
             })),
             created_at: now_ms(),
         };
-        state
-            .store
-            .reserve_direct_control(&mut event, &target.id)?;
+        state.store.reserve_direct_control(&mut event, &target.id)?;
         state.emit(Event::RunEventAppended { event });
     }
     let delivered = if prompt.is_empty() {
@@ -953,6 +977,17 @@ pub async fn steer_run(
     Ok(control_id)
 }
 
+#[derive(Debug)]
+pub struct TaskUnavailable;
+
+impl std::fmt::Display for TaskUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the task is no longer available to start")
+    }
+}
+
+impl std::error::Error for TaskUnavailable {}
+
 pub struct StartRunParams {
     pub agent_id: Id,
     pub channel_id: Id,
@@ -963,6 +998,18 @@ pub struct StartRunParams {
     pub depth: i32,
     pub host_id: Option<Id>,
     pub project_id: Option<Id>,
+    pub required_task_status: Option<TaskStatus>,
+}
+
+fn ensure_task_accepts_run(task: Option<&Task>) -> Result<()> {
+    if let Some(task) = task.filter(|task| task.status.is_terminal()) {
+        bail!(
+            "{} is {}; reopen it before starting more work",
+            task.key,
+            task.status.as_str()
+        );
+    }
+    Ok(())
 }
 
 pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
@@ -977,6 +1024,7 @@ pub async fn start_run(state: &Shared, params: StartRunParams) -> Result<Run> {
         Some(id) => state.store.task(id)?,
         None => None,
     };
+    ensure_task_accepts_run(task.as_ref())?;
     let project_id = params
         .project_id
         .clone()
@@ -1088,6 +1136,27 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         env: Vec::new(),
     };
 
+    let previous_task_status = if let Some(task_id) = &run.task_id {
+        match state
+            .store
+            .activate_task_run(task_id, &run.id, params.required_task_status)?
+        {
+            Some(status) => Some(status),
+            None => {
+                let mut cancelled = run.clone();
+                cancelled.status = RunStatus::Cancelled;
+                cancelled.error = Some("the task is no longer available to start".into());
+                cancelled.ended_at = Some(now_ms());
+                state.store.update_run(&cancelled)?;
+                state.store.revoke_run_tokens(&run.id).ok();
+                state.emit(Event::RunUpdated { run: cancelled });
+                return Err(TaskUnavailable.into());
+            }
+        }
+    } else {
+        None
+    };
+
     if !state
         .send_to_host(
             &host_id,
@@ -1102,20 +1171,28 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         failed.error = Some(format!("host {host_id} is not connected"));
         failed.ended_at = Some(now_ms());
         state.store.update_run(&failed)?;
+        state.store.revoke_run_tokens(&run.id).ok();
+        if let (Some(task_id), Some(previous_status)) =
+            (run.task_id.as_deref(), previous_task_status)
+        {
+            state
+                .store
+                .restore_task_after_failed_start(task_id, &run.id, previous_status)?;
+            if let Some(task) = state.store.task(task_id)? {
+                state.emit(Event::TaskUpdated { task });
+            }
+        }
         state.emit(Event::RunUpdated { run: failed });
         bail!("the execution host for this agent is offline");
     }
 
     state.emit(Event::RunUpdated { run: run.clone() });
 
-    if let Some(task) = &task {
-        let mut task = task.clone();
-        task.current_run_id = Some(run.id.clone());
-        if task.status != TaskStatus::Done {
-            task.status = TaskStatus::Running;
+    if let Some(task_id) = run.task_id.as_deref() {
+        state.store.finalize_task_run_start(task_id, &run.id)?;
+        if let Some(task) = state.store.task(task_id)? {
+            state.emit(Event::TaskUpdated { task });
         }
-        state.store.update_task(&task)?;
-        state.emit(Event::TaskUpdated { task });
     }
 
     // The run card makes concurrent agent work visible in the conversation.
@@ -1142,6 +1219,92 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     .await;
 
     Ok(run)
+}
+
+/// Redispatch an interrupted relay-hosted run without creating a second run
+/// card or losing its task/worktree identity. The fresh token replaces the
+/// unrecoverable plaintext token that was held only by the stopped process.
+pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<()> {
+    let agent = state
+        .store
+        .member(&run.agent_id)?
+        .filter(|member| member.kind == MemberKind::Agent)
+        .ok_or_else(|| anyhow!("the run's agent no longer exists"))?;
+    let profile = agent.agent.clone().unwrap_or_default();
+    let task = match &run.task_id {
+        Some(id) => state.store.task(id)?,
+        None => None,
+    };
+    let project = match &run.project_id {
+        Some(id) => state.store.project(id)?,
+        None => None,
+    };
+    let worktree = if let Some(path) = run.cwd.clone() {
+        WorktreeSpec::Existing { path }
+    } else {
+        resolve_worktree(state, &task, &project, &state.relay_host_id)?.0
+    };
+
+    state.store.revoke_run_tokens(&run.id)?;
+    let token = auth::generate_token();
+    state.store.insert_token(
+        &auth::hash_token(&token),
+        &agent.id,
+        "run",
+        Some(&run.id),
+        Some("run"),
+    )?;
+
+    // An answer routed to the old process cannot be applied to the restored
+    // turn. Cancel it so the resumed agent can ask again if it still needs it.
+    cancel_questions_for_run(state, &run.id).await?;
+
+    let spec = RunSpec {
+        run_id: run.id.clone(),
+        agent_id: agent.id.clone(),
+        agent_handle: agent.handle.clone(),
+        agent_name: agent.display_name.clone(),
+        agent_description: profile.description.clone(),
+        runtime: profile.runtime.clone(),
+        provider: profile.provider.clone(),
+        model: profile.model.clone(),
+        thinking: profile.thinking.clone(),
+        custom_command: profile.custom_command.clone(),
+        channel_id: run.channel_id.clone(),
+        task_id: run.task_id.clone(),
+        project_id: run.project_id.clone(),
+        project_name: project.as_ref().map(|project| project.name.clone()),
+        automation_id: run.automation_id.clone(),
+        worktree,
+        prompt: run.prompt.clone(),
+        context: build_context(state, run, &task).await?,
+        files: task_files(state, &task),
+        api_base: state.public_url.clone(),
+        api_token: token,
+        resume_session_id: run.session_id.clone(),
+        env: Vec::new(),
+    };
+
+    let mut resumed = run.clone();
+    resumed.status = RunStatus::Dispatched;
+    resumed.headline = "Restarting".into();
+    resumed.error = None;
+    resumed.ended_at = None;
+    state.store.update_run(&resumed)?;
+
+    if !state
+        .send_to_host(
+            &state.relay_host_id,
+            RelayToHost::StartRun {
+                spec: Box::new(spec),
+            },
+        )
+        .await
+    {
+        bail!("the relay execution host is not registered");
+    }
+    state.emit(Event::RunUpdated { run: resumed });
+    Ok(())
 }
 
 fn resume_session_for(
@@ -1270,6 +1433,9 @@ fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTri
         if !task.outcome.trim().is_empty() {
             prompt.push_str(&format!("Expected result: {}\n", task.outcome.trim()));
         }
+        prompt.push_str(
+            "Leave finished work in Review for a person to approve; do not mark the task Done yourself.\n",
+        );
         prompt.push('\n');
     }
     if matches!(trigger, RunTrigger::Ambient { .. }) {
@@ -1341,6 +1507,13 @@ pub async fn handle_host_message(state: &Shared, host_id: &str, msg: HostToRelay
     }
 }
 
+fn run_belongs_to_host(state: &Shared, run_id: &str, host_id: &str) -> Result<bool> {
+    Ok(state
+        .store
+        .run(run_id)?
+        .is_some_and(|run| run.host_id.as_deref() == Some(host_id)))
+}
+
 async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRelay) -> Result<()> {
     match msg {
         HostToRelay::Register { .. } | HostToRelay::Heartbeat { .. } | HostToRelay::Pong { .. } => {
@@ -1349,6 +1522,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
 
         HostToRelay::RunAccepted { run_id, cwd } => {
             if let Some(mut run) = state.store.run(&run_id)? {
+                if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                    return Ok(());
+                }
                 run.status = RunStatus::Running;
                 run.cwd = cwd.or(run.cwd);
                 state.store.update_run(&run)?;
@@ -1361,13 +1537,20 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             kind,
             text,
             data,
-        } => append_run_event(state, &run_id, kind, text, data)?,
+        } => {
+            if run_belongs_to_host(state, &run_id, host_id)? {
+                append_run_event(state, &run_id, kind, text, data)?;
+            }
+        }
 
         HostToRelay::RunControlStatus {
             run_id,
             control_id,
             state: control_state,
         } => {
+            if !run_belongs_to_host(state, &run_id, host_id)? {
+                return Ok(());
+            }
             let label = match control_state {
                 RunControlState::Queued => "Steering queued",
                 RunControlState::Started => "Steering delivered",
@@ -1393,7 +1576,14 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let Some(mut run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
-            // A run waiting on a question stays waiting until it is answered.
+            if run.host_id.as_deref() != Some(host_id) {
+                return Ok(());
+            }
+            // The first terminal state wins. A late host cannot revive a run
+            // that was cancelled while it was disconnected.
+            if run.status.is_terminal() {
+                return Ok(());
+            }
             run.status = status;
             if let Some(headline) = headline {
                 run.headline = headline;
@@ -1410,9 +1600,15 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             if status.is_terminal() {
                 run.ended_at = Some(now_ms());
                 state.store.revoke_run_tokens(&run_id).ok();
-                state.store.cancel_questions_for_run(&run_id).ok();
             }
+            // Persist terminal status before settling questions so a concurrent
+            // `patchwork ask` cannot recreate waiting work in between.
             state.store.update_run(&run)?;
+            if status.is_terminal() {
+                if let Err(err) = cancel_questions_for_run(state, &run_id).await {
+                    tracing::warn!(?err, run = %run_id, "could not cancel run questions");
+                }
+            }
             state.emit(Event::RunUpdated { run: run.clone() });
 
             state
@@ -1486,13 +1682,16 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         }
 
         HostToRelay::RunMessageDelta { run_id, body } => {
-            stream_message(state, &run_id, &body).await?;
+            stream_message(state, host_id, &run_id, &body).await?;
         }
 
         HostToRelay::RunMessage { run_id, kind, body } => {
             let Some(run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
+            if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                return Ok(());
+            }
             let draft = state.streaming_messages.write().await.remove(&run_id);
 
             // An ambient agent that has nothing to add says so, and we stay quiet.
@@ -1559,6 +1758,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             let Some(mut run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
+            if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                return Ok(());
+            }
             let Some(task_id) = run.task_id.clone() else {
                 return Ok(());
             };
@@ -1596,22 +1798,20 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         HostToRelay::PreviewStatus {
             preview_id,
             status,
-            url,
+            url: _,
             error,
         } => {
             let Some(mut preview) = state.store.preview(&preview_id)? else {
                 return Ok(());
             };
-            preview.status = status;
-            if let Some(url) = url {
-                // A relay-hosted preview is reachable through the relay; a
-                // desktop preview stays on that machine.
-                preview.url = if host_id == state.relay_host_id {
-                    format!("{}/preview/{}/", state.public_url, preview.id)
-                } else {
-                    url
-                };
+            if preview.host_id != host_id {
+                return Ok(());
             }
+            preview.status = status;
+            // Every host is reached through the workspace relay. Desktops stay
+            // outbound-only and no longer create machine-local previews.
+            preview.url = format!("{}/preview/{}/", state.public_url, preview.id);
+            preview.local_only = false;
             if status == PreviewStatus::Stopped || status == PreviewStatus::Failed {
                 preview.stopped_at = Some(now_ms());
             }
@@ -1648,6 +1848,41 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 .await;
             }
         }
+        HostToRelay::PreviewResponse {
+            request_id,
+            status,
+            headers,
+            body,
+            error,
+        } => {
+            if let Some(waiter) = state.preview_waiters.write().await.remove(&request_id) {
+                let _ = waiter.send(crate::state::PreviewReply {
+                    status,
+                    headers,
+                    body,
+                    error,
+                });
+            }
+        }
+        HostToRelay::PreviewSocketReady { socket_id, error } => {
+            if let Some(socket) = state.preview_sockets.read().await.get(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Ready(error));
+            }
+        }
+        HostToRelay::PreviewSocketData {
+            socket_id,
+            data,
+            binary,
+        } => {
+            if let Some(socket) = state.preview_sockets.read().await.get(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Data { data, binary });
+            }
+        }
+        HostToRelay::PreviewSocketClose { socket_id } => {
+            if let Some(socket) = state.preview_sockets.write().await.remove(&socket_id) {
+                let _ = socket.send(crate::state::PreviewSocketEvent::Close);
+            }
+        }
     }
     Ok(())
 }
@@ -1666,29 +1901,108 @@ pub(crate) fn has_review_evidence(
     run_id: Option<&str>,
     pending_pr_url: Option<&str>,
 ) -> Result<bool> {
-    Ok(pending_pr_url.is_some_and(|url| !url.is_empty())
+    let artifact = pending_pr_url.is_some_and(|url| !url.is_empty())
         || task.pr_url.as_deref().is_some_and(|url| !url.is_empty())
         || state
             .store
             .task_attachments(&task.id)?
             .iter()
             .any(|attachment| attachment.run_id.as_deref() == run_id)
-        || state
-            .store
-            .task_previews(&task.id)?
-            .iter()
-            .any(|preview| preview.run_id.as_deref() == run_id))
+        || state.store.task_previews(&task.id)?.iter().any(|preview| {
+            preview.run_id.as_deref() == run_id && preview.status == PreviewStatus::Live
+        });
+    if artifact {
+        return Ok(true);
+    }
+
+    // A recommendation or answer is itself the thing a person reviews. The
+    // immutable original request tells us that this is an inquiry even when
+    // the agent later distils the task title/outcome into its conclusion.
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    Ok(task_expects_written_answer(state, task)?
+        && state.store.run_events(run_id, 0)?.iter().any(|event| {
+            event.kind == RunEventKind::Message
+                && event.data.is_none()
+                && !event.text.trim().is_empty()
+        }))
+}
+
+pub(crate) fn task_expects_written_answer(state: &Shared, task: &Task) -> Result<bool> {
+    let original = task
+        .source_message_id
+        .as_deref()
+        .map(|id| state.store.message(id))
+        .transpose()?
+        .flatten();
+    Ok(asks_for_written_answer(
+        original
+            .as_ref()
+            .map(|message| message.body.as_str())
+            .unwrap_or(task.outcome.as_str()),
+    ))
+}
+
+fn asks_for_written_answer(request: &str) -> bool {
+    // Only classify the opening line. Implementation requests often contain a
+    // later checklist item phrased as a question, but their expected result is
+    // still a changed product rather than a written answer.
+    let opening = request
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    if opening.contains('?') {
+        return true;
+    }
+
+    let normalized = opening
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    let first = normalized.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first,
+        "who"
+            | "what"
+            | "when"
+            | "where"
+            | "why"
+            | "how"
+            | "which"
+            | "can"
+            | "could"
+            | "should"
+            | "would"
+            | "is"
+            | "are"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "has"
+            | "have"
+    ) || [
+        "decide whether",
+        "find out whether",
+        "help me decide",
+        "i am unsure",
+        "i'm unsure",
+        "i am not sure",
+        "i'm not sure",
+        "recommend whether",
+        "tell me whether",
+        "unsure whether",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
 }
 
 /// A finished run updates the board and the Inbox so nothing silently stalls.
 pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
     // that is the honest record — but nothing may rewrite it after this.
-    if let Some(message_id) = state.streaming_messages.write().await.remove(&run.id) {
-        if let Some(message) = state.store.message(&message_id)? {
-            finish_posted_message(state, &message).await?;
-        }
-    }
+    finish_streamed_reply(state, &run.id).await?;
     state.run_threads.write().await.remove(&run.id);
 
     if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
@@ -1734,15 +2048,21 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
             }
         }
         RunStatus::Failed => {
-            task.status = TaskStatus::Blocked;
-            notify_task(
-                state,
-                &task,
-                InboxKind::TaskBlocked,
-                format!("{} is blocked", task.key),
-            )?;
+            if task.status == TaskStatus::Running {
+                task.status = TaskStatus::Blocked;
+                notify_task(
+                    state,
+                    &task,
+                    InboxKind::TaskBlocked,
+                    format!("{} is blocked", task.key),
+                )?;
+            }
         }
         _ => {}
+    }
+
+    if task.status != TaskStatus::Review {
+        task.review_action = None;
     }
 
     state.store.update_task(&task)?;
@@ -1790,7 +2110,7 @@ pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) 
 // ---------------------------------------------------------------------------
 
 /// First line of the expected result, trimmed to something a board row can show.
-fn title_from(outcome: &str) -> String {
+pub(crate) fn title_from(outcome: &str) -> String {
     let line = outcome
         .trim()
         .lines()
@@ -1812,12 +2132,173 @@ fn title_from(outcome: &str) -> String {
     format!("{}\u{2026}", head.trim_end())
 }
 
+const RECENT_TASK_WINDOW_MS: Millis = 14 * 24 * 60 * 60 * 1_000;
+
+fn task_words(text: &str) -> BTreeSet<String> {
+    const NOISE: &[&str] = &[
+        "add",
+        "after",
+        "alert",
+        "and",
+        "are",
+        "before",
+        "create",
+        "created",
+        "duplicate",
+        "ensure",
+        "failed",
+        "failing",
+        "failure",
+        "fix",
+        "fixed",
+        "follow",
+        "following",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "implement",
+        "incident",
+        "into",
+        "issue",
+        "make",
+        "new",
+        "not",
+        "problem",
+        "production",
+        "report",
+        "reported",
+        "restore",
+        "safe",
+        "should",
+        "spike",
+        "task",
+        "that",
+        "the",
+        "their",
+        "this",
+        "update",
+        "use",
+        "used",
+        "using",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "will",
+        "with",
+        "work",
+        "would",
+        "your",
+    ];
+
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|word| {
+            let mut word = word.to_lowercase();
+            if NOISE.contains(&word.as_str()) {
+                return None;
+            }
+            if word.len() > 5 && word.ends_with("ing") {
+                word.truncate(word.len() - 3);
+            } else if word.len() > 4 && word.ends_with("ed") {
+                word.truncate(word.len() - 2);
+            } else if word.len() > 4 && word.ends_with("ies") {
+                word.truncate(word.len() - 3);
+                word.push('y');
+            } else if word.len() > 4
+                && ["sses", "xes", "zes", "ches", "shes"]
+                    .iter()
+                    .any(|suffix| word.ends_with(suffix))
+            {
+                word.truncate(word.len() - 2);
+            } else if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+                word.pop();
+            }
+            (word.len() >= 3 && !NOISE.contains(&word.as_str())).then_some(word)
+        })
+        .collect()
+}
+
+fn task_similarity(left: &str, right: &str) -> f32 {
+    let left = task_words(left);
+    let right = task_words(right);
+    if left.len() < 3 || right.len() < 3 {
+        return 0.0;
+    }
+    let shared: Vec<&String> = left.intersection(&right).collect();
+    if shared.len() < 2 {
+        return 0.0;
+    }
+    let overlap = shared.len() as f32 / left.len().min(right.len()) as f32;
+    let union = left.union(&right).count();
+    let jaccard = shared.len() as f32 / union as f32;
+    let stable_identifier = shared
+        .iter()
+        .any(|word| word.len() >= 7 || word.chars().any(|c| c.is_ascii_digit()));
+    0.6 * overlap + 0.4 * jaccard + if stable_identifier { 0.1 } else { 0.0 }
+}
+
+/// Best open or recently completed task whose wording looks related. This is
+/// only a warning signal: callers can confirm that distinct work should exist.
+pub(crate) fn similar_task(
+    state: &Shared,
+    title: &str,
+    outcome: &str,
+    project_id: Option<&str>,
+) -> Result<Option<Task>> {
+    let title = if title.trim().is_empty() {
+        title_from(outcome)
+    } else {
+        title.trim().to_string()
+    };
+    let incoming = format!("{title} {outcome}");
+    let recent_after = now_ms() - RECENT_TASK_WINDOW_MS;
+    Ok(state
+        .store
+        .tasks()?
+        .into_iter()
+        .filter(|task| !task.status.is_terminal() || task.updated_at >= recent_after)
+        .filter(|task| {
+            project_id
+                .map(|project| task.project_id.as_deref() == Some(project))
+                .unwrap_or(true)
+        })
+        .filter_map(|task| {
+            let score = task_similarity(&title, &task.title).max(task_similarity(
+                &incoming,
+                &format!("{} {}", task.title, task.outcome),
+            ));
+            (score >= 0.42).then_some((task, score))
+        })
+        .max_by(|(left_task, left), (right_task, right)| {
+            left.total_cmp(right)
+                .then_with(|| left_task.updated_at.cmp(&right_task.updated_at))
+        })
+        .map(|(task, _)| task))
+}
+
+pub struct TaskCreation {
+    pub task: Task,
+    pub created: bool,
+}
+
 /// Boxed: creating a task can fire an automation that creates a task.
 pub fn create_task<'a>(
     state: &'a Shared,
     creator_id: &'a str,
     input: patchwork_core::wire::CreateTask,
 ) -> futures::future::BoxFuture<'a, Result<Task>> {
+    Box::pin(async move { Ok(create_task_inner(state, creator_id, input).await?.task) })
+}
+
+pub fn create_task_with_result<'a>(
+    state: &'a Shared,
+    creator_id: &'a str,
+    input: patchwork_core::wire::CreateTask,
+) -> futures::future::BoxFuture<'a, Result<TaskCreation>> {
     Box::pin(create_task_inner(state, creator_id, input))
 }
 
@@ -1825,12 +2306,15 @@ async fn create_task_inner(
     state: &Shared,
     creator_id: &str,
     input: patchwork_core::wire::CreateTask,
-) -> Result<Task> {
+) -> Result<TaskCreation> {
     // Asked twice, one task. An agent that reports the same blocker every two
     // hours should leave one thing on the board, not twelve.
     if let Some(once_key) = input.once_key.as_deref().filter(|k| !k.trim().is_empty()) {
         if let Some(existing) = state.store.task_by_once_key(once_key.trim())? {
-            return Ok(existing);
+            return Ok(TaskCreation {
+                task: existing,
+                created: false,
+            });
         }
     }
 
@@ -1864,8 +2348,6 @@ async fn create_task_inner(
         task_id: None,
         last_message_at: now,
     };
-    state.store.insert_channel(&discussion)?;
-
     let mut task = Task {
         id: new_id(),
         key: key.clone(),
@@ -1882,6 +2364,7 @@ async fn create_task_inner(
         current_run_id: None,
         pr_url: None,
         pr_state: None,
+        review_action: None,
         created_by: creator_id.to_string(),
         due_at: input.due_at.filter(|at| *at > 0),
         once_key: input
@@ -1889,34 +2372,39 @@ async fn create_task_inner(
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty())
-            .map(str::to_string),
+            .map(str::to_lowercase),
         created_at: now,
         updated_at: now,
         position: now as f64,
     };
-    state.store.insert_task(&task)?;
+    match state.store.insert_task_with_channel(&task, &discussion)? {
+        InsertTaskResult::Existing(existing) => {
+            return Ok(TaskCreation {
+                task: existing,
+                created: false,
+            })
+        }
+        InsertTaskResult::Inserted => {}
+    }
 
-    // Link the discussion back to its task now that the task exists.
     let mut discussion = discussion;
     discussion.task_id = Some(task.id.clone());
-    state.store.conn()?.execute(
-        "UPDATE channels SET task_id = ?2 WHERE id = ?1",
-        rusqlite::params![discussion.id, task.id],
-    )?;
 
     state.emit(Event::ChannelCreated {
         channel: discussion.clone(),
     });
     state.emit(Event::TaskCreated { task: task.clone() });
 
-    // A long voice transcript is source material, not the board title. Keep it
-    // as the first human message so later title/outcome cleanup cannot erase it.
+    // Source material belongs in the discussion, separate from the stable
+    // result that defines the task as done.
     if task.source_message_id.is_none() {
-        let original_request = if task.outcome.trim().is_empty() {
-            task.title.clone()
-        } else {
-            task.outcome.clone()
-        };
+        let original_request = input.initial_message.clone().unwrap_or_else(|| {
+            if task.outcome.trim().is_empty() {
+                task.title.clone()
+            } else {
+                task.outcome.clone()
+            }
+        });
         let original = post_message(
             state,
             &task.discussion_channel_id,
@@ -1981,10 +2469,7 @@ async fn create_task_inner(
                     agent_id: owner,
                     channel_id: task.discussion_channel_id.clone(),
                     task_id: Some(task.id.clone()),
-                    prompt: format!(
-                        "Take this task from Planned to done.\n\n{}",
-                        task.outcome.trim()
-                    ),
+                    prompt: format!("Work on this task.\n\n{}", task.outcome.trim()),
                     trigger: RunTrigger::TaskAssignment {
                         task_id: task.id.clone(),
                     },
@@ -1992,6 +2477,7 @@ async fn create_task_inner(
                     depth: 0,
                     host_id: task.host_id.clone(),
                     project_id: task.project_id.clone(),
+                    required_task_status: Some(TaskStatus::Planned),
                 };
                 if let Err(err) = start_run(state, params).await {
                     let _ = post_system(
@@ -2005,12 +2491,16 @@ async fn create_task_inner(
         }
     }
 
-    Ok(task)
+    Ok(TaskCreation {
+        task,
+        created: true,
+    })
 }
 
 pub async fn update_task(
     state: &Shared,
     actor_id: &str,
+    actor_is_agent: bool,
     task_id: &str,
     input: patchwork_core::wire::UpdateTask,
 ) -> Result<Task> {
@@ -2026,8 +2516,15 @@ pub async fn update_task(
     if let Some(outcome) = input.outcome {
         task.outcome = outcome;
     }
+    let has_explicit_status = input.status.is_some();
     if let Some(status) = input.status {
         task.status = status;
+    }
+    if let Some(review_action) = input.review_action {
+        task.review_action = match review_action.trim() {
+            "" => None,
+            action => Some(action.to_string()),
+        };
     }
     if let Some(owner_id) = input.owner_id {
         task.owner_id = if owner_id.is_empty() {
@@ -2065,8 +2562,29 @@ pub async fn update_task(
     if let Some(position) = input.position {
         task.position = position;
     }
+    if task.status != TaskStatus::Review {
+        task.review_action = None;
+    }
 
-    state.store.update_task(&task)?;
+    if actor_is_agent && previous.status.is_terminal() && !task.status.is_terminal() {
+        bail!("only a person can reopen a completed or canceled task");
+    }
+    if actor_is_agent {
+        if !state
+            .store
+            .update_task_if_unchanged(&task, previous.updated_at, has_explicit_status)?
+        {
+            bail!("the task changed while the agent was updating it; reload it and try again");
+        }
+    } else if has_explicit_status {
+        state.store.update_task_with_explicit_status(&task)?;
+    } else {
+        state.store.update_task(&task)?;
+    }
+    task = state
+        .store
+        .task(task_id)?
+        .ok_or_else(|| anyhow!("task was deleted while it was being updated"))?;
     state.emit(Event::TaskUpdated { task: task.clone() });
     if previous.title != task.title || previous.outcome != task.outcome {
         if let Some(channel) = state.store.channel(&task.discussion_channel_id)? {
@@ -2111,8 +2629,17 @@ pub async fn update_task(
             ),
         )
         .await;
-        if task.status == TaskStatus::Done {
-            state.store.resolve_inbox_for(Some(&task.id), None)?;
+        if task.status.is_terminal() {
+            resolve_inbox(state, Some(&task.id), None, None)?;
+        } else if task.status == TaskStatus::Review {
+            notify_task(
+                state,
+                &task,
+                InboxKind::ReviewReady,
+                format!("{} is ready for review", task.key),
+            )?;
+        } else if previous.status == TaskStatus::Review {
+            resolve_inbox(state, Some(&task.id), None, None)?;
         }
     }
 
@@ -2186,10 +2713,57 @@ pub async fn run_task(
             depth: 0,
             host_id: task.host_id.clone(),
             project_id: task.project_id.clone(),
+            required_task_status: None,
         },
     )
     .await
     .context("could not start the run")
+}
+
+/// Execute the action an agent put behind the review gate. Claiming the task
+/// before dispatch makes the approval single-use; a failed dispatch restores
+/// the exact gate so the person can try again after the host recovers.
+pub async fn approve_task(state: &Shared, actor_id: &str, task_id: &str) -> Result<Option<Run>> {
+    let task = state
+        .store
+        .task(task_id)?
+        .ok_or_else(|| anyhow!("task not found"))?;
+    let Some(action) = task.review_action.clone() else {
+        return Ok(None);
+    };
+    if task.status != TaskStatus::Review || !state.store.claim_review_action(&task.id, &action)? {
+        return Ok(None);
+    }
+
+    let actor = state
+        .store
+        .member(actor_id)?
+        .map(|member| member.display_name)
+        .unwrap_or_else(|| "A workspace member".into());
+    let prompt = format!(
+        "{actor} approved the requested review action:\n\n{action}\n\nCarry out the approved action now. Ask again only if its scope or risk has materially changed."
+    );
+
+    match run_task(state, actor_id, &task.id, None, Some(prompt)).await {
+        Ok(run) => {
+            resolve_inbox(state, Some(&task.id), None, None)?;
+            let _ = post_system(
+                state,
+                &task.discussion_channel_id,
+                &format!("{actor} approved: {action}"),
+            )
+            .await;
+            Ok(Some(run))
+        }
+        Err(err) => {
+            if state.store.restore_review_action(&task.id, &action)? {
+                if let Some(task) = state.store.task(&task.id)? {
+                    state.emit(Event::TaskUpdated { task });
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Answering a question un-blocks the run that asked it.
@@ -2199,31 +2773,165 @@ pub async fn answer_question(
     answers: Vec<QuestionAnswer>,
     by: &str,
 ) -> Result<Question> {
-    let question = state.store.answer_question(question_id, &answers, by)?;
+    let (question, resumed_task) = state.store.answer_question(question_id, &answers, by)?;
     state.emit(Event::QuestionUpdated {
         question: question.clone(),
     });
-    state.resolve_question(&question).await;
-    state
-        .store
-        .resolve_inbox_for(None, Some(&question.run_id))?;
+    if let Some(task) = resumed_task {
+        state.emit(Event::TaskUpdated { task });
+    }
 
+    let run = state.store.run(&question.run_id)?;
+    if let Some(run) = &run {
+        if let Some(host_id) = &run.host_id {
+            state
+                .send_to_host(
+                    host_id,
+                    RelayToHost::AnswerQuestion {
+                        run_id: run.id.clone(),
+                        question_id: question.id.clone(),
+                        answers: answers.clone(),
+                    },
+                )
+                .await;
+        }
+    }
+    // Reset the transcript boundary before the long-poll lets the CLI return.
+    state.resolve_question(&question).await;
+    resolve_inbox(state, None, None, question.message_id.as_deref())?;
+
+    // The host send above yields, so cancellation may have won meanwhile.
     if let Some(mut run) = state.store.run(&question.run_id)? {
-        if run.status == RunStatus::Waiting {
+        let has_open = state
+            .store
+            .run_questions(&run.id)?
+            .iter()
+            .any(|question| question.status == QuestionStatus::Open);
+        let mut changed = false;
+        if has_open && !run.status.is_terminal() && run.status != RunStatus::Waiting {
+            run.status = RunStatus::Waiting;
+            run.headline = "Waiting for an answer".into();
+            changed = true;
+        } else if !has_open && run.status == RunStatus::Waiting {
             run.status = RunStatus::Running;
             run.headline = "Working".into();
+            changed = true;
+        }
+        if changed {
             state.store.update_run(&run)?;
             state.emit(Event::RunUpdated { run: run.clone() });
         }
-        state.set_presence(&run.agent_id, Presence::Working).await;
+        state
+            .set_presence(
+                &run.agent_id,
+                if run.status.is_terminal() {
+                    Presence::Online
+                } else if has_open {
+                    Presence::Waiting
+                } else {
+                    Presence::Working
+                },
+            )
+            .await;
     }
 
     Ok(question)
 }
 
+fn resolve_inbox(
+    state: &Shared,
+    task_id: Option<&str>,
+    question_run_id: Option<&str>,
+    question_message_id: Option<&str>,
+) -> Result<()> {
+    for item in state
+        .store
+        .resolve_inbox_for(task_id, question_run_id, question_message_id)?
+    {
+        state.emit(Event::InboxItemUpdated { item });
+    }
+    Ok(())
+}
+
+/// Settle every outstanding question when its run ends, including the card,
+/// Inbox badge and any long-polling `patchwork ask` process.
+pub async fn cancel_questions_for_run(state: &Shared, run_id: &str) -> Result<()> {
+    for question in state.store.cancel_questions_for_run(run_id)? {
+        state.emit(Event::QuestionUpdated {
+            question: question.clone(),
+        });
+        state.resolve_question(&question).await;
+    }
+    resolve_inbox(state, None, Some(run_id), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interrupted_relay_run_is_redispatched_with_its_session_and_identity() {
+        let path = std::env::temp_dir().join(format!("patchwork-resume-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let mut agent = member("agent", "developer", MemberKind::Agent);
+        agent.agent.as_mut().unwrap().runtime = "codex".into();
+        store.insert_member(&agent).unwrap();
+        let run = Run {
+            id: "run".into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: "channel".into(),
+            task_id: None,
+            host_id: Some("relay".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: Some("/tmp/existing-worktree".into()),
+            automation_id: None,
+            session_id: Some("session".into()),
+            runtime: "codex".into(),
+            prompt: "Finish the interrupted work".into(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&run, 0).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx });
+
+        resume_interrupted_run(&state, &run).await.unwrap();
+
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected the interrupted run to be dispatched");
+        };
+        assert_eq!(spec.run_id, "run");
+        assert_eq!(spec.resume_session_id.as_deref(), Some("session"));
+        assert_eq!(spec.prompt, "Finish the interrupted work");
+        assert!(matches!(
+            spec.worktree,
+            WorktreeSpec::Existing { ref path } if path == "/tmp/existing-worktree"
+        ));
+        let stored = store.run("run").unwrap().unwrap();
+        assert_eq!(stored.status, RunStatus::Dispatched);
+        assert_eq!(stored.headline, "Restarting");
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn titles_come_from_the_first_line() {
@@ -2240,6 +2948,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn written_answer_requests_are_distinct_from_implementation_questions() {
+        assert!(asks_for_written_answer(
+            "Should we add QMD for CLI search? or not"
+        ));
+        assert!(asks_for_written_answer(
+            "Decide whether relay search needs semantic retrieval"
+        ));
+        assert!(asks_for_written_answer(
+            "I'm unsure whether this belongs in the relay"
+        ));
+        assert!(!asks_for_written_answer(
+            "Fix the Expo app\n- should the sheet use a native modal?"
+        ));
+        assert!(!asks_for_written_answer(
+            "Ensure every task view renders its pull request"
+        ));
+    }
+
+    #[test]
+    fn differently_worded_incidents_trigger_a_similarity_warning() {
+        assert!(
+            task_similarity(
+                "PostHog image proxy invalid-content spike",
+                "PostHog: headless images fetch 403 spike",
+            ) >= 0.42
+        );
+        assert!(
+            task_similarity(
+                "Fund production-safe Hyperbrowser fallback capacity",
+                "Restore headless-image fallback capacity",
+            ) >= 0.42
+        );
+    }
+
+    #[test]
+    fn unrelated_incidents_do_not_trigger_a_similarity_warning() {
+        assert!(
+            task_similarity(
+                "PostHog image proxy invalid-content spike",
+                "Throttle scheduled database maintenance IO",
+            ) < 0.42
+        );
+    }
+
     fn member(id: &str, handle: &str, kind: MemberKind) -> Member {
         Member {
             id: id.into(),
@@ -2253,6 +3006,39 @@ mod tests {
             agent: (kind == MemberKind::Agent).then(AgentProfile::default),
             presence: Presence::Offline,
         }
+    }
+
+    #[test]
+    fn terminal_tasks_must_be_reopened_before_another_run() {
+        let mut task = Task {
+            id: "t".into(),
+            key: "PW-1".into(),
+            title: "Ship it".into(),
+            outcome: "It is shipped".into(),
+            status: TaskStatus::Done,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "human".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        assert!(ensure_task_accepts_run(Some(&task)).is_err());
+        task.status = TaskStatus::Canceled;
+        assert!(ensure_task_accepts_run(Some(&task)).is_err());
+        task.status = TaskStatus::Planned;
+        assert!(ensure_task_accepts_run(Some(&task)).is_ok());
     }
 
     #[test]
@@ -2361,9 +3147,53 @@ mod tests {
             depth: 0,
             host_id: None,
             project_id: None,
+            required_task_status: None,
         };
         let prompt = compose_prompt(&params, &None, &params.trigger);
         assert!(prompt.contains("NOTHING"));
         assert!(prompt.contains("deploy is failing"));
+    }
+
+    #[test]
+    fn task_runs_leave_human_confirmation_to_review() {
+        let task = Task {
+            id: "task".into(),
+            key: "PW-1".into(),
+            title: "Answer it".into(),
+            outcome: "What is the answer?".into(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "vince".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        let params = StartRunParams {
+            agent_id: "a".into(),
+            channel_id: "c".into(),
+            task_id: Some(task.id.clone()),
+            prompt: "Work on it".into(),
+            trigger: RunTrigger::Manual { by: "vince".into() },
+            automation_id: None,
+            depth: 0,
+            host_id: None,
+            project_id: None,
+            required_task_status: None,
+        };
+        let prompt = compose_prompt(&params, &Some(task), &params.trigger);
+        assert!(prompt.contains("Leave finished work in Review"));
+        assert!(prompt.contains("do not mark the task Done yourself"));
     }
 }

@@ -27,7 +27,7 @@ pub async fn watcher(state: Shared) {
         };
         for task in tasks
             .into_iter()
-            .filter(|t| t.pr_url.is_some() && t.status != TaskStatus::Done)
+            .filter(|t| t.pr_url.is_some() && !t.status.is_terminal())
         {
             if let Err(err) = poll_task(&state, &task).await {
                 tracing::debug!(?err, task = %task.key, "pull request poll failed");
@@ -59,9 +59,17 @@ async fn poll_task(state: &Shared, task: &Task) -> anyhow::Result<()> {
     state.emit(Event::TaskUpdated { task: task.clone() });
 
     let review_arrived = fresh.review == "CHANGES_REQUESTED"
-        && previous.as_ref().map(|p| p.review.clone()).unwrap_or_default() != "CHANGES_REQUESTED";
+        && previous
+            .as_ref()
+            .map(|p| p.review.clone())
+            .unwrap_or_default()
+            != "CHANGES_REQUESTED";
     let checks_failed = fresh.checks == "FAILURE"
-        && previous.as_ref().map(|p| p.checks.clone()).unwrap_or_default() != "FAILURE";
+        && previous
+            .as_ref()
+            .map(|p| p.checks.clone())
+            .unwrap_or_default()
+            != "FAILURE";
 
     if fresh.state == "MERGED" {
         let _ = orchestrator::post_system(
@@ -134,6 +142,7 @@ this worktree, push, and reply with a short summary of what changed.",
         depth: 0,
         host_id: task.host_id.clone(),
         project_id: task.project_id.clone(),
+        required_task_status: None,
     };
     if let Err(err) = orchestrator::start_run(state, params).await {
         tracing::warn!(?err, "could not bring the agent back for review feedback");
@@ -163,9 +172,10 @@ async fn fetch(url: &str) -> anyhow::Result<Option<PullRequestState>> {
         .get("statusCheckRollup")
         .and_then(|v| v.as_array())
         .map(|checks| {
-            if checks.iter().any(|c| {
-                c.get("conclusion").and_then(|v| v.as_str()) == Some("FAILURE")
-            }) {
+            if checks
+                .iter()
+                .any(|c| c.get("conclusion").and_then(|v| v.as_str()) == Some("FAILURE"))
+            {
                 "FAILURE"
             } else if checks.iter().any(|c| {
                 matches!(

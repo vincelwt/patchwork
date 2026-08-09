@@ -2881,9 +2881,10 @@ dependencies = [
 
 [[package]]
 name = "patchwork-agent"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
  "futures",
  "libc",
@@ -2892,6 +2893,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tracing",
  "uuid",
  "which",
@@ -2899,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-cli"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2913,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-core"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2924,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-desktop"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2952,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-relay"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",

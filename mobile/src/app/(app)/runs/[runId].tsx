@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 
@@ -10,6 +10,7 @@ import { useDictation } from "@/lib/dictation";
 import { duration, relative, runStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
+import { useBottomAnchoredList } from "@/lib/scroll";
 
 export default function RunScreen() {
   const { runId } = useLocalSearchParams<{ runId: string }>();
@@ -23,7 +24,11 @@ export default function RunScreen() {
   const host = workspace.bootstrap?.hosts.find((item) => item.id === run?.host_id);
   const question = detail?.questions.find((item) => item.status === "open")
     ?? workspace.bootstrap?.open_questions.find((item) => item.run_id === runId);
-  const list = useRef<FlatList<RunEvent>>(null);
+  const events = detail?.events ?? [];
+  const anchor = useBottomAnchoredList<RunEvent>(
+    runId,
+    run ? events.length + 1 : 0,
+  );
 
   useEffect(() => {
     void store.loadRun(runId);
@@ -31,8 +36,6 @@ export default function RunScreen() {
 
   if (!run) return <View style={styles.fill}><PageHeader title="Run" back /><Empty title="Loading run" /></View>;
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
-  const events = detail?.events ?? [];
-
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
       <PageHeader
@@ -42,11 +45,17 @@ export default function RunScreen() {
         action={active ? <Button label="Stop" compact tone="danger" onPress={() => void store.mutate((api) => api.cancelRun(run.id))} /> : undefined}
       />
       <FlatList
-        ref={list}
+        ref={anchor.listRef}
         data={events}
         keyExtractor={(event) => event.id}
         contentContainerStyle={styles.list}
-        onContentSizeChange={() => list.current?.scrollToEnd({ animated: false })}
+        onContentSizeChange={anchor.onContentSizeChange}
+        onScroll={anchor.onScroll}
+        onScrollBeginDrag={anchor.onScrollBeginDrag}
+        onScrollEndDrag={anchor.onScrollEndDrag}
+        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
+        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
+        scrollEventThrottle={16}
         ListHeaderComponent={
           <View style={styles.headerContent}>
             <Card style={styles.summary}>

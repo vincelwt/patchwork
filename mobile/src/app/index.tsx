@@ -9,7 +9,7 @@ import { useTheme } from "@/lib/theme";
 export default function Index() {
   const { session } = usePairedSession();
   if (session === undefined) return <Loading />;
-  if (session) return <Redirect href="/(app)/inbox" />;
+  if (session) return <Redirect href="/inbox" />;
   return <Welcome />;
 }
 

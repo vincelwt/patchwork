@@ -12,7 +12,7 @@ use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::host::{HostToRelay, RelayToHost};
-use patchwork_core::models::{Host, Presence};
+use patchwork_core::models::{Host, Presence, PreviewStatus};
 use patchwork_core::{now_ms, Id};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -24,17 +24,27 @@ use crate::state::{HostConn, Shared};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ClientMsg {
+    Heartbeat,
     /// Catch up on everything after `since`, then stream live.
-    Resume { since: i64 },
-    Typing { channel_id: Id },
-    Presence { presence: Presence },
+    Resume {
+        since: i64,
+    },
+    Typing {
+        channel_id: Id,
+    },
+    Presence {
+        presence: Presence,
+    },
     /// This connection is also an execution host.
-    Host { msg: HostToRelay },
+    Host {
+        msg: HostToRelay,
+    },
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum ServerMsg {
+    Heartbeat,
     Ready { seq: i64 },
     Event { envelope: Envelope },
     Host { msg: RelayToHost },
@@ -57,9 +67,7 @@ pub async fn handler(
         return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
     let can_host = caller.can_host();
-    ws.on_upgrade(move |socket| {
-        connection(socket, state, caller.member.id, query.since, can_host)
-    })
+    ws.on_upgrade(move |socket| connection(socket, state, caller.member.id, query.since, can_host))
 }
 
 async fn connection(
@@ -72,12 +80,18 @@ async fn connection(
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
 
-    // Catch-up before live events, so nothing is missed across a reconnect.
+    // Subscribe before taking the replay boundary. A durable event can land at
+    // any point during the handshake; the log supplies everything through
+    // `latest`, and the receiver already holds everything after it.
+    let mut bus = state.bus.subscribe();
     let latest = state.store.latest_seq().unwrap_or(0);
     if let Some(since) = since {
-        if since > 0 && since < latest {
-            if let Ok(missed) = state.store.events_since(since, 2000) {
-                for envelope in missed {
+        if since < latest {
+            // The log is retained at roughly 5,000 events, so the upper bound
+            // covers the complete catch-up window (including a workspace whose
+            // first bootstrap legitimately returned sequence zero).
+            if let Ok(missed) = state.store.events_since(since, 10_000) {
+                for envelope in missed.into_iter().filter(|event| event.seq <= latest) {
                     if crate::visibility::event(&state.store, &member_id, &envelope) {
                         let _ = tx.send(ServerMsg::Event { envelope });
                     }
@@ -87,7 +101,6 @@ async fn connection(
     }
     let _ = tx.send(ServerMsg::Ready { seq: latest });
 
-    let mut bus = state.bus.subscribe();
     let bus_tx = tx.clone();
     let bus_state = state.clone();
     let bus_member_id = member_id.clone();
@@ -95,6 +108,12 @@ async fn connection(
         loop {
             match bus.recv().await {
                 Ok(envelope) => {
+                    // Events at or below the boundary were just replayed from
+                    // the durable log. Transient events have a negative seq and
+                    // are never in that log, so they still pass through.
+                    if envelope.seq > 0 && envelope.seq <= latest {
+                        continue;
+                    }
                     if crate::visibility::event(&bus_state.store, &bus_member_id, &envelope)
                         && bus_tx.send(ServerMsg::Event { envelope }).is_err()
                     {
@@ -151,6 +170,9 @@ async fn connection(
         };
 
         match msg {
+            ClientMsg::Heartbeat => {
+                let _ = tx.send(ServerMsg::Heartbeat);
+            }
             ClientMsg::Resume { since } => {
                 if let Ok(missed) = state.store.events_since(since, 2000) {
                     for envelope in missed {
@@ -236,6 +258,7 @@ async fn connection(
     // Teardown.
     for host_id in registered {
         state.hosts.write().await.remove(&host_id);
+        fail_host_previews(&state, &host_id);
         if let Ok(Some(mut host)) = state.store.host(&host_id) {
             host.online = false;
             host.last_seen = now_ms();
@@ -249,9 +272,29 @@ async fn connection(
     writer.abort();
 }
 
+fn fail_host_previews(state: &Shared, host_id: &str) {
+    let Ok(previews) = state.store.previews(true) else {
+        return;
+    };
+    for mut preview in previews
+        .into_iter()
+        .filter(|preview| preview.host_id == host_id)
+    {
+        preview.status = PreviewStatus::Failed;
+        preview.stopped_at = Some(now_ms());
+        if state.store.upsert_preview(&preview).is_ok() {
+            state.emit(Event::PreviewUpdated { preview });
+        }
+    }
+}
+
 /// A desktop tells us where each project lives on it; that is how "run it
 /// wherever the project is available" can work at all.
-fn merge_project_paths(state: &Shared, host_id: &str, paths: &std::collections::BTreeMap<Id, String>) {
+fn merge_project_paths(
+    state: &Shared,
+    host_id: &str,
+    paths: &std::collections::BTreeMap<Id, String>,
+) {
     if paths.is_empty() {
         return;
     }
@@ -276,21 +319,34 @@ fn merge_project_paths(state: &Shared, host_id: &str, paths: &std::collections::
 
 /// The relay's own execution host: hosted agents keep working when every
 /// laptop is closed.
-pub fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost>) {
+pub async fn register_relay_host(state: &Shared, tx: mpsc::UnboundedSender<RelayToHost>) {
     let host_id = state.relay_host_id.clone();
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            state.hosts.write().await.insert(
-                host_id.clone(),
-                HostConn { tx },
-            );
-            if let Ok(Some(mut host)) = state.store.host(&host_id) {
-                host.online = true;
-                host.last_seen = now_ms();
-                let _ = state.store.upsert_host(&host);
-                state.emit(Event::HostUpdated { host });
-            }
-        }
-    });
+    state
+        .hosts
+        .write()
+        .await
+        .insert(host_id.clone(), HostConn { tx });
+    if let Ok(Some(mut host)) = state.store.host(&host_id) {
+        host.online = true;
+        host.last_seen = now_ms();
+        let _ = state.store.upsert_host(&host);
+        state.emit(Event::HostUpdated { host });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_wire_shape_is_stable() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"heartbeat"}"#).unwrap(),
+            ClientMsg::Heartbeat
+        ));
+        assert_eq!(
+            serde_json::to_string(&ServerMsg::Heartbeat).unwrap(),
+            r#"{"t":"heartbeat"}"#
+        );
+    }
 }

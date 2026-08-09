@@ -9,12 +9,85 @@ use std::time::Duration;
 use anyhow::Result;
 use patchwork_core::events::Event;
 use patchwork_core::models::*;
-use patchwork_core::wire::CreateTask;
+use patchwork_core::wire::{CreateTask, SendMessage};
 use patchwork_core::{new_id, now_ms, Id, Millis};
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::orchestrator::{self, StartRunParams};
 use crate::state::Shared;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WatchEvent {
+    event_key: String,
+    condition_key: String,
+    title: String,
+    outcome: String,
+    #[serde(default)]
+    context: Value,
+}
+
+fn parse_watch_events(stdout: &str) -> Option<Vec<WatchEvent>> {
+    let mut events = Vec::new();
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut event: WatchEvent = serde_json::from_str(line).ok()?;
+        event.event_key = event.event_key.trim().to_string();
+        event.condition_key = event.condition_key.trim().to_string();
+        event.title = event.title.trim().to_string();
+        event.outcome = event.outcome.trim().to_string();
+        if [
+            &event.event_key,
+            &event.condition_key,
+            &event.title,
+            &event.outcome,
+        ]
+        .into_iter()
+        .any(|value| value.is_empty())
+        {
+            return None;
+        }
+        events.push(event);
+    }
+    (!events.is_empty()).then_some(events)
+}
+
+fn watch_event(trigger: &AutomationTrigger, payload: Option<&Value>) -> Option<WatchEvent> {
+    if !matches!(trigger, AutomationTrigger::Watch { .. }) {
+        return None;
+    }
+    serde_json::from_value(payload?.get("watch_event")?.clone()).ok()
+}
+
+fn event_source_message(event: &WatchEvent) -> String {
+    let context = match &event.context {
+        Value::Null => return format!("Automation event `{}`", event.event_key),
+        Value::String(text) => text.clone(),
+        value => format!(
+            "```json\n{}\n```",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        ),
+    };
+    format!("Automation event `{}`\n\n{context}", event.event_key)
+}
+
+fn trigger_source_message(record: &AutomationRun) -> String {
+    match record.trigger_payload.as_ref() {
+        Some(payload) => format!(
+            "{}\n\n```json\n{}\n```",
+            record.trigger_summary,
+            serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+        ),
+        None => record.trigger_summary.clone(),
+    }
+}
+
+fn task_needs_run(task: &Task) -> bool {
+    task.status == TaskStatus::Planned && task.current_run_id.is_none()
+}
 
 pub async fn on_message(state: &Shared, message: &Message) {
     let Ok(automations) = state.store.automations() else {
@@ -66,8 +139,8 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
     for automation in automations.into_iter().filter(|a| a.enabled) {
         let should_fire = match &automation.trigger {
             AutomationTrigger::TaskStatus { status, project_id } => {
-                let entered = previous.map(|p| p.status != *status).unwrap_or(true)
-                    && task.status == *status;
+                let entered =
+                    previous.map(|p| p.status != *status).unwrap_or(true) && task.status == *status;
                 let project_matches = project_id
                     .as_ref()
                     .map(|p| task.project_id.as_ref() == Some(p))
@@ -88,9 +161,17 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
         }
 
         let summary = format!("Task {} entered {}", task.key, task.status.as_str());
-        let payload = json!({ "task_id": task.id, "key": task.key, "status": task.status.as_str() });
-        if let Err(err) =
-            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        let payload =
+            json!({ "task_id": task.id, "key": task.key, "status": task.status.as_str() });
+        if let Err(err) = fire(
+            state,
+            &automation,
+            summary,
+            payload,
+            Some(task.id.clone()),
+            None,
+        )
+        .await
         {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
@@ -119,8 +200,15 @@ pub async fn on_pull_request(state: &Shared, task: &Task, kind: &str, detail: &s
         }
         let summary = format!("Pull request {kind} on {}", task.key);
         let payload = json!({ "task_id": task.id, "kind": kind, "detail": detail });
-        if let Err(err) =
-            fire(state, &automation, summary, payload, Some(task.id.clone()), None).await
+        if let Err(err) = fire(
+            state,
+            &automation,
+            summary,
+            payload,
+            Some(task.id.clone()),
+            None,
+        )
+        .await
         {
             tracing::warn!(?err, "pull request automation failed");
         }
@@ -194,7 +282,9 @@ pub async fn fire(
         created_at: now_ms(),
         ended_at: None,
     };
-    state.store.upsert_automation_run(&record)?;
+    if let Some(existing) = state.store.reserve_automation_run(&record)? {
+        return Ok(existing);
+    }
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });
@@ -241,11 +331,11 @@ async fn dispatch(
         .clone()
         .or_else(|| automation.context_channel_id.clone());
 
-    let (channel_id, task_id) = match automation.action {
+    let (channel_id, task_id, start_agent, required_task_status) = match automation.action {
         AutomationAction::PostInChat => {
             let channel = report_channel
                 .ok_or_else(|| anyhow::anyhow!("this automation has no channel to post in"))?;
-            (channel, None)
+            (channel, None, true, None)
         }
         AutomationAction::ContinueTask => {
             let task_id = trigger_task_id
@@ -254,19 +344,33 @@ async fn dispatch(
                 .store
                 .task(&task_id)?
                 .ok_or_else(|| anyhow::anyhow!("the task no longer exists"))?;
-            (task.discussion_channel_id, Some(task.id))
+            (task.discussion_channel_id, Some(task.id), true, None)
         }
         AutomationAction::CreateTask => {
-            let task = orchestrator::create_task(
+            let event = watch_event(&automation.trigger, record.trigger_payload.as_ref());
+            let (title, outcome, once_key, initial_message) = match &event {
+                Some(event) => (
+                    event.title.clone(),
+                    event.outcome.clone(),
+                    Some(event.condition_key.clone()),
+                    event_source_message(event),
+                ),
+                None => (
+                    automation.name.clone(),
+                    String::new(),
+                    record.once_key.clone(),
+                    trigger_source_message(record),
+                ),
+            };
+            let creation = orchestrator::create_task_with_result(
                 state,
                 &automation.created_by,
                 CreateTask {
-                    title: automation.name.clone(),
-                    outcome: automation.instructions.clone(),
+                    title,
+                    outcome,
+                    initial_message: Some(initial_message.clone()),
                     owner_id: Some(automation.agent_id.clone()),
-                    // The caller's idempotency key doubles as the task's: two
-                    // deliveries about one issue make one task, not two.
-                    once_key: record.once_key.clone(),
+                    once_key,
                     source_channel_id: report_channel.clone(),
                     project_id: automation.project_id.clone(),
                     host_id: automation.host_id.clone(),
@@ -275,7 +379,30 @@ async fn dispatch(
                 },
             )
             .await?;
-            (task.discussion_channel_id.clone(), Some(task.id))
+            let task = creation.task;
+            if !creation.created {
+                orchestrator::post_message(
+                    state,
+                    &task.discussion_channel_id,
+                    &automation.created_by,
+                    SendMessage {
+                        body: initial_message,
+                        ..Default::default()
+                    },
+                    orchestrator::PostOptions {
+                        trigger_agents: false,
+                        run_id: None,
+                    },
+                )
+                .await?;
+            }
+            let start_agent = task_needs_run(&task);
+            (
+                task.discussion_channel_id.clone(),
+                Some(task.id),
+                start_agent,
+                Some(TaskStatus::Planned),
+            )
         }
     };
 
@@ -287,7 +414,14 @@ async fn dispatch(
         "project_id": automation.project_id,
         "host_id": automation.host_id,
         "action": automation.action,
+        "started": start_agent,
     }));
+
+    if !start_agent {
+        record.status = RunStatus::Succeeded;
+        record.ended_at = Some(now_ms());
+        return Ok(());
+    }
 
     let mut prompt = String::new();
     prompt.push_str(&format!("Automation `{}` fired.\n", automation.name));
@@ -305,7 +439,7 @@ async fn dispatch(
     }
     record.context_preview = prompt.chars().take(4000).collect();
 
-    let run = orchestrator::start_run(
+    let run = match orchestrator::start_run(
         state,
         StartRunParams {
             agent_id: automation.agent_id.clone(),
@@ -319,9 +453,25 @@ async fn dispatch(
             depth: 0,
             host_id: automation.host_id.clone(),
             project_id: automation.project_id.clone(),
+            required_task_status,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(run) => run,
+        Err(error)
+            if required_task_status.is_some() && error.is::<orchestrator::TaskUnavailable>() =>
+        {
+            if let Some(selection) = record.selection.as_mut() {
+                selection["started"] = json!(false);
+                selection["reason"] = json!("task state changed before dispatch");
+            }
+            record.status = RunStatus::Succeeded;
+            record.ended_at = Some(now_ms());
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
 
     record.run_id = Some(run.id);
     record.status = RunStatus::Running;
@@ -499,6 +649,28 @@ async fn poll_watch(state: Shared, automation: Automation, command: String) {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        if let Some(events) = parse_watch_events(&stdout) {
+            for event in events {
+                let event_key = event.event_key.clone();
+                let title: String = event.title.chars().take(120).collect();
+                if let Err(err) = fire(
+                    &state,
+                    &automation,
+                    format!("Watch: {title}"),
+                    json!({ "watch_event": event }),
+                    None,
+                    Some(event_key),
+                )
+                .await
+                {
+                    tracing::warn!(?err, automation = %automation.name, "watch event failed");
+                }
+            }
+            return;
+        }
+    }
+
     let last = state
         .store
         .automation_runs(&automation.id, 1)
@@ -579,16 +751,17 @@ fn announce_due_tasks(state: &Shared) {
             continue;
         }
         let title = format!("{} is due", task.key);
-        if let Err(err) = crate::orchestrator::notify_task(state, &task, InboxKind::TaskDue, title) {
+        if let Err(err) = crate::orchestrator::notify_task(state, &task, InboxKind::TaskDue, title)
+        {
             tracing::warn!(?err, task = %task.key, "could not announce a due task");
         }
     }
 }
 
-/// Due, and still worth saying so. Finishing a task is the way to stop it
+/// Due, and still worth saying so. Closing a task is the way to stop it
 /// nagging, whatever its date says.
 fn is_due(task: &Task, now: Millis) -> bool {
-    matches!(task.due_at, Some(at) if at <= now) && task.status != TaskStatus::Done
+    matches!(task.due_at, Some(at) if at <= now) && !task.status.is_terminal()
 }
 
 /// The next firing after `after`, in the relay's local time.
@@ -607,10 +780,7 @@ pub fn next_cron_after(expression: &str, after: i64) -> Option<i64> {
     };
     let schedule = cron::Schedule::from_str(&normalised).ok()?;
     let from = chrono::Local.timestamp_millis_opt(after).single()?;
-    schedule
-        .after(&from)
-        .next()
-        .map(|at| at.timestamp_millis())
+    schedule.after(&from).next().map(|at| at.timestamp_millis())
 }
 
 #[cfg(test)]
@@ -630,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_done() {
+    fn a_task_is_due_once_its_day_arrives_and_never_after_it_is_closed() {
         let mut task = Task {
             id: "t".into(),
             key: "PW-1".into(),
@@ -647,6 +817,7 @@ mod tests {
             current_run_id: None,
             pr_url: None,
             pr_state: None,
+            review_action: None,
             created_by: "m".into(),
             due_at: None,
             once_key: None,
@@ -661,6 +832,9 @@ mod tests {
         assert!(is_due(&task, 2_000));
 
         task.status = TaskStatus::Done;
+        assert!(!is_due(&task, 9_999));
+
+        task.status = TaskStatus::Canceled;
         assert!(!is_due(&task, 9_999));
     }
 
@@ -680,6 +854,92 @@ mod tests {
         assert!(watch_found_something(true, "issue-2", Some("issue-1")));
         // The same finding as last time is not a new one.
         assert!(!watch_found_something(true, "issue-1", Some("issue-1")));
+    }
+
+    #[test]
+    fn structured_watches_separate_deliveries_from_conditions() {
+        let events = parse_watch_events(
+            r#"{"event_key":"deploy-1","condition_key":"checkout:deploy","title":"Restore checkout","outcome":"Checkout deploys from main","context":{"status":500}}
+{"event_key":"deploy-2","condition_key":"checkout:deploy","title":"Restore checkout","outcome":"Checkout deploys from main"}"#,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_key, "deploy-1");
+        assert_eq!(events[1].event_key, "deploy-2");
+        assert_eq!(events[0].condition_key, events[1].condition_key);
+    }
+
+    #[test]
+    fn structured_payloads_only_change_watch_semantics() {
+        let payload = json!({
+            "watch_event": {
+                "event_key": "delivery",
+                "condition_key": "condition",
+                "title": "Produce result",
+                "outcome": "The result exists"
+            }
+        });
+        assert!(watch_event(
+            &AutomationTrigger::Watch {
+                command: "scan".into(),
+                every_seconds: 60,
+            },
+            Some(&payload),
+        )
+        .is_some());
+        assert!(watch_event(
+            &AutomationTrigger::Webhook {
+                token: "token".into(),
+            },
+            Some(&payload),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn ordinary_watch_output_stays_legacy() {
+        assert!(parse_watch_events("one finding\nmore detail").is_none());
+        assert!(
+            parse_watch_events("{\"event_key\":\"missing the other required fields\"}").is_none()
+        );
+    }
+
+    #[test]
+    fn only_idle_planned_tasks_start_from_another_occurrence() {
+        let mut task = Task {
+            id: "t".into(),
+            key: "PW-1".into(),
+            title: "Produce result".into(),
+            outcome: "The result exists".into(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "human".into(),
+            due_at: None,
+            once_key: Some("condition".into()),
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        assert!(task_needs_run(&task));
+        task.status = TaskStatus::Running;
+        assert!(!task_needs_run(&task));
+        task.status = TaskStatus::Review;
+        assert!(!task_needs_run(&task));
+        task.status = TaskStatus::Blocked;
+        assert!(!task_needs_run(&task));
+        task.status = TaskStatus::Planned;
+        task.current_run_id = Some("run".into());
+        assert!(!task_needs_run(&task));
     }
 
     #[test]

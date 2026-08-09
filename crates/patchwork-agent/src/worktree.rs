@@ -275,7 +275,12 @@ async fn carry_untracked_config(checkout: &str, worktree: &str) {
         if !name.starts_with(".env") {
             continue;
         }
-        if entry.file_type().await.map(|t| !t.is_file()).unwrap_or(true) {
+        if entry
+            .file_type()
+            .await
+            .map(|t| !t.is_file())
+            .unwrap_or(true)
+        {
             continue;
         }
         let target = Path::new(worktree).join(&name);
@@ -357,7 +362,10 @@ mod tests {
     #[test]
     fn one_machine_keeps_one_copy_however_the_url_was_written() {
         assert_eq!(repo_slug("https://github.com/acme/app", "x"), "acme-app");
-        assert_eq!(repo_slug("https://github.com/acme/app.git", "x"), "acme-app");
+        assert_eq!(
+            repo_slug("https://github.com/acme/app.git", "x"),
+            "acme-app"
+        );
         assert_eq!(repo_slug("git@github.com:acme/app.git", "x"), "acme-app");
         assert_eq!(repo_slug("ssh://git@host/acme/app/", "x"), "acme-app");
         assert_eq!(repo_slug("", "fallback"), "fallback");
@@ -367,7 +375,10 @@ mod tests {
     fn branch_names_are_readable_and_safe() {
         let b = branch_for("PW-14", "Fix the checkout: totals are wrong!");
         assert_eq!(b, "patchwork/pw-14-fix-the-checkout-totals-are-wrong");
-        assert_eq!(sanitize(&b), "patchwork-pw-14-fix-the-checkout-totals-are-wrong");
+        assert_eq!(
+            sanitize(&b),
+            "patchwork-pw-14-fix-the-checkout-totals-are-wrong"
+        );
     }
 
     #[tokio::test]

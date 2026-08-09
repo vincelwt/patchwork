@@ -6,6 +6,8 @@ import { Composer } from "@/components/Composer";
 import { MessageRow } from "@/components/Message";
 import { Empty, PageHeader } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
+import { useBottomAnchoredList } from "@/lib/scroll";
+import type { Message } from "@client/types";
 
 export default function ThreadScreen() {
   const { messageId } = useLocalSearchParams<{ messageId: string }>();
@@ -17,6 +19,10 @@ export default function ThreadScreen() {
   );
   const replies = workspace.threads[messageId] ?? [];
   const channel = workspace.bootstrap?.channels.find((item) => item.id === root?.channel_id);
+  const anchor = useBottomAnchoredList<Message>(
+    messageId,
+    root ? replies.length + 1 : 0,
+  );
 
   useEffect(() => {
     void store.loadThread(messageId);
@@ -30,11 +36,19 @@ export default function ThreadScreen() {
       ) : (
         <>
           <FlatList
+            ref={anchor.listRef}
             data={replies}
             keyExtractor={(message) => message.id}
             ListHeaderComponent={<View style={styles.root}><MessageRow message={root} inThread /></View>}
             renderItem={({ item }) => <MessageRow message={item} inThread />}
             contentContainerStyle={styles.list}
+            onContentSizeChange={anchor.onContentSizeChange}
+            onScroll={anchor.onScroll}
+            onScrollBeginDrag={anchor.onScrollBeginDrag}
+            onScrollEndDrag={anchor.onScrollEndDrag}
+            onMomentumScrollBegin={anchor.onMomentumScrollBegin}
+            onMomentumScrollEnd={anchor.onMomentumScrollEnd}
+            scrollEventThrottle={16}
           />
           <Composer channelId={channel.id} parentId={messageId} taskId={channel.task_id} placeholder="Reply in thread" />
         </>

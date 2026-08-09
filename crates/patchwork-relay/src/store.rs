@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
 use patchwork_core::wire::Device;
-use patchwork_core::{now_ms, Id};
+use patchwork_core::{now_ms, Id, Millis};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value as Json;
@@ -22,6 +22,11 @@ pub type Conn = r2d2::PooledConnection<SqliteConnectionManager>;
 #[derive(Clone)]
 pub struct Store {
     pool: Pool,
+}
+
+pub enum InsertTaskResult {
+    Inserted,
+    Existing(Task),
 }
 
 fn json_col<T: serde::de::DeserializeOwned>(row: &Row, idx: &str) -> Option<T> {
@@ -81,7 +86,10 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
+            "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
+            "ALTER TABLE tasks ADD COLUMN review_action TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
@@ -89,6 +97,45 @@ impl Store {
         ] {
             let _ = conn.execute(statement, []);
         }
+
+        // Canonicalize legacy keys before enforcing one open task per key.
+        // Keep the newest of any pre-existing duplicates; no task is deleted.
+        conn.execute_batch(
+            "UPDATE tasks
+                SET once_key = NULLIF(lower(trim(once_key)), '')
+              WHERE once_key IS NOT NULL;
+             UPDATE tasks AS older
+                SET once_key = NULL
+              WHERE older.once_key IS NOT NULL
+                AND older.status NOT IN ('done', 'canceled')
+                AND EXISTS (
+                    SELECT 1 FROM tasks AS newer
+                     WHERE newer.once_key = older.once_key COLLATE NOCASE
+                       AND newer.status NOT IN ('done', 'canceled')
+                       AND (newer.created_at > older.created_at
+                            OR (newer.created_at = older.created_at AND newer.id > older.id))
+                );
+             CREATE UNIQUE INDEX IF NOT EXISTS tasks_open_once
+                ON tasks(once_key COLLATE NOCASE)
+             WHERE once_key IS NOT NULL AND status NOT IN ('done', 'canceled');
+             UPDATE automation_runs
+                SET once_key = NULLIF(trim(once_key), '')
+              WHERE once_key IS NOT NULL;
+             UPDATE automation_runs AS newer
+                SET once_key = NULL
+              WHERE newer.once_key IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM automation_runs AS older
+                     WHERE older.automation_id = newer.automation_id
+                       AND older.once_key = newer.once_key
+                       AND (older.created_at < newer.created_at
+                            OR (older.created_at = newer.created_at AND older.id < newer.id))
+                );
+             CREATE UNIQUE INDEX IF NOT EXISTS automation_runs_once_unique
+                ON automation_runs(automation_id, once_key)
+             WHERE once_key IS NOT NULL;",
+        )
+        .context("failed to enforce task idempotency")?;
 
         Ok(Self { pool })
     }
@@ -160,9 +207,9 @@ impl Store {
     /// the series is not rewriting history.
     pub fn next_task_key(&self) -> Result<String> {
         let conn = self.conn()?;
-        conn.execute("UPDATE workspace SET task_seq = task_seq + 1", [])?;
         let (prefix, seq): (String, i64) = conn.query_row(
-            "SELECT task_prefix, task_seq FROM workspace LIMIT 1",
+            "UPDATE workspace SET task_seq = task_seq + 1
+             RETURNING task_prefix, task_seq",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -931,6 +978,7 @@ impl Store {
             file_name: row.get("file_name")?,
             mime: row.get("mime")?,
             size: row.get("size")?,
+            caption: row.get("caption")?,
             message_id: row.get("message_id")?,
             task_id: row.get("task_id")?,
             run_id: row.get("run_id")?,
@@ -940,13 +988,14 @@ impl Store {
 
     pub fn insert_attachment(&self, attachment: &Attachment, path: &str) -> Result<()> {
         self.conn()?.execute(
-            "INSERT INTO attachments (id, file_name, mime, size, path, message_id, task_id, run_id, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            "INSERT INTO attachments (id, file_name, mime, size, caption, path, message_id, task_id, run_id, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 attachment.id,
                 attachment.file_name,
                 attachment.mime,
                 attachment.size,
+                attachment.caption,
                 path,
                 attachment.message_id,
                 attachment.task_id,
@@ -977,6 +1026,14 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Unpin evidence while preserving an attachment posted in chat.
+    pub fn remove_task_attachment(&self, id: &str, task_id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE attachments SET task_id = NULL WHERE id = ?1 AND task_id = ?2",
+            params![id, task_id],
+        )? == 1)
+    }
+
     // -- tasks --------------------------------------------------------------
 
     fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
@@ -997,6 +1054,7 @@ impl Store {
             current_run_id: row.get("current_run_id")?,
             pr_url: row.get("pr_url")?,
             pr_state: json_col(row, "pr_state"),
+            review_action: row.get("review_action")?,
             created_by: row.get("created_by")?,
             due_at: row.get("due_at")?,
             once_key: row.get("once_key")?,
@@ -1010,6 +1068,70 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
+                                pr_state, review_action, created_by, due_at, once_key, position, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            params![
+                task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
+                task.source_channel_id, task.source_message_id, task.discussion_channel_id,
+                task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
+                task.pr_state.as_ref().map(to_json), task.review_action, task.created_by,
+                task.due_at, task.once_key, task.position, task.created_at, task.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a task and its discussion under one SQLite write lock. The
+    /// in-transaction lookup closes the read-before-write race for `once_key`.
+    pub fn insert_task_with_channel(
+        &self,
+        task: &Task,
+        channel: &Channel,
+    ) -> Result<InsertTaskResult> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(key) = task.once_key.as_deref() {
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM tasks
+                     WHERE once_key = ?1 COLLATE NOCASE AND status NOT IN ('done', 'canceled')
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![key],
+                    Self::task_from_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                tx.rollback()?;
+                return Ok(InsertTaskResult::Existing(existing));
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO channels (id, kind, section_id, slug, name, topic, position, task_id, last_message_at, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                channel.id,
+                match channel.kind { ChannelKind::Dm => "dm", ChannelKind::Task => "task", ChannelKind::Channel => "channel" },
+                channel.section_id,
+                channel.slug,
+                channel.name,
+                channel.topic,
+                channel.position,
+                task.id,
+                channel.last_message_at,
+                channel.created_at,
+            ],
+        )?;
+        for member_id in &channel.member_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO channel_members (channel_id, member_id) VALUES (?1, ?2)",
+                params![channel.id, member_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
+                                discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
                                 pr_state, created_by, due_at, once_key, position, created_at, updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
@@ -1020,20 +1142,40 @@ impl Store {
                 task.position, task.created_at, task.updated_at
             ],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(InsertTaskResult::Inserted)
     }
 
     pub fn update_task(&self, task: &Task) -> Result<()> {
+        self.update_task_inner(task, false)
+    }
+
+    /// Persist a task status chosen outside the question lifecycle. Even if
+    /// the visible status stays `blocked`, a human or agent has taken control
+    /// of it and answering an older question must not silently move it again.
+    pub fn update_task_with_explicit_status(&self, task: &Task) -> Result<()> {
+        self.update_task_inner(task, true)
+    }
+
+    fn update_task_inner(&self, task: &Task, explicit_status: bool) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
-                              position=?13, updated_at=?14 WHERE id=?1",
+                              position=?13, updated_at=MAX(?14, updated_at + 1),
+                              question_blocked_run_id=CASE
+                                WHEN ?15 OR ?4 != 'blocked' THEN NULL
+                                ELSE question_blocked_run_id
+                              END,
+                              review_action=?16
+              WHERE id=?1",
             params![
                 task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
-                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms()
+                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms(),
+                explicit_status,
+                task.review_action
             ],
         )?;
         tx.execute(
@@ -1046,6 +1188,132 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Claim a review action exactly once before dispatching the follow-up run.
+    /// The compare-and-set keeps a double click (or two open clients) from
+    /// starting the approved action twice.
+    pub fn claim_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status = 'running', review_action = NULL,
+                              updated_at = MAX(?3, updated_at + 1)
+             WHERE id = ?1 AND status = 'review' AND review_action = ?2
+               AND current_run_id IS NULL",
+            params![task_id, action, now_ms()],
+        )? == 1)
+    }
+
+    /// Put an approval back when dispatch failed before a run took ownership.
+    pub fn restore_review_action(&self, task_id: &str, action: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status = 'review', review_action = ?2,
+                              updated_at = MAX(?3, updated_at + 1)
+             WHERE id = ?1 AND status = 'running' AND review_action IS NULL
+               AND current_run_id IS NULL",
+            params![task_id, action, now_ms()],
+        )? == 1)
+    }
+
+    pub fn update_task_if_unchanged(
+        &self,
+        task: &Task,
+        expected_updated_at: Millis,
+        explicit_status: bool,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
+                              worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
+                              position=?13, updated_at=MAX(?14, updated_at + 1),
+                              question_blocked_run_id=CASE
+                                WHEN ?15 OR ?4 != 'blocked' THEN NULL
+                                ELSE question_blocked_run_id
+                              END,
+                              review_action=?16
+             WHERE id=?1 AND updated_at=?17",
+            params![
+                task.id, task.title, task.outcome, task.status.as_str(), task.owner_id,
+                task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
+                task.pr_state.as_ref().map(to_json), task.due_at, task.position, now_ms(),
+                explicit_status, task.review_action, expected_updated_at
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE channels SET name = ?2, topic = ?3 WHERE id = ?1",
+            params![
+                task.discussion_channel_id,
+                format!("{}: {}", task.key, task.title),
+                task.outcome,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn activate_task_run(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        required_status: Option<TaskStatus>,
+    ) -> Result<Option<TaskStatus>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT status, current_run_id, updated_at FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Millis>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, current_run_id, updated_at)) = current else {
+            return Ok(None);
+        };
+        let status = TaskStatus::parse(&status).unwrap_or(TaskStatus::Planned);
+        if status.is_terminal()
+            || current_run_id.is_some()
+            || required_status.is_some_and(|required| required != status)
+        {
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE tasks SET status='running', current_run_id=?2, updated_at=?3 WHERE id=?1",
+            params![task_id, run_id, now_ms().max(updated_at + 1)],
+        )?;
+        tx.commit()?;
+        Ok(Some(status))
+    }
+
+    pub fn finalize_task_run_start(&self, task_id: &str, run_id: &str) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET review_action=NULL, question_blocked_run_id=NULL,
+                              updated_at=MAX(?3, updated_at + 1)
+             WHERE id=?1 AND current_run_id=?2",
+            params![task_id, run_id, now_ms()],
+        )? > 0)
+    }
+
+    pub fn restore_task_after_failed_start(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        previous_status: TaskStatus,
+    ) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET status=CASE WHEN status='running' THEN ?3 ELSE status END,
+                              current_run_id=NULL, updated_at=MAX(?4, updated_at + 1)
+             WHERE id=?1 AND current_run_id=?2",
+            params![task_id, run_id, previous_status.as_str(), now_ms()],
+        )? > 0)
     }
 
     pub fn task(&self, id: &str) -> Result<Option<Task>> {
@@ -1098,13 +1366,14 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// The open task an agent already made about this, if it made one. Done is
-    /// not open: the same thing going wrong again is a new task, not a ghost.
+    /// The open task an agent already made about this, if it made one. Terminal
+    /// tasks are not open: the same thing recurring is new work, not a ghost.
     pub fn task_by_once_key(&self, key: &str) -> Result<Option<Task>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
-                "SELECT * FROM tasks WHERE once_key = ?1 AND status != 'done'
+                "SELECT * FROM tasks WHERE once_key = ?1 COLLATE NOCASE
+                   AND status NOT IN ('done', 'canceled')
                  ORDER BY created_at DESC LIMIT 1",
                 params![key],
                 |r| Self::task_from_row(r),
@@ -1112,10 +1381,22 @@ impl Store {
             .optional()?)
     }
 
-    pub fn delete_task(&self, id: &str) -> Result<()> {
-        self.conn()?
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
-        Ok(())
+    pub fn delete_task(&self, id: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let files = {
+            let mut statement = tx.prepare("SELECT path FROM attachments WHERE task_id = ?1")?;
+            let files = statement
+                .query_map(params![id], |row| row.get(0))?
+                .filter_map(Result::ok)
+                .collect();
+            files
+        };
+        tx.execute("DELETE FROM attachments WHERE task_id = ?1", params![id])?;
+        tx.execute("DELETE FROM previews WHERE task_id = ?1", params![id])?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(files)
     }
 
     // -- projects, hosts, worktrees ----------------------------------------
@@ -1425,11 +1706,7 @@ impl Store {
 
     /// Reserve one explicit cross-session message and enforce its loop budget
     /// in the same write transaction, so concurrent sends cannot race it.
-    pub fn reserve_direct_control(
-        &self,
-        event: &mut RunEvent,
-        target_run_id: &str,
-    ) -> Result<()> {
+    pub fn reserve_direct_control(&self, event: &mut RunEvent, target_run_id: &str) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let total: i64 = tx.query_row(
@@ -1446,7 +1723,9 @@ impl Store {
             |row| row.get(0),
         )?;
         if total >= 16 || pair >= 4 {
-            return Err(anyhow!("this run has reached its cross-session message limit"));
+            return Err(anyhow!(
+                "this run has reached its cross-session message limit"
+            ));
         }
         event.seq = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
@@ -1545,12 +1824,69 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_question_message(&self, id: &str, message_id: &str) -> Result<()> {
-        self.conn()?.execute(
-            "UPDATE questions SET message_id = ?2 WHERE id = ?1",
-            params![id, message_id],
+    /// Make the question, waiting run, blocked task and Inbox rows visible as
+    /// one state. A terminal run wins the race and commits none of them.
+    pub fn commit_question_waiting(
+        &self,
+        question: &Question,
+        run: &Run,
+        inbox: &[InboxItem],
+    ) -> Result<(bool, Option<Task>)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE runs SET status='waiting', headline=?2
+             WHERE id=?1 AND status NOT IN ('succeeded','failed','cancelled')",
+            params![run.id, run.headline],
         )?;
-        Ok(())
+        if changed == 0 {
+            return Ok((false, None));
+        }
+        tx.execute(
+            "INSERT INTO questions (id, run_id, agent_id, channel_id, task_id, message_id, headline, items, status, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',?9)",
+            params![
+                question.id, question.run_id, question.agent_id, question.channel_id,
+                question.task_id, question.message_id, question.headline,
+                to_json(&question.items), question.created_at
+            ],
+        )?;
+        for item in inbox {
+            tx.execute(
+                "INSERT INTO inbox (id, member_id, kind, title, preview, actor_id, channel_id, message_id,
+                                    task_id, run_id, automation_id, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    item.id, item.member_id,
+                    serde_json::to_string(&item.kind).unwrap_or_default().trim_matches('"'),
+                    item.title, item.preview, item.actor_id, item.channel_id, item.message_id,
+                    item.task_id, item.run_id, item.automation_id, item.created_at
+                ],
+            )?;
+        }
+        let blocked = if let Some(task_id) = &question.task_id {
+            let changed = tx.execute(
+                "UPDATE tasks
+                 SET status='blocked', question_blocked_run_id=?2,
+                     updated_at=MAX(?3, updated_at + 1)
+                 WHERE id=?1 AND current_run_id=?2 AND status='running'",
+                params![task_id, run.id, now_ms()],
+            )?;
+            if changed == 0 {
+                None
+            } else {
+                tx.query_row(
+                    "SELECT * FROM tasks WHERE id=?1",
+                    params![task_id],
+                    Self::task_from_row,
+                )
+                .optional()?
+            }
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok((true, blocked))
     }
 
     pub fn answer_question(
@@ -1558,22 +1894,75 @@ impl Store {
         id: &str,
         answers: &[QuestionAnswer],
         by: &str,
-    ) -> Result<Question> {
-        self.conn()?.execute(
+    ) -> Result<(Question, Option<Task>)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE questions SET status='answered', answers=?2, answered_by=?3, answered_at=?4
              WHERE id=?1 AND status='open'",
             params![id, to_json(&answers), by, now_ms()],
         )?;
-        self.question(id)?
-            .ok_or_else(|| anyhow!("question not found"))
+        if changed == 0 {
+            return Err(anyhow!("question is no longer open"));
+        }
+        let question = tx
+            .query_row(
+                "SELECT * FROM questions WHERE id=?1",
+                params![id],
+                Self::question_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("question not found"))?;
+        let resumed = tx
+            .query_row(
+                "UPDATE tasks
+                 SET status='running', question_blocked_run_id=NULL,
+                     updated_at=MAX(?2, updated_at + 1)
+                 WHERE current_run_id=?1
+                   AND status='blocked'
+                   AND question_blocked_run_id=?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM questions WHERE run_id=?1 AND status='open'
+                   )
+                 RETURNING *",
+                params![question.run_id, now_ms()],
+                Self::task_from_row,
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok((question, resumed))
     }
 
-    pub fn cancel_questions_for_run(&self, run_id: &str) -> Result<()> {
-        self.conn()?.execute(
+    pub fn cancel_questions_for_run(&self, run_id: &str) -> Result<Vec<Question>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut questions = {
+            let mut stmt = tx
+                .prepare("SELECT * FROM questions WHERE run_id=?1 AND status='open' ORDER BY id")?;
+            let rows = stmt.query_map(params![run_id], Self::question_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
             "UPDATE questions SET status='cancelled' WHERE run_id=?1 AND status='open'",
             params![run_id],
         )?;
-        Ok(())
+        // Terminal run handling immediately computes the task's durable final
+        // state. Restore its pre-question status in storage without emitting a
+        // transient Running event between cancellation and that final update.
+        tx.execute(
+            "UPDATE tasks
+             SET status='running', question_blocked_run_id=NULL,
+                 updated_at=MAX(?2, updated_at + 1)
+             WHERE current_run_id=?1
+               AND status='blocked'
+               AND question_blocked_run_id=?1",
+            params![run_id, now_ms()],
+        )?;
+        tx.commit()?;
+        for question in &mut questions {
+            question.status = QuestionStatus::Cancelled;
+        }
+        Ok(questions)
     }
 
     pub fn question(&self, id: &str) -> Result<Option<Question>> {
@@ -1690,7 +2079,7 @@ impl Store {
     pub fn mark_inbox_read(&self, id: &str, member_id: &str) -> Result<()> {
         self.conn()?.execute(
             "UPDATE inbox SET read_at = ?3
-             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL",
+             WHERE id = ?1 AND member_id = ?2 AND read_at IS NULL AND kind != 'question'",
             params![id, member_id, now_ms()],
         )?;
         Ok(())
@@ -1698,28 +2087,47 @@ impl Store {
 
     pub fn mark_all_inbox_read(&self, member_id: &str) -> Result<()> {
         self.conn()?.execute(
-            "UPDATE inbox SET read_at = ?2 WHERE member_id = ?1 AND read_at IS NULL",
+            "UPDATE inbox SET read_at = ?2
+             WHERE member_id = ?1 AND read_at IS NULL AND kind != 'question'",
             params![member_id, now_ms()],
         )?;
         Ok(())
     }
 
-    /// Resolving an item that points at a task or run, once it is handled.
-    pub fn resolve_inbox_for(&self, task_id: Option<&str>, run_id: Option<&str>) -> Result<()> {
+    /// Resolve ordinary task notices, every question cancelled with a run, or
+    /// one answered question. The three scopes deliberately do not overlap.
+    pub fn resolve_inbox_for(
+        &self,
+        task_id: Option<&str>,
+        question_run_id: Option<&str>,
+        question_message_id: Option<&str>,
+    ) -> Result<Vec<InboxItem>> {
         let conn = self.conn()?;
-        if let Some(task_id) = task_id {
-            conn.execute(
-                "UPDATE inbox SET read_at = ?2 WHERE task_id = ?1 AND read_at IS NULL",
-                params![task_id, now_ms()],
+        let mut items = {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM inbox WHERE read_at IS NULL AND
+                 ((?1 IS NOT NULL AND task_id = ?1 AND kind != 'question') OR
+                  (?2 IS NOT NULL AND run_id = ?2 AND kind = 'question') OR
+                  (?3 IS NOT NULL AND message_id = ?3 AND kind = 'question'))",
             )?;
-        }
-        if let Some(run_id) = run_id {
-            conn.execute(
-                "UPDATE inbox SET read_at = ?2 WHERE run_id = ?1 AND read_at IS NULL",
-                params![run_id, now_ms()],
+            let rows = stmt.query_map(
+                params![task_id, question_run_id, question_message_id],
+                Self::inbox_from_row,
             )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let at = now_ms();
+        conn.execute(
+            "UPDATE inbox SET read_at = ?4 WHERE read_at IS NULL AND
+             ((?1 IS NOT NULL AND task_id = ?1 AND kind != 'question') OR
+              (?2 IS NOT NULL AND run_id = ?2 AND kind = 'question') OR
+              (?3 IS NOT NULL AND message_id = ?3 AND kind = 'question'))",
+            params![task_id, question_run_id, question_message_id, at],
+        )?;
+        for item in &mut items {
+            item.read_at = Some(at);
         }
-        Ok(())
+        Ok(items)
     }
 
     // -- automations --------------------------------------------------------
@@ -1841,6 +2249,42 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Reserve a keyed delivery before dispatch. `Some` means another caller
+    /// already reserved it and owns the work.
+    pub fn reserve_automation_run(&self, run: &AutomationRun) -> Result<Option<AutomationRun>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(key) = run.once_key.as_deref() {
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM automation_runs
+                     WHERE automation_id = ?1 AND once_key = ?2
+                     ORDER BY id LIMIT 1",
+                    params![run.automation_id, key],
+                    Self::automation_run_from_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                tx.rollback()?;
+                return Ok(Some(existing));
+            }
+        }
+        tx.execute(
+            "INSERT INTO automation_runs (id, automation_id, run_id, trigger_summary, trigger_payload,
+                                          selection, context_preview, status, error, task_id, created_at, ended_at,
+                                          once_key)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                run.id, run.automation_id, run.run_id, run.trigger_summary,
+                run.trigger_payload.as_ref().map(to_json), run.selection.as_ref().map(to_json),
+                run.context_preview, run.status.as_str(), run.error, run.task_id,
+                run.created_at, run.ended_at, run.once_key
+            ],
+        )?;
+        tx.commit()?;
+        Ok(None)
     }
 
     /// Has this automation already acted on this key? The guard that makes a
@@ -2010,8 +2454,8 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    /// Members who can see a channel: everyone for open channels, the listed
-    /// participants for DMs, and for a task discussion its owner and creator.
+    /// Members who can see a channel: everyone for workspace-visible channels
+    /// and task discussions, and only the listed participants for DMs.
     pub fn channel_audience(&self, channel_id: &str) -> Result<Vec<Id>> {
         let conn = self.conn()?;
         let kind: Option<String> = conn
@@ -2022,7 +2466,7 @@ impl Store {
             )
             .optional()?;
         match kind.as_deref() {
-            Some("dm") | Some("task") => {
+            Some("dm") => {
                 let mut stmt =
                     conn.prepare("SELECT member_id FROM channel_members WHERE channel_id = ?1")?;
                 let rows = stmt.query_map(params![channel_id], |r| r.get::<_, String>(0))?;
@@ -2093,6 +2537,281 @@ mod tests {
             started_at: Some(1),
             ended_at: None,
         }
+    }
+
+    fn question(id: &str, run_id: &str) -> Question {
+        Question {
+            id: id.into(),
+            run_id: run_id.into(),
+            agent_id: "agent".into(),
+            channel_id: "channel".into(),
+            task_id: Some("task".into()),
+            message_id: None,
+            headline: String::new(),
+            items: Vec::new(),
+            status: QuestionStatus::Open,
+            answers: None,
+            answered_by: None,
+            created_at: 1,
+            answered_at: None,
+        }
+    }
+
+    fn idempotent_task(id: &str, key: &str) -> Task {
+        Task {
+            id: id.into(),
+            key: key.into(),
+            title: "Image proxy is returning 403".into(),
+            outcome: "Restore image delivery".into(),
+            status: TaskStatus::Planned,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: format!("channel-{id}"),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "human".into(),
+            due_at: None,
+            once_key: Some("posthog:image-proxy:403".into()),
+            created_at: 1,
+            updated_at: 1,
+            position: 1.0,
+        }
+    }
+
+    fn task_channel(task: &Task) -> Channel {
+        Channel {
+            id: task.discussion_channel_id.clone(),
+            kind: ChannelKind::Task,
+            section_id: None,
+            slug: String::new(),
+            name: task.title.clone(),
+            topic: task.outcome.clone(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: vec!["human".into()],
+            task_id: Some(task.id.clone()),
+            last_message_at: 1,
+        }
+    }
+
+    #[test]
+    fn concurrent_once_keys_create_one_task_and_one_discussion() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for (id, key) in [("one", "PW-1"), ("two", "PW-2")] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let task = idempotent_task(id, key);
+                let channel = task_channel(&task);
+                barrier.wait();
+                store.insert_task_with_channel(&task, &channel).unwrap()
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, InsertTaskResult::Inserted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, InsertTaskResult::Existing(_)))
+                .count(),
+            1
+        );
+        assert_eq!(store.tasks().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .channels()
+                .unwrap()
+                .into_iter()
+                .filter(|channel| channel.kind == ChannelKind::Task)
+                .count(),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_agent_updates_cannot_overwrite_a_newer_task_state() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let mut completed = task.clone();
+        completed.status = TaskStatus::Done;
+        store.update_task(&completed).unwrap();
+
+        let mut stale = task.clone();
+        stale.title = "Stale agent edit".into();
+        assert!(!store
+            .update_task_if_unchanged(&stale, task.updated_at, false)
+            .unwrap());
+        let stored = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+        assert!(stored.updated_at > task.updated_at);
+        assert_ne!(stored.title, stale.title);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_run_activation_claims_the_expected_state_once() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for run_id in ["run-one", "run-two"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let task_id = task.id.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                (
+                    run_id,
+                    store
+                        .activate_task_run(&task_id, run_id, Some(TaskStatus::Planned))
+                        .unwrap(),
+                )
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, status)| status.is_some())
+                .count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find_map(|(run_id, status)| status.map(|_| *run_id))
+            .unwrap();
+        assert!(store
+            .restore_task_after_failed_start(&task.id, winner, TaskStatus::Planned)
+            .unwrap());
+
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, "run-three", Some(TaskStatus::Planned))
+                .unwrap(),
+            Some(TaskStatus::Planned)
+        );
+        let mut reviewed = store.task(&task.id).unwrap().unwrap();
+        reviewed.status = TaskStatus::Review;
+        store.update_task(&reviewed).unwrap();
+        assert!(store
+            .restore_task_after_failed_start(&task.id, "run-three", TaskStatus::Planned)
+            .unwrap());
+        let reviewed = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(reviewed.status, TaskStatus::Review);
+        assert!(reviewed.current_run_id.is_none());
+
+        let mut completed = reviewed;
+        completed.status = TaskStatus::Done;
+        store.update_task(&completed).unwrap();
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, "run-four", Some(TaskStatus::Planned))
+                .unwrap(),
+            None
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_keeps_tasks_but_claims_a_legacy_key_once() {
+        let (store, path) = store();
+        store
+            .conn()
+            .unwrap()
+            .execute("DROP INDEX tasks_open_once", [])
+            .unwrap();
+        let first = idempotent_task("one", "PW-1");
+        let mut second = idempotent_task("two", "PW-2");
+        second.once_key = Some("POSTHOG:IMAGE-PROXY:403".into());
+        store.insert_task(&first).unwrap();
+        store.insert_task(&second).unwrap();
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let tasks = reopened.tasks().unwrap();
+        assert_eq!(tasks.len(), 2, "migration never deletes a task");
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.once_key.as_deref() == Some("posthog:image-proxy:403"))
+                .count(),
+            1
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_webhook_keys_reserve_one_automation_run() {
+        let (store, path) = store();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for id in ["one", "two"] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let run = AutomationRun {
+                    id: id.into(),
+                    automation_id: "automation".into(),
+                    run_id: None,
+                    trigger_summary: "Incoming webhook".into(),
+                    trigger_payload: None,
+                    selection: None,
+                    context_preview: String::new(),
+                    status: RunStatus::Queued,
+                    error: None,
+                    task_id: None,
+                    once_key: Some("delivery-123".into()),
+                    created_at: 1,
+                    ended_at: None,
+                };
+                barrier.wait();
+                store.reserve_automation_run(&run).unwrap()
+            }));
+        }
+        let results: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|existing| existing.is_none()).count(),
+            1
+        );
+        assert_eq!(
+            results.iter().filter(|existing| existing.is_some()).count(),
+            1
+        );
+        assert_eq!(store.automation_runs("automation", 10).unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2243,6 +2962,148 @@ mod tests {
     }
 
     #[test]
+    fn questions_resolve_independently_without_reading_other_run_items() {
+        let (store, path) = store();
+        let item = |id: &str, kind: InboxKind, message_id: Option<&str>| InboxItem {
+            id: id.into(),
+            member_id: "human".into(),
+            kind,
+            title: "Inbox item".into(),
+            preview: String::new(),
+            actor_id: None,
+            channel_id: Some("channel".into()),
+            message_id: message_id.map(str::to_string),
+            task_id: Some("task".into()),
+            run_id: Some("run".into()),
+            automation_id: None,
+            created_at: 1,
+            read_at: None,
+        };
+        store
+            .insert_inbox(&item(
+                "question-one",
+                InboxKind::Question,
+                Some("message-one"),
+            ))
+            .unwrap();
+        store
+            .insert_inbox(&item(
+                "question-two",
+                InboxKind::Question,
+                Some("message-two"),
+            ))
+            .unwrap();
+
+        store.mark_inbox_read("question-one", "human").unwrap();
+        store.mark_all_inbox_read("human").unwrap();
+        assert!(store
+            .resolve_inbox_for(Some("task"), None, None)
+            .unwrap()
+            .is_empty());
+
+        let mut mention = item("mention", InboxKind::Mention, Some("other-message"));
+        mention.task_id = None;
+        store.insert_inbox(&mention).unwrap();
+        let changed = store
+            .resolve_inbox_for(None, None, Some("message-one"))
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "question-one");
+        assert!(store
+            .inbox_item("question-two")
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none());
+
+        let changed = store.resolve_inbox_for(None, Some("run"), None).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].id, "question-two");
+        assert!(store
+            .inbox_item("mention")
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn question_transitions_are_single_use() {
+        let (store, path) = store();
+        store
+            .insert_question(&question("answered", "run-a"))
+            .unwrap();
+        assert_eq!(
+            store
+                .answer_question("answered", &[], "human")
+                .unwrap()
+                .0
+                .status,
+            QuestionStatus::Answered
+        );
+        assert!(store.answer_question("answered", &[], "human").is_err());
+
+        store
+            .insert_question(&question("cancelled", "run-b"))
+            .unwrap();
+        let cancelled = store.cancel_questions_for_run("run-b").unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].status, QuestionStatus::Cancelled);
+        assert!(store.answer_question("cancelled", &[], "human").is_err());
+
+        let mut ended = run("ended-run", "ended-task");
+        ended.status = RunStatus::Cancelled;
+        store.insert_run(&ended, 0).unwrap();
+        let pending = question("too-late", "ended-run");
+        assert!(
+            !store
+                .commit_question_waiting(&pending, &ended, &[])
+                .unwrap()
+                .0
+        );
+        assert!(store.question(&pending.id).unwrap().is_none());
+        assert_eq!(
+            store.run(&ended.id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_questions_reach_every_human_who_can_see_the_task() {
+        let (store, path) = store();
+        store.insert_member(&human("one")).unwrap();
+        store.insert_member(&human("two")).unwrap();
+        for (id, kind) in [("task", ChannelKind::Task), ("dm", ChannelKind::Dm)] {
+            store
+                .insert_channel(&Channel {
+                    id: id.into(),
+                    kind,
+                    section_id: None,
+                    slug: String::new(),
+                    name: id.into(),
+                    topic: String::new(),
+                    position: 0.0,
+                    created_at: 1,
+                    member_ids: vec!["one".into()],
+                    task_id: None,
+                    last_message_at: 0,
+                })
+                .unwrap();
+        }
+
+        let mut task_audience = store.channel_audience("task").unwrap();
+        task_audience.sort();
+        assert_eq!(task_audience, ["one", "two"]);
+        assert_eq!(store.channel_audience("dm").unwrap(), ["one"]);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn one_task_has_one_active_writer() {
         let (store, path) = store();
         let mut first = run("r1", "task");
@@ -2271,9 +3132,7 @@ mod tests {
                 })),
                 created_at: index,
             };
-            store
-                .reserve_direct_control(&mut event, "target")
-                .unwrap();
+            store.reserve_direct_control(&mut event, "target").unwrap();
             assert_eq!(event.seq, index + 1);
         }
         let mut extra = RunEvent {
@@ -2316,13 +3175,16 @@ mod tests {
             file_name: "screen.png".into(),
             mime: "image/png".into(),
             size: 1,
+            caption: String::new(),
             url: "/api/files/file".into(),
             message_id: None,
             task_id: None,
             run_id: None,
             created_at: 1,
         };
-        store.insert_attachment(&attachment, "/tmp/screen.png").unwrap();
+        store
+            .insert_attachment(&attachment, "/tmp/screen.png")
+            .unwrap();
         store
             .insert_message(&Message {
                 id: "message".into(),
@@ -2346,6 +3208,12 @@ mod tests {
         let attached = store.attachment("file").unwrap().unwrap().0;
         assert_eq!(attached.message_id.as_deref(), Some("message"));
         assert_eq!(attached.task_id.as_deref(), Some("task"));
+        assert!(store.remove_task_attachment("file", "task").unwrap());
+        let unpinned = store.attachment("file").unwrap().unwrap().0;
+        assert_eq!(unpinned.message_id.as_deref(), Some("message"));
+        assert_eq!(unpinned.task_id, None);
+        assert!(store.task_attachments("task").unwrap().is_empty());
+        assert!(!store.remove_task_attachment("file", "task").unwrap());
         let mut duplicate = store.message("message").unwrap().unwrap();
         duplicate.id = "other-message".into();
         assert!(store.insert_message(&duplicate).is_err());

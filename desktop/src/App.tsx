@@ -7,7 +7,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
-import { store, useApi, useApp, useAppSelector } from "./lib/store";
+import { store, useApi, useApp, useAppSelector, useWorkspaces } from "./lib/store";
 import {
   boot,
   canHostRelay,
@@ -59,7 +59,11 @@ import {
   Spinner,
   TasksIcon,
 } from "./components/icons";
-import type { Inspector as InspectorState, View } from "./components/common";
+import type {
+  Inspector as InspectorState,
+  ToastAction,
+  View,
+} from "./components/common";
 import type { Channel, Id, SearchResults } from "@client/types";
 
 export default function App() {
@@ -73,11 +77,20 @@ export default function App() {
     void boot().then(() => setLoading(false));
   }, []);
 
-  if (loading) return <div className="empty">Starting Patchwork…</div>;
+  const content = loading ? (
+    <div className="empty">Starting Patchwork…</div>
+  ) : !settings?.workspaces.length ? (
+    <Onboarding />
+  ) : (
+    <Workspace onSignOut={() => void signOutOfEverything()} />
+  );
 
-  if (!settings?.workspaces.length) return <Onboarding />;
-
-  return <Workspace onSignOut={() => void signOutOfEverything()} />;
+  return (
+    <>
+      <UnreadBadge />
+      {content}
+    </>
+  );
 }
 
 /// Two ways in, and the first one needs no server: this machine can *be* the
@@ -224,7 +237,11 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }));
   const [view, setView] = useState<View>({ kind: "inbox" });
   const [inspector, setInspector] = useState<InspectorState>(null);
-  const [toast, setToast] = useState<string>();
+  const [toast, setToast] = useState<{
+    message: string;
+    action?: ToastAction;
+  }>();
+  const toastTimer = useRef<number>(undefined);
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [creating, setCreating] = useState<{
@@ -253,10 +270,21 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
 
   useRememberedView(view, setView, setInspector);
 
-  const showToast = useCallback((message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(undefined), 2600);
+  const dismissToast = useCallback(() => {
+    window.clearTimeout(toastTimer.current);
+    setToast(undefined);
   }, []);
+
+  const showToast = useCallback((message: string, action?: ToastAction) => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ message, action });
+    toastTimer.current = window.setTimeout(
+      () => setToast(undefined),
+      action ? 5000 : 2600,
+    );
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const create = useCallback((what: Creatable, sectionId?: Id) => {
     setCreating({ what, sectionId });
@@ -354,7 +382,26 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
           onClose={() => setCreating(null)}
         />
       )}
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="toast">
+          <span role="status" aria-live="polite">
+            {toast.message}
+          </span>
+          {toast.action && (
+            <button
+              className="toast-action"
+              onClick={() => {
+                const action = toast.action;
+                if (!action) return;
+                dismissToast();
+                action.onClick();
+              }}
+            >
+              {toast.action.label}
+            </button>
+          )}
+        </div>
+      )}
     </NavigationContext.Provider>
   );
 }
@@ -396,6 +443,34 @@ function useRememberedView(
       (workspaceId && remembered.current[workspaceId]) || { kind: "inbox" },
     );
   }, [workspaceId, view, setView, setInspector]);
+}
+
+/// The number on the app icon: everything waiting for you, in every workspace
+/// you have joined, not just the one on screen.
+///
+/// Its own component and drawing nothing, for the same reason as `MarkAsSeen`:
+/// it watches counts that move on every event, and the root of the tree must
+/// not.
+function UnreadBadge() {
+  const total = useWorkspaces().reduce(
+    (sum, workspace) => sum + workspace.unread,
+    0,
+  );
+
+  useEffect(() => {
+    if (!inTauri) return;
+    let cancelled = false;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => {
+        if (!cancelled) return getCurrentWindow().setBadgeCount(total || undefined);
+      })
+      .catch((error) => console.warn("Could not update the app badge", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [total]);
+
+  return null;
 }
 
 /// Opening a conversation is what "I have seen this" means.
@@ -712,6 +787,9 @@ function NewChannelModal({
         topic: topic.trim() || undefined,
         section_id: section || undefined,
       });
+      // The realtime event can arrive after navigation. Reconcile the HTTP
+      // result immediately so the sidebar and channel view render together.
+      store.upsertChannel(channel);
       onClose();
       go({ kind: "channel", id: channel.id });
     } catch (err) {

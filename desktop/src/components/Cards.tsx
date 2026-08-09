@@ -4,7 +4,7 @@ import type { EChartsType } from "echarts";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
-import { useFileUrl } from "../lib/file";
+import { useFileUrl, usePreviewUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
 import {
   ExternalIcon,
@@ -164,12 +164,18 @@ function QuestionCard({ questionId }: { questionId: string }) {
   const [selection, setSelection] = useState<Record<string, string[]>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [sending, setSending] = useState(false);
+  const [failed, setFailed] = useState("");
 
   useEffect(() => {
-    void store.loadQuestion(questionId);
+    // The card event can arrive just before its question transaction settles.
+    void store.loadQuestion(questionId).catch(() => {});
   }, [questionId]);
 
   if (!question) return null;
+  // Only an open question is something to answer. A cancelled one is over:
+  // the run moved on without you, and offering a box that cannot post is
+  // worse than saying so.
+  const open = question.status === "open";
   const answered = question.status === "answered";
 
   const toggle = (itemId: string, label: string, multi: boolean) => {
@@ -188,6 +194,7 @@ function QuestionCard({ questionId }: { questionId: string }) {
 
   const submit = async () => {
     setSending(true);
+    setFailed("");
     try {
       const answers: QuestionAnswer[] = question.items.map((item) => ({
         item_id: item.id,
@@ -195,6 +202,10 @@ function QuestionCard({ questionId }: { questionId: string }) {
         note: notes[item.id] ?? "",
       }));
       await api.answerQuestion(question.id, answers);
+    } catch (error) {
+      // A refusal often means this copy is stale, so show it and refresh.
+      setFailed(String((error as Error).message ?? error));
+      void store.loadQuestion(question.id, true).catch(() => {});
     } finally {
       setSending(false);
     }
@@ -209,7 +220,7 @@ function QuestionCard({ questionId }: { questionId: string }) {
     <div className="card">
       <div className="card-head">
         <QuestionIcon size={14} />
-        <span>Needs your answer</span>
+        <span>{open || answered ? "Needs your answer" : "No longer needed"}</span>
       </div>
       {question.items.map((item) => (
         <div key={item.id} style={{ marginTop: 8 }}>
@@ -227,7 +238,7 @@ function QuestionCard({ questionId }: { questionId: string }) {
               <button
                 key={option.label}
                 className={`question-option${chosen ? " selected" : ""}`}
-                disabled={answered}
+                disabled={!open}
                 onClick={() => toggle(item.id, option.label, item.multi_select)}
               >
                 <div>
@@ -239,7 +250,7 @@ function QuestionCard({ questionId }: { questionId: string }) {
               </button>
             );
           })}
-          {item.allow_free_text && !answered && (
+          {item.allow_free_text && open && (
             <input
               className="field"
               {...proseText}
@@ -261,7 +272,13 @@ function QuestionCard({ questionId }: { questionId: string }) {
         </div>
       ))}
 
-      {!answered && (
+      {failed && (
+        <div className="card-sub" style={{ color: "var(--danger)" }}>
+          {failed}
+        </div>
+      )}
+
+      {open && (
         <div className="card-row">
           <button
             className="button primary"
@@ -276,6 +293,11 @@ function QuestionCard({ questionId }: { questionId: string }) {
       {answered && (
         <div className="card-row">
           <Chip tone="positive">Answered</Chip>
+        </div>
+      )}
+      {!open && !answered && (
+        <div className="card-row">
+          <Chip>Cancelled</Chip>
         </div>
       )}
     </div>
@@ -406,10 +428,8 @@ function PreviewCard({ previewId }: { previewId: string }) {
     void store.loadPreview(previewId);
   }, [previewId]);
 
+  const url = usePreviewUrl(previewId, preview?.status === "live");
   if (!preview) return null;
-  const url = preview.local_only
-    ? `http://127.0.0.1:${preview.port}`
-    : preview.url;
 
   return (
     <div className="card">
@@ -422,11 +442,10 @@ function PreviewCard({ previewId }: { previewId: string }) {
         <Chip tone={preview.status === "live" ? "positive" : ""}>
           {statusLabel(preview.status as never)}
         </Chip>
-        {preview.local_only && <Chip>on this machine</Chip>}
         <span className="spacer" />
         {preview.status === "live" && (
           <>
-            <button className="button" onClick={() => openExternal(url)}>
+            <button className="button" disabled={!url} onClick={() => openExternal(url)}>
               Open
             </button>
             <button

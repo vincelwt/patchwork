@@ -43,7 +43,9 @@ extern "C" fn heard(kind: i32, text: *const c_char) {
     let text = if text.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned()
     };
     let event = match kind {
         0 => Heard::Volatile { text },

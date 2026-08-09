@@ -1,13 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the Patchwork window is allowed to ask the system for: move itself when you drag its top edge, pick a folder, and open a link in the real browser. Without this every plugin call is denied and the thing that calls it does nothing at all — silently, which is how a window with no title bar ends up unmovable.",
+  "description": "What the Patchwork window is allowed to ask the system for: move itself when you drag its top edge, put the unread count on its icon, pick a folder, and open a link in the real browser. Without this every plugin call is denied and the thing that calls it does nothing at all, silently, which is how a window with no title bar ends up unmovable.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-set-badge-count",
     "dialog:allow-open",
     "opener:allow-open-url",
+    "opener:allow-default-urls",
     "process:allow-restart",
     "updater:default"
   ]

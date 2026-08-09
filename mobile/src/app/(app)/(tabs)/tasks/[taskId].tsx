@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import { Conversation } from "@/components/Message";
+import { PullRequestLink } from "@/components/pull-request-link";
 import { TaskEditor } from "@/components/TaskEditor";
-import { Avatar, Badge, Button, Card, ErrorNotice, PageHeader, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "@/components/ui";
 import { taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
+import { isTerminalTaskStatus } from "@client/types";
 
 export default function TaskScreen() {
   const { taskId } = useLocalSearchParams<{ taskId: string }>();
@@ -27,7 +29,7 @@ export default function TaskScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  if (!task || !data) return <View style={styles.fill}><PageHeader title="Task" back /></View>;
+  if (!task || !data) return <View style={styles.fill}><Stack.Screen options={{ title: "Task" }} /></View>;
 
   const start = async (agentId?: string) => {
     setBusy(true);
@@ -43,21 +45,41 @@ export default function TaskScreen() {
     }
   };
 
+  const approve = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const run = await store.mutate((api) => api.approveTask(task.id));
+      router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const active = activeRun && !["succeeded", "failed", "cancelled"].includes(activeRun.status);
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title={task.key} subtitle={task.title} back action={<Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />} />
+      <Stack.Screen
+        options={{
+          title: task.key,
+          headerBackTitle: "Tasks",
+          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
+        }}
+      />
       <Card style={styles.summary}>
         <View style={styles.titleRow}>
           <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
-          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : "accent"}>{taskStatusLabel(task.status)}</Badge>
+          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : task.status === "canceled" ? "neutral" : "accent"}>{taskStatusLabel(task.status)}</Badge>
         </View>
         {task.outcome ? <Text style={[styles.outcome, { color: theme.muted }]} numberOfLines={5}>{task.outcome}</Text> : null}
         <View style={styles.meta}>
           {owner ? <View style={styles.person}><Avatar member={owner} size={25} /><Text style={{ color: theme.text }}>{owner.display_name}</Text></View> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
           {project ? <Badge>{project.name}</Badge> : null}
-          {task.due_at ? <Badge tone={task.due_at < Date.now() && task.status !== "done" ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
+          {task.due_at ? <Badge tone={task.due_at < Date.now() && !isTerminalTaskStatus(task.status) ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
+          <PullRequestLink task={task} />
         </View>
         <View style={styles.actions}>
           {active ? (
@@ -65,7 +87,26 @@ export default function TaskScreen() {
               <Button label="Run details" compact tone="secondary" onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: activeRun.id } })} />
               <Button label="Stop" compact tone="danger" busy={busy} onPress={() => void store.mutate((api) => api.cancelRun(activeRun.id))} />
             </>
-          ) : task.status !== "done" ? (
+          ) : task.status === "review" ? (
+            <>
+              <Button
+                label={task.review_action ?? "Complete"}
+                compact
+                busy={busy}
+                onPress={() =>
+                  task.review_action
+                    ? void approve()
+                    : void store.mutate((api) => api.updateTask(task.id, { status: "done" }))
+                }
+              />
+              <Button
+                label="Back to planning"
+                compact
+                tone="secondary"
+                onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))}
+              />
+            </>
+          ) : !isTerminalTaskStatus(task.status) ? (
             <Button
               label={activeRun?.status === "failed" ? "Retry" : "Start"}
               compact
@@ -75,7 +116,7 @@ export default function TaskScreen() {
           ) : (
             <Button label="Reopen" compact tone="secondary" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))} />
           )}
-          {task.status !== "done" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
+          {!isTerminalTaskStatus(task.status) && task.status !== "review" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
         </View>
         <ErrorNotice message={error} />
       </Card>

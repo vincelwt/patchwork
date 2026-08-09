@@ -45,6 +45,8 @@ enum BrokerFrame {
     SocketData {
         id: String,
         data: String,
+        #[serde(default)]
+        binary: bool,
     },
     SocketClose {
         id: String,
@@ -73,6 +75,7 @@ enum HostFrame {
     SocketData {
         id: String,
         data: String,
+        binary: bool,
     },
     SocketClose {
         id: String,
@@ -85,7 +88,7 @@ enum HostFrame {
 
 #[derive(Debug)]
 enum SocketCommand {
-    Data(String),
+    Data { data: String, binary: bool },
     Close(Option<u16>, Option<String>),
 }
 
@@ -226,9 +229,9 @@ async fn handle_frame(
                 open_socket(id, local_url, path, headers, out, sockets).await;
             });
         }
-        BrokerFrame::SocketData { id, data } => {
+        BrokerFrame::SocketData { id, data, binary } => {
             if let Some(socket) = sockets.lock().await.get(&id).cloned() {
-                let _ = socket.send(SocketCommand::Data(data));
+                let _ = socket.send(SocketCommand::Data { data, binary });
             }
         }
         BrokerFrame::SocketClose { id, code, reason } => {
@@ -248,6 +251,9 @@ async fn proxy_request(
     body: &str,
 ) -> Result<(u16, Vec<(String, String)>, String)> {
     let url = local_target(local_url, path)?;
+    if body.len() > (MAX_BODY_BYTES * 4 / 3) + 4 {
+        bail!("request exceeds 20 MB managed relay limit");
+    }
     let body = base64::engine::general_purpose::STANDARD
         .decode(body)
         .context("invalid request body")?;
@@ -273,9 +279,20 @@ async fn proxy_request(
                 .map(|value| (name.to_string(), value.to_string()))
         })
         .collect();
-    let body = response.bytes().await?;
-    if body.len() > MAX_BODY_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_BODY_BYTES as u64)
+    {
         bail!("response exceeds 20 MB managed relay limit");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            bail!("response exceeds 20 MB managed relay limit");
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok((
         status,
@@ -338,7 +355,13 @@ async fn open_socket(
         loop {
             tokio::select! {
                 command = rx.recv() => match command {
-                    Some(SocketCommand::Data(data)) => writer.send(Message::Text(data.into())).await?,
+                    Some(SocketCommand::Data { data, binary: false }) => writer.send(Message::Text(data.into())).await?,
+                    Some(SocketCommand::Data { data, binary: true }) => {
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .context("invalid binary WebSocket frame")?;
+                        writer.send(Message::Binary(data.into())).await?
+                    }
                     Some(SocketCommand::Close(code, reason)) => {
                         let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
                             code: code.unwrap_or(1000).into(),
@@ -351,7 +374,18 @@ async fn open_socket(
                 },
                 message = reader.next() => match message {
                     Some(Ok(Message::Text(data))) => {
-                        let _ = out.send(HostFrame::SocketData { id: id.clone(), data: data.to_string() });
+                        let _ = out.send(HostFrame::SocketData {
+                            id: id.clone(),
+                            data: data.to_string(),
+                            binary: false,
+                        });
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        let _ = out.send(HostFrame::SocketData {
+                            id: id.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(data),
+                            binary: true,
+                        });
                     }
                     Some(Ok(Message::Close(frame))) => {
                         close_reported = true;

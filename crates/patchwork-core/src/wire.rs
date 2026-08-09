@@ -152,6 +152,10 @@ pub struct CreateTask {
     pub title: String,
     #[serde(default)]
     pub outcome: String,
+    /// Immutable source context for the task discussion. Defaults to the
+    /// outcome, or the title when the outcome is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +181,10 @@ pub struct CreateTask {
     /// this key is returned instead of a second one being created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once_key: Option<String>,
+    /// Confirm creation after the relay found a similar open or recent task.
+    /// Exact `once_key` matches are still reused.
+    #[serde(default)]
+    pub allow_similar: bool,
     /// Files uploaded before the task exists. They become evidence on the
     /// immutable original request.
     #[serde(default)]
@@ -202,6 +210,10 @@ pub struct UpdateTask {
     pub host_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// Exact label and instruction offered to a person in the review state.
+    /// An empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_action: Option<String>,
     /// Epoch millis, or 0 to clear the date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<i64>,
@@ -364,6 +376,26 @@ pub struct SearchHit {
     pub channel_name: String,
     pub author_name: String,
     pub snippet: String,
+}
+
+// --- files ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUpload {
+    pub file_name: String,
+    #[serde(default)]
+    pub mime: String,
+    pub size: i64,
+    #[serde(default)]
+    pub caption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSession {
+    pub id: Id,
+    pub chunk_size: usize,
 }
 
 // --- previews ---------------------------------------------------------------

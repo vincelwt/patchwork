@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { SymbolView, type SymbolViewProps } from "expo-symbols";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -15,6 +16,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { SafeAreaView } from "react-native-safe-area-context";
 
 import type { Member, Presence } from "@client/types";
 import type { ConnectionState } from "@/lib/store";
@@ -23,6 +25,18 @@ import { useTheme, type Palette } from "@/lib/theme";
 export function Screen({ children, style }: { children: ReactNode; style?: ViewStyle }) {
   const theme = useTheme();
   return <View style={[styles.screen, { backgroundColor: theme.bg }, style]}>{children}</View>;
+}
+
+export function Icon({
+  name,
+  color,
+  size = 22,
+}: {
+  name: SymbolViewProps["name"];
+  color: string;
+  size?: number;
+}) {
+  return <SymbolView name={name} size={size} tintColor={color} style={{ width: size, height: size }} />;
 }
 
 export function ScrollScreen({ children }: { children: ReactNode }) {
@@ -52,20 +66,20 @@ export function PageHeader({
   const theme = useTheme();
   const router = useRouter();
   return (
-    <View style={[styles.header, { borderBottomColor: theme.line, backgroundColor: theme.bg }]}>
+    <View style={[styles.header, back && styles.headerCompact, { borderBottomColor: theme.line, backgroundColor: theme.raised }]}>
       {back ? (
         <Pressable
           accessibilityRole="button"
           accessibilityLabel="Go back"
           hitSlop={8}
           onPress={() => router.back()}
-          style={styles.back}
+          style={({ pressed }) => [styles.back, pressed && styles.pressed]}
         >
-          <Text style={[styles.backText, { color: theme.accent }]}>‹</Text>
+          <Icon name={{ ios: "chevron.left", android: "arrow_back", web: "arrow_back" }} color={theme.accent} size={22} />
         </Pressable>
       ) : null}
       <View style={styles.grow}>
-        <Text accessibilityRole="header" numberOfLines={1} style={[styles.title, { color: theme.text }]}>
+        <Text accessibilityRole="header" numberOfLines={1} style={[styles.title, back && styles.titleCompact, { color: theme.text }]}>
           {title}
         </Text>
         {subtitle ? (
@@ -194,7 +208,7 @@ export function ChoiceField({
         <Text numberOfLines={1} style={[styles.choiceText, { color: selected ? theme.text : theme.faint }]}>
           {selected?.label ?? placeholder}
         </Text>
-        <Text style={[styles.chevron, { color: theme.faint }]}>▾</Text>
+        <Icon name={{ ios: "chevron.down", android: "arrow_drop_down", web: "arrow_drop_down" }} color={theme.faint} size={16} />
       </Pressable>
       <Sheet visible={open} title={label ?? "Choose"} onClose={() => setOpen(false)}>
         <ScrollView style={styles.choiceList}>
@@ -218,7 +232,9 @@ export function ChoiceField({
                   <Text style={[styles.rowSubtitle, { color: theme.muted }]}>{option.description}</Text>
                 ) : null}
               </View>
-              {option.value === value ? <Text style={{ color: theme.accent }}>✓</Text> : null}
+              {option.value === value ? (
+                <Icon name={{ ios: "checkmark", android: "check", web: "check" }} color={theme.accent} size={18} />
+              ) : null}
             </Pressable>
           ))}
         </ScrollView>
@@ -265,22 +281,30 @@ export function Sheet({
 }) {
   const theme = useTheme();
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        style={[styles.modal, { backgroundColor: theme.backdrop }]}
-      >
-        <Pressable style={styles.modalDismiss} onPress={onClose} accessibilityLabel="Close" />
-        <View style={[styles.sheet, { backgroundColor: theme.raised, borderColor: theme.line }]}>
-          <View style={[styles.sheetHead, { borderBottomColor: theme.line }]}>
-            <Text accessibilityRole="header" style={[styles.sheetTitle, { color: theme.text }]}>
-              {title}
-            </Text>
-            <Button label="Done" tone="quiet" compact onPress={onClose} />
+    <Modal
+      visible={visible}
+      animationType="slide"
+      presentationStyle={Platform.OS === "ios" ? "formSheet" : "fullScreen"}
+      allowSwipeDismissal
+      onDismiss={onClose}
+      onRequestClose={onClose}
+    >
+      <SafeAreaView style={[styles.modalSafe, { backgroundColor: theme.bg }]} edges={["top", "bottom"]}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={styles.modal}
+        >
+          <View style={[styles.sheet, { backgroundColor: theme.bg }]}>
+            <View style={[styles.sheetHead, { backgroundColor: theme.raised, borderBottomColor: theme.line }]}>
+              <Text accessibilityRole="header" style={[styles.sheetTitle, { color: theme.text }]}>
+                {title}
+              </Text>
+              <Button label="Done" tone="quiet" compact onPress={onClose} />
+            </View>
+            {children}
           </View>
-          {children}
-        </View>
-      </KeyboardAvoidingView>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
     </Modal>
   );
 }
@@ -416,18 +440,19 @@ const styles = StyleSheet.create({
   scroll: { padding: 16, gap: 14, paddingBottom: 36 },
   grow: { flex: 1 },
   header: {
-    minHeight: 58,
-    paddingHorizontal: 16,
-    paddingVertical: 9,
+    minHeight: 72,
+    paddingHorizontal: 18,
+    paddingVertical: 11,
     borderBottomWidth: StyleSheet.hairlineWidth,
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
   },
-  back: { minWidth: 34, minHeight: 42, justifyContent: "center" },
-  backText: { fontSize: 38, lineHeight: 38, fontWeight: "300" },
-  title: { fontSize: 22, fontWeight: "700", letterSpacing: -0.3 },
-  subtitle: { fontSize: 12, marginTop: 1 },
+  headerCompact: { minHeight: 58, paddingVertical: 8, paddingLeft: 10 },
+  back: { width: 38, minHeight: 42, alignItems: "center", justifyContent: "center" },
+  title: { fontSize: 28, fontWeight: "700", letterSpacing: -0.7 },
+  titleCompact: { fontSize: 20, letterSpacing: -0.25 },
+  subtitle: { fontSize: 13, marginTop: 1 },
   button: {
     minHeight: 44,
     paddingHorizontal: 16,
@@ -464,7 +489,6 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   choiceText: { flex: 1, fontSize: 16 },
-  chevron: { fontSize: 12 },
   choiceList: { maxHeight: 500 },
   choiceRow: {
     minHeight: 52,
@@ -478,16 +502,9 @@ const styles = StyleSheet.create({
   rowTitle: { fontSize: 15, fontWeight: "600" },
   rowSubtitle: { fontSize: 13, lineHeight: 18, marginTop: 2 },
   toggleRow: { flexDirection: "row", alignItems: "center", gap: 12, minHeight: 54 },
-  modal: { flex: 1, justifyContent: "flex-end" },
-  modalDismiss: { flex: 1 },
-  sheet: {
-    maxHeight: "86%",
-    minHeight: 160,
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
-    borderWidth: StyleSheet.hairlineWidth,
-    overflow: "hidden",
-  },
+  modalSafe: { flex: 1 },
+  modal: { flex: 1 },
+  sheet: { flex: 1 },
   sheetHead: {
     minHeight: 54,
     flexDirection: "row",
