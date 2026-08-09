@@ -14,6 +14,7 @@ import {
   hostRelayHere,
   join,
   signOutOfEverything,
+  switchTo,
   useSettings,
 } from "./lib/session";
 import { markSeen } from "./lib/unread";
@@ -1092,8 +1093,10 @@ function CommandPalette({
 }) {
   const { go } = useNavigation();
   const app = useApp();
+  const workspaces = useWorkspaces();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const list = useRef<HTMLDivElement>(null);
   const needle = query.trim().toLowerCase();
 
   const open = useCallback(
@@ -1107,6 +1110,26 @@ function CommandPalette({
   const entries = useMemo<Entry[]>(() => {
     const out: Entry[] = [];
     const matches = (text: string) => !needle || text.toLowerCase().includes(needle);
+
+    for (const workspace of workspaces) {
+      if (!matches(workspace.name)) continue;
+      out.push({
+        key: `workspace-${workspace.id}`,
+        group: "Workspaces",
+        label: workspace.name,
+        hint: workspace.active
+          ? "Current workspace"
+          : workspace.unread
+            ? `${workspace.unread} waiting`
+            : workspace.live
+              ? "Connected"
+              : "Offline",
+        run: () => {
+          onClose();
+          if (!workspace.active) void switchTo(workspace.id);
+        },
+      });
+    }
 
     for (const channel of app.channels) {
       if (channel.kind === "task") continue;
@@ -1169,7 +1192,7 @@ function CommandPalette({
     }
 
     return out.slice(0, 40);
-  }, [app, needle, query, shortcuts, open, onClose]);
+  }, [app, needle, query, shortcuts, workspaces, open, onClose]);
 
   // Arrow keys must walk the list the way it is *drawn*. Grouping reorders
   // everything — two channels either side of a task end up adjacent — so the
@@ -1191,6 +1214,11 @@ function CommandPalette({
     setActive((at) => (at >= ordered.length ? Math.max(0, ordered.length - 1) : at));
   }, [ordered.length]);
   useEffect(() => setActive(0), [needle]);
+  useEffect(() => {
+    list.current
+      ?.querySelector<HTMLElement>(`[data-palette-index="${active}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [active]);
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -1211,13 +1239,13 @@ function CommandPalette({
             onKeyDown={(event) => {
               if (event.key === "ArrowDown") {
                 event.preventDefault();
-                setActive((index) => Math.min(index + 1, entries.length - 1));
+                setActive((index) => Math.min(index + 1, ordered.length - 1));
               } else if (event.key === "ArrowUp") {
                 event.preventDefault();
                 setActive((index) => Math.max(index - 1, 0));
               } else if (event.key === "Enter") {
                 event.preventDefault();
-                entries[active]?.run();
+                ordered[active]?.run();
               } else if (event.key === "Escape") {
                 onClose();
               }
@@ -1225,7 +1253,7 @@ function CommandPalette({
           />
           <KeyHint keys="Esc" />
         </div>
-        <div className="palette-list">
+        <div ref={list} className="palette-list">
           {entries.length === 0 && (
             <div className="palette-empty">Nothing matches that.</div>
           )}
@@ -1237,6 +1265,7 @@ function CommandPalette({
                 return (
                   <button
                     key={entry.key}
+                    data-palette-index={index}
                     className={`palette-item${index === active ? " active" : ""}`}
                     onMouseEnter={() => setActive(index)}
                     onClick={entry.run}
