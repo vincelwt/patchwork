@@ -2346,9 +2346,20 @@ details[open] > summary::before {
   margin-top: 4px;
   color: var(--bg);
 }
-.md-check.on {
+.md-check.checked {
   background: var(--positive);
   border-color: var(--positive);
+}
+.md-check.progress {
+  background: var(--caution);
+  border-color: var(--caution);
+}
+.md-check.progress::after {
+  content: "";
+  width: 7px;
+  height: 1.5px;
+  border-radius: 999px;
+  background: var(--bg);
 }
 .md li.task .md-item {
   min-width: 0;
