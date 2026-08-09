@@ -8,7 +8,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types ../client/mobile-store-reducer.test.ts src/lib/format.test.ts",
+    "test": "node --test --experimental-strip-types ../client/mobile-store-reducer.test.ts ../client/scroll.test.ts src/lib/format.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {

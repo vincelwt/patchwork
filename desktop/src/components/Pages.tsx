@@ -48,6 +48,7 @@ import {
 import { RuntimeIcon } from "./RuntimeIcon";
 import { PairDeviceModal } from "./PairDeviceModal";
 import { describeCron, PRESETS, presetFor, WEEKDAYS } from "../lib/schedule";
+import { TASK_STATUSES } from "@client/types";
 import type {
   AgentProfile,
   Automation,
@@ -1755,7 +1756,7 @@ export function AutomationModal({
           label="Status"
           value={status}
           onChange={(value) => setStatus(value as typeof status)}
-          options={["planned", "running", "blocked", "review", "done"].map((value) => ({
+          options={TASK_STATUSES.map((value) => ({
             value,
             label: statusLabel(value as never),
           }))}

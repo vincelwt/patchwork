@@ -288,7 +288,8 @@ patchwork runs
 patchwork tell MER-41 "The API field is now display_name"
 patchwork ask --question "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
-patchwork task update MER-41 --status review
+patchwork task update MER-41 --status review \
+  --approval "Approve and merge PR"
 patchwork pr https://github.com/acme/app/pull/218
 patchwork chart weekly-actives.json --caption "Active studios, last 8 weeks"
 patchwork preview --port 5173

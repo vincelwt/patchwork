@@ -223,8 +223,7 @@ mod tests {
 
     fn written(env: &[(String, String)]) -> serde_json::Value {
         let home = std::path::Path::new(&env[0].1);
-        serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
-            .unwrap()
+        serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap()).unwrap()
     }
 
     /// One test, not two: both write the same file, and a second thread

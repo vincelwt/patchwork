@@ -71,7 +71,10 @@ impl Caller {
 impl FromRequestParts<Shared> for Caller {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &Shared) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Shared,
+    ) -> Result<Self, Self::Rejection> {
         let token = bearer_token(parts).ok_or_else(|| ApiError::unauthorized("missing token"))?;
         authenticate(state, &token).ok_or_else(|| ApiError::unauthorized("invalid token"))
     }

@@ -114,7 +114,8 @@ patchwork task list --status running
 patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
-patchwork task update PW-14 --status review --evidence test-results.txt
+patchwork task update PW-14 --status review --evidence test-results.txt \
+  --approval "Approve and deploy app"
 patchwork task update PW-14 --owner @vince --due 2026-08-14
 patchwork task update PW-14 --pr https://github.com/acme/app/pull/42
 ```
@@ -126,9 +127,15 @@ original request remains in its conversation.
 
 Review means there is something concrete to inspect. An agent may move a task
 to review only after attaching a file from this run, exposing a preview, or
-linking a pull request. Use `--evidence path` to attach a result while updating
-the task. If the work has not started, leave it planned. If it cannot continue,
-mark it blocked. Never move a plan or an unverified claim to review.
+linking a pull request. A written answer or recommendation is itself reviewable
+evidence when that is what the original task asked for. Use `--evidence path`
+to attach a file result while updating the task. Use `--approval "Approve and merge PR"` when approval should resume
+you to perform a specific next action. The text is the primary button the
+person sees; clicking it starts a continuation with that approval recorded.
+They can always send the task back to planning instead. If the work has not
+started, leave it planned. If it cannot continue, mark it blocked. Never move a
+plan or an unverified claim to review, and never mark your own task done: Done
+is the requester's confirmation after review.
 
 ### A task is how you ask a person for something
 
@@ -137,10 +144,16 @@ repeated until they notice. A message scrolls away and reads as chatter; a
 task has an owner, a status, a place on the board and an Inbox entry, and it
 is still there tomorrow.
 
-Use `--once <key>` whenever the thing you are reporting can recur. The key is
-your own short name for the condition. Creating it again with the same key
-returns the open task instead of making a second one, so a sweep that runs
-every two hours leaves one thing on the board rather than twelve.
+Before creating a task for an incident, blocker, alert, or other recurring
+condition, search for its stable identifiers (service, endpoint, error code,
+provider, issue or PR), not only the title you plan to use. Reuse an open task
+when it describes the same condition and add the new findings to its discussion.
+
+Use `--once <key>` for every task that can recur. Derive a stable, lowercase
+key from the condition, such as `posthog:image-proxy:403`; do not derive it from
+the wording of the report. Creating it again with the same key atomically
+returns the open task instead of making a second one, so simultaneous deliveries
+and a sweep that runs every two hours still leave one thing on the board.
 
 ```bash
 # Blocked on something only a person can provide.
@@ -158,6 +171,11 @@ patchwork task create --once auth-approach --owner @vince \
 patchwork task create --title "Plan the checkout rewrite" \
   --outcome "A sequence of reviewable steps, each shippable on its own"
 ```
+
+The relay warns an agent when a differently worded task resembles an open or
+recent task. Inspect the suggested task and continue it when it is the same
+incident. Use `--allow-similar` only after confirming that the new task is
+genuinely distinct; similarity never merges tasks automatically.
 
 Then say it once in chat, or say nothing at all, and move on. Do not repeat
 the blocker every run: the task is the record, and its discussion is where a

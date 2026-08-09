@@ -71,7 +71,14 @@ async fn forward(
         let host_id = preview.host_id;
         let preview_id = preview.id;
         let response = websocket.on_upgrade(move |socket| {
-            bridge_socket(socket_state, host_id, preview_id, target_path, headers, socket)
+            bridge_socket(
+                socket_state,
+                host_id,
+                preview_id,
+                target_path,
+                headers,
+                socket,
+            )
         });
         return response.into_response();
     }
@@ -81,12 +88,22 @@ async fn forward(
     let headers = proxy_headers(request.headers());
     let body = match to_bytes(request.into_body(), MAX_BODY).await {
         Ok(body) => base64::engine::general_purpose::STANDARD.encode(body),
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "preview request is too large").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "preview request is too large",
+            )
+                .into_response()
+        }
     };
 
     let request_id = new_id();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    state.preview_waiters.write().await.insert(request_id.clone(), tx);
+    state
+        .preview_waiters
+        .write()
+        .await
+        .insert(request_id.clone(), tx);
     if !state
         .send_to_host(
             &preview.host_id,
@@ -117,7 +134,13 @@ async fn forward(
     }
     let body = match base64::engine::general_purpose::STANDARD.decode(reply.body) {
         Ok(body) if body.len() <= MAX_BODY => body,
-        _ => return (StatusCode::BAD_GATEWAY, "preview returned an invalid response").into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "preview returned an invalid response",
+            )
+                .into_response()
+        }
     };
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = Response::new(Body::from(body));
@@ -141,11 +164,17 @@ async fn forward(
         }
     }
     if from_query {
-        let secure = if state.public_url.starts_with("https://") { "; Secure" } else { "" };
+        let secure = if state.public_url.starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        };
         if let Ok(cookie) = HeaderValue::from_str(&format!(
             "patchwork_preview={grant}; HttpOnly; SameSite=Lax; Path=/; Max-Age=7200{secure}"
         )) {
-            response.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
         }
     }
     response
@@ -161,7 +190,11 @@ async fn bridge_socket(
 ) {
     let socket_id = new_id();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    state.preview_sockets.write().await.insert(socket_id.clone(), tx);
+    state
+        .preview_sockets
+        .write()
+        .await
+        .insert(socket_id.clone(), tx);
     if !state
         .send_to_host(
             &host_id,
@@ -250,21 +283,22 @@ fn websocket_protocol(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').map(str::trim).find(|value| !value.is_empty()))
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+        })
         .map(str::to_string)
 }
 
 fn preview_grant(request: &Request) -> Option<(String, bool)> {
-    if let Some(grant) = request
-        .uri()
-        .query()
-        .and_then(|query| {
-            query.split('&').find_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                (key == "grant").then(|| value.to_string())
-            })
+    if let Some(grant) = request.uri().query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "grant").then(|| value.to_string())
         })
-    {
+    }) {
         return Some((grant, true));
     }
     request
@@ -289,7 +323,11 @@ fn target_path(path: &str, query: Option<&str>) -> String {
                 .join("&")
         })
         .filter(|query| !query.is_empty());
-    format!("/{}{}", path, query.map(|query| format!("?{query}")).unwrap_or_default())
+    format!(
+        "/{}{}",
+        path,
+        query.map(|query| format!("?{query}")).unwrap_or_default()
+    )
 }
 
 fn proxy_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -298,7 +336,13 @@ fn proxy_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .filter(|(name, _)| {
             !matches!(
                 name.as_str(),
-                "authorization" | "connection" | "content-length" | "host" | "proxy-authorization" | "transfer-encoding" | "upgrade"
+                "authorization"
+                    | "connection"
+                    | "content-length"
+                    | "host"
+                    | "proxy-authorization"
+                    | "transfer-encoding"
+                    | "upgrade"
             )
         })
         .filter_map(|(name, value)| {
@@ -345,7 +389,15 @@ fn rewrite_response_header(name: &str, value: &str) -> Option<String> {
         reqwest::Url::parse(value)
             .ok()
             .filter(|url| matches!(url.host_str(), Some("127.0.0.1" | "localhost")))
-            .map(|url| format!("{}{}", url.path(), url.query().map(|query| format!("?{query}")).unwrap_or_default()))
+            .map(|url| {
+                format!(
+                    "{}{}",
+                    url.path(),
+                    url.query()
+                        .map(|query| format!("?{query}"))
+                        .unwrap_or_default()
+                )
+            })
             .unwrap_or_else(|| value.to_string()),
     )
 }
@@ -356,7 +408,10 @@ mod tests {
 
     #[test]
     fn grants_do_not_reach_the_preview_application() {
-        assert_eq!(target_path("checkout", Some("grant=secret&q=hat")), "/checkout?q=hat");
+        assert_eq!(
+            target_path("checkout", Some("grant=secret&q=hat")),
+            "/checkout?q=hat"
+        );
     }
 
     #[test]

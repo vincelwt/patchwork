@@ -59,7 +59,11 @@ import {
   Spinner,
   TasksIcon,
 } from "./components/icons";
-import type { Inspector as InspectorState, View } from "./components/common";
+import type {
+  Inspector as InspectorState,
+  ToastAction,
+  View,
+} from "./components/common";
 import type { Channel, Id, SearchResults } from "@client/types";
 
 export default function App() {
@@ -233,7 +237,11 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }));
   const [view, setView] = useState<View>({ kind: "inbox" });
   const [inspector, setInspector] = useState<InspectorState>(null);
-  const [toast, setToast] = useState<string>();
+  const [toast, setToast] = useState<{
+    message: string;
+    action?: ToastAction;
+  }>();
+  const toastTimer = useRef<number>(undefined);
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [creating, setCreating] = useState<{
@@ -262,10 +270,21 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
 
   useRememberedView(view, setView, setInspector);
 
-  const showToast = useCallback((message: string) => {
-    setToast(message);
-    window.setTimeout(() => setToast(undefined), 2600);
+  const dismissToast = useCallback(() => {
+    window.clearTimeout(toastTimer.current);
+    setToast(undefined);
   }, []);
+
+  const showToast = useCallback((message: string, action?: ToastAction) => {
+    window.clearTimeout(toastTimer.current);
+    setToast({ message, action });
+    toastTimer.current = window.setTimeout(
+      () => setToast(undefined),
+      action ? 5000 : 2600,
+    );
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const create = useCallback((what: Creatable, sectionId?: Id) => {
     setCreating({ what, sectionId });
@@ -363,7 +382,26 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
           onClose={() => setCreating(null)}
         />
       )}
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="toast">
+          <span role="status" aria-live="polite">
+            {toast.message}
+          </span>
+          {toast.action && (
+            <button
+              className="toast-action"
+              onClick={() => {
+                const action = toast.action;
+                if (!action) return;
+                dismissToast();
+                action.onClick();
+              }}
+            >
+              {toast.action.label}
+            </button>
+          )}
+        </div>
+      )}
     </NavigationContext.Provider>
   );
 }

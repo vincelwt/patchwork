@@ -310,6 +310,9 @@ enum TaskCommand {
         /// same key returns the open task instead of making a second one.
         #[arg(long)]
         once: Option<String>,
+        /// Create after reviewing the relay's possible-duplicate warning.
+        #[arg(long)]
+        allow_similar: bool,
         /// Start the owning agent right away.
         #[arg(long)]
         start: bool,
@@ -334,6 +337,9 @@ enum TaskCommand {
         /// File proving the work is ready to review.
         #[arg(long)]
         evidence: Option<String>,
+        /// Exact action a person can approve in review, e.g. "Approve and merge PR".
+        #[arg(long)]
+        approval: Option<String>,
     },
     Delete {
         reference: String,
@@ -691,7 +697,11 @@ async fn agent(client: &Client, command: AgentCommand) -> Result<()> {
                         "@{}{} — {}",
                         agent.handle,
                         if agent.is_admin { " (admin)" } else { "" },
-                        agent.agent.as_ref().map(|p| p.runtime.as_str()).unwrap_or("")
+                        agent
+                            .agent
+                            .as_ref()
+                            .map(|p| p.runtime.as_str())
+                            .unwrap_or("")
                     );
                 }
             });
@@ -769,9 +779,7 @@ async fn agent(client: &Client, command: AgentCommand) -> Result<()> {
         }
         AgentCommand::Delete { reference } => {
             let agent = resolve_agent(client, &reference).await?;
-            let _: Value = client
-                .delete(&format!("/api/members/{}", agent.id))
-                .await?;
+            let _: Value = client.delete(&format!("/api/members/{}", agent.id)).await?;
             client.print(&json!({ "deleted": agent.id }), || {
                 println!("removed @{}", agent.handle)
             });
@@ -801,10 +809,7 @@ async fn invite(client: &Client, command: InviteCommand) -> Result<()> {
         }
         InviteCommand::Create { email, admin } => {
             let created: Invite = client
-                .post(
-                    "/api/invites",
-                    json!({ "email": email, "is_admin": admin }),
-                )
+                .post("/api/invites", json!({ "email": email, "is_admin": admin }))
                 .await?;
             client.print(&created, || {
                 let relay = client.base.split("/w/").next().unwrap_or(&client.base);
@@ -1415,7 +1420,9 @@ async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result
     if preview.status != PreviewStatus::Live {
         bail!("preview did not become live (status: {:?})", preview.status);
     }
-    client.print(&preview, || println!("preview live on port {}", preview.port));
+    client.print(&preview, || {
+        println!("preview live on port {}", preview.port)
+    });
     Ok(())
 }
 
@@ -1472,6 +1479,9 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 if let Some(pr) = &detail.task.pr_url {
                     println!("Pull request: {pr}");
                 }
+                if let Some(action) = &detail.task.review_action {
+                    println!("Approval: {action}");
+                }
                 for run in detail.runs.iter().take(5) {
                     println!("  run [{}] {}", run.status.as_str(), run.headline);
                 }
@@ -1485,6 +1495,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             project,
             due,
             once,
+            allow_similar,
             start,
         } => {
             let owner_id = match owner {
@@ -1502,6 +1513,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "once_key": once,
+                        "allow_similar": allow_similar,
                         "source_channel_id": ctx.channel_id,
                         "start": start,
                     }),
@@ -1519,25 +1531,18 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             due,
             pr,
             evidence,
+            approval,
         } => {
             let owner_id = match owner {
                 Some(handle) => Some(resolve_member(client, &handle).await?),
                 None => None,
             };
             if let Some(path) = evidence {
-                let detail: TaskDetail = client
-                    .get(&format!("/api/tasks/{reference}"))
-                    .await?;
+                let detail: TaskDetail = client.get(&format!("/api/tasks/{reference}")).await?;
                 let mut evidence_ctx = ctx.clone();
                 evidence_ctx.task_id = Some(detail.task.id);
                 evidence_ctx.channel_id = Some(detail.task.discussion_channel_id);
-                upload_attachment(
-                    client,
-                    &evidence_ctx,
-                    &path,
-                    "Review evidence",
-                )
-                .await?;
+                upload_attachment(client, &evidence_ctx, &path, "Review evidence").await?;
             }
             let updated: Task = client
                 .patch(
@@ -1550,6 +1555,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "pr_url": pr,
+                        "review_action": approval,
                     }),
                 )
                 .await?;
@@ -1559,7 +1565,9 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
         }
         TaskCommand::Delete { reference } => {
             let _: Value = client.delete(&format!("/api/tasks/{reference}")).await?;
-            client.print(&json!({ "deleted": reference }), || println!("task deleted"));
+            client.print(&json!({ "deleted": reference }), || {
+                println!("task deleted")
+            });
         }
     }
     Ok(())
@@ -1809,14 +1817,8 @@ mod tests {
 
     #[test]
     fn admin_commands_are_discoverable() {
-        let cli = Cli::try_parse_from([
-            "patchwork",
-            "workspace",
-            "update",
-            "--icon",
-            "🚀",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["patchwork", "workspace", "update", "--icon", "🚀"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Workspace(WorkspaceCommand::Update { icon: Some(_), .. })
