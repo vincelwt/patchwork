@@ -2188,6 +2188,7 @@ pub async fn update_task(
     if let Some(outcome) = input.outcome {
         task.outcome = outcome;
     }
+    let has_explicit_status = input.status.is_some();
     if let Some(status) = input.status {
         task.status = status;
     }
@@ -2228,7 +2229,11 @@ pub async fn update_task(
         task.position = position;
     }
 
-    state.store.update_task(&task)?;
+    if has_explicit_status {
+        state.store.update_task_with_explicit_status(&task)?;
+    } else {
+        state.store.update_task(&task)?;
+    }
     state.emit(Event::TaskUpdated { task: task.clone() });
     if previous.title != task.title || previous.outcome != task.outcome {
         if let Some(channel) = state.store.channel(&task.discussion_channel_id)? {
@@ -2361,10 +2366,13 @@ pub async fn answer_question(
     answers: Vec<QuestionAnswer>,
     by: &str,
 ) -> Result<Question> {
-    let question = state.store.answer_question(question_id, &answers, by)?;
+    let (question, resumed_task) = state.store.answer_question(question_id, &answers, by)?;
     state.emit(Event::QuestionUpdated {
         question: question.clone(),
     });
+    if let Some(task) = resumed_task {
+        state.emit(Event::TaskUpdated { task });
+    }
 
     let run = state.store.run(&question.run_id)?;
     if let Some(run) = &run {

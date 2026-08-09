@@ -1388,10 +1388,10 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    if !state
+    let (committed, blocked_task) = state
         .store
-        .commit_question_waiting(&question, &run, &inbox_items)?
-    {
+        .commit_question_waiting(&question, &run, &inbox_items)?;
+    if !committed {
         state.store.delete_message(&message.id)?;
         state.emit(Event::MessageDeleted {
             channel_id: run.channel_id.clone(),
@@ -1400,6 +1400,9 @@ async fn ask_question(
         return Err(ApiError::conflict("that run has already ended"));
     }
     state.emit(Event::RunUpdated { run: run.clone() });
+    if let Some(task) = blocked_task {
+        state.emit(Event::TaskUpdated { task });
+    }
     state.set_presence(&run.agent_id, Presence::Waiting).await;
     for item in inbox_items {
         state.emit(Event::InboxItemCreated { item });
@@ -2669,7 +2672,33 @@ mod tests {
             started_at: Some(1),
             ended_at: None,
         };
-        store.insert_run(&make_run("run-one"), 0).unwrap();
+        let task = Task {
+            id: "task".into(),
+            key: "PW-1".into(),
+            title: "Needs a decision".into(),
+            outcome: "Continue after the human decides".into(),
+            status: TaskStatus::Running,
+            owner_id: Some(agent.id.clone()),
+            source_channel_id: Some("channel".into()),
+            source_message_id: None,
+            discussion_channel_id: "channel".into(),
+            project_id: None,
+            host_id: Some("host-one".into()),
+            worktree_id: None,
+            current_run_id: Some("run-one".into()),
+            pr_url: None,
+            pr_state: None,
+            created_by: human.id.clone(),
+            due_at: None,
+            once_key: None,
+            created_at: 1,
+            updated_at: 1,
+            position: 1.0,
+        };
+        store.insert_task(&task).unwrap();
+        let mut first_run = make_run("run-one");
+        first_run.task_id = Some(task.id.clone());
+        store.insert_run(&first_run, 0).unwrap();
         let state = std::sync::Arc::new(crate::state::AppState::new(
             store.clone(),
             path.with_extension("files"),
@@ -2751,6 +2780,10 @@ mod tests {
         .unwrap()
         .0;
         assert!(question.message_id.is_some());
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
         assert!(store
             .inbox(&human.id, false)
             .unwrap()
@@ -2800,6 +2833,11 @@ mod tests {
             RunStatus::Waiting
         );
         assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked,
+            "one answer cannot unblock a task with another open question",
+        );
+        assert_eq!(
             store.question(&second.id).unwrap().unwrap().status,
             QuestionStatus::Open
         );
@@ -2823,6 +2861,43 @@ mod tests {
         assert_eq!(
             store.run("run-one").unwrap().unwrap().status,
             RunStatus::Running
+        );
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+
+        let explicit_block = ask_question(
+            State(state.clone()),
+            agent_caller("run-one"),
+            Json(ask("run-one")),
+        )
+        .await
+        .unwrap()
+        .0;
+        let _ = orchestrator::update_task(
+            &state,
+            &human.id,
+            &task.id,
+            UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let _ = answer_question(
+            State(state.clone()),
+            human_caller(),
+            Path(explicit_block.id),
+            Json(AnswerQuestion { answers: Vec::new() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Blocked,
+            "an explicit Blocked status must outlive the question that first blocked it",
         );
 
         store.insert_run(&make_run("run-two"), 0).unwrap();

@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   host_id               TEXT,
   worktree_id           TEXT,
   current_run_id        TEXT,
+  question_blocked_run_id TEXT,
   pr_url                TEXT,
   pr_state              TEXT,
   created_by            TEXT NOT NULL,
