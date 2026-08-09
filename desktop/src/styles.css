@@ -2471,22 +2471,6 @@ details[open] > summary::before {
   padding-left: 1.15em;
 }
 
-/* The reply is still arriving. */
-.caret {
-  display: inline-block;
-  width: 2px;
-  height: 1.05em;
-  vertical-align: text-bottom;
-  margin-left: 2px;
-  background: var(--accent);
-  animation: blink 1.05s steps(2, start) infinite;
-}
-@keyframes blink {
-  to {
-    visibility: hidden;
-  }
-}
-
 /* --- a run in the transcript ---------------------------------------------- */
 
 /* A run is not an announcement. It is one line, the same weight as a status

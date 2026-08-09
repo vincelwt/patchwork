@@ -195,8 +195,9 @@ struct TurnState {
     /// When we last streamed the partial reply, so a fast agent does not turn
     /// every token into a websocket frame.
     streamed_at: Option<std::time::Instant>,
-    /// Whether anything has been streamed for the message being written.
-    streaming: bool,
+    /// Runtime-specific message phase, when exposed. Codex marks temporary
+    /// commentary separately from the final answer.
+    message_phase: Option<String>,
     /// The agent did something between two pieces of prose. The next chunk
     /// starts a new paragraph rather than running into the last sentence.
     interrupted: bool,
@@ -772,7 +773,22 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
     match kind {
         "agent_message_chunk" => {
             if let Some(text) = content_text(update.get("content")) {
+                let phase = update
+                    .pointer("/_meta/codex/phase")
+                    .and_then(|value| value.as_str());
                 let mut s = state.lock().await;
+                // Codex commentary is useful while work is happening, but the
+                // final answer replaces it rather than preserving the preamble.
+                if phase == Some("final_answer")
+                    && s.message_phase.as_deref() != Some("final_answer")
+                {
+                    s.message.clear();
+                    s.streamed_at = None;
+                    s.interrupted = false;
+                }
+                if let Some(phase) = phase {
+                    s.message_phase = Some(phase.to_string());
+                }
                 // "Let me check the PATH." <tool runs> "Yes, it is at /usr/bin."
                 // are two things the agent said, not one sentence. But a tool
                 // call in the middle of a sentence does not end the sentence,
@@ -793,7 +809,6 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
                 // empty draft in the transcript looks like a glitch.
                 if due && !s.message.trim().is_empty() {
                     s.streamed_at = Some(std::time::Instant::now());
-                    s.streaming = true;
                     let body = s.message.clone();
                     drop(s);
                     let _ = out.send(HostToRelay::RunMessageDelta {
@@ -823,7 +838,19 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
         // update to one already running, or the runtime listing its commands,
         // is not the agent pausing mid-thought.
         "tool_call" | "plan" => {
-            state.lock().await.interrupted = true;
+            let mut s = state.lock().await;
+            s.interrupted = true;
+            // A throttled delta may still be missing the last few words when a
+            // tool starts. Publish the complete progress line before it pauses.
+            if kind == "tool_call" && !s.message.trim().is_empty() {
+                s.streamed_at = Some(std::time::Instant::now());
+                let body = s.message.clone();
+                drop(s);
+                let _ = out.send(HostToRelay::RunMessageDelta {
+                    run_id: run_id.to_string(),
+                    body,
+                });
+            }
         }
         _ => {}
     }
@@ -959,7 +986,7 @@ async fn flush_message(run_id: &str, out: &Sink, state: &Arc<Mutex<TurnState>>, 
     let (message, thought) = {
         let mut s = state.lock().await;
         s.streamed_at = None;
-        s.streaming = false;
+        s.message_phase = None;
         s.interrupted = false;
         (
             std::mem::take(&mut s.message),
@@ -1456,6 +1483,56 @@ mod tests {
             }
         }
         assert_eq!(bodies, vec!["Fixed the test.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn final_answer_replaces_a_complete_progress_draft() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        let commentary = |text: &str| json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text },
+            "_meta": { "codex": { "phase": "commentary" } }
+        });
+
+        handle_update("r1", commentary("I'm "), &tx, &state).await;
+        handle_update("r1", commentary("checking now."), &tx, &state).await;
+        handle_update(
+            "r1",
+            json!({ "sessionUpdate": "tool_call", "title": "bash", "status": "pending" }),
+            &tx,
+            &state,
+        )
+        .await;
+
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let HostToRelay::RunMessageDelta { body, .. } = msg {
+                deltas.push(body);
+            }
+        }
+        assert_eq!(deltas.last().map(String::as_str), Some("I'm checking now."));
+
+        handle_update(
+            "r1",
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Done." },
+                "_meta": { "codex": { "phase": "final_answer" } }
+            }),
+            &tx,
+            &state,
+        )
+        .await;
+        flush_message("r1", &tx, &state, &spec()).await;
+
+        let mut bodies = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let HostToRelay::RunMessage { body, .. } = msg {
+                bodies.push(body);
+            }
+        }
+        assert_eq!(bodies, vec!["Done.".to_string()]);
     }
 
     #[tokio::test]
