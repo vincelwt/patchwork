@@ -307,6 +307,7 @@ export interface Run {
   prompt: string;
   headline: string;
   error?: string;
+  token_usage?: { input: number; output: number };
   created_at: Millis;
   started_at?: Millis;
   ended_at?: Millis;

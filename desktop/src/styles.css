@@ -1883,6 +1883,123 @@ details[open] > summary::before {
   content: "⌄ ";
 }
 
+.run-activity-head {
+  padding-right: 0;
+}
+.run-activity-stats {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+details.run-tool,
+details.run-thought {
+  border-radius: var(--radius-row);
+}
+details.run-tool:hover,
+details.run-thought:hover {
+  background: var(--tint);
+}
+details.run-tool[open],
+details.run-thought[open] {
+  background: var(--surface-sunken);
+  margin: 2px -8px;
+  padding: 0 8px 7px;
+}
+details.run-tool > summary,
+details.run-thought > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 0;
+}
+.run-tool-icon,
+details.run-thought > summary > svg {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-faint);
+}
+.run-tool.completed .run-tool-icon {
+  color: var(--positive);
+}
+.run-tool.failed .run-tool-icon,
+.run-tool.failed .run-tool-status {
+  color: var(--danger);
+}
+.run-tool-title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.run-tool-status,
+.run-tool-duration,
+.run-tool-timing,
+.run-tool-label {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.run-tool-status {
+  text-transform: capitalize;
+}
+.run-tool-duration {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.run-tool-detail,
+.run-thought-body {
+  padding: 2px 0 2px 30px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.run-tool-timing {
+  margin-bottom: 7px;
+}
+.run-tool-field + .run-tool-field {
+  margin-top: 8px;
+}
+.run-tool-label {
+  margin-bottom: -3px;
+}
+.run-tool-field .code-block {
+  max-height: 220px;
+}
+.run-thought-title {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.run-thought-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  font-style: italic;
+}
+.run-event.warning .text {
+  color: var(--caution);
+}
+.run-log-disclosure {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.run-log-disclosure + .run-log-disclosure {
+  margin-top: 7px;
+  padding-top: 0;
+  border-top: 0;
+}
+.run-log-events {
+  margin-top: 7px;
+  padding-left: 12px;
+}
+
 /* --- onboarding and overlays --------------------------------------------- */
 
 .onboarding {
