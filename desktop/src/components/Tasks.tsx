@@ -16,7 +16,15 @@ import {
   TASK_STEPS,
 } from "../lib/task";
 import type { NextAction, TaskState } from "../lib/task";
-import { Avatar, Chip, Field, Modal, proseText, useNavigation } from "./common";
+import {
+  Avatar,
+  Chip,
+  Field,
+  memberOption,
+  Modal,
+  proseText,
+  useNavigation,
+} from "./common";
 import {
   Dropdown,
   EditableText,
@@ -287,11 +295,7 @@ export function TasksBoard() {
           onChange={setFilterOwner}
           options={[
             { value: "", label: "Anyone" },
-            ...app.members.map((member) => ({
-              value: member.id,
-              label: member.display_name,
-              hint: member.kind === "agent" ? "agent" : undefined,
-            })),
+            ...app.members.map(memberOption),
           ]}
         />
         <Dropdown
@@ -866,13 +870,8 @@ export function NewTaskModal({
               onChange={setOwner}
               placeholder="Nobody yet"
               options={[
-                { value: "", label: "Nobody yet" },
-                ...app.members.map((member) => ({
-                  value: member.id,
-                  label: member.display_name,
-                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
-                  icon: <Avatar member={member} size={18} />,
-                })),
+                { value: "", label: "Nobody yet", icon: <Avatar size={18} /> },
+                ...app.members.map(memberOption),
               ]}
             />
             <Dropdown
@@ -1050,8 +1049,7 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
         value={owner}
         onChange={setOwner}
         options={app.members.map((member) => ({
-          value: member.id,
-          label: member.display_name,
+          ...memberOption(member),
           hint:
             member.kind === "agent"
               ? member.agent?.description || member.agent?.runtime
@@ -1464,12 +1462,8 @@ export function TaskPage({ taskId }: { taskId: string }) {
               value={task.owner_id ?? ""}
               onChange={(owner_id) => void api.updateTask(task.id, { owner_id })}
               options={[
-                { value: "", label: "Unassigned" },
-                ...app.members.map((member) => ({
-                  value: member.id,
-                  label: member.display_name,
-                  hint: member.kind === "agent" ? member.agent?.runtime : "person",
-                })),
+                { value: "", label: "Unassigned", icon: <Avatar size={18} /> },
+                ...app.members.map(memberOption),
               ]}
             />
           </Fact>
