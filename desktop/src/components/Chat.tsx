@@ -1094,6 +1094,10 @@ function ComposerBox({
         <textarea
           ref={box}
           rows={1}
+          // Opening a conversation means you are about to write in it. The box
+          // remounts per channel and thread (see `draftKey`), so this fires on
+          // every open, not only the first one.
+          autoFocus
           // Prose, but prose full of paths and flags: check it, do not rewrite it.
           {...proseText}
           spellCheck
