@@ -3,7 +3,7 @@
     "name": "Patchwork",
     "slug": "patchwork",
     "version": "1.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "scheme": "patchwork",
     "userInterfaceStyle": "automatic",
@@ -14,6 +14,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "sh.patchwork.app",
+      "requireFullScreen": false,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSSpeechRecognitionUsageDescription": "Allow Patchwork to turn dictation into text. Audio may be processed by Apple.",

@@ -18,7 +18,13 @@ export default function ChannelScreen() {
   const [sectionId, setSectionId] = useState(channel?.section_id ?? "");
   const [error, setError] = useState("");
 
-  if (!channel) return <View style={styles.fill}><Stack.Screen options={{ title: "Conversation" }} /></View>;
+  if (!channel) {
+    return (
+      <View style={styles.fill}>
+        <Stack.Screen options={{ title: "Conversation", headerTransparent: false }} />
+      </View>
+    );
+  }
 
   const save = async () => {
     try {
@@ -34,7 +40,7 @@ export default function ChannelScreen() {
       <Stack.Screen
         options={{
           title: channel.kind === "channel" ? `# ${channel.name}` : channel.name,
-          headerBackTitle: "Chat",
+          headerTransparent: false,
           headerRight: channel.kind === "channel"
             ? () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />
             : undefined,

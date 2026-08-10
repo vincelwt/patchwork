@@ -1,10 +1,10 @@
 import { useEffect, useMemo } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
-import { useLocalSearchParams } from "expo-router";
+import { Stack, useLocalSearchParams } from "expo-router";
 
 import { Composer } from "@/components/Composer";
 import { MessageRow } from "@/components/Message";
-import { Empty, PageHeader } from "@/components/ui";
+import { Empty, Measured } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useBottomAnchoredList } from "@/lib/scroll";
 import type { Message } from "@client/types";
@@ -30,7 +30,7 @@ export default function ThreadScreen() {
 
   return (
     <View style={styles.fill}>
-      <PageHeader title="Thread" subtitle={replies.length ? `${replies.length} replies` : "No replies yet"} back />
+      <Stack.Screen options={{ title: "Thread", headerBackTitle: "Back" }} />
       {!root || !channel ? (
         <Empty title="Thread unavailable" detail="Open it from its conversation so the original message can be loaded." />
       ) : (
@@ -39,8 +39,9 @@ export default function ThreadScreen() {
             ref={anchor.listRef}
             data={replies}
             keyExtractor={(message) => message.id}
-            ListHeaderComponent={<View style={styles.root}><MessageRow message={root} inThread /></View>}
-            renderItem={({ item }) => <MessageRow message={item} inThread />}
+            ListHeaderComponent={<Measured style={styles.root}><MessageRow message={root} inThread /></Measured>}
+            renderItem={({ item }) => <Measured><MessageRow message={item} inThread /></Measured>}
+            contentInsetAdjustmentBehavior="automatic"
             contentContainerStyle={styles.list}
             onContentSizeChange={anchor.onContentSizeChange}
             onScroll={anchor.onScroll}

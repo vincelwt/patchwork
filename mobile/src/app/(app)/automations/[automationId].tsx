@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import type { AutomationDebug } from "@client/types";
 import { AutomationEditor } from "@/components/AutomationEditor";
-import { Badge, Button, Card, Empty, ErrorNotice, PageHeader, Sheet } from "@/components/ui";
+import { Badge, Button, Card, Empty, ErrorNotice, Measured, Sheet } from "@/components/ui";
 import { relative, runStatusLabel, triggerLabel } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
@@ -34,13 +34,26 @@ export default function AutomationScreen() {
     void load();
   }, [automationId]);
 
-  if (!automation) return <View style={styles.fill}><PageHeader title="Automation" back /><Empty title="Automation unavailable" /></View>;
+  if (!automation) {
+    return (
+      <View style={styles.fill}>
+        <Stack.Screen options={{ title: "Automation" }} />
+        <Empty title="Automation unavailable" />
+      </View>
+    );
+  }
   const agent = workspace.bootstrap?.members.find((member) => member.id === automation.agent_id);
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title={automation.name} subtitle={triggerLabel(automation.trigger)} back action={<Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />} />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <Stack.Screen
+        options={{
+          title: automation.name,
+          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
+        }}
+      />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
+       <Measured style={styles.measured}>
         <Card style={styles.card}>
           <View style={styles.titleRow}>
             <View style={styles.grow}>
@@ -65,7 +78,7 @@ export default function AutomationScreen() {
             <Button label="Delete" compact tone="danger" onPress={() => setDeleting(true)} />
           </View>
         </Card>
-        <Text style={[styles.section, { color: theme.faint }]}>INSTRUCTIONS</Text>
+        <Text style={[styles.section, { color: theme.faint }]}>Instructions</Text>
         <Card style={styles.instructions}>
           <Text selectable style={{ color: automation.instructions ? theme.text : theme.faint, lineHeight: 21 }}>
             {automation.instructions || "No instructions. The agent receives only the trigger and context."}
@@ -85,7 +98,7 @@ export default function AutomationScreen() {
             <Text selectable style={{ color: theme.muted, fontFamily: "monospace" }}>{automation.trigger.command}</Text>
           </Card>
         ) : null}
-        <Text style={[styles.section, { color: theme.faint }]}>RUNS</Text>
+        <Text style={[styles.section, { color: theme.faint }]}>Runs</Text>
         <Card>
           {debug?.runs.map((run) => (
             <Pressable
@@ -103,6 +116,7 @@ export default function AutomationScreen() {
           {!debug?.runs.length ? <Empty title="No runs yet" detail="Run it manually to test the configuration." /> : null}
         </Card>
         <ErrorNotice message={error} />
+       </Measured>
       </ScrollView>
       <Sheet visible={editing} title={`Edit ${automation.name}`} onClose={() => setEditing(false)}>
         <AutomationEditor automation={automation} onSaved={() => { setEditing(false); void load(); }} />
@@ -120,13 +134,14 @@ export default function AutomationScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   grow: { flex: 1 },
-  scroll: { padding: 16, gap: 12, paddingBottom: 34 },
+  scroll: { padding: 16, paddingBottom: 34 },
+  measured: { gap: 12 },
   card: { padding: 14, gap: 11 },
   titleRow: { flexDirection: "row", gap: 10 },
   name: { fontSize: 20, fontWeight: "700", marginBottom: 4 },
   meta: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 7 },
-  section: { fontSize: 11, fontWeight: "700", letterSpacing: 0.8, marginTop: 4 },
+  section: { fontSize: 13, fontWeight: "600", marginTop: 6 },
   instructions: { padding: 14, gap: 8 },
   runRow: { minHeight: 62, flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
   confirm: { padding: 18, gap: 16 },

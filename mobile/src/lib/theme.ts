@@ -21,6 +21,7 @@ const palettes = {
     danger: "#b6382b",
     dangerSoft: "#fceceb",
     code: "#f0f0ed",
+    chip: "rgba(60, 60, 67, 0.09)",
     backdrop: "rgba(20, 20, 18, 0.34)",
   },
   dark: {
@@ -43,6 +44,7 @@ const palettes = {
     danger: "#f28a80",
     dangerSoft: "#472724",
     code: "#151515",
+    chip: "rgba(120, 120, 128, 0.24)",
     backdrop: "rgba(0, 0, 0, 0.62)",
   },
 };

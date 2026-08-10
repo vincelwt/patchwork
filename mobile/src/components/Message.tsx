@@ -19,7 +19,7 @@ import { useBottomAnchoredList } from "@/lib/scroll";
 import { AttachmentView } from "./Attachment";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
-import { Avatar, Badge, Button, Empty, Sheet } from "./ui";
+import { Avatar, Badge, Button, Empty, Icon, Measured, Sheet } from "./ui";
 
 const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
@@ -54,14 +54,14 @@ export function Conversation({ channelId }: { channelId: Id }) {
         keyExtractor={(message) => message.id}
         contentContainerStyle={messages.length ? styles.list : styles.emptyList}
         renderItem={({ item, index }) => (
-          <View>
+          <Measured>
             {index === 0 || dayLabel(messages[index - 1].created_at) !== dayLabel(item.created_at) ? (
               <View style={styles.day}>
                 <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
               </View>
             ) : null}
             <MessageRow message={item} onReply={setReplyTo} />
-          </View>
+          </Measured>
         )}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
         ListHeaderComponent={workspace.hasMore[channelId] ? (
@@ -179,8 +179,8 @@ export const MessageRow = memo(function MessageRow({
           </View>
         ) : null}
         <View style={styles.messageActions}>
-          <Pressable accessibilityRole="button" onPress={() => setReactions(true)} hitSlop={8} style={styles.messageAction}>
-            <Text style={{ color: theme.accent }}>React</Text>
+          <Pressable accessibilityRole="button" accessibilityLabel="React" onPress={() => setReactions(true)} hitSlop={8} style={styles.messageAction}>
+            <Icon name={{ ios: "face.smiling", android: "add_reaction", web: "add_reaction" }} color={theme.faint} size={15} />
           </Pressable>
           {onReply ? (
             <Pressable
@@ -190,7 +190,7 @@ export const MessageRow = memo(function MessageRow({
               hitSlop={8}
               style={styles.messageAction}
             >
-              <Text style={{ color: theme.accent }}>Reply</Text>
+              <Icon name={{ ios: "arrowshape.turn.up.left", android: "reply", web: "reply" }} color={theme.faint} size={15} />
             </Pressable>
           ) : null}
           {!inThread ? (
@@ -201,9 +201,9 @@ export const MessageRow = memo(function MessageRow({
               hitSlop={8}
               style={styles.messageAction}
             >
-              <Text style={{ color: theme.accent }}>
+              <Text style={[styles.actionLabel, { color: message.reply_count ? theme.accent : theme.faint }]}>
                 {message.reply_count
-                  ? `${message.reply_count} ${message.reply_count === 1 ? "thread reply" : "thread replies"}`
+                  ? `${message.reply_count} ${message.reply_count === 1 ? "reply" : "replies"}`
                   : "Thread"}
               </Text>
             </Pressable>
@@ -307,8 +307,9 @@ const styles = StyleSheet.create({
   replyPreview: { flex: 1, fontSize: 12 },
   reactionRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
   reaction: { minHeight: 32, justifyContent: "center", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
-  messageActions: { flexDirection: "row", gap: 18, marginTop: 2 },
-  messageAction: { minHeight: 32, justifyContent: "center" },
+  messageActions: { flexDirection: "row", alignItems: "center", gap: 20, marginTop: 2 },
+  messageAction: { minHeight: 30, justifyContent: "center" },
+  actionLabel: { fontSize: 13, fontWeight: "600" },
   emojiGrid: { flexDirection: "row", flexWrap: "wrap", padding: 18, justifyContent: "center" },
   emoji: { width: 64, height: 58, alignItems: "center", justifyContent: "center" },
   runLine: { flexDirection: "row", gap: 8, alignItems: "center", minHeight: 38, borderRadius: 9, paddingHorizontal: 10, marginVertical: 5 },

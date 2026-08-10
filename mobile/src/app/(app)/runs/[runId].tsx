@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import type { RunEvent } from "@client/types";
 import { PendingImages, useImageAttachments } from "@/components/Attachment";
 import { Markdown } from "@/components/Markdown";
-import { Avatar, Badge, Button, Card, Empty, ErrorNotice, PageHeader } from "@/components/ui";
+import { Avatar, Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/components/ui";
 import { useDictation } from "@/lib/dictation";
 import { duration, relative, runStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
@@ -34,20 +34,30 @@ export default function RunScreen() {
     void store.loadRun(runId);
   }, [runId, store]);
 
-  if (!run) return <View style={styles.fill}><PageHeader title="Run" back /><Empty title="Loading run" /></View>;
+  if (!run) {
+    return (
+      <View style={styles.fill}>
+        <Stack.Screen options={{ title: "Run" }} />
+        <Empty title="Loading run" />
+      </View>
+    );
+  }
   const active = !["succeeded", "failed", "cancelled"].includes(run.status);
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader
-        title={agent?.display_name || "Agent run"}
-        subtitle={run.headline || runStatusLabel(run.status)}
-        back
-        action={active ? <Button label="Stop" compact tone="danger" onPress={() => void store.mutate((api) => api.cancelRun(run.id))} /> : undefined}
+      <Stack.Screen
+        options={{
+          title: agent?.display_name || "Agent run",
+          headerRight: active
+            ? () => <Button label="Stop" compact tone="danger" onPress={() => void store.mutate((api) => api.cancelRun(run.id))} />
+            : undefined,
+        }}
       />
       <FlatList
         ref={anchor.listRef}
         data={events}
         keyExtractor={(event) => event.id}
+        contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.list}
         onContentSizeChange={anchor.onContentSizeChange}
         onScroll={anchor.onScroll}
@@ -57,7 +67,7 @@ export default function RunScreen() {
         onMomentumScrollEnd={anchor.onMomentumScrollEnd}
         scrollEventThrottle={16}
         ListHeaderComponent={
-          <View style={styles.headerContent}>
+          <Measured style={styles.headerContent}>
             <Card style={styles.summary}>
               <View style={styles.summaryHead}>
                 <Avatar member={agent} />
@@ -84,11 +94,11 @@ export default function RunScreen() {
                 <Text style={{ color: theme.text }}>{question.headline}</Text>
               </Pressable>
             ) : null}
-            <Text style={[styles.section, { color: theme.faint }]}>ACTIVITY</Text>
+            <Text style={[styles.section, { color: theme.faint }]}>Activity</Text>
             {!events.length ? <Empty title={active ? "Waiting for activity" : "Nothing was recorded"} /> : null}
-          </View>
+          </Measured>
         }
-        renderItem={({ item }) => <RunEventRow event={item} />}
+        renderItem={({ item }) => <Measured><RunEventRow event={item} /></Measured>}
         initialNumToRender={30}
         windowSize={10}
       />
@@ -137,6 +147,7 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
   };
   return (
     <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg }]}>
+     <Measured>
       <Text style={[styles.steerTarget, { color: theme.muted }]}>Straight to {agentName} in this run</Text>
       <PendingImages images={images.pending} onRemove={images.remove} />
       <View style={[styles.steerBox, { backgroundColor: theme.input, borderColor: theme.line }]}>
@@ -157,6 +168,7 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
         </View>
       </View>
       <ErrorNotice message={error || images.error || dictation.error} />
+     </Measured>
     </View>
   );
 }
@@ -173,9 +185,9 @@ const styles = StyleSheet.create({
   cwd: { fontSize: 11 },
   runError: { fontSize: 14, lineHeight: 20 },
   question: { borderRadius: 11, padding: 13, gap: 4 },
-  section: { fontSize: 11, fontWeight: "700", letterSpacing: 0.8 },
+  section: { fontSize: 13, fontWeight: "600" },
   event: { flexDirection: "row", gap: 10, paddingHorizontal: 14, paddingVertical: 8 },
-  eventKind: { width: 72, fontSize: 10, fontWeight: "700", textTransform: "uppercase" },
+  eventKind: { width: 72, fontSize: 10, fontWeight: "700" },
   eventText: { fontSize: 13, lineHeight: 19, fontFamily: "monospace" },
   steer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, gap: 5 },
   steerTarget: { fontSize: 11, fontWeight: "600" },

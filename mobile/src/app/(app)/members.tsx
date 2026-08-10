@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
 import type { Member } from "@client/types";
-import { Avatar, Badge, Button, Empty, ErrorNotice, PageHeader, Sheet, TextField, ToggleRow } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, ErrorNotice, Grouped, Sheet, TextField, ToggleRow } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -31,8 +31,16 @@ export default function MembersScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Members" subtitle={`${data.members.length} teammates`} back action={data.me.is_admin ? <Button label="Invite" compact onPress={() => setInviting(true)} /> : undefined} />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <Stack.Screen
+        options={{
+          title: "Members",
+          headerRight: data.me.is_admin
+            ? () => <Button label="Invite" compact tone="quiet" onPress={() => setInviting(true)} />
+            : undefined,
+        }}
+      />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
+       <Grouped>
         {data.members.map((member) => (
           <Pressable
             key={member.id}
@@ -50,6 +58,7 @@ export default function MembersScreen() {
             {data.me.is_admin && member.id !== data.me.id ? <Button label="Remove" compact tone="quiet" onPress={() => setRemoving(member)} /> : null}
           </Pressable>
         ))}
+       </Grouped>
       </ScrollView>
 
       <Sheet visible={inviting} title="Invite someone" onClose={() => { setInviting(false); setInvite(""); }}>
@@ -83,8 +92,8 @@ export default function MembersScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  scroll: { paddingHorizontal: 14, paddingBottom: 30 },
-  row: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 9, borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 10 },
+  scroll: { paddingBottom: 30 },
+  row: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 10 },
   main: { flex: 1, minWidth: 0 },
   name: { fontSize: 15, fontWeight: "700", marginBottom: 2 },
   form: { padding: 18, gap: 15 },

@@ -10,11 +10,14 @@ import {
   View,
 } from "react-native";
 
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+
 import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { PendingImages, useImageAttachments } from "./Attachment";
+import { Glass, Icon, Measured } from "./ui";
 
 export function Composer({
   channelId,
@@ -32,6 +35,7 @@ export function Composer({
   onCancelReply?: () => void;
 }) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const draftKey = parentId ? `thread:${parentId}` : channelId;
@@ -100,16 +104,17 @@ export function Composer({
 
   return (
     <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined}>
-      <View style={[styles.wrap, { backgroundColor: theme.bg, borderTopColor: theme.line }]}>
+      <View style={[styles.wrap, { backgroundColor: theme.bg, borderTopColor: theme.line, paddingBottom: 8 + insets.bottom }]}>
+       <Measured>
         {mention.length ? (
-          <View style={[styles.mentions, { backgroundColor: theme.raised, borderColor: theme.line }]}>
+          <Glass radius={14} style={styles.mentions}>
             {mention.map((member) => (
               <Pressable accessibilityRole="button" key={member.id} onPress={() => insertMention(member.handle)} style={styles.mentionRow}>
                 <Text style={{ color: theme.text, fontWeight: "600" }}>{member.display_name}</Text>
                 <Text style={{ color: theme.muted }}>@{member.handle}</Text>
               </Pressable>
             ))}
-          </View>
+          </Glass>
         ) : null}
         {replyTo ? (
           <View style={styles.reply}>
@@ -148,7 +153,7 @@ export function Composer({
           />
           <View style={styles.actions}>
             <Pressable accessibilityRole="button" accessibilityLabel="Attach image" onPress={() => void images.pick()} style={styles.iconButton}>
-              <Text style={[styles.icon, { color: theme.accent }]}>＋</Text>
+              <Icon name={{ ios: "photo.badge.plus", android: "add_photo_alternate", web: "add_photo_alternate" }} color={theme.accent} size={22} />
             </Pressable>
             {dictation.supported ? (
               <Pressable
@@ -157,7 +162,13 @@ export function Composer({
                 onPress={() => (dictation.recording ? dictation.stop() : void dictation.start(text))}
                 style={[styles.iconButton, dictation.recording && { backgroundColor: theme.dangerSoft }]}
               >
-                <Text style={[styles.mic, { color: dictation.recording ? theme.danger : theme.accent }]}>●</Text>
+                <Icon
+                  name={dictation.recording
+                    ? { ios: "stop.fill", android: "stop", web: "stop" }
+                    : { ios: "mic.fill", android: "mic", web: "mic" }}
+                  color={dictation.recording ? theme.danger : theme.accent}
+                  size={20}
+                />
               </Pressable>
             ) : null}
             <View style={{ flex: 1 }} />
@@ -176,7 +187,7 @@ export function Composer({
               {busy || images.uploading ? (
                 <ActivityIndicator size="small" color={theme.onAccent} />
               ) : (
-                <Text style={{ color: theme.onAccent, fontSize: 18, fontWeight: "800" }}>↑</Text>
+                <Icon name={{ ios: "arrow.up", android: "arrow_upward", web: "arrow_upward" }} color={theme.onAccent} size={19} />
               )}
             </Pressable>
           </View>
@@ -184,6 +195,7 @@ export function Composer({
         {error || images.error || dictation.error ? (
           <Text style={[styles.error, { color: theme.danger }]}>{error || images.error || dictation.error}</Text>
         ) : null}
+       </Measured>
       </View>
     </KeyboardAvoidingView>
   );
@@ -191,7 +203,7 @@ export function Composer({
 
 const styles = StyleSheet.create({
   wrap: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 8 },
-  mentions: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, marginBottom: 6, overflow: "hidden" },
+  mentions: { marginBottom: 6, overflow: "hidden" },
   mentionRow: { minHeight: 44, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 8 },
   reply: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 32, paddingHorizontal: 4 },
   replyLabel: { fontSize: 12, fontWeight: "600" },
@@ -200,9 +212,7 @@ const styles = StyleSheet.create({
   composer: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 8 },
   input: { minHeight: 38, maxHeight: 150, fontSize: 16, lineHeight: 22, paddingHorizontal: 4, paddingTop: 4, textAlignVertical: "top" },
   actions: { flexDirection: "row", alignItems: "center", marginTop: 4, gap: 4 },
-  iconButton: { width: 40, height: 40, borderRadius: 10, alignItems: "center", justifyContent: "center" },
-  icon: { fontSize: 26, lineHeight: 28, fontWeight: "400" },
-  mic: { fontSize: 17 },
-  send: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
+  iconButton: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
+  send: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
   error: { fontSize: 12, marginTop: 5, paddingHorizontal: 4 },
 });

@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { GlassView, isLiquidGlassAvailable } from "expo-glass-effect";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
 import {
   ActivityIndicator,
@@ -16,15 +17,80 @@ import {
   type ViewStyle,
 } from "react-native";
 import { useRouter } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Member, Presence } from "@client/types";
+import { useLayout } from "@/lib/layout";
 import type { ConnectionState } from "@/lib/store";
 import { useTheme, type Palette } from "@/lib/theme";
+
+/// iOS 26 renders real Liquid Glass; everywhere else falls back to a plain
+/// raised surface so the same components keep working.
+export const glass = isLiquidGlassAvailable();
+
+export function Glass({
+  children,
+  style,
+  radius,
+  tint,
+  interactive,
+}: {
+  children?: ReactNode;
+  style?: ViewStyle | ViewStyle[];
+  radius?: number;
+  tint?: string;
+  interactive?: boolean;
+}) {
+  const theme = useTheme();
+  const shape = radius === undefined ? undefined : { borderRadius: radius };
+  if (glass) {
+    return (
+      <GlassView glassEffectStyle="regular" isInteractive={interactive} tintColor={tint} style={[shape, style]}>
+        {children}
+      </GlassView>
+    );
+  }
+  return (
+    <View
+      style={[
+        shape,
+        { backgroundColor: tint ?? theme.raised, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.line },
+        style,
+      ]}
+    >
+      {children}
+    </View>
+  );
+}
 
 export function Screen({ children, style }: { children: ReactNode; style?: ViewStyle }) {
   const theme = useTheme();
   return <View style={[styles.screen, { backgroundColor: theme.bg }, style]}>{children}</View>;
+}
+
+/// Keeps text at a readable measure on a big screen without letterboxing a
+/// phone. Sized as a share of whatever it sits in, so it also behaves inside a
+/// narrow pane of a split layout.
+export function Measured({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+  const { measure, wide } = useLayout();
+  if (!wide) return <>{children}</>;
+  // Leading edge, so it lines up with the large title the navigation bar draws.
+  return <View style={[{ width: "100%", maxWidth: measure, alignSelf: "flex-start" }, style]}>{children}</View>;
+}
+
+/// A run of rows reads as a deliberate group on a big screen rather than as a
+/// phone list stretched across it. On a phone the rows stay full bleed.
+export function Grouped({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+  const theme = useTheme();
+  const { wide } = useLayout();
+  if (!wide) return <>{children}</>;
+  return (
+    <Measured>
+      <View style={[styles.grouped, { backgroundColor: theme.raised, borderColor: theme.line }, style]}>
+        {children}
+      </View>
+    </Measured>
+  );
 }
 
 export function Icon({
@@ -41,55 +107,16 @@ export function Icon({
 
 export function ScrollScreen({ children }: { children: ReactNode }) {
   const theme = useTheme();
+  const { measure, wide } = useLayout();
   return (
     <ScrollView
       style={{ flex: 1, backgroundColor: theme.bg }}
-      contentContainerStyle={styles.scroll}
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={[styles.scroll, wide && { width: measure, alignSelf: "center" }]}
       keyboardShouldPersistTaps="handled"
     >
       {children}
     </ScrollView>
-  );
-}
-
-export function PageHeader({
-  title,
-  subtitle,
-  back,
-  action,
-}: {
-  title: string;
-  subtitle?: string;
-  back?: boolean;
-  action?: ReactNode;
-}) {
-  const theme = useTheme();
-  const router = useRouter();
-  return (
-    <View style={[styles.header, back && styles.headerCompact, { borderBottomColor: theme.line, backgroundColor: theme.raised }]}>
-      {back ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Go back"
-          hitSlop={8}
-          onPress={() => router.back()}
-          style={({ pressed }) => [styles.back, pressed && styles.pressed]}
-        >
-          <Icon name={{ ios: "chevron.left", android: "arrow_back", web: "arrow_back" }} color={theme.accent} size={22} />
-        </Pressable>
-      ) : null}
-      <View style={styles.grow}>
-        <Text accessibilityRole="header" numberOfLines={1} style={[styles.title, back && styles.titleCompact, { color: theme.text }]}>
-          {title}
-        </Text>
-        {subtitle ? (
-          <Text numberOfLines={1} style={[styles.subtitle, { color: theme.muted }]}>
-            {subtitle}
-          </Text>
-        ) : null}
-      </View>
-      {action}
-    </View>
   );
 }
 
@@ -345,7 +372,7 @@ export function Badge({
           ? theme.cautionSoft
           : tone === "danger"
             ? theme.dangerSoft
-            : theme.raised;
+            : theme.chip;
   return (
     <View style={[styles.badge, { backgroundColor: background }]}>
       <Text style={[styles.badgeText, { color: colour }]}>{children}</Text>
@@ -365,7 +392,7 @@ export function Avatar({ member, size = 34 }: { member?: Member; size?: number }
     <View
       style={[
         styles.avatar,
-        { width: size, height: size, borderRadius: size / 3, backgroundColor: member?.kind === "agent" ? theme.accentSoft : theme.surface },
+        { width: size, height: size, borderRadius: size / 3, backgroundColor: member?.kind === "agent" ? theme.accentSoft : theme.chip },
       ]}
     >
       <Text style={[styles.avatarText, { color: member?.kind === "agent" ? theme.accent : theme.text, fontSize: size * 0.36 }]}>
@@ -416,21 +443,31 @@ export function ErrorNotice({ message }: { message?: string }) {
   ) : null;
 }
 
+/// Floats over the app instead of shoving the navigation bar down, so a blip
+/// in the connection never moves the content somebody is reading.
 export function ConnectionBar({ connection, error }: { connection: ConnectionState; error?: string }) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   if (connection === "live") return null;
   const message =
     connection === "offline"
-      ? "Offline. Showing saved workspace data."
+      ? "Offline. Showing saved data."
       : connection === "connecting"
         ? "Reconnecting…"
         : error
-          ? "Could not reach the workspace. Reconnecting…"
+          ? "Could not reach the workspace. Retrying…"
           : "Could not reach the workspace.";
+  const colour = connection === "error" ? theme.danger : theme.caution;
   return (
-    <View accessibilityLiveRegion="polite" style={[styles.connection, { backgroundColor: connection === "error" ? theme.dangerSoft : theme.cautionSoft }]}>
-      {connection === "connecting" ? <ActivityIndicator size="small" color={theme.caution} /> : null}
-      <Text numberOfLines={2} style={{ flexShrink: 1, color: connection === "error" ? theme.danger : theme.caution }}>{message}</Text>
+    <View pointerEvents="none" style={[styles.connectionSlot, { bottom: insets.bottom + 74 }]}>
+      <Glass radius={999} tint={glass ? undefined : theme.raised} style={styles.connection}>
+        <View accessibilityLiveRegion="polite" style={styles.connectionRow}>
+          {connection === "connecting" ? <ActivityIndicator size="small" color={colour} /> : (
+            <View style={[styles.connectionDot, { backgroundColor: colour }]} />
+          )}
+          <Text numberOfLines={2} style={[styles.connectionText, { color: theme.text }]}>{message}</Text>
+        </View>
+      </Glass>
     </View>
   );
 }
@@ -439,20 +476,6 @@ const styles = StyleSheet.create({
   screen: { flex: 1 },
   scroll: { padding: 16, gap: 14, paddingBottom: 36 },
   grow: { flex: 1 },
-  header: {
-    minHeight: 72,
-    paddingHorizontal: 18,
-    paddingVertical: 11,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-  },
-  headerCompact: { minHeight: 58, paddingVertical: 8, paddingLeft: 10 },
-  back: { width: 38, minHeight: 42, alignItems: "center", justifyContent: "center" },
-  title: { fontSize: 28, fontWeight: "700", letterSpacing: -0.7 },
-  titleCompact: { fontSize: 20, letterSpacing: -0.25 },
-  subtitle: { fontSize: 13, marginTop: 1 },
   button: {
     minHeight: 44,
     paddingHorizontal: 16,
@@ -514,6 +537,13 @@ const styles = StyleSheet.create({
   },
   sheetTitle: { flex: 1, fontSize: 17, fontWeight: "700" },
   card: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 13, overflow: "hidden" },
+  grouped: {
+    marginHorizontal: 20,
+    marginTop: 6,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: "hidden",
+  },
   badge: { alignSelf: "flex-start", borderRadius: 999, paddingHorizontal: 8, paddingVertical: 4 },
   badgeText: { fontSize: 11, fontWeight: "700" },
   avatar: { alignItems: "center", justifyContent: "center" },
@@ -524,5 +554,9 @@ const styles = StyleSheet.create({
   emptyDetail: { fontSize: 14, lineHeight: 20, textAlign: "center" },
   loading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 30 },
   notice: { borderRadius: 10, padding: 12 },
-  connection: { minHeight: 34, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 7 },
+  connectionSlot: { position: "absolute", left: 0, right: 0, alignItems: "center" },
+  connection: { maxWidth: "86%", overflow: "hidden" },
+  connectionRow: { minHeight: 38, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 15, paddingVertical: 8 },
+  connectionDot: { width: 8, height: 8, borderRadius: 4 },
+  connectionText: { flexShrink: 1, fontSize: 13, fontWeight: "600" },
 });

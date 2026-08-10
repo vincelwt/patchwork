@@ -8,7 +8,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts src/lib/format.test.ts src/lib/workspace-cache.test.ts",
+    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts src/lib/format.test.ts src/lib/paired.test.ts src/lib/workspace-cache.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {
@@ -19,6 +19,7 @@
     "expo-camera": "~57.0.3",
     "expo-constants": "~57.0.9",
     "expo-crypto": "~57.0.1",
+    "expo-glass-effect": "~57.0.1",
     "expo-image": "~57.0.2",
     "expo-image-picker": "~57.0.8",
     "expo-linking": "~57.0.5",

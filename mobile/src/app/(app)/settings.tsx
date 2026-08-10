@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { Alert, Linking, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Stack, useRouter } from "expo-router";
 
 import type { Device } from "@client/types";
-import { Badge, Button, Card, ErrorNotice, PageHeader, Sheet, TextField } from "@/components/ui";
+import { WorkspaceMark, WorkspaceSheet } from "@/components/WorkspaceSwitcher";
+import { Badge, Button, Card, ErrorNotice, Icon, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
+import { workspaceLabel } from "@/lib/paired";
 import { apiFor, usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -14,10 +16,11 @@ export default function SettingsScreen() {
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
-  const { session, signOut } = usePairedSession();
+  const { session, workspaces, signOut } = usePairedSession();
   const data = workspace.bootstrap;
   const [devices, setDevices] = useState<Device[]>([]);
   const [editing, setEditing] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [name, setName] = useState(data?.workspace.name ?? "");
   const [prefix, setPrefix] = useState(data?.workspace.task_prefix ?? "PW");
   const [error, setError] = useState("");
@@ -36,9 +39,32 @@ export default function SettingsScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Settings" subtitle={data?.workspace.name} back />
-      <ScrollView contentContainerStyle={styles.scroll}>
-        <Text style={[styles.section, { color: theme.faint }]}>WORKSPACE</Text>
+      <Stack.Screen options={{ title: "Settings" }} />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
+       <Measured style={styles.measured}>
+        <Text style={[styles.section, { color: theme.faint }]}>Workspaces</Text>
+        <Card>
+          {session ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Switch workspace"
+              onPress={() => setSwitching(true)}
+              style={({ pressed }) => [styles.switcher, pressed && { opacity: 0.6 }]}
+            >
+              <WorkspaceMark session={{ ...session, name: data?.workspace.name ?? session.name }} size={40} />
+              <View style={styles.grow}>
+                <Text style={{ color: theme.text, fontWeight: "700", fontSize: 16 }}>
+                  {data?.workspace.name || workspaceLabel(session)}
+                </Text>
+                <Text style={{ color: theme.muted }}>
+                  {workspaces.length > 1 ? `${workspaces.length} workspaces paired` : "Tap to pair another"}
+                </Text>
+              </View>
+              <Icon name={{ ios: "chevron.up.chevron.down", android: "unfold_more", web: "unfold_more" }} color={theme.faint} size={14} />
+            </Pressable>
+          ) : null}
+        </Card>
+        <Text style={[styles.section, { color: theme.faint }]}>This workspace</Text>
         <Card style={styles.card}>
           <Info label="Name" value={data?.workspace.name || "Loading"} />
           <Info label="Task prefix" value={data?.workspace.task_prefix || ""} />
@@ -47,7 +73,7 @@ export default function SettingsScreen() {
           <Info label="Last sync" value={workspace.lastSyncAt ? relative(workspace.lastSyncAt) : "Not yet"} />
           {data?.me.is_admin ? <Button label="Edit workspace" tone="secondary" onPress={() => setEditing(true)} /> : null}
         </Card>
-        <Text style={[styles.section, { color: theme.faint }]}>YOUR DEVICES</Text>
+        <Text style={[styles.section, { color: theme.faint }]}>Your devices</Text>
         <Card>
           {devices.map((device) => (
             <View key={device.id} style={[styles.device, { borderBottomColor: theme.line }]}>
@@ -60,14 +86,14 @@ export default function SettingsScreen() {
           ))}
           {!devices.length ? <Text style={{ color: theme.muted, padding: 14 }}>Connect to load paired devices.</Text> : null}
         </Card>
-        <Text style={[styles.section, { color: theme.faint }]}>ABOUT</Text>
+        <Text style={[styles.section, { color: theme.faint }]}>About</Text>
         <Card style={styles.card}>
           <Button label="Privacy policy" tone="secondary" onPress={() => void Linking.openURL("https://patchwork.sh/privacy.html")} />
           <Button label="Support" tone="secondary" onPress={() => void Linking.openURL("https://patchwork.sh/support.html")} />
         </Card>
         <ErrorNotice message={error} />
         <Button
-          label="Sign out this device"
+          label={workspaces.length > 1 ? "Sign out of this workspace" : "Sign out this device"}
           tone="danger"
           busy={signingOut}
           onPress={async () => {
@@ -110,7 +136,11 @@ export default function SettingsScreen() {
             if (warning) Alert.alert("Signed out on this device", warning);
           }}
         />
+       </Measured>
       </ScrollView>
+      {session ? (
+        <WorkspaceSheet visible={switching} onClose={() => setSwitching(false)} workspaces={workspaces} active={session} />
+      ) : null}
       <Sheet visible={editing} title="Workspace" onClose={() => setEditing(false)}>
         <View style={styles.form}>
           <TextField label="Name" value={name} onChangeText={setName} />
@@ -135,8 +165,10 @@ function Info({ label, value, selectable }: { label: string; value: string; sele
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   grow: { flex: 1 },
-  scroll: { padding: 16, gap: 12, paddingBottom: 36 },
-  section: { fontSize: 11, fontWeight: "700", letterSpacing: 0.8, marginTop: 5 },
+  scroll: { padding: 16, paddingBottom: 36 },
+  measured: { gap: 12 },
+  switcher: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 12 },
+  section: { fontSize: 13, fontWeight: "600", marginTop: 8 },
   card: { padding: 14, gap: 11 },
   info: { flexDirection: "row", gap: 12, justifyContent: "space-between" },
   infoValue: { flex: 1, textAlign: "right", fontWeight: "600" },

@@ -7,6 +7,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useSyncExternalStore,
   type ReactNode,
 } from "react";
@@ -27,6 +28,7 @@ import type { Envelope, Id, Message, RunDetail } from "@client/types";
 import {
   apiFor,
   clearPairedSession,
+  noteWorkspaceName,
   type PairedSession,
 } from "@/lib/session";
 import { isWorkspaceCacheKey, workspaceCacheKey } from "@/lib/workspace-cache";
@@ -81,7 +83,13 @@ export class MobileWorkspaceStore {
   getSnapshot = () => this.snapshot;
   getServerSnapshot = () => EMPTY;
 
-  async setSession(session: PairedSession | null | undefined): Promise<void> {
+  /// `paired` is every workspace this device holds a key for. Their caches
+  /// survive a switch so coming back to a workspace is instant; anything else
+  /// found on disk belongs to a workspace that was signed out and is removed.
+  async setSession(
+    session: PairedSession | null | undefined,
+    paired: PairedSession[] = [],
+  ): Promise<void> {
     const generation = ++this.generation;
     this.stopConnection();
     this.clearCacheTimer();
@@ -95,23 +103,19 @@ export class MobileWorkspaceStore {
     if (session === undefined) return;
     if (!session) {
       await Promise.all([
-        this.pruneWorkspaceCaches(undefined, generation),
+        this.pruneWorkspaceCaches([], generation),
         this.clearImageCaches(),
       ]).catch(() => undefined);
       return;
     }
 
-    const tokenDigest = await Crypto.digestStringAsync(
-      Crypto.CryptoDigestAlgorithm.SHA256,
-      session.token,
+    const keep = await this.cacheKeysFor(
+      paired.some((item) => item.baseUrl === session.baseUrl) ? paired : [...paired, session],
     );
     if (generation !== this.generation) return;
-    const cacheKey = workspaceCacheKey(session.baseUrl, tokenDigest);
+    const cacheKey = await this.cacheKeyFor(session);
     this.cacheKey = cacheKey;
-    await Promise.all([
-      this.pruneWorkspaceCaches(cacheKey, generation),
-      this.clearImageCaches(),
-    ]).catch(() => undefined);
+    await this.pruneWorkspaceCaches(keep, generation).catch(() => undefined);
     if (generation !== this.generation) return;
 
     try {
@@ -297,6 +301,7 @@ export class MobileWorkspaceStore {
           (bootstrap) => {
             if (this.isCurrent(generation, attempt)) {
               this.replaceData(applyBootstrap(this.snapshot, bootstrap));
+              noteWorkspaceName(api.baseUrl, bootstrap.workspace.name);
             }
           },
         );
@@ -549,10 +554,23 @@ export class MobileWorkspaceStore {
     await this.cacheWrite;
   }
 
-  private async pruneWorkspaceCaches(keep: string | undefined, generation: number) {
+  private async cacheKeyFor(session: PairedSession) {
+    const digest = await Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      session.token,
+    );
+    return workspaceCacheKey(session.baseUrl, digest);
+  }
+
+  private cacheKeysFor(sessions: PairedSession[]) {
+    return Promise.all(sessions.map((session) => this.cacheKeyFor(session)));
+  }
+
+  private async pruneWorkspaceCaches(keep: string[], generation: number) {
     await this.cacheWrite;
+    const kept = new Set(keep);
     const stale = (await AsyncStorage.getAllKeys()).filter(
-      (key) => isWorkspaceCacheKey(key) && key !== keep,
+      (key) => isWorkspaceCacheKey(key) && !kept.has(key),
     );
     if (generation === this.generation && stale.length) {
       await AsyncStorage.multiRemove(stale);
@@ -596,16 +614,22 @@ const WorkspaceContext = createContext<MobileWorkspaceStore | null>(null);
 
 export function WorkspaceProvider({
   session,
+  workspaces,
   children,
 }: {
   session: PairedSession | null | undefined;
+  workspaces?: PairedSession[];
   children: ReactNode;
 }) {
   const store = useMemo(() => new MobileWorkspaceStore(), []);
+  // Reconnect when the credential changes, not when a workspace is merely renamed.
+  const credential = session === undefined ? undefined : session ? `${session.baseUrl}\n${session.token}` : null;
+  const latest = useRef({ session, workspaces });
+  latest.current = { session, workspaces };
 
   useEffect(() => {
-    void store.setSession(session);
-  }, [session, store]);
+    void store.setSession(latest.current.session, latest.current.workspaces ?? []);
+  }, [credential, store]);
 
   useEffect(() => {
     store.setActive(AppState.currentState === "active");
