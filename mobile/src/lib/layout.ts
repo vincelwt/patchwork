@@ -20,14 +20,17 @@ export interface Layout {
 }
 
 const SPLIT_AT = 820;
+/// A phone on its side is wide enough for two columns and far too short for
+/// them: a list, a conversation and a keyboard do not share 440pt of height.
+const SPLIT_NEEDS_HEIGHT = 600;
 const WIDE_AT = 680;
 
 export function useLayout(): Layout {
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const wide = width >= WIDE_AT;
   return {
     width,
-    split: width >= SPLIT_AT,
+    split: width >= SPLIT_AT && height >= SPLIT_NEEDS_HEIGHT,
     wide,
     measure: Math.min(width, 760),
     gutter: wide ? 28 : 16,

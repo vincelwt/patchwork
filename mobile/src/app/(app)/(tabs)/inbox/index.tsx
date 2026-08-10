@@ -6,7 +6,7 @@ import type { SymbolViewProps } from "expo-symbols";
 import type { InboxItem, InboxKind } from "@client/types";
 import { Conversation } from "@/components/Message";
 import { TaskDetail } from "@/components/TaskDetail";
-import { Avatar, Button, Empty, Grouped, Icon, Screen } from "@/components/ui";
+import { Avatar, Button, Empty, Icon, Measured, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
 import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
@@ -17,13 +17,16 @@ export default function InboxScreen() {
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
-  const { split } = useLayout();
+  const { split, gutter } = useLayout();
   const [selected, setSelected] = useState<string>();
   const items = [...(workspace.bootstrap?.inbox ?? [])].sort((a, b) => b.created_at - a.created_at);
   const unread = items.filter((item) => !item.read_at).length;
   // Beside the list, something is always on screen rather than a blank pane.
   const opened = items.find((item) => item.id === selected)
     ?? (split ? items.find((item) => item.task_id || item.channel_id) : undefined);
+  const openedChannel = opened?.channel_id && !opened.task_id
+    ? workspace.bootstrap?.channels.find((channel) => channel.id === opened.channel_id)
+    : undefined;
 
   const open = async (item: InboxItem) => {
     if (!item.read_at) await store.mutate((api) => api.markRead(item.id), false).catch(() => undefined);
@@ -87,7 +90,9 @@ export default function InboxScreen() {
       data={items}
       keyExtractor={(item) => item.id}
       contentContainerStyle={items.length ? styles.list : styles.emptyList}
-      renderItem={split ? row : ({ item }) => <Grouped style={styles.phoneGroup}>{row({ item })}</Grouped>}
+      // One list, one column. Grouping each row into its own card is what a
+      // phone on its side used to do, and it looked like scattered receipts.
+      renderItem={split ? row : ({ item }) => <Measured>{row({ item })}</Measured>}
       ListHeaderComponent={split ? <Text style={[styles.paneTitle, { color: theme.text }]}>Inbox</Text> : null}
       ListEmptyComponent={<Empty title="Nothing needs you" detail="Mentions, questions, reviews, and failed automations appear here." />}
       refreshControl={<RefreshControl refreshing={workspace.connection === "connecting"} onRefresh={() => void store.refresh()} />}
@@ -112,8 +117,15 @@ export default function InboxScreen() {
           <View style={styles.detail}>
             {opened?.task_id ? (
               <TaskDetail taskId={opened.task_id} embedded />
-            ) : opened?.channel_id ? (
-              <Conversation channelId={opened.channel_id} />
+            ) : openedChannel ? (
+              <>
+                <View style={[styles.detailHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
+                  <Text numberOfLines={1} style={[styles.detailTitle, { color: theme.text }]}>
+                    {openedChannel.kind === "channel" ? `# ${openedChannel.name}` : openedChannel.name}
+                  </Text>
+                </View>
+                <Conversation channelId={openedChannel.id} />
+              </>
             ) : (
               <View style={styles.centre}>
                 <Empty title="Nothing selected" detail="Pick something from the list to read it here." />
@@ -159,11 +171,12 @@ function describe(kind: InboxKind, theme: Palette): {
 const styles = StyleSheet.create({
   list: { paddingBottom: 24 },
   emptyList: { flexGrow: 1, justifyContent: "center" },
-  phoneGroup: { marginTop: 0, marginBottom: 0 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 360, borderRightWidth: StyleSheet.hairlineWidth },
   paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
   detail: { flex: 1 },
+  detailHead: { paddingTop: 13, paddingBottom: 11, borderBottomWidth: StyleSheet.hairlineWidth },
+  detailTitle: { fontSize: 19, fontWeight: "700", letterSpacing: -0.3 },
   centre: { flex: 1, justifyContent: "center" },
   row: { minHeight: 80, flexDirection: "row", alignItems: "center", gap: 11, paddingLeft: 6, paddingRight: 16, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
   unread: { width: 8, height: 8, borderRadius: 4 },

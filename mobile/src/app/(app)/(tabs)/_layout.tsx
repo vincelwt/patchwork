@@ -11,7 +11,9 @@ export default function TabLayout() {
     <NativeTabs
       backBehavior="history"
       minimizeBehavior="onScrollDown"
-      sidebarAdaptable
+      // Left adaptable, a big screen turns the tabs into a sidebar that lands on
+      // top of the list pane each screen already keeps there.
+      sidebarAdaptable={false}
       tintColor={theme.accent}
       backgroundColor={process.env.EXPO_OS === "android" ? theme.raised : undefined}
       indicatorColor={process.env.EXPO_OS === "android" ? theme.accentSoft : undefined}
