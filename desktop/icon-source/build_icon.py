@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Compose the macOS-shaped Patchwork app icon from the bubble layers.
+"""Compose the Patchwork app icons from the bubble layers.
 
-Usage: python3 build_icon.py <assets-dir> <out.png>
+Usage: python3 build_icon.py <assets-dir> <out.png>          # macOS-shaped plate
+       python3 build_icon.py --mobile <assets-dir> <out-dir>  # iOS/Android sources
 Then:  npx tauri icon <out.png>
+
+The mobile icon must be full-bleed: iOS and Android apply their own mask, so a
+pre-rounded plate on a transparent canvas shows a border inside a border.
 """
 import sys, math
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
@@ -39,14 +43,48 @@ def squircle(size, radius, supersample=4):
     return m.resize((size, size), Image.LANCZOS)
 
 
-def main(assets, out):
-    plate_mask = squircle(PLATE, int(PLATE * RADIUS_RATIO))
-    plate = Image.new("RGBA", (PLATE, PLATE))
-    grad = Image.linear_gradient("L").resize((PLATE, PLATE), Image.BILINEAR)
-    plate = Image.merge("RGBA", [
+def load_bubbles(assets, size):
+    bubbles = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
+    for name in LAYERS:
+        bubbles.alpha_composite(Image.open(f"{assets}/{name}.png").convert("RGBA"))
+    return bubbles.crop(bubbles.split()[3].getbbox()).resize((size, size), Image.LANCZOS)
+
+
+def plate_gradient(size):
+    grad = Image.linear_gradient("L").resize((size, size), Image.BILINEAR)
+    return Image.merge("RGB", [
         grad.point(lambda v, lo=lo, hi=hi: round(lo + (hi - lo) * v / 255))
         for lo, hi in zip(PLATE_TOP, PLATE_BOTTOM)
-    ] + [plate_mask])
+    ])
+
+
+def bubbles_on(base, bubbles, inset):
+    """Contact shadow + bubbles, as on the macOS plate."""
+    shadow = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    shadow.paste((0, 0, 0, 41), (inset, inset + 6), bubbles.split()[3])
+    base.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(9)))
+    base.alpha_composite(bubbles, (inset, inset))
+
+
+def mobile(assets, outdir):
+    """Square full-bleed icon plus a safe-zone Android adaptive foreground."""
+    icon = plate_gradient(CANVAS).convert("RGBA")
+    inset = round(CANVAS * 0.17)  # keeps the bubbles clear of the iOS corner mask
+    bubbles_on(icon, load_bubbles(assets, CANVAS - 2 * inset), inset)
+    icon.convert("RGB").save(f"{outdir}/icon.png")
+
+    # Android shows only the middle 72/108 of the foreground, so pad to match above.
+    fg_inset = round(CANVAS * (0.5 - (0.5 - 0.17) * 72 / 108))
+    fg = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
+    bubbles_on(fg, load_bubbles(assets, CANVAS - 2 * fg_inset), fg_inset)
+    fg.save(f"{outdir}/adaptive-icon.png")
+    print("wrote", outdir + "/icon.png", outdir + "/adaptive-icon.png")
+
+
+def main(assets, out):
+    plate_mask = squircle(PLATE, int(PLATE * RADIUS_RATIO))
+    plate = plate_gradient(PLATE).convert("RGBA")
+    plate.putalpha(plate_mask)
 
     # rim: darken toward the edge, then a highlight along the top-left
     edge = plate_mask.filter(ImageFilter.GaussianBlur(40))
@@ -61,17 +99,7 @@ def main(assets, out):
 
     # bubbles: source layers are laid out in a 1024 grid, scale into the plate
     inset = int(PLATE * BUBBLE_INSET)
-    inner = PLATE - 2 * inset
-    bubbles = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
-    for name in LAYERS:
-        bubbles.alpha_composite(Image.open(f"{assets}/{name}.png").convert("RGBA"))
-    bubbles = bubbles.crop(bubbles.split()[3].getbbox()).resize((inner, inner), Image.LANCZOS)
-
-    # per-bubble contact shadow (icon.json: neutral, 0.16)
-    shadow = Image.new("RGBA", (PLATE, PLATE), (0, 0, 0, 0))
-    shadow.paste((0, 0, 0, 41), (inset, inset + 6), bubbles.split()[3])
-    plate.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(9)))
-    plate.alpha_composite(bubbles, (inset, inset))
+    bubbles_on(plate, load_bubbles(assets, PLATE - 2 * inset), inset)
 
     icon = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     x = (CANVAS - PLATE) // 2
@@ -85,4 +113,7 @@ def main(assets, out):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:3])
+    if sys.argv[1:2] == ["--mobile"]:
+        mobile(*sys.argv[2:4])
+    else:
+        main(*sys.argv[1:3])
