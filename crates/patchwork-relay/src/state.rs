@@ -31,6 +31,12 @@ pub struct PendingUpload {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Default)]
+pub struct RunDestination {
+    pub parent_id: Option<Id>,
+    pub reply_to_id: Option<Id>,
+}
+
 pub enum PreviewSocketEvent {
     Ready(Option<String>),
     Data { data: String, binary: bool },
@@ -53,11 +59,11 @@ pub struct AppState {
     pub question_waiters: RwLock<HashMap<Id, Vec<oneshot::Sender<Question>>>>,
     /// Replies still being written, by run: the message the next delta rewrites.
     pub streaming_messages: RwLock<HashMap<Id, Id>>,
-    /// Where each live run is talking: the thread it was asked in, or `None`
-    /// for the channel itself. A follow-up can move it, which is why this is
-    /// not read off the run's trigger. Runs do not outlive the process, so
-    /// neither does this.
-    pub run_threads: RwLock<HashMap<Id, Option<Id>>>,
+    /// Where each live run is talking. One value keeps thread and inline reply
+    /// destinations atomic while a follow-up moves the conversation.
+    pub run_destinations: RwLock<HashMap<Id, RunDestination>>,
+    /// A queued follow-up changes the destination only when its ACP turn starts.
+    pub control_destinations: RwLock<HashMap<Id, RunDestination>>,
     /// Short-lived capabilities for execution hosts fetching attached files.
     pub file_grants: StdMutex<HashMap<Id, (Id, Millis)>>,
     /// Browser-loadable preview URLs cannot carry a bearer header on every asset.
@@ -104,7 +110,8 @@ impl AppState {
             presence: RwLock::new(HashMap::new()),
             question_waiters: RwLock::new(HashMap::new()),
             streaming_messages: RwLock::new(HashMap::new()),
-            run_threads: RwLock::new(HashMap::new()),
+            run_destinations: RwLock::new(HashMap::new()),
+            control_destinations: RwLock::new(HashMap::new()),
             file_grants: StdMutex::new(HashMap::new()),
             preview_grants: StdMutex::new(HashMap::new()),
             preview_waiters: RwLock::new(HashMap::new()),

@@ -94,6 +94,13 @@ export const ThreadIcon = (props: IconProps) => (
   </Svg>
 );
 
+export const ReplyIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <path d="m9 7-5 5 5 5" />
+    <path d="M4 12h9a6 6 0 0 1 6 6" />
+  </Svg>
+);
+
 export const ReactIcon = (props: IconProps) => (
   <Svg {...props}>
     <circle cx="12" cy="12" r="8.2" />

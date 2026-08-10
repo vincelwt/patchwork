@@ -87,6 +87,7 @@ impl Store {
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE tasks ADD COLUMN review_action TEXT",
@@ -715,6 +716,8 @@ impl Store {
             body: row.get("body")?,
             card: json_col(row, "card"),
             parent_id: row.get("parent_id")?,
+            reply_to_id: row.get("reply_to_id")?,
+            reply_to: None,
             reply_count: row.get::<_, i64>("reply_count")? as u32,
             last_reply_at: row.get("last_reply_at")?,
             run_id: row.get("run_id")?,
@@ -731,8 +734,8 @@ impl Store {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, run_id, task_id, mentions, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, reply_to_id, run_id, task_id, mentions, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 message.id,
                 message.channel_id,
@@ -746,6 +749,7 @@ impl Store {
                 message.body,
                 message.card.as_ref().map(to_json),
                 message.parent_id,
+                message.reply_to_id,
                 message.run_id,
                 message.task_id,
                 to_json(&message.mentions),
@@ -918,6 +922,8 @@ impl Store {
         let mut reactions =
             conn.prepare("SELECT member_id, emoji FROM reactions WHERE message_id = ?1")?;
         let mut attachments = conn.prepare("SELECT * FROM attachments WHERE message_id = ?1")?;
+        let mut replies =
+            conn.prepare("SELECT id, author_id, body, card FROM messages WHERE id = ?1")?;
         for m in messages.iter_mut() {
             let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let rows = reactions.query_map(params![m.id], |r| {
@@ -933,6 +939,19 @@ impl Store {
 
             let rows = attachments.query_map(params![m.id], |r| Self::attachment_from_row(r))?;
             m.attachments = rows.filter_map(|r| r.ok()).collect();
+
+            if let Some(reply_to_id) = &m.reply_to_id {
+                m.reply_to = replies
+                    .query_row(params![reply_to_id], |row| {
+                        Ok(ReplyPreview {
+                            id: row.get("id")?,
+                            author_id: row.get("author_id")?,
+                            body: row.get("body")?,
+                            card: json_col(row, "card"),
+                        })
+                    })
+                    .optional()?;
+            }
         }
         Ok(())
     }
@@ -3153,6 +3172,70 @@ mod tests {
     }
 
     #[test]
+    fn inline_replies_stay_in_the_timeline_without_becoming_threads() {
+        let (store, path) = store();
+        store
+            .insert_channel(&Channel {
+                id: "channel".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "general".into(),
+                name: "General".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+        let source = Message {
+            id: "m1".into(),
+            channel_id: "channel".into(),
+            author_id: "agent".into(),
+            kind: MessageKind::Text,
+            body: "First".into(),
+            card: None,
+            parent_id: None,
+            reply_to_id: None,
+            reply_to: None,
+            reply_count: 0,
+            last_reply_at: 0,
+            run_id: None,
+            task_id: None,
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+            reactions: Vec::new(),
+            created_at: 1,
+            edited_at: None,
+        };
+        let mut reply = source.clone();
+        reply.id = "m2".into();
+        reply.author_id = "human".into();
+        reply.body = "Second".into();
+        reply.reply_to_id = Some(source.id.clone());
+        reply.created_at = 2;
+        store.insert_message(&source).unwrap();
+        store.insert_message(&reply).unwrap();
+
+        let (timeline, _) = store.messages("channel", None, 10).unwrap();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+        assert_eq!(timeline[1].reply_to_id.as_deref(), Some("m1"));
+        assert_eq!(timeline[1].reply_to.as_ref().unwrap().body, "First");
+        assert!(store.thread("m1").unwrap().is_empty());
+        assert_eq!(store.message("m1").unwrap().unwrap().reply_count, 0);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn a_task_message_pins_its_attachment_to_both_records() {
         let (store, path) = store();
         store
@@ -3194,6 +3277,8 @@ mod tests {
                 body: String::new(),
                 card: None,
                 parent_id: None,
+                reply_to_id: None,
+                reply_to: None,
                 reply_count: 0,
                 last_reply_at: 0,
                 run_id: None,

@@ -88,6 +88,8 @@ pub struct SendMessage {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<Id>,
     #[serde(default)]
     pub kind: Option<MessageKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

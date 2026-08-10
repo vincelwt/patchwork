@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS messages (
   body          TEXT NOT NULL DEFAULT '',
   card          TEXT,
   parent_id     TEXT,
+  reply_to_id   TEXT,
   run_id        TEXT,
   task_id       TEXT,
   mentions      TEXT NOT NULL DEFAULT '[]',

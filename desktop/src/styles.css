@@ -658,6 +658,28 @@ body.resizing {
 .message-body {
   overflow-wrap: anywhere;
 }
+.reply-reference {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 2px 0 3px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+.reply-reference svg,
+.reply-reference .name {
+  flex: none;
+}
+.reply-reference .name {
+  color: var(--text-muted);
+  font-weight: 550;
+}
+.reply-reference .preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* Low-level activity — an agent's status note, a workspace event — reads as a
    quiet single line, never as somebody talking. */
@@ -1104,6 +1126,28 @@ body.resizing {
 }
 .composer:focus-within {
   border-color: var(--tint-strong);
+}
+.composer-reply {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding-bottom: 5px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+}
+.composer-reply .label {
+  color: var(--text-muted);
+  font-weight: 550;
+  flex: none;
+}
+.composer-reply .preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-reply .icon-button {
+  margin-left: auto;
 }
 .composer textarea {
   border: none;

@@ -59,6 +59,22 @@ function message(index: number): Message {
   };
 }
 
+test("inline replies stay in the channel timeline", () => {
+  let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");
+  state = { ...state, messages: { c1: [] } };
+  const reply = { ...message(2), reply_to_id: "m1" };
+
+  state = applyEnvelope(state, {
+    seq: 11,
+    at: 2,
+    kind: "message_created",
+    message: reply,
+  } as Envelope);
+
+  assert.deepEqual(state.messages.c1, [reply]);
+  assert.deepEqual(state.threads, {});
+});
+
 test("events stay monotonic and the restart cache stays bounded", () => {
   let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");
   state = {

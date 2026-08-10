@@ -106,6 +106,13 @@ export interface Reaction {
   member_ids: Id[];
 }
 
+export interface ReplyPreview {
+  id: Id;
+  author_id: Id;
+  body: string;
+  card?: MessageCard;
+}
+
 export interface Message {
   id: Id;
   channel_id: Id;
@@ -114,6 +121,8 @@ export interface Message {
   body: string;
   card?: MessageCard;
   parent_id?: Id;
+  reply_to_id?: Id;
+  reply_to?: ReplyPreview;
   reply_count: number;
   last_reply_at: Millis;
   run_id?: Id;
@@ -266,6 +275,7 @@ export type RunStatus =
 
 export type RunTrigger =
   | { type: "mention"; message_id: Id }
+  | { type: "reply"; message_id: Id }
   | { type: "direct_message"; message_id: Id }
   | { type: "task_assignment"; task_id: Id }
   | { type: "manual"; by: Id }

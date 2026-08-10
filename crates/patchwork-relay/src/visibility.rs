@@ -118,6 +118,8 @@ mod tests {
                     body: "secret".into(),
                     card: None,
                     parent_id: None,
+                    reply_to_id: None,
+                    reply_to: None,
                     reply_count: 0,
                     last_reply_at: 0,
                     run_id: None,

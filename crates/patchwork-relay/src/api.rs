@@ -825,6 +825,22 @@ async fn send_message(
         return Err(ApiError::bad_request("nothing to post"));
     }
     require_channel_access(&state, &caller, &id)?;
+    if input.parent_id.is_some() && input.reply_to_id.is_some() {
+        return Err(ApiError::bad_request(
+            "a message cannot be both an inline reply and a thread reply",
+        ));
+    }
+    if let Some(reply_to_id) = &input.reply_to_id {
+        let source = state
+            .store
+            .message(reply_to_id)?
+            .ok_or_else(|| ApiError::bad_request("reply target not found"))?;
+        if source.channel_id != id {
+            return Err(ApiError::bad_request(
+                "reply target belongs to another conversation",
+            ));
+        }
+    }
     let message = orchestrator::post_message(
         &state,
         &id,
@@ -2751,6 +2767,108 @@ mod tests {
             byte_range("bytes=0-", DOWNLOAD_CHUNK_SIZE * 2),
             Some((0, DOWNLOAD_CHUNK_SIZE - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn inline_replies_reject_threads_and_other_conversations() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-reply-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let human = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Online,
+        };
+        store.insert_member(&human).unwrap();
+        for id in ["one", "two"] {
+            store
+                .insert_channel(&Channel {
+                    id: id.into(),
+                    kind: ChannelKind::Channel,
+                    section_id: None,
+                    slug: id.into(),
+                    name: id.into(),
+                    topic: String::new(),
+                    position: 0.0,
+                    created_at: 1,
+                    member_ids: Vec::new(),
+                    task_id: None,
+                    last_message_at: 0,
+                })
+                .unwrap();
+        }
+        store
+            .insert_message(&Message {
+                id: "source".into(),
+                channel_id: "two".into(),
+                author_id: human.id.clone(),
+                kind: MessageKind::Text,
+                body: "Source".into(),
+                card: None,
+                parent_id: None,
+                reply_to_id: None,
+                reply_to: None,
+                reply_count: 0,
+                last_reply_at: 0,
+                run_id: None,
+                task_id: None,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+                reactions: Vec::new(),
+                created_at: 1,
+                edited_at: None,
+            })
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let caller = || Caller {
+            member: human.clone(),
+            run_id: None,
+            token_hash: "token".into(),
+            token_kind: "device".into(),
+        };
+
+        let both = send_message(
+            State(state.clone()),
+            caller(),
+            Path("one".into()),
+            Json(SendMessage {
+                body: "Both".into(),
+                parent_id: Some("source".into()),
+                reply_to_id: Some("source".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(both.status, axum::http::StatusCode::BAD_REQUEST);
+
+        let cross_channel = send_message(
+            State(state),
+            caller(),
+            Path("one".into()),
+            Json(SendMessage {
+                body: "Cross channel".into(),
+                reply_to_id: Some("source".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cross_channel.status, axum::http::StatusCode::BAD_REQUEST);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
