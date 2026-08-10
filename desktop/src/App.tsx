@@ -239,6 +239,11 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
     error: data.error,
     live: data.live,
   }));
+  const settings = useSettings();
+  const activeWorkspaceId = settings?.active || settings?.workspaces[0]?.id;
+  const otherWorkspaces =
+    settings?.workspaces.filter((workspace) => workspace.id !== activeWorkspaceId) ??
+    [];
   const [view, setView] = useState<View>({ kind: "inbox" });
   const [inspector, setInspector] = useState<InspectorState>(null);
   const [toast, setToast] = useState<{
@@ -329,9 +334,21 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
             <Spinner size={13} />
             Retrying…
           </p>
-          <button className="button quiet" style={{ marginTop: 16 }} onClick={onSignOut}>
-            Use a different workspace
-          </button>
+          {otherWorkspaces.length > 0 && (
+            <div
+              style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap" }}
+            >
+              {otherWorkspaces.map((workspace) => (
+                <button
+                  key={workspace.id}
+                  className="button quiet"
+                  onClick={() => void switchTo(workspace.id)}
+                >
+                  Use {workspace.name}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );

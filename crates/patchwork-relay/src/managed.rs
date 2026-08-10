@@ -126,7 +126,7 @@ impl Connector {
 async fn run_forever(broker_url: String, local_url: String, identity: Identity) {
     let mut delay = Duration::from_secs(1);
     loop {
-        match run_once(&broker_url, &local_url, &identity).await {
+        match run_once(&broker_url, &local_url, &identity, &mut delay).await {
             Ok(()) => tracing::warn!("managed relay connection closed"),
             Err(err) => tracing::warn!(?err, "managed relay connection failed"),
         }
@@ -135,7 +135,12 @@ async fn run_forever(broker_url: String, local_url: String, identity: Identity) 
     }
 }
 
-async fn run_once(broker_url: &str, local_url: &str, identity: &Identity) -> Result<()> {
+async fn run_once(
+    broker_url: &str,
+    local_url: &str,
+    identity: &Identity,
+    retry_delay: &mut Duration,
+) -> Result<()> {
     let mut url = reqwest::Url::parse(broker_url)?;
     url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
         .map_err(|_| anyhow::anyhow!("invalid managed relay scheme"))?;
@@ -150,6 +155,7 @@ async fn run_once(broker_url: &str, local_url: &str, identity: &Identity) -> Res
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .context("could not connect to managed relay")?;
+    *retry_delay = Duration::from_secs(1);
     tracing::info!(public = %format!("{broker_url}/r/{}", identity.relay_id), "managed relay connected");
 
     let (mut writer, mut reader) = socket.split();
@@ -473,6 +479,35 @@ fn identity_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_connected_relay_retries_immediately_after_a_later_reset() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap();
+        });
+        let identity = Identity {
+            relay_id: "a".repeat(32),
+            host_token: "b".repeat(43),
+        };
+        let mut delay = Duration::from_secs(20);
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_once(
+                &format!("http://{address}"),
+                "http://127.0.0.1:1",
+                &identity,
+                &mut delay,
+            ),
+        )
+        .await;
+
+        assert_eq!(delay, Duration::from_secs(1));
+        server.await.unwrap();
+    }
 
     #[test]
     fn identity_is_stable_private_and_targets_stay_local() {
