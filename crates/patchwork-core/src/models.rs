@@ -894,11 +894,14 @@ pub enum AutomationTrigger {
         #[serde(default)]
         include_agents: bool,
     },
-    /// A task entering a status.
+    /// A task entering a status. With `task_id`, one named task, which is how
+    /// an agent waits for work it started to finish.
     TaskStatus {
         status: TaskStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<Id>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<Id>,
     },
     /// A task being assigned to the automation's agent.
     TaskAssigned,

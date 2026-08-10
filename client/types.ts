@@ -409,7 +409,7 @@ export type AutomationTrigger =
       pattern: string;
       include_agents: boolean;
     }
-  | { type: "task_status"; status: TaskStatus; project_id?: Id }
+  | { type: "task_status"; status: TaskStatus; project_id?: Id; task_id?: Id }
   | { type: "task_assigned" }
   | { type: "pull_request"; on_review_comment: boolean; on_checks_failed: boolean }
   | { type: "webhook"; token: string }

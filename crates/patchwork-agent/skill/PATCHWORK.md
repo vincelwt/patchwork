@@ -117,6 +117,8 @@ patchwork task list --status running
 patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
+patchwork task create --title "Cache the pricing endpoint" \
+  --outcome "p95 under 100ms" --owner @me --start   # take it yourself
 patchwork task update PW-14 --status review --evidence test-results.txt \
   --approval "Approve and deploy app"
 patchwork evidence list
@@ -132,6 +134,21 @@ when the task is complete, using the shortest text that unambiguously defines
 done. The triggering request, context, plan, investigation, progress, result,
 and evidence belong in the discussion or attachments, not in the outcome.
 Change the outcome only when the agreed definition of done changes.
+
+Create it before you start, not after: anything that leaves something durable
+behind gets its task before the first change, and a message that reads like a
+go-ahead is the moment to create it. A conversation is for talking about work,
+not doing it, so take the work yourself and continue in the task's own run:
+
+```bash
+patchwork task create --title "Cache the pricing endpoint" \
+  --outcome "p95 under 100ms" --owner @me --start
+```
+
+`--owner @me` is you, and `--start` opens the task's own run and worktree.
+Answer in the conversation, then leave a line saying which task took over.
+Work that begins and ends in the conversation, an answer or a lookup, still
+needs no task.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
@@ -277,6 +294,20 @@ patchwork automation create --name "Failed signups" --agent @dev-agent \
   --action create-task --instructions "Find the cause of what the scan found."
 ```
 
+**Waiting for a task.** `--task` narrows a task-status trigger to one task, so
+you can hand work off, or start it in its own run, and still be woken when it
+lands instead of watching it:
+
+```bash
+patchwork automation create --name "PW-14 follow-up" --agent @me \
+  --trigger task-status --status done --task PW-14 --action post-in-chat \
+  --instructions "Say here what PW-14 changed, and what is left."
+```
+
+It reports back in the conversation you created it from, fires once, and turns
+itself off. Without `--task` the same trigger watches every task in the
+workspace.
+
 **Webhooks.** `POST {url}` with any JSON body; it becomes the trigger payload.
 Add `?once=your-key` and a redelivery of the same event is dropped instead of
 acting twice, so whatever calls it is free to retry.
@@ -314,6 +345,10 @@ need to copy the conversation into the instructions.
 You are already in the task's folder or git worktree. It belongs to the task,
 so a later run can continue exactly where you stopped. `git` and `gh` work
 normally; commit and open pull requests as you would anywhere else.
+
+A run with no task has no checkout: its working directory is an empty scratch
+folder that nothing keeps and nobody can review. Work that needs the
+repository needs its task first.
 
 ## Working next to another agent
 

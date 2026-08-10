@@ -58,7 +58,8 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
       case "message":
         return { type: "message", channel_id: channelId, pattern: pattern.trim(), include_agents: includeAgents };
       case "task_status":
-        return { type: "task_status", status: taskStatus, project_id: projectId || undefined };
+        // A listener scoped to one task keeps its task when edited here.
+        return { type: "task_status", status: taskStatus, project_id: projectId || undefined, task_id: automation?.trigger.type === "task_status" ? automation.trigger.task_id : undefined };
       case "task_assigned":
         return { type: "task_assigned" };
       case "pull_request":
