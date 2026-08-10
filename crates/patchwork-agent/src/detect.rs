@@ -11,6 +11,7 @@
 //! [`refresh_capabilities`] pays the cost again.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -449,14 +450,84 @@ fn refresh_in_flight() -> &'static std::sync::atomic::AtomicBool {
     &IN_FLIGHT
 }
 
-fn discover_system_skills() -> Vec<SystemSkill> {
+fn system_skill_roots() -> Vec<(PathBuf, bool)> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    discover_system_skills_in(&[
+    vec![
         (home.join(".pi/agent/skills"), true),
         (home.join(".agents/skills"), false),
-    ])
+    ]
+}
+
+fn discover_system_skills() -> Vec<SystemSkill> {
+    discover_system_skills_in(&system_skill_roots())
+}
+
+/// Replace one discovered skill atomically. The path must already be in the
+/// global skill directories, so this cannot become an arbitrary file editor.
+pub async fn update_system_skill(
+    path: &str,
+    previous_content: &str,
+    content: &str,
+) -> Result<Vec<SystemSkill>, String> {
+    let skills = update_system_skill_in(&system_skill_roots(), path, previous_content, content)?;
+    if let Some((capabilities, _)) = capability_cache().write().await.as_mut() {
+        capabilities.system_skills = skills.clone();
+    }
+    Ok(skills)
+}
+
+fn update_system_skill_in(
+    roots: &[(PathBuf, bool)],
+    path: &str,
+    previous_content: &str,
+    content: &str,
+) -> Result<Vec<SystemSkill>, String> {
+    const MAX_SYSTEM_SKILL_BYTES: usize = 256 * 1024;
+    if content.len() > MAX_SYSTEM_SKILL_BYTES {
+        return Err("system skills are limited to 256 KB".into());
+    }
+
+    let current = discover_system_skills_in(roots);
+    let installed = current
+        .iter()
+        .find(|skill| skill.path == path)
+        .ok_or_else(|| "that skill is not installed on this machine".to_string())?;
+    if installed.content != previous_content {
+        return Err("that skill changed after it was opened; close it and try again".into());
+    }
+    let path = PathBuf::from(path);
+    let updated = parse_system_skill_text(&path, content)
+        .ok_or_else(|| "a system skill needs name and description frontmatter".to_string())?;
+    if current
+        .iter()
+        .any(|skill| skill.path != updated.path && skill.name == updated.name)
+    {
+        return Err("another system skill already uses that name".into());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the system skill path is invalid".to_string())?;
+    let temporary = path.with_file_name(format!(".{file_name}.patchwork-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.set_permissions(std::fs::metadata(&path)?.permissions())?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("could not save the system skill: {error}"));
+    }
+
+    Ok(discover_system_skills_in(roots))
 }
 
 fn discover_system_skills_in(roots: &[(PathBuf, bool)]) -> Vec<SystemSkill> {
@@ -508,17 +579,31 @@ fn collect_skill_files(
 
 fn parse_system_skill(path: &Path) -> Option<SystemSkill> {
     let text = std::fs::read_to_string(path).ok()?;
+    parse_system_skill_text(path, &text)
+}
+
+fn parse_system_skill_text(path: &Path, text: &str) -> Option<SystemSkill> {
     let mut lines = text.lines();
     if lines.next()?.trim() != "---" {
         return None;
     }
-    let frontmatter = lines
-        .take_while(|line| line.trim() != "---")
-        .collect::<Vec<_>>();
+    let mut frontmatter = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if line.trim() == "---" {
+            closed = true;
+            break;
+        }
+        frontmatter.push(line);
+    }
+    if !closed {
+        return None;
+    }
     Some(SystemSkill {
         name: frontmatter_field(&frontmatter, "name")?,
         description: frontmatter_field(&frontmatter, "description")?,
         path: path.to_string_lossy().to_string(),
+        content: text.to_string(),
     })
 }
 
@@ -665,6 +750,43 @@ mod tests {
                 ("release", "Ship releases"),
             ]
         );
+        assert!(skills[0].content.contains("Build mobile apps"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn only_discovered_system_skills_can_be_updated() {
+        let base = std::env::temp_dir().join(format!("patchwork-skills-{}", uuid::Uuid::new_v4()));
+        let root = base.join("skills");
+        let path = root.join("safe/SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nname: safe\ndescription: Before\n---\n\nOld instructions\n",
+        )
+        .unwrap();
+        let roots = [(root, false)];
+        let content = "---\nname: safe\ndescription: After\n---\n\nNew instructions\n";
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let skills =
+            update_system_skill_in(&roots, path.to_str().unwrap(), &before, content).unwrap();
+        assert_eq!(skills[0].description, "After");
+        assert_eq!(skills[0].content, content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        assert!(update_system_skill_in(&roots, "/tmp/not-a-skill.md", "", content).is_err());
+        assert!(update_system_skill_in(&roots, path.to_str().unwrap(), &before, content).is_err());
+        assert!(
+            update_system_skill_in(&roots, path.to_str().unwrap(), content, "not a skill").is_err()
+        );
+        assert!(update_system_skill_in(
+            &roots,
+            path.to_str().unwrap(),
+            content,
+            "---\nname: safe\ndescription: missing closing frontmatter",
+        )
+        .is_err());
+
         std::fs::remove_dir_all(base).unwrap();
     }
 }

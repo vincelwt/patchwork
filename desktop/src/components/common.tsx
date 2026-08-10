@@ -220,6 +220,7 @@ export function Field({
   textarea,
   autoFocus,
   inputRef,
+  readOnly,
   type = "text",
 }: {
   label: string;
@@ -229,6 +230,7 @@ export function Field({
   textarea?: boolean;
   autoFocus?: boolean;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+  readOnly?: boolean;
   type?: string;
 }) {
   const id = useId();
@@ -244,6 +246,7 @@ export function Field({
           value={value}
           placeholder={placeholder}
           autoFocus={autoFocus}
+          readOnly={readOnly}
           onChange={(event) => onChange(event.target.value)}
         />
       ) : (
@@ -255,6 +258,7 @@ export function Field({
           value={value}
           placeholder={placeholder}
           autoFocus={autoFocus}
+          readOnly={readOnly}
           onChange={(event) => onChange(event.target.value)}
         />
       )}

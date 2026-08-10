@@ -253,6 +253,7 @@ pub fn router(state: Shared) -> Router {
             patch(update_project).delete(delete_project),
         )
         .route("/api/hosts", get(list_hosts))
+        .route("/api/hosts/{id}/skills", patch(update_system_skill))
         // automations
         .route(
             "/api/automations",
@@ -1888,6 +1889,77 @@ async fn delete_skill(
 // ---------------------------------------------------------------------------
 // projects and hosts
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct UpdateSystemSkillInput {
+    path: String,
+    previous_content: String,
+    content: String,
+}
+
+async fn update_system_skill(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(host_id): Path<Id>,
+    Json(input): Json<UpdateSystemSkillInput>,
+) -> ApiResult<Json<SystemSkill>> {
+    const MAX_SYSTEM_SKILL_BYTES: usize = 256 * 1024;
+    caller.require_device()?;
+    caller.require_admin()?;
+    if input.content.len() > MAX_SYSTEM_SKILL_BYTES {
+        return Err(ApiError::bad_request("system skills are limited to 256 KB"));
+    }
+    if input.content.trim().is_empty() {
+        return Err(ApiError::bad_request("a system skill cannot be empty"));
+    }
+    let host = state
+        .store
+        .host(&host_id)?
+        .ok_or_else(|| ApiError::not_found("no such execution machine"))?;
+    if !host
+        .capabilities
+        .system_skills
+        .iter()
+        .any(|skill| skill.path == input.path)
+    {
+        return Err(ApiError::not_found("no such system skill on that machine"));
+    }
+
+    let request_id = new_id();
+    let (reply, wait) = tokio::sync::oneshot::channel();
+    state.system_skill_waiters.write().await.insert(
+        request_id.clone(),
+        crate::state::SystemSkillWaiter {
+            host_id: host_id.clone(),
+            reply,
+        },
+    );
+    if !state
+        .send_to_host(
+            &host_id,
+            RelayToHost::UpdateSystemSkill {
+                request_id: request_id.clone(),
+                path: input.path,
+                previous_content: input.previous_content,
+                content: input.content,
+            },
+        )
+        .await
+    {
+        state.system_skill_waiters.write().await.remove(&request_id);
+        return Err(ApiError::conflict("that execution machine is offline"));
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(15), wait).await {
+        Ok(Ok(Ok(skill))) => Ok(Json(skill)),
+        Ok(Ok(Err(error))) => Err(ApiError::conflict(error)),
+        Ok(Err(_)) => Err(ApiError::conflict("the execution machine disconnected")),
+        Err(_) => {
+            state.system_skill_waiters.write().await.remove(&request_id);
+            Err(ApiError::conflict("the execution machine did not answer"))
+        }
+    }
+}
 
 async fn list_projects(State(state): State<Shared>, _c: Caller) -> ApiResult<Json<Vec<Project>>> {
     Ok(Json(state.store.projects()?))

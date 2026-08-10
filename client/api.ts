@@ -26,6 +26,7 @@ import type {
   RunDetail,
   SearchResults,
   Section,
+  SystemSkill,
   Task,
   TaskDetail,
   TaskStatus,
@@ -297,6 +298,14 @@ export class Api {
 
   hosts() {
     return this.get<Host[]>("/api/hosts");
+  }
+
+  updateSystemSkill(hostId: Id, path: string, previousContent: string, content: string) {
+    return this.patch<SystemSkill>(`/api/hosts/${hostId}/skills`, {
+      path,
+      previous_content: previousContent,
+      content,
+    });
   }
 
   automations() {

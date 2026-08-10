@@ -203,6 +203,12 @@ pub enum RelayToHost {
     StopPreview {
         preview_id: Id,
     },
+    UpdateSystemSkill {
+        request_id: Id,
+        path: String,
+        previous_content: String,
+        content: String,
+    },
     Ping,
 }
 
@@ -337,6 +343,14 @@ pub enum HostToRelay {
     },
     PreviewSocketClose {
         socket_id: Id,
+    },
+    SystemSkillUpdated {
+        request_id: Id,
+        path: String,
+        #[serde(default)]
+        skills: Vec<SystemSkill>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Pong {
         at: Millis,

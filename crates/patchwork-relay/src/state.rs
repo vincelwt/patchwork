@@ -50,6 +50,11 @@ pub struct PreviewReply {
     pub error: Option<String>,
 }
 
+pub struct SystemSkillWaiter {
+    pub host_id: Id,
+    pub reply: oneshot::Sender<std::result::Result<SystemSkill, String>>,
+}
+
 pub struct AppState {
     pub store: Store,
     pub bus: broadcast::Sender<Envelope>,
@@ -70,6 +75,7 @@ pub struct AppState {
     pub preview_grants: StdMutex<HashMap<Id, (Id, Millis)>>,
     /// HTTP requests currently travelling to an execution host.
     pub preview_waiters: RwLock<HashMap<Id, oneshot::Sender<PreviewReply>>>,
+    pub system_skill_waiters: RwLock<HashMap<Id, SystemSkillWaiter>>,
     pub preview_sockets: RwLock<HashMap<Id, mpsc::UnboundedSender<PreviewSocketEvent>>>,
     pub uploads: Mutex<HashMap<Id, PendingUpload>>,
     pub files_dir: PathBuf,
@@ -115,6 +121,7 @@ impl AppState {
             file_grants: StdMutex::new(HashMap::new()),
             preview_grants: StdMutex::new(HashMap::new()),
             preview_waiters: RwLock::new(HashMap::new()),
+            system_skill_waiters: RwLock::new(HashMap::new()),
             preview_sockets: RwLock::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             files_dir,

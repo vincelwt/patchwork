@@ -151,6 +151,25 @@ impl Runner {
             RelayToHost::PreviewSocketClose { socket_id } => {
                 self.previews.close_socket(&socket_id).await;
             }
+            RelayToHost::UpdateSystemSkill {
+                request_id,
+                path,
+                previous_content,
+                content,
+            } => match detect::update_system_skill(&path, &previous_content, &content).await {
+                Ok(skills) => self.emit(HostToRelay::SystemSkillUpdated {
+                    request_id,
+                    path,
+                    skills,
+                    error: None,
+                }),
+                Err(error) => self.emit(HostToRelay::SystemSkillUpdated {
+                    request_id,
+                    path,
+                    skills: Vec::new(),
+                    error: Some(error),
+                }),
+            },
             RelayToHost::Ping => {
                 self.emit(HostToRelay::Pong {
                     at: patchwork_core::now_ms(),

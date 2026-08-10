@@ -63,6 +63,7 @@ import type {
   Project,
   RuntimeInstallation,
   RuntimeOption,
+  SystemSkill,
   WorkspaceSkill,
 } from "@client/types";
 
@@ -825,9 +826,12 @@ export function AgentModal({
 
 // --- workspace skills -------------------------------------------------------
 
+type LocatedSystemSkill = SystemSkill & { machine: string; hostId: Id };
+
 export function SkillsPage() {
   const app = useApp();
   const [editing, setEditing] = useState<WorkspaceSkill | null>(null);
+  const [editingSystem, setEditingSystem] = useState<LocatedSystemSkill | null>(null);
   const [creating, setCreating] = useState(false);
   const systemSkills = distinctMachines(app.hosts).flatMap((machine) =>
     (machine.host.capabilities.system_skills ?? []).map((skill) => ({
@@ -886,7 +890,12 @@ export function SkillsPage() {
           </div>
         ) : (
           systemSkills.map((skill) => (
-            <div className="row" key={`${skill.hostId}:${skill.path}`} title={skill.path}>
+            <button
+              className="row"
+              key={`${skill.hostId}:${skill.path}`}
+              title={skill.path}
+              onClick={() => setEditingSystem(skill)}
+            >
               <span style={{ color: "var(--text-muted)", display: "flex" }}>
                 <FileIcon />
               </span>
@@ -895,7 +904,7 @@ export function SkillsPage() {
                 <span className="sub">{skill.description || skill.path}</span>
               </span>
               <Chip>{skill.machine}</Chip>
-            </div>
+            </button>
           ))
         )}
       </Section>
@@ -909,7 +918,85 @@ export function SkillsPage() {
           }}
         />
       )}
+      {editingSystem && (
+        <SystemSkillModal
+          skill={editingSystem}
+          editable={app.me?.is_admin ?? false}
+          onClose={() => setEditingSystem(null)}
+        />
+      )}
     </Page>
+  );
+}
+
+function SystemSkillModal({
+  skill,
+  editable,
+  onClose,
+}: {
+  skill: LocatedSystemSkill;
+  editable: boolean;
+  onClose: () => void;
+}) {
+  const api = useApi();
+  const original = skill.content ?? "";
+  const [content, setContent] = useState(original);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateSystemSkill(skill.hostId, skill.path, original, content);
+      onClose();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      wide
+      title={skill.name}
+      subtitle={`${skill.machine} · ${skill.path}`}
+      onClose={onClose}
+      actions={
+        <>
+          <span className="spacer" />
+          <button className="button quiet" onClick={onClose}>
+            {editable ? "Cancel" : "Close"}
+          </button>
+          {editable && (
+            <button
+              className="button primary"
+              disabled={busy || !content.trim() || content === original}
+              onClick={() => void save()}
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+          )}
+        </>
+      }
+    >
+      <div className="skill-instructions">
+        <Field
+          label="Full skill content"
+          value={content}
+          onChange={setContent}
+          textarea
+          autoFocus={editable}
+          readOnly={!editable}
+        />
+      </div>
+      <span className="form-help">
+        {editable
+          ? "Saved on this execution machine and used by future agent runs."
+          : "Only workspace administrators can edit execution-machine skills."}
+      </span>
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
   );
 }
 
