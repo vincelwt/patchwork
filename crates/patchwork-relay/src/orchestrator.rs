@@ -820,6 +820,27 @@ pub async fn post_system(state: &Shared, channel_id: &str, body: &str) -> Result
     .await
 }
 
+/// Something meant to be read rather than glanced at. A workspace event is a
+/// quiet one-line activity row with no markdown; quoted review feedback needs
+/// the ordinary message body, where headings, quotes and code render.
+pub async fn post_note(state: &Shared, channel_id: &str, body: &str) -> Result<Message> {
+    let system_id = system_member_id(state)?;
+    post_message(
+        state,
+        channel_id,
+        &system_id,
+        SendMessage {
+            body: body.to_string(),
+            ..Default::default()
+        },
+        PostOptions {
+            trigger_agents: false,
+            run_id: None,
+        },
+    )
+    .await
+}
+
 fn system_member_id(state: &Shared) -> Result<Id> {
     Ok(state
         .store
@@ -874,7 +895,12 @@ fn peer_line(members: &[Member], run: &Run) -> String {
 
 /// Tell everyone else on this task that the company changed. It arrives as a
 /// queued turn in their existing session, so nobody is interrupted mid-edit.
-async fn tell_task_peers(state: &Shared, task_id: &str, except_run_id: &str, body: String) {
+pub(crate) async fn tell_task_peers(
+    state: &Shared,
+    task_id: &str,
+    except_run_id: &str,
+    body: String,
+) {
     let peers = match task_peers(state, task_id, except_run_id) {
         Ok(peers) => peers,
         Err(err) => {

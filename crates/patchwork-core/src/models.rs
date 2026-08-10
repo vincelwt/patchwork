@@ -445,6 +445,10 @@ pub struct PullRequestState {
     pub checks: String,
     #[serde(default)]
     pub review: String,
+    /// Newest comment or review already reported into the task, as GitHub's own
+    /// ISO 8601 timestamp. Empty until the first poll sees the thread.
+    #[serde(default)]
+    pub last_feedback_at: String,
     pub updated_at: Millis,
 }
 
@@ -907,6 +911,7 @@ pub enum AutomationTrigger {
     TaskAssigned,
     /// Pull request activity on a task.
     PullRequest {
+        /// Any new comment, review or line note on the pull request.
         #[serde(default)]
         on_review_comment: bool,
         #[serde(default)]
