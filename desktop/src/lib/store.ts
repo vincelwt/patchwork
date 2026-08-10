@@ -24,6 +24,7 @@ import type {
   Section,
   Task,
   Workspace,
+  WorkspaceSkill,
 } from "@client/types";
 
 export interface AppData {
@@ -35,6 +36,7 @@ export interface AppData {
   members: Member[];
   sections: Section[];
   channels: Channel[];
+  skills: WorkspaceSkill[];
   projects: Project[];
   hosts: Host[];
   tasks: Task[];
@@ -57,6 +59,7 @@ const EMPTY: AppData = {
   members: [],
   sections: [],
   channels: [],
+  skills: [],
   projects: [],
   hosts: [],
   tasks: [],
@@ -169,6 +172,7 @@ class Session {
       members: bootstrap.members,
       sections: bootstrap.sections,
       channels: bootstrap.channels,
+      skills: bootstrap.skills ?? [],
       projects: bootstrap.projects,
       hosts: bootstrap.hosts,
       tasks: bootstrap.tasks,
@@ -281,6 +285,9 @@ class Session {
         break;
       case "sections_updated":
         this.set({ sections: event.sections });
+        break;
+      case "workspace_skills_updated":
+        this.set({ skills: event.skills });
         break;
       case "member_updated":
         this.set({

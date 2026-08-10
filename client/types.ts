@@ -217,8 +217,15 @@ export interface RuntimeInstallation {
   default_mode?: string;
 }
 
+export interface SystemSkill {
+  name: string;
+  description: string;
+  path: string;
+}
+
 export interface HostCapabilities {
   runtimes: RuntimeInstallation[];
+  system_skills: SystemSkill[];
   has_git: boolean;
   has_gh: boolean;
   gh_authenticated: boolean;
@@ -449,6 +456,15 @@ export interface Preview {
   stopped_at?: Millis;
 }
 
+export interface WorkspaceSkill {
+  id: Id;
+  name: string;
+  description: string;
+  instructions: string;
+  created_at: Millis;
+  updated_at: Millis;
+}
+
 export interface Workspace {
   id: Id;
   name: string;
@@ -482,6 +498,7 @@ export interface Bootstrap {
   members: Member[];
   sections: Section[];
   channels: Channel[];
+  skills: WorkspaceSkill[];
   projects: Project[];
   hosts: Host[];
   tasks: Task[];
@@ -539,6 +556,7 @@ export type Event =
   | { kind: "channel_updated"; channel: Channel }
   | { kind: "channel_deleted"; channel_id: Id }
   | { kind: "sections_updated"; sections: Section[] }
+  | { kind: "workspace_skills_updated"; skills: WorkspaceSkill[] }
   | { kind: "member_updated"; member: Member }
   | { kind: "member_removed"; member_id: Id }
   | { kind: "presence_changed"; member_id: Id; presence: Presence }

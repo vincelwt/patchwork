@@ -49,6 +49,9 @@ pub struct RunSpec {
     /// The agent's public description / personality prompt.
     #[serde(default)]
     pub agent_description: String,
+    /// Workspace-wide instructions available to every agent.
+    #[serde(default)]
+    pub skills: Vec<WorkspaceSkill>,
     /// `codex`, `claude`, `gemini`, `grok`, `opencode`, `pi`, `patchwork`,
     /// `custom`.
     pub runtime: String,

@@ -9,6 +9,7 @@ import {
   AgentIcon,
   AutomationIcon,
   ChevronIcon,
+  FileIcon,
   FolderIcon,
   HashIcon,
   InboxIcon,
@@ -29,6 +30,7 @@ export type Creatable =
   | "channel"
   | "section"
   | "agent"
+  | "skill"
   | "project"
   | "invite";
 
@@ -228,6 +230,12 @@ export function Sidebar({
               label: "Agent",
               hint: "A teammate with a runtime",
               onSelect: () => onCreate("agent"),
+            },
+            {
+              key: "skill",
+              label: "Skill",
+              hint: "Instructions shared with every agent",
+              onSelect: () => onCreate("skill"),
             },
             {
               key: "project",
@@ -505,6 +513,12 @@ function MoreMenu({
             if (hidden.automations) onShow("automations");
             go({ kind: "automations" });
           },
+        },
+        {
+          key: "skills",
+          label: "Skills",
+          icon: <FileIcon />,
+          onSelect: () => go({ kind: "skills" }),
         },
         {
           key: "projects",

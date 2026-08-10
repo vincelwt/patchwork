@@ -32,6 +32,7 @@ const bootstrap: Bootstrap = {
   members: [],
   sections: [],
   channels: [],
+  skills: [],
   projects: [],
   hosts: [],
   tasks: [],
@@ -58,6 +59,26 @@ function message(index: number): Message {
     created_at: index,
   };
 }
+
+test("workspace skills stay current in bootstrap state", () => {
+  const state = applyEnvelope(applyBootstrap(emptyWorkspaceData(), bootstrap), {
+    seq: 11,
+    at: 11,
+    kind: "workspace_skills_updated",
+    skills: [
+      {
+        id: "skill-1",
+        name: "Release checks",
+        description: "Before shipping",
+        instructions: "Run the smoke test.",
+        created_at: 1,
+        updated_at: 1,
+      },
+    ],
+  } as Envelope);
+
+  assert.equal(state.bootstrap?.skills[0]?.name, "Release checks");
+});
 
 test("events stay monotonic and the restart cache stays bounded", () => {
   let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");

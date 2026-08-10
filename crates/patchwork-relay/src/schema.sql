@@ -10,6 +10,15 @@ CREATE TABLE IF NOT EXISTS workspace (
   task_seq    INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS workspace_skills (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  description  TEXT NOT NULL DEFAULT '',
+  instructions TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS members (
   id           TEXT PRIMARY KEY,
   kind         TEXT NOT NULL,               -- human | agent

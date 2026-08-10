@@ -30,6 +30,7 @@ import type {
   TaskDetail,
   TaskStatus,
   Workspace,
+  WorkspaceSkill,
 } from "./types";
 
 export class ApiError extends Error {
@@ -257,6 +258,25 @@ export class Api {
 
   removeMember(id: Id) {
     return this.delete(`/api/members/${id}`);
+  }
+
+  skills() {
+    return this.get<WorkspaceSkill[]>("/api/skills");
+  }
+
+  createSkill(input: Pick<WorkspaceSkill, "name" | "description" | "instructions">) {
+    return this.post<WorkspaceSkill>("/api/skills", input);
+  }
+
+  updateSkill(
+    id: Id,
+    input: Pick<WorkspaceSkill, "name" | "description" | "instructions">,
+  ) {
+    return this.patch<WorkspaceSkill>(`/api/skills/${id}`, input);
+  }
+
+  deleteSkill(id: Id) {
+    return this.delete(`/api/skills/${id}`);
   }
 
   projects() {

@@ -147,6 +147,7 @@ export async function desktopInfo(): Promise<DesktopInfo> {
     hosting_relay: false,
     capabilities: {
       runtimes: [],
+      system_skills: [],
       has_git: false,
       has_gh: false,
       gh_authenticated: false,
