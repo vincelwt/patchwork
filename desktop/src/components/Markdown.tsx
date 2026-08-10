@@ -9,6 +9,8 @@ import type { ReactNode } from "react";
 import { parseBlocks, renderInline } from "../lib/markdown";
 import type { InlineOptions } from "../lib/markdown";
 import { CheckIcon, CopyIcon } from "./icons";
+import { useNavigation } from "./common";
+import { useAppSelector } from "../lib/store";
 
 export const Markdown = memo(function Markdown({
   body,
@@ -23,7 +25,18 @@ export const Markdown = memo(function Markdown({
   compact?: boolean;
 }) {
   const blocks = useMemo(() => parseBlocks(body), [body]);
-  const options: InlineOptions = useMemo(() => ({ handles }), [handles]);
+  const { go } = useNavigation();
+  // Read here rather than handed down: a task key means the same task in every
+  // surface that renders a message, and the list only moves when a task does.
+  const allTasks = useAppSelector((data) => data.tasks);
+  const tasks = useMemo(
+    () => new Map(allTasks.map((task) => [task.key.toUpperCase(), task.id])),
+    [allTasks],
+  );
+  const options: InlineOptions = useMemo(
+    () => ({ handles, tasks, onTask: (id: string) => go({ kind: "task", id }) }),
+    [handles, tasks, go],
+  );
 
   return (
     <div className={`md${compact ? " compact" : ""}${className ? ` ${className}` : ""}`}>
