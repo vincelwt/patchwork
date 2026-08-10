@@ -88,6 +88,18 @@ export function Avatar({
   );
 }
 
+/// Every place that picks a teammate shows the same row: their avatar, their
+/// name, and what they are — on one line, because a list of teammates is long
+/// enough without giving every runtime a line of its own.
+export function memberOption(member: Member) {
+  return {
+    value: member.id,
+    label: member.display_name,
+    tag: member.kind === "agent" ? member.agent?.runtime : "person",
+    icon: <Avatar member={member} size={18} />,
+  };
+}
+
 export function PresenceDot({ presence }: { presence: Presence }) {
   return <span className={`dot ${presence}`} />;
 }

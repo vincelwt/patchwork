@@ -99,6 +99,9 @@ export interface Option {
   value: string;
   label: string;
   hint?: string;
+  /// A word that fits beside the name rather than under it — a runtime, not a
+  /// sentence. Keeps rows one line high in the lists people scan most.
+  tag?: string;
   /// A mark that identifies the option faster than its name does — a runtime's
   /// logo, not decoration. `.menu-icon` is the same leading-icon slot the
   /// popover menus use, so nothing new had to be styled.
@@ -331,7 +334,10 @@ export function Dropdown({
               >
                 {option.icon && <span className="menu-icon">{option.icon}</span>}
                 <span className="grow">
-                  <span className="name">{option.label}</span>
+                  <span className="name">
+                    {option.label}
+                    {option.tag && <span className="tag">{option.tag}</span>}
+                  </span>
                   {option.hint && <span className="sub">{option.hint}</span>}
                 </span>
               </button>

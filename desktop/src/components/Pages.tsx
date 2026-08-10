@@ -20,6 +20,7 @@ import {
   Avatar,
   Chip,
   Field,
+  memberOption,
   Modal,
   plainText,
   useAsync,
@@ -1932,11 +1933,7 @@ export function AutomationModal({
         onChange={setAgentId}
         options={app.members
           .filter((member) => member.kind === "agent")
-          .map((member) => ({
-            value: member.id,
-            label: member.display_name,
-            hint: member.agent?.runtime,
-          }))}
+          .map(memberOption)}
       />
       <FormSelect
         label="Trigger"
