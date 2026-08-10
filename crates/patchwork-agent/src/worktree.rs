@@ -68,39 +68,90 @@ async fn prune_root(root: &Path, in_use: &HashSet<PathBuf>, retention: Duration)
         }
         let path_str = path.to_string_lossy().to_string();
         let git_repo = is_worktree || path.join(".git").exists() || is_git_repo(&path_str).await;
-        let Ok(activity) = most_recent_activity(&path, git_repo).await else {
+        let mut git_repos = git_repo
+            .then_some(path.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !git_repo {
+            let Ok(children) = child_dirs(&path).await else {
+                tracing::debug!(path = %path.display(), "could not inspect scratch folder");
+                continue;
+            };
+            // ponytail: task checkouts live directly under scratch. Scan deeper
+            // only if a real task launcher introduces another layout.
+            for child in children {
+                let child_str = child.to_string_lossy();
+                if child.join(".git").exists() || is_git_repo(&child_str).await {
+                    git_repos.push(child);
+                }
+            }
+        }
+
+        let Ok(mut activity) = most_recent_activity(&path, git_repo).await else {
             tracing::debug!(path = %path.display(), "could not read task folder activity");
             continue;
         };
-        if SystemTime::now()
-            .duration_since(activity)
-            .unwrap_or_default()
-            <= retention
+        let mut readable = true;
+        for repo in git_repos.iter().filter(|repo| *repo != &path) {
+            match most_recent_activity(repo, true).await {
+                Ok(repo_activity) => activity = activity.max(repo_activity),
+                Err(err) => {
+                    tracing::debug!(?err, path = %repo.display(), "could not read nested worktree activity");
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        if !readable
+            || SystemTime::now()
+                .duration_since(activity)
+                .unwrap_or_default()
+                <= retention
         {
             continue;
         }
 
-        if git_repo {
-            match git(&path_str, &["status", "--porcelain"]).await {
+        let mut clean = true;
+        for repo in &git_repos {
+            match git(&repo.to_string_lossy(), &["status", "--porcelain"]).await {
                 Ok(status) if status.trim().is_empty() => {}
                 Ok(_) => {
-                    tracing::debug!(path = %path.display(), "keeping dirty task folder");
-                    continue;
+                    tracing::debug!(path = %repo.display(), "keeping dirty task folder");
+                    clean = false;
+                    break;
                 }
                 Err(err) => {
-                    tracing::debug!(?err, path = %path.display(), "could not verify task folder is clean");
-                    continue;
+                    tracing::debug!(?err, path = %repo.display(), "could not verify task folder is clean");
+                    clean = false;
+                    break;
                 }
             }
         }
+        if !clean {
+            continue;
+        }
+
         if is_worktree {
             if let Err(err) = remove_worktree(&path).await {
                 tracing::warn!(?err, path = %path.display(), "could not prune task worktree");
                 continue;
             }
-        } else if let Err(err) = tokio::fs::remove_dir_all(&path).await {
-            tracing::warn!(?err, path = %path.display(), "could not prune scratch folder");
-            continue;
+        } else {
+            let mut failed = false;
+            for repo in git_repos.iter().filter(|repo| *repo != &path) {
+                if let Err(err) = remove_worktree(repo).await {
+                    tracing::warn!(?err, path = %repo.display(), "could not prune nested task worktree");
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                continue;
+            }
+            if let Err(err) = tokio::fs::remove_dir_all(&path).await {
+                tracing::warn!(?err, path = %path.display(), "could not prune scratch folder");
+                continue;
+            }
         }
         removed += 1;
         tracing::info!(path = %path.display(), "pruned idle task folder");
@@ -544,11 +595,11 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&prepared.path).await;
     }
 
-    async fn pruning_fixture(name: &str) -> (PathBuf, PathBuf) {
+    async fn pruning_fixture(name: &str, worktree_path: &str) -> (PathBuf, PathBuf) {
         let root =
             std::env::temp_dir().join(format!("patchwork-prune-{name}-{}", uuid::Uuid::new_v4()));
         let checkout = root.join("checkout");
-        let worktree = root.join("managed/worktrees/repo/task");
+        let worktree = root.join(worktree_path);
         tokio::fs::create_dir_all(&checkout).await.unwrap();
         git(checkout.to_str().unwrap(), &["init", "-b", "main"])
             .await
@@ -586,8 +637,15 @@ mod tests {
         (root, worktree)
     }
 
-    async fn make_old(path: &Path) {
+    fn make_path_old(path: &Path) {
         let old = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    async fn make_old(path: &Path) {
         let path_str = path.to_string_lossy();
         let git_paths = git(
             &path_str,
@@ -604,16 +662,13 @@ mod tests {
         for target in
             std::iter::once(path.to_path_buf()).chain(git_paths.lines().map(PathBuf::from))
         {
-            std::fs::File::open(target)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            make_path_old(&target);
         }
     }
 
     #[tokio::test]
     async fn clean_old_worktree_is_pruned() {
-        let (root, worktree) = pruning_fixture("clean-old").await;
+        let (root, worktree) = pruning_fixture("clean-old", "managed/worktrees/repo/task").await;
         make_old(&worktree).await;
         let removed = prune_root(
             &root.join("managed"),
@@ -629,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_old_worktree_is_kept() {
-        let (root, worktree) = pruning_fixture("dirty-old").await;
+        let (root, worktree) = pruning_fixture("dirty-old", "managed/worktrees/repo/task").await;
         tokio::fs::write(worktree.join("untracked.txt"), "keep me")
             .await
             .unwrap();
@@ -648,7 +703,27 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_clean_worktree_is_kept() {
-        let (root, worktree) = pruning_fixture("fresh-clean").await;
+        let (root, worktree) = pruning_fixture("fresh-clean", "managed/worktrees/repo/task").await;
+        let removed = prune_root(
+            &root.join("managed"),
+            &HashSet::new(),
+            Duration::from_secs(2 * 24 * 60 * 60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(worktree.exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn scratch_with_dirty_nested_worktree_is_kept() {
+        let (root, worktree) = pruning_fixture("dirty-nested", "managed/scratch/task/repo").await;
+        tokio::fs::write(worktree.join("untracked.txt"), "keep me")
+            .await
+            .unwrap();
+        make_old(&worktree).await;
+        make_path_old(&root.join("managed/scratch/task"));
         let removed = prune_root(
             &root.join("managed"),
             &HashSet::new(),
