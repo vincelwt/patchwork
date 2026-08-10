@@ -141,9 +141,15 @@ class Session {
       this.openSocket();
     } catch (err) {
       // A relay restart is routine — keep trying rather than stranding the app
-      // behind a button nobody is there to press.
+      // behind a button nobody is there to press. Keep an existing snapshot on
+      // screen while the relay comes back.
       this.closeSocket();
-      this.set({ status: "error", error: String((err as Error).message ?? err) });
+      const error = String((err as Error).message ?? err);
+      this.set(
+        this.data.status === "ready"
+          ? { live: false, error }
+          : { status: "error", live: false, error },
+      );
       this.scheduleReconnect();
     }
   }
@@ -167,6 +173,7 @@ class Session {
 
     this.set({
       status: "ready",
+      error: undefined,
       workspace: bootstrap.workspace,
       me: bootstrap.me,
       members: bootstrap.members,
