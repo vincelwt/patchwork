@@ -136,8 +136,24 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
-const DONE_COLLAPSED = "patchwork.tasksDoneCollapsed";
+const COLLAPSED_STATUSES = "patchwork.collapsedTaskStatuses";
+const LEGACY_DONE_COLLAPSED = "patchwork.tasksDoneCollapsed";
 const TASK_DRAFT_PREFIX = "patchwork.taskDraft.";
+
+function initialCollapsedStatuses(): TaskStatus[] {
+  try {
+    const saved = localStorage.getItem(COLLAPSED_STATUSES);
+    if (saved) {
+      const statuses = JSON.parse(saved);
+      return Array.isArray(statuses)
+        ? TASK_STATUSES.filter((status) => statuses.includes(status))
+        : ["done"];
+    }
+  } catch {
+    return ["done"];
+  }
+  return localStorage.getItem(LEGACY_DONE_COLLAPSED) === "false" ? [] : ["done"];
+}
 
 /// Who a new task should belong to: whoever you gave the last one to, and
 /// yourself before you have given anyone anything. Guessing an agent for you
@@ -171,8 +187,8 @@ export function TasksBoard() {
     y: number;
   } | null>(null);
   const [assigning, setAssigning] = useState<Task | null>(null);
-  const [doneCollapsed, setDoneCollapsed] = useState(
-    () => localStorage.getItem(DONE_COLLAPSED) !== "false",
+  const [collapsedStatuses, setCollapsedStatuses] = useState(
+    initialCollapsedStatuses,
   );
   // Two ways to look at the same tasks, remembered: a board is for moving work
   // along, a list is for reading it. Which one you want is a habit, not a
@@ -184,10 +200,12 @@ export function TasksBoard() {
     setLayout(next);
     localStorage.setItem("patchwork.taskLayout", next);
   };
-  const toggleDone = () => {
-    const collapsed = !doneCollapsed;
-    setDoneCollapsed(collapsed);
-    localStorage.setItem(DONE_COLLAPSED, String(collapsed));
+  const toggleStatus = (status: TaskStatus) => {
+    const collapsed = collapsedStatuses.includes(status)
+      ? collapsedStatuses.filter((item) => item !== status)
+      : [...collapsedStatuses, status];
+    setCollapsedStatuses(collapsed);
+    localStorage.setItem(COLLAPSED_STATUSES, JSON.stringify(collapsed));
   };
 
   const tasks = useMemo(
@@ -262,15 +280,15 @@ export function TasksBoard() {
       {layout === "list" ? (
         <TaskList
           tasks={tasks}
-          doneCollapsed={doneCollapsed}
-          onToggleDone={toggleDone}
+          collapsedStatuses={collapsedStatuses}
+          onToggleStatus={toggleStatus}
           onMenu={(task, x, y) => setMenuFor({ task, x, y })}
         />
       ) : (
       <div className="board">
         {TASK_STATUSES.map((status) => {
           const column = tasks.filter((task) => task.status === status);
-          const collapsed = status === "done" && doneCollapsed;
+          const collapsed = collapsedStatuses.includes(status);
           return (
             <div
               key={status}
@@ -286,25 +304,17 @@ export function TasksBoard() {
                 setDragging(null);
               }}
             >
-              {status === "done" ? (
-                <button
-                  className="board-column-head collapsible"
-                  aria-expanded={!collapsed}
-                  title={collapsed ? "Show done tasks" : "Hide done tasks"}
-                  onClick={toggleDone}
-                >
-                  <span className={`column-dot ${status}`} />
-                  <span>{statusLabel(status)}</span>
-                  {column.length > 0 && <span className="count">{column.length}</span>}
-                  <ChevronIcon size={13} open={!collapsed} />
-                </button>
-              ) : (
-                <div className="board-column-head">
-                  <span className={`column-dot ${status}`} />
-                  <span>{statusLabel(status)}</span>
-                  {column.length > 0 && <span className="count">{column.length}</span>}
-                </div>
-              )}
+              <button
+                className="board-column-head collapsible"
+                aria-expanded={!collapsed}
+                title={`${collapsed ? "Show" : "Hide"} ${statusLabel(status).toLowerCase()} tasks`}
+                onClick={() => toggleStatus(status)}
+              >
+                <span className={`column-dot ${status}`} />
+                <span>{statusLabel(status)}</span>
+                {column.length > 0 && <span className="count">{column.length}</span>}
+                <ChevronIcon size={13} open={!collapsed} />
+              </button>
               {!collapsed && (
                 <div className="board-column-body">
                   {column.map((task) => (
@@ -348,13 +358,13 @@ export function TasksBoard() {
 /// the shape; a list saying "Blocked (0)" is just noise to scroll past.
 function TaskList({
   tasks,
-  doneCollapsed,
-  onToggleDone,
+  collapsedStatuses,
+  onToggleStatus,
   onMenu,
 }: {
   tasks: Task[];
-  doneCollapsed: boolean;
-  onToggleDone: () => void;
+  collapsedStatuses: TaskStatus[];
+  onToggleStatus: (status: TaskStatus) => void;
   onMenu: (task: Task, x: number, y: number) => void;
 }) {
   const app = useApp();
@@ -383,25 +393,20 @@ function TaskList({
     <div className="task-list">
       {groups.map((group) => (
         <div key={group.status}>
-          {group.status === "done" ? (
-            <button
-              className="section-head collapsible"
-              aria-expanded={!doneCollapsed}
-              onClick={onToggleDone}
-            >
-              <ChevronIcon size={13} open={!doneCollapsed} />
-              <span className={`column-dot ${group.status}`} />
-              <span className="section-title">{statusLabel(group.status)}</span>
-              <span className="count">{group.items.length}</span>
-            </button>
-          ) : (
-            <div className="section-head">
-              <span className={`column-dot ${group.status}`} />
-              <span className="section-title">{statusLabel(group.status)}</span>
-              <span className="count">{group.items.length}</span>
-            </div>
-          )}
-          {(!doneCollapsed || group.status !== "done") && group.items.map((task) => {
+          <button
+            className="section-head collapsible"
+            aria-expanded={!collapsedStatuses.includes(group.status)}
+            onClick={() => onToggleStatus(group.status)}
+          >
+            <ChevronIcon
+              size={13}
+              open={!collapsedStatuses.includes(group.status)}
+            />
+            <span className={`column-dot ${group.status}`} />
+            <span className="section-title">{statusLabel(group.status)}</span>
+            <span className="count">{group.items.length}</span>
+          </button>
+          {!collapsedStatuses.includes(group.status) && group.items.map((task) => {
             const state = readTask(task, app.members, app.runs, app.questions);
             const project = app.projects.find(
               (candidate) => candidate.id === task.project_id,
