@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support | Patchwork</title>
+<meta name="description" content="Help with the Patchwork mobile app and workspace relay.">
+<link rel="icon" href="img/icon.png">
+<style>
+  :root { --ink:#1a1a1e; --muted:#62626d; --line:#e8e8ec; --soft:#f6f6f8; --accent:#3b5bdb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); }
+  header, main, footer { max-width:760px; margin:auto; padding:24px; }
+  header { display:flex; align-items:center; gap:10px; border-bottom:1px solid var(--line); }
+  header img { width:28px; height:28px; } header a { color:inherit; text-decoration:none; font-weight:650; }
+  h1 { font-size:36px; line-height:1.15; margin:24px 0 8px; } h2 { font-size:21px; margin:32px 0 6px; }
+  p, li { color:#3a3a42; } li + li { margin-top:8px; } a { color:var(--accent); }
+  .lede, footer { color:var(--muted); } .card { background:var(--soft); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-top:24px; }
+  footer { border-top:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header><img src="img/icon@2x.png" alt=""><a href="index.html">Patchwork</a></header>
+<main>
+  <h1>Support</h1>
+  <p class="lede">Help with the Patchwork mobile app, device pairing, and workspace access.</p>
+
+  <div class="card">
+    <strong>Need help from a person?</strong>
+    <p>Open a <a href="https://github.com/vincelwt/patchwork/issues/new">GitHub support issue</a>. Do not include pairing codes, access tokens, private messages, or confidential files.</p>
+  </div>
+
+  <h2>Pair a phone or tablet</h2>
+  <ol>
+    <li>Open the workspace in Patchwork Desktop.</li>
+    <li>Open Members and choose <strong>Pair phone or tablet</strong>.</li>
+    <li>In the mobile app, choose <strong>Scan pairing code</strong> and scan the code within five minutes.</li>
+  </ol>
+  <p>Each mobile device receives its own revocable key. The QR code is single-use and does not contain your existing Desktop key.</p>
+
+  <h2>Connection problems</h2>
+  <ul>
+    <li>Confirm that the relay is online and reachable from the phone over HTTPS.</li>
+    <li>For a self-hosted relay, confirm its public URL and TLS certificate are valid.</li>
+    <li>If the app says access was removed, pair the device again or ask a workspace administrator to check Members and paired devices.</li>
+    <li>Offline data is read-only. Reconnect before sending messages or changing workspace data.</li>
+  </ul>
+
+  <h2>Lost or replaced device</h2>
+  <p>On another signed-in device, open Settings or Members and revoke the lost device. Signing out removes the local credential, saved workspace data, drafts, and cached images. If the relay is offline during sign-out, revoke the old key later from another device.</p>
+
+  <h2>Privacy, data, and AI providers</h2>
+  <p>Your workspace administrator controls membership, retention, configured AI agents, and model providers. Contact that administrator for data access, correction, export, or deletion requests and to learn which providers can receive workspace content. See the <a href="privacy.html">privacy policy</a> for details.</p>
+
+  <h2>Security reports</h2>
+  <p>Report vulnerabilities privately through <a href="https://github.com/vincelwt/patchwork/security">GitHub Security</a>. Never post credentials or sensitive workspace data in a public issue.</p>
+</main>
+<footer><a href="index.html">Home</a> · <a href="privacy.html">Privacy</a> · <a href="https://github.com/vincelwt/patchwork">Source</a></footer>
+</body>
+</html>

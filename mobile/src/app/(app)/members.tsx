@@ -22,8 +22,11 @@ export default function MembersScreen() {
   if (!data) return <Empty title="Loading members" />;
 
   const dm = async (member: Member) => {
-    const channel = await store.mutate((api) => api.openDm(member.id));
-    router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
+    await store.mutate(
+      (api) => api.openDm(member.id),
+      true,
+      (channel) => router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } }),
+    );
   };
 
   return (
@@ -62,7 +65,7 @@ export default function MembersScreen() {
               <TextField label="Email (optional)" value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" />
               <ToggleRow label="Workspace admin" value={admin} onChange={setAdmin} />
               <ErrorNotice message={error} />
-              <Button label="Create invite" onPress={async () => { try { const result = await store.mutate((api) => api.createInvite({ email: email.trim() || undefined, is_admin: admin }), false); setInvite(result.code); } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); } }} />
+              <Button label="Create invite" onPress={async () => { try { await store.mutate((api) => api.createInvite({ email: email.trim() || undefined, is_admin: admin }), false, (result) => setInvite(result.code)); } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); } }} />
             </>
           )}
         </View>

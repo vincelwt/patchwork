@@ -38,10 +38,13 @@ export function AgentEditor({ agent, onSaved }: { agent?: Member; onSaved: (agen
     setBusy(true);
     setError("");
     try {
-      const saved = agent
-        ? await store.mutate((api) => api.updateAgent(agent.id, { display_name: name.trim(), profile }))
-        : await store.mutate((api) => api.createAgent({ display_name: name.trim(), profile }));
-      onSaved(saved);
+      await store.mutate(
+        (api) => agent
+          ? api.updateAgent(agent.id, { display_name: name.trim(), profile })
+          : api.createAgent({ display_name: name.trim(), profile }),
+        true,
+        onSaved,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

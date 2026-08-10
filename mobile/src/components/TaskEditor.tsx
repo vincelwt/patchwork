@@ -35,19 +35,17 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
     setBusy(true);
     setError("");
     try {
-      const saved = task
-        ? await store.mutate((api) =>
-            api.updateTask(task.id, {
+      await store.mutate(
+        (api) => task
+          ? api.updateTask(task.id, {
               title: title.trim(),
               outcome: outcome.trim(),
               owner_id: owner || undefined,
               project_id: project || undefined,
               status,
               due_at: due?.getTime() ?? 0,
-            }),
-          )
-        : await store.mutate((api) =>
-            api.createTask({
+            })
+          : api.createTask({
               title: title.trim(),
               outcome: outcome.trim(),
               owner_id: owner || undefined,
@@ -56,8 +54,9 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
               attachment_ids: images.pending.map((item) => item.attachment.id),
               start: start && ownerMember?.kind === "agent",
             }),
-          );
-      onSaved(saved);
+        true,
+        onSaved,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

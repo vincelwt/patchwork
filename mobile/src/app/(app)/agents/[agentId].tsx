@@ -29,8 +29,11 @@ export default function AgentScreen() {
   ].sort((a, b) => b.created_at - a.created_at).slice(0, 10);
 
   const message = async () => {
-    const channel = await store.mutate((api) => api.openDm(agent.id));
-    router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
+    await store.mutate(
+      (api) => api.openDm(agent.id),
+      true,
+      (channel) => router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } }),
+    );
   };
 
   return (
