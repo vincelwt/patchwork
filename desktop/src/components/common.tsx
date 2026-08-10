@@ -89,12 +89,13 @@ export function Avatar({
 }
 
 /// Every place that picks a teammate shows the same row: their avatar, their
-/// name, and what they are.
+/// name, and what they are — on one line, because a list of teammates is long
+/// enough without giving every runtime a line of its own.
 export function memberOption(member: Member) {
   return {
     value: member.id,
     label: member.display_name,
-    hint: member.kind === "agent" ? member.agent?.runtime : "person",
+    tag: member.kind === "agent" ? member.agent?.runtime : "person",
     icon: <Avatar member={member} size={18} />,
   };
 }

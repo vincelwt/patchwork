@@ -1048,13 +1048,7 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
         label="Owner"
         value={owner}
         onChange={setOwner}
-        options={app.members.map((member) => ({
-          ...memberOption(member),
-          hint:
-            member.kind === "agent"
-              ? member.agent?.description || member.agent?.runtime
-              : "person",
-        }))}
+        options={app.members.map(memberOption)}
       />
       {isAgent && (
         <Field
