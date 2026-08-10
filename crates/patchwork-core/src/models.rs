@@ -486,6 +486,14 @@ pub struct Host {
     pub created_at: Millis,
 }
 
+/// A global Agent Skill installed on one execution machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemSkill {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
 /// What a machine can actually do — surfaced in the UI so setup failures are
 /// understandable rather than mysterious.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -493,6 +501,9 @@ pub struct HostCapabilities {
     /// ACP agent installations detected on this machine.
     #[serde(default)]
     pub runtimes: Vec<RuntimeInstallation>,
+    /// Agent Skills from this machine's global skill directories.
+    #[serde(default)]
+    pub system_skills: Vec<SystemSkill>,
     #[serde(default)]
     pub has_git: bool,
     #[serde(default)]

@@ -217,8 +217,15 @@ export interface RuntimeInstallation {
   default_mode?: string;
 }
 
+export interface SystemSkill {
+  name: string;
+  description: string;
+  path: string;
+}
+
 export interface HostCapabilities {
   runtimes: RuntimeInstallation[];
+  system_skills: SystemSkill[];
   has_git: boolean;
   has_gh: boolean;
   gh_authenticated: boolean;

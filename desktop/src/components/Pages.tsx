@@ -828,11 +828,18 @@ export function SkillsPage() {
   const app = useApp();
   const [editing, setEditing] = useState<WorkspaceSkill | null>(null);
   const [creating, setCreating] = useState(false);
+  const systemSkills = distinctMachines(app.hosts).flatMap((machine) =>
+    (machine.host.capabilities.system_skills ?? []).map((skill) => ({
+      ...skill,
+      machine: machine.name,
+      hostId: machine.host.id,
+    })),
+  );
 
   return (
     <Page
       title="Skills"
-      subtitle="Workspace instructions available to every agent"
+      subtitle="Workspace skills and global skills found on execution machines"
       actions={
         <button className="button" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
@@ -840,32 +847,57 @@ export function SkillsPage() {
         </button>
       }
     >
-      {app.skills.length === 0 ? (
-        <Empty
-          title="No workspace skills yet"
-          hint="Add reusable instructions once and every agent can follow them on its next run."
-          action={
-            <button className="button primary" onClick={() => setCreating(true)}>
-              Add a skill
-            </button>
-          }
-        />
-      ) : (
-        app.skills.map((skill) => (
-          <button key={skill.id} className="row" onClick={() => setEditing(skill)}>
-            <span style={{ color: "var(--text-muted)", display: "flex" }}>
-              <FileIcon />
-            </span>
+      <Section title="Workspace skills">
+        {app.skills.length === 0 ? (
+          <div className="row">
             <span className="grow">
-              <span className="name">{skill.name}</span>
+              <span className="name">No workspace skills yet</span>
+              <span className="sub">Add reusable instructions for every agent.</span>
+            </span>
+          </div>
+        ) : (
+          app.skills.map((skill) => (
+            <button key={skill.id} className="row" onClick={() => setEditing(skill)}>
+              <span style={{ color: "var(--text-muted)", display: "flex" }}>
+                <FileIcon />
+              </span>
+              <span className="grow">
+                <span className="name">{skill.name}</span>
+                <span className="sub">
+                  {skill.description || skill.instructions.split("\n")[0]}
+                </span>
+              </span>
+              <Chip>all agents</Chip>
+            </button>
+          ))
+        )}
+      </Section>
+
+      <Section title="Global system skills">
+        {systemSkills.length === 0 ? (
+          <div className="row">
+            <span className="grow">
+              <span className="name">No global skills detected</span>
               <span className="sub">
-                {skill.description || skill.instructions.split("\n")[0]}
+                Install Agent Skills in a global skills directory on an execution machine.
               </span>
             </span>
-            <Chip>all agents</Chip>
-          </button>
-        ))
-      )}
+          </div>
+        ) : (
+          systemSkills.map((skill) => (
+            <div className="row" key={`${skill.hostId}:${skill.path}`} title={skill.path}>
+              <span style={{ color: "var(--text-muted)", display: "flex" }}>
+                <FileIcon />
+              </span>
+              <span className="grow">
+                <span className="name">{skill.name}</span>
+                <span className="sub">{skill.description || skill.path}</span>
+              </span>
+              <Chip>{skill.machine}</Chip>
+            </div>
+          ))
+        )}
+      </Section>
 
       {(creating || editing) && (
         <SkillModal
