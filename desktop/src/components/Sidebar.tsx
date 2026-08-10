@@ -180,7 +180,17 @@ export function Sidebar({
   };
 
   return (
-    <aside className={`sidebar${rail ? " rail" : ""}`}>
+    <aside
+      className={`sidebar${rail ? " rail" : ""}`}
+      // Opening a page with the mouse hands the arrow keys to what was opened:
+      // ↑ ↓ should walk that list, not keep walking the sidebar behind it. A
+      // keyboard press (`detail` 0) is left alone, because a conversation takes
+      // the focus into its message box by itself and a page does not.
+      onClick={(event) => {
+        const hit = (event.target as HTMLElement).closest<HTMLElement>("button.nav-item");
+        if (event.detail > 0) hit?.blur();
+      }}
+    >
       <div className="sidebar-top" data-tauri-drag-region="deep">
         {!rail && (
           <WorkspaceMark

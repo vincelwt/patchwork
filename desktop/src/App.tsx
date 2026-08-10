@@ -21,7 +21,7 @@ import { markSeen } from "./lib/unread";
 import { toggleDictation } from "./lib/dictation";
 import { inTauri, parseInviteDetails } from "./lib/desktop";
 import logo from "./assets/logo.png";
-import { chord, combo, isTyping, moveRowFocus } from "./lib/shortcuts";
+import { chord, combo, isTyping, movePane, moveRowFocus } from "./lib/shortcuts";
 import type { Shortcut } from "./lib/shortcuts";
 import { Sidebar, SIDEBAR_RAIL } from "./components/Sidebar";
 import type { Creatable } from "./components/Sidebar";
@@ -717,19 +717,26 @@ function useShortcuts(actions: {
         }
       }
 
-      // Arrow keys walk whatever list is on screen. Nothing to click first:
-      // opening the inbox and pressing ↓ takes the first row, and Enter opens
-      // it because the row is a button. If there is no list, the keys stay the
-      // scroll keys they always were.
-      if (
-        !typing &&
-        !modified &&
-        !event.altKey &&
-        (event.key === "ArrowDown" || event.key === "ArrowUp") &&
-        moveRowFocus(event.key === "ArrowDown" ? 1 : -1)
-      ) {
-        event.preventDefault();
-        return;
+      // Arrow keys move the focus, so the whole app is reachable without a
+      // mouse. Nothing to click first: opening the inbox and pressing ↓ takes
+      // the first row, and Enter opens it because the row is a button. ← → step
+      // between the sidebar, the conversation and the side panel. Where there is
+      // nothing to move to, the keys stay the scroll keys they always were.
+      if (!typing && !modified && !event.altKey) {
+        const moved =
+          event.key === "ArrowDown"
+            ? moveRowFocus(1)
+            : event.key === "ArrowUp"
+              ? moveRowFocus(-1)
+              : event.key === "ArrowRight"
+                ? movePane(1)
+                : event.key === "ArrowLeft"
+                  ? movePane(-1)
+                  : false;
+        if (moved) {
+          event.preventDefault();
+          return;
+        }
       }
 
       // Arm a chord, but only from a resting state.
@@ -1352,14 +1359,22 @@ function ShortcutsSheet({
         );
       })}
       <div className="shortcut-group">
-        <div className="section-title">In a list</div>
+        <div className="section-title">Moving around</div>
         <div className="shortcut-row">
-          <span className="grow">Move through the rows</span>
+          <span className="grow">Move through rows and messages</span>
           <KeyHint keys="↑ ↓" />
         </div>
         <div className="shortcut-row">
-          <span className="grow">Open the selected row</span>
+          <span className="grow">Sidebar, conversation, side panel</span>
+          <KeyHint keys="← →" />
+        </div>
+        <div className="shortcut-row">
+          <span className="grow">Open the row, or a message's actions</span>
           <KeyHint keys="↵" />
+        </div>
+        <div className="shortcut-row">
+          <span className="grow">Leave the message box</span>
+          <KeyHint keys="Esc" />
         </div>
       </div>
       <div className="shortcut-group">
