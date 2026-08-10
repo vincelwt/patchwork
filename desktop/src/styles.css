@@ -1250,6 +1250,13 @@ button.card:hover {
   font-size: 14px;
   margin-top: 2px;
 }
+/* A task card in a conversation is a summary, not the whole brief. */
+.card .card-sub {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
 .card-row {
   display: flex;
   align-items: center;
@@ -2881,6 +2888,21 @@ details.run-thought > summary > svg {
 .editable .placeholder {
   color: var(--text-faint);
 }
+/* A long expected result should not push the whole task off the screen. */
+.editable.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+}
+.editable-more {
+  color: var(--text-faint);
+  font-size: 13px;
+  padding: 2px 0;
+}
+.editable-more:hover {
+  color: var(--text);
+}
 .editable-input {
   width: calc(100% + 12px);
   margin-left: -6px;
@@ -2916,6 +2938,12 @@ details.run-thought > summary > svg {
   font-size: 14.5px;
   margin-top: 2px;
   line-height: 1.5;
+  /* Written with line breaks, so read with them. */
+  white-space: pre-wrap;
+}
+.task-outcome.editable-input {
+  max-height: 42vh;
+  overflow: auto;
 }
 
 /* Four steps, so where the task is arrives before you have read anything. */
