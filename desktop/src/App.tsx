@@ -13,6 +13,7 @@ import {
   canHostRelay,
   hostRelayHere,
   join,
+  leave,
   signOutOfEverything,
   switchTo,
   useSettings,
@@ -241,6 +242,9 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
   }));
   const settings = useSettings();
   const activeWorkspaceId = settings?.active || settings?.workspaces[0]?.id;
+  const activeWorkspace = settings?.workspaces.find(
+    (workspace) => workspace.id === activeWorkspaceId,
+  );
   const otherWorkspaces =
     settings?.workspaces.filter((workspace) => workspace.id !== activeWorkspaceId) ??
     [];
@@ -334,21 +338,35 @@ function Workspace({ onSignOut }: { onSignOut: () => void }) {
             <Spinner size={13} />
             Retrying…
           </p>
-          {otherWorkspaces.length > 0 && (
-            <div
-              style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap" }}
-            >
-              {otherWorkspaces.map((workspace) => (
-                <button
-                  key={workspace.id}
-                  className="button quiet"
-                  onClick={() => void switchTo(workspace.id)}
-                >
-                  Use {workspace.name}
-                </button>
-              ))}
-            </div>
-          )}
+          <div
+            style={{ marginTop: 16, display: "flex", gap: 8, flexWrap: "wrap" }}
+          >
+            {otherWorkspaces.map((workspace) => (
+              <button
+                key={workspace.id}
+                className="button quiet"
+                onClick={() => void switchTo(workspace.id)}
+              >
+                Use {workspace.name}
+              </button>
+            ))}
+            {activeWorkspace && (
+              <button
+                className="button quiet danger"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Forget ${activeWorkspace.name} on this device? Its data will stay on the relay.`,
+                    )
+                  ) {
+                    void leave(activeWorkspace.id);
+                  }
+                }}
+              >
+                Forget {activeWorkspace.name} on this device
+              </button>
+            )}
+          </div>
         </div>
       </div>
     );
