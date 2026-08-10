@@ -94,6 +94,7 @@ Workspace admins can manage the workspace, agents, and invitations directly:
 ```bash
 patchwork workspace show
 patchwork workspace update --name Acme --icon 🚀 --task-prefix ACME
+patchwork workspace update --icon-file ./logo.png
 patchwork agent list
 patchwork agent create Manager --description "Coordinates the workspace" \
   --runtime codex --location relay --admin

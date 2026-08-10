@@ -1317,6 +1317,18 @@ fn compose_first_prompt(spec: &RunSpec, files: &[String]) -> String {
     }
     s.push_str("\n---\n");
     s.push_str(SKILL);
+    if !spec.skills.is_empty() {
+        s.push_str(
+            "\n\n---\n\n## Workspace skills\n\nUse these workspace-wide instructions when relevant. They are available to every agent.\n",
+        );
+        for skill in &spec.skills {
+            s.push_str(&format!("\n### {}\n", skill.name.trim()));
+            if !skill.description.trim().is_empty() {
+                s.push_str(&format!("\nWhen to use: {}\n", skill.description.trim()));
+            }
+            s.push_str(&format!("\n{}\n", skill.instructions.trim()));
+        }
+    }
     s.push_str("\n---\n");
     if !spec.context.trim().is_empty() {
         s.push_str("## Context\n\n");
@@ -1352,6 +1364,14 @@ mod tests {
             agent_handle: "dev".into(),
             agent_name: "Developer agent".into(),
             agent_description: "You ship small, reviewable changes.".into(),
+            skills: vec![patchwork_core::models::WorkspaceSkill {
+                id: "skill-1".into(),
+                name: "Accessible interfaces".into(),
+                description: "When changing user interfaces".into(),
+                instructions: "Keep keyboard and screen-reader behavior intact.".into(),
+                created_at: 1,
+                updated_at: 1,
+            }],
             runtime: "codex".into(),
             provider: None,
             model: None,
@@ -1448,6 +1468,9 @@ mod tests {
         assert!(p.contains("Developer agent"));
         assert!(p.contains("You ship small, reviewable changes."));
         assert!(p.contains("patchwork ask"));
+        assert!(p.contains("## Workspace skills"));
+        assert!(p.contains("Accessible interfaces"));
+        assert!(p.contains("Keep keyboard and screen-reader behavior intact."));
         assert!(p.contains("the checkout test is red"));
         assert!(p.contains("Fix the failing test"));
     }

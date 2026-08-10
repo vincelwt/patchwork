@@ -30,6 +30,7 @@ import type {
   TaskDetail,
   TaskStatus,
   Workspace,
+  WorkspaceSkill,
 } from "./types";
 
 export class ApiError extends Error {
@@ -259,6 +260,25 @@ export class Api {
     return this.delete(`/api/members/${id}`);
   }
 
+  skills() {
+    return this.get<WorkspaceSkill[]>("/api/skills");
+  }
+
+  createSkill(input: Pick<WorkspaceSkill, "name" | "description" | "instructions">) {
+    return this.post<WorkspaceSkill>("/api/skills", input);
+  }
+
+  updateSkill(
+    id: Id,
+    input: Pick<WorkspaceSkill, "name" | "description" | "instructions">,
+  ) {
+    return this.patch<WorkspaceSkill>(`/api/skills/${id}`, input);
+  }
+
+  deleteSkill(id: Id) {
+    return this.delete(`/api/skills/${id}`);
+  }
+
   projects() {
     return this.get<Project[]>("/api/projects");
   }
@@ -319,7 +339,12 @@ export class Api {
     return this.get<SearchResults>(`/api/search?q=${encodeURIComponent(query)}`);
   }
 
-  updateWorkspace(input: { name?: string; icon?: string; task_prefix?: string }) {
+  updateWorkspace(input: {
+    name?: string;
+    icon?: string;
+    icon_file_id?: Id;
+    task_prefix?: string;
+  }) {
     return this.patch<Workspace>("/api/workspace", input);
   }
 

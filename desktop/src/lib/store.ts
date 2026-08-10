@@ -24,6 +24,7 @@ import type {
   Section,
   Task,
   Workspace,
+  WorkspaceSkill,
 } from "@client/types";
 
 export interface AppData {
@@ -35,6 +36,7 @@ export interface AppData {
   members: Member[];
   sections: Section[];
   channels: Channel[];
+  skills: WorkspaceSkill[];
   projects: Project[];
   hosts: Host[];
   tasks: Task[];
@@ -57,6 +59,7 @@ const EMPTY: AppData = {
   members: [],
   sections: [],
   channels: [],
+  skills: [],
   projects: [],
   hosts: [],
   tasks: [],
@@ -169,6 +172,7 @@ class Session {
       members: bootstrap.members,
       sections: bootstrap.sections,
       channels: bootstrap.channels,
+      skills: bootstrap.skills ?? [],
       projects: bootstrap.projects,
       hosts: bootstrap.hosts,
       tasks: bootstrap.tasks,
@@ -281,6 +285,9 @@ class Session {
         break;
       case "sections_updated":
         this.set({ sections: event.sections });
+        break;
+      case "workspace_skills_updated":
+        this.set({ skills: event.skills });
         break;
       case "member_updated":
         this.set({
@@ -551,6 +558,8 @@ function upsert<T extends { id: string }>(list: T[], item: T): T[] {
 export interface WorkspaceHandle {
   id: Id;
   name: string;
+  icon: string;
+  iconImage?: string;
   unread: number;
   live: boolean;
   active: boolean;
@@ -655,7 +664,7 @@ class Workspaces {
     // A background workspace only ever changes the switcher, so it only wakes
     // the app when what the switcher shows actually moved.
     const data = session.getSnapshot();
-    const badge = `${data.workspace?.name ?? ""}·${unreadOf(data)}·${data.live}`;
+    const badge = `${data.workspace?.name ?? ""}·${data.workspace?.icon ?? ""}·${data.workspace?.icon_image ?? ""}·${unreadOf(data)}·${data.live}`;
     if (this.badges.get(session.id) === badge) return;
     this.badges.set(session.id, badge);
     this.notify();
@@ -670,6 +679,11 @@ class Workspaces {
         {
           id,
           name: data.workspace?.name ?? this.names.get(id) ?? "Workspace",
+          icon: data.workspace?.icon ?? "",
+          iconImage:
+            data.workspace?.icon_image && session.api
+              ? `${session.api.baseUrl.replace(/\/$/, "")}${data.workspace.icon_image}`
+              : undefined,
           unread: unreadOf(data),
           live: data.live,
           active: id === this.activeId,

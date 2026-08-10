@@ -29,6 +29,12 @@ pub enum InsertTaskResult {
     Existing(Task),
 }
 
+pub enum SaveWorkspaceSkillResult {
+    Saved(WorkspaceSkill),
+    Missing,
+    TooLarge,
+}
+
 fn json_col<T: serde::de::DeserializeOwned>(row: &Row, idx: &str) -> Option<T> {
     row.get::<_, Option<String>>(idx)
         .ok()
@@ -86,6 +92,7 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE workspace ADD COLUMN icon_file_id TEXT",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
@@ -149,16 +156,19 @@ impl Store {
     pub fn workspace(&self) -> Result<Workspace> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, icon, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
+            "SELECT id, name, icon, icon_file_id, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
             [],
             |r| {
+                let icon_file_id: Option<String> = r.get(3)?;
                 Ok(Workspace {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     icon: r.get(2)?,
-                    created_at: r.get(3)?,
-                    task_prefix: r.get(4)?,
-                    task_seq: r.get(5)?,
+                    icon_image: icon_file_id
+                        .map(|id| format!("/api/workspace/icon/{id}")),
+                    created_at: r.get(4)?,
+                    task_prefix: r.get(5)?,
+                    task_seq: r.get(6)?,
                 })
             },
         )
@@ -174,6 +184,7 @@ impl Store {
             task_prefix: patchwork_core::models::default_task_prefix(),
             name: name.to_string(),
             icon: String::new(),
+            icon_image: None,
             created_at: now_ms(),
             task_seq: 0,
         };
@@ -188,6 +199,7 @@ impl Store {
         &self,
         name: Option<&str>,
         icon: Option<&str>,
+        icon_file_id: Option<&str>,
         task_prefix: Option<&str>,
     ) -> Result<Workspace> {
         let conn = self.conn()?;
@@ -195,12 +207,95 @@ impl Store {
             conn.execute("UPDATE workspace SET name = ?1", params![name])?;
         }
         if let Some(icon) = icon {
-            conn.execute("UPDATE workspace SET icon = ?1", params![icon])?;
+            conn.execute(
+                "UPDATE workspace SET icon = ?1, icon_file_id = NULL",
+                params![icon],
+            )?;
+        }
+        if let Some(id) = icon_file_id {
+            conn.execute(
+                "UPDATE workspace SET icon = '', icon_file_id = ?1",
+                params![id],
+            )?;
         }
         if let Some(prefix) = task_prefix {
             conn.execute("UPDATE workspace SET task_prefix = ?1", params![prefix])?;
         }
         self.workspace()
+    }
+
+    pub fn save_workspace_skill(
+        &self,
+        mut skill: WorkspaceSkill,
+        must_exist: bool,
+        max_total_bytes: usize,
+    ) -> Result<SaveWorkspaceSkillResult> {
+        let mut conn = self.conn()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_created_at = transaction
+            .query_row(
+                "SELECT created_at FROM workspace_skills WHERE id = ?1",
+                params![skill.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if must_exist && existing_created_at.is_none() {
+            return Ok(SaveWorkspaceSkillResult::Missing);
+        }
+        if let Some(created_at) = existing_created_at {
+            skill.created_at = created_at;
+        }
+        let existing_bytes: i64 = transaction.query_row(
+            "SELECT COALESCE(SUM(length(CAST(name AS BLOB)) + length(CAST(description AS BLOB)) + length(CAST(instructions AS BLOB))), 0)
+             FROM workspace_skills WHERE id != ?1",
+            params![skill.id],
+            |row| row.get(0),
+        )?;
+        let new_bytes = skill.name.len() + skill.description.len() + skill.instructions.len();
+        if existing_bytes as usize + new_bytes > max_total_bytes {
+            return Ok(SaveWorkspaceSkillResult::TooLarge);
+        }
+        transaction.execute(
+            "INSERT INTO workspace_skills (id, name, description, instructions, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET name=?2, description=?3, instructions=?4, updated_at=?6",
+            params![
+                skill.id,
+                skill.name,
+                skill.description,
+                skill.instructions,
+                skill.created_at,
+                skill.updated_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(SaveWorkspaceSkillResult::Saved(skill))
+    }
+
+    pub fn workspace_skills(&self) -> Result<Vec<WorkspaceSkill>> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT id, name, description, instructions, created_at, updated_at
+             FROM workspace_skills ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(WorkspaceSkill {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                instructions: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn delete_workspace_skill(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .execute("DELETE FROM workspace_skills WHERE id = ?1", params![id])?
+            > 0)
     }
 
     /// Keys already handed out keep the prefix they were made with: renaming
@@ -2598,6 +2693,86 @@ mod tests {
             task_id: Some(task.id.clone()),
             last_message_at: 1,
         }
+    }
+
+    #[test]
+    fn workspace_skills_persist_in_name_order() {
+        let (store, path) = store();
+        for (id, name) in [("two", "Writing"), ("one", "Accessibility")] {
+            assert!(matches!(
+                store
+                    .save_workspace_skill(
+                        WorkspaceSkill {
+                            id: id.into(),
+                            name: name.into(),
+                            description: format!("Use {name}"),
+                            instructions: format!("Follow {name}"),
+                            created_at: 1,
+                            updated_at: 1,
+                        },
+                        false,
+                        usize::MAX,
+                    )
+                    .unwrap(),
+                SaveWorkspaceSkillResult::Saved(_)
+            ));
+        }
+        let skills = store.workspace_skills().unwrap();
+        assert_eq!(
+            skills
+                .iter()
+                .map(|skill| skill.id.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert!(store.delete_workspace_skill("one").unwrap());
+        assert_eq!(store.workspace_skills().unwrap(), skills[1..]);
+        assert!(matches!(
+            store
+                .save_workspace_skill(skills[0].clone(), true, usize::MAX)
+                .unwrap(),
+            SaveWorkspaceSkillResult::Missing
+        ));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_workspace_skills_keep_the_prompt_limit() {
+        let (store, path) = store();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let joins = ["one", "two"].map(|id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .save_workspace_skill(
+                        WorkspaceSkill {
+                            id: id.into(),
+                            name: id.into(),
+                            description: String::new(),
+                            instructions: "x".repeat(40),
+                            created_at: 1,
+                            updated_at: 1,
+                        },
+                        false,
+                        50,
+                    )
+                    .unwrap()
+            })
+        });
+        let results = joins.map(|join| join.join().unwrap());
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, SaveWorkspaceSkillResult::Saved(_)))
+                .count(),
+            1
+        );
+        assert_eq!(store.workspace_skills().unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

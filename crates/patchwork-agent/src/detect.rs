@@ -10,12 +10,13 @@
 //! [`detect_capabilities`] is cheap to call from anywhere, and only
 //! [`refresh_capabilities`] pays the cost again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use patchwork_core::models::{HostCapabilities, RuntimeInstallation, RuntimeOption};
+use patchwork_core::models::{HostCapabilities, RuntimeInstallation, RuntimeOption, SystemSkill};
 use tokio::process::Command;
 
 /// `gh auth status` contacts GitHub. On a captive-portal network it can hang
@@ -448,6 +449,100 @@ fn refresh_in_flight() -> &'static std::sync::atomic::AtomicBool {
     &IN_FLIGHT
 }
 
+fn discover_system_skills() -> Vec<SystemSkill> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    discover_system_skills_in(&[
+        (home.join(".pi/agent/skills"), true),
+        (home.join(".agents/skills"), false),
+    ])
+}
+
+fn discover_system_skills_in(roots: &[(PathBuf, bool)]) -> Vec<SystemSkill> {
+    let mut files = Vec::new();
+    for (root, root_markdown) in roots {
+        let start = files.len();
+        collect_skill_files(root, root, *root_markdown, 0, &mut files);
+        files[start..].sort();
+    }
+
+    let mut names = HashSet::new();
+    let mut skills = files
+        .into_iter()
+        .filter_map(|path| parse_system_skill(&path))
+        // Pi keeps the first skill when global locations reuse a name.
+        .filter(|skill| names.insert(skill.name.clone()))
+        .collect::<Vec<_>>();
+    skills.sort_by_key(|skill| skill.name.to_lowercase());
+    skills
+}
+
+fn collect_skill_files(
+    root: &Path,
+    dir: &Path,
+    root_markdown: bool,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) {
+    // ponytail: the cap prevents symlink loops; use canonical visited paths if
+    // valid global skills ever need more than 12 nested directories.
+    if depth > 12 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_dir() {
+            collect_skill_files(root, &path, root_markdown, depth + 1, out);
+        } else if path.file_name().is_some_and(|name| name == "SKILL.md")
+            || (root_markdown
+                && dir == root
+                && path.extension().is_some_and(|extension| extension == "md"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn parse_system_skill(path: &Path) -> Option<SystemSkill> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let frontmatter = lines
+        .take_while(|line| line.trim() != "---")
+        .collect::<Vec<_>>();
+    Some(SystemSkill {
+        name: frontmatter_field(&frontmatter, "name")?,
+        description: frontmatter_field(&frontmatter, "description")?,
+        path: path.to_string_lossy().to_string(),
+    })
+}
+
+fn frontmatter_field(lines: &[&str], key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    let (at, value) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(at, line)| line.strip_prefix(&prefix).map(|value| (at, value.trim())))?;
+    if value.starts_with(['>', '|']) {
+        return Some(
+            lines[at + 1..]
+                .iter()
+                .take_while(|line| line.is_empty() || line.starts_with([' ', '\t']))
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(if value.starts_with('|') { "\n" } else { " " })
+                .trim()
+                .to_string(),
+        );
+    }
+    Some(value.trim_matches(['"', '\'']).to_string())
+}
+
 async fn probe_capabilities() -> HostCapabilities {
     let has_git = on_path("git").is_some();
     let has_gh = on_path("gh").is_some();
@@ -479,6 +574,7 @@ async fn probe_capabilities() -> HostCapabilities {
 
     HostCapabilities {
         runtimes,
+        system_skills: discover_system_skills(),
         has_git,
         has_gh,
         gh_authenticated,
@@ -529,4 +625,46 @@ pub fn base_env(extra: &[(String, String)]) -> HashMap<String, String> {
         env.insert(k.clone(), v.clone());
     }
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_agent_skills_are_discovered_with_frontmatter() {
+        let base = std::env::temp_dir().join(format!("patchwork-skills-{}", uuid::Uuid::new_v4()));
+        let pi = base.join("pi");
+        let agents = base.join("agents");
+        std::fs::create_dir_all(agents.join("nested")).unwrap();
+        std::fs::create_dir_all(&pi).unwrap();
+        std::fs::write(
+            pi.join("release.md"),
+            "---\nname: release\ndescription: Ship releases\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("ignored.md"),
+            "---\nname: ignored\ndescription: Root markdown is not an Agent Skills skill\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("nested/SKILL.md"),
+            "---\nname: mobile\ndescription: >\n  Build mobile apps\n  in an isolated simulator.\n---\n",
+        )
+        .unwrap();
+
+        let skills = discover_system_skills_in(&[(pi, true), (agents, false)]);
+        assert_eq!(
+            skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mobile", "Build mobile apps in an isolated simulator."),
+                ("release", "Ship releases"),
+            ]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

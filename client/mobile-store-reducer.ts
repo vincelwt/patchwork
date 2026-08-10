@@ -123,6 +123,10 @@ export function applyEnvelope(
       return bootstrap
         ? withBootstrap(state, seq, { ...bootstrap, sections: event.sections })
         : { ...state, seq };
+    case "workspace_skills_updated":
+      return bootstrap
+        ? withBootstrap(state, seq, { ...bootstrap, skills: event.skills })
+        : { ...state, seq };
     case "member_updated":
       return bootstrap
         ? withBootstrap(state, seq, {

@@ -21,6 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::orchestrator::{self, PostOptions, StartRunParams};
 use crate::relay::Relay;
 use crate::state::Shared;
+use crate::store::SaveWorkspaceSkillResult;
 use crate::{automations, preview_proxy};
 
 /// The relay itself: what is true before you have picked a workspace.
@@ -185,6 +186,7 @@ pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/pair", post(claim_pairing))
+        .route("/api/workspace/icon/{id}", get(workspace_icon))
         .route("/api/webhooks/{token}", post(webhook));
 
     let api = Router::new()
@@ -241,6 +243,9 @@ pub fn router(state: Shared) -> Router {
         .route("/api/members/{id}", delete(remove_member))
         .route("/api/agents", post(create_agent))
         .route("/api/agents/{id}", patch(update_agent))
+        // workspace skills
+        .route("/api/skills", get(list_skills).post(create_skill))
+        .route("/api/skills/{id}", patch(update_skill).delete(delete_skill))
         // projects and hosts
         .route("/api/projects", get(list_projects).post(create_project))
         .route(
@@ -272,7 +277,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/files/{id}/grant", post(grant_file))
         .route("/api/files/{id}/evidence", delete(remove_file_evidence))
         // workspace admin
-        .route("/api/workspace", patch(rename_workspace))
+        .route("/api/workspace", patch(update_workspace))
         .route("/api/invites", get(list_invites).post(create_invite))
         .route("/api/search", get(search))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
@@ -487,6 +492,7 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
         members,
         sections: state.store.sections()?,
         channels,
+        skills: state.store.workspace_skills()?,
         projects: state.store.projects()?,
         hosts: state.hosts_with_presence().await?,
         tasks: state.store.tasks()?,
@@ -1740,6 +1746,130 @@ async fn update_agent(
 }
 
 // ---------------------------------------------------------------------------
+// workspace skills
+// ---------------------------------------------------------------------------
+
+const MAX_SKILL_NAME_BYTES: usize = 100;
+const MAX_SKILL_DESCRIPTION_BYTES: usize = 500;
+const MAX_SKILL_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+const MAX_WORKSPACE_SKILLS_BYTES: usize = 64 * 1024;
+
+fn validated_skill(input: UpsertWorkspaceSkill) -> ApiResult<(String, String, String)> {
+    let name = input.name.trim().to_string();
+    let description = input.description.trim().to_string();
+    let instructions = input.instructions.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a skill needs a name"));
+    }
+    if name.contains('\n') || name.contains('\r') {
+        return Err(ApiError::bad_request("the skill name must be one line"));
+    }
+    if instructions.is_empty() {
+        return Err(ApiError::bad_request("a skill needs instructions"));
+    }
+    if name.len() > MAX_SKILL_NAME_BYTES {
+        return Err(ApiError::bad_request("the skill name is too long"));
+    }
+    if description.len() > MAX_SKILL_DESCRIPTION_BYTES {
+        return Err(ApiError::bad_request("the skill description is too long"));
+    }
+    if instructions.len() > MAX_SKILL_INSTRUCTIONS_BYTES {
+        return Err(ApiError::bad_request("the skill instructions are too long"));
+    }
+    Ok((name, description, instructions))
+}
+
+fn save_skill(
+    state: &Shared,
+    skill: WorkspaceSkill,
+    must_exist: bool,
+) -> ApiResult<WorkspaceSkill> {
+    match state
+        .store
+        .save_workspace_skill(skill, must_exist, MAX_WORKSPACE_SKILLS_BYTES)?
+    {
+        SaveWorkspaceSkillResult::Saved(skill) => Ok(skill),
+        SaveWorkspaceSkillResult::Missing => Err(ApiError::not_found("no such skill")),
+        SaveWorkspaceSkillResult::TooLarge => Err(ApiError::bad_request(
+            "workspace skills are limited to 64 KB in total",
+        )),
+    }
+}
+
+fn emit_skills(state: &Shared) -> ApiResult<()> {
+    state.emit(Event::WorkspaceSkillsUpdated {
+        skills: state.store.workspace_skills()?,
+    });
+    Ok(())
+}
+
+async fn list_skills(
+    State(state): State<Shared>,
+    _caller: Caller,
+) -> ApiResult<Json<Vec<WorkspaceSkill>>> {
+    Ok(Json(state.store.workspace_skills()?))
+}
+
+async fn create_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Json(input): Json<UpsertWorkspaceSkill>,
+) -> ApiResult<Json<WorkspaceSkill>> {
+    let (name, description, instructions) = validated_skill(input)?;
+    let now = now_ms();
+    let skill = save_skill(
+        &state,
+        WorkspaceSkill {
+            id: new_id(),
+            name,
+            description,
+            instructions,
+            created_at: now,
+            updated_at: now,
+        },
+        false,
+    )?;
+    emit_skills(&state)?;
+    Ok(Json(skill))
+}
+
+async fn update_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<UpsertWorkspaceSkill>,
+) -> ApiResult<Json<WorkspaceSkill>> {
+    let (name, description, instructions) = validated_skill(input)?;
+    let now = now_ms();
+    let skill = save_skill(
+        &state,
+        WorkspaceSkill {
+            id,
+            name,
+            description,
+            instructions,
+            created_at: now,
+            updated_at: now,
+        },
+        true,
+    )?;
+    emit_skills(&state)?;
+    Ok(Json(skill))
+}
+
+async fn delete_skill(
+    State(state): State<Shared>,
+    _caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Ok>> {
+    if !state.store.delete_workspace_skill(&id)? {
+        return Err(ApiError::not_found("no such skill"));
+    }
+    emit_skills(&state)?;
+    Ok(Json(Ok::default()))
+}
+
+// ---------------------------------------------------------------------------
 // projects and hosts
 // ---------------------------------------------------------------------------
 
@@ -2548,17 +2678,67 @@ struct WorkspaceInput {
     name: Option<String>,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    icon_file_id: Option<Id>,
     /// What task keys start with. Letters and digits, upper-cased.
     #[serde(default)]
     task_prefix: Option<String>,
 }
 
-async fn rename_workspace(
+const MAX_WORKSPACE_ICON_SIZE: i64 = 2 * 1024 * 1024;
+
+fn workspace_icon_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+async fn workspace_icon(State(state): State<Shared>, Path(id): Path<Id>) -> ApiResult<Response> {
+    let workspace = state.store.workspace()?;
+    let icon_path = format!("/api/workspace/icon/{id}");
+    if workspace.icon_image.as_deref() != Some(icon_path.as_str()) {
+        return Err(ApiError::not_found("workspace icon not found"));
+    }
+    let (attachment, path) = state
+        .store
+        .attachment(&id)?
+        .ok_or_else(|| ApiError::not_found("workspace icon not found"))?;
+    if attachment.size > MAX_WORKSPACE_ICON_SIZE {
+        return Err(ApiError::not_found("workspace icon not found"));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| ApiError::not_found("workspace icon not found"))?;
+    let mime = workspace_icon_mime(&bytes)
+        .ok_or_else(|| ApiError::not_found("workspace icon not found"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn update_workspace(
     State(state): State<Shared>,
     caller: Caller,
     Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
+    if input.icon.is_some() && input.icon_file_id.is_some() {
+        return Err(ApiError::bad_request(
+            "choose an emoji or an image, not both",
+        ));
+    }
     let name = input
         .name
         .as_deref()
@@ -2569,6 +2749,26 @@ async fn rename_workspace(
         .as_deref()
         .map(str::trim)
         .map(|value| value.chars().take(8).collect::<String>());
+    if let Some(id) = input.icon_file_id.as_deref() {
+        let (attachment, path) = state
+            .store
+            .attachment(id)?
+            .ok_or_else(|| ApiError::not_found("icon image not found"))?;
+        require_attachment_access(&state, &caller, &attachment)?;
+        if attachment.size > MAX_WORKSPACE_ICON_SIZE {
+            return Err(ApiError::bad_request(
+                "a workspace icon must be no larger than 2 MB",
+            ));
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|_| ApiError::not_found("icon image not found"))?;
+        if workspace_icon_mime(&bytes).is_none() {
+            return Err(ApiError::bad_request(
+                "a workspace icon must be a PNG or JPEG",
+            ));
+        }
+    }
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw
@@ -2584,9 +2784,12 @@ async fn rename_workspace(
         }
         None => None,
     };
-    let workspace = state
-        .store
-        .update_workspace(name, icon.as_deref(), prefix.as_deref())?;
+    let workspace = state.store.update_workspace(
+        name,
+        icon.as_deref(),
+        input.icon_file_id.as_deref(),
+        prefix.as_deref(),
+    )?;
     state.emit(Event::WorkspaceUpdated {
         workspace: workspace.clone(),
     });
@@ -2722,6 +2925,108 @@ mod tests {
         assert!(s.len() < 260);
     }
 
+    #[tokio::test]
+    async fn an_admin_agent_can_set_an_image_or_emoji_workspace_icon() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let files = path.with_extension("files");
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        tokio::fs::create_dir_all(&files).await.unwrap();
+        let image_path = files.join("icon");
+        tokio::fs::write(&image_path, b"\x89PNG\r\n\x1a\n")
+            .await
+            .unwrap();
+        store
+            .insert_attachment(
+                &Attachment {
+                    id: "icon".into(),
+                    file_name: "icon.png".into(),
+                    mime: "image/png".into(),
+                    size: 8,
+                    caption: String::new(),
+                    url: "/api/files/icon".into(),
+                    message_id: None,
+                    task_id: None,
+                    run_id: None,
+                    created_at: 1,
+                },
+                &image_path.to_string_lossy(),
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            files.clone(),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let caller = Caller {
+            member: Member {
+                id: "agent".into(),
+                kind: MemberKind::Agent,
+                handle: "agent".into(),
+                display_name: "Agent".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: Some(AgentProfile::default()),
+                presence: Presence::Offline,
+            },
+            run_id: Some("run".into()),
+            token_hash: "hash".into(),
+            token_kind: "run".into(),
+        };
+
+        let Json(updated) = update_workspace(
+            State(state.clone()),
+            caller.clone(),
+            Json(WorkspaceInput {
+                name: None,
+                icon: None,
+                icon_file_id: Some("icon".into()),
+                task_prefix: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated.icon_image.as_deref(),
+            Some("/api/workspace/icon/icon")
+        );
+        assert_eq!(
+            axum::body::to_bytes(
+                workspace_icon(State(state.clone()), Path("icon".into()))
+                    .await
+                    .unwrap()
+                    .into_body(),
+                32,
+            )
+            .await
+            .unwrap(),
+            b"\x89PNG\r\n\x1a\n".as_slice()
+        );
+
+        let Json(updated) = update_workspace(
+            State(state.clone()),
+            caller,
+            Json(WorkspaceInput {
+                name: None,
+                icon: Some("🚀".into()),
+                icon_file_id: None,
+                task_prefix: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.icon, "🚀");
+        assert!(updated.icon_image.is_none());
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(files);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn only_a_deliberate_reopen_leaves_a_terminal_state() {
         assert!(reopens_terminal(
@@ -2751,6 +3056,74 @@ mod tests {
             byte_range("bytes=0-", DOWNLOAD_CHUNK_SIZE * 2),
             Some((0, DOWNLOAD_CHUNK_SIZE - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_skills_are_shared_without_per_member_access() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let member = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Online,
+        };
+        store.insert_member(&member).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let caller = Caller {
+            member,
+            run_id: None,
+            token_hash: "token".into(),
+            token_kind: "device".into(),
+        };
+
+        let skill = create_skill(
+            State(state.clone()),
+            caller.clone(),
+            Json(UpsertWorkspaceSkill {
+                name: "Release checks".into(),
+                description: "Before shipping".into(),
+                instructions: "Run the smoke test.".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            list_skills(State(state.clone()), caller.clone())
+                .await
+                .unwrap()
+                .0,
+            [skill]
+        );
+
+        let too_large = create_skill(
+            State(state.clone()),
+            caller,
+            Json(UpsertWorkspaceSkill {
+                name: "Too large".into(),
+                description: String::new(),
+                instructions: "x".repeat(MAX_SKILL_INSTRUCTIONS_BYTES + 1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(too_large.status, axum::http::StatusCode::BAD_REQUEST);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
