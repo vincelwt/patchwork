@@ -587,6 +587,18 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
         None => None,
     };
 
+    // Anyone else working on this task is in the same worktree as you.
+    let peers: Vec<&Run> = task
+        .as_ref()
+        .map(|detail| {
+            detail
+                .runs
+                .iter()
+                .filter(|run| !run.status.is_terminal() && Some(&run.id) != ctx.run_id.as_ref())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let payload = json!({
         "me": bootstrap.me,
         "workspace": bootstrap.workspace.name,
@@ -595,6 +607,7 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
         "task": task.as_ref().map(|t| &t.task),
         "worktree": task.as_ref().and_then(|t| t.worktree.clone()),
         "cwd": std::env::var("PATCHWORK_CWD").ok(),
+        "peers": peers,
     });
 
     client.print(&payload, || {
@@ -622,6 +635,24 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
             }
             if let Some(worktree) = &detail.worktree {
                 println!("Worktree: {} ({})", worktree.path, worktree.branch);
+            }
+            if !peers.is_empty() {
+                println!("Also working here right now:");
+                for run in &peers {
+                    let agent = bootstrap
+                        .members
+                        .iter()
+                        .find(|member| member.id == run.agent_id)
+                        .map(|member| format!("{} (@{})", member.display_name, member.handle))
+                        .unwrap_or_else(|| "another agent".into());
+                    println!(
+                        "  {agent} — run {} [{}] {}",
+                        run.id,
+                        run.status.as_str(),
+                        run.headline
+                    );
+                }
+                println!("Reach them with `patchwork tell <run-id> \"…\"`.");
             }
             if full {
                 for run in detail.runs.iter().take(5) {
@@ -1158,38 +1189,54 @@ async fn tell(client: &Client, args: TellArgs) -> Result<()> {
         bail!("nothing to tell the other run");
     }
     let bootstrap: Bootstrap = client.get("/api/bootstrap").await?;
-    let run_id = if let Some(run) = bootstrap
+    // A task key reaches everyone working on that task, because several agents
+    // can be in it at once and the news is about the task, not about one of
+    // them. A run id reaches exactly that run.
+    let targets: Vec<String> = if let Some(run) = bootstrap
         .active_runs
         .iter()
         .find(|run| run.id == args.target)
     {
-        run.id.clone()
+        vec![run.id.clone()]
     } else if let Some(task) = bootstrap
         .tasks
         .iter()
         .find(|task| task.key.eq_ignore_ascii_case(&args.target))
     {
-        task.current_run_id
-            .clone()
-            .filter(|id| bootstrap.active_runs.iter().any(|run| run.id == *id))
-            .ok_or_else(|| anyhow!("{} has no active run", task.key))?
+        let runs: Vec<String> = bootstrap
+            .active_runs
+            .iter()
+            .filter(|run| run.task_id.as_deref() == Some(task.id.as_str()))
+            .map(|run| run.id.clone())
+            .collect();
+        if runs.is_empty() {
+            bail!("{} has no active run", task.key);
+        }
+        runs
     } else {
         bail!(
             "no active run or task called `{}`; use `patchwork runs`",
             args.target
         );
     };
-    let response: SteerRunResponse = client
-        .post(
-            &format!("/api/runs/{run_id}/steer"),
-            serde_json::to_value(SteerRun {
-                prompt,
-                mode: RunControlMode::Queue,
-                attachment_ids: Vec::new(),
-            })?,
-        )
-        .await?;
-    client.print(&response, || println!("sent"));
+    let mut responses = Vec::new();
+    for run_id in &targets {
+        let response: SteerRunResponse = client
+            .post(
+                &format!("/api/runs/{run_id}/steer"),
+                serde_json::to_value(SteerRun {
+                    prompt: prompt.clone(),
+                    mode: RunControlMode::Queue,
+                    attachment_ids: Vec::new(),
+                })?,
+            )
+            .await?;
+        responses.push(response);
+    }
+    client.print(&responses, || match targets.len() {
+        1 => println!("sent"),
+        n => println!("sent to {n} runs"),
+    });
     Ok(())
 }
 

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 
-import type { Task, TaskStatus } from "@client/types";
+import type { Member, Task, TaskStatus } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
 import { TaskEditor } from "@/components/TaskEditor";
 import { PullRequestLink } from "@/components/pull-request-link";
@@ -80,6 +80,13 @@ function TaskRow({ task }: { task: Task }) {
   const data = useWorkspace().bootstrap;
   const owner = data?.members.find((member) => member.id === task.owner_id);
   const project = data?.projects.find((item) => item.id === task.project_id);
+  // A task can hold several agents at once. Two of them must not look like
+  // one, so the row shows a face each once there is more than one.
+  const working = (data?.active_runs ?? [])
+    .filter((run) => run.task_id === task.id)
+    .sort((a, b) => a.created_at - b.created_at)
+    .map((run) => data?.members.find((member) => member.id === run.agent_id))
+    .filter((member, index, all): member is Member => !!member && all.indexOf(member) === index);
   return (
     <Pressable
       onPress={() => router.push({ pathname: "/tasks/[taskId]", params: { taskId: task.id } })}
@@ -95,7 +102,11 @@ function TaskRow({ task }: { task: Task }) {
           <PullRequestLink task={task} />
         </View>
       </View>
-      {owner ? <Avatar member={owner} size={28} /> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
+      {working.length > 1 ? (
+        <View style={styles.faces}>
+          {working.map((member) => <Avatar key={member.id} member={member} size={24} />)}
+        </View>
+      ) : owner ? <Avatar member={owner} size={28} /> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
       <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={15} />
     </Pressable>
   );
@@ -118,6 +129,7 @@ const styles = StyleSheet.create({
   groupHead: { minHeight: 34, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16 },
   groupTitle: { fontSize: 12, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.7 },
   groupList: { overflow: "hidden" },
+  faces: { flexDirection: "row", alignItems: "center", gap: 3 },
   row: { minHeight: 70, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 9 },
   key: { width: 58, fontSize: 12, fontWeight: "700" },
   main: { flex: 1, minWidth: 0 },

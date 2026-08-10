@@ -780,6 +780,16 @@ body.resizing {
   display: inline-flex;
   flex: none;
 }
+
+/* Several agents on one task. Side by side rather than overlapped: an agent
+   avatar is a ring, and rings that overlap read as a smudge rather than as
+   two teammates. */
+.agent-stack {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+}
 .presence-badge {
   position: absolute;
   right: -1px;

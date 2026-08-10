@@ -766,26 +766,12 @@ async fn trigger_agents(
             continue;
         }
 
-        // An explicit reply still invokes its agent when another agent owns the
-        // task's active writer slot. This conversation-only run gets the task
-        // channel context without becoming a second task writer.
-        let another_task_writer = match &channel.task_id {
-            Some(task_id) => state
-                .store
-                .task_runs(task_id)?
-                .into_iter()
-                .any(|run| !run.status.is_terminal() && run.agent_id != agent.id),
-            None => false,
-        };
-        let task_id = if replied_to_agent && another_task_writer {
-            None
-        } else {
-            channel.task_id.clone()
-        };
+        // A second agent on a busy task joins it: same task, same worktree,
+        // and each of them is told who else is working there.
         let params = StartRunParams {
             agent_id: agent.id.clone(),
             channel_id: channel.id.clone(),
-            task_id,
+            task_id: channel.task_id.clone(),
             prompt: message.body.clone(),
             trigger,
             automation_id: None,
@@ -840,6 +826,85 @@ fn system_member_id(state: &Shared) -> Result<Id> {
         .member_by_handle("patchwork")?
         .map(|m| m.id)
         .unwrap_or_else(|| "patchwork".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Agents sharing a task
+// ---------------------------------------------------------------------------
+
+/// A task takes as many agents at once as somebody starts on it, and they all
+/// work in its one worktree. Nothing here arbitrates between them: it makes
+/// each of them aware of the others, at the start of a run and whenever the
+/// company changes, so they can stay out of each other's way themselves.
+const SHARED_WORKTREE_ETIQUETTE: &str = "You share this checkout with them: \
+touch only the files your own work needs, stage those paths by name rather than \
+`git commit -a`, and do not switch, rebase or reset the branch under someone \
+else. Read a file again before you edit it, and use `patchwork tell <run-id>` \
+when something you changed affects their work.";
+
+/// Everyone else still working on this task, newest first.
+fn task_peers(state: &Shared, task_id: &str, except_run_id: &str) -> Result<Vec<Run>> {
+    Ok(state
+        .store
+        .active_task_runs(task_id)?
+        .into_iter()
+        .filter(|run| run.id != except_run_id)
+        .collect())
+}
+
+fn agent_label(members: &[Member], agent_id: &str) -> String {
+    match members.iter().find(|member| member.id == agent_id) {
+        Some(member) => format!("{} (@{})", member.display_name, member.handle),
+        None => "Another agent".to_string(),
+    }
+}
+
+/// One line per agent in the worktree: who, which run to talk to, and what
+/// they said they were doing when they last reported.
+fn peer_line(members: &[Member], run: &Run) -> String {
+    let doing = run.headline.trim();
+    let doing = if doing.is_empty() { "working" } else { doing };
+    format!(
+        "- {} — run {} [{}] — {doing}\n",
+        agent_label(members, &run.agent_id),
+        run.id,
+        run.status.as_str()
+    )
+}
+
+/// Tell everyone else on this task that the company changed. It arrives as a
+/// queued turn in their existing session, so nobody is interrupted mid-edit.
+async fn tell_task_peers(state: &Shared, task_id: &str, except_run_id: &str, body: String) {
+    let peers = match task_peers(state, task_id, except_run_id) {
+        Ok(peers) => peers,
+        Err(err) => {
+            tracing::warn!(?err, task = %task_id, "could not list the task's other runs");
+            return;
+        }
+    };
+    for peer in peers {
+        let control_id = new_id();
+        if let Err(err) = deliver_control(
+            state,
+            &peer,
+            control_id,
+            body.clone(),
+            RunControlMode::Queue,
+            Vec::new(),
+        )
+        .await
+        {
+            tracing::warn!(?err, run = %peer.id, "could not tell a task peer");
+            continue;
+        }
+        let _ = append_run_event(
+            state,
+            &peer.id,
+            RunEventKind::Lifecycle,
+            body.lines().next().unwrap_or_default().to_string(),
+            None,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1403,30 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         }
     }
 
+    // Whoever is already in this worktree hears that someone joined them,
+    // rather than discovering it in a file that moved.
+    if let (Some(task_id), Some(task)) = (run.task_id.as_deref(), task.as_ref()) {
+        let asked = params.prompt.trim().chars().take(500).collect::<String>();
+        let where_ = run
+            .cwd
+            .as_deref()
+            .map(|path| format!(" ({path})"))
+            .unwrap_or_default();
+        tell_task_peers(
+            state,
+            task_id,
+            &run.id,
+            format!(
+                "{} just started working on {} alongside you, in the same worktree{where_}. \
+They were asked:\n\n{asked}\n\n{SHARED_WORKTREE_ETIQUETTE} Carry on with your own work; \
+reply only if this changes it.",
+                agent_label(&state.store.members()?, &agent.id),
+                task.key,
+            ),
+        )
+        .await;
+    }
+
     // The run card makes concurrent agent work visible in the conversation.
     let _ = post_message(
         state,
@@ -1620,6 +1709,15 @@ async fn build_context(state: &Shared, run: &Run, task: &Option<Task>) -> Result
             out.push_str(&format!("Pull request: {pr}\n"));
         }
         out.push('\n');
+
+        let peers = task_peers(state, &task.id, &run.id)?;
+        if !peers.is_empty() {
+            out.push_str("Working on this task right now, in the same worktree:\n");
+            for peer in &peers {
+                out.push_str(&peer_line(&members, peer));
+            }
+            out.push_str(&format!("{SHARED_WORKTREE_ETIQUETTE}\n\n"));
+        }
     }
 
     let messages = match &run.trigger {
@@ -2115,21 +2213,56 @@ fn discussion_channel(state: &Shared, task_id: &str) -> Result<Id> {
         .ok_or_else(|| anyhow!("task not found"))
 }
 
-pub(crate) fn has_review_evidence(
+/// The run that just ended plus everyone who was working on the task at the
+/// same time. Evidence from any of them belongs to this stretch of work, and
+/// which agent attached it is not the reviewer's problem.
+fn concurrent_run_ids(state: &Shared, task: &Task, run: &Run) -> Vec<Id> {
+    let started = run.started_at.unwrap_or(run.created_at);
+    let mut ids = vec![run.id.clone()];
+    ids.extend(
+        state
+            .store
+            .task_runs(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|other| other.id != run.id && other.ended_at.unwrap_or_else(now_ms) >= started)
+            .map(|other| other.id),
+    );
+    ids
+}
+
+/// Whose artifacts count as this task's current evidence: the caller's own run
+/// and everyone working alongside it right now.
+pub(crate) fn evidence_run_ids(
     state: &Shared,
     task: &Task,
     run_id: Option<&str>,
+) -> Result<Vec<Id>> {
+    let mut ids: Vec<Id> = run_id.into_iter().map(str::to_string).collect();
+    for peer in state.store.active_task_runs(&task.id)? {
+        if !ids.contains(&peer.id) {
+            ids.push(peer.id);
+        }
+    }
+    Ok(ids)
+}
+
+pub(crate) fn has_review_evidence(
+    state: &Shared,
+    task: &Task,
+    run_ids: &[Id],
     pending_pr_url: Option<&str>,
 ) -> Result<bool> {
+    let produced_by = |id: Option<&str>| id.is_some_and(|id| run_ids.iter().any(|run| run == id));
     let artifact = pending_pr_url.is_some_and(|url| !url.is_empty())
         || task.pr_url.as_deref().is_some_and(|url| !url.is_empty())
         || state
             .store
             .task_attachments(&task.id)?
             .iter()
-            .any(|attachment| attachment.run_id.as_deref() == run_id)
+            .any(|attachment| produced_by(attachment.run_id.as_deref()))
         || state.store.task_previews(&task.id)?.iter().any(|preview| {
-            preview.run_id.as_deref() == run_id && preview.status == PreviewStatus::Live
+            produced_by(preview.run_id.as_deref()) && preview.status == PreviewStatus::Live
         });
     if artifact {
         return Ok(true);
@@ -2138,15 +2271,20 @@ pub(crate) fn has_review_evidence(
     // A recommendation or answer is itself the thing a person reviews. The
     // immutable original request tells us that this is an inquiry even when
     // the agent later distils the task title/outcome into its conclusion.
-    let Some(run_id) = run_id else {
+    if run_ids.is_empty() || !task_expects_written_answer(state, task)? {
         return Ok(false);
-    };
-    Ok(task_expects_written_answer(state, task)?
-        && state.store.run_events(run_id, 0)?.iter().any(|event| {
+    }
+    for run_id in run_ids {
+        let answered = state.store.run_events(run_id, 0)?.iter().any(|event| {
             event.kind == RunEventKind::Message
                 && event.data.is_none()
                 && !event.text.trim().is_empty()
-        }))
+        });
+        if answered {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn task_expects_written_answer(state: &Shared, task: &Task) -> Result<bool> {
@@ -2246,15 +2384,66 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     let Some(mut task) = state.store.task(task_id)? else {
         return Ok(());
     };
+
+    // Several agents can be working here at once. Whoever is left keeps the
+    // task running, and only the last one out decides what it became.
+    let peers = task_peers(state, task_id, &run.id)?;
+    if !peers.is_empty() {
+        let members = state.store.members()?;
+        let outcome = match run.status {
+            RunStatus::Succeeded => "finished",
+            RunStatus::Failed => "stopped with an error",
+            _ => "stopped",
+        };
+        let headline = run.headline.trim();
+        let headline = if headline.is_empty() {
+            String::new()
+        } else {
+            format!(": {headline}")
+        };
+        tell_task_peers(
+            state,
+            task_id,
+            &run.id,
+            format!(
+                "{} {outcome} on {}{headline}. You are still working here; \
+the task stays yours until you stop. Reply only if this changes your work.",
+                agent_label(&members, &run.agent_id),
+                task.key,
+            ),
+        )
+        .await;
+        if task.current_run_id.as_deref() == Some(run.id.as_str()) {
+            task.current_run_id = peers.first().map(|peer| peer.id.clone());
+            state.store.update_task(&task)?;
+            state.emit(Event::TaskUpdated { task });
+        }
+        return Ok(());
+    }
+
     if task.current_run_id.as_deref() != Some(run.id.as_str()) {
         return Ok(());
     }
     task.current_run_id = None;
 
-    match run.status {
+    // The last agent out reports for the whole group, and a failure inside it
+    // is not erased by whoever happened to finish afterwards.
+    let group = concurrent_run_ids(state, &task, run);
+    let outcome = if state
+        .store
+        .task_runs(task_id)?
+        .iter()
+        .any(|other| other.status == RunStatus::Failed && group.contains(&other.id))
+    {
+        RunStatus::Failed
+    } else {
+        run.status
+    };
+
+    match outcome {
         RunStatus::Succeeded => {
             if task.status == TaskStatus::Running {
-                if has_review_evidence(state, &task, Some(run.id.as_str()), None)? {
+                if has_review_evidence(state, &task, &group, None)? {
                     task.status = TaskStatus::Review;
                     notify_task(
                         state,

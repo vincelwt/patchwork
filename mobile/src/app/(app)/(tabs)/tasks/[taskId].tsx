@@ -6,10 +6,14 @@ import { Conversation } from "@/components/Message";
 import { PullRequestLink } from "@/components/pull-request-link";
 import { TaskEditor } from "@/components/TaskEditor";
 import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "@/components/ui";
-import { taskStatusLabel } from "@/lib/format";
+import { runStatusLabel, taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { isTerminalTaskStatus } from "@client/types";
+
+/// A run in one of these states is over. Anything else is still on the task,
+/// and there can be more than one of those at a time.
+const FINISHED = ["succeeded", "failed", "cancelled"];
 
 export default function TaskScreen() {
   const { taskId } = useLocalSearchParams<{ taskId: string }>();
@@ -21,9 +25,24 @@ export default function TaskScreen() {
   const task = data?.tasks.find((item) => item.id === taskId);
   const owner = data?.members.find((member) => member.id === task?.owner_id);
   const project = data?.projects.find((item) => item.id === task?.project_id);
-  const activeRun = task?.current_run_id
+  const currentRun = task?.current_run_id
     ? workspace.runDetails[task.current_run_id]?.run ?? data?.active_runs.find((run) => run.id === task.current_run_id)
     : undefined;
+  // Several agents can be inside one task at once, sharing its worktree, so
+  // `current_run_id` names the newest run to look at rather than the only one.
+  // Oldest first, so an agent keeps its place while another starts or stops.
+  const taskRuns = (data?.active_runs ?? [])
+    .filter((run) => run.task_id === task?.id && !FINISHED.includes(run.status))
+    .sort((a, b) => a.created_at - b.created_at);
+  // A run opened from this screen can be fresher than the bootstrap list.
+  if (currentRun && !FINISHED.includes(currentRun.status) && !taskRuns.some((run) => run.id === currentRun.id)) {
+    taskRuns.push(currentRun);
+  }
+  // The run the header speaks for: the newest one still going, and otherwise
+  // whatever ran last, so "Retry" still knows it is a retry.
+  const activeRun = currentRun && !FINISHED.includes(currentRun.status)
+    ? currentRun
+    : taskRuns[taskRuns.length - 1] ?? currentRun;
   const [editing, setEditing] = useState(false);
   const [agents, setAgents] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -66,7 +85,7 @@ export default function TaskScreen() {
     }
   };
 
-  const active = activeRun && !["succeeded", "failed", "cancelled"].includes(activeRun.status);
+  const active = taskRuns.length > 0;
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
@@ -89,12 +108,43 @@ export default function TaskScreen() {
           {task.due_at ? <Badge tone={task.due_at < Date.now() && !isTerminalTaskStatus(task.status) ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
           <PullRequestLink task={task} />
         </View>
+        {taskRuns.length > 1 ? (
+          <View style={styles.runs}>
+            {taskRuns.map((run) => {
+              const agent = data.members.find((member) => member.id === run.agent_id);
+              return (
+                <View key={run.id} style={[styles.runRow, { borderTopColor: theme.line }]}>
+                  <Avatar member={agent} size={26} />
+                  <Pressable
+                    style={styles.fill}
+                    onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } })}
+                  >
+                    <Text numberOfLines={1} style={{ color: theme.text, fontWeight: "600" }}>{agent?.display_name ?? "Agent"}</Text>
+                    <Text numberOfLines={1} style={{ color: theme.muted }}>{run.headline || runStatusLabel(run.status)}</Text>
+                  </Pressable>
+                  {/* Per run, because one Stop for several agents is a guess. */}
+                  <Button label="Stop" compact tone="danger" onPress={() => void store.mutate((api) => api.cancelRun(run.id))} />
+                </View>
+              );
+            })}
+          </View>
+        ) : null}
         <View style={styles.actions}>
           {active ? (
-            <>
-              <Button label="Run details" compact tone="secondary" onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: activeRun.id } })} />
-              <Button label="Stop" compact tone="danger" busy={busy} onPress={() => void store.mutate((api) => api.cancelRun(activeRun.id))} />
-            </>
+            taskRuns.length > 1 ? (
+              <Button
+                label="Stop all"
+                compact
+                tone="danger"
+                busy={busy}
+                onPress={() => void store.mutate((api) => Promise.all(taskRuns.map((run) => api.cancelRun(run.id))))}
+              />
+            ) : (
+              <>
+                <Button label="Run details" compact tone="secondary" onPress={() => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: taskRuns[0].id } })} />
+                <Button label="Stop" compact tone="danger" busy={busy} onPress={() => void store.mutate((api) => api.cancelRun(taskRuns[0].id))} />
+              </>
+            )
           ) : task.status === "review" ? (
             <>
               <Button
@@ -161,6 +211,8 @@ const styles = StyleSheet.create({
   outcome: { fontSize: 14, lineHeight: 20 },
   meta: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 9 },
   person: { flexDirection: "row", alignItems: "center", gap: 6 },
+  runs: { gap: 2 },
+  runRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8, borderTopWidth: StyleSheet.hairlineWidth },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   discussionHead: { paddingHorizontal: 16, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth },
   discussionTitle: { fontSize: 13, fontWeight: "700" },

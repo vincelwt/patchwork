@@ -10,6 +10,12 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use patchwork_core::host::WorktreeSpec;
 use tokio::process::Command;
+use tokio::sync::Mutex;
+
+/// Two agents starting on the same task at the same moment would both try to
+/// create its worktree. Preparing one at a time costs nothing and means the
+/// second one simply finds the directory the first made.
+static PREPARING: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone)]
 pub struct PreparedWorktree {
@@ -31,6 +37,7 @@ pub fn work_root() -> PathBuf {
 }
 
 pub async fn prepare(spec: &WorktreeSpec, task_key: &str) -> Result<PreparedWorktree> {
+    let _one_at_a_time = PREPARING.lock().await;
     match spec {
         WorktreeSpec::None => {
             let path = work_root().join("scratch").join(task_key);
