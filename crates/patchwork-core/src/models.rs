@@ -1004,9 +1004,12 @@ pub enum PreviewStatus {
 pub struct Workspace {
     pub id: Id,
     pub name: String,
-    /// A short label or emoji shown in the workspace switcher.
+    /// Emoji shown when no custom image is set.
     #[serde(default)]
     pub icon: String,
+    /// Relay-relative URL of the current PNG or JPEG icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_image: Option<String>,
     pub created_at: Millis,
     /// What task keys start with: `PW` gives `PW-14`.
     #[serde(default = "default_task_prefix")]

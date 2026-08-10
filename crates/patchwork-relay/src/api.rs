@@ -185,6 +185,7 @@ pub fn router(state: Shared) -> Router {
     let public = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/pair", post(claim_pairing))
+        .route("/api/workspace/icon/{id}", get(workspace_icon))
         .route("/api/webhooks/{token}", post(webhook));
 
     let api = Router::new()
@@ -272,7 +273,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/files/{id}/grant", post(grant_file))
         .route("/api/files/{id}/evidence", delete(remove_file_evidence))
         // workspace admin
-        .route("/api/workspace", patch(rename_workspace))
+        .route("/api/workspace", patch(update_workspace))
         .route("/api/invites", get(list_invites).post(create_invite))
         .route("/api/search", get(search))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
@@ -2548,17 +2549,67 @@ struct WorkspaceInput {
     name: Option<String>,
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default)]
+    icon_file_id: Option<Id>,
     /// What task keys start with. Letters and digits, upper-cased.
     #[serde(default)]
     task_prefix: Option<String>,
 }
 
-async fn rename_workspace(
+const MAX_WORKSPACE_ICON_SIZE: i64 = 2 * 1024 * 1024;
+
+fn workspace_icon_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+async fn workspace_icon(State(state): State<Shared>, Path(id): Path<Id>) -> ApiResult<Response> {
+    let workspace = state.store.workspace()?;
+    let icon_path = format!("/api/workspace/icon/{id}");
+    if workspace.icon_image.as_deref() != Some(icon_path.as_str()) {
+        return Err(ApiError::not_found("workspace icon not found"));
+    }
+    let (attachment, path) = state
+        .store
+        .attachment(&id)?
+        .ok_or_else(|| ApiError::not_found("workspace icon not found"))?;
+    if attachment.size > MAX_WORKSPACE_ICON_SIZE {
+        return Err(ApiError::not_found("workspace icon not found"));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|_| ApiError::not_found("workspace icon not found"))?;
+    let mime = workspace_icon_mime(&bytes)
+        .ok_or_else(|| ApiError::not_found("workspace icon not found"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn update_workspace(
     State(state): State<Shared>,
     caller: Caller,
     Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
+    if input.icon.is_some() && input.icon_file_id.is_some() {
+        return Err(ApiError::bad_request(
+            "choose an emoji or an image, not both",
+        ));
+    }
     let name = input
         .name
         .as_deref()
@@ -2569,6 +2620,26 @@ async fn rename_workspace(
         .as_deref()
         .map(str::trim)
         .map(|value| value.chars().take(8).collect::<String>());
+    if let Some(id) = input.icon_file_id.as_deref() {
+        let (attachment, path) = state
+            .store
+            .attachment(id)?
+            .ok_or_else(|| ApiError::not_found("icon image not found"))?;
+        require_attachment_access(&state, &caller, &attachment)?;
+        if attachment.size > MAX_WORKSPACE_ICON_SIZE {
+            return Err(ApiError::bad_request(
+                "a workspace icon must be no larger than 2 MB",
+            ));
+        }
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|_| ApiError::not_found("icon image not found"))?;
+        if workspace_icon_mime(&bytes).is_none() {
+            return Err(ApiError::bad_request(
+                "a workspace icon must be a PNG or JPEG",
+            ));
+        }
+    }
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw
@@ -2584,9 +2655,12 @@ async fn rename_workspace(
         }
         None => None,
     };
-    let workspace = state
-        .store
-        .update_workspace(name, icon.as_deref(), prefix.as_deref())?;
+    let workspace = state.store.update_workspace(
+        name,
+        icon.as_deref(),
+        input.icon_file_id.as_deref(),
+        prefix.as_deref(),
+    )?;
     state.emit(Event::WorkspaceUpdated {
         workspace: workspace.clone(),
     });
@@ -2720,6 +2794,108 @@ mod tests {
         assert!(s.starts_with('…'));
         assert!(s.contains("NEEDLE"));
         assert!(s.len() < 260);
+    }
+
+    #[tokio::test]
+    async fn an_admin_agent_can_set_an_image_or_emoji_workspace_icon() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let files = path.with_extension("files");
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        tokio::fs::create_dir_all(&files).await.unwrap();
+        let image_path = files.join("icon");
+        tokio::fs::write(&image_path, b"\x89PNG\r\n\x1a\n")
+            .await
+            .unwrap();
+        store
+            .insert_attachment(
+                &Attachment {
+                    id: "icon".into(),
+                    file_name: "icon.png".into(),
+                    mime: "image/png".into(),
+                    size: 8,
+                    caption: String::new(),
+                    url: "/api/files/icon".into(),
+                    message_id: None,
+                    task_id: None,
+                    run_id: None,
+                    created_at: 1,
+                },
+                &image_path.to_string_lossy(),
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            files.clone(),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let caller = Caller {
+            member: Member {
+                id: "agent".into(),
+                kind: MemberKind::Agent,
+                handle: "agent".into(),
+                display_name: "Agent".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: Some(AgentProfile::default()),
+                presence: Presence::Offline,
+            },
+            run_id: Some("run".into()),
+            token_hash: "hash".into(),
+            token_kind: "run".into(),
+        };
+
+        let Json(updated) = update_workspace(
+            State(state.clone()),
+            caller.clone(),
+            Json(WorkspaceInput {
+                name: None,
+                icon: None,
+                icon_file_id: Some("icon".into()),
+                task_prefix: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated.icon_image.as_deref(),
+            Some("/api/workspace/icon/icon")
+        );
+        assert_eq!(
+            axum::body::to_bytes(
+                workspace_icon(State(state.clone()), Path("icon".into()))
+                    .await
+                    .unwrap()
+                    .into_body(),
+                32,
+            )
+            .await
+            .unwrap(),
+            b"\x89PNG\r\n\x1a\n".as_slice()
+        );
+
+        let Json(updated) = update_workspace(
+            State(state.clone()),
+            caller,
+            Json(WorkspaceInput {
+                name: None,
+                icon: Some("🚀".into()),
+                icon_file_id: None,
+                task_prefix: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.icon, "🚀");
+        assert!(updated.icon_image.is_none());
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(files);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

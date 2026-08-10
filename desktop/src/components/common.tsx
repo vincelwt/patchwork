@@ -91,6 +91,33 @@ export function PresenceDot({ presence }: { presence: Presence }) {
   return <span className={`dot ${presence}`} />;
 }
 
+export function WorkspaceMark({
+  name,
+  icon,
+  image,
+  size = 22,
+}: {
+  name: string;
+  icon?: string;
+  image?: string;
+  size?: number;
+}) {
+  const [brokenImage, setBrokenImage] = useState("");
+  const showImage = !!image && brokenImage !== image;
+  return (
+    <span
+      className="workspace-mark"
+      aria-hidden="true"
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.52) }}
+    >
+      {showImage ? (
+        <img src={image} alt="" onError={() => setBrokenImage(image)} />
+      ) : (
+        icon?.trim() || name.trim().charAt(0).toUpperCase() || "?"
+      )}
+    </span>
+  );
+}
 
 export function Chip({
   tone = "",

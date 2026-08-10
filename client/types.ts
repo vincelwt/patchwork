@@ -452,7 +452,10 @@ export interface Preview {
 export interface Workspace {
   id: Id;
   name: string;
+  /** Emoji shown when no custom image is set. */
   icon?: string;
+  /** Relay-relative URL of the current PNG or JPEG icon. */
+  icon_image?: string;
   /// What task keys start with: "PW" gives PW-14.
   task_prefix: string;
   created_at: Millis;

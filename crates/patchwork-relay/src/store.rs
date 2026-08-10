@@ -86,6 +86,7 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN due_at INTEGER",
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE workspace ADD COLUMN icon_file_id TEXT",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
@@ -149,16 +150,19 @@ impl Store {
     pub fn workspace(&self) -> Result<Workspace> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, icon, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
+            "SELECT id, name, icon, icon_file_id, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
             [],
             |r| {
+                let icon_file_id: Option<String> = r.get(3)?;
                 Ok(Workspace {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     icon: r.get(2)?,
-                    created_at: r.get(3)?,
-                    task_prefix: r.get(4)?,
-                    task_seq: r.get(5)?,
+                    icon_image: icon_file_id
+                        .map(|id| format!("/api/workspace/icon/{id}")),
+                    created_at: r.get(4)?,
+                    task_prefix: r.get(5)?,
+                    task_seq: r.get(6)?,
                 })
             },
         )
@@ -174,6 +178,7 @@ impl Store {
             task_prefix: patchwork_core::models::default_task_prefix(),
             name: name.to_string(),
             icon: String::new(),
+            icon_image: None,
             created_at: now_ms(),
             task_seq: 0,
         };
@@ -188,6 +193,7 @@ impl Store {
         &self,
         name: Option<&str>,
         icon: Option<&str>,
+        icon_file_id: Option<&str>,
         task_prefix: Option<&str>,
     ) -> Result<Workspace> {
         let conn = self.conn()?;
@@ -195,7 +201,16 @@ impl Store {
             conn.execute("UPDATE workspace SET name = ?1", params![name])?;
         }
         if let Some(icon) = icon {
-            conn.execute("UPDATE workspace SET icon = ?1", params![icon])?;
+            conn.execute(
+                "UPDATE workspace SET icon = ?1, icon_file_id = NULL",
+                params![icon],
+            )?;
+        }
+        if let Some(id) = icon_file_id {
+            conn.execute(
+                "UPDATE workspace SET icon = '', icon_file_id = ?1",
+                params![id],
+            )?;
         }
         if let Some(prefix) = task_prefix {
             conn.execute("UPDATE workspace SET task_prefix = ?1", params![prefix])?;
