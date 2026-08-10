@@ -556,15 +556,15 @@ async fn trigger_agents(
         Some(run_id) => state.store.run_depth(run_id)?,
         None => -1,
     };
-    let reply_agent = match &message.reply_to_id {
-        Some(id) => state
-            .store
-            .message(id)?
-            .and_then(|source| members.iter().find(|member| member.id == source.author_id))
-            .filter(|member| member.kind == MemberKind::Agent)
-            .map(|member| member.id.clone()),
+    let reply_source = match &message.reply_to_id {
+        Some(id) => state.store.message(id)?,
         None => None,
     };
+    let reply_agent = reply_source
+        .as_ref()
+        .and_then(|source| members.iter().find(|member| member.id == source.author_id))
+        .filter(|member| member.kind == MemberKind::Agent)
+        .map(|member| member.id.clone());
 
     // Ownership can change while work is running. Feedback belongs to the
     // task's actual writer first, not whoever currently owns the card.
@@ -724,16 +724,21 @@ async fn trigger_agents(
         if let Some(active) = state.store.agent_active_run(&agent.id, &channel.id)? {
             let control_id = new_id();
             queue_destination(state, &control_id, message).await;
-            let prompt = format!(
-                "{} {}:\n\n{}",
-                display_name_of(members, &message.author_id),
-                if replied_to_agent {
-                    "replied to your message"
-                } else {
-                    "just said"
-                },
-                message.body
-            );
+            let prompt = if let Some(source) = reply_source.as_ref().filter(|_| replied_to_agent) {
+                format!(
+                    "{} replied to {}'s message:\n\n{}\n\nReply:\n\n{}",
+                    display_name_of(members, &message.author_id),
+                    display_name_of(members, &source.author_id),
+                    source.body,
+                    message.body
+                )
+            } else {
+                format!(
+                    "{} just said:\n\n{}",
+                    display_name_of(members, &message.author_id),
+                    message.body
+                )
+            };
             let attachment_ids = message
                 .attachments
                 .iter()
@@ -3215,6 +3220,7 @@ mod tests {
         for member in [&human, &target, &ambient] {
             store.insert_member(member).unwrap();
         }
+        let members = [human, target, ambient];
         let channel = Channel {
             id: "channel".into(),
             kind: ChannelKind::Channel,
@@ -3229,9 +3235,10 @@ mod tests {
             last_message_at: 0,
         };
         store.insert_channel(&channel).unwrap();
-        let mut source = message_at("source", &target.id, 1, None);
+        let mut source = message_at("source", "target", 1, None);
         source.channel_id = channel.id.clone();
-        let mut reply = message_at("reply", &human.id, 2, None);
+        source.body = "Original answer".into();
+        let mut reply = message_at("reply", "human", 2, None);
         reply.channel_id = channel.id.clone();
         reply.reply_to_id = Some(source.id.clone());
         store.insert_message(&source).unwrap();
@@ -3250,7 +3257,7 @@ mod tests {
             .await
             .insert("relay".into(), crate::state::HostConn { tx });
 
-        trigger_agents(&state, &reply, &channel, &[human, target, ambient])
+        trigger_agents(&state, &reply, &channel, &members)
             .await
             .unwrap();
 
@@ -3267,7 +3274,23 @@ mod tests {
 
         let mut followup = message_at("followup", "human", 3, None);
         followup.channel_id = channel.id.clone();
-        queue_destination(&state, "control", &followup).await;
+        followup.body = "That makes sense".into();
+        followup.reply_to_id = Some(source.id.clone());
+        store.insert_message(&followup).unwrap();
+        trigger_agents(&state, &followup, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::FollowUp {
+            control_id, prompt, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected a follow-up");
+        };
+        assert_eq!(
+            prompt,
+            "vince replied to target's message:\n\nOriginal answer\n\nReply:\n\nThat makes sense"
+        );
         assert_eq!(
             reply_destination(&state, &run).await.reply_to_id.as_deref(),
             Some("reply"),
@@ -3278,7 +3301,7 @@ mod tests {
             "relay",
             HostToRelay::RunControlStatus {
                 run_id: run.id.clone(),
-                control_id: "control".into(),
+                control_id,
                 state: RunControlState::Started,
             },
         )
