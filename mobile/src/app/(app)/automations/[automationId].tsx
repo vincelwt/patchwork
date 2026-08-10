@@ -25,7 +25,7 @@ export default function AutomationScreen() {
 
   const load = async () => {
     try {
-      setDebug(await store.mutate((api) => api.automationDebug(automationId), false));
+      await store.mutate((api) => api.automationDebug(automationId), false, setDebug);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -55,7 +55,7 @@ export default function AutomationScreen() {
             <Badge>{automation.action.replaceAll("_", " ")}</Badge>
           </View>
           <View style={styles.actions}>
-            <Button label="Run now" compact onPress={async () => { const run = await store.mutate((api) => api.runAutomation(automation.id)); if (run.run_id) router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }); void load(); }} />
+            <Button label="Run now" compact onPress={async () => { await store.mutate((api) => api.runAutomation(automation.id), true, (run) => { if (run.run_id) router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }); void load(); }); }} />
             <Button
               label={automation.enabled ? "Pause" : "Resume"}
               compact

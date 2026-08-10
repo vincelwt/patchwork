@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { avatarStyle, initials } from "../lib/format";
 import type { Id, Member, Presence } from "@client/types";
@@ -9,6 +9,7 @@ export type View =
   | { kind: "channel"; id: Id }
   | { kind: "task"; id: Id }
   | { kind: "agents" }
+  | { kind: "skills" }
   | { kind: "projects" }
   | { kind: "members" }
   | { kind: "automations" }
@@ -91,6 +92,33 @@ export function PresenceDot({ presence }: { presence: Presence }) {
   return <span className={`dot ${presence}`} />;
 }
 
+export function WorkspaceMark({
+  name,
+  icon,
+  image,
+  size = 22,
+}: {
+  name: string;
+  icon?: string;
+  image?: string;
+  size?: number;
+}) {
+  const [brokenImage, setBrokenImage] = useState("");
+  const showImage = !!image && brokenImage !== image;
+  return (
+    <span
+      className="workspace-mark"
+      aria-hidden="true"
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.52) }}
+    >
+      {showImage ? (
+        <img src={image} alt="" onError={() => setBrokenImage(image)} />
+      ) : (
+        icon?.trim() || name.trim().charAt(0).toUpperCase() || "?"
+      )}
+    </span>
+  );
+}
 
 export function Chip({
   tone = "",
@@ -203,11 +231,13 @@ export function Field({
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   type?: string;
 }) {
+  const id = useId();
   return (
     <div className="form-row">
-      <label>{label}</label>
+      <label htmlFor={id}>{label}</label>
       {textarea ? (
         <textarea
+          id={id}
           className="field"
           {...proseText}
           ref={inputRef}
@@ -218,6 +248,7 @@ export function Field({
         />
       ) : (
         <input
+          id={id}
           className="field"
           {...plainText}
           type={type}

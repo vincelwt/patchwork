@@ -1253,6 +1253,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         agent_handle: agent.handle.clone(),
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
+        skills: state.store.workspace_skills()?,
         runtime: profile.runtime.clone(),
         provider: profile.provider.clone(),
         model: profile.model.clone(),
@@ -1402,6 +1403,7 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
         agent_handle: agent.handle.clone(),
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
+        skills: state.store.workspace_skills()?,
         runtime: profile.runtime.clone(),
         provider: profile.provider.clone(),
         model: profile.model.clone(),
@@ -3054,6 +3056,20 @@ mod tests {
         let mut agent = member("agent", "developer", MemberKind::Agent);
         agent.agent.as_mut().unwrap().runtime = "codex".into();
         store.insert_member(&agent).unwrap();
+        store
+            .save_workspace_skill(
+                WorkspaceSkill {
+                    id: "skill".into(),
+                    name: "Release checks".into(),
+                    description: String::new(),
+                    instructions: "Run the release smoke test.".into(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                false,
+                usize::MAX,
+            )
+            .unwrap();
         let run = Run {
             id: "run".into(),
             agent_id: agent.id.clone(),
@@ -3098,6 +3114,7 @@ mod tests {
         assert_eq!(spec.run_id, "run");
         assert_eq!(spec.resume_session_id.as_deref(), Some("session"));
         assert_eq!(spec.prompt, "Finish the interrupted work");
+        assert_eq!(spec.skills, store.workspace_skills().unwrap());
         assert!(matches!(
             spec.worktree,
             WorktreeSpec::Existing { ref path } if path == "/tmp/existing-worktree"

@@ -187,9 +187,12 @@ enum WorkspaceCommand {
     Update {
         #[arg(long)]
         name: Option<String>,
-        /// A short label or emoji.
+        /// An emoji. Clears a custom image when supplied.
         #[arg(long)]
         icon: Option<String>,
+        /// A PNG or JPEG file, up to 2 MB.
+        #[arg(long, conflicts_with = "icon")]
+        icon_file: Option<String>,
         #[arg(long)]
         task_prefix: Option<String>,
     },
@@ -654,12 +657,22 @@ async fn workspace(client: &Client, command: WorkspaceCommand) -> Result<()> {
         WorkspaceCommand::Update {
             name,
             icon,
+            icon_file,
             task_prefix,
         } => {
+            let icon_file_id = match icon_file {
+                Some(path) => Some(upload_file(client, &path, "", None).await?.id),
+                None => None,
+            };
             let updated: Workspace = client
                 .patch(
                     "/api/workspace",
-                    json!({ "name": name, "icon": icon, "task_prefix": task_prefix }),
+                    json!({
+                        "name": name,
+                        "icon": icon,
+                        "icon_file_id": icon_file_id,
+                        "task_prefix": task_prefix
+                    }),
                 )
                 .await?;
             client.print(&updated, || println!("workspace updated"));
@@ -1308,11 +1321,11 @@ async fn ask(client: &Client, ctx: &RunContext, args: AskArgs) -> Result<()> {
     Ok(())
 }
 
-async fn upload_attachment(
+async fn upload_file(
     client: &Client,
-    ctx: &RunContext,
     path: &str,
     caption: &str,
+    task_id: Option<&str>,
 ) -> Result<Attachment> {
     let file_name = std::path::Path::new(path)
         .file_name()
@@ -1333,7 +1346,7 @@ async fn upload_attachment(
                     "mime": "",
                     "size": size,
                     "caption": caption,
-                    "task_id": ctx.task_id,
+                    "task_id": task_id,
                 }),
             )
             .await?;
@@ -1365,8 +1378,8 @@ async fn upload_attachment(
             "file",
             reqwest::multipart::Part::bytes(bytes).file_name(file_name),
         );
-        if let Some(task_id) = &ctx.task_id {
-            form = form.text("task_id", task_id.clone());
+        if let Some(task_id) = task_id {
+            form = form.text("task_id", task_id.to_string());
         }
         if !caption.is_empty() {
             form = form.text("caption", caption.to_string());
@@ -1380,6 +1393,16 @@ async fn upload_attachment(
             .await?;
         parse(response).await?
     };
+    Ok(attachment)
+}
+
+async fn upload_attachment(
+    client: &Client,
+    ctx: &RunContext,
+    path: &str,
+    caption: &str,
+) -> Result<Attachment> {
+    let attachment = upload_file(client, path, caption, ctx.task_id.as_deref()).await?;
     if let Some(channel_id) = &ctx.channel_id {
         let _: Message = client
             .post(
@@ -1882,6 +1905,21 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Workspace(WorkspaceCommand::Update { icon: Some(_), .. })
+        ));
+        let cli = Cli::try_parse_from([
+            "patchwork",
+            "workspace",
+            "update",
+            "--icon-file",
+            "logo.png",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Workspace(WorkspaceCommand::Update {
+                icon_file: Some(_),
+                ..
+            })
         ));
 
         let cli = Cli::try_parse_from([

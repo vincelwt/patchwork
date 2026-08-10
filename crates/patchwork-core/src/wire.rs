@@ -68,6 +68,8 @@ pub struct Bootstrap {
     pub members: Vec<Member>,
     pub sections: Vec<Section>,
     pub channels: Vec<Channel>,
+    #[serde(default)]
+    pub skills: Vec<WorkspaceSkill>,
     pub projects: Vec<Project>,
     pub hosts: Vec<Host>,
     pub tasks: Vec<Task>,
@@ -287,7 +289,15 @@ pub struct AnswerQuestion {
     pub answers: Vec<QuestionAnswer>,
 }
 
-// --- agents, projects, hosts ------------------------------------------------
+// --- agents, skills, projects, hosts ----------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpsertWorkspaceSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub instructions: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateAgent {

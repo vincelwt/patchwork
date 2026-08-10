@@ -1,5 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo, { type NetInfoState } from "@react-native-community/netinfo";
+import * as Crypto from "expo-crypto";
+import { Image } from "expo-image";
 import {
   createContext,
   useContext,
@@ -8,7 +10,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { AppState } from "react-native";
+import { Alert, AppState } from "react-native";
 
 import { Api, ApiError } from "@client/api";
 import {
@@ -27,6 +29,7 @@ import {
   clearPairedSession,
   type PairedSession,
 } from "@/lib/session";
+import { isWorkspaceCacheKey, workspaceCacheKey } from "@/lib/workspace-cache";
 
 export type ConnectionState = "connecting" | "live" | "offline" | "error";
 
@@ -44,7 +47,6 @@ export class OfflineError extends Error {
 }
 
 type Listener = () => void;
-const CACHE_PREFIX = "patchwork.workspace.v1:";
 const MAX_CACHE_CHARS = 2_000_000;
 const EMPTY: WorkspaceSnapshot = {
   ...emptyWorkspaceData(),
@@ -60,6 +62,8 @@ export class MobileWorkspaceStore {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private cacheTimer?: ReturnType<typeof setTimeout>;
+  private cacheWrite: Promise<void> = Promise.resolve();
+  private localCleanup: Promise<void> = Promise.resolve();
   private retryDelay = 1_000;
   private generation = 0;
   private attempt = 0;
@@ -80,19 +84,38 @@ export class MobileWorkspaceStore {
   async setSession(session: PairedSession | null | undefined): Promise<void> {
     const generation = ++this.generation;
     this.stopConnection();
+    this.clearCacheTimer();
     this.api = session ? apiFor(session) : undefined;
-    this.cacheKey = session
-      ? `${CACHE_PREFIX}${encodeURIComponent(session.baseUrl.replace(/\/$/, ""))}`
-      : undefined;
+    this.cacheKey = undefined;
     this.hydrated = false;
     this.replace({
       ...emptyWorkspaceData(),
       connection: session && this.active && this.reachable ? "connecting" : "offline",
     });
-    if (!session || !this.cacheKey) return;
+    if (session === undefined) return;
+    if (!session) {
+      await Promise.all([
+        this.pruneWorkspaceCaches(undefined, generation),
+        this.clearImageCaches(),
+      ]).catch(() => undefined);
+      return;
+    }
+
+    const tokenDigest = await Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      session.token,
+    );
+    if (generation !== this.generation) return;
+    const cacheKey = workspaceCacheKey(session.baseUrl, tokenDigest);
+    this.cacheKey = cacheKey;
+    await Promise.all([
+      this.pruneWorkspaceCaches(cacheKey, generation),
+      this.clearImageCaches(),
+    ]).catch(() => undefined);
+    if (generation !== this.generation) return;
 
     try {
-      const raw = await AsyncStorage.getItem(this.cacheKey);
+      const raw = await AsyncStorage.getItem(cacheKey);
       if (generation !== this.generation) return;
       if (raw && raw.length <= MAX_CACHE_CHARS) {
         const restored = fromCache(JSON.parse(raw));
@@ -104,7 +127,7 @@ export class MobileWorkspaceStore {
           });
         }
       } else if (raw) {
-        await AsyncStorage.removeItem(this.cacheKey);
+        await AsyncStorage.removeItem(cacheKey);
       }
     } catch {
       // A corrupt or unavailable cache is expendable; the relay is authoritative.
@@ -144,9 +167,34 @@ export class MobileWorkspaceStore {
   dispose() {
     ++this.generation;
     this.stopConnection();
-    if (this.cacheTimer) clearTimeout(this.cacheTimer);
-    this.cacheTimer = undefined;
+    this.clearCacheTimer();
     this.listeners.clear();
+  }
+
+  async clearLocalData(expected?: PairedSession): Promise<void> {
+    if (
+      expected &&
+      (this.api?.baseUrl !== expected.baseUrl || this.api.token !== expected.token)
+    ) return;
+    ++this.generation;
+    const cacheKey = this.cacheKey;
+    this.stopConnection();
+    this.clearCacheTimer();
+    this.api = undefined;
+    this.cacheKey = undefined;
+    this.hydrated = false;
+    this.replace({ ...emptyWorkspaceData(), connection: "offline" });
+    const cleanup = this.localCleanup
+      .catch(() => undefined)
+      .then(async () => {
+        await this.cacheWrite;
+        await Promise.all([
+          cacheKey ? AsyncStorage.removeItem(cacheKey) : Promise.resolve(),
+          this.clearImageCaches(),
+        ]);
+      });
+    this.localCleanup = cleanup;
+    await cleanup;
   }
 
   async refresh(): Promise<void> {
@@ -163,34 +211,42 @@ export class MobileWorkspaceStore {
     this.scheduleCache();
     if (!this.canConnect() || !this.api) return;
 
-    const page = await this.request(() => this.api!.messages(channelId, before));
-    const existing = this.snapshot.messages[channelId] ?? [];
-    this.replaceData({
-      ...this.snapshot,
-      messages: {
-        ...this.snapshot.messages,
-        [channelId]: before
-          ? mergeMessages(page.messages, existing)
-          : page.messages,
+    await this.request(
+      () => this.api!.messages(channelId, before),
+      (page) => {
+        const existing = this.snapshot.messages[channelId] ?? [];
+        this.replaceData({
+          ...this.snapshot,
+          messages: {
+            ...this.snapshot.messages,
+            [channelId]: before
+              ? mergeMessages(page.messages, existing)
+              : page.messages,
+          },
+          hasMore: { ...this.snapshot.hasMore, [channelId]: page.has_more },
+        });
+        this.scheduleCache();
       },
-      hasMore: { ...this.snapshot.hasMore, [channelId]: page.has_more },
-    });
-    this.scheduleCache();
+    );
   }
 
   async loadThread(messageId: Id): Promise<void> {
     if (!this.canConnect() || !this.api) return;
-    const replies = await this.request(() => this.api!.thread(messageId));
-    this.replaceData({
-      ...this.snapshot,
-      threads: { ...this.snapshot.threads, [messageId]: replies },
-    });
+    await this.request(
+      () => this.api!.thread(messageId),
+      (replies) => this.replaceData({
+        ...this.snapshot,
+        threads: { ...this.snapshot.threads, [messageId]: replies },
+      }),
+    );
   }
 
   async loadRun(runId: Id): Promise<void> {
     if (!this.canConnect() || !this.api) return;
-    const detail = await this.request(() => this.api!.run(runId));
-    this.setRunDetail(detail);
+    await this.request(
+      () => this.api!.run(runId),
+      (detail) => this.setRunDetail(detail),
+    );
   }
 
   setDraft(channelId: Id, draft: string) {
@@ -209,11 +265,17 @@ export class MobileWorkspaceStore {
   async mutate<T>(
     operation: (api: Api) => Promise<T>,
     refresh = true,
-  ): Promise<T> {
+    apply?: (result: T) => void,
+  ): Promise<void> {
     if (!this.canConnect() || !this.api) throw new OfflineError();
-    const result = await this.request(() => operation(this.api!));
+    const generation = this.generation;
+    const api = this.api;
+    const result = await this.request(() => operation(api));
     if (refresh) await this.refresh();
-    return result;
+    if (generation !== this.generation || api !== this.api) {
+      throw new Error("The workspace session changed.");
+    }
+    apply?.(result);
   }
 
   private async connectNow(force = false): Promise<void> {
@@ -230,27 +292,37 @@ export class MobileWorkspaceStore {
 
     const task = (async () => {
       try {
-        const bootstrap = await this.request(() => api.bootstrap());
+        await this.request(
+          () => api.bootstrap(),
+          (bootstrap) => {
+            if (this.isCurrent(generation, attempt)) {
+              this.replaceData(applyBootstrap(this.snapshot, bootstrap));
+            }
+          },
+        );
         if (!this.isCurrent(generation, attempt)) return;
-        this.replaceData(applyBootstrap(this.snapshot, bootstrap));
 
         // Bootstrap does not contain messages. Refresh the bounded recent set so
         // events covered by bootstrap.seq cannot leave restored channel caches stale.
         await Promise.allSettled(
           this.snapshot.recentChannels.map(async (channelId) => {
-            const page = await this.request(() => api.messages(channelId));
-            if (!this.isCurrent(generation, attempt)) return;
-            this.replaceData({
-              ...this.snapshot,
-              messages: {
-                ...this.snapshot.messages,
-                [channelId]: page.messages,
+            await this.request(
+              () => api.messages(channelId),
+              (page) => {
+                if (!this.isCurrent(generation, attempt)) return;
+                this.replaceData({
+                  ...this.snapshot,
+                  messages: {
+                    ...this.snapshot.messages,
+                    [channelId]: page.messages,
+                  },
+                  hasMore: {
+                    ...this.snapshot.hasMore,
+                    [channelId]: page.has_more,
+                  },
+                });
               },
-              hasMore: {
-                ...this.snapshot.hasMore,
-                [channelId]: page.has_more,
-              },
-            });
+            );
           }),
         );
         if (!this.isCurrent(generation, attempt)) return;
@@ -350,10 +422,21 @@ export class MobileWorkspaceStore {
     }, delay);
   }
 
-  private async request<T>(operation: () => Promise<T>): Promise<T> {
+  private async request<T>(
+    operation: () => Promise<T>,
+    apply?: (result: T) => void,
+  ): Promise<T> {
+    const generation = this.generation;
+    const api = this.api;
     try {
-      return await operation();
+      const result = await operation();
+      if (generation !== this.generation || api !== this.api) {
+        throw new Error("The workspace session changed.");
+      }
+      apply?.(result);
+      return result;
     } catch (error) {
+      if (generation !== this.generation || api !== this.api) throw error;
       if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
         await this.invalidateSession(error);
       }
@@ -362,22 +445,37 @@ export class MobileWorkspaceStore {
   }
 
   private async invalidateSession(error: ApiError) {
-    const cacheKey = this.cacheKey;
-    ++this.generation;
-    this.stopConnection();
-    this.api = undefined;
-    this.cacheKey = undefined;
-    await Promise.all([
-      clearPairedSession(),
-      cacheKey ? AsyncStorage.removeItem(cacheKey) : Promise.resolve(),
-    ]).catch(() => undefined);
+    const expected = this.api
+      ? { baseUrl: this.api.baseUrl, token: this.api.token }
+      : undefined;
+    let cleanupError = "";
+    try {
+      await this.clearLocalData(expected);
+    } catch (caught) {
+      cleanupError = ` Local data could not be fully removed: ${messageOf(caught)}`;
+    }
+    let removed = false;
+    try {
+      removed = await clearPairedSession(expected);
+    } catch (caught) {
+      cleanupError += ` The device credential could not be removed: ${messageOf(caught)}`;
+    }
+    if (!removed) {
+      if (cleanupError) Alert.alert("Previous session cleanup incomplete", cleanupError.trim());
+      return;
+    }
+    if (expected && this.api) return;
+    if (cleanupError) {
+      Alert.alert("Local data removal incomplete", cleanupError.trim());
+    }
     this.replace({
       ...emptyWorkspaceData(),
       connection: "error",
-      error:
+      error: `${
         error.status === 401
           ? "This phone is no longer paired with that workspace."
-          : "This phone no longer has access to that workspace.",
+          : "This phone no longer has access to that workspace."
+      }${cleanupError}`,
     });
   }
 
@@ -426,20 +524,47 @@ export class MobileWorkspaceStore {
   }
 
   private scheduleCache() {
-    if (this.cacheTimer) clearTimeout(this.cacheTimer);
+    this.clearCacheTimer();
     this.cacheTimer = setTimeout(() => {
       this.cacheTimer = undefined;
       void this.persistNow();
     }, 500);
   }
 
+  private clearCacheTimer() {
+    if (this.cacheTimer) clearTimeout(this.cacheTimer);
+    this.cacheTimer = undefined;
+  }
+
   private async persistNow() {
-    if (!this.cacheKey) return;
+    const cacheKey = this.cacheKey;
+    if (!cacheKey) return;
     const cache = toCache(this.snapshot, this.snapshot.lastSyncAt);
     if (!cache) return;
     const raw = JSON.stringify(cache);
     if (raw.length > MAX_CACHE_CHARS) return;
-    await AsyncStorage.setItem(this.cacheKey, raw).catch(() => undefined);
+    this.cacheWrite = this.cacheWrite
+      .then(() => AsyncStorage.setItem(cacheKey, raw))
+      .catch(() => undefined);
+    await this.cacheWrite;
+  }
+
+  private async pruneWorkspaceCaches(keep: string | undefined, generation: number) {
+    await this.cacheWrite;
+    const stale = (await AsyncStorage.getAllKeys()).filter(
+      (key) => isWorkspaceCacheKey(key) && key !== keep,
+    );
+    if (generation === this.generation && stale.length) {
+      await AsyncStorage.multiRemove(stale);
+    }
+  }
+
+  private async clearImageCaches() {
+    const [memory, disk] = await Promise.all([
+      Image.clearMemoryCache(),
+      Image.clearDiskCache(),
+    ]);
+    if (!memory || !disk) throw new Error("Cached images could not be removed.");
   }
 
   private replaceData(data: WorkspaceData) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useApi, useApp } from "../lib/store";
+import { useApi, useApp, useWorkspaces } from "../lib/store";
 import { relative, statusLabel, statusTone } from "../lib/format";
 import {
   desktopBoot,
@@ -24,6 +24,7 @@ import {
   plainText,
   useAsync,
   useNavigation,
+  WorkspaceMark,
 } from "./common";
 import {
   Dropdown,
@@ -38,6 +39,7 @@ import {
   CheckIcon,
   ChevronIcon,
   ExternalIcon,
+  FileIcon,
   FolderIcon,
   MoreIcon,
   PencilIcon,
@@ -61,6 +63,7 @@ import type {
   Project,
   RuntimeInstallation,
   RuntimeOption,
+  WorkspaceSkill,
 } from "@client/types";
 
 /// A string that changes when the machine list meaningfully changes — a host
@@ -815,6 +818,194 @@ export function AgentModal({
             ))}
         </Section>
       )}
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
+  );
+}
+
+// --- workspace skills -------------------------------------------------------
+
+export function SkillsPage() {
+  const app = useApp();
+  const [editing, setEditing] = useState<WorkspaceSkill | null>(null);
+  const [creating, setCreating] = useState(false);
+  const systemSkills = distinctMachines(app.hosts).flatMap((machine) =>
+    (machine.host.capabilities.system_skills ?? []).map((skill) => ({
+      ...skill,
+      machine: machine.name,
+      hostId: machine.host.id,
+    })),
+  );
+
+  return (
+    <Page
+      title="Skills"
+      subtitle="Workspace skills and global skills found on execution machines"
+      actions={
+        <button className="button" onClick={() => setCreating(true)}>
+          <PlusIcon size={15} />
+          New skill
+        </button>
+      }
+    >
+      <Section title="Workspace skills">
+        {app.skills.length === 0 ? (
+          <div className="row">
+            <span className="grow">
+              <span className="name">No workspace skills yet</span>
+              <span className="sub">Add reusable instructions for every agent.</span>
+            </span>
+          </div>
+        ) : (
+          app.skills.map((skill) => (
+            <button key={skill.id} className="row" onClick={() => setEditing(skill)}>
+              <span style={{ color: "var(--text-muted)", display: "flex" }}>
+                <FileIcon />
+              </span>
+              <span className="grow">
+                <span className="name">{skill.name}</span>
+                <span className="sub">
+                  {skill.description || skill.instructions.split("\n")[0]}
+                </span>
+              </span>
+              <Chip>all agents</Chip>
+            </button>
+          ))
+        )}
+      </Section>
+
+      <Section title="Global system skills">
+        {systemSkills.length === 0 ? (
+          <div className="row">
+            <span className="grow">
+              <span className="name">No global skills detected</span>
+              <span className="sub">
+                Install Agent Skills in a global skills directory on an execution machine.
+              </span>
+            </span>
+          </div>
+        ) : (
+          systemSkills.map((skill) => (
+            <div className="row" key={`${skill.hostId}:${skill.path}`} title={skill.path}>
+              <span style={{ color: "var(--text-muted)", display: "flex" }}>
+                <FileIcon />
+              </span>
+              <span className="grow">
+                <span className="name">{skill.name}</span>
+                <span className="sub">{skill.description || skill.path}</span>
+              </span>
+              <Chip>{skill.machine}</Chip>
+            </div>
+          ))
+        )}
+      </Section>
+
+      {(creating || editing) && (
+        <SkillModal
+          skill={editing}
+          onClose={() => {
+            setCreating(false);
+            setEditing(null);
+          }}
+        />
+      )}
+    </Page>
+  );
+}
+
+export function SkillModal({
+  skill,
+  onClose,
+}: {
+  skill: WorkspaceSkill | null;
+  onClose: () => void;
+}) {
+  const api = useApi();
+  const [name, setName] = useState(skill?.name ?? "");
+  const [description, setDescription] = useState(skill?.description ?? "");
+  const [instructions, setInstructions] = useState(skill?.instructions ?? "");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const input = { name, description, instructions };
+      if (skill) await api.updateSkill(skill.id, input);
+      else await api.createSkill(input);
+      onClose();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      wide
+      title={skill ? skill.name : "New skill"}
+      subtitle="Reusable workspace instructions shared with every agent."
+      onClose={onClose}
+      actions={
+        <>
+          {skill && (
+            <button
+              className="button quiet danger"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setError("");
+                try {
+                  await api.deleteSkill(skill.id);
+                  onClose();
+                } catch (err) {
+                  setError(String((err as Error).message ?? err));
+                  setBusy(false);
+                }
+              }}
+            >
+              Delete
+            </button>
+          )}
+          <span className="spacer" />
+          <button className="button quiet" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || !name.trim() || !instructions.trim()}
+            onClick={() => void save()}
+          >
+            {busy ? "Saving…" : "Save"}
+          </button>
+        </>
+      }
+    >
+      <Field
+        label="Name"
+        value={name}
+        onChange={setName}
+        autoFocus
+        placeholder="Review pull requests"
+      />
+      <Field
+        label="When to use it"
+        value={description}
+        onChange={setDescription}
+        placeholder="Optional. For example: when reviewing a code change"
+      />
+      <div className="skill-instructions">
+        <Field
+          label="Instructions"
+          value={instructions}
+          onChange={setInstructions}
+          textarea
+          placeholder="What should every agent know how to do?"
+        />
+      </div>
+      <span className="form-help">Changes apply when an agent next starts or restarts a run.</span>
       {error && <div className="error-text">{error}</div>}
     </Modal>
   );
@@ -1957,13 +2148,28 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
 export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   const app = useApp();
   const api = useApi();
+  const workspaces = useWorkspaces();
+  const { toast } = useNavigation();
+  const iconInput = useRef<HTMLInputElement>(null);
   const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
   const [icon, setIcon] = useState(app.workspace?.icon ?? "");
   const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
+  const [iconUploading, setIconUploading] = useState(false);
   const [saved, setSaved] = useState(false);
   const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
   const [updateStatus, setUpdateStatus] = useState("");
+
+  useEffect(() => {
+    setName(app.workspace?.name ?? "");
+    setIcon(app.workspace?.icon ?? "");
+    setPrefix(app.workspace?.task_prefix ?? "PW");
+  }, [
+    app.workspace?.id,
+    app.workspace?.name,
+    app.workspace?.icon,
+    app.workspace?.task_prefix,
+  ]);
 
   const checkForUpdate = async () => {
     setUpdateStatus("Checking…");
@@ -1995,6 +2201,8 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     info?.settings.workspaces.find(
       (workspace) => workspace.id === app.workspace?.id,
     )?.relay_url ?? "";
+  const currentWorkspace = workspaces.find((workspace) => workspace.active);
+  const iconChanged = icon !== (app.workspace?.icon ?? "");
   const managedRelay = relayUrl.startsWith("https://relay.patchwork.sh/r/");
 
   // The relay knows about every host. This machine also knows things the relay
@@ -2051,9 +2259,53 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   return (
     <Page title="Settings">
       <Section title="Workspace">
+        <div className="workspace-icon-editor">
+          <WorkspaceMark
+            name={app.workspace?.name ?? "Workspace"}
+            icon={app.workspace?.icon}
+            image={currentWorkspace?.iconImage}
+            size={42}
+          />
+          <button
+            className="button quiet"
+            disabled={iconUploading}
+            onClick={() => iconInput.current?.click()}
+          >
+            {iconUploading ? "Uploading…" : "Upload PNG or JPEG"}
+          </button>
+          {app.workspace?.icon_image && (
+            <button
+              className="button quiet danger"
+              onClick={() => void api.updateWorkspace({ icon: "" })}
+            >
+              Remove image
+            </button>
+          )}
+          <input
+            ref={iconInput}
+            type="file"
+            hidden
+            accept="image/png,image/jpeg,.png,.jpg,.jpeg"
+            onChange={async (event) => {
+              const file = event.currentTarget.files?.[0];
+              event.currentTarget.value = "";
+              if (!file) return;
+              setIconUploading(true);
+              try {
+                const uploaded = await api.upload(file);
+                await api.updateWorkspace({ icon_file_id: uploaded.id });
+                setIcon("");
+              } catch (err) {
+                toast(String((err as Error).message ?? err));
+              } finally {
+                setIconUploading(false);
+              }
+            }}
+          />
+        </div>
         <Field label="Name" value={name} onChange={setName} />
         <Field
-          label="Icon"
+          label="Emoji"
           value={icon}
           onChange={(value) => setIcon([...value].slice(0, 8).join(""))}
           placeholder="🚀"
@@ -2074,13 +2326,13 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           style={{ marginTop: 10 }}
           disabled={
             (!name.trim() || name === app.workspace?.name) &&
-            icon === (app.workspace?.icon ?? "") &&
+            !iconChanged &&
             (!prefix.trim() || prefix === app.workspace?.task_prefix)
           }
           onClick={async () => {
             await api.updateWorkspace({
               name: name.trim() || undefined,
-              icon: icon.trim(),
+              icon: iconChanged ? icon.trim() : undefined,
               task_prefix: prefix.trim() || undefined,
             });
             setSaved(true);
@@ -2197,12 +2449,18 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
       >
         {(info?.settings.workspaces ?? []).map((workspace) => {
           const here = workspace.id === app.workspace?.id;
+          const live = workspaces.find((joined) => joined.id === workspace.id);
           return (
             <div className="row hoverable" key={workspace.id}>
-              <span className={`dot ${here && app.live ? "online" : ""}`} />
+              <WorkspaceMark
+                name={live?.name ?? workspace.name}
+                icon={live?.icon}
+                image={live?.iconImage}
+                size={28}
+              />
               <span className="grow">
                 <span className="name">
-                  {workspace.name}
+                  {live?.name ?? workspace.name}
                   {here && <span className="you"> showing</span>}
                 </span>
                 <span className="sub">

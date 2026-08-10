@@ -167,7 +167,7 @@ export function AttachmentView({ attachment }: { attachment: Attachment }) {
         style={[styles.image, { backgroundColor: theme.surface }]}
         contentFit="cover"
         transition={120}
-        cachePolicy="memory-disk"
+        cachePolicy="none"
         accessibilityLabel={attachment.file_name}
       />
     );

@@ -24,6 +24,7 @@ pub enum Event {
     ChannelUpdated { channel: Channel },
     ChannelDeleted { channel_id: Id },
     SectionsUpdated { sections: Vec<Section> },
+    WorkspaceSkillsUpdated { skills: Vec<WorkspaceSkill> },
     MemberUpdated { member: Member },
     MemberRemoved { member_id: Id },
     PresenceChanged { member_id: Id, presence: Presence },

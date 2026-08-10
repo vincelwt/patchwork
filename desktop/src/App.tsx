@@ -39,6 +39,8 @@ import {
   ProjectModal,
   ProjectsPage,
   SettingsPage,
+  SkillModal,
+  SkillsPage,
 } from "./components/Pages";
 import {
   Avatar,
@@ -48,6 +50,7 @@ import {
   NavigationContext,
   proseText,
   useNavigation,
+  WorkspaceMark,
 } from "./components/common";
 import { Empty, KeyHint, MenuButton, Page } from "./components/ui";
 import { Markdown } from "./components/Markdown";
@@ -758,6 +761,8 @@ function CreateSomething({
       return <NewSectionModal onClose={onClose} />;
     case "agent":
       return <AgentModal agent={null} onClose={onClose} />;
+    case "skill":
+      return <SkillModal skill={null} onClose={onClose} />;
     case "project":
       return <ProjectModal project={null} onClose={onClose} />;
     case "invite":
@@ -907,6 +912,8 @@ function MainView({ view, onSignOut }: { view: View; onSignOut: () => void }) {
       return <TaskPage taskId={view.id} />;
     case "agents":
       return <AgentsPage />;
+    case "skills":
+      return <SkillsPage />;
     case "projects":
       return <ProjectsPage />;
     case "members":
@@ -1124,6 +1131,14 @@ function CommandPalette({
             : workspace.live
               ? "Connected"
               : "Offline",
+        icon: (
+          <WorkspaceMark
+            name={workspace.name}
+            icon={workspace.icon}
+            image={workspace.iconImage}
+            size={20}
+          />
+        ),
         run: () => {
           onClose();
           if (!workspace.active) void switchTo(workspace.id);

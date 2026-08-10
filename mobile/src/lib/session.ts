@@ -14,6 +14,7 @@ export interface PairedSession {
 type Snapshot = PairedSession | null | undefined;
 let snapshot: Snapshot;
 let loading: Promise<void> | undefined;
+let secureOperations: Promise<void> = Promise.resolve();
 const listeners = new Set<() => void>();
 
 function publish(next: Snapshot) {
@@ -38,21 +39,34 @@ function validSession(value: unknown): PairedSession | null {
   }
 }
 
+function serialize<T>(operation: () => Promise<T>): Promise<T> {
+  const task = secureOperations.then(operation);
+  secureOperations = task.then(() => undefined, () => undefined);
+  return task;
+}
+
 async function hydrate() {
   if (loading) return loading;
-  loading = SecureStore.getItemAsync(KEY)
-    .then((raw) => publish(raw ? validSession(JSON.parse(raw)) : null))
-    .catch(() => publish(null));
+  loading = serialize(async () => {
+    try {
+      const raw = await SecureStore.getItemAsync(KEY);
+      publish(raw ? validSession(JSON.parse(raw)) : null);
+    } catch {
+      publish(null);
+    }
+  });
   return loading;
 }
 
 export async function savePairedSession(input: PairedSession): Promise<void> {
   const session = validSession(input);
   if (!session) throw new Error("That pairing response is not valid.");
-  await SecureStore.setItemAsync(KEY, JSON.stringify(session), {
-    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  await serialize(async () => {
+    await SecureStore.setItemAsync(KEY, JSON.stringify(session), {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+    publish(session);
   });
-  publish(session);
 }
 
 export async function loadPairedSession(): Promise<PairedSession | null> {
@@ -60,13 +74,21 @@ export async function loadPairedSession(): Promise<PairedSession | null> {
   return snapshot ?? null;
 }
 
-export async function clearPairedSession(): Promise<void> {
-  await SecureStore.deleteItemAsync(KEY);
-  publish(null);
+export function clearPairedSession(expected?: PairedSession): Promise<boolean> {
+  return serialize(async () => {
+    if (expected && !sameSession(snapshot, expected)) return false;
+    await SecureStore.deleteItemAsync(KEY);
+    publish(null);
+    return true;
+  });
 }
 
 export function apiFor(session: PairedSession): Api {
   return new Api(session.baseUrl, session.token);
+}
+
+function sameSession(a: Snapshot, b: PairedSession) {
+  return a?.baseUrl === b.baseUrl && a?.token === b.token;
 }
 
 export function usePairedSession() {

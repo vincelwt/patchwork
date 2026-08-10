@@ -4,9 +4,19 @@ CREATE TABLE IF NOT EXISTS workspace (
   id          TEXT PRIMARY KEY,
   name        TEXT NOT NULL,
   icon        TEXT NOT NULL DEFAULT '',
+  icon_file_id TEXT,
   created_at  INTEGER NOT NULL,
   task_prefix TEXT NOT NULL DEFAULT 'PW',
   task_seq    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS workspace_skills (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  description  TEXT NOT NULL DEFAULT '',
+  instructions TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS members (

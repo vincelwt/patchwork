@@ -502,6 +502,14 @@ pub struct Host {
     pub created_at: Millis,
 }
 
+/// A global Agent Skill installed on one execution machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemSkill {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
 /// What a machine can actually do — surfaced in the UI so setup failures are
 /// understandable rather than mysterious.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -509,6 +517,9 @@ pub struct HostCapabilities {
     /// ACP agent installations detected on this machine.
     #[serde(default)]
     pub runtimes: Vec<RuntimeInstallation>,
+    /// Agent Skills from this machine's global skill directories.
+    #[serde(default)]
+    pub system_skills: Vec<SystemSkill>,
     #[serde(default)]
     pub has_git: bool,
     #[serde(default)]
@@ -1017,13 +1028,28 @@ pub enum PreviewStatus {
 // Workspace
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSkill {
+    pub id: Id,
+    pub name: String,
+    /// When this shared instruction is useful.
+    #[serde(default)]
+    pub description: String,
+    pub instructions: String,
+    pub created_at: Millis,
+    pub updated_at: Millis,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Id,
     pub name: String,
-    /// A short label or emoji shown in the workspace switcher.
+    /// Emoji shown when no custom image is set.
     #[serde(default)]
     pub icon: String,
+    /// Relay-relative URL of the current PNG or JPEG icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_image: Option<String>,
     pub created_at: Millis,
     /// What task keys start with: `PW` gives `PW-14`.
     #[serde(default = "default_task_prefix")]

@@ -26,12 +26,17 @@ export default function ChannelsScreen() {
   const create = async () => {
     setError("");
     try {
-      const channel = await store.mutate((api) => api.createChannel({ name, topic, section_id: sectionId || undefined }));
-      setNewChannel(false);
-      setName("");
-      setTopic("");
-      setSectionId("");
-      open(channel);
+      await store.mutate(
+        (api) => api.createChannel({ name, topic, section_id: sectionId || undefined }),
+        true,
+        (channel) => {
+          setNewChannel(false);
+          setName("");
+          setTopic("");
+          setSectionId("");
+          open(channel);
+        },
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -98,9 +103,14 @@ export default function ChannelsScreen() {
               style={[styles.memberRow, { borderBottomColor: theme.line }]}
               onPress={async () => {
                 try {
-                  const channel = await store.mutate((api) => api.openDm(member.id));
-                  setNewDm(false);
-                  open(channel);
+                  await store.mutate(
+                    (api) => api.openDm(member.id),
+                    true,
+                    (channel) => {
+                      setNewDm(false);
+                      open(channel);
+                    },
+                  );
                 } catch (caught) {
                   setError(caught instanceof Error ? caught.message : String(caught));
                 }

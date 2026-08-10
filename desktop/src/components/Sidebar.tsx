@@ -3,13 +3,13 @@ import { store, useApi, useApp, useAppSelector, useWorkspaces } from "../lib/sto
 import { create, join, switchTo } from "../lib/session";
 import { parseInviteDetails } from "../lib/desktop";
 import { hasUnseen, useSeen } from "../lib/unread";
-import { Avatar, Field, Modal, useNavigation } from "./common";
+import { Avatar, Field, Modal, useNavigation, WorkspaceMark } from "./common";
 import { Menu, MenuButton } from "./ui";
 import {
   AgentIcon,
   AutomationIcon,
-  CheckIcon,
   ChevronIcon,
+  FileIcon,
   FolderIcon,
   HashIcon,
   InboxIcon,
@@ -30,6 +30,7 @@ export type Creatable =
   | "channel"
   | "section"
   | "agent"
+  | "skill"
   | "project"
   | "invite";
 
@@ -111,6 +112,9 @@ export function Sidebar({
     );
   }, [hidden]);
 
+  const workspaceImage = app.workspace?.icon_image
+    ? `${api.baseUrl.replace(/\/$/, "")}${app.workspace.icon_image}`
+    : undefined;
   const unread = app.inbox.filter((item) => !item.read_at).length;
   const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
   const liveAutomations = app.automations.filter((a) => a.enabled).length;
@@ -179,9 +183,17 @@ export function Sidebar({
     <aside className={`sidebar${rail ? " rail" : ""}`}>
       <div className="sidebar-top" data-tauri-drag-region="deep">
         {!rail && (
-          <span className="workspace-title">
-            {app.workspace?.name ?? "Patchwork"}
-          </span>
+          <>
+            <WorkspaceMark
+              name={app.workspace?.name ?? "Patchwork"}
+              icon={app.workspace?.icon}
+              image={workspaceImage}
+              size={24}
+            />
+            <span className="workspace-title">
+              {app.workspace?.name ?? "Patchwork"}
+            </span>
+          </>
         )}
         <span className="spacer" />
         <button className="icon-button" onClick={onSearch} title="Search (⌘K)">
@@ -218,6 +230,12 @@ export function Sidebar({
               label: "Agent",
               hint: "A teammate with a runtime",
               onSelect: () => onCreate("agent"),
+            },
+            {
+              key: "skill",
+              label: "Skill",
+              hint: "Instructions shared with every agent",
+              onSelect: () => onCreate("skill"),
             },
             {
               key: "project",
@@ -497,6 +515,12 @@ function MoreMenu({
           },
         },
         {
+          key: "skills",
+          label: "Skills",
+          icon: <FileIcon />,
+          onSelect: () => go({ kind: "skills" }),
+        },
+        {
           key: "projects",
           label: "Projects and machines",
           icon: <FolderIcon />,
@@ -549,7 +573,6 @@ function MoreMenu({
 /// them, and switching back is instant.
 function WorkspaceSwitcher() {
   const workspaces = useWorkspaces();
-  const icon = useAppSelector((app) => app.workspace?.icon);
   const { toast } = useNavigation();
   const [adding, setAdding] = useState<"join" | "create" | null>(null);
   const active = workspaces.find((workspace) => workspace.active);
@@ -568,12 +591,21 @@ function WorkspaceSwitcher() {
           ...workspaces.map((workspace) => ({
             key: workspace.id,
             label: workspace.name,
-            hint: workspace.unread
-              ? `${workspace.unread} waiting`
-              : workspace.live
-                ? undefined
-                : "connecting\u2026",
-            icon: workspace.active ? <CheckIcon size={15} /> : undefined,
+            hint: workspace.active
+              ? "Current"
+              : workspace.unread
+                ? `${workspace.unread} waiting`
+                : workspace.live
+                  ? undefined
+                  : "connecting\u2026",
+            icon: (
+              <WorkspaceMark
+                name={workspace.name}
+                icon={workspace.icon}
+                image={workspace.iconImage}
+                size={20}
+              />
+            ),
             onSelect: () => void switchTo(workspace.id),
           })),
           "separator" as const,
@@ -591,9 +623,11 @@ function WorkspaceSwitcher() {
           },
         ]}
       >
-        <span className="workspace-initial">
-          {icon || (active?.name ?? "?").trim().charAt(0).toUpperCase()}
-        </span>
+        <WorkspaceMark
+          name={active?.name ?? "?"}
+          icon={active?.icon}
+          image={active?.iconImage}
+        />
         {elsewhere > 0 && <span className="dot unread" />}
         <ChevronIcon size={13} />
       </MenuButton>
