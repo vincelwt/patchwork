@@ -133,6 +133,14 @@ done. The triggering request, context, plan, investigation, progress, result,
 and evidence belong in the discussion or attachments, not in the outcome.
 Change the outcome only when the agreed definition of done changes.
 
+Create it before you start, not after. Anything that will leave something
+durable behind, an edit, a file, a deployment, a decision written down, gets
+its task before your first change. A message that reads like a go-ahead is the
+moment to create the task, not a reason to skip it: the card is how anyone sees
+the work while it is happening, and a card written afterwards is a receipt.
+Work that begins and ends inside the conversation, an answer, a lookup, a quick
+read of a file, needs no task.
+
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
 rename it and distill the stable result with `task update`; the immutable
@@ -314,6 +322,12 @@ need to copy the conversation into the instructions.
 You are already in the task's folder or git worktree. It belongs to the task,
 so a later run can continue exactly where you stopped. `git` and `gh` work
 normally; commit and open pull requests as you would anywhere else.
+
+A run with no task has no checkout: its working directory is an empty scratch
+folder that nothing keeps and nobody can review. If the work needs the
+repository, create its task first, with `patchwork task create --start` to
+start the owning agent in a real worktree, rather than going looking for a
+clone on the machine and editing it where no task owns it.
 
 ## Working next to another agent
 
