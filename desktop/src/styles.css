@@ -563,6 +563,10 @@ body.resizing {
    the message so the hover target and the message are obviously the same
    thing. */
 .message {
+  /* The composer floats over the transcript, so a message arrowed into view has
+     to come to rest above it rather than under it. Reserving the same strip the
+     transcript already pads for is what makes the browser scroll that far. */
+  scroll-margin-bottom: calc(var(--composer-h, 100px) + 10px);
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr);
   gap: 10px;
@@ -577,12 +581,23 @@ body.resizing {
 .message.bare {
   grid-template-columns: 38px minmax(0, 1fr);
 }
-.message:hover {
+.message:hover,
+.message:focus-visible {
   background: var(--tint);
 }
+/* Arrowing onto a message is the same thing as hovering it, so it shows the
+   same actions. The row is full-bleed, so its ring is traced just inside. */
+.message:focus-visible {
+  outline-offset: -2px;
+}
+/* Focus reveals what hover reveals, minus the add-reaction chip: that one takes
+   up room, and a row that grows as you arrow onto it shoves itself under the
+   composer. Enter opens the menu, which offers the same picker. */
 .message:hover .message-actions,
 .message:hover .hover-time,
-.message:hover .reaction.add {
+.message:hover .reaction.add,
+.message:focus-visible .message-actions,
+.message:focus-visible .hover-time {
   opacity: 1;
 }
 
@@ -1644,6 +1659,12 @@ select.field {
 }
 .task-card:hover {
   background: var(--tint);
+}
+/* A card fills the width of a scrolling column, so a ring drawn outside it is
+   clipped on three sides. Trace it just inside the border instead. */
+.task-card:focus-visible {
+  outline-offset: -2px;
+  border-radius: var(--radius-card);
 }
 .task-card .key {
   font-size: 12.5px;

@@ -508,8 +508,18 @@ function TaskCard({
     <div
       className={`task-card ${state.situation}`}
       draggable
+      // A card is a button in everything but tag name: reachable by keyboard,
+      // and opened by Enter like every other row in the app.
+      role="button"
+      tabIndex={0}
       onDragStart={onDragStart}
       onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" && event.target === event.currentTarget) {
+          event.preventDefault();
+          onClick();
+        }
+      }}
       onContextMenu={(event) => {
         event.preventDefault();
         onMenu(event.clientX, event.clientY);

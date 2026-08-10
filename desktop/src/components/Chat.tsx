@@ -14,6 +14,7 @@ import { useFileUrl } from "../lib/file";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
 import { readTask } from "../lib/task";
+import { leaveComposer, movePane } from "../lib/shortcuts";
 import {
   AttachIcon,
   CloseIcon,
@@ -489,6 +490,11 @@ export const MessageRow = memo(function MessageRow({
       className={`message message-${message.kind}${grouped ? " grouped" : ""}${
         selfAttributed ? " bare" : ""
       }`}
+      // A message is a row like any other: ↑ ↓ walk the transcript and Enter
+      // opens the same menu as a right-click, so react, reply, thread and copy
+      // need no mouse. Not in the tab order — tabbing through a day of chat to
+      // reach the box you are typing in would be worse than useless.
+      tabIndex={-1}
       onContextMenu={(event) => {
         event.preventDefault();
         setMenu({
@@ -496,6 +502,12 @@ export const MessageRow = memo(function MessageRow({
           y: event.clientY,
           selection: selectionIn(event.currentTarget),
         });
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" || event.target !== event.currentTarget) return;
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        setMenu({ x: rect.left + 48, y: rect.top + 24, selection: "" });
       }}
     >
       <div className="message-gutter">
@@ -1110,6 +1122,10 @@ function ComposerBox({
         <textarea
           ref={box}
           rows={1}
+          // Opening a conversation means you are about to write in it. The box
+          // remounts per channel and thread (see `draftKey`), so this fires on
+          // every open, not only the first one.
+          autoFocus
           // Prose, but prose full of paths and flags: check it, do not rewrite it.
           {...proseText}
           spellCheck
@@ -1138,6 +1154,14 @@ function ComposerBox({
                 return;
               }
             }
+            // Esc hands the keyboard back to navigation, and an empty box has no
+            // caret for ↑ to move, so it does the same rather than nothing: the
+            // arrows go back to walking the transcript and the sidebar.
+            if (event.key === "Escape" || (!text && event.key === "ArrowUp")) {
+              leaveComposer(event.currentTarget);
+              return;
+            }
+            if (!text && event.key === "ArrowLeft" && movePane(-1)) return;
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               void send();
