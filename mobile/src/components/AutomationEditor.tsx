@@ -90,10 +90,13 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
       enabled,
     };
     try {
-      const saved = automation
-        ? await store.mutate((api) => api.updateAutomation(automation.id, body))
-        : await store.mutate((api) => api.createAutomation(body));
-      onSaved(saved);
+      await store.mutate(
+        (api) => automation
+          ? api.updateAutomation(automation.id, body)
+          : api.createAutomation(body),
+        true,
+        onSaved,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

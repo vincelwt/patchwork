@@ -30,12 +30,15 @@ export default function SearchScreen() {
 
     setLoading(true);
     const timer = setTimeout(() => {
-      void store.mutate((api) => api.search(value), false).then(
+      void store.mutate(
+        (api) => api.search(value),
+        false,
         (next) => {
           if (request.current !== current) return;
           setResults(next);
           setLoading(false);
         },
+      ).catch(
         (caught) => {
           if (request.current !== current) return;
           setError(caught instanceof Error ? caught.message : String(caught));

@@ -1,5 +1,5 @@
 import { Redirect, useRouter } from "expo-router";
-import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Linking, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button, Card } from "@/components/ui";
@@ -36,6 +36,10 @@ function Welcome() {
           <Text style={[styles.detail, { color: theme.muted }]}>Each device receives its own revocable key. Patchwork Relay handles the secure connection automatically.</Text>
           <Button label="Scan pairing code" onPress={() => router.push("/pair")} />
         </Card>
+        <View style={styles.links}>
+          <Button label="Privacy" tone="quiet" compact onPress={() => void Linking.openURL("https://patchwork.sh/privacy.html")} />
+          <Button label="Support" tone="quiet" compact onPress={() => void Linking.openURL("https://patchwork.sh/support.html")} />
+        </View>
       </View>
     </SafeAreaView>
   );
@@ -60,6 +64,7 @@ const styles = StyleSheet.create({
   wordmark: { fontSize: 34, fontWeight: "700", letterSpacing: -0.8 },
   lede: { fontSize: 17, marginTop: 6, marginBottom: 24, textAlign: "center" },
   card: { width: "100%", maxWidth: 460, padding: 18, gap: 12 },
+  links: { flexDirection: "row", marginTop: 10 },
   body: { fontSize: 17, fontWeight: "600", lineHeight: 23 },
   detail: { fontSize: 14, lineHeight: 20 },
 });

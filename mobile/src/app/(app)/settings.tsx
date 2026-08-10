@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { Alert, Linking, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 
 import type { Device } from "@client/types";
 import { Badge, Button, Card, ErrorNotice, PageHeader, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { usePairedSession } from "@/lib/session";
+import { apiFor, usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -21,10 +21,11 @@ export default function SettingsScreen() {
   const [name, setName] = useState(data?.workspace.name ?? "");
   const [prefix, setPrefix] = useState(data?.workspace.task_prefix ?? "PW");
   const [error, setError] = useState("");
+  const [signingOut, setSigningOut] = useState(false);
 
   const loadDevices = async () => {
     try {
-      setDevices(await store.mutate((api) => api.devices(), false));
+      await store.mutate((api) => api.devices(), false, setDevices);
     } catch {
       setDevices([]);
     }
@@ -59,22 +60,56 @@ export default function SettingsScreen() {
           ))}
           {!devices.length ? <Text style={{ color: theme.muted, padding: 14 }}>Connect to load paired devices.</Text> : null}
         </Card>
+        <Text style={[styles.section, { color: theme.faint }]}>ABOUT</Text>
+        <Card style={styles.card}>
+          <Button label="Privacy policy" tone="secondary" onPress={() => void Linking.openURL("https://patchwork.sh/privacy.html")} />
+          <Button label="Support" tone="secondary" onPress={() => void Linking.openURL("https://patchwork.sh/support.html")} />
+        </Card>
         <ErrorNotice message={error} />
         <Button
           label="Sign out this device"
           tone="danger"
-          disabled={workspace.connection !== "live"}
+          busy={signingOut}
           onPress={async () => {
+            if (!session) return;
+            setSigningOut(true);
+            const revocation = workspace.connection === "live" && session
+              ? Promise.race([
+                  apiFor(session).revokeCurrentDevice().then(() => ""),
+                  new Promise<string>((resolve) => setTimeout(
+                    () => resolve("The device key could not be confirmed as revoked. Revoke it from another signed-in device."),
+                    5_000,
+                  )),
+                ]).catch((caught) => `The device key could not be revoked: ${caught instanceof Error ? caught.message : String(caught)}`)
+              : Promise.resolve("The workspace could not be reached, so this device key may still be active. Revoke it from another signed-in device.");
+            let localWarning = "";
             try {
-              await store.mutate((api) => api.revokeCurrentDevice(), false);
-              await signOut();
-              router.replace("/");
+              await store.clearLocalData(session);
             } catch (caught) {
-              setError(caught instanceof Error ? caught.message : String(caught));
+              localWarning = `Some saved workspace data could not be removed. Delete Patchwork before sharing this device: ${caught instanceof Error ? caught.message : String(caught)}`;
             }
+            let removed = false;
+            let secureWarning = "";
+            try {
+              removed = await signOut(session);
+            } catch (caught) {
+              secureWarning = `Patchwork could not remove this device's secure credential. Try again before sharing the device: ${caught instanceof Error ? caught.message : String(caught)}`;
+            }
+            const warning = [localWarning, await revocation].filter(Boolean).join("\n\n");
+            if (secureWarning) {
+              Alert.alert("Could not sign out", [secureWarning, warning].filter(Boolean).join("\n\n"));
+              setSigningOut(false);
+              return;
+            }
+            if (!removed) {
+              if (warning) Alert.alert("Previous session cleanup incomplete", warning);
+              setSigningOut(false);
+              return;
+            }
+            router.replace("/");
+            if (warning) Alert.alert("Signed out on this device", warning);
           }}
         />
-        {workspace.connection !== "live" ? <Text style={{ color: theme.muted, textAlign: "center" }}>Reconnect before signing out so the device key can be revoked.</Text> : null}
       </ScrollView>
       <Sheet visible={editing} title="Workspace" onClose={() => setEditing(false)}>
         <View style={styles.form}>

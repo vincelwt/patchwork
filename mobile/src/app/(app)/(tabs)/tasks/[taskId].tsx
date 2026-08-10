@@ -35,9 +35,14 @@ export default function TaskScreen() {
     setBusy(true);
     setError("");
     try {
-      const run = await store.mutate((api) => api.runTask(task.id, { agent_id: agentId }));
-      setAgents(false);
-      router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
+      await store.mutate(
+        (api) => api.runTask(task.id, { agent_id: agentId }),
+        true,
+        (run) => {
+          setAgents(false);
+          router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
+        },
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -49,8 +54,11 @@ export default function TaskScreen() {
     setBusy(true);
     setError("");
     try {
-      const run = await store.mutate((api) => api.approveTask(task.id));
-      router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
+      await store.mutate(
+        (api) => api.approveTask(task.id),
+        true,
+        (run) => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } }),
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

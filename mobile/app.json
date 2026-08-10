@@ -2,7 +2,7 @@
   "expo": {
     "name": "Patchwork",
     "slug": "patchwork",
-    "version": "0.1.0",
+    "version": "1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "patchwork",
@@ -16,8 +16,8 @@
       "bundleIdentifier": "sh.patchwork.app",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSSpeechRecognitionUsageDescription": "Allow Patchwork to transcribe dictation on this device.",
-        "NSMicrophoneUsageDescription": "Allow Patchwork to dictate text using the microphone."
+        "NSSpeechRecognitionUsageDescription": "Allow Patchwork to turn dictation into text. Audio may be processed by Apple.",
+        "NSMicrophoneUsageDescription": "Allow Patchwork to record audio while you dictate text."
       }
     },
     "android": {
@@ -45,8 +45,8 @@
       [
         "expo-speech-recognition",
         {
-          "microphonePermission": "Allow Patchwork to dictate text using the microphone.",
-          "speechRecognitionPermission": "Allow Patchwork to transcribe dictation on this device."
+          "microphonePermission": "Allow Patchwork to record audio while you dictate text.",
+          "speechRecognitionPermission": "Allow Patchwork to turn dictation into text. Audio may be processed by Apple."
         }
       ],
       [
