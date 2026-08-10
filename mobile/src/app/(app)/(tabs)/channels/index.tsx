@@ -15,7 +15,7 @@ export default function ChannelsScreen() {
   const store = useWorkspaceStore();
   const router = useRouter();
   const theme = useTheme();
-  const { split } = useLayout();
+  const { split, gutter } = useLayout();
   const [newChannel, setNewChannel] = useState(false);
   const [newDm, setNewDm] = useState(false);
   const [name, setName] = useState("");
@@ -127,7 +127,7 @@ export default function ChannelsScreen() {
           <View style={[styles.detail, { backgroundColor: theme.surface }]}>
             {openChannel ? (
               <>
-                <View style={[styles.detailHead, { borderBottomColor: theme.line }]}>
+                <View style={[styles.detailHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
                   <Text numberOfLines={1} style={[styles.detailTitle, { color: theme.text }]}>
                     {openChannel.kind === "channel" ? `# ${openChannel.name}` : openChannel.name}
                   </Text>
@@ -276,10 +276,10 @@ const styles = StyleSheet.create({
   scroll: { paddingBottom: 30 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 340, borderRightWidth: StyleSheet.hairlineWidth },
-  paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 10 },
+  paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
   detail: { flex: 1 },
   centre: { flex: 1, justifyContent: "center" },
-  detailHead: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 10, borderBottomWidth: StyleSheet.hairlineWidth },
+  detailHead: { paddingTop: 13, paddingBottom: 11, borderBottomWidth: StyleSheet.hairlineWidth },
   detailTitle: { fontSize: 19, fontWeight: "700", letterSpacing: -0.3 },
   detailTopic: { fontSize: 13, marginTop: 2 },
   group: { marginBottom: 16 },

@@ -165,7 +165,7 @@ const styles = StyleSheet.create({
   paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
   detail: { flex: 1 },
   centre: { flex: 1, justifyContent: "center" },
-  row: { minHeight: 80, flexDirection: "row", alignItems: "center", gap: 11, paddingLeft: 8, paddingRight: 16, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
+  row: { minHeight: 80, flexDirection: "row", alignItems: "center", gap: 11, paddingLeft: 6, paddingRight: 16, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
   unread: { width: 8, height: 8, borderRadius: 4 },
   kindMark: {
     position: "absolute",

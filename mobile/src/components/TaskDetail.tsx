@@ -8,6 +8,7 @@ import { TaskEditor } from "./TaskEditor";
 import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "./ui";
 import { runStatusLabel, taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
+import { useLayout } from "@/lib/layout";
 import { useTheme } from "@/lib/theme";
 import { isTerminalTaskStatus } from "@client/types";
 
@@ -19,6 +20,7 @@ const FINISHED = ["succeeded", "failed", "cancelled"];
 /// is not on screen and the task key belongs in the body instead.
 export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: boolean }) {
   const theme = useTheme();
+  const { gutter } = useLayout();
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
@@ -105,7 +107,7 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
           }}
         />
       )}
-      <Card style={styles.summary}>
+      <Card style={[styles.summary, { marginHorizontal: gutter, marginTop: gutter - 4 }]}>
         <View style={styles.titleRow}>
           <View style={styles.grow}>
             {embedded ? <Text style={[styles.key, { color: theme.faint }]}>{task.key}</Text> : null}
@@ -191,7 +193,7 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
         </View>
         <ErrorNotice message={error} />
       </Card>
-      <View style={[styles.discussionHead, { borderBottomColor: theme.line }]}>
+      <View style={[styles.discussionHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
         <Text style={[styles.discussionTitle, { color: theme.faint }]}>Discussion</Text>
       </View>
       <Conversation channelId={task.discussion_channel_id} />
@@ -220,7 +222,7 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   grow: { flex: 1, minWidth: 0 },
   key: { fontSize: 12, fontWeight: "700", marginBottom: 2 },
-  summary: { margin: 12, padding: 14, gap: 10 },
+  summary: { marginBottom: 12, padding: 16, gap: 10 },
   titleRow: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
   title: { fontSize: 19, fontWeight: "700", lineHeight: 25 },
   outcome: { fontSize: 14, lineHeight: 20 },

@@ -13,6 +13,7 @@ import { useRouter } from "expo-router";
 
 import type { Id, Message, MessageCard, Run } from "@client/types";
 import { dayLabel, runStatusLabel, timeOfDay } from "@/lib/format";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { useBottomAnchoredList } from "@/lib/scroll";
@@ -25,6 +26,7 @@ const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
 export function Conversation({ channelId }: { channelId: Id }) {
   const theme = useTheme();
+  const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
@@ -65,11 +67,13 @@ export function Conversation({ channelId }: { channelId: Id }) {
         )}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
         ListHeaderComponent={workspace.hasMore[channelId] ? (
-          <Button
-            label="Load older messages"
-            tone="quiet"
-            onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
-          />
+          <View style={{ paddingHorizontal: gutter, paddingTop: 8 }}>
+            <Button
+              label="Load older messages"
+              tone="quiet"
+              onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
+            />
+          </View>
         ) : null}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
@@ -105,9 +109,10 @@ export const MessageRow = memo(function MessageRow({
 }) {
   const theme = useTheme();
   const router = useRouter();
+  const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
-  const [reactions, setReactions] = useState(false);
+  const [actions, setActions] = useState(false);
   const author = workspace.bootstrap?.members.find((member) => member.id === message.author_id);
   const replyTo = message.reply_to_id
     ? workspace.messages[message.channel_id]?.find((item) => item.id === message.reply_to_id)
@@ -121,13 +126,13 @@ export const MessageRow = memo(function MessageRow({
     : undefined;
 
   const react = async (emoji: string) => {
-    setReactions(false);
+    setActions(false);
     await store.mutate((api) => api.react(message.id, emoji), false);
   };
 
   if (message.kind === "status" || message.kind === "system") {
     return (
-      <View style={styles.activity}>
+      <View style={[styles.activity, { paddingHorizontal: gutter + 6 }]}>
         <Text style={{ color: theme.faint }}>•</Text>
         <Text style={[styles.activityText, { color: theme.muted }]}>{message.body}</Text>
       </View>
@@ -135,7 +140,26 @@ export const MessageRow = memo(function MessageRow({
   }
 
   return (
-    <View style={styles.message}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${author?.display_name ?? "Unknown"}. ${message.body}`}
+      accessibilityHint="Press and hold for reactions, reply, and thread"
+      accessibilityActions={[
+        { name: "react", label: "React" },
+        ...(onReply ? [{ name: "reply", label: "Reply" }] : []),
+        ...(inThread ? [] : [{ name: "thread", label: "Open thread" }]),
+      ]}
+      onAccessibilityAction={({ nativeEvent }) => {
+        if (nativeEvent.actionName === "reply") return onReply?.(message);
+        if (nativeEvent.actionName === "thread") {
+          return router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } });
+        }
+        setActions(true);
+      }}
+      delayLongPress={280}
+      onLongPress={() => setActions(true)}
+      style={[styles.message, { paddingHorizontal: gutter }]}
+    >
       <Avatar member={author} size={32} />
       <View style={styles.messageMain}>
         <View style={styles.messageHead}>
@@ -178,39 +202,23 @@ export const MessageRow = memo(function MessageRow({
             ))}
           </View>
         ) : null}
-        <View style={styles.messageActions}>
-          <Pressable accessibilityRole="button" accessibilityLabel="React" onPress={() => setReactions(true)} hitSlop={8} style={styles.messageAction}>
-            <Icon name={{ ios: "face.smiling", android: "add_reaction", web: "add_reaction" }} color={theme.faint} size={15} />
+        {/* Only a thread that exists earns a line of its own; everything else
+            lives behind a press and hold, so the transcript stays readable. */}
+        {!inThread && message.reply_count ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Open thread"
+            onPress={() => router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } })}
+            hitSlop={6}
+            style={styles.threadLine}
+          >
+            <Text style={[styles.actionLabel, { color: theme.accent }]}>
+              {`${message.reply_count} ${message.reply_count === 1 ? "reply" : "replies"}`}
+            </Text>
           </Pressable>
-          {onReply ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Reply"
-              onPress={() => onReply(message)}
-              hitSlop={8}
-              style={styles.messageAction}
-            >
-              <Icon name={{ ios: "arrowshape.turn.up.left", android: "reply", web: "reply" }} color={theme.faint} size={15} />
-            </Pressable>
-          ) : null}
-          {!inThread ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Open thread"
-              onPress={() => router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } })}
-              hitSlop={8}
-              style={styles.messageAction}
-            >
-              <Text style={[styles.actionLabel, { color: message.reply_count ? theme.accent : theme.faint }]}>
-                {message.reply_count
-                  ? `${message.reply_count} ${message.reply_count === 1 ? "reply" : "replies"}`
-                  : "Thread"}
-              </Text>
-            </Pressable>
-          ) : null}
-        </View>
+        ) : null}
       </View>
-      <Sheet visible={reactions} title="React" onClose={() => setReactions(false)}>
+      <Sheet visible={actions} title="Message" onClose={() => setActions(false)}>
         <View style={styles.emojiGrid}>
           {EMOJI.map((emoji) => (
             <Pressable key={emoji} accessibilityRole="button" accessibilityLabel={`React ${emoji}`} onPress={() => void react(emoji)} style={styles.emoji}>
@@ -218,8 +226,30 @@ export const MessageRow = memo(function MessageRow({
             </Pressable>
           ))}
         </View>
+        <View style={styles.sheetActions}>
+          {onReply ? (
+            <Button
+              label="Reply"
+              tone="secondary"
+              onPress={() => {
+                setActions(false);
+                onReply(message);
+              }}
+            />
+          ) : null}
+          {!inThread ? (
+            <Button
+              label={message.reply_count ? "Open thread" : "Reply in thread"}
+              tone="secondary"
+              onPress={() => {
+                setActions(false);
+                router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } });
+              }}
+            />
+          ) : null}
+        </View>
       </Sheet>
-    </View>
+    </Pressable>
   );
 });
 
@@ -279,6 +309,7 @@ function CardView({ card }: { card: MessageCard }) {
 
 function TypingLine({ channelId }: { channelId: Id }) {
   const theme = useTheme();
+  const { gutter } = useLayout();
   const workspace = useWorkspace();
   const names = Object.entries(workspace.typing[channelId] ?? {})
     .filter(([memberId, at]) => memberId !== workspace.bootstrap?.me.id && Date.now() - at < 4_000)
@@ -286,7 +317,9 @@ function TypingLine({ channelId }: { channelId: Id }) {
     .filter(Boolean);
   const runs = workspace.bootstrap?.active_runs.filter((run) => run.channel_id === channelId) ?? [];
   const label = names.length ? `${names.join(", ")} typing…` : runs.length ? `${runs.length === 1 ? "An agent is" : `${runs.length} agents are`} working…` : "";
-  return label ? <Text style={[styles.typing, { color: theme.muted }]}>{label}</Text> : null;
+  return label ? (
+    <Text style={[styles.typing, { color: theme.muted, paddingHorizontal: gutter }]}>{label}</Text>
+  ) : null;
 }
 
 const styles = StyleSheet.create({
@@ -295,25 +328,25 @@ const styles = StyleSheet.create({
   emptyList: { flexGrow: 1, justifyContent: "center" },
   day: { alignItems: "center", paddingVertical: 10 },
   dayText: { fontSize: 12, fontWeight: "600", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3, overflow: "hidden" },
-  message: { flexDirection: "row", gap: 10, paddingHorizontal: 14, paddingVertical: 8 },
+  message: { flexDirection: "row", gap: 11, paddingVertical: 9 },
   messageMain: { flex: 1, minWidth: 0 },
   messageHead: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 2 },
   author: { fontSize: 15, fontWeight: "700" },
   time: { fontSize: 11 },
-  activity: { flexDirection: "row", gap: 8, paddingHorizontal: 20, paddingVertical: 7 },
+  activity: { flexDirection: "row", gap: 8, paddingVertical: 7 },
   activityText: { flex: 1, fontSize: 13, lineHeight: 18 },
   replyReference: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0, marginBottom: 3 },
   replyAuthor: { fontSize: 12, fontWeight: "600" },
   replyPreview: { flex: 1, fontSize: 12 },
   reactionRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
   reaction: { minHeight: 32, justifyContent: "center", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
-  messageActions: { flexDirection: "row", alignItems: "center", gap: 20, marginTop: 2 },
-  messageAction: { minHeight: 30, justifyContent: "center" },
+  threadLine: { minHeight: 28, justifyContent: "center", marginTop: 1 },
   actionLabel: { fontSize: 13, fontWeight: "600" },
+  sheetActions: { paddingHorizontal: 18, paddingBottom: 20, gap: 10 },
   emojiGrid: { flexDirection: "row", flexWrap: "wrap", padding: 18, justifyContent: "center" },
   emoji: { width: 64, height: 58, alignItems: "center", justifyContent: "center" },
   runLine: { flexDirection: "row", gap: 8, alignItems: "center", minHeight: 38, borderRadius: 9, paddingHorizontal: 10, marginVertical: 5 },
   card: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 11, padding: 12, gap: 3, marginTop: 7 },
   cardTitle: { fontWeight: "700", fontSize: 15 },
-  typing: { fontSize: 12, paddingHorizontal: 16, paddingVertical: 4 },
+  typing: { fontSize: 12, paddingVertical: 4 },
 });

@@ -218,5 +218,5 @@ const styles = StyleSheet.create({
   prompt: { flex: 1, minHeight: 330, alignItems: "center", justifyContent: "center", paddingHorizontal: 28 },
   promptIcon: { width: 68, height: 68, alignItems: "center", justifyContent: "center", marginBottom: 16 },
   promptTitle: { fontSize: 19, fontWeight: "700", textAlign: "center" },
-  promptDetail: { maxWidth: 300, fontSize: 14, lineHeight: 20, textAlign: "center", marginTop: 6 },
+  promptDetail: { maxWidth: 420, fontSize: 15, lineHeight: 21, textAlign: "center", marginTop: 6 },
 });

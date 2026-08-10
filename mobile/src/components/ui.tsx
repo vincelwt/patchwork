@@ -13,6 +13,7 @@ import {
   Text,
   TextInput,
   View,
+  type StyleProp,
   type TextInputProps,
   type ViewStyle,
 } from "react-native";
@@ -36,7 +37,7 @@ export function Glass({
   interactive,
 }: {
   children?: ReactNode;
-  style?: ViewStyle | ViewStyle[];
+  style?: StyleProp<ViewStyle>;
   radius?: number;
   tint?: string;
   interactive?: boolean;
@@ -63,29 +64,28 @@ export function Glass({
   );
 }
 
-export function Screen({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+export function Screen({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
   const theme = useTheme();
   return <View style={[styles.screen, { backgroundColor: theme.bg }, style]}>{children}</View>;
 }
 
 /// Keeps text at a readable measure on a big screen without letterboxing a
-/// phone. Sized as a share of whatever it sits in, so it also behaves inside a
-/// narrow pane of a split layout.
-export function Measured({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+/// phone. Centred, because the navigation bar centres its title above it.
+/// Sized as a share of its parent, so it also behaves inside a narrow pane.
+export function Measured({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
   const { measure, wide } = useLayout();
   if (!wide) return <>{children}</>;
-  // Leading edge, so it lines up with the large title the navigation bar draws.
-  return <View style={[{ width: "100%", maxWidth: measure, alignSelf: "flex-start" }, style]}>{children}</View>;
+  return <View style={[{ width: "100%", maxWidth: measure, alignSelf: "center" }, style]}>{children}</View>;
 }
 
 /// A run of rows reads as a deliberate group on a big screen rather than as a
 /// phone list stretched across it. On a phone the rows stay full bleed.
-export function Grouped({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+export function Grouped({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
   const theme = useTheme();
-  const { wide } = useLayout();
+  const { wide, gutter } = useLayout();
   if (!wide) return <>{children}</>;
   return (
-    <Measured>
+    <Measured style={{ paddingHorizontal: gutter }}>
       <View style={[styles.grouped, { backgroundColor: theme.raised, borderColor: theme.line }, style]}>
         {children}
       </View>
@@ -107,12 +107,12 @@ export function Icon({
 
 export function ScrollScreen({ children }: { children: ReactNode }) {
   const theme = useTheme();
-  const { measure, wide } = useLayout();
+  const { measure, gutter } = useLayout();
   return (
     <ScrollView
       style={{ flex: 1, backgroundColor: theme.bg }}
       contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={[styles.scroll, wide && { width: measure, alignSelf: "center" }]}
+      contentContainerStyle={[styles.scroll, { padding: gutter, maxWidth: measure, width: "100%", alignSelf: "center" }]}
       keyboardShouldPersistTaps="handled"
     >
       {children}
@@ -336,7 +336,7 @@ export function Sheet({
   );
 }
 
-export function Card({ children, style }: { children: ReactNode; style?: ViewStyle }) {
+export function Card({ children, style }: { children: ReactNode; style?: StyleProp<ViewStyle> }) {
   const theme = useTheme();
   return (
     <View style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.line }, style]}>
@@ -537,13 +537,7 @@ const styles = StyleSheet.create({
   },
   sheetTitle: { flex: 1, fontSize: 17, fontWeight: "700" },
   card: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 13, overflow: "hidden" },
-  grouped: {
-    marginHorizontal: 20,
-    marginTop: 6,
-    borderRadius: 16,
-    borderWidth: StyleSheet.hairlineWidth,
-    overflow: "hidden",
-  },
+  grouped: { marginTop: 6, borderRadius: 16, borderWidth: StyleSheet.hairlineWidth, overflow: "hidden" },
   badge: { alignSelf: "flex-start", borderRadius: 999, paddingHorizontal: 8, paddingVertical: 4 },
   badgeText: { fontSize: 11, fontWeight: "700" },
   avatar: { alignItems: "center", justifyContent: "center" },

@@ -14,6 +14,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { PendingImages, useImageAttachments } from "./Attachment";
@@ -36,6 +37,7 @@ export function Composer({
 }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const draftKey = parentId ? `thread:${parentId}` : channelId;
@@ -104,7 +106,14 @@ export function Composer({
 
   return (
     <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined}>
-      <View style={[styles.wrap, { backgroundColor: theme.bg, borderTopColor: theme.line, paddingBottom: 8 + insets.bottom }]}>
+      {/* The bar floats as a capsule over the conversation rather than sealing
+          the bottom of the screen with a rule. */}
+      <View
+        style={[
+          styles.wrap,
+          { backgroundColor: theme.bg, paddingHorizontal: gutter, paddingBottom: 10 + insets.bottom },
+        ]}
+      >
        <Measured>
         {mention.length ? (
           <Glass radius={14} style={styles.mentions}>
@@ -140,6 +149,7 @@ export function Composer({
         ) : null}
         <PendingImages images={images.pending} onRemove={images.remove} />
         <View style={[styles.composer, { backgroundColor: theme.input, borderColor: theme.line }]}>
+
           <TextInput
             ref={input}
             accessibilityLabel={placeholder}
@@ -202,15 +212,15 @@ export function Composer({
 }
 
 const styles = StyleSheet.create({
-  wrap: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 8 },
+  wrap: { paddingTop: 10 },
   mentions: { marginBottom: 6, overflow: "hidden" },
   mentionRow: { minHeight: 44, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 8 },
   reply: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 32, paddingHorizontal: 4 },
   replyLabel: { fontSize: 12, fontWeight: "600" },
   replyPreview: { flex: 1, fontSize: 12 },
   replyClose: { width: 28, height: 28, alignItems: "center", justifyContent: "center" },
-  composer: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 8 },
-  input: { minHeight: 38, maxHeight: 150, fontSize: 16, lineHeight: 22, paddingHorizontal: 4, paddingTop: 4, textAlignVertical: "top" },
+  composer: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 24, paddingHorizontal: 10, paddingVertical: 9 },
+  input: { minHeight: 38, maxHeight: 150, fontSize: 16, lineHeight: 22, paddingHorizontal: 8, paddingTop: 4, textAlignVertical: "top" },
   actions: { flexDirection: "row", alignItems: "center", marginTop: 4, gap: 4 },
   iconButton: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   send: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },

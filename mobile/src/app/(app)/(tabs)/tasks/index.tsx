@@ -192,7 +192,7 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 360, borderRightWidth: StyleSheet.hairlineWidth },
-  paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 6 },
+  paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
   detail: { flex: 1 },
   centre: { flex: 1, justifyContent: "center" },
   filters: { flexDirection: "row", gap: 8, paddingHorizontal: 16, paddingTop: 4, paddingBottom: 12 },
