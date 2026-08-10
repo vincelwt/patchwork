@@ -183,17 +183,12 @@ export function Sidebar({
     <aside className={`sidebar${rail ? " rail" : ""}`}>
       <div className="sidebar-top" data-tauri-drag-region="deep">
         {!rail && (
-          <>
-            <WorkspaceMark
-              name={app.workspace?.name ?? "Patchwork"}
-              icon={app.workspace?.icon}
-              image={workspaceImage}
-              size={24}
-            />
-            <span className="workspace-title">
-              {app.workspace?.name ?? "Patchwork"}
-            </span>
-          </>
+          <WorkspaceMark
+            name={app.workspace?.name ?? "Patchwork"}
+            icon={app.workspace?.icon}
+            image={workspaceImage}
+            size={24}
+          />
         )}
         <span className="spacer" />
         <button className="icon-button" onClick={onSearch} title="Search (⌘K)">

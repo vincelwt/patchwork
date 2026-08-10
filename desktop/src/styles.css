@@ -203,16 +203,6 @@ body.resizing {
   flex: none;
 }
 
-.workspace-title {
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: -0.012em;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .sidebar-scroll {
   overflow-y: auto;
   flex: 1;
