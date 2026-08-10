@@ -17,6 +17,7 @@ import { readTask } from "../lib/task";
 import {
   AttachIcon,
   CloseIcon,
+  CopyIcon,
   EventIcon,
   MicIcon,
   MoreIcon,
@@ -28,6 +29,7 @@ import {
   Spinner,
   ThreadIcon,
 } from "./icons";
+import { Menu, type MenuItem } from "./ui";
 import { AttachmentRow, Card } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
@@ -417,6 +419,10 @@ export const MessageRow = memo(function MessageRow({
   const api = useApi();
   const { inspect } = useNavigation();
   const [picker, setPicker] = useState<{ x: number; y: number } | null>(null);
+  // Right-click, and the "…" button, open the same menu at a point.
+  const [menu, setMenu] = useState<{ x: number; y: number; selection: string } | null>(
+    null,
+  );
 
   // A status note or a workspace event is not somebody talking. It reads as a
   // quiet line, the way tool activity does in a good agent transcript.
@@ -445,11 +451,51 @@ export const MessageRow = memo(function MessageRow({
   };
   const repliedMessage = replyTo ?? replyPreview;
 
+  const items = (at: { x: number; y: number; selection: string }): MenuItem[] => [
+    {
+      key: "react",
+      label: "Add a reaction…",
+      icon: <ReactIcon size={15} />,
+      onSelect: () => setPicker({ x: at.x, y: at.y }),
+    },
+    ...(onReply
+      ? [
+          {
+            key: "reply",
+            label: "Reply",
+            icon: <ReplyIcon size={15} />,
+            onSelect: () => onReply(message),
+          },
+        ]
+      : []),
+    {
+      key: "thread",
+      label: "Reply in thread",
+      icon: <ThreadIcon size={15} />,
+      onSelect: () => inspect({ kind: "thread", messageId: message.id }),
+    },
+    {
+      key: "copy",
+      label: at.selection ? "Copy selection" : "Copy text",
+      icon: <CopyIcon size={15} />,
+      disabled: !at.selection && !message.body.trim(),
+      onSelect: () => void navigator.clipboard.writeText(at.selection || message.body),
+    },
+  ];
+
   return (
     <div
       className={`message message-${message.kind}${grouped ? " grouped" : ""}${
         selfAttributed ? " bare" : ""
       }`}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        setMenu({
+          x: event.clientX,
+          y: event.clientY,
+          selection: selectionIn(event.currentTarget),
+        });
+      }}
     >
       <div className="message-gutter">
         {showHead ? (
@@ -551,19 +597,41 @@ export const MessageRow = memo(function MessageRow({
         </button>
         <button
           className="icon-button small"
-          title="Copy text"
-          onClick={() => void navigator.clipboard.writeText(message.body)}
+          title="More"
+          aria-label="More"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            const row = event.currentTarget.closest(".message");
+            setMenu({ x: rect.left, y: rect.bottom, selection: selectionIn(row) });
+          }}
         >
           <MoreIcon size={16} />
         </button>
       </div>
 
+      {menu && (
+        <Menu
+          at={menu}
+          header={author?.display_name}
+          items={items(menu)}
+          onClose={() => setMenu(null)}
+        />
+      )}
       {picker && (
         <ReactionPicker at={picker} onPick={react} onClose={() => setPicker(null)} />
       )}
     </div>
   );
 });
+
+/// Text selected inside this message, if any. Right-clicking a highlighted
+/// quote should still copy the quote, not the whole message.
+function selectionIn(row: Node | null) {
+  const selection = window.getSelection();
+  const text = selection?.toString() ?? "";
+  if (!text.trim() || !row || !selection?.anchorNode) return "";
+  return row.contains(selection.anchorNode) ? text : "";
+}
 
 /// What the run behind a reply cost, sitting in the reply's own header: which
 /// runtime, how long, and the way into the full trace. Live runs say nothing
