@@ -2881,7 +2881,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-agent"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-cli"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-core"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-desktop"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2954,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "patchwork-relay"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
