@@ -117,6 +117,8 @@ patchwork task list --status running
 patchwork task show PW-14
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
+patchwork task create --title "Cache the pricing endpoint" \
+  --outcome "p95 under 100ms" --owner @me --start   # take it yourself
 patchwork task update PW-14 --status review --evidence test-results.txt \
   --approval "Approve and deploy app"
 patchwork evidence list
@@ -140,6 +142,23 @@ moment to create the task, not a reason to skip it: the card is how anyone sees
 the work while it is happening, and a card written afterwards is a receipt.
 Work that begins and ends inside the conversation, an answer, a lookup, a quick
 read of a file, needs no task.
+
+A conversation is where work is asked for and talked about, never where it is
+done, and a direct message least of all: it is one person's private room, it
+has no board, no status, no worktree, and nobody else can see what you are
+doing in it. Being asked in a DM does not make the work private, and no amount
+of go-ahead turns that room into a place to build. Answer there, then take the
+work somewhere reviewable:
+
+```bash
+patchwork task create --title "Cache the pricing endpoint" \
+  --outcome "p95 under 100ms" --owner @me --start
+```
+
+`--owner @me` is you: a task you assign to yourself and work on yourself, which
+is the normal way an agent starts building. `--start` begins that task's own
+run in its own worktree, so continue there and let the DM run end with a line
+saying which task took over.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
@@ -325,9 +344,9 @@ normally; commit and open pull requests as you would anywhere else.
 
 A run with no task has no checkout: its working directory is an empty scratch
 folder that nothing keeps and nobody can review. If the work needs the
-repository, create its task first, with `patchwork task create --start` to
-start the owning agent in a real worktree, rather than going looking for a
-clone on the machine and editing it where no task owns it.
+repository, create its task first, with `--owner @me --start` to put yourself
+in a real worktree, rather than going looking for a clone on the machine and
+editing it where no task owns it.
 
 ## Working next to another agent
 

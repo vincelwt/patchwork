@@ -313,7 +313,8 @@ enum TaskCommand {
         title: String,
         #[arg(long, default_value = "")]
         outcome: String,
-        /// `@handle` of the owner. A person, when the task is for a person.
+        /// `@handle` of the owner, or `@me` for yourself. A person, when the
+        /// task is for a person.
         #[arg(long)]
         owner: Option<String>,
         #[arg(long)]
@@ -1629,7 +1630,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             start,
         } => {
             let owner_id = match owner {
-                Some(handle) => Some(resolve_member(client, &handle).await?),
+                Some(handle) => Some(resolve_member(client, ctx, &handle).await?),
                 None => None,
             };
             let created: Task = client
@@ -1664,7 +1665,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             approval,
         } => {
             let owner_id = match owner {
-                Some(handle) => Some(resolve_member(client, &handle).await?),
+                Some(handle) => Some(resolve_member(client, ctx, &handle).await?),
                 None => None,
             };
             if let Some(path) = evidence {
@@ -1703,8 +1704,13 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
     Ok(())
 }
 
-async fn resolve_member(client: &Client, handle: &str) -> Result<String> {
+async fn resolve_member(client: &Client, ctx: &RunContext, handle: &str) -> Result<String> {
     let handle = handle.trim_start_matches('@');
+    if handle == "me" {
+        if let Some(agent_id) = ctx.agent_id.clone() {
+            return Ok(agent_id);
+        }
+    }
     let members: Vec<Member> = client.get("/api/members").await?;
     members
         .into_iter()
@@ -1739,7 +1745,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
             channel,
             status,
         } => {
-            let agent_id = resolve_member(client, &agent).await?;
+            let agent_id = resolve_member(client, ctx, &agent).await?;
             let channel_id = match channel {
                 Some(reference) => Some(resolve_channel(client, ctx, Some(reference)).await?),
                 None => ctx.channel_id.clone(),
