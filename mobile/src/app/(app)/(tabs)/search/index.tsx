@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import { router, Stack } from "expo-router";
 
 import type { SearchResults } from "@client/types";
-import { Badge, ErrorNotice, Icon, Screen } from "@/components/ui";
+import { Badge, ErrorNotice, Glass, Icon, Measured, Screen } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
 import { useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -101,6 +101,7 @@ export default function SearchScreen() {
         keyboardDismissMode="on-drag"
         keyboardShouldPersistTaps="handled"
       >
+       <Measured>
         <ErrorNotice message={error} />
         {!query.trim() ? (
           <SearchPrompt
@@ -168,6 +169,7 @@ export default function SearchScreen() {
             ) : null}
           </>
         ) : null}
+       </Measured>
       </ScrollView>
     </Screen>
   );
@@ -187,9 +189,9 @@ function SearchPrompt({ icon, title, detail }: { icon: Parameters<typeof Icon>[0
   const theme = useTheme();
   return (
     <View style={styles.prompt}>
-      <View style={[styles.promptIcon, { backgroundColor: theme.surface }]}>
+      <Glass radius={22} style={styles.promptIcon}>
         <Icon name={icon} color={theme.faint} size={30} />
-      </View>
+      </Glass>
       <Text style={[styles.promptTitle, { color: theme.text }]}>{title}</Text>
       <Text style={[styles.promptDetail, { color: theme.muted }]}>{detail}</Text>
     </View>
@@ -203,7 +205,7 @@ const styles = StyleSheet.create({
   scroll: { flexGrow: 1, paddingBottom: 40 },
   section: { marginBottom: 22 },
   sectionTitleRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 16 },
-  sectionTitle: { fontSize: 12, fontWeight: "700", letterSpacing: 0.7, textTransform: "uppercase" },
+  sectionTitle: { fontSize: 13, fontWeight: "600" },
   sectionCount: { fontSize: 12, fontWeight: "600" },
   resultGroup: { overflow: "hidden" },
   result: { minHeight: 76, flexDirection: "row", alignItems: "center", gap: 11, paddingHorizontal: 16, paddingVertical: 11, borderBottomWidth: StyleSheet.hairlineWidth },
@@ -214,7 +216,7 @@ const styles = StyleSheet.create({
   meta: { fontSize: 11 },
   pressed: { opacity: 0.58 },
   prompt: { flex: 1, minHeight: 330, alignItems: "center", justifyContent: "center", paddingHorizontal: 28 },
-  promptIcon: { width: 64, height: 64, borderRadius: 20, alignItems: "center", justifyContent: "center", marginBottom: 16 },
+  promptIcon: { width: 68, height: 68, alignItems: "center", justifyContent: "center", marginBottom: 16 },
   promptTitle: { fontSize: 19, fontWeight: "700", textAlign: "center" },
-  promptDetail: { maxWidth: 300, fontSize: 14, lineHeight: 20, textAlign: "center", marginTop: 6 },
+  promptDetail: { maxWidth: 420, fontSize: 15, lineHeight: 21, textAlign: "center", marginTop: 6 },
 });

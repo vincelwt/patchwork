@@ -1,7 +1,7 @@
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 
-import { Icon, Screen } from "@/components/ui";
+import { Grouped, Icon, Screen } from "@/components/ui";
 import { useTheme } from "@/lib/theme";
 
 const items = [
@@ -17,6 +17,7 @@ export default function MoreScreen() {
   return (
     <Screen style={{ backgroundColor: theme.surface }}>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.list}>
+       <Grouped>
         {items.map((item) => (
           <Pressable
             key={item.href}
@@ -33,6 +34,7 @@ export default function MoreScreen() {
             <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={16} />
           </Pressable>
         ))}
+       </Grouped>
       </ScrollView>
     </Screen>
   );

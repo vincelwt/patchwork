@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
-import { Conversation } from "@/components/Message";
-import { PullRequestLink } from "@/components/pull-request-link";
-import { TaskEditor } from "@/components/TaskEditor";
-import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "@/components/ui";
+import { Conversation } from "./Message";
+import { PullRequestLink } from "./pull-request-link";
+import { TaskEditor } from "./TaskEditor";
+import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "./ui";
 import { runStatusLabel, taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
+import { useLayout } from "@/lib/layout";
 import { useTheme } from "@/lib/theme";
 import { isTerminalTaskStatus } from "@client/types";
 
@@ -15,9 +16,11 @@ import { isTerminalTaskStatus } from "@client/types";
 /// and there can be more than one of those at a time.
 const FINISHED = ["succeeded", "failed", "cancelled"];
 
-export default function TaskScreen() {
-  const { taskId } = useLocalSearchParams<{ taskId: string }>();
+/// Also rendered beside the list on a wide screen, where the route's own header
+/// is not on screen and the task key belongs in the body instead.
+export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: boolean }) {
   const theme = useTheme();
+  const { gutter } = useLayout();
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
@@ -48,7 +51,13 @@ export default function TaskScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  if (!task || !data) return <View style={styles.fill}><Stack.Screen options={{ title: "Task" }} /></View>;
+  if (!task || !data) {
+    return (
+      <View style={styles.fill}>
+        {embedded ? null : <Stack.Screen options={{ title: "Task", headerTransparent: false }} />}
+      </View>
+    );
+  }
 
   const start = async (agentId?: string) => {
     setBusy(true);
@@ -89,17 +98,23 @@ export default function TaskScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <Stack.Screen
-        options={{
-          title: task.key,
-          headerBackTitle: "Tasks",
-          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
-        }}
-      />
-      <Card style={styles.summary}>
+      {embedded ? null : (
+        <Stack.Screen
+          options={{
+            title: task.key,
+            headerTransparent: false,
+            headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
+          }}
+        />
+      )}
+      <Card style={[styles.summary, { marginHorizontal: gutter, marginTop: gutter - 4 }]}>
         <View style={styles.titleRow}>
-          <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
+          <View style={styles.grow}>
+            {embedded ? <Text style={[styles.key, { color: theme.faint }]}>{task.key}</Text> : null}
+            <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
+          </View>
           <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : task.status === "canceled" ? "neutral" : "accent"}>{taskStatusLabel(task.status)}</Badge>
+          {embedded ? <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} /> : null}
         </View>
         {task.outcome ? <Text style={[styles.outcome, { color: theme.muted }]} numberOfLines={5}>{task.outcome}</Text> : null}
         <View style={styles.meta}>
@@ -178,8 +193,8 @@ export default function TaskScreen() {
         </View>
         <ErrorNotice message={error} />
       </Card>
-      <View style={[styles.discussionHead, { borderBottomColor: theme.line }]}>
-        <Text style={[styles.discussionTitle, { color: theme.text }]}>Discussion</Text>
+      <View style={[styles.discussionHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
+        <Text style={[styles.discussionTitle, { color: theme.faint }]}>Discussion</Text>
       </View>
       <Conversation channelId={task.discussion_channel_id} />
 
@@ -205,9 +220,11 @@ export default function TaskScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  summary: { margin: 12, padding: 14, gap: 10 },
+  grow: { flex: 1, minWidth: 0 },
+  key: { fontSize: 12, fontWeight: "700", marginBottom: 2 },
+  summary: { marginBottom: 12, padding: 16, gap: 10 },
   titleRow: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
-  title: { flex: 1, fontSize: 19, fontWeight: "700", lineHeight: 25 },
+  title: { fontSize: 19, fontWeight: "700", lineHeight: 25 },
   outcome: { fontSize: 14, lineHeight: 20 },
   meta: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 9 },
   person: { flexDirection: "row", alignItems: "center", gap: 6 },
@@ -215,7 +232,7 @@ const styles = StyleSheet.create({
   runRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8, borderTopWidth: StyleSheet.hairlineWidth },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   discussionHead: { paddingHorizontal: 16, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth },
-  discussionTitle: { fontSize: 13, fontWeight: "700" },
+  discussionTitle: { fontSize: 13, fontWeight: "600" },
   agentList: { paddingBottom: 20 },
   agentRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
 });

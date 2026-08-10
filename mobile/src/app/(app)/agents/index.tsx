@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
 import { AgentEditor } from "@/components/AgentEditor";
-import { Avatar, Badge, Button, Empty, Icon, PageHeader, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, Grouped, Icon, Sheet } from "@/components/ui";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -15,8 +15,14 @@ export default function AgentsScreen() {
   const agents = data?.members.filter((member) => member.kind === "agent") ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Agents" subtitle={`${agents.length} teammates`} back action={<Button label="New agent" compact onPress={() => setCreating(true)} />} />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <Stack.Screen
+        options={{
+          title: "Agents",
+          headerRight: () => <Button label="New" compact tone="quiet" onPress={() => setCreating(true)} />,
+        }}
+      />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
+       <Grouped>
         {agents.length ? (
           <View style={styles.group}>
             {agents.map((agent) => {
@@ -43,6 +49,7 @@ export default function AgentsScreen() {
           </View>
         ) : null}
         {!agents.length ? <Empty title="No agents yet" detail="Create an agent teammate and choose where it runs." /> : null}
+       </Grouped>
       </ScrollView>
       <Sheet visible={creating} title="New agent" onClose={() => setCreating(false)}>
         <AgentEditor

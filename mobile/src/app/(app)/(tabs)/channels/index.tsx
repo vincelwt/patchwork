@@ -2,9 +2,11 @@ import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 
-import type { Channel } from "@client/types";
-import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, Sheet, TextField } from "@/components/ui";
+import type { Channel, Id } from "@client/types";
+import { Conversation } from "@/components/Message";
+import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -13,16 +15,22 @@ export default function ChannelsScreen() {
   const store = useWorkspaceStore();
   const router = useRouter();
   const theme = useTheme();
+  const { split, gutter } = useLayout();
   const [newChannel, setNewChannel] = useState(false);
   const [newDm, setNewDm] = useState(false);
   const [name, setName] = useState("");
   const [topic, setTopic] = useState("");
   const [sectionId, setSectionId] = useState("");
   const [error, setError] = useState("");
+  const [selected, setSelected] = useState<Id>();
   const data = workspace.bootstrap;
   if (!data) return <Empty title="No workspace data yet" />;
 
-  const open = (channel: Channel) => router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
+  // On a wide screen the conversation opens beside the list instead of on top of it.
+  const open = (channel: Channel) =>
+    split
+      ? setSelected(channel.id)
+      : router.push({ pathname: "/channels/[channelId]", params: { channelId: channel.id } });
   const create = async () => {
     setError("");
     try {
@@ -46,11 +54,61 @@ export default function ChannelsScreen() {
   const channels = data.channels.filter((channel) => channel.kind === "channel").sort((a, b) => a.position - b.position);
   const sectionIds = new Set(data.sections.map((section) => section.id));
   const unsectioned = channels.filter((channel) => !channel.section_id || !sectionIds.has(channel.section_id));
+  const openChannel = selected ? data.channels.find((channel) => channel.id === selected) : undefined;
+
+  const groups = (
+    <>
+      <ChannelGroup
+        title="Channels"
+        channels={unsectioned}
+        onOpen={open}
+        selected={split ? selected : undefined}
+        empty="Create the first channel to get going."
+      />
+      {data.sections.map((section) => (
+        <ChannelGroup
+          key={section.id}
+          title={section.name}
+          channels={channels.filter((channel) => channel.section_id === section.id)}
+          onOpen={open}
+          selected={split ? selected : undefined}
+        />
+      ))}
+      <ChannelGroup
+        title="Direct messages"
+        channels={dms}
+        onOpen={open}
+        selected={split ? selected : undefined}
+        empty="Start a direct conversation with a teammate."
+      />
+    </>
+  );
+
+  const list = (
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={styles.scroll}
+      showsVerticalScrollIndicator={!split}
+    >
+      {split ? (
+        <>
+          <Text style={[styles.paneTitle, { color: theme.text }]}>Chat</Text>
+          {groups}
+        </>
+      ) : (
+        <Measured>{groups}</Measured>
+      )}
+    </ScrollView>
+  );
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.surface }]}>
       <Stack.Screen
         options={{
+          // Beside a detail pane the bar stays opaque, so neither column slides
+          // under it and no column has to guess the bar's height.
+          headerLargeTitle: !split,
+          headerTransparent: !split,
           headerRight: () => (
             <View style={styles.actions}>
               <Pressable accessibilityRole="button" accessibilityLabel="New direct message" hitSlop={8} onPress={() => setNewDm(true)}>
@@ -63,20 +121,32 @@ export default function ChannelsScreen() {
           ),
         }}
       />
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
-        {unsectioned.length || !data.sections.length ? (
-          <ChannelGroup title={data.sections.length ? "Other channels" : "Channels"} channels={unsectioned} onOpen={open} />
-        ) : null}
-        {data.sections.map((section) => (
-          <ChannelGroup
-            key={section.id}
-            title={section.name}
-            channels={channels.filter((channel) => channel.section_id === section.id)}
-            onOpen={open}
-          />
-        ))}
-        <ChannelGroup title="Direct messages" channels={dms} onOpen={open} empty="Start a direct conversation with a teammate." />
-      </ScrollView>
+      {split ? (
+        <View style={styles.split}>
+          <View style={[styles.pane, { borderRightColor: theme.line }]}>{list}</View>
+          <View style={[styles.detail, { backgroundColor: theme.surface }]}>
+            {openChannel ? (
+              <>
+                <View style={[styles.detailHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
+                  <Text numberOfLines={1} style={[styles.detailTitle, { color: theme.text }]}>
+                    {openChannel.kind === "channel" ? `# ${openChannel.name}` : openChannel.name}
+                  </Text>
+                  {openChannel.topic ? (
+                    <Text numberOfLines={1} style={[styles.detailTopic, { color: theme.muted }]}>{openChannel.topic}</Text>
+                  ) : null}
+                </View>
+                <Conversation channelId={openChannel.id} />
+              </>
+            ) : (
+              <View style={styles.centre}>
+                <Empty title="Pick a conversation" detail="Channels and direct messages open beside the list." />
+              </View>
+            )}
+          </View>
+        </View>
+      ) : (
+        list
+      )}
 
       <Sheet visible={newChannel} title="New channel" onClose={() => setNewChannel(false)}>
         <View style={styles.form}>
@@ -129,28 +199,37 @@ export default function ChannelsScreen() {
   );
 }
 
+/// An empty section is noise, so only the first group explains itself.
 function ChannelGroup({
   title,
   channels,
   onOpen,
-  empty = "No channels in this section.",
+  selected,
+  empty,
 }: {
   title: string;
   channels: Channel[];
   onOpen: (channel: Channel) => void;
+  selected?: Id;
   empty?: string;
 }) {
   const theme = useTheme();
+  if (!channels.length && !empty) return null;
   return (
     <View style={styles.group}>
       <View style={styles.sectionHead}>
         <Text style={[styles.section, { color: theme.faint }]}>{title}</Text>
-        <Text style={[styles.count, { color: theme.faint }]}>{channels.length}</Text>
+        {channels.length ? <Text style={[styles.count, { color: theme.faint }]}>{channels.length}</Text> : null}
       </View>
       {channels.length ? (
-        <View style={styles.channelGroup}>
-          {channels.map((channel) => <ChannelRow key={channel.id} channel={channel} onPress={() => onOpen(channel)} />)}
-        </View>
+        channels.map((channel) => (
+          <ChannelRow
+            key={channel.id}
+            channel={channel}
+            active={channel.id === selected}
+            onPress={() => onOpen(channel)}
+          />
+        ))
       ) : (
         <Text style={[styles.groupEmpty, { color: theme.muted }]}>{empty}</Text>
       )}
@@ -158,10 +237,20 @@ function ChannelGroup({
   );
 }
 
-function ChannelRow({ channel, onPress }: { channel: Channel; onPress: () => void }) {
+function ChannelRow({ channel, active, onPress }: { channel: Channel; active?: boolean; onPress: () => void }) {
   const theme = useTheme();
   return (
-    <Pressable onPress={onPress} style={({ pressed }) => [styles.channel, { borderBottomColor: theme.line }, pressed && { opacity: 0.6 }]}>
+    <Pressable
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.channel,
+        { borderBottomColor: theme.line },
+        active && { backgroundColor: theme.accentSoft },
+        pressed && { opacity: 0.6 },
+      ]}
+    >
       <View style={styles.channelIcon}>
         <Icon
           name={channel.kind === "dm" ? { ios: "person.crop.circle", android: "person", web: "person" } : { ios: "number", android: "tag", web: "tag" }}
@@ -171,7 +260,9 @@ function ChannelRow({ channel, onPress }: { channel: Channel; onPress: () => voi
       </View>
       <View style={styles.fill}>
         <Text numberOfLines={1} style={[styles.channelName, { color: theme.text }]}>{channel.name}</Text>
-        <Text numberOfLines={1} style={{ color: theme.muted }}>{channel.topic || "No topic"}</Text>
+        {channel.topic ? (
+          <Text numberOfLines={1} style={[styles.channelTopic, { color: theme.muted }]}>{channel.topic}</Text>
+        ) : null}
       </View>
       {channel.last_message_at ? <Text style={[styles.time, { color: theme.faint }]}>{relative(channel.last_message_at)}</Text> : null}
       <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={15} />
@@ -183,14 +274,22 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   actions: { flexDirection: "row", alignItems: "center", gap: 18 },
   scroll: { paddingBottom: 30 },
-  group: { marginBottom: 18 },
-  sectionHead: { minHeight: 34, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 16 },
-  section: { fontSize: 12, fontWeight: "700", textTransform: "uppercase", letterSpacing: 0.7 },
+  split: { flex: 1, flexDirection: "row" },
+  pane: { width: 340, borderRightWidth: StyleSheet.hairlineWidth },
+  paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },
+  detail: { flex: 1 },
+  centre: { flex: 1, justifyContent: "center" },
+  detailHead: { paddingTop: 13, paddingBottom: 11, borderBottomWidth: StyleSheet.hairlineWidth },
+  detailTitle: { fontSize: 19, fontWeight: "700", letterSpacing: -0.3 },
+  detailTopic: { fontSize: 13, marginTop: 2 },
+  group: { marginBottom: 16 },
+  sectionHead: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 16 },
+  section: { fontSize: 13, fontWeight: "600" },
   count: { fontSize: 12, fontWeight: "600" },
-  channelGroup: { overflow: "hidden" },
-  channel: { minHeight: 66, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 9 },
-  channelIcon: { width: 28, alignItems: "center", justifyContent: "center" },
-  channelName: { fontSize: 16, fontWeight: "600", marginBottom: 2 },
+  channel: { minHeight: 62, flexDirection: "row", alignItems: "center", gap: 11, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 9 },
+  channelIcon: { width: 26, alignItems: "center", justifyContent: "center" },
+  channelName: { fontSize: 16, fontWeight: "600" },
+  channelTopic: { fontSize: 13, marginTop: 1 },
   time: { fontSize: 11 },
   groupEmpty: { paddingHorizontal: 16, paddingVertical: 9, fontSize: 13 },
   form: { padding: 16, gap: 14 },

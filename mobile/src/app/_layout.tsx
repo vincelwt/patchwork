@@ -10,7 +10,7 @@ import { useTheme } from "@/lib/theme";
 export default function RootLayout() {
   const scheme = useColorScheme();
   const theme = useTheme();
-  const { session } = usePairedSession();
+  const { session, workspaces } = usePairedSession();
   const base = scheme === "dark" ? DarkTheme : DefaultTheme;
 
   return (
@@ -28,7 +28,7 @@ export default function RootLayout() {
           },
         }}
       >
-        <WorkspaceProvider session={session}>
+        <WorkspaceProvider session={session} workspaces={workspaces}>
           <Stack screenOptions={{ headerShown: false, animation: "simple_push" }} />
         </WorkspaceProvider>
         <StatusBar style="auto" />

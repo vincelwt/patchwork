@@ -15,16 +15,20 @@ export default function AppLayout() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ConnectionBar connection={workspace.connection} error={workspace.error} />
       <Stack
         screenOptions={{
-          headerShown: false,
           animation: "default",
           animationTypeForReplace: "pop",
           contentStyle: { backgroundColor: theme.bg },
           gestureEnabled: true,
+          headerBackButtonDisplayMode: "minimal",
+          headerShadowVisible: false,
+          headerTransparent: true,
         }}
-      />
+      >
+        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+      </Stack>
+      <ConnectionBar connection={workspace.connection} error={workspace.error} />
     </View>
   );
 }

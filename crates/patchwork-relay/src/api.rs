@@ -675,7 +675,8 @@ async fn create_section(
 ) -> ApiResult<Json<Section>> {
     let section = Section {
         id: new_id(),
-        name: input.name.trim().to_uppercase(),
+        // A section keeps the name it was given; shouting is not our decision.
+        name: input.name.trim().to_string(),
         position: state.store.sections()?.len() as f64,
     };
     state.store.upsert_section(&section)?;
@@ -716,7 +717,7 @@ async fn create_channel(
                 None => {
                     let section = Section {
                         id: new_id(),
-                        name: name.trim().to_uppercase(),
+                        name: name.trim().to_string(),
                         position: state.store.sections()?.len() as f64,
                     };
                     state.store.upsert_section(&section)?;

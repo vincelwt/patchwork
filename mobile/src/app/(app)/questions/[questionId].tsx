@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import type { QuestionAnswer } from "@client/types";
-import { Button, Card, ErrorNotice, PageHeader, ScrollScreen, TextField } from "@/components/ui";
+import { Button, Card, ErrorNotice, ScrollScreen, TextField } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -21,7 +21,14 @@ export default function QuestionScreen() {
   const [error, setError] = useState("");
 
   if (!question) {
-    return <View style={{ flex: 1 }}><PageHeader title="Question" back /><Text style={{ color: theme.muted, padding: 20 }}>This question was already answered or cancelled.</Text></View>;
+    return (
+      <View style={{ flex: 1 }}>
+        <Stack.Screen options={{ title: "Question" }} />
+        <ScrollScreen>
+          <Text style={{ color: theme.muted }}>This question was already answered or cancelled.</Text>
+        </ScrollScreen>
+      </View>
+    );
   }
 
   const toggle = (itemId: string, value: string, multi: boolean) => {
@@ -62,7 +69,7 @@ export default function QuestionScreen() {
 
   return (
     <View style={{ flex: 1 }}>
-      <PageHeader title={question.headline || "Agent question"} back />
+      <Stack.Screen options={{ title: question.headline || "Agent question" }} />
       <ScrollScreen>
         {question.items.map((item) => (
           <Card key={item.id} style={styles.card}>
@@ -105,7 +112,7 @@ export default function QuestionScreen() {
 
 const styles = StyleSheet.create({
   card: { padding: 16, gap: 12 },
-  header: { fontSize: 11, fontWeight: "700", letterSpacing: 0.8, textTransform: "uppercase" },
+  header: { fontSize: 13, fontWeight: "600" },
   question: { fontSize: 17, lineHeight: 24, fontWeight: "600" },
   options: { gap: 8 },
   option: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 11, padding: 12, gap: 4 },

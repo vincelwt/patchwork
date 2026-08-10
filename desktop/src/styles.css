@@ -639,9 +639,7 @@ body.resizing {
   background: var(--tint-strong);
   border-radius: 4px;
   padding: 0 5px;
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-size: 11px;
 }
 /* What the run cost, in the header of the reply it produced. */
 .message-run {

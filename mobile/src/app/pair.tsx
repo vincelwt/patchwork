@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import type { Member, Workspace } from "@client/types";
-import { Button, ErrorNotice, PageHeader } from "@/components/ui";
+import { Button, ErrorNotice, Measured } from "@/components/ui";
+import { useLayout } from "@/lib/layout";
 import { usePairedSession } from "@/lib/session";
 import { useTheme } from "@/lib/theme";
 
@@ -19,7 +20,8 @@ export default function PairDevice() {
   const theme = useTheme();
   const router = useRouter();
   const params = useLocalSearchParams<{ base?: string; secret?: string }>();
-  const { pair } = usePairedSession();
+  const { pair, workspaces } = usePairedSession();
+  const { wide } = useLayout();
   const [permission, requestPermission] = useCameraPermissions();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -43,7 +45,7 @@ export default function PairDevice() {
       if (!response.ok || !body || !("token" in body)) {
         throw new Error(body && "error" in body ? body.error?.message || "Pairing failed." : "Pairing failed.");
       }
-      await pair({ baseUrl: url.toString(), token: body.token });
+      await pair({ baseUrl: url.toString(), token: body.token, name: body.workspace?.name });
       router.replace("/inbox");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -71,36 +73,48 @@ export default function PairDevice() {
   };
 
   return (
-    <SafeAreaView style={[styles.fill, { backgroundColor: theme.bg }]} edges={["top", "bottom"]}>
-      <PageHeader title="Pair this device" back />
-      <View style={styles.body}>
-        {busy ? (
-          <View style={styles.center}>
-            <ActivityIndicator size="large" color={theme.accent} />
-            <Text style={{ color: theme.muted }}>Joining your workspace…</Text>
-          </View>
-        ) : permission?.granted ? (
-          <>
-            <View style={[styles.cameraFrame, { borderColor: theme.line }]}>
-              <CameraView
-                style={styles.camera}
-                facing="back"
-                barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-                onBarcodeScanned={scan}
-              />
-              <View pointerEvents="none" style={[styles.target, { borderColor: theme.onAccent }]} />
+    <SafeAreaView style={[styles.fill, { backgroundColor: theme.bg }]} edges={["bottom"]}>
+      <Stack.Screen
+        options={{
+          headerShown: true,
+          title: workspaces.length ? "Add a workspace" : "Pair this device",
+          headerShadowVisible: false,
+          headerBackButtonDisplayMode: "minimal",
+        }}
+      />
+      <Measured style={styles.fill}>
+        <View style={[styles.body, wide && styles.bodyWide]}>
+          {busy ? (
+            <View style={styles.center}>
+              <ActivityIndicator size="large" color={theme.accent} />
+              <Text style={{ color: theme.muted }}>Joining your workspace…</Text>
             </View>
-            <Text style={[styles.help, { color: theme.muted }]}>On Desktop, open Members and choose Pair phone or tablet. Point this camera at the code.</Text>
-          </>
-        ) : (
-          <View style={styles.center}>
-            <Text style={[styles.permissionTitle, { color: theme.text }]}>Camera access is needed once</Text>
-            <Text style={[styles.help, { color: theme.muted }]}>The code contains a short-lived pairing secret, never your existing Desktop key.</Text>
-            <Button label="Allow camera" onPress={() => void requestPermission()} />
-          </View>
-        )}
-        <ErrorNotice message={error} />
-      </View>
+          ) : permission?.granted ? (
+            <>
+              <View style={[styles.cameraFrame, { borderColor: theme.line }]}>
+                <CameraView
+                  style={styles.camera}
+                  facing="back"
+                  barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                  onBarcodeScanned={scan}
+                />
+                <View pointerEvents="none" style={[styles.target, { borderColor: theme.onAccent }]} />
+              </View>
+              <Text style={[styles.help, { color: theme.muted }]}>
+                On Desktop, open Members and choose Pair phone or tablet. Point this camera at the code.
+                {workspaces.length ? " Pairing another workspace keeps the ones you already have." : ""}
+              </Text>
+            </>
+          ) : (
+            <View style={styles.center}>
+              <Text style={[styles.permissionTitle, { color: theme.text }]}>Camera access is needed once</Text>
+              <Text style={[styles.help, { color: theme.muted }]}>The code contains a short-lived pairing secret, never your existing Desktop key.</Text>
+              <Button label="Allow camera" onPress={() => void requestPermission()} />
+            </View>
+          )}
+          <ErrorNotice message={error} />
+        </View>
+      </Measured>
     </SafeAreaView>
   );
 }
@@ -112,6 +126,7 @@ function deviceLabel() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   body: { flex: 1, padding: 20, gap: 16 },
+  bodyWide: { paddingHorizontal: 0 },
   center: { flex: 1, justifyContent: "center", alignItems: "center", gap: 14, padding: 24 },
   cameraFrame: { flex: 1, maxHeight: 620, borderWidth: StyleSheet.hairlineWidth, borderRadius: 18, overflow: "hidden" },
   camera: { flex: 1 },

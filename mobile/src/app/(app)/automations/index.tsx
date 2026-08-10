@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 
 import type { Automation } from "@client/types";
 import { AutomationEditor } from "@/components/AutomationEditor";
-import { Avatar, Badge, Button, Empty, PageHeader, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, Grouped, Sheet } from "@/components/ui";
 import { relative, triggerLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -18,10 +18,17 @@ export default function AutomationsScreen() {
   const automations = workspace.bootstrap?.automations ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <PageHeader title="Automations" subtitle={`${automations.length} workflows`} back action={<Button label="New" compact onPress={() => setCreating(true)} />} />
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <Stack.Screen
+        options={{
+          title: "Automations",
+          headerRight: () => <Button label="New" compact tone="quiet" onPress={() => setCreating(true)} />,
+        }}
+      />
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
+       <Grouped>
         {automations.map((automation) => <AutomationRow key={automation.id} automation={automation} />)}
         {!automations.length ? <Empty title="No automations yet" detail="Choose what fires, which agent acts, and where the result lands." /> : null}
+       </Grouped>
       </ScrollView>
       <Sheet visible={creating} title="New automation" onClose={() => setCreating(false)}>
         <AutomationEditor
@@ -59,8 +66,8 @@ export default function AutomationsScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  scroll: { paddingHorizontal: 14, paddingBottom: 30 },
-  row: { minHeight: 82, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 11 },
+  scroll: { paddingBottom: 30 },
+  row: { minHeight: 82, flexDirection: "row", alignItems: "center", gap: 10, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 11 },
   main: { flex: 1, minWidth: 0, gap: 3 },
   head: { flexDirection: "row", alignItems: "center", gap: 6 },
   name: { flex: 1, fontSize: 16, fontWeight: "700" },
