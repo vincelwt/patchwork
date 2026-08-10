@@ -112,9 +112,6 @@ export function Sidebar({
     );
   }, [hidden]);
 
-  const workspaceImage = app.workspace?.icon_image
-    ? `${api.baseUrl.replace(/\/$/, "")}${app.workspace.icon_image}`
-    : undefined;
   const unread = app.inbox.filter((item) => !item.read_at).length;
   const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
   const liveAutomations = app.automations.filter((a) => a.enabled).length;
@@ -192,14 +189,6 @@ export function Sidebar({
       }}
     >
       <div className="sidebar-top" data-tauri-drag-region="deep">
-        {!rail && (
-          <WorkspaceMark
-            name={app.workspace?.name ?? "Patchwork"}
-            icon={app.workspace?.icon}
-            image={workspaceImage}
-            size={24}
-          />
-        )}
         <span className="spacer" />
         <button className="icon-button" onClick={onSearch} title="Search (⌘K)">
           <SearchIcon size={17} />
