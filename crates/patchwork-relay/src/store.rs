@@ -1407,6 +1407,31 @@ impl Store {
         Ok(Some(status))
     }
 
+    /// Only the pull request column. The watcher's task snapshot is seconds
+    /// old by the time `gh` answers, so writing the whole row back would undo
+    /// everything that happened meanwhile — including a `current_run_id` the
+    /// finished run had just cleared, which parks the task for good.
+    pub fn set_task_pr_state(&self, task_id: &str, pr: &PullRequestState) -> Result<Option<Task>> {
+        self.conn()?.execute(
+            "UPDATE tasks SET pr_state=?2, updated_at=MAX(?3, updated_at + 1) WHERE id=?1",
+            params![task_id, to_json(pr), now_ms()],
+        )?;
+        self.task(task_id)
+    }
+
+    /// Free tasks still pointing at a run that has already ended. `finish_run`
+    /// clears the pointer as work ends; a row that missed it accepts no new run
+    /// and no approval, and nothing else ever comes back to fix it.
+    pub fn clear_finished_task_runs(&self) -> Result<usize> {
+        Ok(self.conn()?.execute(
+            "UPDATE tasks SET current_run_id = NULL, updated_at = updated_at + 1
+             WHERE current_run_id IS NOT NULL
+               AND current_run_id IN
+                   (SELECT id FROM runs WHERE status IN ('succeeded','failed','cancelled'))",
+            [],
+        )?)
+    }
+
     pub fn finalize_task_run_start(&self, task_id: &str, run_id: &str) -> Result<bool> {
         Ok(self.conn()?.execute(
             "UPDATE tasks SET review_action=NULL, question_blocked_run_id=NULL,
@@ -2861,6 +2886,63 @@ mod tests {
         assert_eq!(stored.status, TaskStatus::Done);
         assert!(stored.updated_at > task.updated_at);
         assert_ne!(stored.title, stale.title);
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_finished_run_never_keeps_a_task_busy() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let mut done = run("run-done", &task.id);
+        store.insert_run(&done, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &done.id, None)
+            .unwrap()
+            .unwrap();
+        done.status = RunStatus::Succeeded;
+        done.ended_at = Some(2);
+        store.update_run(&done).unwrap();
+
+        // The run ended and released the task, which is now waiting on a human.
+        let mut released = store.task(&task.id).unwrap().unwrap();
+        released.current_run_id = None;
+        released.status = TaskStatus::Review;
+        store.update_task(&released).unwrap();
+
+        // A pull request poll writes its own column and nothing else.
+        let pr = PullRequestState {
+            number: 89,
+            title: "fix the icon".into(),
+            state: "OPEN".into(),
+            checks: String::new(),
+            review: String::new(),
+            updated_at: 3,
+        };
+        let polled = store.set_task_pr_state(&task.id, &pr).unwrap().unwrap();
+        assert!(polled.current_run_id.is_none());
+        assert_eq!(polled.status, TaskStatus::Review);
+        assert_eq!(polled.pr_state.as_ref().map(|p| p.number), Some(89));
+
+        // And a pointer that survived anyway does not park the task forever.
+        let mut stuck = polled.clone();
+        stuck.current_run_id = Some(done.id.clone());
+        store.update_task(&stuck).unwrap();
+        assert!(store
+            .activate_task_run(&task.id, "next-run", None)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.clear_finished_task_runs().unwrap(), 1);
+        assert!(store
+            .activate_task_run(&task.id, "next-run", None)
+            .unwrap()
+            .is_some());
 
         drop(store);
         let _ = std::fs::remove_file(path);
