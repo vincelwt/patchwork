@@ -31,6 +31,7 @@ import {
 } from "./icons";
 import { Menu, type MenuItem } from "./ui";
 import { AttachmentRow, Card } from "./Cards";
+import { Lightbox } from "./Evidence";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
 import type { Attachment, Channel, Id, Member, Message, Run } from "@client/types";
@@ -653,19 +654,34 @@ function RunMeta({ run }: { run: Run }) {
   );
 }
 
-/// An image someone dropped in should be visible without a download step.
+/// An image someone dropped in should be visible without a download step, and
+/// legible without leaving the app: the thumbnail opens into the zoom view.
 export function Attached({ attachment }: { attachment: Attachment }) {
   const api = useApi();
   const image = attachment.mime.startsWith("image/");
   const url = useFileUrl(image ? attachment.url : "");
   const [broken, setBroken] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
 
   if (image && !broken) {
     if (!url) return <span className="attachment-chip">Loading image…</span>;
     return (
-      <a href={url} target="_blank" rel="noreferrer noopener" className="image-attachment">
-        <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
-      </a>
+      <>
+        <button
+          className="image-attachment"
+          title="Open this image"
+          onClick={() => setZoomed(true)}
+        >
+          <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
+        </button>
+        {zoomed && (
+          <Lightbox
+            url={url}
+            alt={attachment.caption || attachment.file_name}
+            onClose={() => setZoomed(false)}
+          />
+        )}
+      </>
     );
   }
   return (

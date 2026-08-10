@@ -6,6 +6,7 @@ import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, usePreviewUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
+import { Lightbox } from "./Evidence";
 import {
   ExternalIcon,
   PreviewIcon,
@@ -315,6 +316,7 @@ function ArtifactCard({
   const path = `/api/files/${attachmentId}`;
   const url = useFileUrl(path);
   const [broken, setBroken] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
 
   if (broken) {
     return (
@@ -335,8 +337,21 @@ function ArtifactCard({
   // around an image say nothing the image does not.
   return (
     <figure className="artifact">
-      <img src={url} alt={caption ?? "attachment"} onError={() => setBroken(true)} />
+      <img
+        src={url}
+        alt={caption ?? "attachment"}
+        title="Open this image"
+        onClick={() => setZoomed(true)}
+        onError={() => setBroken(true)}
+      />
       {caption && <figcaption className="card-sub">{caption}</figcaption>}
+      {zoomed && (
+        <Lightbox
+          url={url}
+          alt={caption ?? "attachment"}
+          onClose={() => setZoomed(false)}
+        />
+      )}
     </figure>
   );
 }

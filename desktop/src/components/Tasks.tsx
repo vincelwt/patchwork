@@ -37,6 +37,8 @@ import {
   WarningIcon,
 } from "./icons";
 import { Attached, ChatView, DictateButton } from "./Chat";
+import { Lightbox, TextEvidence } from "./Evidence";
+import { evidenceKind, isTextEvidence } from "@client/evidence";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
@@ -1109,11 +1111,7 @@ function ReviewPanel({ task }: { task: Task }) {
               <span>
                 {item.kind === "preview"
                   ? statusLabel(item.preview.status as never)
-                  : item.attachment.mime.startsWith("video/")
-                    ? "Video"
-                    : item.attachment.mime.startsWith("image/")
-                      ? "Image"
-                      : "File"}
+                  : evidenceLabel(item.attachment)}
               </span>
               <strong>{label}</strong>
             </button>
@@ -1169,13 +1167,31 @@ function PreviewViewer({ preview }: { preview: Preview }) {
   );
 }
 
+const EVIDENCE_LABELS: Record<string, string> = {
+  image: "Image",
+  video: "Video",
+  markdown: "Markdown",
+  html: "Page",
+  csv: "Table",
+  text: "Text",
+  file: "File",
+};
+
+function evidenceLabel(attachment: Attachment) {
+  return EVIDENCE_LABELS[evidenceKind(attachment.mime, attachment.file_name)];
+}
+
 function AttachmentViewer({ attachment }: { attachment: Attachment }) {
   const api = useApi();
-  const image = attachment.mime.startsWith("image/");
-  const video = attachment.mime.startsWith("video/");
-  const grantedUrl = useGrantedFileUrl(image ? undefined : attachment.id);
+  const kind = evidenceKind(attachment.mime, attachment.file_name);
+  const image = kind === "image";
+  const video = kind === "video";
+  // Only a video needs a URL the media element can fetch on its own; text is
+  // read through the authenticated client and images are already blobs.
+  const grantedUrl = useGrantedFileUrl(video ? attachment.id : undefined);
   const imageUrl = useFileUrl(image ? attachment.url : "");
   const url = image ? imageUrl : grantedUrl;
+  const [zoomed, setZoomed] = useState(false);
 
   return (
     <div className="review-viewer">
@@ -1191,16 +1207,25 @@ function AttachmentViewer({ attachment }: { attachment: Attachment }) {
           Download
         </button>
       </div>
-      {!url ? (
+      {isTextEvidence(kind) ? (
+        <TextEvidence attachment={attachment} />
+      ) : !url ? (
         <div className="review-unavailable"><Spinner size={14} /></div>
       ) : image ? (
-        <a href={url} target="_blank" rel="noreferrer noopener" className="review-image">
+        <button className="review-image" title="Zoom" onClick={() => setZoomed(true)}>
           <img src={url} alt={attachment.caption || attachment.file_name} />
-        </a>
+        </button>
       ) : video ? (
         <video className="review-video" src={url} controls preload="metadata" />
       ) : (
         <div className="review-unavailable">Open the attached file to review it.</div>
+      )}
+      {zoomed && url && (
+        <Lightbox
+          url={url}
+          alt={attachment.caption || attachment.file_name}
+          onClose={() => setZoomed(false)}
+        />
       )}
     </div>
   );
