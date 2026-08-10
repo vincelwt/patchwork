@@ -1046,6 +1046,9 @@ body.resizing {
   color: var(--accent);
   font-weight: 550;
 }
+.mention.task {
+  cursor: pointer;
+}
 
 /* --- composer ------------------------------------------------------------ */
 

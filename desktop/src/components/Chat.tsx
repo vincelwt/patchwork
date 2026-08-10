@@ -7,7 +7,8 @@ import {
   useState,
 } from "react";
 import { store, useApi, useAppSelector } from "../lib/store";
-import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
+import { bytes, dayLabel, duration, statusLabel, timeOfDay } from "../lib/format";
+import { matchTasks } from "@client/mentions";
 import { useVirtualWindow } from "../lib/virtual";
 import { useBottomAnchor } from "../lib/scroll";
 import { useFileUrl } from "../lib/file";
@@ -27,6 +28,7 @@ import {
   RunIcon,
   SendIcon,
   Spinner,
+  TasksIcon,
   ThreadIcon,
 } from "./icons";
 import { Menu, type MenuItem } from "./ui";
@@ -257,7 +259,8 @@ export function Timeline({
       <div className="timeline-inner" ref={contentRef}>
         {messages.length === 0 && (
           <div className="empty">
-            Nothing here yet. Say something, or bring an agent in with @.
+            Nothing here yet. Say something, bring an agent in with @, or point
+            at a task with #.
           </div>
         )}
         {window_.padTop > 0 && <div style={{ height: window_.padTop }} />}
@@ -919,14 +922,16 @@ function ComposerBox({
   onCancelReply,
 }: ComposerProps & { draftKey: string }) {
   const api = useApi();
-  const { members, me } = useAppSelector((data) => ({
+  const { members, me, tasks } = useAppSelector((data) => ({
     members: data.members,
     me: data.me,
+    tasks: data.tasks,
   }));
   const [text, setText] = useState(() => localStorage.getItem(draftKey) ?? "");
   const files = useAttachments({ incoming, onConsumed, taskId: channel.task_id });
   const [busy, setBusy] = useState(false);
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  // `@` brings a teammate in, `#` points at a task. One menu, one keyboard.
+  const [mention, setMention] = useState<{ sigil: string; query: string } | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const box = useRef<HTMLTextAreaElement>(null);
   const wrap = useRef<HTMLDivElement>(null);
@@ -983,27 +988,42 @@ function ComposerBox({
     }
   };
 
-  const candidates =
-    mentionQuery === null
-      ? []
-      : members
-          .filter(
-            (member) =>
-              member.handle.startsWith(mentionQuery.toLowerCase()) &&
-              member.id !== me?.id,
-          )
-          .slice(0, 6);
+  const candidates = useMemo(() => {
+    if (!mention) return [];
+    const query = mention.query.toLowerCase();
+    if (mention.sigil === "#") {
+      // The key is the mention: what lands in the message is what every other
+      // surface already writes, so the reference reads the same everywhere.
+      return matchTasks(tasks, query).map((task) => ({
+        id: task.id,
+        insert: `${task.key} `,
+        name: task.title,
+        sub: `${task.key} · ${statusLabel(task.status)}`,
+        member: undefined as Member | undefined,
+      }));
+    }
+    return members
+      .filter((member) => member.handle.startsWith(query) && member.id !== me?.id)
+      .slice(0, 6)
+      .map((member) => ({
+        id: member.id,
+        insert: `@${member.handle} `,
+        name: member.display_name,
+        sub: `@${member.handle}${member.kind === "agent" ? " · agent" : ""}`,
+        member,
+      }));
+  }, [mention, members, me?.id, tasks]);
 
-  const applyMention = (handle: string) => {
-    setText((current) => current.replace(/@[\w-]*$/, `@${handle} `));
-    setMentionQuery(null);
+  const applyMention = (insert: string) => {
+    setText((current) => current.replace(/[@#][\w-]*$/, insert));
+    setMention(null);
     box.current?.focus();
   };
 
   const onChange = (value: string) => {
     setText(value);
-    const match = value.match(/@([\w-]*)$/);
-    setMentionQuery(match ? match[1] : null);
+    const match = value.match(/([@#])([\w-]*)$/);
+    setMention(match ? { sigil: match[1], query: match[2] } : null);
     setMentionIndex(0);
     store.typing(channel.id);
   };
@@ -1047,20 +1067,21 @@ function ComposerBox({
 
       {candidates.length > 0 && (
         <div className="mention-menu">
-          {candidates.map((member, index) => (
+          {candidates.map((candidate, index) => (
             <button
-              key={member.id}
+              key={candidate.id}
               className={`row${index === mentionIndex ? " active" : ""}`}
               onMouseEnter={() => setMentionIndex(index)}
-              onClick={() => applyMention(member.handle)}
+              onClick={() => applyMention(candidate.insert)}
             >
-              <Avatar member={member} size={22} />
+              {candidate.member ? (
+                <Avatar member={candidate.member} size={22} />
+              ) : (
+                <TasksIcon size={16} />
+              )}
               <span className="grow">
-                <span className="name">{member.display_name}</span>
-                <span className="sub">
-                  @{member.handle}
-                  {member.kind === "agent" ? " · agent" : ""}
-                </span>
+                <span className="name">{candidate.name}</span>
+                <span className="sub">{candidate.sub}</span>
               </span>
             </button>
           ))}
@@ -1114,11 +1135,11 @@ function ComposerBox({
               }
               if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
                 event.preventDefault();
-                applyMention(candidates[mentionIndex].handle);
+                applyMention(candidates[mentionIndex].insert);
                 return;
               }
               if (event.key === "Escape") {
-                setMentionQuery(null);
+                setMention(null);
                 return;
               }
             }

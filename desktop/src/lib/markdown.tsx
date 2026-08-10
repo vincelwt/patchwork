@@ -8,6 +8,7 @@
 // table has to render as something calm rather than flickering into garbage.
 
 import type { ReactNode } from "react";
+import { TASK_KEY } from "@client/mentions";
 
 // --- blocks -----------------------------------------------------------------
 
@@ -346,6 +347,9 @@ export interface InlineOptions {
   /// Handles that resolve to a real member, so `@nobody` stays plain text.
   handles?: Set<string>;
   onMention?: (handle: string) => void;
+  /// Uppercased task keys to task ids, so `PW-999` stays plain text.
+  tasks?: Map<string, string>;
+  onTask?: (taskId: string) => void;
 }
 
 /// Only schemes that can't execute anything. A `javascript:` href in an agent's
@@ -371,6 +375,7 @@ const INLINE = new RegExp(
     "<(https?://[^>\\s]+)>", // autolink
     "(?<![\\w/])(https?://[^\\s<>()\\[\\]]+[^\\s<>()\\[\\].,;:!?'\"])", // bare url
     "@([a-z0-9][\\w-]*)", // mention
+    TASK_KEY.source, // task mention: PW-42
   ].join("|"),
   "gi",
 );
@@ -423,6 +428,7 @@ export function renderInline(
       autolink,
       bareUrl,
       mention,
+      taskKey,
     ] = match;
 
     if (code !== undefined) {
@@ -482,6 +488,26 @@ export function renderInline(
           </span>
         ) : (
           <span key={k}>@{mention}</span>
+        ),
+      );
+    } else if (taskKey !== undefined) {
+      // Every surface writes the key the same way, so recognising it here makes
+      // a task someone typed and a task an agent cited the same live reference.
+      const taskId = options.tasks?.get(taskKey.toUpperCase());
+      push(
+        taskId ? (
+          <span
+            key={k}
+            className="mention task"
+            onClick={(event) => {
+              event.stopPropagation();
+              options.onTask?.(taskId);
+            }}
+          >
+            {taskKey.toUpperCase()}
+          </span>
+        ) : (
+          <span key={k}>{taskKey}</span>
         ),
       );
     }

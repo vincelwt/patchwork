@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 
+import { matchTasks } from "@client/mentions";
 import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
@@ -42,14 +43,30 @@ export function Composer({
   const typingAt = useRef(0);
   const input = useRef<TextInput>(null);
   const members = workspace.bootstrap?.members ?? [];
+  const tasks = workspace.bootstrap?.tasks ?? [];
+  // `@` brings a teammate in, `#` points at a task. A task mention is its key,
+  // the same reference every other surface writes.
   const mention = useMemo(() => {
-    const match = text.match(/(?:^|\s)@([\w-]*)$/);
+    const match = text.match(/(?:^|\s)([@#])([\w-]*)$/);
     if (!match) return [];
-    const query = match[1].toLowerCase();
+    const query = match[2].toLowerCase();
+    if (match[1] === "#")
+      return matchTasks(tasks, query, 5).map((task) => ({
+        id: task.id,
+        insert: `${task.key} `,
+        name: task.title,
+        sub: task.key,
+      }));
     return members
       .filter((member) => member.handle.toLowerCase().startsWith(query))
-      .slice(0, 5);
-  }, [members, text]);
+      .slice(0, 5)
+      .map((member) => ({
+        id: member.id,
+        insert: `@${member.handle} `,
+        name: member.display_name,
+        sub: `@${member.handle}`,
+      }));
+  }, [members, tasks, text]);
   const dictation = useDictation((value) => store.setDraft(draftKey, value));
   const offline = workspace.connection !== "live";
   const empty = !text.trim() && images.pending.length === 0;
@@ -67,8 +84,8 @@ export function Composer({
     }
   };
 
-  const insertMention = (handle: string) => {
-    change(text.replace(/@[\w-]*$/, `@${handle} `));
+  const insertMention = (insert: string) => {
+    change(text.replace(/[@#][\w-]*$/, insert));
   };
 
   const send = async () => {
@@ -103,10 +120,10 @@ export function Composer({
       <View style={[styles.wrap, { backgroundColor: theme.bg, borderTopColor: theme.line }]}>
         {mention.length ? (
           <View style={[styles.mentions, { backgroundColor: theme.raised, borderColor: theme.line }]}>
-            {mention.map((member) => (
-              <Pressable accessibilityRole="button" key={member.id} onPress={() => insertMention(member.handle)} style={styles.mentionRow}>
-                <Text style={{ color: theme.text, fontWeight: "600" }}>{member.display_name}</Text>
-                <Text style={{ color: theme.muted }}>@{member.handle}</Text>
+            {mention.map((candidate) => (
+              <Pressable accessibilityRole="button" key={candidate.id} onPress={() => insertMention(candidate.insert)} style={styles.mentionRow}>
+                <Text numberOfLines={1} style={{ color: theme.text, flexShrink: 1, fontWeight: "600" }}>{candidate.name}</Text>
+                <Text style={{ color: theme.muted }}>{candidate.sub}</Text>
               </Pressable>
             ))}
           </View>
