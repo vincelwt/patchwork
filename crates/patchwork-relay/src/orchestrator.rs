@@ -874,7 +874,12 @@ fn peer_line(members: &[Member], run: &Run) -> String {
 
 /// Tell everyone else on this task that the company changed. It arrives as a
 /// queued turn in their existing session, so nobody is interrupted mid-edit.
-async fn tell_task_peers(state: &Shared, task_id: &str, except_run_id: &str, body: String) {
+pub(crate) async fn tell_task_peers(
+    state: &Shared,
+    task_id: &str,
+    except_run_id: &str,
+    body: String,
+) {
     let peers = match task_peers(state, task_id, except_run_id) {
         Ok(peers) => peers,
         Err(err) => {

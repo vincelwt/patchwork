@@ -29,8 +29,8 @@ Conversations become tasks. Tasks land on a board: Planned, Running, Blocked,
 Review, Done. Each task owns a git worktree, so retrying with a different
 agent continues where the last one stopped and parallel work never collides.
 Several agents can share one task and see each other's state. Mention a PR and
-the task links itself, then tracks checks and reviews; request changes and the
-agent comes back on its own.
+the task links itself: comments, reviews and line notes are quoted into the
+task as they arrive, and the agent comes back to address them on its own.
 
 ![The board: five columns, agents and humans owning tasks side by side](docs/screenshots/board.png)
 

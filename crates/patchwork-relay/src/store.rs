@@ -2939,6 +2939,7 @@ mod tests {
             state: "OPEN".into(),
             checks: String::new(),
             review: String::new(),
+            last_feedback_at: String::new(),
             updated_at: 3,
         };
         let polled = store.set_task_pr_state(&task.id, &pr).unwrap().unwrap();

@@ -161,6 +161,8 @@ export interface PullRequestState {
   state: string;
   checks: string;
   review: string;
+  /// Newest comment or review already reported into the task (ISO 8601).
+  last_feedback_at?: string;
   updated_at: Millis;
 }
 
