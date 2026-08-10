@@ -136,6 +136,7 @@ function actionIcon(kind: NextAction["kind"]) {
 /// The default owner: the agent you gave work to last, because a workspace with
 /// one working agent should not make you pick it every single time.
 const LAST_OWNER = "patchwork.lastTaskOwner";
+const LAST_AGENT = "patchwork.lastTaskAgent";
 const COLLAPSED_STATUSES = "patchwork.collapsedTaskStatuses";
 const LEGACY_DONE_COLLAPSED = "patchwork.tasksDoneCollapsed";
 const TASK_DRAFT_PREFIX = "patchwork.taskDraft.";
@@ -165,6 +166,22 @@ function suggestedOwner(members: Member[], me?: Member): string {
     return remembered;
   }
   return me?.id ?? "";
+}
+
+/// Handing a task over is always to an agent, so the box opens on the agent
+/// you used last — never on the person who is trying to hand it away.
+function suggestedAgent(members: Member[], fallback?: string | null): string {
+  const agents = members.filter((member) => member.kind === "agent");
+  const remembered = localStorage.getItem(LAST_AGENT);
+  if (remembered && agents.some((agent) => agent.id === remembered)) return remembered;
+  if (fallback && agents.some((agent) => agent.id === fallback)) return fallback;
+  return agents[0]?.id ?? fallback ?? "";
+}
+
+function rememberOwner(members: Member[], owner: string) {
+  localStorage.setItem(LAST_OWNER, owner);
+  const chosen = members.find((member) => member.id === owner);
+  if (chosen?.kind === "agent") localStorage.setItem(LAST_AGENT, owner);
 }
 
 // --- board ------------------------------------------------------------------
@@ -685,7 +702,7 @@ export function NewTaskModal({
     setBusy(true);
     setError("");
     try {
-      localStorage.setItem(LAST_OWNER, owner);
+      rememberOwner(app.members, owner);
       // Uploaded before the task exists, then handed over on create: the relay
       // writes the request message with its screenshots already attached, so
       // the agent's first read is the whole question rather than half of it.
@@ -925,9 +942,7 @@ function TaskFiles({ taskId, channelId }: { taskId: Id; channelId: Id }) {
 export function AssignModal({ task, onClose }: { task: Task; onClose: () => void }) {
   const app = useApp();
   const api = useApi();
-  const [owner, setOwner] = useState(
-    task.owner_id || suggestedOwner(app.members, app.me),
-  );
+  const [owner, setOwner] = useState(() => suggestedAgent(app.members, task.owner_id));
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -940,7 +955,7 @@ export function AssignModal({ task, onClose }: { task: Task; onClose: () => void
     setError("");
     try {
       if (owner !== task.owner_id) {
-        localStorage.setItem(LAST_OWNER, owner);
+        rememberOwner(app.members, owner);
         await api.updateTask(task.id, { owner_id: owner });
       }
       if (andStart && isAgent) {
@@ -1307,6 +1322,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
           value={task.outcome}
           placeholder="What has to be true when this is done?"
           multiline
+          clamp
           title="Click to describe the expected result"
           onCommit={(outcome) => void api.updateTask(task.id, { outcome })}
         />

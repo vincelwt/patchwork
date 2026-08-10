@@ -557,6 +557,7 @@ export function EditableText({
   placeholder = "Untitled",
   className = "",
   multiline,
+  clamp,
   title = "Click to edit",
 }: {
   value: string;
@@ -564,11 +565,22 @@ export function EditableText({
   placeholder?: string;
   className?: string;
   multiline?: boolean;
+  /// Show only the first few lines until the reader asks for the rest.
+  clamp?: boolean;
   title?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
+  const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
   const input = useRef<HTMLTextAreaElement | HTMLInputElement>(null);
+  const display = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const element = display.current;
+    if (!element || expanded) return;
+    setOverflowing(element.scrollHeight > element.clientHeight + 1);
+  }, [value, editing, expanded]);
 
   useEffect(() => {
     if (!editing) setDraft(value);
@@ -589,14 +601,26 @@ export function EditableText({
   };
 
   if (!editing) {
-    return (
+    const shown = (
       <button
-        className={`editable ${className}`.trim()}
+        ref={display}
+        className={`editable ${className}${clamp && !expanded ? " clamped" : ""}`.trim()}
         title={title}
         onClick={() => setEditing(true)}
       >
         {value || <span className="placeholder">{placeholder}</span>}
       </button>
+    );
+    if (!clamp) return shown;
+    return (
+      <>
+        {shown}
+        {(overflowing || expanded) && (
+          <button className="editable-more" onClick={() => setExpanded(!expanded)}>
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        )}
+      </>
     );
   }
 
@@ -622,7 +646,7 @@ export function EditableText({
       {...proseText}
       {...shared}
       ref={input as React.RefObject<HTMLTextAreaElement>}
-      rows={2}
+      rows={Math.min(14, Math.max(2, draft.split("\n").length + 1))}
     />
   ) : (
     <input
