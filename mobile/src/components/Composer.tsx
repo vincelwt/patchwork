@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -10,7 +10,7 @@ import {
   View,
 } from "react-native";
 
-import type { Id } from "@client/types";
+import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -21,11 +21,15 @@ export function Composer({
   parentId,
   taskId,
   placeholder = "Message the workspace",
+  replyTo,
+  onCancelReply,
 }: {
   channelId: Id;
   parentId?: Id;
   taskId?: Id;
   placeholder?: string;
+  replyTo?: Message;
+  onCancelReply?: () => void;
 }) {
   const theme = useTheme();
   const workspace = useWorkspace();
@@ -36,6 +40,7 @@ export function Composer({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const typingAt = useRef(0);
+  const input = useRef<TextInput>(null);
   const members = workspace.bootstrap?.members ?? [];
   const mention = useMemo(() => {
     const match = text.match(/(?:^|\s)@([\w-]*)$/);
@@ -48,6 +53,10 @@ export function Composer({
   const dictation = useDictation((value) => store.setDraft(draftKey, value));
   const offline = workspace.connection !== "live";
   const empty = !text.trim() && images.pending.length === 0;
+
+  useEffect(() => {
+    if (replyTo) input.current?.focus();
+  }, [replyTo?.id]);
 
   const change = (value: string) => {
     store.setDraft(draftKey, value);
@@ -72,12 +81,14 @@ export function Composer({
           api.send(channelId, {
             body: text.trim(),
             parent_id: parentId,
+            reply_to_id: replyTo?.id,
             attachment_ids: images.pending.map((item) => item.attachment.id),
           }),
         false,
       );
       store.setDraft(draftKey, "");
       images.clear();
+      onCancelReply?.();
       if (parentId) await store.loadThread(parentId);
       else await store.loadMessages(channelId);
     } catch (caught) {
@@ -100,9 +111,32 @@ export function Composer({
             ))}
           </View>
         ) : null}
+        {replyTo ? (
+          <View style={styles.reply}>
+            <Text style={[styles.replyLabel, { color: theme.muted }]}>
+              Replying to{" "}
+              {members.find((member) => member.id === replyTo.author_id)?.display_name ??
+                "Unknown"}
+            </Text>
+            <Text numberOfLines={1} style={[styles.replyPreview, { color: theme.faint }]}>
+              {replyTo.body.trim() ||
+                (replyTo.card ? replyTo.card.type.replaceAll("_", " ") : "Attachment")}
+            </Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Cancel reply"
+              onPress={onCancelReply}
+              hitSlop={8}
+              style={styles.replyClose}
+            >
+              <Text style={{ color: theme.muted, fontSize: 20 }}>×</Text>
+            </Pressable>
+          </View>
+        ) : null}
         <PendingImages images={images.pending} onRemove={images.remove} />
         <View style={[styles.composer, { backgroundColor: theme.input, borderColor: theme.line }]}>
           <TextInput
+            ref={input}
             accessibilityLabel={placeholder}
             multiline
             maxLength={32_000}
@@ -159,6 +193,10 @@ const styles = StyleSheet.create({
   wrap: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 8 },
   mentions: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 10, marginBottom: 6, overflow: "hidden" },
   mentionRow: { minHeight: 44, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 8 },
+  reply: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 32, paddingHorizontal: 4 },
+  replyLabel: { fontSize: 12, fontWeight: "600" },
+  replyPreview: { flex: 1, fontSize: 12 },
+  replyClose: { width: 28, height: 28, alignItems: "center", justifyContent: "center" },
   composer: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 14, padding: 8 },
   input: { minHeight: 38, maxHeight: 150, fontSize: 16, lineHeight: 22, paddingHorizontal: 4, paddingTop: 4, textAlignVertical: "top" },
   actions: { flexDirection: "row", alignItems: "center", marginTop: 4, gap: 4 },

@@ -30,9 +30,11 @@ export function Conversation({ channelId }: { channelId: Id }) {
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
   const messages = workspace.messages[channelId] ?? [];
   const [refreshing, setRefreshing] = useState(false);
+  const [replyTo, setReplyTo] = useState<Message>();
   const anchor = useBottomAnchoredList<Message>(channelId, messages.length);
 
   useEffect(() => {
+    setReplyTo(undefined);
     void store.loadMessages(channelId);
   }, [channelId, store]);
 
@@ -58,7 +60,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
                 <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
               </View>
             ) : null}
-            <MessageRow message={item} />
+            <MessageRow message={item} onReply={setReplyTo} />
           </View>
         )}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
@@ -82,18 +84,38 @@ export function Conversation({ channelId }: { channelId: Id }) {
         windowSize={9}
       />
       <TypingLine channelId={channelId} />
-      <Composer channelId={channelId} taskId={channel.task_id} />
+      <Composer
+        channelId={channelId}
+        taskId={channel.task_id}
+        replyTo={replyTo}
+        onCancelReply={() => setReplyTo(undefined)}
+      />
     </View>
   );
 }
 
-export const MessageRow = memo(function MessageRow({ message, inThread }: { message: Message; inThread?: boolean }) {
+export const MessageRow = memo(function MessageRow({
+  message,
+  inThread,
+  onReply,
+}: {
+  message: Message;
+  inThread?: boolean;
+  onReply?: (message: Message) => void;
+}) {
   const theme = useTheme();
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [reactions, setReactions] = useState(false);
   const author = workspace.bootstrap?.members.find((member) => member.id === message.author_id);
+  const replyTo = message.reply_to_id
+    ? workspace.messages[message.channel_id]?.find((item) => item.id === message.reply_to_id)
+    : undefined;
+  const repliedMessage = replyTo ?? message.reply_to;
+  const replyAuthor = repliedMessage
+    ? workspace.bootstrap?.members.find((member) => member.id === repliedMessage.author_id)
+    : undefined;
   const run = message.run_id
     ? workspace.runDetails[message.run_id]?.run ?? workspace.bootstrap?.active_runs.find((item) => item.id === message.run_id)
     : undefined;
@@ -122,6 +144,22 @@ export const MessageRow = memo(function MessageRow({ message, inThread }: { mess
           <Text style={[styles.time, { color: theme.faint }]}>{timeOfDay(message.created_at)}</Text>
         </View>
         {run ? <RunLine run={run} /> : null}
+        {message.reply_to_id ? (
+          <View style={styles.replyReference}>
+            <Text style={{ color: theme.faint }}>↩</Text>
+            <Text style={[styles.replyAuthor, { color: theme.muted }]}>
+              {repliedMessage ? replyAuthor?.display_name ?? "Unknown" : "Earlier message"}
+            </Text>
+            {repliedMessage ? (
+              <Text numberOfLines={1} style={[styles.replyPreview, { color: theme.faint }]}>
+                {repliedMessage.body.trim() ||
+                  (repliedMessage.card
+                    ? repliedMessage.card.type.replaceAll("_", " ")
+                    : "Attachment")}
+              </Text>
+            ) : null}
+          </View>
+        ) : null}
         {message.body ? <Markdown body={message.body} /> : null}
         {message.card ? <CardView card={message.card} /> : null}
         {message.attachments.map((attachment) => <AttachmentView key={attachment.id} attachment={attachment} />)}
@@ -144,10 +182,29 @@ export const MessageRow = memo(function MessageRow({ message, inThread }: { mess
           <Pressable accessibilityRole="button" onPress={() => setReactions(true)} hitSlop={8} style={styles.messageAction}>
             <Text style={{ color: theme.accent }}>React</Text>
           </Pressable>
+          {onReply ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Reply"
+              onPress={() => onReply(message)}
+              hitSlop={8}
+              style={styles.messageAction}
+            >
+              <Text style={{ color: theme.accent }}>Reply</Text>
+            </Pressable>
+          ) : null}
           {!inThread ? (
-            <Pressable accessibilityRole="button" onPress={() => router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } })} hitSlop={8} style={styles.messageAction}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open thread"
+              onPress={() => router.push({ pathname: "/(app)/threads/[messageId]", params: { messageId: message.id } })}
+              hitSlop={8}
+              style={styles.messageAction}
+            >
               <Text style={{ color: theme.accent }}>
-                {message.reply_count ? `${message.reply_count} ${message.reply_count === 1 ? "reply" : "replies"}` : "Reply"}
+                {message.reply_count
+                  ? `${message.reply_count} ${message.reply_count === 1 ? "thread reply" : "thread replies"}`
+                  : "Thread"}
               </Text>
             </Pressable>
           ) : null}
@@ -245,6 +302,9 @@ const styles = StyleSheet.create({
   time: { fontSize: 11 },
   activity: { flexDirection: "row", gap: 8, paddingHorizontal: 20, paddingVertical: 7 },
   activityText: { flex: 1, fontSize: 13, lineHeight: 18 },
+  replyReference: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0, marginBottom: 3 },
+  replyAuthor: { fontSize: 12, fontWeight: "600" },
+  replyPreview: { flex: 1, fontSize: 12 },
   reactionRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
   reaction: { minHeight: 32, justifyContent: "center", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   messageActions: { flexDirection: "row", gap: 18, marginTop: 2 },

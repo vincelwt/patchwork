@@ -18,7 +18,7 @@ use patchwork_core::{new_id, now_ms, Id, Millis};
 use serde_json::json;
 
 use crate::auth;
-use crate::state::Shared;
+use crate::state::{RunDestination, Shared};
 use crate::store::{InsertTaskResult, Store};
 
 /// How much conversation an agent gets by default. Deeper history stays
@@ -75,17 +75,34 @@ async fn post_message_inner(
     let mentions = parse_mentions(&input.body, &members);
 
     let task_id = channel.task_id.clone();
+    let kind = input.kind.unwrap_or(MessageKind::Text);
+    let run_id = options.run_id.clone().or(input.run_id.clone());
+    let destination =
+        if input.reply_to_id.is_none() && input.parent_id.is_none() && kind == MessageKind::Text {
+            match options
+                .run_id
+                .as_deref()
+                .and_then(|id| state.store.run(id).ok().flatten())
+            {
+                Some(run) if run.channel_id == channel_id => reply_destination(state, &run).await,
+                _ => RunDestination::default(),
+            }
+        } else {
+            RunDestination::default()
+        };
     let mut message = Message {
         id: new_id(),
         channel_id: channel_id.to_string(),
         author_id: author_id.to_string(),
-        kind: input.kind.unwrap_or(MessageKind::Text),
+        kind,
         body: input.body.clone(),
         card: input.card.clone(),
-        parent_id: input.parent_id.clone(),
+        parent_id: input.parent_id.clone().or(destination.parent_id),
+        reply_to_id: input.reply_to_id.clone().or(destination.reply_to_id),
+        reply_to: None,
         reply_count: 0,
         last_reply_at: 0,
-        run_id: options.run_id.clone().or(input.run_id.clone()),
+        run_id,
         task_id,
         mentions: mentions.clone(),
         attachments: Vec::new(),
@@ -155,26 +172,40 @@ async fn follow_through(
 /// triggering message already says which, so nothing has to be carried on the
 /// run itself.
 pub async fn reply_parent(state: &Shared, run: &Run) -> Option<Id> {
-    if let Some(known) = state.run_threads.read().await.get(&run.id) {
+    reply_destination(state, run).await.parent_id
+}
+
+async fn reply_destination(state: &Shared, run: &Run) -> RunDestination {
+    if let Some(known) = state.run_destinations.read().await.get(&run.id) {
         return known.clone();
     }
     let message_id = match &run.trigger {
         RunTrigger::Mention { message_id }
+        | RunTrigger::Reply { message_id }
         | RunTrigger::DirectMessage { message_id }
         | RunTrigger::Ambient { message_id } => message_id,
-        _ => return None,
+        _ => return RunDestination::default(),
     };
-    state.store.message(message_id).ok().flatten()?.parent_id
+    state
+        .store
+        .message(message_id)
+        .ok()
+        .flatten()
+        .map(|message| RunDestination {
+            reply_to_id: message.parent_id.is_none().then_some(message.id),
+            parent_id: message.parent_id,
+        })
+        .unwrap_or_default()
 }
 
-/// Follow the conversation: whatever message just spoke to this run decides
-/// where its next answer goes.
-async fn talk_where(state: &Shared, run_id: &str, message: &Message) {
-    state
-        .run_threads
-        .write()
-        .await
-        .insert(run_id.to_string(), message.parent_id.clone());
+async fn queue_destination(state: &Shared, control_id: &str, message: &Message) {
+    state.control_destinations.write().await.insert(
+        control_id.to_string(),
+        RunDestination {
+            parent_id: message.parent_id.clone(),
+            reply_to_id: message.parent_id.is_none().then_some(message.id.clone()),
+        },
+    );
 }
 
 /// A reply that is still being written: posted on the first delta so the reader
@@ -204,6 +235,7 @@ async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str)
     let Some(channel) = state.store.channel(&run.channel_id)? else {
         return Ok(());
     };
+    let destination = reply_destination(state, &run).await;
 
     let message = Message {
         id: new_id(),
@@ -212,7 +244,9 @@ async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str)
         kind: MessageKind::Text,
         body: body.to_string(),
         card: None,
-        parent_id: reply_parent(state, &run).await,
+        parent_id: destination.parent_id,
+        reply_to_id: destination.reply_to_id,
+        reply_to: None,
         reply_count: 0,
         last_reply_at: 0,
         run_id: Some(run.id.clone()),
@@ -224,12 +258,13 @@ async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str)
         edited_at: None,
     };
     state.store.insert_message(&message)?;
+    let stored = state.store.message(&message.id)?.unwrap_or(message);
     state
         .streaming_messages
         .write()
         .await
-        .insert(run_id.to_string(), message.id.clone());
-    state.emit(Event::MessageCreated { message });
+        .insert(run_id.to_string(), stored.id.clone());
+    state.emit(Event::MessageCreated { message: stored });
     Ok(())
 }
 
@@ -295,19 +330,33 @@ pub fn parse_mentions(body: &str, members: &[Member]) -> Vec<Id> {
 
 /// A threaded message sees its root and replies, never unrelated channel chat.
 fn conversation_messages(store: &Store, message: &Message, limit: usize) -> Result<Vec<Message>> {
-    let Some(parent_id) = &message.parent_id else {
-        return store.recent_messages(&message.channel_id, limit);
+    let mut messages = if let Some(parent_id) = &message.parent_id {
+        let Some(parent) = store.message(parent_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut messages = store.thread(parent_id)?;
+        let keep = limit.saturating_sub(1);
+        if messages.len() > keep {
+            messages.drain(..messages.len() - keep);
+        }
+        if limit > 0 {
+            messages.insert(0, parent);
+        }
+        messages
+    } else {
+        store.recent_messages(&message.channel_id, limit)?
     };
-    let Some(parent) = store.message(parent_id)? else {
-        return Ok(Vec::new());
-    };
-    let mut messages = store.thread(parent_id)?;
-    let keep = limit.saturating_sub(1);
-    if messages.len() > keep {
-        messages.drain(..messages.len() - keep);
-    }
-    if limit > 0 {
-        messages.insert(0, parent);
+
+    // A reply may answer an older message outside the normal context window.
+    if let Some(reply_to_id) = &message.reply_to_id {
+        if limit > 0 && !messages.iter().any(|item| item.id == *reply_to_id) {
+            if let Some(source) = store.message(reply_to_id)? {
+                if messages.len() >= limit {
+                    messages.remove(0);
+                }
+                messages.insert(0, source);
+            }
+        }
     }
     Ok(messages)
 }
@@ -342,6 +391,7 @@ fn continuation_target(state: &Shared, message: &Message, author: &Member) -> Re
     // not an invitation to have your next sentence routed into it.
     let spoke_to = match &run.trigger {
         RunTrigger::Mention { message_id }
+        | RunTrigger::Reply { message_id }
         | RunTrigger::DirectMessage { message_id }
         | RunTrigger::Ambient { message_id } => {
             state.store.message(message_id)?.map(|m| m.author_id)
@@ -450,7 +500,17 @@ async fn notify_inbox(
         }
     }
 
-    if let Some(parent_id) = &message.parent_id {
+    if let Some(reply_to_id) = &message.reply_to_id {
+        if let Some(parent) = state.store.message(reply_to_id)? {
+            push(
+                state,
+                &parent.author_id,
+                InboxKind::Reply,
+                format!("{author_name} replied to your message"),
+                &mut notified,
+            )?;
+        }
+    } else if let Some(parent_id) = &message.parent_id {
         if let Some(parent) = state.store.message(parent_id)? {
             push(
                 state,
@@ -496,11 +556,21 @@ async fn trigger_agents(
         Some(run_id) => state.store.run_depth(run_id)?,
         None => -1,
     };
+    let reply_source = match &message.reply_to_id {
+        Some(id) => state.store.message(id)?,
+        None => None,
+    };
+    let reply_agent = reply_source
+        .as_ref()
+        .and_then(|source| members.iter().find(|member| member.id == source.author_id))
+        .filter(|member| member.kind == MemberKind::Agent)
+        .map(|member| member.id.clone());
 
     // Ownership can change while work is running. Feedback belongs to the
     // task's actual writer first, not whoever currently owns the card.
     if author.kind == MemberKind::Human
         && message.mentions.is_empty()
+        && message.reply_to_id.is_none()
         && channel.kind == ChannelKind::Task
     {
         let active = channel
@@ -511,7 +581,8 @@ async fn trigger_agents(
             .and_then(|id| state.store.run(&id).ok().flatten())
             .filter(|run| !run.status.is_terminal());
         if let Some(active) = active {
-            talk_where(state, &active.id, message).await;
+            let control_id = new_id();
+            queue_destination(state, &control_id, message).await;
             let attachment_ids = message
                 .attachments
                 .iter()
@@ -525,13 +596,14 @@ async fn trigger_agents(
             if let Err(err) = deliver_control(
                 state,
                 &active,
-                new_id(),
+                control_id.clone(),
                 prompt,
                 RunControlMode::Queue,
                 run_files(state, &attachment_ids)?,
             )
             .await
             {
+                state.control_destinations.write().await.remove(&control_id);
                 let _ = post_system(
                     state,
                     &channel.id,
@@ -550,11 +622,16 @@ async fn trigger_agents(
     // reaches an ambient agent as ambient chatter, it decides it has nothing to
     // add, and the reply you were waiting for never comes. The reader is left
     // with a working app that simply ignored them.
-    let continuing = continuation_target(state, message, &author)?;
+    let continuing = if message.reply_to_id.is_none() {
+        continuation_target(state, message, &author)?
+    } else {
+        None
+    };
     // A task is already addressed: its owner is the recipient. Ordinary room
     // chat keeps the narrower recent-reply heuristic.
     let task_owner = if author.kind == MemberKind::Human
         && message.mentions.is_empty()
+        && message.reply_to_id.is_none()
         && channel.kind == ChannelKind::Task
     {
         channel
@@ -588,9 +665,10 @@ async fn trigger_agents(
             .copied()
             .unwrap_or(profile.default_participation);
 
+        let replied_to_agent = reply_agent.as_deref() == Some(agent.id.as_str());
         // Agent-authored messages only ever wake an explicitly mentioned agent,
-        // and only while the chain is still shallow. This is what stops two
-        // agents from talking to each other forever.
+        // and only while the chain is still shallow. Inline reply references on
+        // agent output must not make two active runs answer each other forever.
         if author.kind == MemberKind::Agent {
             if !mentioned || author_depth >= MAX_AGENT_CHAIN_DEPTH {
                 continue;
@@ -598,9 +676,14 @@ async fn trigger_agents(
         }
 
         let owns_task = task_owner.as_deref() == Some(agent.id.as_str());
-        let addressed = mentioned || owns_task || continuing.as_deref() == Some(agent.id.as_str());
+        let addressed = replied_to_agent
+            || mentioned
+            || owns_task
+            || continuing.as_deref() == Some(agent.id.as_str());
 
-        let should_run = if addressed {
+        let should_run = if replied_to_agent {
+            true
+        } else if addressed {
             participation != Participation::Off || in_dm || owns_task
         } else if in_dm {
             profile.dm_enabled
@@ -609,7 +692,8 @@ async fn trigger_agents(
             // room. A direct message is between the people in it, and a task
             // discussion belongs to whoever is on the task — an uninvited agent
             // wandering into either is not helpfulness, it is eavesdropping.
-            participation == Participation::Ambient
+            message.reply_to_id.is_none()
+                && participation == Participation::Ambient
                 && author.kind == MemberKind::Human
                 && channel.kind == ChannelKind::Channel
         };
@@ -617,7 +701,11 @@ async fn trigger_agents(
             continue;
         }
 
-        let trigger = if addressed {
+        let trigger = if replied_to_agent {
+            RunTrigger::Reply {
+                message_id: message.id.clone(),
+            }
+        } else if addressed {
             RunTrigger::Mention {
                 message_id: message.id.clone(),
             }
@@ -634,12 +722,23 @@ async fn trigger_agents(
         // If the agent is already working here, this is a follow-up, not a
         // second agent on the same front.
         if let Some(active) = state.store.agent_active_run(&agent.id, &channel.id)? {
-            talk_where(state, &active.id, message).await;
-            let prompt = format!(
-                "{} just said:\n\n{}",
-                display_name_of(members, &message.author_id),
-                message.body
-            );
+            let control_id = new_id();
+            queue_destination(state, &control_id, message).await;
+            let prompt = if let Some(source) = reply_source.as_ref().filter(|_| replied_to_agent) {
+                format!(
+                    "{} replied to {}'s message:\n\n{}\n\nReply:\n\n{}",
+                    display_name_of(members, &message.author_id),
+                    display_name_of(members, &source.author_id),
+                    source.body,
+                    message.body
+                )
+            } else {
+                format!(
+                    "{} just said:\n\n{}",
+                    display_name_of(members, &message.author_id),
+                    message.body
+                )
+            };
             let attachment_ids = message
                 .attachments
                 .iter()
@@ -648,13 +747,14 @@ async fn trigger_agents(
             if let Err(err) = deliver_control(
                 state,
                 &active,
-                new_id(),
+                control_id.clone(),
                 prompt,
                 RunControlMode::Queue,
                 run_files(state, &attachment_ids)?,
             )
             .await
             {
+                state.control_destinations.write().await.remove(&control_id);
                 tracing::warn!(?err, run = %active.id, "could not steer active run");
                 let _ = post_system(
                     state,
@@ -666,10 +766,26 @@ async fn trigger_agents(
             continue;
         }
 
+        // An explicit reply still invokes its agent when another agent owns the
+        // task's active writer slot. This conversation-only run gets the task
+        // channel context without becoming a second task writer.
+        let another_task_writer = match &channel.task_id {
+            Some(task_id) => state
+                .store
+                .task_runs(task_id)?
+                .into_iter()
+                .any(|run| !run.status.is_terminal() && run.agent_id != agent.id),
+            None => false,
+        };
+        let task_id = if replied_to_agent && another_task_writer {
+            None
+        } else {
+            channel.task_id.clone()
+        };
         let params = StartRunParams {
             agent_id: agent.id.clone(),
             channel_id: channel.id.clone(),
-            task_id: channel.task_id.clone(),
+            task_id,
             prompt: message.body.clone(),
             trigger,
             automation_id: None,
@@ -823,6 +939,8 @@ fn post_control_note(
         body,
         card: None,
         parent_id: None,
+        reply_to_id: None,
+        reply_to: None,
         reply_count: 0,
         last_reply_at: 0,
         run_id: source_run_id.map(str::to_string),
@@ -930,6 +1048,11 @@ pub async fn steer_run(
     } else {
         format!("{sender} sent steering feedback:\n\n{prompt}")
     };
+    state
+        .control_destinations
+        .write()
+        .await
+        .insert(control_id.clone(), RunDestination::default());
     if let Err(err) = deliver_control(
         state,
         &target,
@@ -940,6 +1063,7 @@ pub async fn steer_run(
     )
     .await
     {
+        state.control_destinations.write().await.remove(&control_id);
         if let Some(source) = &source {
             append_run_event(
                 state,
@@ -958,7 +1082,7 @@ pub async fn steer_run(
         format!("Feedback for {target_name}: {summary}")
     };
     let target_channel = run_conversation(state, &target)?;
-    let target_note = post_control_note(
+    post_control_note(
         state,
         &target_channel,
         author_id,
@@ -966,7 +1090,6 @@ pub async fn steer_run(
         note.clone(),
         &input.attachment_ids,
     )?;
-    talk_where(state, &target.id, &target_note).await;
 
     append_run_event(
         state,
@@ -1501,6 +1624,7 @@ async fn build_context(state: &Shared, run: &Run, task: &Option<Task>) -> Result
 
     let messages = match &run.trigger {
         RunTrigger::Mention { message_id }
+        | RunTrigger::Reply { message_id }
         | RunTrigger::DirectMessage { message_id }
         | RunTrigger::Ambient { message_id } => match state.store.message(message_id)? {
             Some(message) => conversation_messages(&state.store, &message, CONTEXT_MESSAGES)?,
@@ -1520,7 +1644,18 @@ async fn build_context(state: &Shared, run: &Run, task: &Option<Task>) -> Result
             }
             let author = display_name_of(&members, &message.author_id);
             let body: String = message.body.chars().take(2000).collect();
-            out.push_str(&format!("- {author}: {body}\n"));
+            let replying_to = message
+                .reply_to_id
+                .as_deref()
+                .and_then(|id| state.store.message(id).ok().flatten())
+                .map(|source| {
+                    format!(
+                        " (replying to {})",
+                        display_name_of(&members, &source.author_id)
+                    )
+                })
+                .unwrap_or_default();
+            out.push_str(&format!("- {author}{replying_to}: {body}\n"));
         }
     }
 
@@ -1581,6 +1716,23 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         } => {
             if !run_belongs_to_host(state, &run_id, host_id)? {
                 return Ok(());
+            }
+            match control_state {
+                RunControlState::Started => {
+                    if let Some(destination) =
+                        state.control_destinations.write().await.remove(&control_id)
+                    {
+                        state
+                            .run_destinations
+                            .write()
+                            .await
+                            .insert(run_id.clone(), destination);
+                    }
+                }
+                RunControlState::Rejected => {
+                    state.control_destinations.write().await.remove(&control_id);
+                }
+                RunControlState::Queued => {}
             }
             let label = match control_state {
                 RunControlState::Queued => "Steering queued",
@@ -1756,6 +1908,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 }
             }
 
+            let destination = reply_destination(state, &run).await;
             post_message(
                 state,
                 &run.channel_id,
@@ -1763,7 +1916,8 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 SendMessage {
                     body,
                     kind: Some(kind),
-                    parent_id: reply_parent(state, &run).await,
+                    parent_id: destination.parent_id,
+                    reply_to_id: destination.reply_to_id,
                     ..Default::default()
                 },
                 PostOptions {
@@ -2034,7 +2188,7 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
     // that is the honest record — but nothing may rewrite it after this.
     finish_streamed_reply(state, &run.id).await?;
-    state.run_threads.write().await.remove(&run.id);
+    state.run_destinations.write().await.remove(&run.id);
 
     if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
         let mut automation_run = automation_run;
@@ -3054,6 +3208,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn replying_to_an_agent_always_invokes_only_that_agent() {
+        let path = std::env::temp_dir().join(format!("patchwork-reply-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        let human = member("human", "vince", MemberKind::Human);
+        let mut target = member("target", "target", MemberKind::Agent);
+        target.agent.as_mut().unwrap().default_participation = Participation::Off;
+        let mut ambient = member("ambient", "ambient", MemberKind::Agent);
+        ambient.agent.as_mut().unwrap().default_participation = Participation::Ambient;
+        for member in [&human, &target, &ambient] {
+            store.insert_member(member).unwrap();
+        }
+        let members = [human, target, ambient];
+        let channel = Channel {
+            id: "channel".into(),
+            kind: ChannelKind::Channel,
+            section_id: None,
+            slug: "general".into(),
+            name: "General".into(),
+            topic: String::new(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: Vec::new(),
+            task_id: None,
+            last_message_at: 0,
+        };
+        store.insert_channel(&channel).unwrap();
+        let mut source = message_at("source", "target", 1, None);
+        source.channel_id = channel.id.clone();
+        source.body = "Original answer".into();
+        let mut reply = message_at("reply", "human", 2, None);
+        reply.channel_id = channel.id.clone();
+        reply.reply_to_id = Some(source.id.clone());
+        store.insert_message(&source).unwrap();
+        store.insert_message(&reply).unwrap();
+
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx });
+
+        trigger_agents(&state, &reply, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected a run to start");
+        };
+        assert_eq!(spec.agent_id, "target");
+        let run = store.run(&spec.run_id).unwrap().unwrap();
+        assert!(matches!(run.trigger, RunTrigger::Reply { .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "ambient agents must not join a direct reply"
+        );
+
+        let mut followup = message_at("followup", "human", 3, None);
+        followup.channel_id = channel.id.clone();
+        followup.body = "That makes sense".into();
+        followup.reply_to_id = Some(source.id.clone());
+        store.insert_message(&followup).unwrap();
+        trigger_agents(&state, &followup, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::FollowUp {
+            control_id, prompt, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected a follow-up");
+        };
+        assert_eq!(
+            prompt,
+            "vince replied to target's message:\n\nOriginal answer\n\nReply:\n\nThat makes sense"
+        );
+        assert_eq!(
+            reply_destination(&state, &run).await.reply_to_id.as_deref(),
+            Some("reply"),
+            "queued feedback must not move the answer still being written"
+        );
+        handle_host_message_inner(
+            &state,
+            "relay",
+            HostToRelay::RunControlStatus {
+                run_id: run.id.clone(),
+                control_id,
+                state: RunControlState::Started,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reply_destination(&state, &run).await.reply_to_id.as_deref(),
+            Some("followup")
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn terminal_tasks_must_be_reopened_before_another_run() {
         let mut task = Task {
@@ -3110,6 +3373,8 @@ mod tests {
             body: String::new(),
             card: None,
             parent_id: None,
+            reply_to_id: None,
+            reply_to: None,
             reply_count: 0,
             last_reply_at: 0,
             run_id: run.map(|r| r.to_string()),
@@ -3120,6 +3385,47 @@ mod tests {
             created_at: at,
             edited_at: None,
         }
+    }
+
+    #[test]
+    fn an_old_inline_reply_target_stays_in_agent_context() {
+        let path =
+            std::env::temp_dir().join(format!("patchwork-reply-context-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store
+            .insert_channel(&Channel {
+                id: "c".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "general".into(),
+                name: "General".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 0,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+        let source = message_at("m1", "agent", 1, Some("r1"));
+        let middle = message_at("m2", "other", 2, None);
+        let mut reply = message_at("m3", "vince", 3, None);
+        reply.reply_to_id = Some(source.id.clone());
+        for message in [&source, &middle, &reply] {
+            store.insert_message(message).unwrap();
+        }
+
+        let messages = conversation_messages(&store, &reply, 2).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m3"]
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

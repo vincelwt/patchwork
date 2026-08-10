@@ -246,6 +246,16 @@ pub enum MessageCard {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyPreview {
+    pub id: Id,
+    pub author_id: Id,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<MessageCard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: Id,
     pub channel_id: Id,
@@ -258,6 +268,12 @@ pub struct Message {
     /// Root message of the thread this reply belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Id>,
+    /// Message this top-level reply answers without starting a thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<Id>,
+    /// Small source preview so older replies remain legible outside the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyPreview>,
     #[serde(default)]
     pub reply_count: u32,
     #[serde(default)]
@@ -640,6 +656,7 @@ impl RunStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunTrigger {
     Mention { message_id: Id },
+    Reply { message_id: Id },
     DirectMessage { message_id: Id },
     TaskAssignment { task_id: Id },
     Manual { by: Id },

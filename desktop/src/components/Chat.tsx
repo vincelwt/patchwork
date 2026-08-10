@@ -22,6 +22,7 @@ import {
   MoreIcon,
   PulseIcon,
   ReactIcon,
+  ReplyIcon,
   RunIcon,
   SendIcon,
   Spinner,
@@ -38,9 +39,11 @@ export function ChatView({ channelId }: { channelId: Id }) {
     messages: data.messages[channelId],
   }));
   const [dropped, setDropped] = useState<File[]>([]);
+  const [replyTo, setReplyTo] = useState<Message>();
   const clearDropped = useCallback(() => setDropped([]), []);
 
   useEffect(() => {
+    setReplyTo(undefined);
     void store.loadChannel(channelId);
   }, [channelId]);
 
@@ -51,8 +54,18 @@ export function ChatView({ channelId }: { channelId: Id }) {
     // a requirement invented by the implementation, not by the person holding
     // the file — they are dropping it *into this conversation*.
     <DropZone onFiles={(files) => setDropped(files)}>
-      <Timeline channelId={channelId} messages={messages ?? []} />
-      <Composer channel={channel} incoming={dropped} onConsumed={clearDropped} />
+      <Timeline
+        channelId={channelId}
+        messages={messages ?? []}
+        onReply={setReplyTo}
+      />
+      <Composer
+        channel={channel}
+        incoming={dropped}
+        onConsumed={clearDropped}
+        replyTo={replyTo}
+        onCancelReply={() => setReplyTo(undefined)}
+      />
     </DropZone>
   );
 }
@@ -130,9 +143,11 @@ function groupsWithPrevious(message: Message, previous?: Message): boolean {
 export function Timeline({
   channelId,
   messages,
+  onReply,
 }: {
   channelId: Id;
   messages: Message[];
+  onReply: (message: Message) => void;
 }) {
   const { members, runs, hasMore, sourceMessageId } = useAppSelector((data) => {
     const channel = data.channels.find((candidate) => candidate.id === channelId);
@@ -220,6 +235,10 @@ export function Timeline({
     for (const member of members) map.set(member.id, member);
     return map;
   }, [members]);
+  const messageOf = useMemo(
+    () => new Map(messages.map((message) => [message.id, message])),
+    [messages],
+  );
 
   // A finished run belongs *in* the reply it produced, not on a line of its own
   // above it. Two rows for one thing the agent did is one row too many.
@@ -271,6 +290,14 @@ export function Timeline({
                 handles={handles}
                 run={run}
                 original={message.id === sourceMessageId}
+                replyTo={messageOf.get(message.reply_to_id ?? "")}
+                replyPreview={message.reply_to}
+                replyAuthor={authorOf.get(
+                  messageOf.get(message.reply_to_id ?? "")?.author_id ??
+                    message.reply_to?.author_id ??
+                    "",
+                )}
+                onReply={onReply}
               />
               )}
             </div>
@@ -369,6 +396,10 @@ export const MessageRow = memo(function MessageRow({
   handles,
   run,
   original = false,
+  replyTo,
+  replyPreview,
+  replyAuthor,
+  onReply,
 }: {
   message: Message;
   grouped: boolean;
@@ -378,6 +409,10 @@ export const MessageRow = memo(function MessageRow({
   run?: Run;
   /// The immutable request this task started from.
   original?: boolean;
+  replyTo?: Message;
+  replyPreview?: Message["reply_to"];
+  replyAuthor?: Member;
+  onReply?: (message: Message) => void;
 }) {
   const api = useApi();
   const { inspect } = useNavigation();
@@ -408,6 +443,7 @@ export const MessageRow = memo(function MessageRow({
     void api.react(message.id, emoji);
     setPicker(null);
   };
+  const repliedMessage = replyTo ?? replyPreview;
 
   return (
     <div
@@ -433,6 +469,22 @@ export const MessageRow = memo(function MessageRow({
             <span className="message-time">{timeOfDay(message.created_at)}</span>
             {message.edited_at && <span className="message-time">edited</span>}
             {run && <RunMeta run={run} />}
+          </div>
+        )}
+        {message.reply_to_id && (
+          <div className="reply-reference">
+            <ReplyIcon size={13} />
+            <span className="name">
+              {repliedMessage ? replyAuthor?.display_name ?? "Unknown" : "Earlier message"}
+            </span>
+            {repliedMessage && (
+              <span className="preview">
+                {repliedMessage.body.trim() ||
+                  (repliedMessage.card
+                    ? repliedMessage.card.type.replaceAll("_", " ")
+                    : "Attachment")}
+              </span>
+            )}
           </div>
         )}
         {message.body && (
@@ -480,6 +532,16 @@ export const MessageRow = memo(function MessageRow({
         >
           <ReactIcon size={16} />
         </button>
+        {onReply && (
+          <button
+            className="icon-button small"
+            title="Reply"
+            aria-label="Reply"
+            onClick={() => onReply(message)}
+          >
+            <ReplyIcon size={16} />
+          </button>
+        )}
         <button
           className="icon-button small"
           title="Reply in thread"
@@ -758,6 +820,8 @@ interface ComposerProps {
   /// Files dropped anywhere in the conversation, not just on the text box.
   incoming?: File[];
   onConsumed?: () => void;
+  replyTo?: Message;
+  onCancelReply?: () => void;
 }
 
 /// Drafts belong to one workspace, channel and optional thread. Attachments
@@ -783,6 +847,8 @@ function ComposerBox({
   placeholder,
   incoming,
   onConsumed,
+  replyTo,
+  onCancelReply,
 }: ComposerProps & { draftKey: string }) {
   const api = useApi();
   const { members, me } = useAppSelector((data) => ({
@@ -803,6 +869,10 @@ function ComposerBox({
     element.style.height = "auto";
     element.style.height = `${Math.min(element.scrollHeight, 240)}px`;
   }, [text]);
+
+  useEffect(() => {
+    if (replyTo) box.current?.focus();
+  }, [replyTo?.id]);
 
   // Typing, dictation and mention completion all update this same value.
   useEffect(() => {
@@ -834,10 +904,12 @@ function ComposerBox({
       await api.send(channel.id, {
         body: text.trim(),
         parent_id: parentId,
+        reply_to_id: replyTo?.id,
         attachment_ids: files.pending.map((attachment) => attachment.id),
       } as never);
       setText("");
       files.clear();
+      onCancelReply?.();
     } finally {
       setBusy(false);
     }
@@ -928,6 +1000,28 @@ function ComposerBox({
       )}
 
       <div className="composer">
+        {replyTo && (
+          <div className="composer-reply">
+            <ReplyIcon size={14} />
+            <span className="label">
+              Replying to{" "}
+              {members.find((member) => member.id === replyTo.author_id)?.display_name ??
+                "Unknown"}
+            </span>
+            <span className="preview">
+              {replyTo.body.trim() ||
+                (replyTo.card ? replyTo.card.type.replaceAll("_", " ") : "Attachment")}
+            </span>
+            <button
+              className="icon-button small"
+              title="Cancel reply"
+              aria-label="Cancel reply"
+              onClick={onCancelReply}
+            >
+              <CloseIcon size={13} />
+            </button>
+          </div>
+        )}
         {files.strip}
         <textarea
           ref={box}
