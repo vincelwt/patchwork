@@ -893,6 +893,7 @@ body.resizing {
   overflow: hidden;
   border: 1px solid var(--line);
   line-height: 0;
+  cursor: zoom-in;
 }
 .image-attachment img {
   max-width: 100%;
@@ -2154,6 +2155,7 @@ details.run-thought > summary > svg {
   display: block;
   max-width: 100%;
   border-radius: 10px;
+  cursor: zoom-in;
 }
 .artifact .card-sub,
 .chart .card-sub {
@@ -2633,6 +2635,9 @@ details.run-thought > summary > svg {
   font-weight: 570;
   color: var(--text-muted);
   background: var(--tint);
+  /* Markdown passes its own alignment; a table built from a CSV has none, and
+     a centred header over a left-aligned column reads as a mistake. */
+  text-align: left;
 }
 .md tbody tr:last-child td {
   border-bottom: none;
@@ -3162,12 +3167,17 @@ details.run-thought > summary > svg {
 }
 .review-frame {
   border: 0;
+  /* A standalone HTML document assumes it owns the page, and a page is white
+     until it says otherwise — including in dark mode, where its own dark text
+     would otherwise land on our dark surface. */
+  background: #fff;
 }
 .review-image {
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: auto;
+  cursor: zoom-in;
 }
 .review-image img {
   display: block;
@@ -3184,6 +3194,96 @@ details.run-thought > summary > svg {
   color: var(--text-muted);
   padding: 20px;
   text-align: center;
+}
+
+/* Evidence that is text: rendered where it sits, in the same box an image or
+   a preview would have used. */
+.evidence-view {
+  flex: 1;
+  min-height: 0;
+  width: calc(100% - 28px);
+  margin: 0 14px 14px;
+  padding: 12px 15px;
+  border-radius: 10px;
+  background: var(--surface-sunken);
+  overflow: auto;
+}
+.evidence-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.evidence-note {
+  margin: 10px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* A screenshot over the whole app, because the detail worth reviewing is
+   usually smaller than the thumbnail it arrived as. */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 10, 8, 0.66);
+}
+.lightbox-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.lightbox-bar .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 550;
+  font-size: 13px;
+}
+.lightbox-bar .scale {
+  min-width: 46px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.lightbox-bar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.lightbox-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  padding: 20px;
+}
+.lightbox-stage img {
+  display: block;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+.lightbox-stage img.zoomed {
+  /* A flex item shrinks by default, which would quietly cap every zoom at the
+     width of the window and make the buttons look broken. */
+  flex: none;
+  max-width: none;
+  max-height: none;
+  height: auto;
+  cursor: zoom-out;
 }
 
 .notice {
