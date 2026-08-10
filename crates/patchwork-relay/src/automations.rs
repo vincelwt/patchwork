@@ -138,14 +138,8 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
     };
     for automation in automations.into_iter().filter(|a| a.enabled) {
         let should_fire = match &automation.trigger {
-            AutomationTrigger::TaskStatus { status, project_id } => {
-                let entered =
-                    previous.map(|p| p.status != *status).unwrap_or(true) && task.status == *status;
-                let project_matches = project_id
-                    .as_ref()
-                    .map(|p| task.project_id.as_ref() == Some(p))
-                    .unwrap_or(true);
-                entered && project_matches
+            trigger @ AutomationTrigger::TaskStatus { .. } => {
+                task_status_fires(trigger, task, previous)
             }
             AutomationTrigger::TaskAssigned => {
                 let now_owned = task.owner_id.as_deref() == Some(automation.agent_id.as_str());
@@ -175,7 +169,40 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
         {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
+        // A listener naming one task has nothing left to wait for once it
+        // fires; leaving it enabled is clutter on the automations list.
+        if let AutomationTrigger::TaskStatus {
+            task_id: Some(_), ..
+        } = &automation.trigger
+        {
+            if let Ok(Some(mut latest)) = state.store.automation(&automation.id) {
+                latest.enabled = false;
+                if state.store.upsert_automation(&latest).is_ok() {
+                    state.emit(Event::AutomationUpdated { automation: latest });
+                }
+            }
+        }
     }
+}
+
+/// Does this task change satisfy a task-status trigger? Status has to be
+/// *entered*, and a trigger naming a project or a task only watches that one.
+fn task_status_fires(trigger: &AutomationTrigger, task: &Task, previous: Option<&Task>) -> bool {
+    let AutomationTrigger::TaskStatus {
+        status,
+        project_id,
+        task_id,
+    } = trigger
+    else {
+        return false;
+    };
+    let entered = previous.map(|p| p.status != *status).unwrap_or(true) && task.status == *status;
+    let project_matches = project_id
+        .as_ref()
+        .map(|p| task.project_id.as_ref() == Some(p))
+        .unwrap_or(true);
+    let task_matches = task_id.as_ref().map(|id| *id == task.id).unwrap_or(true);
+    entered && project_matches && task_matches
 }
 
 pub async fn on_pull_request(state: &Shared, task: &Task, kind: &str, detail: &str) {
@@ -950,6 +977,55 @@ mod tests {
         };
         assert_eq!(next_due_after(&watch, 1_000), Some(61_000));
         assert_eq!(next_due_after(&AutomationTrigger::Manual, 1_000), None);
+    }
+
+    #[test]
+    fn a_task_scoped_listener_only_wakes_for_its_own_task() {
+        let mut task = Task {
+            id: "mine".into(),
+            key: "PW-1".into(),
+            title: "Produce result".into(),
+            outcome: "The result exists".into(),
+            status: TaskStatus::Running,
+            owner_id: None,
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: "c".into(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: None,
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "agent".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 0,
+            updated_at: 0,
+            position: 0.0,
+        };
+        let previous = task.clone();
+        let mine = AutomationTrigger::TaskStatus {
+            status: TaskStatus::Done,
+            project_id: None,
+            task_id: Some("mine".into()),
+        };
+        let anyones = AutomationTrigger::TaskStatus {
+            status: TaskStatus::Done,
+            project_id: None,
+            task_id: None,
+        };
+
+        assert!(!task_status_fires(&mine, &task, Some(&previous)));
+        task.status = TaskStatus::Done;
+        assert!(task_status_fires(&mine, &task, Some(&previous)));
+        // Already done before the change: entered, not sitting there.
+        assert!(!task_status_fires(&mine, &task, Some(&task.clone())));
+
+        task.id = "someone else's".into();
+        assert!(!task_status_fires(&mine, &task, Some(&previous)));
+        assert!(task_status_fires(&anyones, &task, Some(&previous)));
     }
 
     #[test]

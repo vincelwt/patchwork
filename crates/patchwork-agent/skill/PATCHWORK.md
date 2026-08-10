@@ -135,30 +135,20 @@ done. The triggering request, context, plan, investigation, progress, result,
 and evidence belong in the discussion or attachments, not in the outcome.
 Change the outcome only when the agreed definition of done changes.
 
-Create it before you start, not after. Anything that will leave something
-durable behind, an edit, a file, a deployment, a decision written down, gets
-its task before your first change. A message that reads like a go-ahead is the
-moment to create the task, not a reason to skip it: the card is how anyone sees
-the work while it is happening, and a card written afterwards is a receipt.
-Work that begins and ends inside the conversation, an answer, a lookup, a quick
-read of a file, needs no task.
-
-A conversation is where work is asked for and talked about, never where it is
-done, and a direct message least of all: it is one person's private room, it
-has no board, no status, no worktree, and nobody else can see what you are
-doing in it. Being asked in a DM does not make the work private, and no amount
-of go-ahead turns that room into a place to build. Answer there, then take the
-work somewhere reviewable:
+Create it before you start, not after: anything that leaves something durable
+behind gets its task before the first change, and a message that reads like a
+go-ahead is the moment to create it. A conversation is for talking about work,
+not doing it, so take the work yourself and continue in the task's own run:
 
 ```bash
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @me --start
 ```
 
-`--owner @me` is you: a task you assign to yourself and work on yourself, which
-is the normal way an agent starts building. `--start` begins that task's own
-run in its own worktree, so continue there and let the DM run end with a line
-saying which task took over.
+`--owner @me` is you, and `--start` opens the task's own run and worktree.
+Answer in the conversation, then leave a line saying which task took over.
+Work that begins and ends in the conversation, an answer or a lookup, still
+needs no task.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
@@ -304,6 +294,20 @@ patchwork automation create --name "Failed signups" --agent @dev-agent \
   --action create-task --instructions "Find the cause of what the scan found."
 ```
 
+**Waiting for a task.** `--task` narrows a task-status trigger to one task, so
+you can hand work off, or start it in its own run, and still be woken when it
+lands instead of watching it:
+
+```bash
+patchwork automation create --name "PW-14 follow-up" --agent @me \
+  --trigger task-status --status done --task PW-14 --action post-in-chat \
+  --instructions "Say here what PW-14 changed, and what is left."
+```
+
+It reports back in the conversation you created it from, fires once, and turns
+itself off. Without `--task` the same trigger watches every task in the
+workspace.
+
 **Webhooks.** `POST {url}` with any JSON body; it becomes the trigger payload.
 Add `?once=your-key` and a redelivery of the same event is dropped instead of
 acting twice, so whatever calls it is free to retry.
@@ -343,10 +347,8 @@ so a later run can continue exactly where you stopped. `git` and `gh` work
 normally; commit and open pull requests as you would anywhere else.
 
 A run with no task has no checkout: its working directory is an empty scratch
-folder that nothing keeps and nobody can review. If the work needs the
-repository, create its task first, with `--owner @me --start` to put yourself
-in a real worktree, rather than going looking for a clone on the machine and
-editing it where no task owns it.
+folder that nothing keeps and nobody can review. Work that needs the
+repository needs its task first.
 
 ## Working next to another agent
 

@@ -1847,7 +1847,15 @@ export function AutomationModal({
           include_agents: false,
         };
       case "task_status":
-        return { type: "task_status", status };
+        // A listener scoped to one task keeps its task when edited here.
+        return {
+          type: "task_status",
+          status,
+          task_id:
+            automation?.trigger.type === "task_status"
+              ? automation.trigger.task_id
+              : undefined,
+        };
       case "task_assigned":
         return { type: "task_assigned" };
       case "pull_request":

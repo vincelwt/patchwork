@@ -398,6 +398,10 @@ enum AutomationCommand {
         /// Task status for `--trigger task-status`.
         #[arg(long)]
         status: Option<String>,
+        /// One task to watch, for `--trigger task-status`. Without it, every
+        /// task entering that status fires.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// Everything about one automation, including its last firings.
     Show {
@@ -1744,13 +1748,28 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
             command,
             channel,
             status,
+            task,
         } => {
             let agent_id = resolve_member(client, ctx, &agent).await?;
             let channel_id = match channel {
                 Some(reference) => Some(resolve_channel(client, ctx, Some(reference)).await?),
                 None => ctx.channel_id.clone(),
             };
-            let trigger = build_trigger(&trigger, every, command, channel_id.clone(), status)?;
+            let task_id = match task {
+                Some(reference) => {
+                    let detail: TaskDetail = client.get(&format!("/api/tasks/{reference}")).await?;
+                    Some(detail.task.id)
+                }
+                None => None,
+            };
+            let trigger = build_trigger(
+                &trigger,
+                every,
+                command,
+                channel_id.clone(),
+                status,
+                task_id,
+            )?;
             let action = match action.as_str() {
                 "create-task" => "create_task",
                 "continue-task" => "continue_task",
@@ -1877,6 +1896,7 @@ fn build_trigger(
     command: Option<String>,
     channel_id: Option<String>,
     status: Option<String>,
+    task_id: Option<String>,
 ) -> Result<Value> {
     Ok(match kind {
         "schedule" => json!({
@@ -1896,7 +1916,8 @@ fn build_trigger(
         }),
         "task-status" => json!({
             "type": "task_status",
-            "status": status.unwrap_or_else(|| "review".into())
+            "status": status.unwrap_or_else(|| "review".into()),
+            "task_id": task_id
         }),
         "task-assigned" => json!({ "type": "task_assigned" }),
         "pull-request" => json!({
@@ -1995,19 +2016,37 @@ mod tests {
 
     #[test]
     fn schedule_triggers_need_an_interval() {
-        assert!(build_trigger("schedule", None, None, None, None).is_err());
+        assert!(build_trigger("schedule", None, None, None, None, None).is_err());
         assert_eq!(
-            build_trigger("schedule", Some(3600), None, None, None).unwrap()["every_seconds"],
+            build_trigger("schedule", Some(3600), None, None, None, None).unwrap()["every_seconds"],
             3600
         );
     }
 
     #[test]
     fn watch_triggers_need_a_command_and_default_their_interval() {
-        assert!(build_trigger("watch", Some(60), None, None, None).is_err());
-        assert!(build_trigger("watch", Some(60), Some("  ".into()), None, None).is_err());
-        let watch = build_trigger("watch", None, Some("scan.sh".into()), None, None).unwrap();
+        assert!(build_trigger("watch", Some(60), None, None, None, None).is_err());
+        assert!(build_trigger("watch", Some(60), Some("  ".into()), None, None, None).is_err());
+        let watch = build_trigger("watch", None, Some("scan.sh".into()), None, None, None).unwrap();
         assert_eq!(watch["command"], "scan.sh");
         assert_eq!(watch["every_seconds"], 300);
+    }
+
+    #[test]
+    fn task_status_triggers_can_name_one_task() {
+        let any =
+            build_trigger("task-status", None, None, None, Some("done".into()), None).unwrap();
+        assert_eq!(any["status"], "done");
+        assert!(any["task_id"].is_null());
+        let one = build_trigger(
+            "task-status",
+            None,
+            None,
+            None,
+            Some("done".into()),
+            Some("task-1".into()),
+        )
+        .unwrap();
+        assert_eq!(one["task_id"], "task-1");
     }
 }
