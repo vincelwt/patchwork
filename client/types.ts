@@ -490,6 +490,26 @@ export interface Workspace {
   task_seq: number;
 }
 
+/// The relay's own vital signs. `system` is only filled in for an
+/// authenticated caller: a bare probe gets liveness and nothing about the box.
+export interface Health {
+  ok: boolean;
+  version: string;
+  api: number;
+  started_at: Millis;
+  hosts_online: number;
+  runs_active: number;
+  system?: SystemHealth;
+}
+
+export interface SystemHealth {
+  cpu_percent: number;
+  cpu_count: number;
+  memory_used: number;
+  memory_total: number;
+  process_memory: number;
+}
+
 export interface Device {
   id: Id;
   label: string;

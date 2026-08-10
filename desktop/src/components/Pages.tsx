@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp, useWorkspaces } from "../lib/store";
-import { relative, statusLabel, statusTone } from "../lib/format";
+import { bytes, duration, relative, statusLabel, statusTone } from "../lib/format";
 import {
   desktopBoot,
   desktopInfo,
@@ -37,16 +37,21 @@ import {
   Toggle,
 } from "./ui";
 import {
+  AgentIcon,
+  AppIcon,
   CheckIcon,
   ChevronIcon,
   ExternalIcon,
   FileIcon,
   FolderIcon,
+  MachineIcon,
   MoreIcon,
   PencilIcon,
   PlusIcon,
+  RelayIcon,
   Spinner,
   TrashIcon,
+  WorkspaceIcon,
 } from "./icons";
 import { RuntimeIcon } from "./RuntimeIcon";
 import { PairDeviceModal } from "./PairDeviceModal";
@@ -57,6 +62,7 @@ import type {
   Automation,
   AutomationDebug,
   AutomationRun,
+  Health,
   Host,
   Id,
   Member,
@@ -2237,20 +2243,78 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
 
 // --- settings --------------------------------------------------------------
 
+/// Settings is five unrelated conversations — this workspace, the machines
+/// that run agents, the relay everything hangs off, the built-in agent's keys,
+/// and the app itself. One scroll made you hunt through all five to change one
+/// thing, so each is now a tab that stands on its own.
+const SETTINGS_TABS = [
+  { id: "workspace", label: "Workspace", Icon: WorkspaceIcon },
+  { id: "machines", label: "Machines", Icon: MachineIcon },
+  { id: "relay", label: "Relay", Icon: RelayIcon },
+  // Nothing to hold a key in a browser tab, so nothing to show there.
+  ...(inTauri ? [{ id: "agent", label: "Agent", Icon: AgentIcon }] : []),
+  { id: "app", label: "App", Icon: AppIcon },
+] as const;
+
+type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
+
 export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
+  const app = useApp();
+  const [tab, setTab] = useState<SettingsTab>("workspace");
+  const [info, setInfo] = useState<DesktopInfo>();
+
+  const hostSignature = useHostSignature(app.hosts);
+  useEffect(() => {
+    void desktopInfo().then(setInfo);
+  }, [hostSignature]);
+
+  const relayUrl =
+    info?.settings.workspaces.find(
+      (workspace) => workspace.id === app.workspace?.id,
+    )?.relay_url ?? "";
+
+  return (
+    <Page title="Settings">
+      <div className="segmented settings-tabs">
+        {SETTINGS_TABS.map((option) => (
+          <button
+            key={option.id}
+            className={option.id === tab ? "active" : ""}
+            onClick={() => setTab(option.id)}
+          >
+            <option.Icon size={15} />
+            {option.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "workspace" && <WorkspaceSettings />}
+      {tab === "machines" && <MachineSettings info={info} />}
+      {tab === "relay" && <RelaySettings info={info} relayUrl={relayUrl} />}
+      {tab === "agent" && <ProviderSection />}
+      {tab === "app" && (
+        <AppSettings
+          info={info}
+          onChanged={async () => setInfo(await desktopInfo())}
+          onSignOut={onSignOut}
+        />
+      )}
+    </Page>
+  );
+}
+
+/// Name, mark and task prefix: what every teammate sees, wherever they are.
+function WorkspaceSettings() {
   const app = useApp();
   const api = useApi();
   const workspaces = useWorkspaces();
   const { toast } = useNavigation();
   const iconInput = useRef<HTMLInputElement>(null);
-  const [info, setInfo] = useState<DesktopInfo>();
   const [name, setName] = useState(app.workspace?.name ?? "");
   const [icon, setIcon] = useState(app.workspace?.icon ?? "");
   const [prefix, setPrefix] = useState(app.workspace?.task_prefix ?? "PW");
   const [iconUploading, setIconUploading] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
-  const [updateStatus, setUpdateStatus] = useState("");
 
   useEffect(() => {
     setName(app.workspace?.name ?? "");
@@ -2263,39 +2327,111 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     app.workspace?.task_prefix,
   ]);
 
-  const checkForUpdate = async () => {
-    setUpdateStatus("Checking…");
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (!update) {
-        setUpdateStatus("Patchwork is up to date");
-        return;
-      }
-      setUpdateStatus(`Installing ${update.version}…`);
-      await update.downloadAndInstall();
-      const { relaunch } = await import("@tauri-apps/plugin-process");
-      await relaunch();
-    } catch (err) {
-      setUpdateStatus(String((err as Error).message ?? err));
-    }
-  };
-
-  const hostSignature = useHostSignature(app.hosts);
-  useEffect(() => {
-    void desktopInfo().then((loaded) => {
-      setInfo(loaded);
-      setAwake(loaded.settings.awake ?? "never");
-    });
-  }, [hostSignature]);
-
-  const relayUrl =
-    info?.settings.workspaces.find(
-      (workspace) => workspace.id === app.workspace?.id,
-    )?.relay_url ?? "";
   const currentWorkspace = workspaces.find((workspace) => workspace.active);
   const iconChanged = icon !== (app.workspace?.icon ?? "");
-  const managedRelay = relayUrl.startsWith("https://relay.patchwork.sh/r/");
+
+  return (
+    <Section
+      title="Workspace"
+      action={<span className="section-note">What every teammate sees</span>}
+    >
+      <div className="workspace-icon-editor">
+        <WorkspaceMark
+          name={app.workspace?.name ?? "Workspace"}
+          icon={app.workspace?.icon}
+          image={currentWorkspace?.iconImage}
+          size={42}
+        />
+        <button
+          className="button quiet"
+          disabled={iconUploading}
+          onClick={() => iconInput.current?.click()}
+        >
+          {iconUploading ? "Uploading…" : "Upload PNG or JPEG"}
+        </button>
+        {app.workspace?.icon_image && (
+          <button
+            className="button quiet danger"
+            onClick={() => void api.updateWorkspace({ icon: "" })}
+          >
+            Remove image
+          </button>
+        )}
+        <input
+          ref={iconInput}
+          type="file"
+          hidden
+          accept="image/png,image/jpeg,.png,.jpg,.jpeg"
+          onChange={async (event) => {
+            const file = event.currentTarget.files?.[0];
+            event.currentTarget.value = "";
+            if (!file) return;
+            setIconUploading(true);
+            try {
+              const uploaded = await api.upload(file);
+              await api.updateWorkspace({ icon_file_id: uploaded.id });
+              setIcon("");
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            } finally {
+              setIconUploading(false);
+            }
+          }}
+        />
+      </div>
+      <Field label="Name" value={name} onChange={setName} />
+      <Field
+        label="Emoji"
+        value={icon}
+        onChange={(value) => setIcon([...value].slice(0, 8).join(""))}
+        placeholder="🚀"
+      />
+      <Field
+        label="Task prefix"
+        value={prefix}
+        onChange={(value) => setPrefix(value.toUpperCase().slice(0, 6))}
+        placeholder="PW"
+      />
+      <span className="form-help">
+        The next task will be {prefix.trim() || "PW"}-
+        {(app.workspace?.task_seq ?? 0) + 1}. Keys already handed out keep the
+        prefix they were made with.
+      </span>
+      <button
+        className="button"
+        style={{ marginTop: 10 }}
+        disabled={
+          (!name.trim() || name === app.workspace?.name) &&
+          !iconChanged &&
+          (!prefix.trim() || prefix === app.workspace?.task_prefix)
+        }
+        onClick={async () => {
+          await api.updateWorkspace({
+            name: name.trim() || undefined,
+            icon: iconChanged ? icon.trim() : undefined,
+            task_prefix: prefix.trim() || undefined,
+          });
+          setSaved(true);
+          window.setTimeout(() => setSaved(false), 1800);
+        }}
+      >
+        {saved ? <CheckIcon size={15} /> : null}
+        {saved ? "Saved" : "Save"}
+      </button>
+    </Section>
+  );
+}
+
+/// Every machine, not just this one. An agent installed on the relay is the
+/// whole point of running a relay, and it used to be invisible here because
+/// this section only ever asked the local host what it had.
+function MachineSettings({ info }: { info?: DesktopInfo }) {
+  const app = useApp();
+  const [awakePolicy, setAwake] = useState<AwakePolicy>("never");
+
+  useEffect(() => {
+    setAwake(info?.settings.awake ?? "never");
+  }, [info?.settings.awake]);
 
   // The relay knows about every host. This machine also knows things the relay
   // has not been told yet — its own capabilities before it has registered — so
@@ -2349,195 +2485,287 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
   }
 
   return (
-    <Page title="Settings">
-      <Section title="Workspace">
-        <div className="workspace-icon-editor">
-          <WorkspaceMark
-            name={app.workspace?.name ?? "Workspace"}
-            icon={app.workspace?.icon}
-            image={currentWorkspace?.iconImage}
-            size={42}
-          />
-          <button
-            className="button quiet"
-            disabled={iconUploading}
-            onClick={() => iconInput.current?.click()}
-          >
-            {iconUploading ? "Uploading…" : "Upload PNG or JPEG"}
-          </button>
-          {app.workspace?.icon_image && (
-            <button
-              className="button quiet danger"
-              onClick={() => void api.updateWorkspace({ icon: "" })}
-            >
-              Remove image
-            </button>
-          )}
-          <input
-            ref={iconInput}
-            type="file"
-            hidden
-            accept="image/png,image/jpeg,.png,.jpg,.jpeg"
-            onChange={async (event) => {
-              const file = event.currentTarget.files?.[0];
-              event.currentTarget.value = "";
-              if (!file) return;
-              setIconUploading(true);
-              try {
-                const uploaded = await api.upload(file);
-                await api.updateWorkspace({ icon_file_id: uploaded.id });
-                setIcon("");
-              } catch (err) {
-                toast(String((err as Error).message ?? err));
-              } finally {
-                setIconUploading(false);
-              }
-            }}
-          />
-        </div>
-        <Field label="Name" value={name} onChange={setName} />
-        <Field
-          label="Emoji"
-          value={icon}
-          onChange={(value) => setIcon([...value].slice(0, 8).join(""))}
-          placeholder="🚀"
-        />
-        <Field
-          label="Task prefix"
-          value={prefix}
-          onChange={(value) => setPrefix(value.toUpperCase().slice(0, 6))}
-          placeholder="PW"
-        />
-        <span className="form-help">
-          The next task will be {prefix.trim() || "PW"}-
-          {(app.workspace?.task_seq ?? 0) + 1}. Keys already handed out keep
-          the prefix they were made with.
+    <Section
+      title="Machines and runtimes"
+      action={
+        <span className="section-note">
+          An agent can run anywhere its runtime is installed
         </span>
-        <button
-          className="button"
-          style={{ marginTop: 10 }}
-          disabled={
-            (!name.trim() || name === app.workspace?.name) &&
-            !iconChanged &&
-            (!prefix.trim() || prefix === app.workspace?.task_prefix)
-          }
-          onClick={async () => {
-            await api.updateWorkspace({
-              name: name.trim() || undefined,
-              icon: iconChanged ? icon.trim() : undefined,
-              task_prefix: prefix.trim() || undefined,
-            });
-            setSaved(true);
-            window.setTimeout(() => setSaved(false), 1800);
-          }}
-        >
-          {saved ? <CheckIcon size={15} /> : null}
-          {saved ? "Saved" : "Save"}
-        </button>
-      </Section>
-
-      {/* Every machine, not just this one. An agent installed on the relay is
-          the whole point of running a relay, and it used to be invisible here
-          because this section only ever asked the local host what it had. */}
-      <Section
-        title="Machines and runtimes"
-        action={
-          <span className="section-note">
-            An agent can run anywhere its runtime is installed
-          </span>
-        }
-      >
-        {machines.length === 0 && (
-          <div className="notice">No machine has reported in yet.</div>
-        )}
-        {machines.map((machine) => (
-          <div className="machine" key={machine.id}>
-            <div className="machine-head">
-              <span className={`dot ${machine.online ? "online" : ""}`} />
-              <span className="grow">
-                <span className="name">
-                  {machine.name}
-                  {machine.isThis && <span className="you"> this machine</span>}
-                </span>
-                <span className="sub">
-                  {machine.platform} · {machine.role}
-                  {machine.online ? "" : ` · seen ${relative(machine.lastSeen)}`}
-                  {machine.error ? ` · ${machine.error}` : ""}
-                </span>
+      }
+    >
+      {machines.length === 0 && (
+        <div className="notice">No machine has reported in yet.</div>
+      )}
+      {machines.map((machine) => (
+        <div className="machine" key={machine.id}>
+          <div className="machine-head">
+            <span className={`dot ${machine.online ? "online" : ""}`} />
+            <span className="grow">
+              <span className="name">
+                {machine.name}
+                {machine.isThis && <span className="you"> this machine</span>}
               </span>
-              {machine.hasGh && (
-                <Chip tone={machine.ghAuthed ? "positive" : "caution"}>gh</Chip>
-              )}
-            </div>
-            {machine.runtimes.length === 0 ? (
-              <div className="machine-runtime empty">
-                No agent runtimes detected here
-              </div>
-            ) : (
-              machine.runtimes.map((runtime) => (
-                <div className="machine-runtime" key={runtime.id}>
-                  <RuntimeIcon runtime={runtime.id} />
-                  <span className="grow">
-                    <span className="name">{runtime.label}</span>
-                    <span className="sub">
-                      {runtime.problem ??
-                        runtime.version ??
-                        runtime.command.join(" ")}
-                    </span>
-                  </span>
-                  <Chip tone={runtime.available ? "positive" : "caution"}>
-                    {runtime.available ? "ready" : "unavailable"}
-                  </Chip>
-                </div>
-              ))
-            )}
-
-            {/* Only this machine, because only this machine's sleep is ours to
-                prevent. An agent working here dies when the lid closes. */}
-            {machine.isThis && (
-              <div className="machine-runtime">
-                <span className="grow">
-                  <span className="name">Keep awake</span>
-                  <span className="sub">
-                    Stops this machine sleeping and killing a run part-way
-                  </span>
-                </span>
-                <Dropdown
-                  align="right"
-                  width={210}
-                  value={awakePolicy}
-                  onChange={(value) => {
-                    const policy = value as AwakePolicy;
-                    setAwake(policy);
-                    void setAwakePolicy(policy);
-                  }}
-                  options={[
-                    { value: "never", label: "Never" },
-                    {
-                      value: "while_running",
-                      label: "While an agent is running",
-                      hint: "recommended",
-                    },
-                    { value: "while_open", label: "While Patchwork is open" },
-                  ]}
-                />
-              </div>
+              <span className="sub">
+                {machine.platform} · {machine.role}
+                {machine.online ? "" : ` · seen ${relative(machine.lastSeen)}`}
+                {machine.error ? ` · ${machine.error}` : ""}
+              </span>
+            </span>
+            {machine.hasGh && (
+              <Chip tone={machine.ghAuthed ? "positive" : "caution"}>gh</Chip>
             )}
           </div>
-        ))}
-      </Section>
+          {machine.runtimes.length === 0 ? (
+            <div className="machine-runtime empty">
+              No agent runtimes detected here
+            </div>
+          ) : (
+            machine.runtimes.map((runtime) => (
+              <div className="machine-runtime" key={runtime.id}>
+                <RuntimeIcon runtime={runtime.id} />
+                <span className="grow">
+                  <span className="name">{runtime.label}</span>
+                  <span className="sub">
+                    {runtime.problem ??
+                      runtime.version ??
+                      runtime.command.join(" ")}
+                  </span>
+                </span>
+                <Chip tone={runtime.available ? "positive" : "caution"}>
+                  {runtime.available ? "ready" : "unavailable"}
+                </Chip>
+              </div>
+            ))
+          )}
 
-      {/* Only inside the app: a browser tab has no machine to keep a key on. */}
-      {inTauri && <ProviderSection />}
+          {/* Only this machine, because only this machine's sleep is ours to
+              prevent. An agent working here dies when the lid closes. */}
+          {machine.isThis && (
+            <div className="machine-runtime">
+              <span className="grow">
+                <span className="name">Keep awake</span>
+                <span className="sub">
+                  Stops this machine sleeping and killing a run part-way
+                </span>
+              </span>
+              <Dropdown
+                align="right"
+                width={210}
+                value={awakePolicy}
+                onChange={(value) => {
+                  const policy = value as AwakePolicy;
+                  setAwake(policy);
+                  void setAwakePolicy(policy);
+                }}
+                options={[
+                  { value: "never", label: "Never" },
+                  {
+                    value: "while_running",
+                    label: "While an agent is running",
+                    hint: "recommended",
+                  },
+                  { value: "while_open", label: "While Patchwork is open" },
+                ]}
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </Section>
+  );
+}
 
-      {/* Every workspace this machine has joined stays connected, whichever
-          one the window is showing: an agent working in one of them does not
-          care what you are looking at. */}
+/// The relay's own vital signs, on the page rather than behind a link to a
+/// JSON endpoint. It is the one thing whose failure takes everything else with
+/// it, so "is it up" is never the whole question: a wedged relay is usually a
+/// machine that ran out of memory or has been pinned at 100% for an hour.
+function RelaySettings({
+  info,
+  relayUrl,
+}: {
+  info?: DesktopInfo;
+  relayUrl: string;
+}) {
+  const app = useApp();
+  const api = useApi();
+  const [health, setHealth] = useState<Health>();
+  const [unreachable, setUnreachable] = useState("");
+
+  // Polled, not pushed: these numbers are only interesting while somebody is
+  // looking at them, and this stops when the tab does.
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const next = await api.health();
+        if (stopped) return;
+        setHealth(next);
+        setUnreachable("");
+      } catch (err) {
+        if (!stopped) setUnreachable(String((err as Error).message ?? err));
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 3000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [api]);
+
+  const managedRelay = relayUrl.startsWith("https://relay.patchwork.sh/r/");
+  const system = health?.system;
+  const memoryPercent = system?.memory_total
+    ? (system.memory_used / system.memory_total) * 100
+    : 0;
+
+  return (
+    <Section
+      title="Relay"
+      action={
+        <span className="section-note">
+          {unreachable ? "Not answering" : "Live"}
+        </span>
+      }
+    >
+      <div className="row" title={unreachable || undefined}>
+        <span className={`dot ${unreachable ? "" : app.live ? "online" : "waiting"}`} />
+        <span className="grow">
+          <span className="name">{relayUrl}</span>
+          <span className="sub">
+            {info?.hosting_relay
+              ? `${managedRelay ? "shared securely through Patchwork Relay" : "served by this machine"} · `
+              : ""}
+            {unreachable
+              ? "not answering"
+              : app.live
+                ? "connected"
+                : "reconnecting…"}
+          </span>
+        </span>
+        <button
+          className="button quiet"
+          onClick={() => openExternal(`${relayUrl}/api/health`)}
+        >
+          <ExternalIcon size={14} />
+          Open
+        </button>
+      </div>
+
+      {/* Kept on screen but faded when the relay stops answering: the last
+          reading is still the most useful thing to have, as long as nobody
+          mistakes it for now. */}
+      <div className={`health${unreachable ? " stale" : ""}`}>
+        <Meter
+          label="CPU"
+          percent={system?.cpu_percent ?? 0}
+          value={
+            system
+              ? // A decimal below 10%: a quiet relay would otherwise read "0%"
+                // forever and look like a number that had stopped arriving.
+                `${system.cpu_percent < 10 ? system.cpu_percent.toFixed(1) : Math.round(system.cpu_percent)}% of ${system.cpu_count} core${system.cpu_count === 1 ? "" : "s"}`
+              : "—"
+          }
+        />
+        <Meter
+          label="Memory"
+          percent={memoryPercent}
+          value={
+            system
+              ? `${bytes(system.memory_used)} of ${bytes(system.memory_total)}`
+              : "—"
+          }
+        />
+        <div className="health-facts">
+          <Fact label="Version" value={health?.version ?? "—"} />
+          <Fact
+            label="Uptime"
+            value={health ? duration(health.started_at) : "—"}
+          />
+          <Fact label="Hosts online" value={health?.hosts_online ?? "—"} />
+          <Fact label="Runs active" value={health?.runs_active ?? "—"} />
+          <Fact
+            label="Relay process"
+            value={system ? bytes(system.process_memory) : "—"}
+          />
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+/// A bar plus the number it stands for. Colour is the alarm, so it only
+/// appears once the reading is worth reacting to.
+function Meter({
+  label,
+  percent,
+  value,
+}: {
+  label: string;
+  percent: number;
+  value: string;
+}) {
+  const capped = Math.max(0, Math.min(100, percent));
+  const tone = capped >= 90 ? "danger" : capped >= 75 ? "caution" : "";
+  return (
+    <div className="meter">
+      <span className="meter-label">{label}</span>
+      <span className="meter-track">
+        <span className={`meter-fill ${tone}`} style={{ width: `${capped}%` }} />
+      </span>
+      <span className="meter-value">{value}</span>
+    </div>
+  );
+}
+
+function Fact({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="fact">
+      <span className="fact-label">{label}</span>
+      <span className="fact-value">{value}</span>
+    </div>
+  );
+}
+
+/// The app rather than the workspace: every workspace this machine has joined
+/// stays connected, whichever one the window is showing, because an agent
+/// working in one of them does not care what you are looking at.
+function AppSettings({
+  info,
+  onChanged,
+  onSignOut,
+}: {
+  info?: DesktopInfo;
+  onChanged: () => Promise<void>;
+  onSignOut: () => void;
+}) {
+  const app = useApp();
+  const workspaces = useWorkspaces();
+  const [updateStatus, setUpdateStatus] = useState("");
+
+  const checkForUpdate = async () => {
+    setUpdateStatus("Checking…");
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (!update) {
+        setUpdateStatus("Patchwork is up to date");
+        return;
+      }
+      setUpdateStatus(`Installing ${update.version}…`);
+      await update.downloadAndInstall();
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (err) {
+      setUpdateStatus(String((err as Error).message ?? err));
+    }
+  };
+
+  return (
+    <>
       <Section
         title="Workspaces"
-        action={
-          <span className="section-note">All connected, all working</span>
-        }
+        action={<span className="section-note">All connected, all working</span>}
       >
         {(info?.settings.workspaces ?? []).map((workspace) => {
           const here = workspace.id === app.workspace?.id;
@@ -2571,7 +2799,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
                 className="button quiet danger"
                 onClick={async () => {
                   await leave(workspace.id);
-                  setInfo(await desktopInfo());
+                  await onChanged();
                 }}
               >
                 Leave
@@ -2579,29 +2807,6 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             </div>
           );
         })}
-      </Section>
-
-      <Section title="Relay">
-        <div className="row hoverable">
-          <span className={`dot ${app.live ? "online" : "waiting"}`} />
-          <span className="grow">
-            <span className="name">{relayUrl}</span>
-            <span className="sub">
-              {info?.hosting_relay
-                ? `${managedRelay ? "shared securely through Patchwork Relay" : "served by this machine"} · ${app.live ? "connected" : "reconnecting…"}`
-                : app.live
-                  ? "connected"
-                  : "reconnecting…"}
-            </span>
-          </span>
-          <button
-            className="button quiet"
-            onClick={() => openExternal(`${relayUrl}/api/health`)}
-          >
-            <ExternalIcon size={14} />
-            Health
-          </button>
-        </div>
       </Section>
 
       {inTauri && (
@@ -2615,7 +2820,10 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             </span>
             <button
               className="button"
-              disabled={updateStatus === "Checking…" || updateStatus.startsWith("Installing ")}
+              disabled={
+                updateStatus === "Checking…" ||
+                updateStatus.startsWith("Installing ")
+              }
               onClick={() => void checkForUpdate()}
             >
               Check for updates
@@ -2635,9 +2843,10 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
           Sign out of every workspace
         </button>
       </Section>
-    </Page>
+    </>
   );
 }
+
 
 /// `https://github.com/acme/app.git` is called `app`.
 function nameFromRepo(url: string) {

@@ -444,6 +444,23 @@ pub struct Health {
     pub started_at: Millis,
     pub hosts_online: usize,
     pub runs_active: usize,
+    /// How the machine underneath is coping. Only for a caller the relay
+    /// already trusts: an unauthenticated probe gets a liveness answer, not an
+    /// inventory of somebody's hardware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemHealth>,
+}
+
+/// Sampled at the moment of asking, not averaged since boot: the question this
+/// answers is "is the relay struggling right now".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemHealth {
+    pub cpu_percent: f32,
+    pub cpu_count: usize,
+    pub memory_used: u64,
+    pub memory_total: u64,
+    /// The relay process itself, so a leak is visible next to the machine total.
+    pub process_memory: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
