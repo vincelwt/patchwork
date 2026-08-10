@@ -7,9 +7,10 @@
 //! Everything below that prefix is the single-workspace API, unchanged: the
 //! request is stripped of the prefix and handed to that workspace's router.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -58,6 +59,7 @@ impl Relay {
                 .await
                 .with_context(|| format!("failed to open workspace {id}"))?;
         }
+        tokio::spawn(prune_worktrees(Arc::downgrade(&relay)));
         Ok(relay)
     }
 
@@ -221,6 +223,43 @@ impl Relay {
             .collect();
         for runner in runners {
             runner.shutdown().await;
+        }
+    }
+}
+
+async fn prune_worktrees(relay: Weak<Relay>) {
+    const DEFAULT_DAYS: u64 = 2;
+    let days = std::env::var("PATCHWORK_WORKTREE_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_DAYS);
+    let retention = Duration::from_secs(days.saturating_mul(24 * 60 * 60));
+    let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
+    loop {
+        ticker.tick().await;
+        let Some(relay) = relay.upgrade() else {
+            return;
+        };
+        let mut in_use = HashSet::new();
+        let mut complete = true;
+        for state in relay.states().await {
+            match state.store.active_runs() {
+                Ok(runs) => in_use.extend(
+                    runs.into_iter()
+                        .filter_map(|run| run.cwd.map(PathBuf::from)),
+                ),
+                Err(err) => {
+                    tracing::warn!(?err, "could not read active runs before worktree pruning");
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            if let Err(err) = patchwork_agent::worktree::prune(&in_use, retention).await {
+                tracing::warn!(?err, "worktree pruning failed");
+            }
         }
     }
 }
