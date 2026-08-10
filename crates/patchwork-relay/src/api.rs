@@ -88,7 +88,10 @@ async fn dispatch(State(relay): State<Arc<Relay>>, mut request: Request) -> Resp
     router.oneshot(request).await.into_response()
 }
 
-async fn relay_health(State(relay): State<Arc<Relay>>) -> ApiResult<Json<Health>> {
+async fn relay_health(
+    State(relay): State<Arc<Relay>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<Health>> {
     let states = relay.states().await;
     let mut hosts_online = 0;
     let mut runs_active = 0;
@@ -98,6 +101,10 @@ async fn relay_health(State(relay): State<Arc<Relay>>) -> ApiResult<Json<Health>
         runs_active += state.store.active_runs().map(|r| r.len()).unwrap_or(0);
         started_at = started_at.min(state.started_at);
     }
+    let known = match bearer(&headers) {
+        Ok(token) => relay.workspace_for_token(&token).await.is_some(),
+        Err(_) => false,
+    };
     Ok(Json(Health {
         ok: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -105,6 +112,7 @@ async fn relay_health(State(relay): State<Arc<Relay>>) -> ApiResult<Json<Health>
         started_at,
         hosts_online,
         runs_active,
+        system: if known { Some(system_health().await) } else { None },
     }))
 }
 
@@ -296,7 +304,14 @@ pub fn router(state: Shared) -> Router {
 // health and auth
 // ---------------------------------------------------------------------------
 
-async fn health(State(state): State<Shared>) -> ApiResult<Json<Health>> {
+async fn health(
+    State(state): State<Shared>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<Health>> {
+    let known = bearer(&headers)
+        .ok()
+        .and_then(|token| auth::authenticate(&state, &token))
+        .is_some();
     Ok(Json(Health {
         ok: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -304,7 +319,44 @@ async fn health(State(state): State<Shared>) -> ApiResult<Json<Health>> {
         started_at: state.started_at,
         hosts_online: state.online_host_ids().await.len(),
         runs_active: state.store.active_runs().map(|r| r.len()).unwrap_or(0),
+        system: if known { Some(system_health().await) } else { None },
     }))
+}
+
+/// What the relay's machine is doing right now. CPU usage is a rate, so it
+/// needs two samples: the reader is built per call and thrown away, which
+/// costs one 200ms wait and buys no shared state to keep correct.
+async fn system_health() -> SystemHealth {
+    use sysinfo::{
+        get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System,
+        MINIMUM_CPU_UPDATE_INTERVAL,
+    };
+
+    let mut system = System::new();
+    system.refresh_cpu_usage();
+    tokio::time::sleep(MINIMUM_CPU_UPDATE_INTERVAL).await;
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+
+    let pid = get_current_pid().ok();
+    if let Some(pid) = pid {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+    }
+
+    SystemHealth {
+        cpu_percent: system.global_cpu_usage(),
+        cpu_count: system.cpus().len(),
+        memory_used: system.used_memory(),
+        memory_total: system.total_memory(),
+        process_memory: pid
+            .and_then(|pid| system.process(pid))
+            .map(|process| process.memory())
+            .unwrap_or(0),
+    }
 }
 
 async fn join_workspace(state: &Shared, input: JoinRequest) -> ApiResult<AuthResponse> {
@@ -3004,6 +3056,16 @@ mod tests {
         assert_eq!(split_workspace("/w/ws1"), Some(("ws1", "/")));
         assert_eq!(split_workspace("/w/"), None);
         assert_eq!(split_workspace("/api/health"), None);
+    }
+
+    #[tokio::test]
+    async fn the_machine_reads_back_plausible_cpu_and_memory() {
+        let system = system_health().await;
+        assert!(system.cpu_count >= 1);
+        assert!((0.0..=100.0).contains(&system.cpu_percent));
+        assert!(system.memory_total > 0);
+        assert!(system.memory_used <= system.memory_total);
+        assert!(system.process_memory > 0);
     }
 
     #[test]

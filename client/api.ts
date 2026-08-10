@@ -11,6 +11,7 @@ import type {
   Bootstrap,
   Channel,
   Device,
+  Health,
   Host,
   Id,
   InboxItem,
@@ -106,6 +107,11 @@ export class Api {
 
   bootstrap() {
     return this.get<Bootstrap>("/api/bootstrap");
+  }
+
+  /// Live: the relay samples its machine when asked, so this is worth polling.
+  health() {
+    return this.get<Health>("/api/health");
   }
 
   createPairing() {

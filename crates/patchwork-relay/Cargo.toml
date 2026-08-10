@@ -48,3 +48,4 @@ cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 reqwest.workspace = true
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
