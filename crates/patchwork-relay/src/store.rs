@@ -1368,6 +1368,10 @@ impl Store {
         Ok(true)
     }
 
+    /// Put the task in Running and point it at this run. Joining a task that
+    /// is already running is allowed: `current_run_id` is the newest run to
+    /// look at, not a lock, and the task is only released when the last of
+    /// them stops.
     pub fn activate_task_run(
         &self,
         task_id: &str,
@@ -1389,14 +1393,11 @@ impl Store {
                 },
             )
             .optional()?;
-        let Some((status, current_run_id, updated_at)) = current else {
+        let Some((status, _current_run_id, updated_at)) = current else {
             return Ok(None);
         };
         let status = TaskStatus::parse(&status).unwrap_or(TaskStatus::Planned);
-        if status.is_terminal()
-            || current_run_id.is_some()
-            || required_status.is_some_and(|required| required != status)
-        {
+        if status.is_terminal() || required_status.is_some_and(|required| required != status) {
             return Ok(None);
         }
         tx.execute(
@@ -1441,6 +1442,9 @@ impl Store {
         )? > 0)
     }
 
+    /// A run that never reached its host gives the task back — unless someone
+    /// else is still working on it, in which case the task stays running and
+    /// only the pointer moves to whoever is left.
     pub fn restore_task_after_failed_start(
         &self,
         task_id: &str,
@@ -1448,8 +1452,17 @@ impl Store {
         previous_status: TaskStatus,
     ) -> Result<bool> {
         Ok(self.conn()?.execute(
-            "UPDATE tasks SET status=CASE WHEN status='running' THEN ?3 ELSE status END,
-                              current_run_id=NULL, updated_at=MAX(?4, updated_at + 1)
+            "WITH remaining AS (
+               SELECT id FROM runs WHERE task_id = ?1 AND id != ?2
+                 AND status IN ('queued','dispatched','running','waiting')
+               ORDER BY id DESC LIMIT 1
+             )
+             UPDATE tasks
+             SET status = CASE
+                   WHEN status='running' AND (SELECT id FROM remaining) IS NULL THEN ?3
+                   ELSE status END,
+                 current_run_id = (SELECT id FROM remaining),
+                 updated_at = MAX(?4, updated_at + 1)
              WHERE id=?1 AND current_run_id=?2",
             params![task_id, run_id, previous_status.as_str(), now_ms()],
         )? > 0)
@@ -1719,20 +1732,12 @@ impl Store {
         })
     }
 
+    /// A task takes as many runs at once as people start on it. They share one
+    /// worktree, so each of them is told who else is in there; the relay does
+    /// not arbitrate, it just keeps everyone's state visible.
     pub fn insert_run(&self, run: &Run, depth: i32) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(task_id) = &run.task_id {
-            let busy: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM runs WHERE task_id = ?1
-                 AND status IN ('queued','dispatched','running','waiting'))",
-                params![task_id],
-                |row| row.get(0),
-            )?;
-            if busy {
-                return Err(anyhow!("this task already has an active run"));
-            }
-        }
         tx.execute(
             "INSERT INTO runs (id, agent_id, status, trigger, channel_id, task_id, host_id, project_id,
                                worktree_id, cwd, automation_id, session_id, runtime, prompt, headline,
@@ -1785,6 +1790,17 @@ impl Store {
     pub fn task_runs(&self, task_id: &str) -> Result<Vec<Run>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare("SELECT * FROM runs WHERE task_id = ?1 ORDER BY id DESC")?;
+        let rows = stmt.query_map(params![task_id], |r| Self::run_from_row(r))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Everyone still working on this task, newest first.
+    pub fn active_task_runs(&self, task_id: &str) -> Result<Vec<Run>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM runs WHERE task_id = ?1
+             AND status IN ('queued','dispatched','running','waiting') ORDER BY id DESC",
+        )?;
         let rows = stmt.query_map(params![task_id], |r| Self::run_from_row(r))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -2930,15 +2946,19 @@ mod tests {
         assert_eq!(polled.status, TaskStatus::Review);
         assert_eq!(polled.pr_state.as_ref().map(|p| p.number), Some(89));
 
-        // And a pointer that survived anyway does not park the task forever.
+        // And a pointer that survived anyway does not park the task forever:
+        // the sweeper clears it, and an approval that needs a free task can
+        // claim it again.
         let mut stuck = polled.clone();
         stuck.current_run_id = Some(done.id.clone());
         store.update_task(&stuck).unwrap();
-        assert!(store
-            .activate_task_run(&task.id, "next-run", None)
-            .unwrap()
-            .is_none());
         assert_eq!(store.clear_finished_task_runs().unwrap(), 1);
+        assert!(store
+            .task(&task.id)
+            .unwrap()
+            .unwrap()
+            .current_run_id
+            .is_none());
         assert!(store
             .activate_task_run(&task.id, "next-run", None)
             .unwrap()
@@ -3380,14 +3400,65 @@ mod tests {
     }
 
     #[test]
-    fn one_task_has_one_active_writer() {
+    fn a_task_runs_several_agents_at_once_and_lists_them() {
         let (store, path) = store();
-        let mut first = run("r1", "task");
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+
+        let mut first = run("r1", &task.id);
         store.insert_run(&first, 0).unwrap();
-        assert!(store.insert_run(&run("r2", "task"), 0).is_err());
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, &first.id, None)
+                .unwrap()
+                .unwrap(),
+            TaskStatus::Planned
+        );
+
+        // A second agent joins the same task and the same worktree.
+        let second = run("r2", &task.id);
+        store.insert_run(&second, 0).unwrap();
+        assert_eq!(
+            store
+                .activate_task_run(&task.id, &second.id, None)
+                .unwrap()
+                .unwrap(),
+            TaskStatus::Running
+        );
+        assert_eq!(
+            store
+                .active_task_runs(&task.id)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            ["r2", "r1"]
+        );
+
+        // One of them falling over leaves the other in charge of the task.
+        assert!(store
+            .restore_task_after_failed_start(&task.id, "r2", TaskStatus::Planned)
+            .unwrap());
+        let stored = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Running);
+        assert_eq!(stored.current_run_id.as_deref(), Some("r1"));
+
+        // The last one out gives the task back.
+        let mut second = second;
+        second.status = RunStatus::Cancelled;
+        store.update_run(&second).unwrap();
         first.status = RunStatus::Succeeded;
         store.update_run(&first).unwrap();
-        store.insert_run(&run("r2", "task"), 0).unwrap();
+        assert!(store.active_task_runs(&task.id).unwrap().is_empty());
+        assert!(store
+            .restore_task_after_failed_start(&task.id, "r1", TaskStatus::Planned)
+            .unwrap());
+        let stored = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Planned);
+        assert_eq!(stored.current_run_id, None);
         drop(store);
         let _ = std::fs::remove_file(path);
     }

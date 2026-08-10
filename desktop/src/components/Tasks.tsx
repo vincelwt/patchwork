@@ -8,7 +8,13 @@ import {
   statusLabel,
   statusTone,
 } from "../lib/format";
-import { readTask, situationTone, stepIndex, TASK_STEPS } from "../lib/task";
+import {
+  isRunActive,
+  readTask,
+  situationTone,
+  stepIndex,
+  TASK_STEPS,
+} from "../lib/task";
 import type { NextAction, TaskState } from "../lib/task";
 import { Avatar, Chip, Field, Modal, proseText, useNavigation } from "./common";
 import {
@@ -86,11 +92,21 @@ function useTaskActions(task: Task) {
         case "retry":
           await start();
           break;
-        case "stop":
-          if (state.run) await api.cancelRun(state.run.id);
+        case "stop": {
+          // Stopping a task stops the task: every agent on it, not whichever
+          // one happens to be newest. The label says "Stop all" when it is
+          // more than one.
+          const running = state.activeRuns.length
+            ? state.activeRuns
+            : state.run
+              ? [state.run]
+              : [];
+          await Promise.all(running.map((run) => api.cancelRun(run.id)));
           break;
+        }
         case "answer":
-          if (state.run) inspect({ kind: "run", runId: state.run.id });
+          if (state.question) inspect({ kind: "run", runId: state.question.run_id });
+          else if (state.run) inspect({ kind: "run", runId: state.run.id });
           break;
         case "approve": {
           setBusy(true);
@@ -117,6 +133,21 @@ function useTaskActions(task: Task) {
   };
 
   return { perform, start, busy, error, assigning, setAssigning };
+}
+
+/// Who is on this task right now, when that is more than one agent. A single
+/// agent stays the single avatar it has always been, wherever it already sat.
+function AgentStack({ members, size }: { members: Member[]; size: number }) {
+  return (
+    <span
+      className="agent-stack"
+      title={members.map((member) => member.display_name).join(", ")}
+    >
+      {members.map((member) => (
+        <Avatar key={member.id} member={member} size={size} />
+      ))}
+    </span>
+  );
 }
 
 function actionIcon(kind: NextAction["kind"]) {
@@ -450,7 +481,9 @@ function TaskList({
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
                 )}
                 {project && <Chip>{project.name}</Chip>}
-                {state.owner ? (
+                {state.agents.length > 1 ? (
+                  <AgentStack members={state.agents} size={20} />
+                ) : state.owner ? (
                   <Avatar member={state.owner} size={20} />
                 ) : (
                   <span className="unowned">unassigned</span>
@@ -528,7 +561,9 @@ function TaskCard({
       <div className="head">
         <span className="key">{task.key}</span>
         <span className="spacer" />
-        {state.owner ? (
+        {state.agents.length > 1 ? (
+          <AgentStack members={state.agents} size={18} />
+        ) : state.owner ? (
           <Avatar member={state.owner} size={18} />
         ) : (
           <span className="unowned">unassigned</span>
@@ -1389,6 +1424,9 @@ export function TaskPage({ taskId }: { taskId: string }) {
           {(state.situation === "failed" || state.situation === "blocked") && (
             <WarningIcon size={15} />
           )}
+          {state.agents.length > 1 && (
+            <AgentStack members={state.agents} size={20} />
+          )}
           <span className="grow">
             <span className="line">{state.headline}</span>
             {state.detail && <span className="detail">{state.detail}</span>}
@@ -1576,6 +1614,12 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
 
   if (!detail) return <div className="inspector-body">Loading…</div>;
 
+  // Several agents can be inside this task at once. Each one gets its own
+  // thinking below, because "what is happening" is a different answer per
+  // agent — and one of them stops without stopping the others.
+  const live = detail.runs.filter(isRunActive);
+  const currentRunId = live[0]?.id ?? detail.task.current_run_id;
+
   return (
     <div className="inspector-body">
       {detail.worktree && (
@@ -1643,11 +1687,31 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
         </Section>
       )}
 
-      {detail.task.current_run_id && (
+      {live.length > 1 ? (
+        live.map((run) => (
+          <Section
+            key={run.id}
+            title={
+              members.find((member) => member.id === run.agent_id)?.display_name ??
+              "Run"
+            }
+            action={
+              <button
+                className="button quiet"
+                onClick={() => void api.cancelRun(run.id)}
+              >
+                Stop
+              </button>
+            }
+          >
+            <RunPanel runId={run.id} embedded />
+          </Section>
+        ))
+      ) : currentRunId ? (
         <Section title="Current run">
-          <RunPanel runId={detail.task.current_run_id} embedded />
+          <RunPanel runId={currentRunId} embedded />
         </Section>
-      )}
+      ) : null}
     </div>
   );
 }

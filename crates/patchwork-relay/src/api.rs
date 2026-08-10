@@ -1078,7 +1078,7 @@ async fn update_task(
         if !orchestrator::has_review_evidence(
             &state,
             &task,
-            caller.run_id.as_deref(),
+            &orchestrator::evidence_run_ids(&state, &task, caller.run_id.as_deref())?,
             input.pr_url.as_deref(),
         )? {
             return Err(ApiError::bad_request(
@@ -1193,9 +1193,11 @@ async fn approve_task(
             "this task no longer has an action awaiting approval",
         ));
     }
+    // Approving starts another run in the task's worktree. While an agent is
+    // still working in there, waiting is the honest answer.
     if task.current_run_id.is_some() {
         return Err(ApiError::conflict(
-            "the agent is still finishing its review handoff",
+            "an agent is still working on this task; approve once it stops",
         ));
     }
     let run = orchestrator::approve_task(&state, &caller.member.id, &task.id)
@@ -3779,6 +3781,126 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item.run_id.as_deref() != Some("run-two")));
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Two agents in one task and one worktree: the task belongs to both of
+    /// them until the last one stops, and either one's evidence is the task's.
+    #[tokio::test]
+    async fn a_task_waits_for_its_last_agent_to_stop() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Online,
+        };
+        store.insert_member(&agent).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let task = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "Ship the partner hub".into(),
+                outcome: "The hub is live".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let working = |id: &str| Run {
+            id: id.into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual {
+                by: "person".into(),
+            },
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            host_id: None,
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            prompt: String::new(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        let mut builder = working("run-builder");
+        let mut writer = working("run-writer");
+        store.insert_run(&builder, 0).unwrap();
+        store.insert_run(&writer, 0).unwrap();
+        assert!(store
+            .activate_task_run(&task.id, &builder.id, None)
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .activate_task_run(&task.id, &writer.id, None)
+                .unwrap()
+                .is_some(),
+            "a second agent joins a task that is already running"
+        );
+
+        // Evidence from either of them belongs to the task.
+        store
+            .upsert_preview(&Preview {
+                id: "preview".into(),
+                task_id: task.id.clone(),
+                host_id: "host".into(),
+                run_id: Some(builder.id.clone()),
+                label: "Partner hub".into(),
+                port: 5173,
+                url: "http://preview".into(),
+                status: PreviewStatus::Live,
+                local_only: false,
+                created_at: 2,
+                stopped_at: None,
+            })
+            .unwrap();
+
+        builder.status = RunStatus::Succeeded;
+        builder.ended_at = Some(3);
+        store.update_run(&builder).unwrap();
+        orchestrator::finish_run(&state, &builder).await.unwrap();
+        let mid = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(
+            mid.status,
+            TaskStatus::Running,
+            "the task is still being worked on by the other agent"
+        );
+        assert_eq!(mid.current_run_id.as_deref(), Some(writer.id.as_str()));
+
+        writer.status = RunStatus::Succeeded;
+        writer.ended_at = Some(4);
+        store.update_run(&writer).unwrap();
+        orchestrator::finish_run(&state, &writer).await.unwrap();
+        let done = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(done.status, TaskStatus::Review);
+        assert!(done.current_run_id.is_none());
 
         drop(state);
         drop(store);

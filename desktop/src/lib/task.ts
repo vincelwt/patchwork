@@ -43,7 +43,14 @@ export interface TaskState {
   /// One line, in plain language, about where this task actually is.
   headline: string;
   detail?: string;
+  /// The run to look at first: the newest one still going, or the last one to
+  /// have left a mark. Never the only run on the task.
   run?: Run;
+  /// Every run still going on this task, oldest first. Agents share a task's
+  /// worktree rather than queue behind it, so this is a list.
+  activeRuns: Run[];
+  /// The agents behind `activeRuns`, one entry each and in the same order.
+  agents: Member[];
   question?: Question;
   owner?: Member;
   action?: NextAction;
@@ -53,20 +60,64 @@ export interface TaskState {
 
 const ACTIVE_RUN = ["queued", "dispatched", "running", "waiting"];
 
+/// A run nobody is waiting on has finished. Several unfinished runs can belong
+/// to one task at the same time.
+export function isRunActive(run: Run): boolean {
+  return ACTIVE_RUN.includes(run.status);
+}
+
+/// A Stop that ends more than one agent's work has to say so before it is
+/// pressed, not after.
+function stopLabel(live: Run[]): string {
+  return live.length > 1 ? "Stop all" : "Stop";
+}
+
 export function readTask(
   task: Task,
   members: Member[],
   runs: Record<string, Run>,
   questions: Record<string, Question>,
 ): TaskState {
+  // Oldest first, so an agent keeps its place in the row when another one
+  // starts or stops beside it.
+  const live = Object.values(runs)
+    .filter((run) => run.task_id === task.id && isRunActive(run))
+    .sort((a, b) => a.created_at - b.created_at);
+  // One face per agent, even when the same agent has two runs on the task.
+  const agents: Member[] = [];
+  for (const run of live) {
+    const agent = members.find((member) => member.id === run.agent_id);
+    if (agent && !agents.includes(agent)) agents.push(agent);
+  }
+  return {
+    ...describe(task, members, runs, questions, live, agents),
+    activeRuns: live,
+    agents,
+  };
+}
+
+function describe(
+  task: Task,
+  members: Member[],
+  runs: Record<string, Run>,
+  questions: Record<string, Question>,
+  live: Run[],
+  agents: Member[],
+): Omit<TaskState, "activeRuns" | "agents"> {
   const owner = members.find((member) => member.id === task.owner_id);
   const ownerIsAgent = owner?.kind === "agent";
-  const run = task.current_run_id ? runs[task.current_run_id] : undefined;
-  const active = run && ACTIVE_RUN.includes(run.status);
+  const current = task.current_run_id ? runs[task.current_run_id] : undefined;
+  // `current_run_id` is the newest run worth looking at, not the only one on
+  // the task: prefer it while it is going, then the newest that still is, and
+  // otherwise whatever ran last.
+  const run =
+    current && isRunActive(current) ? current : (live[live.length - 1] ?? current);
   const question = Object.values(questions).find(
     (candidate) =>
       candidate.status === "open" &&
-      (candidate.task_id === task.id || (run && candidate.run_id === run.id)),
+      (candidate.task_id === task.id ||
+        candidate.run_id === run?.id ||
+        live.some((entry) => entry.id === candidate.run_id)),
   );
 
   // Closed work cannot keep asking for attention because of a stale question,
@@ -86,29 +137,43 @@ export function readTask(
   // Something being asked of a person outranks everything else: it is the only
   // state where the task cannot progress without the reader.
   if (question) {
+    // Whoever asked, which is not always the agent the task belongs to.
+    const asking = members.find((member) => member.id === question.agent_id);
     return {
       situation: "asking",
-      headline: `${owner?.display_name ?? "The agent"} needs an answer`,
+      headline: `${asking?.display_name ?? owner?.display_name ?? "The agent"} needs an answer`,
       detail: question.headline || question.items[0]?.question,
       run,
       question,
       owner,
       action: { label: "Answer", kind: "answer", tone: "primary" },
-      secondary: run ? { label: "Stop", kind: "stop", tone: "quiet" } : undefined,
+      secondary: run
+        ? { label: stopLabel(live), kind: "stop", tone: "quiet" }
+        : undefined,
     };
   }
 
-  if (active && run) {
-    const queued = run.status === "queued" || run.status === "dispatched";
+  if (live.length > 0 && run) {
+    // Queued is only the honest word while none of them has started.
+    const queued = live.every(
+      (entry) => entry.status === "queued" || entry.status === "dispatched",
+    );
+    const several = live.length > 1;
     return {
       situation: queued ? "queued" : "working",
-      headline: queued
-        ? `Waiting for a machine to pick this up`
-        : run.headline || `${owner?.display_name ?? "An agent"} is working`,
-      detail: queued ? `Queued for ${owner?.display_name ?? "an agent"}` : undefined,
+      headline: several
+        ? `${live.length} agents are ${queued ? "queued" : "working"}`
+        : queued
+          ? `Waiting for a machine to pick this up`
+          : run.headline || `${owner?.display_name ?? "An agent"} is working`,
+      detail: several
+        ? agents.map((agent) => agent.display_name).join(" · ")
+        : queued
+          ? `Queued for ${owner?.display_name ?? "an agent"}`
+          : undefined,
       run,
       owner,
-      action: { label: "Stop", kind: "stop", tone: "normal" },
+      action: { label: stopLabel(live), kind: "stop", tone: "normal" },
     };
   }
 

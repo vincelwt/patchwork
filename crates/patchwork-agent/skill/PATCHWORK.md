@@ -314,3 +314,20 @@ need to copy the conversation into the instructions.
 You are already in the task's folder or git worktree. It belongs to the task,
 so a later run can continue exactly where you stopped. `git` and `gh` work
 normally; commit and open pull requests as you would anywhere else.
+
+## Working next to another agent
+
+A task takes several agents at once, and they all work in that one checkout.
+Nobody arbitrates between you, so the etiquette is yours to keep:
+
+- `patchwork whoami` lists everyone else in the worktree and the run id that
+  reaches them. You are also told when one of them joins or finishes.
+- Touch only the files your own work needs, and stage those paths by name
+  rather than `git commit -a`.
+- Do not switch, rebase or reset the branch while someone else is working on
+  it, and read a file again before you edit it.
+- `patchwork tell <run-id> "…"` when something you changed affects their work.
+  `patchwork tell PW-14 "…"` reaches everyone on that task.
+
+If the work genuinely needs its own branch, make it a separate task instead:
+separate task, separate worktree, one merge at the end.
