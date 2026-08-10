@@ -2033,6 +2033,41 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 .await;
             }
         }
+        HostToRelay::SystemSkillUpdated {
+            request_id,
+            path,
+            skills,
+            error,
+        } => {
+            let pending = match state.system_skill_waiters.write().await.remove(&request_id) {
+                Some(waiter) if waiter.host_id != host_id => {
+                    state
+                        .system_skill_waiters
+                        .write()
+                        .await
+                        .insert(request_id, waiter);
+                    return Ok(());
+                }
+                pending => pending,
+            };
+
+            let result = if let Some(error) = error {
+                Err(error)
+            } else if let Some(skill) = skills.iter().find(|skill| skill.path == path).cloned() {
+                if let Some(mut host) = state.store.host(host_id)? {
+                    host.capabilities.system_skills = skills;
+                    state.store.upsert_host(&host)?;
+                    host.online = true;
+                    state.emit(Event::HostUpdated { host });
+                }
+                Ok(skill)
+            } else {
+                Err("the updated skill was no longer detected".into())
+            };
+            if let Some(waiter) = pending {
+                let _ = waiter.reply.send(result);
+            }
+        }
         HostToRelay::PreviewResponse {
             request_id,
             status,

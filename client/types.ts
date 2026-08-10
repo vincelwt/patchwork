@@ -230,6 +230,7 @@ export interface SystemSkill {
   name: string;
   description: string;
   path: string;
+  content?: string;
 }
 
 export interface HostCapabilities {

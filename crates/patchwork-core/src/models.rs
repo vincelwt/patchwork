@@ -508,6 +508,9 @@ pub struct SystemSkill {
     pub name: String,
     pub description: String,
     pub path: String,
+    /// Complete markdown, including frontmatter, so the Skills page can edit it.
+    #[serde(default)]
+    pub content: String,
 }
 
 /// What a machine can actually do — surfaced in the UI so setup failures are
