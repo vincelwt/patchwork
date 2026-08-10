@@ -53,9 +53,11 @@ async fn poll_task(state: &Shared, task: &Task) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut task = task.clone();
-    task.pr_state = Some(fresh.clone());
-    state.store.update_task(&task)?;
+    // Re-read: this snapshot predates the `gh` call, so anything decided while
+    // it ran (a run finishing, a status change) is only in the stored row.
+    let Some(task) = state.store.set_task_pr_state(&task.id, &fresh)? else {
+        return Ok(());
+    };
     state.emit(Event::TaskUpdated { task: task.clone() });
 
     let review_arrived = fresh.review == "CHANGES_REQUESTED"
