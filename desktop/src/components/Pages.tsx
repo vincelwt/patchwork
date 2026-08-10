@@ -37,16 +37,21 @@ import {
   Toggle,
 } from "./ui";
 import {
+  AgentIcon,
+  AppIcon,
   CheckIcon,
   ChevronIcon,
   ExternalIcon,
   FileIcon,
   FolderIcon,
+  MachineIcon,
   MoreIcon,
   PencilIcon,
   PlusIcon,
+  RelayIcon,
   Spinner,
   TrashIcon,
+  WorkspaceIcon,
 } from "./icons";
 import { RuntimeIcon } from "./RuntimeIcon";
 import { PairDeviceModal } from "./PairDeviceModal";
@@ -2243,12 +2248,12 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
 /// and the app itself. One scroll made you hunt through all five to change one
 /// thing, so each is now a tab that stands on its own.
 const SETTINGS_TABS = [
-  { id: "workspace", label: "Workspace" },
-  { id: "machines", label: "Machines" },
-  { id: "relay", label: "Relay" },
+  { id: "workspace", label: "Workspace", Icon: WorkspaceIcon },
+  { id: "machines", label: "Machines", Icon: MachineIcon },
+  { id: "relay", label: "Relay", Icon: RelayIcon },
   // Nothing to hold a key in a browser tab, so nothing to show there.
-  ...(inTauri ? [{ id: "agent", label: "Agent" }] : []),
-  { id: "app", label: "App" },
+  ...(inTauri ? [{ id: "agent", label: "Agent", Icon: AgentIcon }] : []),
+  { id: "app", label: "App", Icon: AppIcon },
 ] as const;
 
 type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
@@ -2277,6 +2282,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
             className={option.id === tab ? "active" : ""}
             onClick={() => setTab(option.id)}
           >
+            <option.Icon size={15} />
             {option.label}
           </button>
         ))}

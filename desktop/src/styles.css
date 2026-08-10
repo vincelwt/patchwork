@@ -3772,7 +3772,18 @@ details.run-thought > summary > svg {
 }
 .settings-tabs button {
   flex: none;
-  padding: 5px 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+}
+/* The icon is the label's marker, not a second thing to read: it stays a shade
+   back until the tab is the one you are on. */
+.settings-tabs button svg {
+  opacity: 0.55;
+}
+.settings-tabs button.active svg {
+  opacity: 1;
 }
 
 /* The relay's vitals: two rates worth a bar, and five facts worth a number. */

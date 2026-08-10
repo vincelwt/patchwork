@@ -174,6 +174,41 @@ export const SettingsIcon = (props: IconProps) => (
   </Svg>
 );
 
+/// The workspace itself: the shared surface every teammate looks at.
+export const WorkspaceIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="3.6" y="4.6" width="7" height="7" rx="1.8" />
+    <rect x="13.4" y="4.6" width="7" height="7" rx="1.8" />
+    <rect x="3.6" y="14.4" width="7" height="5" rx="1.8" />
+    <rect x="13.4" y="14.4" width="7" height="5" rx="1.8" />
+  </Svg>
+);
+
+/// A box an agent can run on.
+export const MachineIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="3" y="4.6" width="18" height="11.4" rx="2.2" />
+    <path d="M9 20h6M12 16v4" />
+  </Svg>
+);
+
+/// The relay: one thing everything else talks through.
+export const RelayIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <circle cx="12" cy="12" r="2.4" />
+    <path d="M8.1 15.9a5.5 5.5 0 0 1 0-7.8M15.9 8.1a5.5 5.5 0 0 1 0 7.8" />
+    <path d="M5.3 18.7a9.5 9.5 0 0 1 0-13.4M18.7 5.3a9.5 9.5 0 0 1 0 13.4" />
+  </Svg>
+);
+
+/// This app on this machine, as opposed to the workspace it is showing.
+export const AppIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="4" y="4" width="16" height="16" rx="4" />
+    <path d="M4 9.2h16M7.2 6.6h.01M10 6.6h.01" />
+  </Svg>
+);
+
 export const PreviewIcon = (props: IconProps) => (
   <Svg {...props}>
     <rect x="3.5" y="5" width="17" height="12.5" rx="2" />
