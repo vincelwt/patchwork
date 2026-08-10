@@ -133,7 +133,12 @@ async fn poll_task(state: &Shared, task: &Task) -> anyhow::Result<()> {
     }
     let what = parts.join("\n\n");
 
-    let _ = orchestrator::post_system(state, &task.discussion_channel_id, &what).await;
+    // Quoted feedback is somebody talking, so it goes in a message body that
+    // renders markdown; a bare state change stays a quiet activity line.
+    let _ = match arrived.is_empty() {
+        true => orchestrator::post_system(state, &task.discussion_channel_id, &what).await,
+        false => orchestrator::post_note(state, &task.discussion_channel_id, &what).await,
+    };
     if review_arrived || !arrived.is_empty() {
         automations_hook(state, &task, "review").await;
     }
