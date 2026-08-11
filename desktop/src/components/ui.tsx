@@ -13,7 +13,7 @@ import {
 import { createPortal } from "react-dom";
 import type { ReactNode, RefObject } from "react";
 import { ChevronIcon } from "./icons";
-import { plainText, proseText } from "./common";
+import { plainText } from "./common";
 
 export function Page({
   title,
@@ -562,31 +562,17 @@ export function EditableText({
   onCommit,
   placeholder = "Untitled",
   className = "",
-  multiline,
-  clamp,
   title = "Click to edit",
 }: {
   value: string;
   onCommit: (value: string) => void;
   placeholder?: string;
   className?: string;
-  multiline?: boolean;
-  /// Show only the first few lines until the reader asks for the rest.
-  clamp?: boolean;
   title?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
-  const [expanded, setExpanded] = useState(false);
-  const [overflowing, setOverflowing] = useState(false);
-  const input = useRef<HTMLTextAreaElement | HTMLInputElement>(null);
-  const display = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    const element = display.current;
-    if (!element || expanded) return;
-    setOverflowing(element.scrollHeight > element.clientHeight + 1);
-  }, [value, editing, expanded]);
+  const input = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!editing) setDraft(value);
@@ -595,7 +581,7 @@ export function EditableText({
   useEffect(() => {
     if (editing) {
       input.current?.focus();
-      if (input.current instanceof HTMLInputElement) input.current.select();
+      input.current?.select();
     }
   }, [editing]);
 
@@ -607,58 +593,35 @@ export function EditableText({
   };
 
   if (!editing) {
-    const shown = (
+    return (
       <button
-        ref={display}
-        className={`editable ${className}${clamp && !expanded ? " clamped" : ""}`.trim()}
+        className={`editable ${className}`.trim()}
         title={title}
         onClick={() => setEditing(true)}
       >
         {value || <span className="placeholder">{placeholder}</span>}
       </button>
     );
-    if (!clamp) return shown;
-    return (
-      <>
-        {shown}
-        {(overflowing || expanded) && (
-          <button className="editable-more" onClick={() => setExpanded(!expanded)}>
-            {expanded ? "Show less" : "Show more"}
-          </button>
-        )}
-      </>
-    );
   }
 
-  const shared = {
-    className: `editable-input ${className}`.trim(),
-    value: draft,
-    placeholder,
-    onBlur: commit,
-    onChange: (event: { target: { value: string } }) => setDraft(event.target.value),
-    onKeyDown: (event: React.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setDraft(value);
-        setEditing(false);
-      } else if (event.key === "Enter" && (!multiline || event.metaKey)) {
-        event.preventDefault();
-        commit();
-      }
-    },
-  };
-
-  return multiline ? (
-    <textarea
-      {...proseText}
-      {...shared}
-      ref={input as React.RefObject<HTMLTextAreaElement>}
-      rows={Math.min(14, Math.max(2, draft.split("\n").length + 1))}
-    />
-  ) : (
+  return (
     <input
       {...plainText}
-      {...shared}
-      ref={input as React.RefObject<HTMLInputElement>}
+      className={`editable-input ${className}`.trim()}
+      value={draft}
+      placeholder={placeholder}
+      ref={input}
+      onBlur={commit}
+      onChange={(event) => setDraft(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          setDraft(value);
+          setEditing(false);
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          commit();
+        }
+      }}
     />
   );
 }

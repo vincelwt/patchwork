@@ -2942,20 +2942,6 @@ details.run-thought > summary > svg {
   color: var(--text-faint);
 }
 /* A long expected result should not push the whole task off the screen. */
-.editable.clamped {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 6;
-  overflow: hidden;
-}
-.editable-more {
-  color: var(--text-faint);
-  font-size: 13px;
-  padding: 2px 0;
-}
-.editable-more:hover {
-  color: var(--text);
-}
 .editable-input {
   width: calc(100% + 12px);
   margin-left: -6px;
@@ -2984,19 +2970,6 @@ details.run-thought > summary > svg {
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.25;
-}
-.task-outcome,
-.task-outcome.editable-input {
-  color: var(--text-muted);
-  font-size: 14.5px;
-  margin-top: 2px;
-  line-height: 1.5;
-  /* Written with line breaks, so read with them. */
-  white-space: pre-wrap;
-}
-.task-outcome.editable-input {
-  max-height: 42vh;
-  overflow: auto;
 }
 
 /* Four steps, so where the task is arrives before you have read anything. */
