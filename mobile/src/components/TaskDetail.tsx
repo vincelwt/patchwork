@@ -193,17 +193,9 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
         </View>
         <ErrorNotice message={error} />
       </View>
-      {/* The outcome opens the history rather than sitting above it: read once,
-          then scrolled away like the oldest message. */}
-      <Conversation
-        channelId={task.discussion_channel_id}
-        intro={task.outcome.trim() ? (
-          <View style={styles.outcome}>
-            <Text style={[styles.outcomeLabel, { color: theme.faint }]}>Outcome</Text>
-            <Text style={[styles.outcomeText, { color: theme.muted }]}>{task.outcome.trim()}</Text>
-          </View>
-        ) : undefined}
-      />
+      {/* The outcome is already the first message of this discussion, posted
+          when the task was opened, so the header does not repeat it. */}
+      <Conversation channelId={task.discussion_channel_id} />
 
       <Sheet visible={editing} title={`Edit ${task.key}`} onClose={() => setEditing(false)}>
         <TaskEditor task={task} onSaved={() => setEditing(false)} />
@@ -237,9 +229,6 @@ const styles = StyleSheet.create({
   runs: { gap: 2 },
   runRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8, borderTopWidth: StyleSheet.hairlineWidth },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  outcome: { paddingVertical: 8, gap: 3 },
-  outcomeLabel: { fontSize: 12, fontWeight: "700" },
-  outcomeText: { fontSize: 14, lineHeight: 20 },
   agentList: { paddingBottom: 20 },
   agentRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
 });

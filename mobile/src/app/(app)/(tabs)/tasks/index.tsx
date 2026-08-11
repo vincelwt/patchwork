@@ -8,7 +8,7 @@ import { TaskEditor } from "@/components/TaskEditor";
 import { PullRequestLink } from "@/components/pull-request-link";
 import { Avatar, Badge, ChoiceField, Empty, Icon, Measured, Sheet } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { largeTitles, useLayout } from "@/lib/layout";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { TaskDetail } from "@/components/TaskDetail";
@@ -99,8 +99,8 @@ export default function TasksScreen() {
         options={{
           // Beside a detail pane the bar stays opaque, so neither column slides
           // under it and no column has to guess the bar's height.
-          headerLargeTitle: !split,
-          headerTransparent: !split,
+          headerLargeTitle: largeTitles && !split,
+          headerTransparent: largeTitles && !split,
           headerRight: () => (
             <Pressable accessibilityRole="button" accessibilityLabel="New task" hitSlop={8} onPress={() => setCreating(true)}>
               <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />

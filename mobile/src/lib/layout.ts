@@ -19,6 +19,11 @@ export interface Layout {
   gutter: number;
 }
 
+/// iOS draws a large title in its own space and insets a scroll view under a
+/// transparent bar for you. Android does neither, so asking for both there
+/// paints the title straight onto the first row of the list.
+export const largeTitles = process.env.EXPO_OS === "ios";
+
 const SPLIT_AT = 820;
 /// A phone on its side is wide enough for two columns and far too short for
 /// them: a list, a conversation and a keyboard do not share 440pt of height.

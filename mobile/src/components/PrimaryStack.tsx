@@ -1,6 +1,6 @@
 import { Stack } from "expo-router";
 
-import { useLayout } from "@/lib/layout";
+import { largeTitles, useLayout } from "@/lib/layout";
 import { useTheme } from "@/lib/theme";
 
 /// Every tab's root looks the same: a title and its own actions on the right.
@@ -20,12 +20,12 @@ export function PrimaryStack({ title, detail }: { title: string; detail?: string
         headerBackButtonDisplayMode: "minimal",
         headerLargeTitleShadowVisible: false,
         headerShadowVisible: false,
-        headerTransparent: true,
+        headerTransparent: largeTitles,
       }}
     >
       <Stack.Screen
         name="index"
-        options={{ title, headerLargeTitle: !wide }}
+        options={{ title, headerLargeTitle: largeTitles && !wide }}
       />
       {/* A detail screen leads with a header row or a bottom-anchored list, so it
           keeps an opaque bar rather than letting content slide under it. */}

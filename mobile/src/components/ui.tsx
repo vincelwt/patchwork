@@ -3,7 +3,6 @@ import { GlassView, isLiquidGlassAvailable } from "expo-glass-effect";
 import { SymbolView, type SymbolViewProps } from "expo-symbols";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -21,6 +20,7 @@ import { useRouter } from "expo-router";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Member, Presence } from "@client/types";
+import { useKeyboardInset } from "@/lib/keyboard";
 import { useLayout } from "@/lib/layout";
 import type { ConnectionState } from "@/lib/store";
 import { useTheme, type Palette } from "@/lib/theme";
@@ -309,6 +309,9 @@ export function Sheet({
   children: ReactNode;
 }) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
+  // The safe area below is already reserved by the sheet's own SafeAreaView.
+  const keyboard = useKeyboardInset(insets.bottom);
   return (
     <Modal
       visible={visible}
@@ -319,17 +322,15 @@ export function Sheet({
       onRequestClose={onClose}
     >
       <SafeAreaView style={[styles.modalSafe, { backgroundColor: theme.bg }]} edges={["top", "bottom"]}>
-        <KeyboardAvoidingView behavior="padding" style={styles.modal}>
-          <View style={[styles.sheet, { backgroundColor: theme.bg }]}>
-            <View style={[styles.sheetHead, { backgroundColor: theme.raised, borderBottomColor: theme.line }]}>
-              <Text accessibilityRole="header" style={[styles.sheetTitle, { color: theme.text }]}>
-                {title}
-              </Text>
-              <Button label="Done" tone="quiet" compact onPress={onClose} />
-            </View>
-            {children}
+        <View style={[styles.sheet, { backgroundColor: theme.bg, paddingBottom: keyboard }]}>
+          <View style={[styles.sheetHead, { backgroundColor: theme.raised, borderBottomColor: theme.line }]}>
+            <Text accessibilityRole="header" style={[styles.sheetTitle, { color: theme.text }]}>
+              {title}
+            </Text>
+            <Button label="Done" tone="quiet" compact onPress={onClose} />
           </View>
-        </KeyboardAvoidingView>
+          {children}
+        </View>
       </SafeAreaView>
     </Modal>
   );
@@ -525,7 +526,6 @@ const styles = StyleSheet.create({
   rowSubtitle: { fontSize: 13, lineHeight: 18, marginTop: 2 },
   toggleRow: { flexDirection: "row", alignItems: "center", gap: 12, minHeight: 54 },
   modalSafe: { flex: 1 },
-  modal: { flex: 1 },
   sheet: { flex: 1 },
   sheetHead: {
     minHeight: 54,

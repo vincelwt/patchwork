@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ActivityIndicator, FlatList, KeyboardAvoidingView, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -9,9 +9,9 @@ import { Markdown } from "@/components/Markdown";
 import { Avatar, Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/components/ui";
 import { useDictation } from "@/lib/dictation";
 import { duration, relative, runStatusLabel } from "@/lib/format";
+import { useKeyboardInset } from "@/lib/keyboard";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
-import { useBottomAnchoredList } from "@/lib/scroll";
 
 export default function RunScreen() {
   const { runId } = useLocalSearchParams<{ runId: string }>();
@@ -26,10 +26,9 @@ export default function RunScreen() {
   const question = detail?.questions.find((item) => item.status === "open")
     ?? workspace.bootstrap?.open_questions.find((item) => item.run_id === runId);
   const events = detail?.events ?? [];
-  const anchor = useBottomAnchoredList<RunEvent>(
-    runId,
-    run ? events.length + 1 : 0,
-  );
+  // Newest first and drawn upside down, so a run that is still working opens on
+  // what it just did rather than on where it started.
+  const newestFirst = useMemo(() => [...events].reverse(), [events]);
 
   useEffect(() => {
     void store.loadRun(runId);
@@ -55,19 +54,13 @@ export default function RunScreen() {
         }}
       />
       <FlatList
-        ref={anchor.listRef}
-        data={events}
+        inverted
+        data={newestFirst}
         keyExtractor={(event) => event.id}
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.list}
-        onContentSizeChange={anchor.onContentSizeChange}
-        onScroll={anchor.onScroll}
-        onScrollBeginDrag={anchor.onScrollBeginDrag}
-        onScrollEndDrag={anchor.onScrollEndDrag}
-        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
-        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
-        scrollEventThrottle={16}
-        ListHeaderComponent={
+        keyboardDismissMode="interactive"
+        ListFooterComponent={
           <Measured style={styles.headerContent}>
             <Card style={styles.summary}>
               <View style={styles.summaryHead}>
@@ -122,6 +115,7 @@ function RunEventRow({ event }: { event: RunEvent }) {
 function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string; agentName: string }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardInset(insets.bottom);
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [text, setText] = useState("");
@@ -148,10 +142,7 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
     }
   };
   return (
-    // `padding` overwrites this view's own paddingBottom, so the bar's spacing
-    // and safe-area inset live on the child instead.
-    <KeyboardAvoidingView behavior="padding" style={{ backgroundColor: theme.bg }}>
-     <View style={[styles.steer, { borderTopColor: theme.line, paddingBottom: 10 + insets.bottom }]}>
+    <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg, paddingBottom: 10 + insets.bottom + keyboard }]}>
      <Measured>
       <Text style={[styles.steerTarget, { color: theme.muted }]}>Straight to {agentName} in this run</Text>
       <PendingImages images={images.pending} onRemove={images.remove} />
@@ -174,8 +165,7 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
       </View>
       <ErrorNotice message={error || images.error || dictation.error} />
      </Measured>
-     </View>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 

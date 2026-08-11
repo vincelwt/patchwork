@@ -1,10 +1,9 @@
-import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
   Linking,
   Pressable,
-  RefreshControl,
   StyleSheet,
   Text,
   View,
@@ -16,7 +15,6 @@ import { dayLabel, isSameTurn, runStatusLabel, timeOfDay } from "@/lib/format";
 import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
-import { useBottomAnchoredList } from "@/lib/scroll";
 import { AttachmentView } from "./Attachment";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
@@ -24,21 +22,19 @@ import { Avatar, Badge, Button, Empty, Icon, Measured, Sheet } from "./ui";
 
 const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
-export function Conversation({ channelId, intro }: {
-  channelId: Id;
-  /// Where the conversation came from, read once at the top of its own history
-  /// instead of pinned above it forever.
-  intro?: ReactNode;
-}) {
+export function Conversation({ channelId }: { channelId: Id }) {
   const theme = useTheme();
   const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
   const messages = workspace.messages[channelId] ?? [];
-  const [refreshing, setRefreshing] = useState(false);
   const [replyTo, setReplyTo] = useState<Message>();
-  const anchor = useBottomAnchoredList<Message>(channelId, messages.length);
+  // Newest first, drawn upside down. The newest message then lives at offset
+  // zero, so the transcript opens on it rather than being scrolled there once
+  // it has laid out, and older messages load in without moving the view. The
+  // oldest end is the list's footer, which is where loading more belongs.
+  const newestFirst = useMemo(() => [...messages].reverse(), [messages]);
 
   useEffect(() => {
     setReplyTo(undefined);
@@ -47,21 +43,17 @@ export function Conversation({ channelId, intro }: {
 
   if (!channel) return <Empty title="Conversation unavailable" detail="It may have been archived or removed." />;
 
-  const refresh = async () => {
-    setRefreshing(true);
-    await store.loadMessages(channelId).catch(() => undefined);
-    setRefreshing(false);
-  };
-
   return (
     <View style={styles.conversation}>
       <FlatList
-        ref={anchor.listRef}
-        data={messages}
+        inverted
+        data={newestFirst}
         keyExtractor={(message) => message.id}
-        contentContainerStyle={messages.length ? styles.list : styles.emptyList}
+        contentContainerStyle={newestFirst.length ? styles.list : styles.emptyList}
         renderItem={({ item, index }) => {
-          const previous = messages[index - 1];
+          // Upside down, so the message before this one in time is the next one
+          // along in the data.
+          const previous = newestFirst[index + 1];
           const newDay = !previous || dayLabel(previous.created_at) !== dayLabel(item.created_at);
           return (
             <Measured>
@@ -75,29 +67,18 @@ export function Conversation({ channelId, intro }: {
           );
         }}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
-        ListHeaderComponent={intro || workspace.hasMore[channelId] ? (
+        ListFooterComponent={workspace.hasMore[channelId] ? (
           <Measured>
-            <View style={{ paddingHorizontal: gutter, paddingTop: 8 }}>
-              {intro}
-              {workspace.hasMore[channelId] ? (
-                <Button
-                  label="Load older messages"
-                  tone="quiet"
-                  onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
-                />
-              ) : null}
+            <View style={{ paddingHorizontal: gutter, paddingVertical: 8 }}>
+              <Button
+                label="Load older messages"
+                tone="quiet"
+                onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
+              />
             </View>
           </Measured>
         ) : null}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
-        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
-        onContentSizeChange={anchor.onContentSizeChange}
-        onScroll={anchor.onScroll}
-        onScrollBeginDrag={anchor.onScrollBeginDrag}
-        onScrollEndDrag={anchor.onScrollEndDrag}
-        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
-        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
-        scrollEventThrottle={16}
+        keyboardDismissMode="interactive"
         initialNumToRender={20}
         windowSize={9}
       />

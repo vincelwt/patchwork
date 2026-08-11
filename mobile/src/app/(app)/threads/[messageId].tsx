@@ -6,8 +6,6 @@ import { Composer } from "@/components/Composer";
 import { MessageRow } from "@/components/Message";
 import { Empty, Measured } from "@/components/ui";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
-import { useBottomAnchoredList } from "@/lib/scroll";
-import type { Message } from "@client/types";
 
 export default function ThreadScreen() {
   const { messageId } = useLocalSearchParams<{ messageId: string }>();
@@ -19,10 +17,10 @@ export default function ThreadScreen() {
   );
   const replies = workspace.threads[messageId] ?? [];
   const channel = workspace.bootstrap?.channels.find((item) => item.id === root?.channel_id);
-  const anchor = useBottomAnchoredList<Message>(
-    messageId,
-    root ? replies.length + 1 : 0,
-  );
+  // Newest reply first and drawn upside down, so the thread opens on the latest
+  // reply without having to be scrolled there. The message the thread hangs off
+  // is its oldest entry, which upside down is the list's footer.
+  const newestFirst = useMemo(() => [...replies].reverse(), [replies]);
 
   useEffect(() => {
     void store.loadThread(messageId);
@@ -36,20 +34,14 @@ export default function ThreadScreen() {
       ) : (
         <>
           <FlatList
-            ref={anchor.listRef}
-            data={replies}
+            inverted
+            data={newestFirst}
             keyExtractor={(message) => message.id}
-            ListHeaderComponent={<Measured style={styles.root}><MessageRow message={root} inThread /></Measured>}
+            ListFooterComponent={<Measured style={styles.root}><MessageRow message={root} inThread /></Measured>}
             renderItem={({ item }) => <Measured><MessageRow message={item} inThread /></Measured>}
             contentInsetAdjustmentBehavior="automatic"
             contentContainerStyle={styles.list}
-            onContentSizeChange={anchor.onContentSizeChange}
-            onScroll={anchor.onScroll}
-            onScrollBeginDrag={anchor.onScrollBeginDrag}
-            onScrollEndDrag={anchor.onScrollEndDrag}
-            onMomentumScrollBegin={anchor.onMomentumScrollBegin}
-            onMomentumScrollEnd={anchor.onMomentumScrollEnd}
-            scrollEventThrottle={16}
+            keyboardDismissMode="interactive"
           />
           <Composer channelId={channel.id} parentId={messageId} taskId={channel.task_id} placeholder="Reply in thread" />
         </>
@@ -61,5 +53,5 @@ export default function ThreadScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   list: { paddingVertical: 8 },
-  root: { paddingBottom: 12, marginBottom: 4 },
+  root: { paddingTop: 12, marginTop: 4 },
 });

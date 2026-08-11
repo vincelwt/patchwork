@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  KeyboardAvoidingView,
   Pressable,
   StyleSheet,
   Text,
@@ -13,6 +12,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
+import { useKeyboardInset } from "@/lib/keyboard";
 import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -36,6 +36,7 @@ export function Composer({
 }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardInset(insets.bottom);
   const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
@@ -104,20 +105,17 @@ export function Composer({
   };
 
   return (
-    // `padding` measures this bar's own frame against the keyboard, so it lifts
-    // by the real overlap on both platforms, including Android's edge-to-edge
-    // window, which never resizes for the keyboard on its own.
-    <KeyboardAvoidingView behavior="padding">
-      {/* The bar floats as a capsule over the conversation rather than sealing
-          the bottom of the screen with a rule. */}
-      <View
-        style={[
-          styles.wrap,
-          { backgroundColor: theme.bg, paddingHorizontal: gutter, paddingBottom: 10 + insets.bottom },
-        ]}
-      >
-       <Measured>
-        {mention.length ? (
+    // The bar floats as a capsule over the conversation rather than sealing the
+    // bottom of the screen with a rule, and sits on the keyboard while one is
+    // open instead of underneath it.
+    <View
+      style={[
+        styles.wrap,
+        { backgroundColor: theme.bg, paddingHorizontal: gutter, paddingBottom: 10 + insets.bottom + keyboard },
+      ]}
+    >
+     <Measured>
+      {mention.length ? (
           <Glass radius={14} style={styles.mentions}>
             {mention.map((member) => (
               <Pressable accessibilityRole="button" key={member.id} onPress={() => insertMention(member.handle)} style={styles.mentionRow}>
@@ -207,9 +205,8 @@ export function Composer({
         {error || images.error || dictation.error ? (
           <Text style={[styles.error, { color: theme.danger }]}>{error || images.error || dictation.error}</Text>
         ) : null}
-       </Measured>
-      </View>
-    </KeyboardAvoidingView>
+     </Measured>
+    </View>
   );
 }
 
