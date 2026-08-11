@@ -139,6 +139,9 @@ struct AskArgs {
     /// Require one of the options.
     #[arg(long)]
     no_free_text: bool,
+    /// Cancel the question this run already asked and ask this one instead.
+    #[arg(long)]
+    replace: bool,
 }
 
 #[derive(Args)]
@@ -1345,7 +1348,12 @@ async fn ask(client: &Client, ctx: &RunContext, args: AskArgs) -> Result<()> {
     let question: Question = client
         .post(
             "/api/questions",
-            json!({ "run_id": run_id, "headline": args.header, "items": [item] }),
+            json!({
+                "run_id": run_id,
+                "headline": args.header,
+                "items": [item],
+                "replace": args.replace,
+            }),
         )
         .await?;
 

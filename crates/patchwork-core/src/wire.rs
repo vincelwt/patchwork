@@ -282,6 +282,10 @@ pub struct AskQuestion {
     #[serde(default)]
     pub headline: String,
     pub items: Vec<QuestionItem>,
+    /// Cancel whatever this run already asked and ask this instead. Without
+    /// it, a second question is refused while the first is unanswered.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
