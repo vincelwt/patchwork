@@ -1,12 +1,10 @@
-import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 
 import { relayLabel, workspaceInitials, workspaceLabel, type PairedSession } from "@/lib/paired";
 import { usePairedSession } from "@/lib/session";
-import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
-import { Glass, Icon, Sheet, glass } from "./ui";
+import { Icon, Sheet } from "./ui";
 
 /// Four squares of the mark, coloured from the workspace's own identity so two
 /// workspaces never look alike in the switcher.
@@ -24,41 +22,6 @@ export function WorkspaceMark({ session, size = 26 }: { session: PairedSession; 
     <View style={[styles.mark, { width: size, height: size, borderRadius: size * 0.3, backgroundColor: tint }]}>
       <Text style={[styles.markText, { fontSize: size * 0.42 }]}>{workspaceInitials(session)}</Text>
     </View>
-  );
-}
-
-/// The header control. Shows which workspace is on screen and opens the list.
-export function WorkspaceButton() {
-  const theme = useTheme();
-  const { session, workspaces } = usePairedSession();
-  const live = useWorkspace().bootstrap?.workspace.name;
-  const [open, setOpen] = useState(false);
-  if (!session) return null;
-  const named = live ? { ...session, name: live } : session;
-
-  return (
-    <>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`Workspace ${workspaceLabel(named)}. Switch workspace`}
-        hitSlop={6}
-        onPress={() => setOpen(true)}
-        style={({ pressed }) => [pressed && { opacity: 0.6 }]}
-      >
-        <Glass radius={999} style={styles.button} interactive>
-          <WorkspaceMark session={named} size={22} />
-          <Text numberOfLines={1} style={[styles.buttonLabel, { color: theme.text }]}>
-            {workspaceLabel(named)}
-          </Text>
-          <Icon
-            name={{ ios: "chevron.up.chevron.down", android: "unfold_more", web: "unfold_more" }}
-            color={theme.faint}
-            size={11}
-          />
-        </Glass>
-      </Pressable>
-      <WorkspaceSheet visible={open} onClose={() => setOpen(false)} workspaces={workspaces} active={session} />
-    </>
   );
 }
 
@@ -141,18 +104,6 @@ export function WorkspaceSheet({
 }
 
 const styles = StyleSheet.create({
-  button: {
-    maxWidth: 190,
-    minHeight: 34,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 7,
-    paddingLeft: 6,
-    paddingRight: 11,
-    overflow: "hidden",
-    ...(glass ? null : { paddingVertical: 3 }),
-  },
-  buttonLabel: { flexShrink: 1, fontSize: 14, fontWeight: "700", letterSpacing: -0.2 },
   mark: { alignItems: "center", justifyContent: "center" },
   markText: { color: "#ffffff", fontWeight: "800" },
   list: { paddingBottom: 24 },

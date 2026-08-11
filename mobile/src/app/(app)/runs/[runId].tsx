@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, FlatList, KeyboardAvoidingView, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { RunEvent } from "@client/types";
 import { PendingImages, useImageAttachments } from "@/components/Attachment";
@@ -120,6 +121,7 @@ function RunEventRow({ event }: { event: RunEvent }) {
 
 function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string; agentName: string }) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [text, setText] = useState("");
@@ -146,7 +148,10 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
     }
   };
   return (
-    <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg }]}>
+    // `padding` overwrites this view's own paddingBottom, so the bar's spacing
+    // and safe-area inset live on the child instead.
+    <KeyboardAvoidingView behavior="padding" style={{ backgroundColor: theme.bg }}>
+     <View style={[styles.steer, { borderTopColor: theme.line, paddingBottom: 10 + insets.bottom }]}>
      <Measured>
       <Text style={[styles.steerTarget, { color: theme.muted }]}>Straight to {agentName} in this run</Text>
       <PendingImages images={images.pending} onRemove={images.remove} />
@@ -169,7 +174,8 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
       </View>
       <ErrorNotice message={error || images.error || dictation.error} />
      </Measured>
-    </View>
+     </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -189,7 +195,7 @@ const styles = StyleSheet.create({
   event: { flexDirection: "row", gap: 10, paddingHorizontal: 14, paddingVertical: 8 },
   eventKind: { width: 72, fontSize: 10, fontWeight: "700" },
   eventText: { fontSize: 13, lineHeight: 19, fontFamily: "monospace" },
-  steer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, gap: 5 },
+  steer: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 10, paddingTop: 10, gap: 5 },
   steerTarget: { fontSize: 11, fontWeight: "600" },
   steerBox: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 8 },
   steerInput: { minHeight: 38, maxHeight: 120, fontSize: 15, textAlignVertical: "top" },

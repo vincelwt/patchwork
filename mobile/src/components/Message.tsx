@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -12,7 +12,7 @@ import {
 import { useRouter } from "expo-router";
 
 import type { Id, Message, MessageCard, Run } from "@client/types";
-import { dayLabel, runStatusLabel, timeOfDay } from "@/lib/format";
+import { dayLabel, isSameTurn, runStatusLabel, timeOfDay } from "@/lib/format";
 import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -24,7 +24,12 @@ import { Avatar, Badge, Button, Empty, Icon, Measured, Sheet } from "./ui";
 
 const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
-export function Conversation({ channelId }: { channelId: Id }) {
+export function Conversation({ channelId, intro }: {
+  channelId: Id;
+  /// Where the conversation came from, read once at the top of its own history
+  /// instead of pinned above it forever.
+  intro?: ReactNode;
+}) {
   const theme = useTheme();
   const { gutter } = useLayout();
   const workspace = useWorkspace();
@@ -55,25 +60,34 @@ export function Conversation({ channelId }: { channelId: Id }) {
         data={messages}
         keyExtractor={(message) => message.id}
         contentContainerStyle={messages.length ? styles.list : styles.emptyList}
-        renderItem={({ item, index }) => (
-          <Measured>
-            {index === 0 || dayLabel(messages[index - 1].created_at) !== dayLabel(item.created_at) ? (
-              <View style={styles.day}>
-                <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
-              </View>
-            ) : null}
-            <MessageRow message={item} onReply={setReplyTo} />
-          </Measured>
-        )}
+        renderItem={({ item, index }) => {
+          const previous = messages[index - 1];
+          const newDay = !previous || dayLabel(previous.created_at) !== dayLabel(item.created_at);
+          return (
+            <Measured>
+              {newDay ? (
+                <View style={styles.day}>
+                  <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
+                </View>
+              ) : null}
+              <MessageRow message={item} compact={!newDay && isSameTurn(previous, item)} onReply={setReplyTo} />
+            </Measured>
+          );
+        }}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
-        ListHeaderComponent={workspace.hasMore[channelId] ? (
-          <View style={{ paddingHorizontal: gutter, paddingTop: 8 }}>
-            <Button
-              label="Load older messages"
-              tone="quiet"
-              onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
-            />
-          </View>
+        ListHeaderComponent={intro || workspace.hasMore[channelId] ? (
+          <Measured>
+            <View style={{ paddingHorizontal: gutter, paddingTop: 8 }}>
+              {intro}
+              {workspace.hasMore[channelId] ? (
+                <Button
+                  label="Load older messages"
+                  tone="quiet"
+                  onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
+                />
+              ) : null}
+            </View>
+          </Measured>
         ) : null}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
         maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
@@ -101,10 +115,13 @@ export function Conversation({ channelId }: { channelId: Id }) {
 export const MessageRow = memo(function MessageRow({
   message,
   inThread,
+  compact,
   onReply,
 }: {
   message: Message;
   inThread?: boolean;
+  /// Part of the same turn as the line above: no face, no name, no time.
+  compact?: boolean;
   onReply?: (message: Message) => void;
 }) {
   const theme = useTheme();
@@ -158,15 +175,17 @@ export const MessageRow = memo(function MessageRow({
       }}
       delayLongPress={280}
       onLongPress={() => setActions(true)}
-      style={[styles.message, { paddingHorizontal: gutter }]}
+      style={[styles.message, compact && styles.messageTight, { paddingHorizontal: gutter }]}
     >
-      <Avatar member={author} size={32} />
+      {compact ? <View style={styles.avatarSpacer} /> : <Avatar member={author} size={32} />}
       <View style={styles.messageMain}>
-        <View style={styles.messageHead}>
-          <Text style={[styles.author, { color: theme.text }]}>{author?.display_name ?? "Unknown"}</Text>
-          {author?.kind === "agent" ? <Badge tone="accent">agent</Badge> : null}
-          <Text style={[styles.time, { color: theme.faint }]}>{timeOfDay(message.created_at)}</Text>
-        </View>
+        {compact ? null : (
+          <View style={styles.messageHead}>
+            <Text style={[styles.author, { color: theme.text }]}>{author?.display_name ?? "Unknown"}</Text>
+            {author?.kind === "agent" ? <Badge tone="accent">agent</Badge> : null}
+            <Text style={[styles.time, { color: theme.faint }]}>{timeOfDay(message.created_at)}</Text>
+          </View>
+        )}
         {run ? <RunLine run={run} /> : null}
         {message.reply_to_id ? (
           <View style={styles.replyReference}>
@@ -329,6 +348,8 @@ const styles = StyleSheet.create({
   day: { alignItems: "center", paddingVertical: 10 },
   dayText: { fontSize: 12, fontWeight: "600", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3, overflow: "hidden" },
   message: { flexDirection: "row", gap: 11, paddingVertical: 9 },
+  messageTight: { paddingTop: 0, paddingBottom: 3 },
+  avatarSpacer: { width: 32 },
   messageMain: { flex: 1, minWidth: 0 },
   messageHead: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 2 },
   author: { fontSize: 15, fontWeight: "700" },

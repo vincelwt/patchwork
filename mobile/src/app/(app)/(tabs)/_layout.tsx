@@ -1,11 +1,23 @@
 import { NativeTabs } from "expo-router/unstable-native-tabs";
 
+import type { SFSymbol } from "sf-symbols-typescript";
+
+import { workspaceSymbol } from "@/lib/paired";
+import { usePairedSession } from "@/lib/session";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
 export default function TabLayout() {
   const theme = useTheme();
-  const unread = useWorkspace().bootstrap?.inbox.filter((item) => !item.read_at).length ?? 0;
+  const bootstrap = useWorkspace().bootstrap;
+  const unread = bootstrap?.inbox.filter((item) => !item.read_at).length ?? 0;
+  const { session } = usePairedSession();
+  // Which workspace is on screen rides on the More tab, the way a settings tab
+  // carries the current account, instead of taking a header row on every tab.
+  const workspace = workspaceSymbol(session && bootstrap ? { ...session, name: bootstrap.workspace.name } : session) as {
+    default: SFSymbol;
+    selected: SFSymbol;
+  };
 
   return (
     <NativeTabs
@@ -35,7 +47,7 @@ export default function TabLayout() {
         <NativeTabs.Trigger.Label>Tasks</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
       <NativeTabs.Trigger name="more" role="more">
-        <NativeTabs.Trigger.Icon sf={{ default: "ellipsis.circle", selected: "ellipsis.circle.fill" }} md="more_horiz" />
+        <NativeTabs.Trigger.Icon sf={workspace} md="workspaces" />
         <NativeTabs.Trigger.Label>More</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
       <NativeTabs.Trigger name="search" role="search">

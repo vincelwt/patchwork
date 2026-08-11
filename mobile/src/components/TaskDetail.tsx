@@ -5,7 +5,7 @@ import { Stack, useRouter } from "expo-router";
 import { Conversation } from "./Message";
 import { PullRequestLink } from "./pull-request-link";
 import { TaskEditor } from "./TaskEditor";
-import { Avatar, Badge, Button, Card, ErrorNotice, Sheet } from "./ui";
+import { Avatar, Badge, Button, ErrorNotice, Sheet } from "./ui";
 import { runStatusLabel, taskStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useLayout } from "@/lib/layout";
@@ -107,17 +107,18 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
           }}
         />
       )}
-      <Card style={[styles.summary, { marginHorizontal: gutter, marginTop: gutter - 4 }]}>
+      {/* One strip under the navigation bar rather than a card floating below
+          it: the title, who and when, and what can be done, in three tight
+          lines. Everything the task said about itself is in the discussion. */}
+      <View style={[styles.head, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
         <View style={styles.titleRow}>
-          <View style={styles.grow}>
-            {embedded ? <Text style={[styles.key, { color: theme.faint }]}>{task.key}</Text> : null}
-            <Text style={[styles.title, { color: theme.text }]}>{task.title}</Text>
-          </View>
-          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : task.status === "canceled" ? "neutral" : "accent"}>{taskStatusLabel(task.status)}</Badge>
+          <Text numberOfLines={2} style={[styles.title, { color: theme.text }]}>{task.title}</Text>
           {embedded ? <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} /> : null}
         </View>
         <View style={styles.meta}>
-          {owner ? <View style={styles.person}><Avatar member={owner} size={25} /><Text style={{ color: theme.text }}>{owner.display_name}</Text></View> : <Text style={{ color: theme.faint }}>Unassigned</Text>}
+          {embedded ? <Text style={[styles.key, { color: theme.faint }]}>{task.key}</Text> : null}
+          <Badge tone={task.status === "blocked" ? "danger" : task.status === "review" ? "caution" : task.status === "done" ? "positive" : task.status === "canceled" ? "neutral" : "accent"}>{taskStatusLabel(task.status)}</Badge>
+          {owner ? <View style={styles.person}><Avatar member={owner} size={22} /><Text numberOfLines={1} style={[styles.metaText, { color: theme.muted }]}>{owner.display_name}</Text></View> : <Text style={[styles.metaText, { color: theme.faint }]}>Unassigned</Text>}
           {project ? <Badge>{project.name}</Badge> : null}
           {task.due_at ? <Badge tone={task.due_at < Date.now() && !isTerminalTaskStatus(task.status) ? "danger" : "caution"}>Due {new Date(task.due_at).toLocaleDateString()}</Badge> : null}
           <PullRequestLink task={task} />
@@ -191,11 +192,18 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
           {!isTerminalTaskStatus(task.status) && task.status !== "review" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
         </View>
         <ErrorNotice message={error} />
-      </Card>
-      <View style={[styles.discussionHead, { borderBottomColor: theme.line, paddingHorizontal: gutter }]}>
-        <Text style={[styles.discussionTitle, { color: theme.faint }]}>Discussion</Text>
       </View>
-      <Conversation channelId={task.discussion_channel_id} />
+      {/* The outcome opens the history rather than sitting above it: read once,
+          then scrolled away like the oldest message. */}
+      <Conversation
+        channelId={task.discussion_channel_id}
+        intro={task.outcome.trim() ? (
+          <View style={styles.outcome}>
+            <Text style={[styles.outcomeLabel, { color: theme.faint }]}>Outcome</Text>
+            <Text style={[styles.outcomeText, { color: theme.muted }]}>{task.outcome.trim()}</Text>
+          </View>
+        ) : undefined}
+      />
 
       <Sheet visible={editing} title={`Edit ${task.key}`} onClose={() => setEditing(false)}>
         <TaskEditor task={task} onSaved={() => setEditing(false)} />
@@ -219,18 +227,19 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  grow: { flex: 1, minWidth: 0 },
-  key: { fontSize: 12, fontWeight: "700", marginBottom: 2 },
-  summary: { marginBottom: 12, padding: 16, gap: 10 },
-  titleRow: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
-  title: { fontSize: 19, fontWeight: "700", lineHeight: 25 },
-  meta: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 9 },
-  person: { flexDirection: "row", alignItems: "center", gap: 6 },
+  key: { fontSize: 12, fontWeight: "700" },
+  head: { paddingTop: 6, paddingBottom: 9, gap: 7, borderBottomWidth: StyleSheet.hairlineWidth },
+  titleRow: { flexDirection: "row", gap: 8, alignItems: "flex-start" },
+  title: { flex: 1, fontSize: 16, fontWeight: "700", lineHeight: 21 },
+  meta: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
+  metaText: { flexShrink: 1, fontSize: 13 },
+  person: { flexDirection: "row", alignItems: "center", gap: 5 },
   runs: { gap: 2 },
   runRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8, borderTopWidth: StyleSheet.hairlineWidth },
   actions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  discussionHead: { paddingHorizontal: 16, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth },
-  discussionTitle: { fontSize: 13, fontWeight: "600" },
+  outcome: { paddingVertical: 8, gap: 3 },
+  outcomeLabel: { fontSize: 12, fontWeight: "700" },
+  outcomeText: { fontSize: 14, lineHeight: 20 },
   agentList: { paddingBottom: 20 },
   agentRow: { minHeight: 60, flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
 });

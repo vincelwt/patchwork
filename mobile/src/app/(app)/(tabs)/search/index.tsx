@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { router, Stack } from "expo-router";
+import { router, Stack, useFocusEffect } from "expo-router";
+import type { SearchBarCommands } from "react-native-screens";
 
 import type { SearchResults } from "@client/types";
 import { Badge, ErrorNotice, Glass, Icon, Measured, Screen } from "@/components/ui";
@@ -17,6 +18,22 @@ export default function SearchScreen() {
   const [error, setError] = useState("");
   const request = useRef(0);
   const nativeSearch = process.env.EXPO_OS === "ios";
+  const searchBar = useRef<SearchBarCommands>(null);
+  const input = useRef<TextInput>(null);
+  // Read on focus rather than closed over, so returning to a search that still
+  // has its query sees the current one.
+  const typed = useRef("");
+  typed.current = query;
+
+  // Reaching this tab is the whole intent, so the caret is already waiting.
+  // A search that still has its query keeps its results readable instead.
+  useFocusEffect(
+    useCallback(() => {
+      if (typed.current) return;
+      const frame = requestAnimationFrame(() => (nativeSearch ? searchBar : input).current?.focus());
+      return () => cancelAnimationFrame(frame);
+    }, [nativeSearch]),
+  );
 
   useEffect(() => {
     const value = query.trim();
@@ -57,7 +74,9 @@ export default function SearchScreen() {
         options={{
           headerSearchBarOptions: nativeSearch
             ? {
+                ref: searchBar,
                 autoCapitalize: "none",
+                autoFocus: true,
                 hideNavigationBar: false,
                 hideWhenScrolling: false,
                 onCancelButtonPress: () => setQuery(""),
@@ -73,6 +92,7 @@ export default function SearchScreen() {
           <View style={[styles.searchBar, { backgroundColor: theme.input, borderColor: theme.line }]}>
             <Icon name={{ ios: "magnifyingglass", android: "search", web: "search" }} color={theme.faint} size={19} />
             <TextInput
+              ref={input}
               accessibilityLabel="Search workspace"
               autoCapitalize="none"
               autoCorrect={false}

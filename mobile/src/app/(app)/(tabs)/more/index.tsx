@@ -1,7 +1,12 @@
+import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 
+import { WorkspaceMark, WorkspaceSheet } from "@/components/WorkspaceSwitcher";
 import { Grouped, Icon, Screen } from "@/components/ui";
+import { workspaceLabel } from "@/lib/paired";
+import { usePairedSession } from "@/lib/session";
+import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
 const items = [
@@ -14,10 +19,34 @@ const items = [
 export default function MoreScreen() {
   const theme = useTheme();
   const router = useRouter();
+  const { session, workspaces } = usePairedSession();
+  const live = useWorkspace().bootstrap?.workspace.name;
+  const [switching, setSwitching] = useState(false);
+  const named = session ? { ...session, name: live || session.name } : null;
+
   return (
     <Screen style={{ backgroundColor: theme.surface }}>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.list}>
        <Grouped>
+        {/* The workspace leads the tab whose icon it is, so switching costs one
+            tap from anywhere instead of a control on every screen. */}
+        {named ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Workspace ${workspaceLabel(named)}. Switch workspace`}
+            onPress={() => setSwitching(true)}
+            style={({ pressed }) => [styles.row, { borderBottomColor: theme.line }, pressed && { opacity: 0.6 }]}
+          >
+            <WorkspaceMark session={named} size={30} />
+            <View style={styles.main}>
+              <Text numberOfLines={1} style={[styles.title, { color: theme.text }]}>{workspaceLabel(named)}</Text>
+              <Text numberOfLines={1} style={[styles.detail, { color: theme.muted }]}>
+                {workspaces.length > 1 ? `Switch between ${workspaces.length} workspaces` : "Pair another workspace"}
+              </Text>
+            </View>
+            <Icon name={{ ios: "chevron.up.chevron.down", android: "unfold_more", web: "unfold_more" }} color={theme.faint} size={14} />
+          </Pressable>
+        ) : null}
         {items.map((item) => (
           <Pressable
             key={item.href}
@@ -36,15 +65,18 @@ export default function MoreScreen() {
         ))}
        </Grouped>
       </ScrollView>
+      {named ? (
+        <WorkspaceSheet visible={switching} onClose={() => setSwitching(false)} workspaces={workspaces} active={named} />
+      ) : null}
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
   list: { paddingBottom: 24 },
-  row: { minHeight: 72, flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 10 },
+  row: { minHeight: 58, flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 16, paddingVertical: 8 },
   icon: { width: 30, alignItems: "center", justifyContent: "center" },
-  main: { flex: 1 },
-  title: { fontSize: 16, fontWeight: "700" },
-  detail: { fontSize: 13, marginTop: 3 },
+  main: { flex: 1, minWidth: 0 },
+  title: { fontSize: 16, fontWeight: "600" },
+  detail: { fontSize: 13, marginTop: 1 },
 });

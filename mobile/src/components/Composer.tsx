@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -105,7 +104,10 @@ export function Composer({
   };
 
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined}>
+    // `padding` measures this bar's own frame against the keyboard, so it lifts
+    // by the real overlap on both platforms, including Android's edge-to-edge
+    // window, which never resizes for the keyboard on its own.
+    <KeyboardAvoidingView behavior="padding">
       {/* The bar floats as a capsule over the conversation rather than sealing
           the bottom of the screen with a rule. */}
       <View

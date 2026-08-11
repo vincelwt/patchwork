@@ -9,6 +9,7 @@ import {
   withSession,
   withoutSession,
   workspaceInitials,
+  workspaceSymbol,
   type PairedSession,
 } from "./paired.ts";
 
@@ -58,4 +59,14 @@ test("names refresh from the workspace without disturbing the active choice", ()
 test("a workspace without a name is labelled by its relay host", () => {
   assert.equal(workspaceInitials(acme), "A");
   assert.equal(workspaceInitials(nightshade), "RE");
+});
+
+test("the tab bar symbol is the workspace's own initial", () => {
+  assert.deepEqual(workspaceSymbol(acme), { default: "a.square", selected: "a.square.fill" });
+  // No letter symbol exists outside a-z0-9, and nothing is paired yet either.
+  assert.deepEqual(workspaceSymbol({ ...acme, name: "\u5b57\u5178" }), {
+    default: "square.grid.2x2",
+    selected: "square.grid.2x2.fill",
+  });
+  assert.deepEqual(workspaceSymbol(null), { default: "square.grid.2x2", selected: "square.grid.2x2.fill" });
 });

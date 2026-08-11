@@ -112,6 +112,8 @@ export function ScrollScreen({ children }: { children: ReactNode }) {
     <ScrollView
       style={{ flex: 1, backgroundColor: theme.bg }}
       contentInsetAdjustmentBehavior="automatic"
+      // Scrolls whichever field is being typed into clear of the keyboard.
+      automaticallyAdjustKeyboardInsets
       contentContainerStyle={[styles.scroll, { padding: gutter, maxWidth: measure, width: "100%", alignSelf: "center" }]}
       keyboardShouldPersistTaps="handled"
     >
@@ -317,10 +319,7 @@ export function Sheet({
       onRequestClose={onClose}
     >
       <SafeAreaView style={[styles.modalSafe, { backgroundColor: theme.bg }]} edges={["top", "bottom"]}>
-        <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
-          style={styles.modal}
-        >
+        <KeyboardAvoidingView behavior="padding" style={styles.modal}>
           <View style={[styles.sheet, { backgroundColor: theme.bg }]}>
             <View style={[styles.sheetHead, { backgroundColor: theme.raised, borderBottomColor: theme.line }]}>
               <Text accessibilityRole="header" style={[styles.sheetTitle, { color: theme.text }]}>
