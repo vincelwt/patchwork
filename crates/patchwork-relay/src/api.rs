@@ -1555,7 +1555,7 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    let (committed, blocked_task) =
+    let (committed, blocked_task, superseded) =
         state
             .store
             .commit_question_waiting(&question, &run, &inbox_items)?;
@@ -1567,6 +1567,7 @@ async fn ask_question(
         });
         return Err(ApiError::conflict("that run has already ended"));
     }
+    orchestrator::settle_superseded_questions(&state, superseded).await?;
     state.emit(Event::RunUpdated { run: run.clone() });
     if let Some(task) = blocked_task {
         state.emit(Event::TaskUpdated { task });
@@ -3706,24 +3707,33 @@ mod tests {
         .await
         .unwrap()
         .0;
-        let _ = answer_question(
-            State(state.clone()),
-            human_caller(),
-            Path(question.id),
-            Json(AnswerQuestion {
-                answers: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
+        // The abandoned first ask cannot keep the task blocked once the run
+        // asks again: only the card a human can still answer counts.
+        assert_eq!(
+            store.question(&question.id).unwrap().unwrap().status,
+            QuestionStatus::Cancelled,
+        );
+        assert_eq!(
+            answer_question(
+                State(state.clone()),
+                human_caller(),
+                Path(question.id),
+                Json(AnswerQuestion {
+                    answers: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::CONFLICT
+        );
         assert_eq!(
             store.run("run-one").unwrap().unwrap().status,
             RunStatus::Waiting
         );
         assert_eq!(
             store.task(&task.id).unwrap().unwrap().status,
-            TaskStatus::Blocked,
-            "one answer cannot unblock a task with another open question",
+            TaskStatus::Blocked
         );
         assert_eq!(
             store.question(&second.id).unwrap().unwrap().status,
@@ -3736,7 +3746,8 @@ mod tests {
                 .iter()
                 .filter(|item| item.run_id.as_deref() == Some("run-one"))
                 .count(),
-            1
+            1,
+            "the superseded question's Inbox row is resolved with its card",
         );
         let _ = answer_question(
             State(state.clone()),

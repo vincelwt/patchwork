@@ -1981,12 +1981,17 @@ impl Store {
 
     /// Make the question, waiting run, blocked task and Inbox rows visible as
     /// one state. A terminal run wins the race and commits none of them.
+    ///
+    /// A run only reaches `ask` again once the `ask` before it is gone, because
+    /// that command blocks until it is answered. So whatever it left open was
+    /// abandoned: it is superseded here, or its unanswerable card holds the
+    /// task in Blocked even after somebody answers the question they can see.
     pub fn commit_question_waiting(
         &self,
         question: &Question,
         run: &Run,
         inbox: &[InboxItem],
-    ) -> Result<(bool, Option<Task>)> {
+    ) -> Result<(bool, Option<Task>, Vec<Question>)> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
@@ -1995,8 +2000,16 @@ impl Store {
             params![run.id, run.headline],
         )?;
         if changed == 0 {
-            return Ok((false, None));
+            return Ok((false, None, Vec::new()));
         }
+        let superseded = {
+            let mut stmt = tx.prepare(
+                "UPDATE questions SET status='cancelled'
+                 WHERE run_id=?1 AND status='open' RETURNING *",
+            )?;
+            let rows = stmt.query_map(params![run.id], Self::question_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         tx.execute(
             "INSERT INTO questions (id, run_id, agent_id, channel_id, task_id, message_id, headline, items, status, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',?9)",
@@ -2041,7 +2054,7 @@ impl Store {
             None
         };
         tx.commit()?;
-        Ok((true, blocked))
+        Ok((true, blocked, superseded))
     }
 
     pub fn answer_question(

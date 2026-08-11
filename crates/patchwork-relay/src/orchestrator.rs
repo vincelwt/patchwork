@@ -3288,6 +3288,20 @@ fn resolve_inbox(
     Ok(())
 }
 
+/// Retire the questions a re-asking run left open: the card stops inviting an
+/// answer nobody is waiting for, the Inbox badge clears, and a `patchwork ask`
+/// still long-polling learns it lost the floor instead of hanging.
+pub async fn settle_superseded_questions(state: &Shared, questions: Vec<Question>) -> Result<()> {
+    for question in questions {
+        state.emit(Event::QuestionUpdated {
+            question: question.clone(),
+        });
+        state.resolve_question(&question).await;
+        resolve_inbox(state, None, None, question.message_id.as_deref())?;
+    }
+    Ok(())
+}
+
 /// Settle every outstanding question when its run ends, including the card,
 /// Inbox badge and any long-polling `patchwork ask` process.
 pub async fn cancel_questions_for_run(state: &Shared, run_id: &str) -> Result<()> {
