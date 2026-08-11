@@ -72,6 +72,17 @@ body,
   margin: 0;
 }
 
+/* The app is a window, not a document. Pinned to the viewport so that nothing
+   inside it can ever make the page itself scrollable: one overflowing message,
+   chart or card used to let a focus() or a trackpad flick slide the entire
+   layout up, leaving the traffic lights over the sidebar and a band of empty
+   window under the app. */
+#root {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
@@ -150,6 +161,9 @@ code {
 .shell {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  /* Definite, not content-sized: an auto row grows to whatever the tallest
+     thing in the conversation asks for, and takes the window with it. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
 }
 
