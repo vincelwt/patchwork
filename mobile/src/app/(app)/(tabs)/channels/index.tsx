@@ -63,7 +63,9 @@ export default function ChannelsScreen() {
         channels={unsectioned}
         onOpen={open}
         selected={split ? selected : undefined}
-        empty="Create the first channel to get going."
+        // Only an empty workspace needs telling. With channels in sections, an
+        // empty ungrouped heading is a wasted row saying something untrue.
+        empty={channels.length ? undefined : "Create the first channel to get going."}
       />
       {data.sections.map((section) => (
         <ChannelGroup

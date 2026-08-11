@@ -10,12 +10,14 @@ import { Avatar, Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/com
 import { useDictation } from "@/lib/dictation";
 import { duration, relative, runStatusLabel } from "@/lib/format";
 import { useKeyboardInset } from "@/lib/keyboard";
+import { followNewest } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
 export default function RunScreen() {
   const { runId } = useLocalSearchParams<{ runId: string }>();
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
@@ -58,7 +60,11 @@ export default function RunScreen() {
         data={newestFirst}
         keyExtractor={(event) => event.id}
         contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.list}
+        // Upside down, so the container's top padding is what holds the newest
+        // event clear of the home indicator. A run still going has the steer bar
+        // there instead.
+        contentContainerStyle={[styles.list, !active && { paddingTop: insets.bottom + 8 }]}
+        maintainVisibleContentPosition={followNewest}
         keyboardDismissMode="interactive"
         ListFooterComponent={
           <Measured style={styles.headerContent}>

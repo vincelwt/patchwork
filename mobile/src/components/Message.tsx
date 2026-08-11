@@ -12,7 +12,7 @@ import { useRouter } from "expo-router";
 
 import type { Id, Message, MessageCard, Run } from "@client/types";
 import { dayLabel, isSameTurn, runStatusLabel, timeOfDay } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { followNewest, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { AttachmentView } from "./Attachment";
@@ -78,6 +78,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
             </View>
           </Measured>
         ) : null}
+        maintainVisibleContentPosition={followNewest}
         keyboardDismissMode="interactive"
         initialNumToRender={20}
         windowSize={9}

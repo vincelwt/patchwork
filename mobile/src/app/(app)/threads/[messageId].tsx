@@ -5,6 +5,7 @@ import { Stack, useLocalSearchParams } from "expo-router";
 import { Composer } from "@/components/Composer";
 import { MessageRow } from "@/components/Message";
 import { Empty, Measured } from "@/components/ui";
+import { followNewest } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 
 export default function ThreadScreen() {
@@ -41,6 +42,7 @@ export default function ThreadScreen() {
             renderItem={({ item }) => <Measured><MessageRow message={item} inThread /></Measured>}
             contentInsetAdjustmentBehavior="automatic"
             contentContainerStyle={styles.list}
+            maintainVisibleContentPosition={followNewest}
             keyboardDismissMode="interactive"
           />
           <Composer channelId={channel.id} parentId={messageId} taskId={channel.task_id} placeholder="Reply in thread" />
