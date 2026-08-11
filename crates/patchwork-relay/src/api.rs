@@ -21,7 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::orchestrator::{self, PostOptions, StartRunParams};
 use crate::relay::Relay;
 use crate::state::Shared;
-use crate::store::SaveWorkspaceSkillResult;
+use crate::store::{QuestionCommit, SaveWorkspaceSkillResult};
 use crate::{automations, preview_proxy};
 
 /// The relay itself: what is true before you have picked a workspace.
@@ -1447,6 +1447,22 @@ async fn get_question(
 }
 
 /// An agent asks. The card lands in the conversation and the right Inboxes.
+fn open_question(state: &Shared, run_id: &str) -> ApiResult<Option<Question>> {
+    Ok(state
+        .store
+        .run_questions(run_id)?
+        .into_iter()
+        .find(|question| question.status == QuestionStatus::Open))
+}
+
+fn already_asking(open: &Question) -> ApiError {
+    ApiError::conflict(format!(
+        "this run is already waiting on the question \"{}\": let it be answered, \
+ or pass --replace to cancel it and ask this instead",
+        open.headline.trim()
+    ))
+}
+
 async fn ask_question(
     State(state): State<Shared>,
     caller: Caller,
@@ -1468,6 +1484,14 @@ async fn ask_question(
     }
     if run.status.is_terminal() {
         return Err(ApiError::conflict("that run has already ended"));
+    }
+    // One run asks one thing at a time, so nobody is left with two cards and
+    // no idea which one the run is waiting on. Several things at once belong in
+    // one question with several items.
+    if !input.replace {
+        if let Some(open) = open_question(&state, &run.id)? {
+            return Err(already_asking(&open));
+        }
     }
 
     let mut question = Question {
@@ -1555,18 +1579,28 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    let (committed, blocked_task, superseded) =
-        state
-            .store
-            .commit_question_waiting(&question, &run, &inbox_items)?;
-    if !committed {
-        state.store.delete_message(&message.id)?;
-        state.emit(Event::MessageDeleted {
-            channel_id: run.channel_id.clone(),
-            message_id: message.id,
-        });
-        return Err(ApiError::conflict("that run has already ended"));
-    }
+    let (blocked_task, superseded) = match state.store.commit_question_waiting(
+        &question,
+        &run,
+        &inbox_items,
+        input.replace,
+    )? {
+        QuestionCommit::Committed {
+            blocked,
+            superseded,
+        } => (blocked, superseded),
+        outcome => {
+            state.store.delete_message(&message.id)?;
+            state.emit(Event::MessageDeleted {
+                channel_id: run.channel_id.clone(),
+                message_id: message.id,
+            });
+            return Err(match outcome {
+                QuestionCommit::AlreadyAsking(open) => already_asking(&open),
+                _ => ApiError::conflict("that run has already ended"),
+            });
+        }
+    };
     orchestrator::settle_superseded_questions(&state, superseded).await?;
     state.emit(Event::RunUpdated { run: run.clone() });
     if let Some(task) = blocked_task {
@@ -3617,6 +3651,11 @@ mod tests {
                 allow_free_text: true,
                 multi_select: false,
             }],
+            replace: false,
+        };
+        let replace = |run_id: &str| AskQuestion {
+            replace: true,
+            ..ask(run_id)
         };
 
         orchestrator::handle_host_message(
@@ -3699,16 +3738,32 @@ mod tests {
             .status,
             axum::http::StatusCode::FORBIDDEN
         );
+        // A run asks one thing at a time, and the messages it would have
+        // posted do not survive the refusal.
+        let count = || store.messages("channel", None, 200).unwrap().0.len();
+        let before = count();
+        assert_eq!(
+            ask_question(
+                State(state.clone()),
+                agent_caller("run-one"),
+                Json(ask("run-one")),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(count(), before, "a refused ask posts no card");
+        // Replacing is how a run whose `ask` died gets to ask again. The
+        // abandoned card stops holding the task in Blocked.
         let second = ask_question(
             State(state.clone()),
             agent_caller("run-one"),
-            Json(ask("run-one")),
+            Json(replace("run-one")),
         )
         .await
         .unwrap()
         .0;
-        // The abandoned first ask cannot keep the task blocked once the run
-        // asks again: only the card a human can still answer counts.
         assert_eq!(
             store.question(&question.id).unwrap().unwrap().status,
             QuestionStatus::Cancelled,

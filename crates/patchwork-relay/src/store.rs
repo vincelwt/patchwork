@@ -35,6 +35,15 @@ pub enum SaveWorkspaceSkillResult {
     TooLarge,
 }
 
+pub enum QuestionCommit {
+    Committed {
+        blocked: Option<Task>,
+        superseded: Vec<Question>,
+    },
+    RunEnded,
+    AlreadyAsking(Question),
+}
+
 fn json_col<T: serde::de::DeserializeOwned>(row: &Row, idx: &str) -> Option<T> {
     row.get::<_, Option<String>>(idx)
         .ok()
@@ -1982,16 +1991,17 @@ impl Store {
     /// Make the question, waiting run, blocked task and Inbox rows visible as
     /// one state. A terminal run wins the race and commits none of them.
     ///
-    /// A run only reaches `ask` again once the `ask` before it is gone, because
-    /// that command blocks until it is answered. So whatever it left open was
-    /// abandoned: it is superseded here, or its unanswerable card holds the
-    /// task in Blocked even after somebody answers the question they can see.
+    /// One run asks one thing at a time: a second open question is nobody's to
+    /// answer, and it holds the task in Blocked even after somebody answers
+    /// the card they can see. `replace` cancels the earlier question instead of
+    /// refusing, which is how a run whose `ask` died gets to ask again.
     pub fn commit_question_waiting(
         &self,
         question: &Question,
         run: &Run,
         inbox: &[InboxItem],
-    ) -> Result<(bool, Option<Task>, Vec<Question>)> {
+        replace: bool,
+    ) -> Result<QuestionCommit> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
@@ -2000,16 +2010,28 @@ impl Store {
             params![run.id, run.headline],
         )?;
         if changed == 0 {
-            return Ok((false, None, Vec::new()));
+            return Ok(QuestionCommit::RunEnded);
         }
         let superseded = {
             let mut stmt = tx.prepare(
                 "UPDATE questions SET status='cancelled'
-                 WHERE run_id=?1 AND status='open' RETURNING *",
+                 WHERE run_id=?1 AND status='open' AND ?2 RETURNING *",
             )?;
-            let rows = stmt.query_map(params![run.id], Self::question_from_row)?;
+            let rows = stmt.query_map(params![run.id, replace], Self::question_from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        if !replace {
+            if let Some(open) = tx
+                .query_row(
+                    "SELECT * FROM questions WHERE run_id=?1 AND status='open' ORDER BY created_at LIMIT 1",
+                    params![run.id],
+                    Self::question_from_row,
+                )
+                .optional()?
+            {
+                return Ok(QuestionCommit::AlreadyAsking(open));
+            }
+        }
         tx.execute(
             "INSERT INTO questions (id, run_id, agent_id, channel_id, task_id, message_id, headline, items, status, created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',?9)",
@@ -2054,7 +2076,10 @@ impl Store {
             None
         };
         tx.commit()?;
-        Ok((true, blocked, superseded))
+        Ok(QuestionCommit::Committed {
+            blocked,
+            superseded,
+        })
     }
 
     pub fn answer_question(
@@ -3363,16 +3388,40 @@ mod tests {
         assert_eq!(cancelled[0].status, QuestionStatus::Cancelled);
         assert!(store.answer_question("cancelled", &[], "human").is_err());
 
+        // Two asks racing past the API's pre-check still leave one question.
+        let live = run("run-c", "task-c");
+        store.insert_run(&live, 0).unwrap();
+        store.insert_question(&question("asking", "run-c")).unwrap();
+        assert!(matches!(
+            store
+                .commit_question_waiting(&question("second", "run-c"), &live, &[], false)
+                .unwrap(),
+            QuestionCommit::AlreadyAsking(open) if open.id == "asking"
+        ));
+        assert!(store.question("second").unwrap().is_none());
+        let QuestionCommit::Committed { superseded, .. } = store
+            .commit_question_waiting(&question("third", "run-c"), &live, &[], true)
+            .unwrap()
+        else {
+            panic!("replacing a question commits");
+        };
+        assert_eq!(superseded.len(), 1);
+        assert_eq!(superseded[0].id, "asking");
+        assert_eq!(
+            store.question("third").unwrap().unwrap().status,
+            QuestionStatus::Open
+        );
+
         let mut ended = run("ended-run", "ended-task");
         ended.status = RunStatus::Cancelled;
         store.insert_run(&ended, 0).unwrap();
         let pending = question("too-late", "ended-run");
-        assert!(
-            !store
-                .commit_question_waiting(&pending, &ended, &[])
-                .unwrap()
-                .0
-        );
+        assert!(matches!(
+            store
+                .commit_question_waiting(&pending, &ended, &[], false)
+                .unwrap(),
+            QuestionCommit::RunEnded
+        ));
         assert!(store.question(&pending.id).unwrap().is_none());
         assert_eq!(
             store.run(&ended.id).unwrap().unwrap().status,

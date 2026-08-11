@@ -72,6 +72,12 @@ up as a card in the conversation and in the right person's Inbox. Ask when a
 decision is genuinely the user's to make — not for things you can determine
 from the code.
 
+One question at a time: asking again while the first is unanswered is refused,
+because two cards leave a person guessing which one you are waiting on. When
+the earlier question no longer makes sense, or your `ask` died and you are
+asking the same thing again, add `--replace`: it cancels that question and asks
+yours instead.
+
 ## Channels
 
 ```bash
