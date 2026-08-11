@@ -1379,15 +1379,6 @@ export function TaskPage({ taskId }: { taskId: string }) {
           title="Click to rename"
           onCommit={(title) => void api.updateTask(task.id, { title })}
         />
-        <EditableText
-          className="task-outcome"
-          value={task.outcome}
-          placeholder="What has to be true when this is done?"
-          multiline
-          clamp
-          title="Click to describe the expected result"
-          onCommit={(outcome) => void api.updateTask(task.id, { outcome })}
-        />
 
         <TaskFiles taskId={task.id} channelId={task.discussion_channel_id} />
 
