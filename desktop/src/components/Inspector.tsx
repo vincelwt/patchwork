@@ -189,6 +189,9 @@ export function RunPanel({
               <div className="card-row">
                 <Chip tone={statusTone(run.status)}>{statusLabel(run.status)}</Chip>
                 <Chip>{run.runtime}</Chip>
+                {run.provider && <Chip>{run.provider}</Chip>}
+                {run.model && <Chip>{run.model}</Chip>}
+                {run.thinking && <Chip>{run.thinking} thinking</Chip>}
                 {host && <Chip>{host.name}</Chip>}
                 <Chip>{duration(run.started_at, run.ended_at)}</Chip>
                 {run.token_usage && (

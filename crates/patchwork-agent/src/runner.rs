@@ -379,7 +379,7 @@ async fn execute(
     });
 
     // 3. Environment: the agent's native access to Patchwork.
-    let env = build_env(&runner.cfg, &spec, &prepared.path);
+    let env = build_env(&runner.cfg, &spec, &prepared.path)?;
     write_skill(&prepared.path).await;
     let files = fetch_files(&prepared.path, &spec.files).await;
     if !files.is_empty() {
@@ -436,7 +436,14 @@ async fn execute(
             default_mode: opened.current_mode.clone(),
         });
     }
-    apply_session_preferences(&conn, &session_id, &spec, &opened, &run_id, &out).await;
+    apply_session_preferences(&conn, &session_id, &spec, &opened, &run_id, &out).await?;
+    let (provider, model, thinking) = effective_configuration(&spec, &opened);
+    emit(HostToRelay::RunConfiguration {
+        run_id: run_id.clone(),
+        provider,
+        model,
+        thinking,
+    });
     emit(HostToRelay::RunStatus {
         run_id: run_id.clone(),
         status: RunStatus::Running,
@@ -703,12 +710,9 @@ async fn execute(
     Ok(())
 }
 
-/// Apply the agent's configured model and permission mode.
-///
-/// A runtime that cannot switch is not a reason to fail the run: the session is
-/// already open and perfectly usable on its defaults. But it *is* worth saying
-/// out loud, because "I set this agent to a cheap model" silently not happening
-/// is exactly the kind of thing that shows up later on a bill.
+/// Apply the agent's configured runtime preferences. A requested provider,
+/// model, or thinking level is a promise: fail before the prompt rather than
+/// silently run on a different configuration.
 async fn apply_session_preferences(
     conn: &AcpConnection,
     session_id: &str,
@@ -716,7 +720,7 @@ async fn apply_session_preferences(
     opened: &NewSession,
     run_id: &str,
     out: &Sink,
-) {
+) -> Result<()> {
     let note = |text: String| {
         let _ = out.send(HostToRelay::RunEvent {
             run_id: run_id.to_string(),
@@ -727,31 +731,49 @@ async fn apply_session_preferences(
     };
 
     if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty()) {
-        if opened.current_model.as_deref() == Some(model) {
-            // Already what was asked for.
-        } else if let Err(err) = conn
-            .set_model(session_id, model, opened.model_config_id.as_deref())
-            .await
-        {
-            note(format!("could not select model `{model}`: {err:#}"));
-        } else {
+        if opened.current_model.as_deref() != Some(model) {
+            if opened.config_options && opened.model_config_id.is_none() {
+                return Err(anyhow!(
+                    "could not select model `{model}`: runtime offers no model setting"
+                ));
+            }
+            conn.set_model(session_id, model, opened.model_config_id.as_deref())
+                .await
+                .map_err(|err| anyhow!("could not select model `{model}`: {err:#}"))?;
             note(format!("model: {model}"));
         }
     }
 
-    if let Some(level) = spec.thinking.as_deref().filter(|m| !m.is_empty()) {
-        if opened.current_thinking.as_deref() == Some(level) {
-            // Already what was asked for.
-        } else if let Some(config_id) = opened.thinking_config_id.as_deref() {
-            if let Err(err) = conn.set_thinking(session_id, config_id, level).await {
-                note(format!("could not think `{level}`: {err:#}"));
-            } else {
-                note(format!("thinking: {level}"));
+    if spec.runtime == detect::PATCHWORK_RUNTIME {
+        if let Some(provider) = spec.provider.as_deref().filter(|value| !value.is_empty()) {
+            let expected = match provider {
+                "anthropic-oauth" => "anthropic",
+                other => other,
+            };
+            let effective_model = spec
+                .model
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .or(opened.current_model.as_deref());
+            let actual = effective_model.and_then(|value| value.split_once('/').map(|pair| pair.0));
+            if actual != Some(expected) {
+                return Err(anyhow!(
+                    "could not select provider `{provider}`: runtime opened with `{}`",
+                    effective_model.unwrap_or("an unknown model")
+                ));
             }
-        } else {
-            note(format!(
-                "could not think `{level}`: runtime offers no thinking setting"
-            ));
+        }
+    }
+
+    if let Some(level) = spec.thinking.as_deref().filter(|m| !m.is_empty()) {
+        if opened.current_thinking.as_deref() != Some(level) {
+            let config_id = opened.thinking_config_id.as_deref().ok_or_else(|| {
+                anyhow!("could not think `{level}`: runtime offers no thinking setting")
+            })?;
+            conn.set_thinking(session_id, config_id, level)
+                .await
+                .map_err(|err| anyhow!("could not think `{level}`: {err:#}"))?;
+            note(format!("thinking: {level}"));
         }
     }
 
@@ -772,6 +794,33 @@ async fn apply_session_preferences(
             }
         }
     }
+    Ok(())
+}
+
+fn effective_configuration(
+    spec: &RunSpec,
+    opened: &NewSession,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let model = spec
+        .model
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| opened.current_model.clone());
+    let provider = model
+        .as_deref()
+        .and_then(|value| {
+            value
+                .split_once('/')
+                .map(|(provider, _)| provider.to_string())
+        })
+        .or_else(|| spec.provider.clone().filter(|value| !value.is_empty()));
+    let thinking = spec
+        .thinking
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| opened.current_thinking.clone());
+    (provider, model, thinking)
 }
 
 /// The widest of the modes a runtime offers, by the names they use for it.
@@ -1151,7 +1200,7 @@ fn resolve_command(spec: &RunSpec) -> Result<Vec<String>> {
     })
 }
 
-fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Vec<(String, String)> {
+fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = vec![
         ("PATCHWORK".into(), "1".into()),
         ("PATCHWORK_API_BASE".into(), spec.api_base.clone()),
@@ -1183,12 +1232,12 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Vec<(String, Stri
         env.extend(crate::providers::pi_env(
             spec.provider.as_deref(),
             spec.model.as_deref(),
-        ));
+        )?);
     }
     env.extend(project_env(spec.project_name.as_deref()));
     env.extend(cfg.env.iter().cloned());
     env.extend(spec.env.iter().cloned());
-    env
+    Ok(env)
 }
 
 /// What this machine knows about a project that the workspace must not: a
@@ -1415,6 +1464,67 @@ mod tests {
     }
 
     #[test]
+    fn a_run_records_the_configuration_used_for_its_prompt() {
+        let mut requested = spec();
+        requested.provider = Some("openai".into());
+        requested.model = Some("anthropic/claude-opus-5".into());
+        requested.thinking = Some("xhigh".into());
+        let opened = NewSession {
+            current_model: Some("openai/gpt-5.6-sol".into()),
+            current_thinking: Some("medium".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_configuration(&requested, &opened),
+            (
+                Some("anthropic".into()),
+                Some("anthropic/claude-opus-5".into()),
+                Some("xhigh".into())
+            )
+        );
+
+        requested.provider = None;
+        requested.model = None;
+        requested.thinking = None;
+        assert_eq!(
+            effective_configuration(&requested, &opened),
+            (
+                Some("openai".into()),
+                Some("openai/gpt-5.6-sol".into()),
+                Some("medium".into())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_model_pin_fails_before_the_prompt() {
+        let script = r#"
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"message":"not available"}}'
+"#;
+        let command = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let (conn, _events) = AcpConnection::spawn(&command, "/tmp", &[]).await.unwrap();
+        let mut requested = spec();
+        requested.model = Some("openai/gpt-5.6-sol".into());
+        let opened = NewSession {
+            config_options: true,
+            model_config_id: Some("model".into()),
+            ..Default::default()
+        };
+        let (out, _messages) = mpsc::unbounded_channel();
+
+        let error = apply_session_preferences(&conn, "s1", &requested, &opened, "r1", &out)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("could not select model `openai/gpt-5.6-sol`"));
+        assert!(error.contains("not available"));
+        conn.shutdown().await;
+    }
+
+    #[test]
     fn a_run_takes_the_widest_mode_its_runtime_offers() {
         let modes = |ids: &[&str]| -> Vec<patchwork_core::models::RuntimeOption> {
             ids.iter()
@@ -1513,7 +1623,7 @@ mod tests {
 
     #[test]
     fn env_gives_the_agent_native_access() {
-        let env = build_env(&RunnerConfig::default(), &spec(), "/tmp/wt");
+        let env = build_env(&RunnerConfig::default(), &spec(), "/tmp/wt").unwrap();
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map.get("PATCHWORK_RUN_ID").unwrap(), "r1");
         assert_eq!(map.get("PATCHWORK_TASK_ID").unwrap(), "t1");

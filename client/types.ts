@@ -307,6 +307,9 @@ export interface Run {
   automation_id?: Id;
   session_id?: string;
   runtime: string;
+  provider?: string;
+  model?: string;
+  thinking?: string;
   prompt: string;
   headline: string;
   error?: string;
