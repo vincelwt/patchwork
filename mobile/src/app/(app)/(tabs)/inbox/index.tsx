@@ -8,7 +8,7 @@ import { Conversation } from "@/components/Message";
 import { TaskDetail } from "@/components/TaskDetail";
 import { Avatar, Button, Empty, Icon, Measured, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { largeTitles, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme, type Palette } from "@/lib/theme";
 
@@ -104,8 +104,8 @@ export default function InboxScreen() {
     <Screen style={{ backgroundColor: theme.surface }}>
       <Stack.Screen
         options={{
-          headerLargeTitle: !split,
-          headerTransparent: !split,
+          headerLargeTitle: largeTitles && !split,
+          headerTransparent: largeTitles && !split,
           headerRight: unread
             ? () => <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} />
             : undefined,

@@ -4,7 +4,6 @@ import {
   FlatList,
   Linking,
   Pressable,
-  RefreshControl,
   StyleSheet,
   Text,
   View,
@@ -12,11 +11,10 @@ import {
 import { useRouter } from "expo-router";
 
 import type { Id, Message, MessageCard, Run } from "@client/types";
-import { dayLabel, runStatusLabel, timeOfDay } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { dayLabel, isSameTurn, runStatusLabel, timeOfDay } from "@/lib/format";
+import { followNewest, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
-import { useBottomAnchoredList } from "@/lib/scroll";
 import { AttachmentView } from "./Attachment";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
@@ -31,9 +29,12 @@ export function Conversation({ channelId }: { channelId: Id }) {
   const store = useWorkspaceStore();
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
   const messages = workspace.messages[channelId] ?? [];
-  const [refreshing, setRefreshing] = useState(false);
   const [replyTo, setReplyTo] = useState<Message>();
-  const anchor = useBottomAnchoredList<Message>(channelId, messages.length);
+  // Newest first, drawn upside down. The newest message then lives at offset
+  // zero, so the transcript opens on it rather than being scrolled there once
+  // it has laid out, and older messages load in without moving the view. The
+  // oldest end is the list's footer, which is where loading more belongs.
+  const newestFirst = useMemo(() => [...messages].reverse(), [messages]);
 
   useEffect(() => {
     setReplyTo(undefined);
@@ -42,48 +43,43 @@ export function Conversation({ channelId }: { channelId: Id }) {
 
   if (!channel) return <Empty title="Conversation unavailable" detail="It may have been archived or removed." />;
 
-  const refresh = async () => {
-    setRefreshing(true);
-    await store.loadMessages(channelId).catch(() => undefined);
-    setRefreshing(false);
-  };
-
   return (
     <View style={styles.conversation}>
       <FlatList
-        ref={anchor.listRef}
-        data={messages}
+        inverted
+        data={newestFirst}
         keyExtractor={(message) => message.id}
-        contentContainerStyle={messages.length ? styles.list : styles.emptyList}
-        renderItem={({ item, index }) => (
-          <Measured>
-            {index === 0 || dayLabel(messages[index - 1].created_at) !== dayLabel(item.created_at) ? (
-              <View style={styles.day}>
-                <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
-              </View>
-            ) : null}
-            <MessageRow message={item} onReply={setReplyTo} />
-          </Measured>
-        )}
+        contentContainerStyle={newestFirst.length ? styles.list : styles.emptyList}
+        renderItem={({ item, index }) => {
+          // Upside down, so the message before this one in time is the next one
+          // along in the data.
+          const previous = newestFirst[index + 1];
+          const newDay = !previous || dayLabel(previous.created_at) !== dayLabel(item.created_at);
+          return (
+            <Measured>
+              {newDay ? (
+                <View style={styles.day}>
+                  <Text style={[styles.dayText, { color: theme.muted, backgroundColor: theme.surface }]}>{dayLabel(item.created_at)}</Text>
+                </View>
+              ) : null}
+              <MessageRow message={item} compact={!newDay && isSameTurn(previous, item)} onReply={setReplyTo} />
+            </Measured>
+          );
+        }}
         ListEmptyComponent={<Empty title="Nothing here yet" detail="Say something or mention an agent with @." />}
-        ListHeaderComponent={workspace.hasMore[channelId] ? (
-          <View style={{ paddingHorizontal: gutter, paddingTop: 8 }}>
-            <Button
-              label="Load older messages"
-              tone="quiet"
-              onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
-            />
-          </View>
+        ListFooterComponent={workspace.hasMore[channelId] ? (
+          <Measured>
+            <View style={{ paddingHorizontal: gutter, paddingVertical: 8 }}>
+              <Button
+                label="Load older messages"
+                tone="quiet"
+                onPress={() => void store.loadMessages(channelId, messages[0]?.id)}
+              />
+            </View>
+          </Measured>
         ) : null}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} />}
-        maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
-        onContentSizeChange={anchor.onContentSizeChange}
-        onScroll={anchor.onScroll}
-        onScrollBeginDrag={anchor.onScrollBeginDrag}
-        onScrollEndDrag={anchor.onScrollEndDrag}
-        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
-        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
-        scrollEventThrottle={16}
+        maintainVisibleContentPosition={followNewest}
+        keyboardDismissMode="interactive"
         initialNumToRender={20}
         windowSize={9}
       />
@@ -101,10 +97,13 @@ export function Conversation({ channelId }: { channelId: Id }) {
 export const MessageRow = memo(function MessageRow({
   message,
   inThread,
+  compact,
   onReply,
 }: {
   message: Message;
   inThread?: boolean;
+  /// Part of the same turn as the line above: no face, no name, no time.
+  compact?: boolean;
   onReply?: (message: Message) => void;
 }) {
   const theme = useTheme();
@@ -158,15 +157,17 @@ export const MessageRow = memo(function MessageRow({
       }}
       delayLongPress={280}
       onLongPress={() => setActions(true)}
-      style={[styles.message, { paddingHorizontal: gutter }]}
+      style={[styles.message, compact && styles.messageTight, { paddingHorizontal: gutter }]}
     >
-      <Avatar member={author} size={32} />
+      {compact ? <View style={styles.avatarSpacer} /> : <Avatar member={author} size={32} />}
       <View style={styles.messageMain}>
-        <View style={styles.messageHead}>
-          <Text style={[styles.author, { color: theme.text }]}>{author?.display_name ?? "Unknown"}</Text>
-          {author?.kind === "agent" ? <Badge tone="accent">agent</Badge> : null}
-          <Text style={[styles.time, { color: theme.faint }]}>{timeOfDay(message.created_at)}</Text>
-        </View>
+        {compact ? null : (
+          <View style={styles.messageHead}>
+            <Text style={[styles.author, { color: theme.text }]}>{author?.display_name ?? "Unknown"}</Text>
+            {author?.kind === "agent" ? <Badge tone="accent">agent</Badge> : null}
+            <Text style={[styles.time, { color: theme.faint }]}>{timeOfDay(message.created_at)}</Text>
+          </View>
+        )}
         {run ? <RunLine run={run} /> : null}
         {message.reply_to_id ? (
           <View style={styles.replyReference}>
@@ -329,6 +330,8 @@ const styles = StyleSheet.create({
   day: { alignItems: "center", paddingVertical: 10 },
   dayText: { fontSize: 12, fontWeight: "600", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3, overflow: "hidden" },
   message: { flexDirection: "row", gap: 11, paddingVertical: 9 },
+  messageTight: { paddingTop: 0, paddingBottom: 3 },
+  avatarSpacer: { width: 32 },
   messageMain: { flex: 1, minWidth: 0 },
   messageHead: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6, marginBottom: 2 },
   author: { fontSize: 15, fontWeight: "700" },

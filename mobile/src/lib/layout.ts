@@ -19,6 +19,17 @@ export interface Layout {
   gutter: number;
 }
 
+/// iOS draws a large title in its own space and insets a scroll view under a
+/// transparent bar for you. Android does neither, so asking for both there
+/// paints the title straight onto the first row of the list.
+export const largeTitles = process.env.EXPO_OS === "ios";
+
+/// What an upside-down transcript does when an entry arrives. Inverted, offset
+/// zero is the newest end, so pinning the first item keeps whatever an unhurried
+/// reader is looking at exactly where it is, and the threshold lets a reader who
+/// is already at the newest end follow along without being scrolled anywhere.
+export const followNewest = { minIndexForVisible: 0, autoscrollToTopThreshold: 24 };
+
 const SPLIT_AT = 820;
 /// A phone on its side is wide enough for two columns and far too short for
 /// them: a list, a conversation and a keyboard do not share 440pt of height.

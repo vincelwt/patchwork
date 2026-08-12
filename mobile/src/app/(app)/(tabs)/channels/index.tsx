@@ -6,7 +6,7 @@ import type { Channel, Id } from "@client/types";
 import { Conversation } from "@/components/Message";
 import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { largeTitles, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -63,7 +63,9 @@ export default function ChannelsScreen() {
         channels={unsectioned}
         onOpen={open}
         selected={split ? selected : undefined}
-        empty="Create the first channel to get going."
+        // Only an empty workspace needs telling. With channels in sections, an
+        // empty ungrouped heading is a wasted row saying something untrue.
+        empty={channels.length ? undefined : "Create the first channel to get going."}
       />
       {data.sections.map((section) => (
         <ChannelGroup
@@ -107,8 +109,8 @@ export default function ChannelsScreen() {
         options={{
           // Beside a detail pane the bar stays opaque, so neither column slides
           // under it and no column has to guess the bar's height.
-          headerLargeTitle: !split,
-          headerTransparent: !split,
+          headerLargeTitle: largeTitles && !split,
+          headerTransparent: largeTitles && !split,
           headerRight: () => (
             <View style={styles.actions}>
               <Pressable accessibilityRole="button" accessibilityLabel="New direct message" hitSlop={8} onPress={() => setNewDm(true)}>

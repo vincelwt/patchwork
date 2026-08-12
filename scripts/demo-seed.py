@@ -109,14 +109,23 @@ def make_agent(name, handle, avatar, runtime, description):
             "default_participation": "off",
         },
     })
+    return member["id"], mint_token(member["id"])
+
+
+def mint_token(member_id, run_id=None):
+    """A bearer token for a seeded member, optionally scoped to one of its runs.
+
+    Anything only a run may do (asking a question, for one) checks that the
+    caller's own token names that run, so a plain agent token is refused.
+    """
     token = secrets.token_urlsafe(32)
     digest = base64.urlsafe_b64encode(hashlib.sha256(token.encode()).digest()).rstrip(b"=").decode()
     db.execute(
-        "INSERT INTO tokens (token_hash, member_id, kind, label, created_at) VALUES (?,?,?,?,?)",
-        (digest, member["id"], "device", "seed", NOW),
+        "INSERT INTO tokens (token_hash, member_id, kind, run_id, label, created_at) VALUES (?,?,?,?,?,?)",
+        (digest, member_id, "run" if run_id else "device", run_id, "seed", NOW),
     )
     db.commit()
-    return member["id"], token
+    return token
 
 
 iris_id, iris = make_agent(
@@ -228,9 +237,12 @@ def react(message_id, token, emoji):
 m1 = say(dev, jonas, "A studio in Berlin got double-booked the night DST ended — two confirmed bookings, same 09:00 slot. Their email is not friendly.", 178)
 m2 = say(dev, vince, "Recurring slots are stored in local time, that's the bug. @iris take this one? Repro first, then fix.", 176)
 
+# Iris opens it mid-conversation and reaches review further down, once the pull
+# request below is its evidence. The relay will not let an agent claim review
+# up front, so the seeded end state is written straight to the row.
 t41 = task(iris, "Fix DST double-booking in recurring schedules",
            "Recurring bookings survive DST transitions in every timezone. Property test across the IANA db.",
-           "review", iris_id, app_project, source=dev, created_days_ago=0)
+           "running", iris_id, app_project, source=dev, created_days_ago=0)
 last_message(dev, 172)  # the task card Iris just dropped in the conversation
 
 say(dev, iris, "Reproduced with a Europe/Berlin fixture — the recurrence expander compares naive local times, so the repeated hour collides.", 169, kind="status")
@@ -238,6 +250,8 @@ say(dev, iris, "Root cause: `expandRecurring()` detects conflicts *before* conve
 m_pr = say(dev, iris, "PR is up — 14 files, property test included. One studio needs a data fix; the migration ships with the PR.", 134,
            card={"type": "pull_request", "url": "https://github.com/meridianhq/meridian/pull/218", "task_id": t41["id"]})
 api(WS, "PATCH", f"/api/tasks/{t41['id']}", iris, {"pr_url": "https://github.com/meridianhq/meridian/pull/218"})
+db.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (t41["id"],))
+db.commit()
 m_maya = say(dev, maya, "While you're in there — could we warn studios with recurring classes the week before a DST shift? We got six tickets last spring.", 105)
 react(m_maya, jonas, "👍")
 react(m_maya, vince, "💡")
@@ -308,7 +322,7 @@ db.commit()
 
 # Iris hits a real product decision and asks instead of guessing. The card
 # lands in #dev and the run visibly waits.
-question = api(WS, "POST", "/api/questions", iris, {
+question = api(WS, "POST", "/api/questions", mint_token(iris_id, iris_run), {
     "run_id": iris_run,
     "headline": "DST warning: where should it surface?",
     "items": [{

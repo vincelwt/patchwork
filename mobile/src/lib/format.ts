@@ -1,5 +1,6 @@
 import type {
   AutomationTrigger,
+  Message,
   Millis,
   RunStatus,
   Task,
@@ -29,6 +30,21 @@ export function timeOfDay(value: Millis) {
 
 export function dayLabel(value: Millis) {
   return new Date(value).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
+
+/// Someone saying three things in a row is one turn, not three headers, so only
+/// the first line of a turn carries a face, a name, and a time. A run line or a
+/// reply reference belongs to its own message, so either one starts a new turn.
+const SAME_TURN_WINDOW = 5 * 60_000;
+export function isSameTurn(previous: Message | undefined, message: Message) {
+  return (
+    !!previous &&
+    previous.author_id === message.author_id &&
+    previous.kind === message.kind &&
+    message.created_at - previous.created_at < SAME_TURN_WINDOW &&
+    !message.reply_to_id &&
+    !message.run_id
+  );
 }
 
 export function duration(start?: Millis, end?: Millis) {

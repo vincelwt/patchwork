@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { RunEvent } from "@client/types";
 import { PendingImages, useImageAttachments } from "@/components/Attachment";
@@ -8,13 +9,15 @@ import { Markdown } from "@/components/Markdown";
 import { Avatar, Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/components/ui";
 import { useDictation } from "@/lib/dictation";
 import { duration, relative, runStatusLabel } from "@/lib/format";
+import { useKeyboardInset } from "@/lib/keyboard";
+import { followNewest } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
-import { useBottomAnchoredList } from "@/lib/scroll";
 
 export default function RunScreen() {
   const { runId } = useLocalSearchParams<{ runId: string }>();
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
@@ -25,10 +28,9 @@ export default function RunScreen() {
   const question = detail?.questions.find((item) => item.status === "open")
     ?? workspace.bootstrap?.open_questions.find((item) => item.run_id === runId);
   const events = detail?.events ?? [];
-  const anchor = useBottomAnchoredList<RunEvent>(
-    runId,
-    run ? events.length + 1 : 0,
-  );
+  // Newest first and drawn upside down, so a run that is still working opens on
+  // what it just did rather than on where it started.
+  const newestFirst = useMemo(() => [...events].reverse(), [events]);
 
   useEffect(() => {
     void store.loadRun(runId);
@@ -54,19 +56,17 @@ export default function RunScreen() {
         }}
       />
       <FlatList
-        ref={anchor.listRef}
-        data={events}
+        inverted
+        data={newestFirst}
         keyExtractor={(event) => event.id}
         contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.list}
-        onContentSizeChange={anchor.onContentSizeChange}
-        onScroll={anchor.onScroll}
-        onScrollBeginDrag={anchor.onScrollBeginDrag}
-        onScrollEndDrag={anchor.onScrollEndDrag}
-        onMomentumScrollBegin={anchor.onMomentumScrollBegin}
-        onMomentumScrollEnd={anchor.onMomentumScrollEnd}
-        scrollEventThrottle={16}
-        ListHeaderComponent={
+        // Upside down, so the container's top padding is what holds the newest
+        // event clear of the home indicator. A run still going has the steer bar
+        // there instead.
+        contentContainerStyle={[styles.list, !active && { paddingTop: insets.bottom + 8 }]}
+        maintainVisibleContentPosition={followNewest}
+        keyboardDismissMode="interactive"
+        ListFooterComponent={
           <Measured style={styles.headerContent}>
             <Card style={styles.summary}>
               <View style={styles.summaryHead}>
@@ -120,6 +120,8 @@ function RunEventRow({ event }: { event: RunEvent }) {
 
 function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string; agentName: string }) {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardInset(insets.bottom);
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [text, setText] = useState("");
@@ -146,7 +148,7 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
     }
   };
   return (
-    <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg }]}>
+    <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg, paddingBottom: 10 + insets.bottom + keyboard }]}>
      <Measured>
       <Text style={[styles.steerTarget, { color: theme.muted }]}>Straight to {agentName} in this run</Text>
       <PendingImages images={images.pending} onRemove={images.remove} />
@@ -189,7 +191,7 @@ const styles = StyleSheet.create({
   event: { flexDirection: "row", gap: 10, paddingHorizontal: 14, paddingVertical: 8 },
   eventKind: { width: 72, fontSize: 10, fontWeight: "700" },
   eventText: { fontSize: 13, lineHeight: 19, fontFamily: "monospace" },
-  steer: { borderTopWidth: StyleSheet.hairlineWidth, padding: 10, gap: 5 },
+  steer: { borderTopWidth: StyleSheet.hairlineWidth, paddingHorizontal: 10, paddingTop: 10, gap: 5 },
   steerTarget: { fontSize: 11, fontWeight: "600" },
   steerBox: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 8 },
   steerInput: { minHeight: 38, maxHeight: 120, fontSize: 15, textAlignVertical: "top" },

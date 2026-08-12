@@ -3,10 +3,8 @@ import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "r
 import { Stack, useRouter } from "expo-router";
 
 import type { Device } from "@client/types";
-import { WorkspaceMark, WorkspaceSheet } from "@/components/WorkspaceSwitcher";
-import { Badge, Button, Card, ErrorNotice, Icon, Measured, Sheet, TextField } from "@/components/ui";
+import { Badge, Button, Card, ErrorNotice, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { workspaceLabel } from "@/lib/paired";
 import { apiFor, usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -20,7 +18,6 @@ export default function SettingsScreen() {
   const data = workspace.bootstrap;
   const [devices, setDevices] = useState<Device[]>([]);
   const [editing, setEditing] = useState(false);
-  const [switching, setSwitching] = useState(false);
   const [name, setName] = useState(data?.workspace.name ?? "");
   const [prefix, setPrefix] = useState(data?.workspace.task_prefix ?? "PW");
   const [error, setError] = useState("");
@@ -42,28 +39,8 @@ export default function SettingsScreen() {
       <Stack.Screen options={{ title: "Settings" }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
        <Measured style={styles.measured}>
-        <Text style={[styles.section, { color: theme.faint }]}>Workspaces</Text>
-        <Card>
-          {session ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Switch workspace"
-              onPress={() => setSwitching(true)}
-              style={({ pressed }) => [styles.switcher, pressed && { opacity: 0.6 }]}
-            >
-              <WorkspaceMark session={{ ...session, name: data?.workspace.name ?? session.name }} size={40} />
-              <View style={styles.grow}>
-                <Text style={{ color: theme.text, fontWeight: "700", fontSize: 16 }}>
-                  {data?.workspace.name || workspaceLabel(session)}
-                </Text>
-                <Text style={{ color: theme.muted }}>
-                  {workspaces.length > 1 ? `${workspaces.length} workspaces paired` : "Tap to pair another"}
-                </Text>
-              </View>
-              <Icon name={{ ios: "chevron.up.chevron.down", android: "unfold_more", web: "unfold_more" }} color={theme.faint} size={14} />
-            </Pressable>
-          ) : null}
-        </Card>
+        {/* Switching workspaces lives on the More tab, whose icon is the one
+            you are in; this screen is about the workspace already open. */}
         <Text style={[styles.section, { color: theme.faint }]}>This workspace</Text>
         <Card style={styles.card}>
           <Info label="Name" value={data?.workspace.name || "Loading"} />
@@ -138,9 +115,6 @@ export default function SettingsScreen() {
         />
        </Measured>
       </ScrollView>
-      {session ? (
-        <WorkspaceSheet visible={switching} onClose={() => setSwitching(false)} workspaces={workspaces} active={session} />
-      ) : null}
       <Sheet visible={editing} title="Workspace" onClose={() => setEditing(false)}>
         <View style={styles.form}>
           <TextField label="Name" value={name} onChangeText={setName} />
@@ -167,7 +141,6 @@ const styles = StyleSheet.create({
   grow: { flex: 1 },
   scroll: { padding: 16, paddingBottom: 36 },
   measured: { gap: 12 },
-  switcher: { minHeight: 68, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 12 },
   section: { fontSize: 13, fontWeight: "600", marginTop: 8 },
   card: { padding: 14, gap: 11 },
   info: { flexDirection: "row", gap: 12, justifyContent: "space-between" },
