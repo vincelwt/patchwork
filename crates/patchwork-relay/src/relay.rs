@@ -197,6 +197,7 @@ impl Relay {
 
         let runner = start_hosted_execution(&state, self.agent_env.clone()).await;
         reconcile_interrupted_runs(&state).await;
+        tokio::spawn(orchestrator::watch_hosts(state.clone()));
         tokio::spawn(automations::scheduler(state.clone()));
         tokio::spawn(github::watcher(state.clone()));
 
@@ -391,31 +392,29 @@ async fn start_hosted_execution(state: &Shared, env: Vec<(String, String)>) -> A
 }
 
 /// Resume relay-hosted work after the in-process host has been registered.
-/// Runs owned by another machine cannot be redispatched safely: that runtime
-/// may still be alive and reconnecting, so retain the conservative failure
-/// behavior for those runs.
+/// A run owned by another machine is left alone: that machine takes it back
+/// when it registers again, and `orchestrator::watch_hosts` ends it if it
+/// never does.
 async fn reconcile_interrupted_runs(state: &Shared) {
     let Ok(runs) = state.store.active_runs() else {
         return;
     };
-    for mut run in runs {
-        if run.host_id.as_deref() == Some(&state.relay_host_id) {
-            if let Err(err) = orchestrator::resume_interrupted_run(state, &run).await {
-                tracing::warn!(?err, run = %run.id, "could not resume interrupted run");
-            } else {
-                continue;
-            }
+    for run in runs {
+        if run.host_id.as_deref() != Some(&state.relay_host_id) {
+            let _ = orchestrator::append_run_event(
+                state,
+                &run.id,
+                RunEventKind::Lifecycle,
+                "The relay restarted; waiting for the machine running this to reconnect".into(),
+                None,
+            );
+            continue;
         }
-        run.status = RunStatus::Failed;
-        run.error = Some("the relay restarted while this run was in flight".into());
-        run.ended_at = Some(now_ms());
-        if state.store.update_run(&run).is_ok() {
-            state.store.revoke_run_tokens(&run.id).ok();
-            if let Err(err) = orchestrator::cancel_questions_for_run(state, &run.id).await {
-                tracing::warn!(?err, run = %run.id, "could not cancel interrupted run questions");
-            }
-            state.emit(Event::RunUpdated { run: run.clone() });
-            if let Err(err) = orchestrator::finish_run(state, &run).await {
+        if let Err(err) = orchestrator::resume_interrupted_run(state, &run).await {
+            tracing::warn!(?err, run = %run.id, "could not resume interrupted run");
+            let why =
+                format!("the relay restarted while this run was in flight, and it could not be resumed: {err:#}");
+            if let Err(err) = orchestrator::fail_run(state, &run, &why).await {
                 tracing::warn!(?err, run = %run.id, "could not finish interrupted run");
             }
         }
@@ -482,6 +481,55 @@ fn seed(store: &Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restart must not kill work on a machine that is simply reconnecting:
+    /// the run stays as it was, and that machine takes it back when it
+    /// registers again.
+    #[tokio::test]
+    async fn a_restart_leaves_a_desktop_run_for_its_machine_to_take_back() {
+        let path = std::env::temp_dir().join(format!("patchwork-restart-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        let run = Run {
+            id: "run".into(),
+            agent_id: "agent".into(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: "channel".into(),
+            task_id: None,
+            host_id: Some("desktop".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: Some("session".into()),
+            runtime: "codex".into(),
+            prompt: "Keep going".into(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&run, 0).unwrap();
+        let state: Shared = Arc::new(AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+
+        reconcile_interrupted_runs(&state).await;
+
+        let kept = store.run("run").unwrap().unwrap();
+        assert_eq!(kept.status, RunStatus::Running);
+        assert_eq!(kept.session_id.as_deref(), Some("session"));
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn capability_refresh_keeps_every_learned_runtime_option() {

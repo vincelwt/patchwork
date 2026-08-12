@@ -53,8 +53,10 @@ impl Runner {
         })
     }
 
-    pub async fn active_runs(&self) -> usize {
-        self.running.lock().await.len()
+    /// The runs this machine is executing. The relay uses it to tell a run
+    /// that is still alive from one that died with its process.
+    pub async fn active_run_ids(&self) -> Vec<Id> {
+        self.running.lock().await.keys().cloned().collect()
     }
 
     /// Route a relay command to the run it belongs to.

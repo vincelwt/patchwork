@@ -241,6 +241,13 @@ async fn connection(
                     );
                     registered.push(host_id.clone());
                     state.emit(Event::HostUpdated { host });
+                    // This machine stops its agents when its connection drops,
+                    // so anything the relay still has on it needs restarting.
+                    // Off the socket: resuming reads files and talks back.
+                    let resuming = state.clone();
+                    tokio::spawn(async move {
+                        orchestrator::resume_host_runs(&resuming, &host_id).await;
+                    });
                     continue;
                 }
 
@@ -255,9 +262,23 @@ async fn connection(
         }
     }
 
-    // Teardown.
+    // Teardown. A machine that already reconnected is not this socket's to
+    // bury: whether it is online now depends on the newer connection, not on
+    // this one noticing its own end.
     for host_id in registered {
-        state.hosts.write().await.remove(&host_id);
+        let ours = {
+            let mut hosts = state.hosts.write().await;
+            let ours = hosts
+                .get(&host_id)
+                .is_some_and(|conn| conn.tx.same_channel(&host_tx));
+            if ours {
+                hosts.remove(&host_id);
+            }
+            ours
+        };
+        if !ours {
+            continue;
+        }
         fail_host_previews(&state, &host_id);
         if let Ok(Some(mut host)) = state.store.host(&host_id) {
             host.online = false;
