@@ -280,6 +280,20 @@ function ModelField({
   fallback?: string;
   help: string;
 }) {
+  // Never give this input a <datalist>. WebKit draws those suggestions in a
+  // child NSWindow, and on macOS 27 that window throws inside ViewBridge and
+  // takes the whole app down with it. Typing filters the menu below instead.
+  const query = value.trim().toLowerCase();
+  const matches = query
+    ? models.filter(
+        (model) =>
+          model.id.toLowerCase().includes(query) ||
+          model.name.toLowerCase().includes(query),
+      )
+    : models;
+  // A typed-out model nobody reported is still valid, so an empty filter shows
+  // the full list rather than an empty menu.
+  const shown = matches.length > 0 ? matches : models;
   return (
     <div className="form-row">
       <label>Model</label>
@@ -287,7 +301,6 @@ function ModelField({
         <input
           className="field grow"
           {...plainText}
-          list={models.length > 0 ? "runtime-models" : undefined}
           value={value}
           placeholder={
             fallback ? `${fallback} — the default` : "whatever the machine is set to"
@@ -297,21 +310,12 @@ function ModelField({
         {/* Some runtimes report a thousand models. Typing filters them; the
             menu is for browsing, so it shows a readable number and says so. */}
         {models.length > 0 && (
-          <datalist id="runtime-models">
-            {models.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.name}
-              </option>
-            ))}
-          </datalist>
-        )}
-        {models.length > 0 && (
           <MenuButton
             align="right"
             title="Models this runtime reported"
             header={
-              models.length > MODEL_MENU_LIMIT
-                ? `${models.length} models — type to filter`
+              shown.length > MODEL_MENU_LIMIT
+                ? `${shown.length} models — type to filter`
                 : "Reported by the runtime"
             }
             items={[
@@ -320,7 +324,7 @@ function ModelField({
                 label: fallback ? `${fallback} — the default` : "The machine's default",
                 onSelect: () => onChange(""),
               },
-              ...models.slice(0, MODEL_MENU_LIMIT).map((model) => ({
+              ...shown.slice(0, MODEL_MENU_LIMIT).map((model) => ({
                 key: model.id,
                 label: model.name,
                 hint: model.description || model.id,
