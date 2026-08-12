@@ -163,6 +163,11 @@ async fn connect(
         },
         out_tx.clone(),
     );
+    // This connection ending, however it ends, ends the runs it was carrying.
+    // `restart` aborts us without unwinding, and an agent left running on a
+    // connection the relay has given up on would edit a worktree the relay is
+    // about to hand to its replacement.
+    let _stop_runs = StopOnDrop(runner.clone());
 
     // Announce what this machine can actually do.
     let registration = HostRegistration {
@@ -202,7 +207,9 @@ async fn connect(
     }
 
     // Keep the relay's view of this host fresh, and keep the machine awake for
-    // exactly as long as it is doing work.
+    // exactly as long as it is doing work. The heartbeat carries the runs we
+    // are actually executing: that is how the relay notices a run that died
+    // here instead of leaving it looking alive.
     let heartbeat = {
         let out_tx = out_tx.clone();
         let runner = runner.clone();
@@ -211,9 +218,13 @@ async fn connect(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                awake.set_running(&workspace_id, runner.active_runs().await);
+                let runs = runner.active_run_ids().await;
+                awake.set_running(&workspace_id, runs.len());
                 if out_tx
-                    .send(HostToRelay::Heartbeat { capabilities: None })
+                    .send(HostToRelay::Heartbeat {
+                        capabilities: None,
+                        runs: Some(runs),
+                    })
                     .is_err()
                 {
                     break;
@@ -231,7 +242,7 @@ async fn connect(
                 runner.handle(msg).await;
                 // Checked on every command rather than only on the heartbeat,
                 // so a run that starts now is covered now.
-                awake.set_running(&workspace.id, runner.active_runs().await);
+                awake.set_running(&workspace.id, runner.active_run_ids().await.len());
             }
             Ok(ServerMsg::Error { message }) => {
                 tracing::warn!(%message, "relay rejected a host message");
@@ -246,6 +257,16 @@ async fn connect(
     runner.shutdown().await;
     awake.set_running(&workspace.id, 0);
     Ok(())
+}
+
+/// Agents stop when the connection that owns them does.
+struct StopOnDrop(Arc<Runner>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let runner = self.0.clone();
+        tokio::spawn(async move { runner.shutdown().await });
+    }
 }
 
 /// The workspace's own WebSocket, derived from its base URL.

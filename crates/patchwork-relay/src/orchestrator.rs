@@ -937,7 +937,7 @@ pub(crate) async fn tell_task_peers(
 // Runs
 // ---------------------------------------------------------------------------
 
-fn append_run_event(
+pub(crate) fn append_run_event(
     state: &Shared,
     run_id: &str,
     kind: RunEventKind,
@@ -1479,10 +1479,15 @@ reply only if this changes it.",
     Ok(run)
 }
 
-/// Redispatch an interrupted relay-hosted run without creating a second run
-/// card or losing its task/worktree identity. The fresh token replaces the
-/// unrecoverable plaintext token that was held only by the stopped process.
+/// Redispatch an interrupted run to the machine that owns it, without creating
+/// a second run card or losing its task/worktree identity. The fresh token
+/// replaces the unrecoverable plaintext token that was held only by the
+/// stopped process.
 pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<()> {
+    let host_id = run
+        .host_id
+        .clone()
+        .ok_or_else(|| anyhow!("the run never reached a machine"))?;
     let agent = state
         .store
         .member(&run.agent_id)?
@@ -1500,7 +1505,7 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
     let worktree = if let Some(path) = run.cwd.clone() {
         WorktreeSpec::Existing { path }
     } else {
-        resolve_worktree(state, &task, &project, &state.relay_host_id)?.0
+        resolve_worktree(state, &task, &project, &host_id)?.0
     };
 
     state.store.revoke_run_tokens(&run.id)?;
@@ -1553,17 +1558,196 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
 
     if !state
         .send_to_host(
-            &state.relay_host_id,
+            &host_id,
             RelayToHost::StartRun {
                 spec: Box::new(spec),
             },
         )
         .await
     {
-        bail!("the relay execution host is not registered");
+        bail!("the machine that was running this is not connected");
     }
+    append_run_event(
+        state,
+        &run.id,
+        RunEventKind::Lifecycle,
+        "Resumed after an interruption".into(),
+        None,
+    )?;
     state.emit(Event::RunUpdated { run: resumed });
     Ok(())
+}
+
+/// A machine that just registered takes back the runs the relay still has on
+/// it. A host stops its agents when its connection drops, so a run still
+/// pointing at it is one nobody is executing — including every desktop run
+/// left in flight by a relay restart.
+pub async fn resume_host_runs(state: &Shared, host_id: &str) {
+    let Ok(runs) = state.store.active_runs() else {
+        return;
+    };
+    for run in runs {
+        if run.host_id.as_deref() != Some(host_id) {
+            continue;
+        }
+        if let Err(err) = resume_interrupted_run(state, &run).await {
+            tracing::warn!(?err, run = %run.id, "could not resume a run on the machine that owns it");
+            let _ = fail_run(
+                state,
+                &run,
+                &format!(
+                    "it could not be resumed on {}: {err:#}",
+                    host_name(state, host_id)
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// Three missed heartbeats. Long enough to survive a reconnect, short enough
+/// that nobody watches a dead run pretend to work.
+const HOST_SILENCE_LIMIT_MS: Millis = 90_000;
+
+/// A run dispatched moments ago is not yet in the machine's own list of what
+/// it is running, so only runs old enough to have been picked up are judged.
+const RUN_PICKUP_GRACE_MS: Millis = 60_000;
+
+/// A machine that stops answering takes its runs down with it, and nothing
+/// else notices: the socket may have gone quietly, and the work it carried
+/// would look alive until the next relay restart.
+pub async fn watch_hosts(state: Shared) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        end_runs_on_silent_hosts(&state).await;
+    }
+}
+
+async fn end_runs_on_silent_hosts(state: &Shared) {
+    let Ok(runs) = state.store.active_runs() else {
+        return;
+    };
+    let now = now_ms();
+    for run in runs {
+        let Some(host_id) = run.host_id.clone() else {
+            continue;
+        };
+        if state.host_online(&host_id).await {
+            continue;
+        }
+        let last_seen = state
+            .store
+            .host(&host_id)
+            .ok()
+            .flatten()
+            .map(|host| host.last_seen)
+            .unwrap_or(0);
+        if !host_is_gone(now, last_seen, state.started_at) {
+            continue;
+        }
+        let _ = fail_run(
+            state,
+            &run,
+            &format!(
+                "{} stopped answering while this run was in flight",
+                host_name(state, &host_id)
+            ),
+        )
+        .await;
+    }
+}
+
+/// Runs the relay still has on a machine that the machine itself is not
+/// running: whatever was executing them died without reporting back.
+async fn end_runs_the_host_lost(state: &Shared, host_id: &str, alive: &[Id]) {
+    let Ok(runs) = state.store.active_runs() else {
+        return;
+    };
+    let now = now_ms();
+    for run in runs {
+        if run.host_id.as_deref() != Some(host_id) || alive.contains(&run.id) {
+            continue;
+        }
+        if now.saturating_sub(run.started_at.unwrap_or(run.created_at)) < RUN_PICKUP_GRACE_MS {
+            continue;
+        }
+        let machine = host_name(state, host_id);
+        let why = match run.status {
+            RunStatus::Queued | RunStatus::Dispatched => {
+                format!("{machine} never picked this run up")
+            }
+            _ => format!("the agent process on {machine} stopped without reporting back"),
+        };
+        let _ = fail_run(state, &run, &why).await;
+    }
+}
+
+/// A relay restart is not a dead machine: silence is measured from the moment
+/// we came up, so a desktop that reconnects keeps the work it was given.
+fn host_is_gone(now: Millis, last_seen: Millis, relay_started_at: Millis) -> bool {
+    now.saturating_sub(last_seen.max(relay_started_at)) >= HOST_SILENCE_LIMIT_MS
+}
+
+fn host_name(state: &Shared, host_id: &str) -> String {
+    state
+        .store
+        .host(host_id)
+        .ok()
+        .flatten()
+        .map(|host| host.name)
+        .unwrap_or_else(|| "the machine running it".into())
+}
+
+/// The relay declaring a run dead. The agent cannot report this itself, so the
+/// relay says what happened where the run was talking, and the task it was
+/// working on reaches somebody who can act on it.
+pub(crate) async fn fail_run(state: &Shared, run: &Run, why: &str) -> Result<()> {
+    let mut run = run.clone();
+    if run.status.is_terminal() {
+        return Ok(());
+    }
+    run.status = RunStatus::Failed;
+    run.headline = "Interrupted".into();
+    run.error = Some(why.to_string());
+    run.ended_at = Some(now_ms());
+    state.store.update_run(&run)?;
+    state.store.revoke_run_tokens(&run.id).ok();
+    append_run_event(state, &run.id, RunEventKind::Error, why.to_string(), None)?;
+    if let Err(err) = cancel_questions_for_run(state, &run.id).await {
+        tracing::warn!(?err, run = %run.id, "could not cancel the questions of a dead run");
+    }
+    state.emit(Event::RunUpdated { run: run.clone() });
+    state.set_presence(&run.agent_id, Presence::Online).await;
+
+    // Said before `finish_run`, which closes the run's half-written reply and
+    // forgets where it was talking.
+    let members = state.store.members().unwrap_or_default();
+    let body = format!(
+        "{} stopped working here: {why}.",
+        agent_label(&members, &run.agent_id)
+    );
+    if let Ok(system_id) = system_member_id(state) {
+        if let Err(err) = post_message(
+            state,
+            &run.channel_id,
+            &system_id,
+            SendMessage {
+                body,
+                ..Default::default()
+            },
+            PostOptions {
+                trigger_agents: false,
+                run_id: Some(run.id.clone()),
+            },
+        )
+        .await
+        {
+            tracing::warn!(?err, run = %run.id, "could not report a dead run in its channel");
+        }
+    }
+
+    finish_run(state, &run).await
 }
 
 fn resume_session_for(
@@ -1806,8 +1990,17 @@ fn run_belongs_to_host(state: &Shared, run_id: &str, host_id: &str) -> Result<bo
 
 async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRelay) -> Result<()> {
     match msg {
-        HostToRelay::Register { .. } | HostToRelay::Heartbeat { .. } | HostToRelay::Pong { .. } => {
+        HostToRelay::Register { .. } | HostToRelay::Pong { .. } => {
             state.store.touch_host(host_id).ok();
+        }
+
+        HostToRelay::Heartbeat { runs, .. } => {
+            state.store.touch_host(host_id).ok();
+            // What the machine says it is running is the truth about what is
+            // still alive on it; anything else there died with its process.
+            if let Some(alive) = runs {
+                end_runs_the_host_lost(state, host_id, &alive).await;
+            }
         }
 
         HostToRelay::RunAccepted { run_id, cwd } => {
@@ -2506,22 +2699,10 @@ the task stays yours until you stop. Reply only if this changes your work.",
 }
 
 pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) -> Result<()> {
-    let mut targets: Vec<Id> = Vec::new();
-    if let Some(owner) = &task.owner_id {
-        targets.push(owner.clone());
-    }
-    targets.push(task.created_by.clone());
-
-    for member_id in targets {
-        let Some(member) = state.store.member(&member_id)? else {
-            continue;
-        };
-        if member.kind != MemberKind::Human {
-            continue;
-        }
+    for member_id in task_recipients(state, task)? {
         let item = InboxItem {
             id: new_id(),
-            member_id: member.id.clone(),
+            member_id: member_id.clone(),
             kind,
             title: title.clone(),
             preview: task.title.clone(),
@@ -2538,6 +2719,39 @@ pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) 
         state.emit(Event::InboxItemCreated { item });
     }
     Ok(())
+}
+
+/// Who hears about a task. Agents own tasks and create them for each other, so
+/// an Inbox item addressed only to them would reach nobody at all: fall back to
+/// the people who run the workspace, and then to everybody in it.
+fn task_recipients(state: &Shared, task: &Task) -> Result<Vec<Id>> {
+    let members = state.store.members()?;
+    let system = system_member_id(state)?;
+    let people: Vec<&Member> = members
+        .iter()
+        .filter(|member| member.kind == MemberKind::Human && member.id != system)
+        .collect();
+
+    let mut targets: Vec<Id> = [task.owner_id.clone(), Some(task.created_by.clone())]
+        .into_iter()
+        .flatten()
+        .filter(|id| people.iter().any(|member| &member.id == id))
+        .collect();
+    targets.dedup();
+    if !targets.is_empty() {
+        return Ok(targets);
+    }
+
+    let admins: Vec<Id> = people
+        .iter()
+        .filter(|member| member.is_admin)
+        .map(|member| member.id.clone())
+        .collect();
+    Ok(if admins.is_empty() {
+        people.iter().map(|member| member.id.clone()).collect()
+    } else {
+        admins
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3391,6 +3605,158 @@ mod tests {
         let stored = store.run("run").unwrap().unwrap();
         assert_eq!(stored.status, RunStatus::Dispatched);
         assert_eq!(stored.headline, "Restarting");
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_machine_is_only_gone_after_its_silence_outlasts_the_relays_own_start() {
+        let now = 10_000_000;
+        assert!(host_is_gone(now, now - HOST_SILENCE_LIMIT_MS, 0));
+        assert!(!host_is_gone(now, now - 1_000, 0));
+        // Restarted a moment ago: nobody has had a chance to reconnect yet.
+        assert!(!host_is_gone(now, now - 10 * HOST_SILENCE_LIMIT_MS, now));
+        assert!(host_is_gone(now, 0, now - HOST_SILENCE_LIMIT_MS - 1));
+    }
+
+    /// A desktop that stops running a run without saying so: the relay hears
+    /// it in the heartbeat, ends the run, says why where the run was talking,
+    /// and reaches a person even though no human is anywhere near the task.
+    #[tokio::test]
+    async fn a_run_the_machine_no_longer_has_is_ended_reported_and_escalated() {
+        let path = std::env::temp_dir().join(format!("patchwork-dead-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        for member in [
+            member("system", "patchwork", MemberKind::Human),
+            member("agent", "developer", MemberKind::Agent),
+            member("manager", "manager", MemberKind::Agent),
+            {
+                let mut human = member("human", "vince", MemberKind::Human);
+                human.is_admin = true;
+                human
+            },
+        ] {
+            store.insert_member(&member).unwrap();
+        }
+        let channel = Channel {
+            id: "channel".into(),
+            kind: ChannelKind::Channel,
+            section_id: None,
+            slug: "dev".into(),
+            name: "dev".into(),
+            topic: String::new(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: Vec::new(),
+            task_id: None,
+            last_message_at: 0,
+        };
+        store.insert_channel(&channel).unwrap();
+        let host = Host {
+            id: "desktop".into(),
+            name: "Vince's MacBook".into(),
+            kind: HostKind::Desktop,
+            platform: "macos".into(),
+            owner_id: None,
+            online: true,
+            last_seen: now_ms(),
+            capabilities: HostCapabilities::default(),
+            created_at: 1,
+        };
+        store.upsert_host(&host).unwrap();
+        let task = Task {
+            id: "task".into(),
+            key: "PW-1".into(),
+            title: "Ship it".into(),
+            outcome: "Shipped".into(),
+            status: TaskStatus::Running,
+            owner_id: Some("agent".into()),
+            source_channel_id: None,
+            source_message_id: None,
+            discussion_channel_id: channel.id.clone(),
+            project_id: None,
+            host_id: None,
+            worktree_id: None,
+            current_run_id: Some("run".into()),
+            pr_url: None,
+            pr_state: None,
+            review_action: None,
+            created_by: "manager".into(),
+            due_at: None,
+            once_key: None,
+            created_at: 1,
+            updated_at: 1,
+            position: 0.0,
+        };
+        store.insert_task(&task).unwrap();
+        let run = Run {
+            id: "run".into(),
+            agent_id: "agent".into(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual {
+                by: "manager".into(),
+            },
+            channel_id: channel.id.clone(),
+            task_id: Some(task.id.clone()),
+            host_id: Some("desktop".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "codex".into(),
+            prompt: "Ship it".into(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&run, 0).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+
+        handle_host_message(
+            &state,
+            "desktop",
+            HostToRelay::Heartbeat {
+                capabilities: None,
+                runs: Some(Vec::new()),
+            },
+        )
+        .await;
+
+        let ended = store.run("run").unwrap().unwrap();
+        assert_eq!(ended.status, RunStatus::Failed);
+        assert!(
+            ended.error.as_deref().unwrap().contains("Vince's MacBook"),
+            "{:?}",
+            ended.error
+        );
+        let said = store
+            .messages(&channel.id, None, 10)
+            .unwrap()
+            .0
+            .into_iter()
+            .any(|message| message.body.contains("stopped working here"));
+        assert!(said, "the channel it was talking in must be told why");
+        assert_eq!(
+            store.task("task").unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert_eq!(
+            store.inbox("human", true).unwrap().len(),
+            1,
+            "a task owned and created by agents must still reach a person"
+        );
 
         drop(state);
         drop(store);

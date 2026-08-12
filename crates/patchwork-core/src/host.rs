@@ -221,6 +221,11 @@ pub enum HostToRelay {
     Heartbeat {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<HostCapabilities>,
+        /// The runs this machine is actually executing right now. `None` from
+        /// a host too old to report them; `Some` is authoritative, so a run
+        /// missing from it died with whatever was running it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<Vec<Id>>,
     },
     RunAccepted {
         run_id: Id,
