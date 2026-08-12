@@ -1394,7 +1394,9 @@ export function TaskPage({ taskId }: { taskId: string }) {
                 void api.updateTask(task.id, { status: entry.key as TaskStatus })
               }
             >
-              {entry.label}
+              {task.status === "blocked" && entry.key === "running"
+                ? "Blocked"
+                : entry.label}
             </button>
           ))}
         </div>
