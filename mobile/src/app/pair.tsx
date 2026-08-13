@@ -101,7 +101,7 @@ export default function PairDevice() {
                 <View pointerEvents="none" style={[styles.target, { borderColor: theme.onAccent }]} />
               </View>
               <Text style={[styles.help, { color: theme.muted }]}>
-                On Desktop, open Members and choose Pair phone or tablet. Point this camera at the code.
+                On Desktop, open Settings, choose Remote, then show a pairing code. Point this camera at the code.
                 {workspaces.length ? " Pairing another workspace keeps the ones you already have." : ""}
               </Text>
             </>
