@@ -1442,6 +1442,7 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Result<Vec<(Strin
             spec.model.as_deref(),
         )?);
     }
+    env.extend(detect::runtime_env(&spec.runtime));
     env.extend(project_env(spec.project_name.as_deref()));
     env.extend(cfg.env.iter().cloned());
     env.extend(spec.env.iter().cloned());
@@ -1831,11 +1832,16 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"message":"not available"}}'
 
     #[test]
     fn env_gives_the_agent_native_access() {
-        let env = build_env(&RunnerConfig::default(), &spec(), "/tmp/wt").unwrap();
+        let mut run = spec();
+        run.runtime = "claude".into();
+        let env = build_env(&RunnerConfig::default(), &run, "/tmp/wt").unwrap();
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map.get("PATCHWORK_RUN_ID").unwrap(), "r1");
         assert_eq!(map.get("PATCHWORK_TASK_ID").unwrap(), "t1");
         assert_eq!(map.get("PATCHWORK_TOKEN").unwrap(), "tok");
+        if let Some(path) = detect::runtime_env("claude").first() {
+            assert_eq!(map.get(&path.0), Some(&path.1));
+        }
     }
 
     #[test]
