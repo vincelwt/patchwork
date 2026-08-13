@@ -1,12 +1,15 @@
 import { useCallback, useState } from "react";
-import { Linking, Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { Image } from "expo-image";
 import * as ImagePicker from "expo-image-picker";
 
+import { evidenceKind } from "@client/evidence";
 import type { Attachment, Id } from "@client/types";
 import { bytes } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useTheme } from "@/lib/theme";
+import { EvidenceView, opensExternally, useGrantedOpen } from "./Evidence";
+import { ErrorNotice, Sheet } from "./ui";
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -155,45 +158,55 @@ export function PendingImages({
   );
 }
 
+/// In the transcript: a screenshot to look at, or a line to press. What can be
+/// read on the phone opens over the app; a video, a page or a download goes to
+/// whatever the phone uses for it.
 export function AttachmentView({ attachment }: { attachment: Attachment }) {
   const { session } = usePairedSession();
   const theme = useTheme();
+  const { open, busy, error } = useGrantedOpen();
+  const [viewing, setViewing] = useState(false);
+  const kind = evidenceKind(attachment.mime, attachment.file_name);
+  const press = () =>
+    opensExternally(kind) ? void open((api) => api.grantFile(attachment.id)) : setViewing(true);
+  const label = attachment.caption || attachment.file_name;
   if (!session) return null;
-  const url = `${session.baseUrl.replace(/\/$/, "")}${attachment.url}`;
-  if (attachment.mime.startsWith("image/")) {
-    return (
-      <Image
-        source={{ uri: url, headers: { Authorization: `Bearer ${session.token}` } }}
-        style={[styles.image, { backgroundColor: theme.surface }]}
-        contentFit="cover"
-        transition={120}
-        cachePolicy="none"
-        accessibilityLabel={attachment.file_name}
-      />
-    );
-  }
-  const open = async () => {
-    const response = await fetch(
-      `${session.baseUrl.replace(/\/$/, "")}/api/files/${attachment.id}/grant`,
-      {
-        method: "POST",
-        headers: { Authorization: `Bearer ${session.token}` },
-      },
-    );
-    if (response.ok) await Linking.openURL((await response.json()).url);
-  };
+
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`Open ${attachment.file_name}`}
-      onPress={() => void open()}
-      style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}
-    >
-      <Text numberOfLines={1} style={[styles.fileName, { color: theme.text }]}>{attachment.file_name}</Text>
-      <Text style={{ color: theme.muted }}>
-        {attachment.mime.startsWith("video/") ? "Video · " : ""}{bytes(attachment.size)}
-      </Text>
-    </Pressable>
+    <>
+      {kind === "image" ? (
+        <Pressable accessibilityRole="button" accessibilityLabel={`Open ${label}`} onPress={press}>
+          <Image
+            source={{
+              uri: `${session.baseUrl.replace(/\/$/, "")}${attachment.url}`,
+              headers: { Authorization: `Bearer ${session.token}` },
+            }}
+            style={[styles.image, { backgroundColor: theme.surface }]}
+            contentFit="cover"
+            transition={120}
+            cachePolicy="none"
+            accessibilityLabel={label}
+          />
+        </Pressable>
+      ) : (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Open ${label}`}
+          accessibilityState={{ busy }}
+          onPress={press}
+          style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}
+        >
+          <Text numberOfLines={1} style={[styles.fileName, { color: theme.text }]}>{label}</Text>
+          <Text style={{ color: theme.muted }}>
+            {kind === "video" ? "Video · " : ""}{bytes(attachment.size)}{busy ? " · opening…" : ""}
+          </Text>
+        </Pressable>
+      )}
+      <ErrorNotice message={error} />
+      <Sheet visible={viewing} title={label} onClose={() => setViewing(false)}>
+        {viewing ? <EvidenceView attachment={attachment} /> : null}
+      </Sheet>
+    </>
   );
 }
 

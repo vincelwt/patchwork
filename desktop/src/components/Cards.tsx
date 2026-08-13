@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChartAssemblyInput } from "flint-chart";
 import type { EChartsType } from "echarts";
+import { normalizedChartSpec } from "@client/evidence";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
@@ -391,7 +392,7 @@ function ChartCard({ spec, caption }: { spec: unknown; caption?: string }) {
           import("flint-chart"),
           import("echarts"),
         ]);
-        const option = flint.assembleECharts(spec as ChartAssemblyInput);
+        const option = flint.assembleECharts(normalizedChartSpec(spec) as ChartAssemblyInput);
         if (dropped || !host.current) return;
         chart = echarts.init(host.current, dark ? "dark" : null);
         // No title inside the canvas: the message above the chart is its
