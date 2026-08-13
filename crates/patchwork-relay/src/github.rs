@@ -459,6 +459,7 @@ pub async fn link_pr_from_message(state: &Shared, task_id: &Id, body: &str) {
         return;
     }
     task.pr_url = Some(url);
+    task.pr_state = None;
     if state.store.update_task(&task).is_ok() {
         state.emit(Event::TaskUpdated { task });
     }

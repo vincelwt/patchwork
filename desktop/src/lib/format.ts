@@ -152,6 +152,17 @@ export function avatarStyle(member?: Member): {
   return { "--avatar-h": String(AVATAR_HUES[hash % AVATAR_HUES.length]) };
 }
 
+const PULL_REQUEST_TONES: Record<string, string> = {
+  OPEN: "accent",
+  DRAFT: "caution",
+  MERGED: "positive",
+  CLOSED: "danger",
+};
+
+export function pullRequestTone(state?: string): string {
+  return PULL_REQUEST_TONES[state?.toUpperCase() ?? ""] ?? "";
+}
+
 export function statusTone(status: TaskStatus | RunStatus): string {
   switch (status) {
     case "running":

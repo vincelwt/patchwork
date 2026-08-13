@@ -1330,7 +1330,7 @@ button.card:hover {
   background: var(--danger-soft);
   color: var(--danger);
 }
-button.chip:hover {
+button.chip:not(.accent):not(.positive):not(.caution):not(.danger):hover {
   background: var(--tint-strong);
 }
 

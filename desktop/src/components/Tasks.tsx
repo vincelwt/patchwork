@@ -4,6 +4,7 @@ import {
   dateInputToMillis,
   dateInputValue,
   dueLabel,
+  pullRequestTone,
   relative,
   statusLabel,
   statusTone,
@@ -38,8 +39,10 @@ import {
 import {
   AgentIcon,
   AttachIcon,
+  BranchIcon,
   ChevronIcon,
   CheckIcon,
+  CloseIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -156,6 +159,18 @@ function AgentStack({ members, size }: { members: Member[]; size: number }) {
       ))}
     </span>
   );
+}
+
+const PULL_REQUEST_ICONS = {
+  OPEN: BranchIcon,
+  DRAFT: BranchIcon,
+  MERGED: CheckIcon,
+  CLOSED: CloseIcon,
+};
+
+function PullRequestStatusIcon({ state, size }: { state?: string; size: number }) {
+  const Icon = PULL_REQUEST_ICONS[state?.toUpperCase() as keyof typeof PULL_REQUEST_ICONS] ?? ExternalIcon;
+  return <Icon size={size} />;
 }
 
 function actionIcon(kind: NextAction["kind"]) {
@@ -594,7 +609,8 @@ function TaskCard({
         )}
         {project && <Chip>{project.name}</Chip>}
         {task.pr_state && (
-          <Chip tone={task.pr_state.checks === "FAILURE" ? "danger" : ""}>
+          <Chip tone={pullRequestTone(task.pr_state.state)}>
+            <PullRequestStatusIcon state={task.pr_state.state} size={11} />
             #{task.pr_state.number}
           </Chip>
         )}
@@ -1485,8 +1501,11 @@ export function TaskPage({ taskId }: { taskId: string }) {
           </Fact>
           {task.pr_url && (
             <Fact label="Pull request">
-              <button className="chip" onClick={() => openExternal(task.pr_url!)}>
-                <ExternalIcon size={12} />
+              <button
+                className={`chip ${pullRequestTone(task.pr_state?.state)}`.trim()}
+                onClick={() => openExternal(task.pr_url!)}
+              >
+                <PullRequestStatusIcon state={task.pr_state?.state} size={12} />
                 {task.pr_state
                   ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
                   : "Open"}
