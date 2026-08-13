@@ -1330,7 +1330,7 @@ button.card:hover {
   background: var(--danger-soft);
   color: var(--danger);
 }
-button.chip:hover {
+button.chip:not(.accent):not(.positive):not(.caution):not(.danger):hover {
   background: var(--tint-strong);
 }
 
@@ -3750,9 +3750,11 @@ details.run-thought > summary > svg {
 /* --- settings ------------------------------------------------------------- */
 
 /* Tabs, not a toolbar: they hug their labels so the strip reads as navigation
-   rather than as four buttons competing with the content below it. */
+   rather than as a row of buttons competing with the content below it. */
 .settings-tabs {
   display: inline-flex;
+  flex-wrap: wrap;
+  max-width: 100%;
   margin: 18px 0 4px;
 }
 .settings-tabs button {

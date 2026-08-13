@@ -692,7 +692,8 @@ async fn trigger_agents(
             // room. A direct message is between the people in it, and a task
             // discussion belongs to whoever is on the task — an uninvited agent
             // wandering into either is not helpfulness, it is eavesdropping.
-            message.reply_to_id.is_none()
+            message.mentions.is_empty()
+                && message.reply_to_id.is_none()
                 && participation == Participation::Ambient
                 && author.kind == MemberKind::Human
                 && channel.kind == ChannelKind::Channel
@@ -3219,11 +3220,11 @@ pub async fn update_task(
         };
     }
     if let Some(pr_url) = input.pr_url {
-        task.pr_url = if pr_url.is_empty() {
-            None
-        } else {
-            Some(pr_url)
-        };
+        let pr_url = (!pr_url.is_empty()).then_some(pr_url);
+        if task.pr_url != pr_url {
+            task.pr_url = pr_url;
+            task.pr_state = None;
+        }
     }
     // 0 is how a client says "no date": there is no such instant in practice,
     // and `null` cannot be told apart from "not mentioned" in a patch.
@@ -3887,7 +3888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replying_to_an_agent_always_invokes_only_that_agent() {
+    async fn replies_and_mentions_only_invoke_the_target_agent() {
         let path = std::env::temp_dir().join(format!("patchwork-reply-{}.sqlite", new_id()));
         let store = Store::open(&path).unwrap();
         let human = member("human", "vince", MemberKind::Human);
@@ -3898,7 +3899,7 @@ mod tests {
         for member in [&human, &target, &ambient] {
             store.insert_member(member).unwrap();
         }
-        let members = [human, target, ambient];
+        let mut members = [human, target, ambient];
         let channel = Channel {
             id: "channel".into(),
             kind: ChannelKind::Channel,
@@ -3988,6 +3989,25 @@ mod tests {
         assert_eq!(
             reply_destination(&state, &run).await.reply_to_id.as_deref(),
             Some("followup")
+        );
+
+        members[1].agent.as_mut().unwrap().default_participation = Participation::Mention;
+        let mut mention = message_at("mention", "human", 4, None);
+        mention.channel_id = channel.id.clone();
+        mention.body = "@target can you check?".into();
+        mention.mentions = vec!["target".into()];
+        store.insert_message(&mention).unwrap();
+        trigger_agents(&state, &mention, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::FollowUp { prompt, .. } = rx.recv().await.unwrap() else {
+            panic!("expected a follow-up for the mentioned agent");
+        };
+        assert_eq!(prompt, "vince just said:\n\n@target can you check?");
+        assert!(
+            rx.try_recv().is_err(),
+            "unmentioned ambient agents must not join an explicit mention"
         );
 
         drop(state);

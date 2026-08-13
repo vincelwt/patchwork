@@ -1098,6 +1098,21 @@ fn reopens_terminal(from: TaskStatus, to: Option<TaskStatus>) -> bool {
     from.is_terminal() && to.is_some_and(|status| !status.is_terminal())
 }
 
+fn pull_request_blocks_completion(task: &Task, input: &UpdateTask) -> bool {
+    if input.status != Some(TaskStatus::Done) {
+        return false;
+    }
+    let requested_url = input.pr_url.as_deref().filter(|url| !url.is_empty());
+    if requested_url.is_none() && task.pr_url.is_none() {
+        return false;
+    }
+    let state_matches_link = requested_url.is_none() || requested_url == task.pr_url.as_deref();
+    !state_matches_link
+        || !task.pr_state.as_ref().is_some_and(|pr| {
+            pr.state.eq_ignore_ascii_case("merged") || pr.state.eq_ignore_ascii_case("closed")
+        })
+}
+
 async fn update_task(
     State(state): State<Shared>,
     caller: Caller,
@@ -1125,6 +1140,11 @@ async fn update_task(
     if caller.is_agent() && reopens_terminal(task.status, input.status) {
         return Err(ApiError::bad_request(
             "only a person can reopen a completed or canceled task",
+        ));
+    }
+    if pull_request_blocks_completion(&task, &input) {
+        return Err(ApiError::conflict(
+            "the linked pull request must be closed or merged before this task can be marked done",
         ));
     }
     if caller.is_agent() && input.status == Some(TaskStatus::Review) {
@@ -3231,6 +3251,49 @@ mod tests {
             Some(TaskStatus::Planned)
         ));
         assert!(!reopens_terminal(TaskStatus::Done, None));
+    }
+
+    #[test]
+    fn an_unfinished_pull_request_blocks_completion() {
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task",
+            "key": "PW-1",
+            "title": "Ship it",
+            "outcome": "The change is live",
+            "status": "review",
+            "discussion_channel_id": "channel",
+            "created_by": "human",
+            "created_at": 1,
+            "updated_at": 1,
+            "position": 1
+        }))
+        .unwrap();
+        let mut input = UpdateTask {
+            status: Some(TaskStatus::Done),
+            ..Default::default()
+        };
+        assert!(!pull_request_blocks_completion(&task, &input));
+
+        task.pr_url = Some("https://github.com/acme/app/pull/42".into());
+        assert!(pull_request_blocks_completion(&task, &input));
+        for state in ["OPEN", "DRAFT", "MERGED", "CLOSED", "merged", "closed"] {
+            task.pr_state = Some(PullRequestState {
+                number: 42,
+                title: "Ship it".into(),
+                state: state.into(),
+                checks: String::new(),
+                review: String::new(),
+                last_feedback_at: String::new(),
+                updated_at: 1,
+            });
+            assert_eq!(
+                pull_request_blocks_completion(&task, &input),
+                matches!(state, "OPEN" | "DRAFT")
+            );
+        }
+
+        input.pr_url = Some("https://github.com/acme/app/pull/43".into());
+        assert!(pull_request_blocks_completion(&task, &input));
     }
 
     #[test]

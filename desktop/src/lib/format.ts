@@ -152,6 +152,27 @@ export function avatarStyle(member?: Member): {
   return { "--avatar-h": String(AVATAR_HUES[hash % AVATAR_HUES.length]) };
 }
 
+const PULL_REQUEST_TONES: Record<string, string> = {
+  OPEN: "accent",
+  DRAFT: "caution",
+  MERGED: "positive",
+  CLOSED: "danger",
+  PENDING: "caution",
+  SUCCESS: "positive",
+  FAILURE: "danger",
+};
+
+export function pullRequestStatus(state?: string, checks?: string): string {
+  const normalizedState = state?.toUpperCase() ?? "";
+  return ["MERGED", "CLOSED"].includes(normalizedState)
+    ? normalizedState
+    : checks?.toUpperCase() || normalizedState;
+}
+
+export function pullRequestTone(state?: string, checks?: string): string {
+  return PULL_REQUEST_TONES[pullRequestStatus(state, checks)] ?? "";
+}
+
 export function statusTone(status: TaskStatus | RunStatus): string {
   switch (status) {
     case "running":
