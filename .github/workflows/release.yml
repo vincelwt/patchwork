@@ -56,3 +56,30 @@ jobs:
             --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+
+  testflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changes
+        run: |
+          current=$(git rev-list -n 1 "$GITHUB_REF_NAME")
+          previous=$(git describe --tags --match 'v*' --abbrev=0 "$current^")
+          git diff --quiet "$previous" "$current" -- mobile client && changed=false || changed=true
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+      - if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - if: steps.changes.outputs.changed == 'true'
+        run: npm ci
+        working-directory: mobile
+      - if: steps.changes.outputs.changed == 'true'
+        run: npx --yes eas-cli@21.8.0 build --platform ios --profile production --non-interactive --auto-submit
+        working-directory: mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
