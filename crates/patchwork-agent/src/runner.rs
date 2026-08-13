@@ -248,6 +248,8 @@ impl Runner {
 struct TurnState {
     message: String,
     thought: String,
+    background_generation: u64,
+    background_processes: Vec<BackgroundProcess>,
     plan_posted: bool,
     /// Setup metadata that the adapter repeats as an agent message.
     startup_message: Option<String>,
@@ -265,6 +267,26 @@ struct TurnState {
     /// The agent did something between two pieces of prose. The next chunk
     /// starts a new paragraph rather than running into the last sentence.
     interrupted: bool,
+}
+
+#[derive(Debug)]
+struct BackgroundProcess {
+    pid: u32,
+    generation: u64,
+}
+
+impl TurnState {
+    fn background_started_since(&self, generation: u64) -> bool {
+        self.background_processes
+            .iter()
+            .any(|process| process.generation > generation && process_is_alive(process.pid))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeSignal {
+    Activity,
+    Settled,
 }
 
 /// Long enough that a chatty model does not flood the relay, short enough that
@@ -460,6 +482,7 @@ async fn execute(
 
     // 4. Pump the runtime's stream into run events, permission answers and
     //    accumulated prose.
+    let (runtime_signal_tx, mut runtime_signals) = mpsc::unbounded_channel();
     let pump = {
         let out = out.clone();
         let conn = conn.clone();
@@ -469,7 +492,11 @@ async fn execute(
             while let Some(event) = events.recv().await {
                 match event {
                     AgentEvent::SessionUpdate { update, .. } => {
+                        let signal = runtime_signal(&update);
                         handle_update(&run_id, update, &out, &state).await;
+                        if let Some(signal) = signal {
+                            let _ = runtime_signal_tx.send(signal);
+                        }
                     }
                     AgentEvent::PermissionRequest {
                         request_id,
@@ -540,6 +567,7 @@ async fn execute(
             });
         }
 
+        let background_before = state.lock().await.background_generation;
         let mut prompt_call = Box::pin(conn.prompt(&session_id, &prompt));
         let mut interrupted = false;
         let stop_reason = loop {
@@ -626,6 +654,120 @@ async fn execute(
             data: None,
         });
 
+        let mut background_generation = state.lock().await.background_generation;
+        if state
+            .lock()
+            .await
+            .background_started_since(background_before)
+        {
+            emit(HostToRelay::RunStatus {
+                run_id: run_id.clone(),
+                status: RunStatus::Waiting,
+                headline: Some("Waiting for background work".into()),
+                session_id: Some(session_id.clone()),
+                error: None,
+                token_usage: None,
+            });
+
+            // Pi's process tool deliberately ends the visible turn while a
+            // build or simulator runs, then wakes the same session on exit.
+            // Keep the ACP session (and therefore the task) alive for that
+            // autonomous continuation instead of declaring the run finished.
+            let mut initial_turn_settled = false;
+            let mut continuation_active = false;
+            let mut queued_control = false;
+            let mut queued_interrupted = false;
+            loop {
+                tokio::select! {
+                    signal = runtime_signals.recv() => match signal {
+                        Some(RuntimeSignal::Activity) if initial_turn_settled => {
+                            continuation_active = true;
+                        }
+                        Some(RuntimeSignal::Settled) if !initial_turn_settled => {
+                            initial_turn_settled = true;
+                            if queued_control {
+                                break;
+                            }
+                        }
+                        Some(RuntimeSignal::Settled) if continuation_active => {
+                            turns += 1;
+                            flush_message(&run_id, &out, &state, &spec).await;
+                            emit(HostToRelay::RunEvent {
+                                run_id: run_id.clone(),
+                                kind: RunEventKind::Lifecycle,
+                                text: format!("Turn {turns} ended: background notification"),
+                                data: None,
+                            });
+                            if queued_control {
+                                break;
+                            }
+
+                            let turn = state.lock().await;
+                            let started_another =
+                                turn.background_started_since(background_generation);
+                            background_generation = turn.background_generation;
+                            drop(turn);
+                            if started_another {
+                                continuation_active = false;
+                                emit(HostToRelay::RunStatus {
+                                    run_id: run_id.clone(),
+                                    status: RunStatus::Waiting,
+                                    headline: Some("Waiting for background work".into()),
+                                    session_id: Some(session_id.clone()),
+                                    error: None,
+                                    token_usage: None,
+                                });
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => return Err(anyhow!(
+                            "the runtime closed while background work was still pending"
+                        )),
+                    },
+                    cmd = control.recv() => match cmd {
+                        Some(RelayToHost::FollowUp { control_id, prompt, mode, files, .. }) => {
+                            let files = fetch_files(&prepared.path, &files).await;
+                            emit(HostToRelay::RunControlStatus {
+                                run_id: run_id.clone(),
+                                control_id: control_id.clone(),
+                                state: RunControlState::Queued,
+                            });
+                            if queue_control(
+                                &mut pending,
+                                &mut queued_interrupted,
+                                QueuedControl { control_id, prompt, files },
+                                mode,
+                            ) && continuation_active {
+                                conn.cancel(&session_id);
+                            }
+                            queued_control = true;
+                            if initial_turn_settled && !continuation_active {
+                                break;
+                            }
+                        }
+                        Some(RelayToHost::CancelRun { .. }) => {
+                            stop_run = true;
+                            conn.cancel(&session_id);
+                            break;
+                        }
+                        Some(RelayToHost::QuestionAsked { .. })
+                        | Some(RelayToHost::AnswerQuestion { .. }) => {
+                            begin_message_after_question(&state).await;
+                        }
+                        Some(_) => {}
+                        None => return Err(anyhow!(
+                            "run control closed while background work was still pending"
+                        )),
+                    }
+                }
+                if stop_run || (queued_control && initial_turn_settled && !continuation_active) {
+                    break;
+                }
+            }
+        }
+
         let closed = pending.is_empty();
         if closed {
             // Close under the same lock used by `handle`, then drain anything
@@ -697,6 +839,7 @@ async fn execute(
         }
     }
 
+    conn.shutdown().await;
     emit(HostToRelay::RunStatus {
         run_id: run_id.clone(),
         status: RunStatus::Succeeded,
@@ -705,8 +848,6 @@ async fn execute(
         error: None,
         token_usage: None,
     });
-
-    conn.shutdown().await;
     Ok(())
 }
 
@@ -904,6 +1045,11 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if kind == "tool_call_update" {
+        let mut turn = state.lock().await;
+        update_background_processes(&update, &mut turn);
+    }
+
     match kind {
         "agent_message_chunk" => {
             if let Some(text) = content_text(update.get("content")) {
@@ -1092,6 +1238,68 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
             });
         }
     }
+}
+
+fn runtime_signal(update: &Value) -> Option<RuntimeSignal> {
+    match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "plan") => {
+            Some(RuntimeSignal::Activity)
+        }
+        Some("session_info_update")
+            if update
+                .pointer("/_meta/piAcp/running")
+                .and_then(Value::as_bool)
+                == Some(false) =>
+        {
+            Some(RuntimeSignal::Settled)
+        }
+        _ => None,
+    }
+}
+
+fn update_background_processes(update: &Value, state: &mut TurnState) {
+    let Some(details) = update.pointer("/rawOutput/details") else {
+        return;
+    };
+    let Some(process) = details
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| *action == "start")
+        .and_then(|_| details.get("process"))
+    else {
+        return;
+    };
+    let wakes_on_success = details
+        .pointer("/notify/onSuccess")
+        .and_then(Value::as_str)
+        .unwrap_or("turn")
+        == "turn";
+    let Some(pid) = process
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| *status == "running")
+        .and_then(|_| process.get("pid"))
+        .and_then(Value::as_u64)
+        .filter(|pid| wakes_on_success && (1..=i32::MAX as u64).contains(pid))
+    else {
+        return;
+    };
+    state.background_generation += 1;
+    state.background_processes.push(BackgroundProcess {
+        pid: pid as u32,
+        generation: state.background_generation,
+    });
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
 }
 
 /// Runtimes are chatty on stderr. A deprecation notice from a package manager
@@ -1673,6 +1881,57 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"message":"not available"}}'
                 .collect::<Vec<_>>(),
             vec!["now", "later", "after"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_wakeful_background_process_keeps_its_run_open() {
+        let script = r#"
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+read _
+sleep 0.2 & pid=$!
+printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","status":"completed","rawOutput":{"details":{"action":"start","notify":{"onSuccess":"turn"},"process":{"pid":%s,"status":"running"}}}}}}\n' "$pid"
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Build still running."}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","_meta":{"piAcp":{"running":false}}}}}'
+wait "$pid"
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Build passed."}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"session_info_update","_meta":{"piAcp":{"running":false}}}}}'
+"#;
+        let (out, mut messages) = mpsc::unbounded_channel();
+        let runner = Runner::new(RunnerConfig::default(), out);
+        let (_control, control) = mpsc::unbounded_channel();
+        let mut requested = spec();
+        requested.run_id = "background-run".into();
+        requested.task_id = Some("runner-background-test".into());
+        requested.runtime = "custom".into();
+        requested.custom_command = Some(vec!["sh".into(), "-c".into(), script.into()]);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            execute(runner, requested, control),
+        )
+        .await
+        .expect("the background continuation should settle")
+        .unwrap();
+
+        let statuses = std::iter::from_fn(|| messages.try_recv().ok())
+            .filter_map(|message| match message {
+                HostToRelay::RunStatus { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let waiting = statuses
+            .iter()
+            .position(|status| *status == RunStatus::Waiting)
+            .expect("the run should wait while the build is alive");
+        let succeeded = statuses
+            .iter()
+            .position(|status| *status == RunStatus::Succeeded)
+            .expect("the notification turn should finish the run");
+        assert!(waiting < succeeded);
     }
 
     #[tokio::test]
