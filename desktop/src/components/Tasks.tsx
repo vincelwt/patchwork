@@ -507,7 +507,11 @@ function TaskList({
                 <span className="task-key">{task.key}</span>
                 <span className="grow">
                   <span className="name">{task.title}</span>
-                  <span className="sub">{state.headline}</span>
+                  <span className="sub">
+                    {state.headline === statusLabel(task.status)
+                      ? relative(task.updated_at)
+                      : state.headline}
+                  </span>
                 </span>
                 {due && !isTerminalTaskStatus(task.status) && (
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
