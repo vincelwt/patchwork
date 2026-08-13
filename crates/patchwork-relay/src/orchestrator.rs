@@ -3220,11 +3220,11 @@ pub async fn update_task(
         };
     }
     if let Some(pr_url) = input.pr_url {
-        task.pr_url = if pr_url.is_empty() {
-            None
-        } else {
-            Some(pr_url)
-        };
+        let pr_url = (!pr_url.is_empty()).then_some(pr_url);
+        if task.pr_url != pr_url {
+            task.pr_url = pr_url;
+            task.pr_state = None;
+        }
     }
     // 0 is how a client says "no date": there is no such instant in practice,
     // and `null` cannot be told apart from "not mentioned" in a patch.

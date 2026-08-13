@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChartAssemblyInput } from "flint-chart";
 import type { EChartsType } from "echarts";
 import { useApi, useAppSelector, store } from "../lib/store";
-import { bytes, duration, statusLabel, statusTone } from "../lib/format";
+import { bytes, duration, pullRequestTone, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, usePreviewUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
@@ -489,7 +489,7 @@ function PullRequestCard({ url, taskId }: { url: string; taskId?: string }) {
       </div>
       <div className="card-title">{pr?.title ?? url}</div>
       <div className="card-row">
-        {pr && <Chip tone={pr.state === "MERGED" ? "positive" : ""}>{pr.state}</Chip>}
+        {pr && <Chip tone={pullRequestTone(pr.state)}>{pr.state}</Chip>}
         {pr?.checks && (
           <Chip tone={pr.checks === "FAILURE" ? "danger" : pr.checks === "SUCCESS" ? "positive" : "caution"}>
             checks {pr.checks.toLowerCase()}
