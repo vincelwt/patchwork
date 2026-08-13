@@ -47,6 +47,7 @@ import {
   MachineIcon,
   MoreIcon,
   PencilIcon,
+  PhoneIcon,
   PlusIcon,
   RelayIcon,
   Spinner,
@@ -2247,13 +2248,14 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
 
 // --- settings --------------------------------------------------------------
 
-/// Settings is five unrelated conversations — this workspace, the machines
-/// that run agents, the relay everything hangs off, the built-in agent's keys,
-/// and the app itself. One scroll made you hunt through all five to change one
-/// thing, so each is now a tab that stands on its own.
+/// Settings is a handful of unrelated conversations: this workspace, the
+/// machines that run agents, remote access, the relay everything hangs off,
+/// the built-in agent's keys, and the app itself. One scroll made you hunt
+/// through all of them to change one thing, so each is a tab that stands alone.
 const SETTINGS_TABS = [
   { id: "workspace", label: "Workspace", Icon: WorkspaceIcon },
   { id: "machines", label: "Machines", Icon: MachineIcon },
+  { id: "remote", label: "Remote", Icon: PhoneIcon },
   { id: "relay", label: "Relay", Icon: RelayIcon },
   // Nothing to hold a key in a browser tab, so nothing to show there.
   ...(inTauri ? [{ id: "agent", label: "Agent", Icon: AgentIcon }] : []),
@@ -2294,6 +2296,7 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
 
       {tab === "workspace" && <WorkspaceSettings />}
       {tab === "machines" && <MachineSettings info={info} />}
+      {tab === "remote" && <RemoteSettings />}
       {tab === "relay" && <RelaySettings info={info} relayUrl={relayUrl} />}
       {tab === "agent" && <ProviderSection />}
       {tab === "app" && (
@@ -2576,6 +2579,29 @@ function MachineSettings({ info }: { info?: DesktopInfo }) {
         </div>
       ))}
     </Section>
+  );
+}
+
+function RemoteSettings() {
+  const [pairing, setPairing] = useState(false);
+
+  return (
+    <>
+      <Section title="Phones and tablets">
+        <div className="row">
+          <span className="grow">
+            <span className="name">Link this workspace</span>
+            <span className="sub">
+              Open Patchwork on another device and scan a secure, five-minute QR code.
+            </span>
+          </span>
+          <button className="button primary" onClick={() => setPairing(true)}>
+            Show pairing code
+          </button>
+        </div>
+      </Section>
+      {pairing && <PairDeviceModal onClose={() => setPairing(false)} />}
+    </>
   );
 }
 

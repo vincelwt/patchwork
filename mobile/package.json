@@ -8,13 +8,15 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts ../client/keyboard.test.ts src/lib/format.test.ts src/lib/paired.test.ts src/lib/workspace-cache.test.ts",
+    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/inbox.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts ../client/keyboard.test.ts src/lib/chart.test.ts src/lib/format.test.ts src/lib/paired.test.ts src/lib/workspace-cache.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/datetimepicker": "9.1.0",
     "@react-native-community/netinfo": "12.0.1",
+    "@wuba/react-native-echarts": "^3.1.1",
+    "echarts": "^6.1.0",
     "expo": "~57.0.11",
     "expo-camera": "~57.0.3",
     "expo-constants": "~57.0.9",
@@ -30,14 +32,19 @@
     "expo-status-bar": "~57.0.1",
     "expo-symbols": "~57.0.2",
     "expo-system-ui": "~57.0.2",
+    "flint-chart": "^0.4.1",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-native": "0.86.2",
     "react-native-safe-area-context": "~5.7.0",
-    "react-native-screens": "~4.26.0"
+    "react-native-screens": "~4.26.0",
+    "react-native-svg": "15.15.4"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
     "typescript": "~6.0.3"
+  },
+  "overrides": {
+    "tslib": "2.8.1"
   }
 }

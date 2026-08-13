@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 
+import { TaskEvidence } from "./Evidence";
 import { Conversation } from "./Message";
 import { PullRequestLink } from "./pull-request-link";
 import { TaskEditor } from "./TaskEditor";
@@ -48,6 +49,7 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
     : taskRuns[taskRuns.length - 1] ?? currentRun;
   const [editing, setEditing] = useState(false);
   const [agents, setAgents] = useState(false);
+  const [evidence, setEvidence] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -190,6 +192,8 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
             <Button label="Reopen" compact tone="secondary" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "planned" }))} />
           )}
           {!isTerminalTaskStatus(task.status) && task.status !== "review" && !active ? <Button label="Complete" compact tone="quiet" onPress={() => void store.mutate((api) => api.updateTask(task.id, { status: "done" }))} /> : null}
+          {/* What the run left to look at. The discussion stays the screen. */}
+          <Button label="Evidence" compact tone="quiet" onPress={() => setEvidence(true)} />
         </View>
         <ErrorNotice message={error} />
       </View>
@@ -197,6 +201,7 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
           when the task was opened, so the header does not repeat it. */}
       <Conversation channelId={task.discussion_channel_id} />
 
+      <TaskEvidence task={task} visible={evidence} onClose={() => setEvidence(false)} />
       <Sheet visible={editing} title={`Edit ${task.key}`} onClose={() => setEditing(false)}>
         <TaskEditor task={task} onSaved={() => setEditing(false)} />
       </Sheet>

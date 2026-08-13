@@ -2,6 +2,7 @@ import { NativeTabs } from "expo-router/unstable-native-tabs";
 
 import type { SFSymbol } from "sf-symbols-typescript";
 
+import { unreadInboxCount } from "@client/inbox";
 import { workspaceSymbol } from "@/lib/paired";
 import { usePairedSession } from "@/lib/session";
 import { useWorkspace } from "@/lib/store";
@@ -10,7 +11,7 @@ import { useTheme } from "@/lib/theme";
 export default function TabLayout() {
   const theme = useTheme();
   const bootstrap = useWorkspace().bootstrap;
-  const unread = bootstrap?.inbox.filter((item) => !item.read_at).length ?? 0;
+  const unread = unreadInboxCount(bootstrap?.inbox ?? []);
   const { session } = usePairedSession();
   // Which workspace is on screen rides on the More tab, the way a settings tab
   // carries the current account, instead of taking a header row on every tab.

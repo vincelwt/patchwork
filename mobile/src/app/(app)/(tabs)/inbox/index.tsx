@@ -3,7 +3,9 @@ import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "rea
 import { Stack, useRouter } from "expo-router";
 import type { SymbolViewProps } from "expo-symbols";
 
-import type { InboxItem, InboxKind } from "@client/types";
+import { groupInbox, unreadInboxCount } from "@client/inbox";
+import type { InboxGroup } from "@client/inbox";
+import type { InboxKind } from "@client/types";
 import { Conversation } from "@/components/Message";
 import { TaskDetail } from "@/components/TaskDetail";
 import { Avatar, Button, Empty, Icon, Measured, Screen } from "@/components/ui";
@@ -19,40 +21,50 @@ export default function InboxScreen() {
   const store = useWorkspaceStore();
   const { split, gutter } = useLayout();
   const [selected, setSelected] = useState<string>();
-  const items = [...(workspace.bootstrap?.inbox ?? [])].sort((a, b) => b.created_at - a.created_at);
-  const unread = items.filter((item) => !item.read_at).length;
+  const groups = groupInbox(workspace.bootstrap?.inbox ?? []);
+  const unread = unreadInboxCount(workspace.bootstrap?.inbox ?? []);
   // Beside the list, something is always on screen rather than a blank pane.
-  const opened = items.find((item) => item.id === selected)
-    ?? (split ? items.find((item) => item.task_id || item.channel_id) : undefined);
+  const openedGroup = groups.find((group) => group.key === selected)
+    ?? (split ? groups.find((group) => group.latest.task_id || group.latest.channel_id) : undefined);
+  const opened = openedGroup?.latest;
   const openedChannel = opened?.channel_id && !opened.task_id
     ? workspace.bootstrap?.channels.find((channel) => channel.id === opened.channel_id)
     : undefined;
 
-  const open = async (item: InboxItem) => {
-    if (!item.read_at) await store.mutate((api) => api.markRead(item.id), false).catch(() => undefined);
+  const open = async (group: InboxGroup) => {
+    const item = group.latest;
+    const unreadIds = group.items.filter((candidate) => !candidate.read_at).map((candidate) => candidate.id);
+    if (unreadIds.length) {
+      await store.mutate(
+        (api) => Promise.all(unreadIds.map((id) => api.markRead(id))),
+        false,
+      ).catch(() => undefined);
+    }
     if (item.kind === "question" && item.run_id) {
       const question = workspace.bootstrap?.open_questions.find((candidate) => candidate.run_id === item.run_id);
       if (question) return router.push({ pathname: "/(app)/questions/[questionId]", params: { questionId: question.id } });
     }
     // Beside the list a task or conversation opens in place; a run, question or
     // automation is deep enough to deserve the whole screen either way.
-    if (split && (item.task_id || item.channel_id) && !item.run_id) return setSelected(item.id);
+    if (split && (item.task_id || item.channel_id) && !item.run_id) return setSelected(group.key);
     if (item.task_id) return router.push({ pathname: "/tasks/[taskId]", params: { taskId: item.task_id } });
     if (item.run_id) return router.push({ pathname: "/(app)/runs/[runId]", params: { runId: item.run_id } });
     if (item.channel_id) return router.push({ pathname: "/channels/[channelId]", params: { channelId: item.channel_id } });
     if (item.automation_id) return router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: item.automation_id } });
   };
 
-  const row = ({ item }: { item: InboxItem }) => {
+  const row = ({ item: group }: { item: InboxGroup }) => {
+    const item = group.latest;
     const actor = workspace.bootstrap?.members.find((member) => member.id === item.actor_id);
-    const kind = describe(item.kind, theme);
-    const active = split && opened?.id === item.id;
+    const kind = describe(group.lead, theme);
+    const active = split && openedGroup?.key === group.key;
+    const extra = group.items.length - 1;
     return (
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ selected: active }}
         accessibilityLabel={`${kind.label}. ${item.title}`}
-        onPress={() => void open(item)}
+        onPress={() => void open(group)}
         style={({ pressed }) => [
           styles.row,
           { borderBottomColor: theme.line },
@@ -61,7 +73,7 @@ export default function InboxScreen() {
         ]}
       >
         {/* An unread mark reads faster than tinting the whole row. */}
-        <View style={[styles.unread, !item.read_at && { backgroundColor: theme.accent }]} />
+        <View style={[styles.unread, group.unread > 0 && { backgroundColor: theme.accent }]} />
         <View>
           <Avatar member={actor} size={38} />
           {/* The reason it arrived matters as much as who sent it. */}
@@ -74,6 +86,9 @@ export default function InboxScreen() {
           {item.preview ? <Text numberOfLines={2} style={[styles.preview, { color: theme.muted }]}>{item.preview}</Text> : null}
           <View style={styles.foot}>
             <Text numberOfLines={1} style={[styles.kindLabel, { color: kind.colour }]}>{kind.label}</Text>
+            {extra > 0 ? (
+              <Text numberOfLines={1} style={[styles.more, { color: theme.faint }]}>+{extra} more</Text>
+            ) : null}
             <Text style={[styles.time, { color: theme.faint }]}>{relative(item.created_at)}</Text>
           </View>
         </View>
@@ -87,9 +102,9 @@ export default function InboxScreen() {
   const list = (
     <FlatList
       contentInsetAdjustmentBehavior="automatic"
-      data={items}
-      keyExtractor={(item) => item.id}
-      contentContainerStyle={items.length ? styles.list : styles.emptyList}
+      data={groups}
+      keyExtractor={(group) => group.key}
+      contentContainerStyle={groups.length ? styles.list : styles.emptyList}
       // One list, one column. Grouping each row into its own card is what a
       // phone on its side used to do, and it looked like scattered receipts.
       renderItem={split ? row : ({ item }) => <Measured>{row({ item })}</Measured>}
@@ -197,4 +212,5 @@ const styles = StyleSheet.create({
   foot: { flexDirection: "row", alignItems: "baseline", gap: 8 },
   time: { fontSize: 12 },
   kindLabel: { flexShrink: 1, fontSize: 12, fontWeight: "600" },
+  more: { flexShrink: 1, fontSize: 12 },
 });

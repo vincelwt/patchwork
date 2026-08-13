@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { evidenceKind, parseTable, separatorFor } from "./evidence.ts";
+import { evidenceKind, normalizedChartSpec, parseTable, separatorFor } from "./evidence.ts";
 
 test("the file name decides whenever the MIME type is vague", () => {
   assert.equal(evidenceKind("application/octet-stream", "report.md"), "markdown");
@@ -36,4 +36,13 @@ test("a tab separated table is the same parser with another separator", () => {
 test("empty cells and an empty file stay empty rather than disappearing", () => {
   assert.deepEqual(parseTable("a,,c\n"), [["a", "", "c"]]);
   assert.deepEqual(parseTable(""), []);
+});
+
+test("the documented Box Plot name reaches Flint's Boxplot renderer", () => {
+  const spec = { data: { values: [] }, chart_spec: { chartType: "Box Plot" } };
+  assert.deepEqual(normalizedChartSpec(spec), {
+    data: spec.data,
+    chart_spec: { chartType: "Boxplot" },
+  });
+  assert.equal(normalizedChartSpec(null), null);
 });
