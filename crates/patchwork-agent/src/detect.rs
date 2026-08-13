@@ -263,6 +263,17 @@ pub fn runtime_command(runtime: &str) -> Option<Vec<String>> {
     ])
 }
 
+/// Adapter-specific environment needed to drive the installed runtime rather
+/// than the adapter's bundled fallback.
+pub(crate) fn runtime_env(runtime: &str) -> Vec<(String, String)> {
+    match runtime {
+        "claude" => on_path("claude")
+            .map(|path| vec![("CLAUDE_CODE_EXECUTABLE".into(), path)])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 pub async fn detect_runtimes() -> Vec<RuntimeInstallation> {
     let has_npx = on_path("npx").is_some();
     let mut out = Vec::new();
@@ -715,6 +726,17 @@ pub fn base_env(extra: &[(String, String)]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_adapter_uses_the_installed_cli() {
+        assert!(runtime_env("codex").is_empty());
+        if let Some(path) = on_path("claude") {
+            assert_eq!(
+                runtime_env("claude"),
+                vec![("CLAUDE_CODE_EXECUTABLE".into(), path)]
+            );
+        }
+    }
 
     #[test]
     fn global_agent_skills_are_discovered_with_frontmatter() {

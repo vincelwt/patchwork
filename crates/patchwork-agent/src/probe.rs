@@ -19,13 +19,6 @@ use crate::{detect, Sink};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn report_runtime_options(out: Sink, env: Vec<(String, String)>) {
-    // A dropped connection re-registers, and spawning every runtime again each
-    // time the network hiccups is not a thing worth doing twice.
-    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if ASKED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return;
-    }
-
     let capabilities = detect::detect_capabilities().await;
     let cwd = crate::worktree::work_root().join("probe");
     if tokio::fs::create_dir_all(&cwd).await.is_err() {
@@ -48,7 +41,9 @@ pub async fn report_runtime_options(out: Sink, env: Vec<(String, String)>) {
             continue;
         };
 
-        match tokio::time::timeout(PROBE_TIMEOUT, ask(&command, &cwd, &env)).await {
+        let mut runtime_env = detect::runtime_env(&runtime.id);
+        runtime_env.extend(env.iter().cloned());
+        match tokio::time::timeout(PROBE_TIMEOUT, ask(&command, &cwd, &runtime_env)).await {
             Ok(Ok(session))
                 if !session.models.is_empty()
                     || !session.thinking.is_empty()
