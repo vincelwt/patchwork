@@ -1353,6 +1353,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         agent_handle: agent.handle.clone(),
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
+        autonomy: state.store.workspace()?.autonomy,
         skills: state.store.workspace_skills()?,
         runtime: profile.runtime.clone(),
         provider: profile.provider.clone(),
@@ -1532,6 +1533,7 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
         agent_handle: agent.handle.clone(),
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
+        autonomy: state.store.workspace()?.autonomy,
         skills: state.store.workspace_skills()?,
         runtime: run.runtime.clone(),
         provider: run.provider.clone().or(profile.provider.clone()),
@@ -3559,6 +3561,10 @@ mod tests {
     async fn interrupted_relay_run_is_redispatched_with_its_session_and_identity() {
         let path = std::env::temp_dir().join(format!("patchwork-resume-{}.sqlite", new_id()));
         let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        store
+            .update_workspace(None, None, None, None, Some("Merge after checks pass."))
+            .unwrap();
         let mut agent = member("agent", "developer", MemberKind::Agent);
         let current_profile = agent.agent.as_mut().unwrap();
         current_profile.runtime = "claude".into();
@@ -3643,6 +3649,7 @@ mod tests {
         assert_eq!(spec.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
         assert_eq!(spec.thinking.as_deref(), Some("xhigh"));
         assert_eq!(spec.prompt, "Finish the interrupted work");
+        assert_eq!(spec.autonomy, "Merge after checks pass.");
         assert_eq!(spec.skills, store.workspace_skills().unwrap());
         assert!(matches!(
             spec.worktree,

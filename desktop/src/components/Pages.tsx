@@ -844,7 +844,13 @@ export function SkillsPage() {
   const app = useApp();
   const [editing, setEditing] = useState<WorkspaceSkill | null>(null);
   const [editingSystem, setEditingSystem] = useState<LocatedSystemSkill | null>(null);
+  const [editingAutonomy, setEditingAutonomy] = useState(false);
   const [creating, setCreating] = useState(false);
+  const autonomySummary =
+    (app.workspace?.autonomy ?? "")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean) ?? "No workspace autonomy policy yet.";
   const systemSkills = distinctMachines(app.hosts).flatMap((machine) =>
     (machine.host.capabilities.system_skills ?? []).map((skill) => ({
       ...skill,
@@ -865,6 +871,17 @@ export function SkillsPage() {
       }
     >
       <Section title="Workspace skills">
+        <button className="row" onClick={() => setEditingAutonomy(true)}>
+          <span style={{ color: "var(--text-muted)", display: "flex" }}>
+            <FileIcon />
+          </span>
+          <span className="grow">
+            <span className="name">AUTONOMY.md</span>
+            <span className="sub">{autonomySummary}</span>
+          </span>
+          <Chip>policy</Chip>
+          <Chip>all agents</Chip>
+        </button>
         {app.skills.length === 0 ? (
           <div className="row">
             <span className="grow">
@@ -930,6 +947,7 @@ export function SkillsPage() {
           }}
         />
       )}
+      {editingAutonomy && <AutonomyModal onClose={() => setEditingAutonomy(false)} />}
       {editingSystem && (
         <SystemSkillModal
           skill={editingSystem}
@@ -938,6 +956,76 @@ export function SkillsPage() {
         />
       )}
     </Page>
+  );
+}
+
+/// AUTONOMY.md is not a skill row in the database: it lives on the workspace
+/// and is edited here because that is where agents' standing instructions live.
+function AutonomyModal({ onClose }: { onClose: () => void }) {
+  const app = useApp();
+  const api = useApi();
+  const editable = app.me?.is_admin ?? false;
+  const original = app.workspace?.autonomy ?? "";
+  const [content, setContent] = useState(original);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateWorkspace({ autonomy: content });
+      onClose();
+    } catch (err) {
+      setError(String((err as Error).message ?? err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      wide
+      title="AUTONOMY.md"
+      subtitle="Workspace policy · what agents may do without asking"
+      onClose={onClose}
+      actions={
+        <>
+          <span className="spacer" />
+          <button className="button quiet" onClick={onClose}>
+            {editable ? "Cancel" : "Close"}
+          </button>
+          {editable && (
+            <button
+              className="button primary"
+              disabled={busy || content === original}
+              onClick={() => void save()}
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+          )}
+        </>
+      }
+    >
+      <div className="skill-instructions">
+        <Field
+          label="Policy"
+          value={content}
+          onChange={setContent}
+          textarea
+          autoFocus={editable}
+          readOnly={!editable}
+          placeholder={
+            "Agents may merge pull requests after checks pass.\nAsk before contacting customers."
+          }
+        />
+      </div>
+      <span className="form-help">
+        {editable
+          ? "Included in every future agent run. Save it empty to clear the policy."
+          : "Only workspace administrators can edit the workspace autonomy policy."}
+      </span>
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
   );
 }
 

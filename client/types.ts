@@ -491,6 +491,8 @@ export interface Workspace {
   icon_image?: string;
   /// What task keys start with: "PW" gives PW-14.
   task_prefix: string;
+  /// AUTONOMY.md: what agents may do without asking. Empty when unset.
+  autonomy: string;
   created_at: Millis;
   task_seq: number;
 }

@@ -1387,6 +1387,13 @@ fn compose_first_prompt(spec: &RunSpec, files: &[String]) -> String {
     }
     s.push_str("\n---\n");
     s.push_str(SKILL);
+    if !spec.autonomy.trim().is_empty() {
+        s.push_str(
+            "\n\n---\n\n## AUTONOMY.md\n\nThis workspace policy defines what you may do without asking. Follow it for every task.\n\n",
+        );
+        s.push_str(spec.autonomy.trim());
+        s.push('\n');
+    }
     if !spec.skills.is_empty() {
         s.push_str(
             "\n\n---\n\n## Workspace skills\n\nUse these workspace-wide instructions when relevant. They are available to every agent.\n",
@@ -1434,6 +1441,8 @@ mod tests {
             agent_handle: "dev".into(),
             agent_name: "Developer agent".into(),
             agent_description: "You ship small, reviewable changes.".into(),
+            autonomy: "Merge pull requests after checks pass. Ask before contacting customers."
+                .into(),
             skills: vec![patchwork_core::models::WorkspaceSkill {
                 id: "skill-1".into(),
                 name: "Accessible interfaces".into(),
@@ -1599,6 +1608,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"message":"not available"}}'
         assert!(p.contains("Developer agent"));
         assert!(p.contains("You ship small, reviewable changes."));
         assert!(p.contains("patchwork ask"));
+        assert!(p.contains("## AUTONOMY.md"));
+        assert!(p.contains("Merge pull requests after checks pass."));
         assert!(p.contains("## Workspace skills"));
         assert!(p.contains("Accessible interfaces"));
         assert!(p.contains("Keep keyboard and screen-reader behavior intact."));
