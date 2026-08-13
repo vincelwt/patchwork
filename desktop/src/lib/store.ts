@@ -4,6 +4,7 @@
 
 import { useCallback, useRef, useSyncExternalStore } from "react";
 import { Api } from "./api";
+import { unreadInboxCount } from "@client/inbox";
 import { REALTIME_HEARTBEAT, REALTIME_HEARTBEAT_MS } from "@client/types";
 import type {
   Automation,
@@ -728,7 +729,7 @@ class Workspaces {
 }
 
 function unreadOf(data: AppData) {
-  return data.inbox.filter((item) => !item.read_at).length;
+  return unreadInboxCount(data.inbox);
 }
 
 export const store = new Workspaces();
