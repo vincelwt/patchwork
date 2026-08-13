@@ -201,6 +201,13 @@ export const RelayIcon = (props: IconProps) => (
   </Svg>
 );
 
+export const PhoneIcon = (props: IconProps) => (
+  <Svg {...props}>
+    <rect x="6.5" y="2.5" width="11" height="19" rx="2.2" />
+    <path d="M10 5h4M11.5 18.5h1" />
+  </Svg>
+);
+
 /// This app on this machine, as opposed to the workspace it is showing.
 export const AppIcon = (props: IconProps) => (
   <Svg {...props}>
