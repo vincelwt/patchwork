@@ -87,3 +87,13 @@ export function parseTable(text: string, separator = ","): string[][] {
 export function separatorFor(fileName: string) {
   return fileName.toLowerCase().endsWith(".tsv") ? "\t" : ",";
 }
+
+/// Flint names this one chart `Boxplot`, while the public Patchwork format
+/// documents the ordinary `Box Plot`. Accept what agents are told to send.
+export function normalizedChartSpec(spec: unknown): unknown {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) return spec;
+  const chart = (spec as { chart_spec?: unknown }).chart_spec;
+  if (!chart || typeof chart !== "object" || Array.isArray(chart)) return spec;
+  if ((chart as { chartType?: unknown }).chartType !== "Box Plot") return spec;
+  return { ...spec, chart_spec: { ...chart, chartType: "Boxplot" } };
+}
