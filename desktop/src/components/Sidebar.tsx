@@ -21,6 +21,7 @@ import {
   Spinner,
   TasksIcon,
 } from "./icons";
+import { unreadInboxCount } from "@client/inbox";
 import { isTerminalTaskStatus } from "@client/types";
 import type { Channel, Id, Member } from "@client/types";
 import type { View as NavView } from "./common";
@@ -112,7 +113,7 @@ export function Sidebar({
     );
   }, [hidden]);
 
-  const unread = app.inbox.filter((item) => !item.read_at).length;
+  const unread = unreadInboxCount(app.inbox);
   const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
   const liveAutomations = app.automations.filter((a) => a.enabled).length;
   const failingAutomations = app.automations.filter(
@@ -125,7 +126,7 @@ export function Sidebar({
     const counts: Record<Id, number> = {};
     for (const item of app.inbox) {
       if (item.read_at || !item.channel_id) continue;
-      counts[item.channel_id] = (counts[item.channel_id] ?? 0) + 1;
+      counts[item.channel_id] = 1;
     }
     return counts;
   }, [app.inbox]);

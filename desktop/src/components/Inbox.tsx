@@ -5,7 +5,9 @@ import { markSeen } from "../lib/unread";
 import { Avatar, Chip, useNavigation } from "./common";
 import { Empty, Page } from "./ui";
 import { CheckIcon } from "./icons";
-import type { Channel, InboxItem, InboxKind, Task } from "@client/types";
+import { groupInbox, unreadInboxCount } from "@client/inbox";
+import type { InboxGroup } from "@client/inbox";
+import type { Channel, InboxKind, Task } from "@client/types";
 
 const LABELS: Record<InboxKind, string> = {
   mention: "Mention",
@@ -27,29 +29,6 @@ const TONES: Partial<Record<InboxKind, string>> = {
   automation_failed: "danger",
 };
 
-/// Some things are blocking somebody; a chatty channel is not. Ordering puts
-/// what is stuck first, whatever the timestamps say.
-const URGENCY: Record<InboxKind, number> = {
-  question: 0,
-  task_blocked: 1,
-  automation_failed: 1,
-  task_due: 1,
-  review_ready: 2,
-  task_assigned: 3,
-  direct_message: 4,
-  mention: 5,
-  reply: 6,
-};
-
-interface Group {
-  key: string;
-  items: InboxItem[];
-  latest: InboxItem;
-  /// The most pressing kind in the group — what the row is really about.
-  lead: InboxKind;
-  unread: number;
-}
-
 /// Inbox is a view onto things that need attention. Opening an item always
 /// lands in the original conversation or task, never a parallel thread.
 ///
@@ -62,41 +41,12 @@ export function InboxView() {
   const { go } = useNavigation();
   const [showRead, setShowRead] = useState(false);
 
-  const groups = useMemo(() => {
-    const source = showRead ? app.inbox : app.inbox.filter((item) => !item.read_at);
-    const byConversation = new Map<string, InboxItem[]>();
-    for (const item of source) {
-      // A question or a failed automation is about that specific thing, so it
-      // keeps its own row even when it shares a channel with ordinary chatter.
-      const standalone = item.kind === "question" || item.kind === "automation_failed";
-      const key = standalone
-        ? item.id
-        : (item.task_id ?? item.channel_id ?? item.automation_id ?? item.id);
-      byConversation.set(key, [...(byConversation.get(key) ?? []), item]);
-    }
+  const groups = useMemo(
+    () => groupInbox(showRead ? app.inbox : app.inbox.filter((item) => !item.read_at)),
+    [app.inbox, showRead],
+  );
 
-    const out: Group[] = [];
-    for (const [key, items] of byConversation) {
-      const sorted = [...items].sort((a, b) => b.created_at - a.created_at);
-      const lead = [...items].sort((a, b) => URGENCY[a.kind] - URGENCY[b.kind])[0]
-        .kind;
-      out.push({
-        key,
-        items: sorted,
-        latest: sorted[0],
-        lead,
-        unread: items.filter((item) => !item.read_at).length,
-      });
-    }
-
-    return out.sort(
-      (a, b) =>
-        URGENCY[a.lead] - URGENCY[b.lead] ||
-        b.latest.created_at - a.latest.created_at,
-    );
-  }, [app.inbox, showRead]);
-
-  const open = async (group: Group) => {
+  const open = async (group: InboxGroup) => {
     const item = group.latest;
     await Promise.all(
       group.items
@@ -115,7 +65,7 @@ export function InboxView() {
     if (item.automation_id) go({ kind: "automation", id: item.automation_id });
   };
 
-  const unread = app.inbox.filter((item) => !item.read_at).length;
+  const unread = unreadInboxCount(app.inbox);
 
   return (
     <Page
@@ -154,7 +104,7 @@ export function InboxView() {
 }
 
 function conversationLabel(
-  group: Group,
+  group: InboxGroup,
   channels: Channel[],
   tasks: Task[],
 ): string | undefined {
@@ -176,7 +126,7 @@ function InboxRow({
   where,
   onOpen,
 }: {
-  group: Group;
+  group: InboxGroup;
   where?: string;
   onOpen: () => void;
 }) {
