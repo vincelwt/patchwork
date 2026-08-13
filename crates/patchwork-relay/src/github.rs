@@ -366,6 +366,42 @@ async fn line_notes(url: &str) -> Option<Vec<Feedback>> {
     Some(line_notes_of(&gh_json(&["api", &path]).await.ok()??))
 }
 
+fn checks_of(json: &Value) -> &'static str {
+    let checks = items(json, "statusCheckRollup");
+    if checks.iter().any(|check| {
+        matches!(
+            check.get("conclusion").and_then(Value::as_str),
+            Some(
+                "ACTION_REQUIRED"
+                    | "CANCELLED"
+                    | "FAILURE"
+                    | "STARTUP_FAILURE"
+                    | "STALE"
+                    | "TIMED_OUT"
+            )
+        ) || matches!(
+            check.get("state").and_then(Value::as_str),
+            Some("ERROR" | "FAILURE")
+        )
+    }) {
+        "FAILURE"
+    } else if checks.iter().any(|check| {
+        matches!(
+            check.get("status").and_then(Value::as_str),
+            Some("IN_PROGRESS" | "QUEUED" | "PENDING")
+        ) || matches!(
+            check.get("state").and_then(Value::as_str),
+            Some("EXPECTED" | "PENDING")
+        )
+    }) {
+        "PENDING"
+    } else if checks.is_empty() {
+        ""
+    } else {
+        "SUCCESS"
+    }
+}
+
 async fn fetch(url: &str) -> anyhow::Result<Option<(PullRequestState, Vec<Feedback>)>> {
     let Some(json) = gh_json(&[
         "pr",
@@ -379,30 +415,7 @@ async fn fetch(url: &str) -> anyhow::Result<Option<(PullRequestState, Vec<Feedba
         return Ok(None);
     };
 
-    let checks = json
-        .get("statusCheckRollup")
-        .and_then(|v| v.as_array())
-        .map(|checks| {
-            if checks
-                .iter()
-                .any(|c| c.get("conclusion").and_then(|v| v.as_str()) == Some("FAILURE"))
-            {
-                "FAILURE"
-            } else if checks.iter().any(|c| {
-                matches!(
-                    c.get("status").and_then(|v| v.as_str()),
-                    Some("IN_PROGRESS") | Some("QUEUED") | Some("PENDING")
-                )
-            }) {
-                "PENDING"
-            } else if checks.is_empty() {
-                ""
-            } else {
-                "SUCCESS"
-            }
-        })
-        .unwrap_or("")
-        .to_string();
+    let checks = checks_of(&json).to_string();
 
     let draft = json
         .get("isDraft")
@@ -468,6 +481,26 @@ pub async fn link_pr_from_message(state: &Shared, task_id: &Id, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinguishes_check_progress_and_failures() {
+        for (rollup, expected) in [
+            (serde_json::json!([]), ""),
+            (serde_json::json!([{ "status": "IN_PROGRESS" }]), "PENDING"),
+            (serde_json::json!([{ "state": "PENDING" }]), "PENDING"),
+            (serde_json::json!([{ "conclusion": "SUCCESS" }]), "SUCCESS"),
+            (serde_json::json!([{ "state": "ERROR" }]), "FAILURE"),
+            (
+                serde_json::json!([{ "conclusion": "CANCELLED" }]),
+                "FAILURE",
+            ),
+        ] {
+            assert_eq!(
+                checks_of(&serde_json::json!({ "statusCheckRollup": rollup })),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn finds_a_pull_request_url_in_prose() {

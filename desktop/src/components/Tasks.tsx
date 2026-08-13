@@ -4,6 +4,7 @@ import {
   dateInputToMillis,
   dateInputValue,
   dueLabel,
+  pullRequestStatus,
   pullRequestTone,
   relative,
   statusLabel,
@@ -166,10 +167,22 @@ const PULL_REQUEST_ICONS = {
   DRAFT: BranchIcon,
   MERGED: CheckIcon,
   CLOSED: CloseIcon,
+  PENDING: Spinner,
+  SUCCESS: CheckIcon,
+  FAILURE: WarningIcon,
 };
 
-function PullRequestStatusIcon({ state, size }: { state?: string; size: number }) {
-  const Icon = PULL_REQUEST_ICONS[state?.toUpperCase() as keyof typeof PULL_REQUEST_ICONS] ?? ExternalIcon;
+function PullRequestStatusIcon({
+  state,
+  checks,
+  size,
+}: {
+  state?: string;
+  checks?: string;
+  size: number;
+}) {
+  const status = pullRequestStatus(state, checks);
+  const Icon = PULL_REQUEST_ICONS[status as keyof typeof PULL_REQUEST_ICONS] ?? ExternalIcon;
   return <Icon size={size} />;
 }
 
@@ -609,8 +622,19 @@ function TaskCard({
         )}
         {project && <Chip>{project.name}</Chip>}
         {task.pr_state && (
-          <Chip tone={pullRequestTone(task.pr_state.state)}>
-            <PullRequestStatusIcon state={task.pr_state.state} size={11} />
+          <Chip
+            tone={pullRequestTone(task.pr_state.state, task.pr_state.checks)}
+            title={`${task.pr_state.state.toLowerCase()}${
+              task.pr_state.checks
+                ? ` · checks ${task.pr_state.checks.toLowerCase()}`
+                : ""
+            }`}
+          >
+            <PullRequestStatusIcon
+              state={task.pr_state.state}
+              checks={task.pr_state.checks}
+              size={11}
+            />
             #{task.pr_state.number}
           </Chip>
         )}
@@ -1502,12 +1526,23 @@ export function TaskPage({ taskId }: { taskId: string }) {
           {task.pr_url && (
             <Fact label="Pull request">
               <button
-                className={`chip ${pullRequestTone(task.pr_state?.state)}`.trim()}
+                className={`chip ${pullRequestTone(
+                  task.pr_state?.state,
+                  task.pr_state?.checks,
+                )}`.trim()}
                 onClick={() => openExternal(task.pr_url!)}
               >
-                <PullRequestStatusIcon state={task.pr_state?.state} size={12} />
+                <PullRequestStatusIcon
+                  state={task.pr_state?.state}
+                  checks={task.pr_state?.checks}
+                  size={12}
+                />
                 {task.pr_state
-                  ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
+                  ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}${
+                      task.pr_state.checks
+                        ? ` · checks ${task.pr_state.checks.toLowerCase()}`
+                        : ""
+                    }`
                   : "Open"}
               </button>
             </Fact>

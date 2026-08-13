@@ -157,10 +157,20 @@ const PULL_REQUEST_TONES: Record<string, string> = {
   DRAFT: "caution",
   MERGED: "positive",
   CLOSED: "danger",
+  PENDING: "caution",
+  SUCCESS: "positive",
+  FAILURE: "danger",
 };
 
-export function pullRequestTone(state?: string): string {
-  return PULL_REQUEST_TONES[state?.toUpperCase() ?? ""] ?? "";
+export function pullRequestStatus(state?: string, checks?: string): string {
+  const normalizedState = state?.toUpperCase() ?? "";
+  return ["MERGED", "CLOSED"].includes(normalizedState)
+    ? normalizedState
+    : checks?.toUpperCase() || normalizedState;
+}
+
+export function pullRequestTone(state?: string, checks?: string): string {
+  return PULL_REQUEST_TONES[pullRequestStatus(state, checks)] ?? "";
 }
 
 export function statusTone(status: TaskStatus | RunStatus): string {
