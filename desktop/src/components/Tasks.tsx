@@ -4,6 +4,8 @@ import {
   dateInputToMillis,
   dateInputValue,
   dueLabel,
+  pullRequestStatus,
+  pullRequestTone,
   relative,
   statusLabel,
   statusTone,
@@ -38,8 +40,10 @@ import {
 import {
   AgentIcon,
   AttachIcon,
+  BranchIcon,
   ChevronIcon,
   CheckIcon,
+  CloseIcon,
   ExternalIcon,
   MoreIcon,
   PlayIcon,
@@ -156,6 +160,30 @@ function AgentStack({ members, size }: { members: Member[]; size: number }) {
       ))}
     </span>
   );
+}
+
+const PULL_REQUEST_ICONS = {
+  OPEN: BranchIcon,
+  DRAFT: BranchIcon,
+  MERGED: CheckIcon,
+  CLOSED: CloseIcon,
+  PENDING: Spinner,
+  SUCCESS: CheckIcon,
+  FAILURE: WarningIcon,
+};
+
+function PullRequestStatusIcon({
+  state,
+  checks,
+  size,
+}: {
+  state?: string;
+  checks?: string;
+  size: number;
+}) {
+  const status = pullRequestStatus(state, checks);
+  const Icon = PULL_REQUEST_ICONS[status as keyof typeof PULL_REQUEST_ICONS] ?? ExternalIcon;
+  return <Icon size={size} />;
 }
 
 function actionIcon(kind: NextAction["kind"]) {
@@ -594,7 +622,19 @@ function TaskCard({
         )}
         {project && <Chip>{project.name}</Chip>}
         {task.pr_state && (
-          <Chip tone={task.pr_state.checks === "FAILURE" ? "danger" : ""}>
+          <Chip
+            tone={pullRequestTone(task.pr_state.state, task.pr_state.checks)}
+            title={`${task.pr_state.state.toLowerCase()}${
+              task.pr_state.checks
+                ? ` · checks ${task.pr_state.checks.toLowerCase()}`
+                : ""
+            }`}
+          >
+            <PullRequestStatusIcon
+              state={task.pr_state.state}
+              checks={task.pr_state.checks}
+              size={11}
+            />
             #{task.pr_state.number}
           </Chip>
         )}
@@ -1485,10 +1525,24 @@ export function TaskPage({ taskId }: { taskId: string }) {
           </Fact>
           {task.pr_url && (
             <Fact label="Pull request">
-              <button className="chip" onClick={() => openExternal(task.pr_url!)}>
-                <ExternalIcon size={12} />
+              <button
+                className={`chip ${pullRequestTone(
+                  task.pr_state?.state,
+                  task.pr_state?.checks,
+                )}`.trim()}
+                onClick={() => openExternal(task.pr_url!)}
+              >
+                <PullRequestStatusIcon
+                  state={task.pr_state?.state}
+                  checks={task.pr_state?.checks}
+                  size={12}
+                />
                 {task.pr_state
-                  ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}`
+                  ? `#${task.pr_state.number} · ${task.pr_state.state.toLowerCase()}${
+                      task.pr_state.checks
+                        ? ` · checks ${task.pr_state.checks.toLowerCase()}`
+                        : ""
+                    }`
                   : "Open"}
               </button>
             </Fact>

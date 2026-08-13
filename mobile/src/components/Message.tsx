@@ -16,9 +16,11 @@ import { followNewest, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { AttachmentView } from "./Attachment";
+import { ChartCard } from "./Chart";
 import { Composer } from "./Composer";
+import { useGrantedOpen } from "./Evidence";
 import { Markdown } from "./Markdown";
-import { Avatar, Badge, Button, Empty, Icon, Measured, Sheet } from "./ui";
+import { Avatar, Badge, Button, Empty, ErrorNotice, Icon, Measured, Sheet } from "./ui";
 
 const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
@@ -275,6 +277,7 @@ function CardView({ card }: { card: MessageCard }) {
   const theme = useTheme();
   const router = useRouter();
   const workspace = useWorkspace();
+  const { open, busy, error } = useGrantedOpen();
   const content = useMemo(() => {
     switch (card.type) {
       case "task": {
@@ -288,23 +291,36 @@ function CardView({ card }: { card: MessageCard }) {
       case "pull_request":
         return { title: "Pull request", detail: card.url, press: () => void Linking.openURL(card.url) };
       case "artifact":
-        return { title: card.caption || "Artifact", detail: "Open on Desktop", press: undefined };
-      case "preview":
-        return { title: "Preview", detail: "Open on Desktop", press: undefined };
+        return { title: card.caption || "Artifact", detail: "Open the file", press: () => void open((api) => api.grantFile(card.attachment_id)) };
+      case "preview": {
+        const preview = workspace.bootstrap?.previews.find((item) => item.id === card.preview_id);
+        const live = preview?.status === "live";
+        return {
+          title: preview?.label || "Preview",
+          detail: live ? "Open the running site" : preview ? `Preview is ${preview.status}` : "Preview unavailable",
+          press: live ? (() => { void open((api) => api.grantPreview(card.preview_id)); }) : undefined,
+        };
+      }
       case "chart":
-        return { title: "Chart", detail: card.caption || "Open on Desktop", press: undefined };
+        return { title: "Chart", detail: card.caption, press: undefined };
     }
-  }, [card, router, workspace.bootstrap?.tasks]);
+  }, [card, open, router, workspace.bootstrap?.tasks]);
+  // Drawn from its spec rather than announced, so the numbers are on screen.
+  if (card.type === "chart") return <ChartCard spec={card.spec} caption={card.caption} />;
   return (
-    <Pressable
-      accessibilityRole={content.press ? "button" : undefined}
-      disabled={!content.press}
-      onPress={content.press}
-      style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.line }]}
-    >
-      <Text style={[styles.cardTitle, { color: theme.text }]}>{content.title}</Text>
-      {content.detail ? <Text numberOfLines={2} style={{ color: theme.muted }}>{content.detail}</Text> : null}
-    </Pressable>
+    <>
+      <Pressable
+        accessibilityRole={content.press ? "button" : undefined}
+        accessibilityState={{ busy }}
+        disabled={!content.press || busy}
+        onPress={content.press}
+        style={[styles.card, { backgroundColor: theme.surface, borderColor: theme.line }]}
+      >
+        <Text style={[styles.cardTitle, { color: theme.text }]}>{content.title}</Text>
+        {content.detail ? <Text numberOfLines={2} style={{ color: theme.muted }}>{busy ? "Opening…" : content.detail}</Text> : null}
+      </Pressable>
+      <ErrorNotice message={error} />
+    </>
   );
 }
 
