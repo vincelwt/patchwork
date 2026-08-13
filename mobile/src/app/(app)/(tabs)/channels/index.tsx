@@ -4,9 +4,9 @@ import { Stack, useRouter } from "expo-router";
 
 import type { Channel, Id } from "@client/types";
 import { Conversation } from "@/components/Message";
-import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Icon, Measured, Sheet, TextField } from "@/components/ui";
+import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Glass, Icon, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { largeTitles, useLayout } from "@/lib/layout";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -25,6 +25,18 @@ export default function ChannelsScreen() {
   const [selected, setSelected] = useState<Id>();
   const data = workspace.bootstrap;
   if (!data) return <Empty title="No workspace data yet" />;
+
+  const inlineTitle = !split;
+  const actions = (
+    <View style={styles.actions}>
+      <Pressable accessibilityRole="button" accessibilityLabel="New direct message" hitSlop={8} style={styles.action} onPress={() => setNewDm(true)}>
+        <Icon name={{ ios: "person.badge.plus", android: "person_add", web: "person_add" }} color={theme.accent} size={21} />
+      </Pressable>
+      <Pressable accessibilityRole="button" accessibilityLabel="New channel" hitSlop={8} style={styles.action} onPress={() => setNewChannel(true)}>
+        <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />
+      </Pressable>
+    </View>
+  );
 
   // On a wide screen the conversation opens beside the list instead of on top of it.
   const open = (channel: Channel) =>
@@ -98,7 +110,15 @@ export default function ChannelsScreen() {
           {groups}
         </>
       ) : (
-        <Measured>{groups}</Measured>
+        <Measured>
+          {inlineTitle ? (
+            <View style={styles.titleRow}>
+              <Text accessibilityRole="header" style={[styles.title, { color: theme.text }]}>Chat</Text>
+              <Glass interactive radius={24} style={styles.inlineActions}>{actions}</Glass>
+            </View>
+          ) : null}
+          {groups}
+        </Measured>
       )}
     </ScrollView>
   );
@@ -107,20 +127,10 @@ export default function ChannelsScreen() {
     <View style={[styles.fill, { backgroundColor: theme.surface }]}>
       <Stack.Screen
         options={{
-          // Beside a detail pane the bar stays opaque, so neither column slides
-          // under it and no column has to guess the bar's height.
-          headerLargeTitle: largeTitles && !split,
-          headerTransparent: largeTitles && !split,
-          headerRight: () => (
-            <View style={styles.actions}>
-              <Pressable accessibilityRole="button" accessibilityLabel="New direct message" hitSlop={8} onPress={() => setNewDm(true)}>
-                <Icon name={{ ios: "person.badge.plus", android: "person_add", web: "person_add" }} color={theme.accent} size={21} />
-              </Pressable>
-              <Pressable accessibilityRole="button" accessibilityLabel="New channel" hitSlop={8} onPress={() => setNewChannel(true)}>
-                <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />
-              </Pressable>
-            </View>
-          ),
+          // UIKit cannot place bar buttons beside a large title, so the phone
+          // draws that row itself and skips the otherwise-empty compact bar.
+          headerShown: !inlineTitle,
+          headerRight: inlineTitle ? undefined : () => actions,
         }}
       />
       {split ? (
@@ -274,7 +284,11 @@ function ChannelRow({ channel, active, onPress }: { channel: Channel; active?: b
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  actions: { flexDirection: "row", alignItems: "center", gap: 18 },
+  titleRow: { minHeight: 64, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 8 },
+  title: { fontSize: 34, fontWeight: "700", letterSpacing: -0.8 },
+  actions: { flexDirection: "row", alignItems: "center" },
+  action: { width: 36, height: 44, alignItems: "center", justifyContent: "center" },
+  inlineActions: { height: 48, justifyContent: "center", paddingHorizontal: 4 },
   scroll: { paddingBottom: 30 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 340, borderRightWidth: StyleSheet.hairlineWidth },
