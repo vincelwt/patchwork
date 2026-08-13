@@ -359,6 +359,7 @@ export class Api {
     icon?: string;
     icon_file_id?: Id;
     task_prefix?: string;
+    autonomy?: string;
   }) {
     return this.patch<Workspace>("/api/workspace", input);
   }

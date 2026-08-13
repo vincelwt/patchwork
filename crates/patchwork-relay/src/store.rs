@@ -102,6 +102,7 @@ impl Store {
             "ALTER TABLE workspace ADD COLUMN task_prefix TEXT NOT NULL DEFAULT 'PW'",
             "ALTER TABLE workspace ADD COLUMN icon TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE workspace ADD COLUMN icon_file_id TEXT",
+            "ALTER TABLE workspace ADD COLUMN autonomy TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
@@ -169,7 +170,7 @@ impl Store {
     pub fn workspace(&self) -> Result<Workspace> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, icon, icon_file_id, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
+            "SELECT id, name, icon, icon_file_id, autonomy, created_at, task_prefix, task_seq FROM workspace LIMIT 1",
             [],
             |r| {
                 let icon_file_id: Option<String> = r.get(3)?;
@@ -179,9 +180,10 @@ impl Store {
                     icon: r.get(2)?,
                     icon_image: icon_file_id
                         .map(|id| format!("/api/workspace/icon/{id}")),
-                    created_at: r.get(4)?,
-                    task_prefix: r.get(5)?,
-                    task_seq: r.get(6)?,
+                    autonomy: r.get(4)?,
+                    created_at: r.get(5)?,
+                    task_prefix: r.get(6)?,
+                    task_seq: r.get(7)?,
                 })
             },
         )
@@ -198,6 +200,7 @@ impl Store {
             name: name.to_string(),
             icon: String::new(),
             icon_image: None,
+            autonomy: String::new(),
             created_at: now_ms(),
             task_seq: 0,
         };
@@ -214,6 +217,7 @@ impl Store {
         icon: Option<&str>,
         icon_file_id: Option<&str>,
         task_prefix: Option<&str>,
+        autonomy: Option<&str>,
     ) -> Result<Workspace> {
         let conn = self.conn()?;
         if let Some(name) = name {
@@ -233,6 +237,9 @@ impl Store {
         }
         if let Some(prefix) = task_prefix {
             conn.execute("UPDATE workspace SET task_prefix = ?1", params![prefix])?;
+        }
+        if let Some(autonomy) = autonomy {
+            conn.execute("UPDATE workspace SET autonomy = ?1", params![autonomy])?;
         }
         self.workspace()
     }
@@ -2824,6 +2831,22 @@ mod tests {
             store.run(&configured.id).unwrap().unwrap().model.as_deref(),
             Some("anthropic/claude-opus-5")
         );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workspace_autonomy_defaults_empty_and_round_trips() {
+        let (store, path) = store();
+        let created = store.create_workspace("ws", "Test").unwrap();
+        assert!(created.autonomy.is_empty());
+
+        let updated = store
+            .update_workspace(None, None, None, None, Some("Merge after checks pass."))
+            .unwrap();
+        assert_eq!(updated.autonomy, "Merge after checks pass.");
+        assert_eq!(store.workspace().unwrap().autonomy, updated.autonomy);
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }

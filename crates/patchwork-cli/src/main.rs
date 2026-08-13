@@ -610,6 +610,7 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
     let payload = json!({
         "me": bootstrap.me,
         "workspace": bootstrap.workspace.name,
+        "autonomy": bootstrap.workspace.autonomy,
         "run_id": ctx.run_id,
         "channel_id": ctx.channel_id,
         "task": task.as_ref().map(|t| &t.task),
@@ -624,6 +625,9 @@ async fn whoami(client: &Client, ctx: &RunContext, full: bool) -> Result<()> {
             bootstrap.me.display_name, bootstrap.me.handle
         );
         println!("Workspace: {}", bootstrap.workspace.name);
+        if !bootstrap.workspace.autonomy.trim().is_empty() {
+            println!("\nAUTONOMY.md:\n{}", bootstrap.workspace.autonomy.trim());
+        }
         if let Some(channel) = bootstrap
             .channels
             .iter()

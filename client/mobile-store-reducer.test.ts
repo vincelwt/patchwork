@@ -17,6 +17,7 @@ const bootstrap: Bootstrap = {
     id: "w1",
     name: "Workspace",
     task_prefix: "PW",
+    autonomy: "",
     created_at: 1,
     task_seq: 1,
   },

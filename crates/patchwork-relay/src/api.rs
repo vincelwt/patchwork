@@ -2881,6 +2881,9 @@ struct WorkspaceInput {
     /// What task keys start with. Letters and digits, upper-cased.
     #[serde(default)]
     task_prefix: Option<String>,
+    /// Contents of the workspace's AUTONOMY.md policy.
+    #[serde(default)]
+    autonomy: Option<String>,
 }
 
 const MAX_WORKSPACE_ICON_SIZE: i64 = 2 * 1024 * 1024;
@@ -2932,6 +2935,9 @@ async fn update_workspace(
     Json(input): Json<WorkspaceInput>,
 ) -> ApiResult<Json<Workspace>> {
     caller.require_admin()?;
+    if input.autonomy.is_some() {
+        caller.require_device()?;
+    }
     if input.icon.is_some() && input.icon_file_id.is_some() {
         return Err(ApiError::bad_request(
             "choose an emoji or an image, not both",
@@ -2967,6 +2973,10 @@ async fn update_workspace(
             ));
         }
     }
+    let autonomy = input.autonomy.as_deref().map(str::trim);
+    if autonomy.is_some_and(|policy| policy.len() > MAX_SKILL_INSTRUCTIONS_BYTES) {
+        return Err(ApiError::bad_request("AUTONOMY.md is limited to 32 KB"));
+    }
     let prefix = match input.task_prefix.as_deref() {
         Some(raw) => {
             let cleaned: String = raw
@@ -2987,6 +2997,7 @@ async fn update_workspace(
         icon.as_deref(),
         input.icon_file_id.as_deref(),
         prefix.as_deref(),
+        autonomy,
     )?;
     state.emit(Event::WorkspaceUpdated {
         workspace: workspace.clone(),
@@ -3134,7 +3145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_admin_agent_can_set_an_image_or_emoji_workspace_icon() {
+    async fn workspace_policy_is_human_admin_controlled_and_bounded() {
         let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
         let files = path.with_extension("files");
         let store = crate::store::Store::open(&path).unwrap();
@@ -3167,7 +3178,7 @@ mod tests {
             "http://workspace".into(),
             "host".into(),
         ));
-        let caller = Caller {
+        let agent = Caller {
             member: Member {
                 id: "agent".into(),
                 kind: MemberKind::Agent,
@@ -3187,12 +3198,13 @@ mod tests {
 
         let Json(updated) = update_workspace(
             State(state.clone()),
-            caller.clone(),
+            agent.clone(),
             Json(WorkspaceInput {
                 name: None,
                 icon: None,
                 icon_file_id: Some("icon".into()),
                 task_prefix: None,
+                autonomy: None,
             }),
         )
         .await
@@ -3213,21 +3225,67 @@ mod tests {
             .unwrap(),
             b"\x89PNG\r\n\x1a\n".as_slice()
         );
+        assert!(update_workspace(
+            State(state.clone()),
+            agent,
+            Json(WorkspaceInput {
+                name: None,
+                icon: None,
+                icon_file_id: None,
+                task_prefix: None,
+                autonomy: Some("Agents may change this policy.".into()),
+            }),
+        )
+        .await
+        .is_err());
 
+        let human_admin = Caller {
+            member: Member {
+                id: "human".into(),
+                kind: MemberKind::Human,
+                handle: "human".into(),
+                display_name: "Human".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: None,
+                presence: Presence::Offline,
+            },
+            run_id: None,
+            token_hash: "human-hash".into(),
+            token_kind: "device".into(),
+        };
         let Json(updated) = update_workspace(
             State(state.clone()),
-            caller,
+            human_admin.clone(),
             Json(WorkspaceInput {
                 name: None,
                 icon: Some("🚀".into()),
                 icon_file_id: None,
                 task_prefix: None,
+                autonomy: Some("  Merge after checks pass.  ".into()),
             }),
         )
         .await
         .unwrap();
         assert_eq!(updated.icon, "🚀");
-        assert!(updated.icon_image.is_none());
+        assert_eq!(updated.autonomy, "Merge after checks pass.");
+
+        assert!(update_workspace(
+            State(state.clone()),
+            human_admin,
+            Json(WorkspaceInput {
+                name: None,
+                icon: None,
+                icon_file_id: None,
+                task_prefix: None,
+                autonomy: Some("x".repeat(MAX_SKILL_INSTRUCTIONS_BYTES + 1)),
+            }),
+        )
+        .await
+        .is_err());
+        assert_eq!(state.store.workspace().unwrap().autonomy, updated.autonomy);
 
         drop(state);
         drop(store);

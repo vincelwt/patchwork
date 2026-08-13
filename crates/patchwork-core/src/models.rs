@@ -1068,6 +1068,9 @@ pub struct Workspace {
     /// Relay-relative URL of the current PNG or JPEG icon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_image: Option<String>,
+    /// Workspace policy for what agents may do without asking.
+    #[serde(default)]
+    pub autonomy: String,
     pub created_at: Millis,
     /// What task keys start with: `PW` gives `PW-14`.
     #[serde(default = "default_task_prefix")]

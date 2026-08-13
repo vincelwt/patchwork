@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS workspace (
   name        TEXT NOT NULL,
   icon        TEXT NOT NULL DEFAULT '',
   icon_file_id TEXT,
+  autonomy    TEXT NOT NULL DEFAULT '',
   created_at  INTEGER NOT NULL,
   task_prefix TEXT NOT NULL DEFAULT 'PW',
   task_seq    INTEGER NOT NULL DEFAULT 0
