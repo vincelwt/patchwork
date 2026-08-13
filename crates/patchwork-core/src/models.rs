@@ -697,6 +697,13 @@ pub struct Run {
     pub session_id: Option<String>,
     #[serde(default)]
     pub runtime: String,
+    /// Effective ACP configuration used before the first prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// The prompt actually delivered to the agent.
     #[serde(default)]
     pub prompt: String,

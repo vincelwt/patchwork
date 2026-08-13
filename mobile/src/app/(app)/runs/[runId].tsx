@@ -79,6 +79,9 @@ export default function RunScreen() {
               </View>
               <View style={styles.meta}>
                 <Badge>{run.runtime}</Badge>
+                {run.provider ? <Badge>{run.provider}</Badge> : null}
+                {run.model ? <Badge>{run.model}</Badge> : null}
+                {run.thinking ? <Badge>{run.thinking} thinking</Badge> : null}
                 {host ? <Badge tone={host.online ? "positive" : "neutral"}>{host.name}</Badge> : null}
                 <Badge>{duration(run.started_at, run.ended_at)}</Badge>
               </View>

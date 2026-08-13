@@ -1320,6 +1320,9 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         automation_id: params.automation_id.clone(),
         session_id: None,
         runtime: profile.runtime.clone(),
+        provider: None,
+        model: None,
+        thinking: None,
         prompt: params.prompt.clone(),
         headline: "Starting".into(),
         error: None,
@@ -1529,10 +1532,10 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
         skills: state.store.workspace_skills()?,
-        runtime: profile.runtime.clone(),
-        provider: profile.provider.clone(),
-        model: profile.model.clone(),
-        thinking: profile.thinking.clone(),
+        runtime: run.runtime.clone(),
+        provider: run.provider.clone().or(profile.provider.clone()),
+        model: run.model.clone().or(profile.model.clone()),
+        thinking: run.thinking.clone().or(profile.thinking.clone()),
         custom_command: profile.custom_command.clone(),
         channel_id: run.channel_id.clone(),
         task_id: run.task_id.clone(),
@@ -2125,6 +2128,25 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             if status.is_terminal() {
                 finish_run(state, &run).await?;
             }
+        }
+
+        HostToRelay::RunConfiguration {
+            run_id,
+            provider,
+            model,
+            thinking,
+        } => {
+            let Some(mut run) = state.store.run(&run_id)? else {
+                return Ok(());
+            };
+            if run.host_id.as_deref() != Some(host_id) || run.status.is_terminal() {
+                return Ok(());
+            }
+            run.provider = provider;
+            run.model = model;
+            run.thinking = thinking;
+            state.store.update_run(&run)?;
+            state.emit(Event::RunUpdated { run });
         }
 
         HostToRelay::ProjectCheckout { project_id, path } => {
@@ -3537,7 +3559,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("patchwork-resume-{}.sqlite", new_id()));
         let store = crate::store::Store::open(&path).unwrap();
         let mut agent = member("agent", "developer", MemberKind::Agent);
-        agent.agent.as_mut().unwrap().runtime = "codex".into();
+        let current_profile = agent.agent.as_mut().unwrap();
+        current_profile.runtime = "claude".into();
+        current_profile.provider = Some("wrong-provider".into());
+        current_profile.model = Some("wrong/model".into());
+        current_profile.thinking = Some("low".into());
         store.insert_member(&agent).unwrap();
         store
             .save_workspace_skill(
@@ -3566,7 +3592,10 @@ mod tests {
             cwd: Some("/tmp/existing-worktree".into()),
             automation_id: None,
             session_id: Some("session".into()),
-            runtime: "codex".into(),
+            runtime: "pi".into(),
+            provider: Some("openai".into()),
+            model: Some("openai/gpt-5.5".into()),
+            thinking: Some("high".into()),
             prompt: "Finish the interrupted work".into(),
             headline: "Working".into(),
             error: None,
@@ -3588,14 +3617,30 @@ mod tests {
             .write()
             .await
             .insert("relay".into(), crate::state::HostConn { tx });
+        handle_host_message(
+            &state,
+            "relay",
+            HostToRelay::RunConfiguration {
+                run_id: run.id.clone(),
+                provider: Some("openai-codex".into()),
+                model: Some("openai-codex/gpt-5.6-sol".into()),
+                thinking: Some("xhigh".into()),
+            },
+        )
+        .await;
+        let configured = store.run(&run.id).unwrap().unwrap();
 
-        resume_interrupted_run(&state, &run).await.unwrap();
+        resume_interrupted_run(&state, &configured).await.unwrap();
 
         let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
             panic!("expected the interrupted run to be dispatched");
         };
         assert_eq!(spec.run_id, "run");
         assert_eq!(spec.resume_session_id.as_deref(), Some("session"));
+        assert_eq!(spec.runtime, "pi");
+        assert_eq!(spec.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(spec.model.as_deref(), Some("openai-codex/gpt-5.6-sol"));
+        assert_eq!(spec.thinking.as_deref(), Some("xhigh"));
         assert_eq!(spec.prompt, "Finish the interrupted work");
         assert_eq!(spec.skills, store.workspace_skills().unwrap());
         assert!(matches!(
@@ -3708,6 +3753,9 @@ mod tests {
             automation_id: None,
             session_id: None,
             runtime: "codex".into(),
+            provider: None,
+            model: None,
+            thinking: None,
             prompt: "Ship it".into(),
             headline: "Working".into(),
             error: None,
@@ -4114,6 +4162,9 @@ mod tests {
             automation_id: None,
             session_id: None,
             runtime: "claude".into(),
+            provider: None,
+            model: None,
+            thinking: None,
             prompt: String::new(),
             headline: String::new(),
             error: None,

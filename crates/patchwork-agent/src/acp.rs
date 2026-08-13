@@ -195,7 +195,7 @@ fn restore_method(capabilities: &Value) -> Option<&'static str> {
     }
 }
 
-/// Read a `session/new` result in either dialect.
+/// Read a `session/new`, `session/load`, or `session/resume` result in either dialect.
 fn describe_session(session_id: String, res: &Value) -> NewSession {
     let startup_message = res
         .pointer("/_meta/piAcp/startupInfo")
@@ -422,8 +422,7 @@ impl AcpConnection {
         Ok(describe_session(session_id, &res))
     }
 
-    /// Ask for a specific model. A runtime that does not support choosing is
-    /// not an error worth failing a run over — the caller logs and carries on.
+    /// Ask for a specific model. The caller decides whether rejection is fatal.
     pub async fn set_model(
         &self,
         session_id: &str,
@@ -880,6 +879,60 @@ mod tests {
             events.try_recv(),
             Ok(AgentEvent::SessionUpdate { session_id, .. }) if session_id == "s1"
         ));
+    }
+
+    #[tokio::test]
+    async fn load_preserves_session_configuration_and_restore_capability() {
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let pending = Arc::new(Pending(Mutex::new(HashMap::new())));
+        let conn = AcpConnection {
+            child: Mutex::new(None),
+            stdin_tx,
+            pending: pending.clone(),
+            suppressed_updates: Arc::new(Mutex::new(None)),
+            next_id: AtomicI64::new(1),
+            agent_capabilities: json!({ "loadSession": true }),
+            auth_methods: Vec::new(),
+        };
+        let runtime = tokio::spawn(async move {
+            let request: Value =
+                serde_json::from_str(&stdin_rx.recv().await.expect("session/load request"))
+                    .expect("valid JSON-RPC");
+            assert_eq!(request["method"], "session/load");
+            let id = request["id"].as_i64().expect("numeric request id");
+            pending
+                .0
+                .lock()
+                .await
+                .remove(&id)
+                .expect("pending request")
+                .send(Ok(json!({
+                    "configOptions": [
+                        {
+                            "id": "model", "category": "model",
+                            "currentValue": "openai/gpt-5.6-sol",
+                            "options": [{ "value": "openai/gpt-5.6-sol" }]
+                        },
+                        {
+                            "id": "reasoning_effort", "category": "thought_level",
+                            "currentValue": "xhigh",
+                            "options": [{ "value": "xhigh" }]
+                        }
+                    ]
+                })))
+                .expect("request receiver alive");
+        });
+
+        let restored = conn.restore_session("s1", "/tmp").await.unwrap();
+        assert!(conn.supports_restore_session());
+        assert!(restored.config_options);
+        assert_eq!(
+            restored.current_model.as_deref(),
+            Some("openai/gpt-5.6-sol")
+        );
+        assert_eq!(restored.current_thinking.as_deref(), Some("xhigh"));
+        assert_eq!(restored.model_config_id.as_deref(), Some("model"));
+        runtime.await.unwrap();
     }
 
     #[test]

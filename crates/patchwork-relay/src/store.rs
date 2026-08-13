@@ -108,6 +108,9 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE tasks ADD COLUMN review_action TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
+            "ALTER TABLE runs ADD COLUMN provider TEXT",
+            "ALTER TABLE runs ADD COLUMN model TEXT",
+            "ALTER TABLE runs ADD COLUMN thinking TEXT",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
             "CREATE INDEX IF NOT EXISTS automation_runs_once ON automation_runs(automation_id, once_key)",
@@ -1731,6 +1734,9 @@ impl Store {
             automation_id: row.get("automation_id")?,
             session_id: row.get("session_id")?,
             runtime: row.get("runtime")?,
+            provider: row.get("provider")?,
+            model: row.get("model")?,
+            thinking: row.get("thinking")?,
             prompt: row.get("prompt")?,
             headline: row.get("headline")?,
             error: row.get("error")?,
@@ -1749,14 +1755,16 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO runs (id, agent_id, status, trigger, channel_id, task_id, host_id, project_id,
-                               worktree_id, cwd, automation_id, session_id, runtime, prompt, headline,
-                               error, token_usage, depth, created_at, started_at, ended_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                               worktree_id, cwd, automation_id, session_id, runtime, provider, model,
+                               thinking, prompt, headline, error, token_usage, depth, created_at,
+                               started_at, ended_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             params![
                 run.id, run.agent_id, run.status.as_str(), to_json(&run.trigger), run.channel_id,
                 run.task_id, run.host_id, run.project_id, run.worktree_id, run.cwd, run.automation_id,
-                run.session_id, run.runtime, run.prompt, run.headline, run.error,
-                run.token_usage.as_ref().map(to_json), depth, run.created_at, run.started_at, run.ended_at
+                run.session_id, run.runtime, run.provider, run.model, run.thinking, run.prompt,
+                run.headline, run.error, run.token_usage.as_ref().map(to_json), depth, run.created_at,
+                run.started_at, run.ended_at
             ],
         )?;
         tx.commit()?;
@@ -1766,12 +1774,12 @@ impl Store {
     pub fn update_run(&self, run: &Run) -> Result<()> {
         self.conn()?.execute(
             "UPDATE runs SET status=?2, host_id=?3, worktree_id=?4, cwd=?5, session_id=?6, runtime=?7,
-                             headline=?8, error=?9, token_usage=?10, started_at=?11, ended_at=?12,
-                             project_id=?13 WHERE id=?1",
+                             provider=?8, model=?9, thinking=?10, headline=?11, error=?12,
+                             token_usage=?13, started_at=?14, ended_at=?15, project_id=?16 WHERE id=?1",
             params![
                 run.id, run.status.as_str(), run.host_id, run.worktree_id, run.cwd, run.session_id,
-                run.runtime, run.headline, run.error, run.token_usage.as_ref().map(to_json),
-                run.started_at, run.ended_at, run.project_id
+                run.runtime, run.provider, run.model, run.thinking, run.headline, run.error,
+                run.token_usage.as_ref().map(to_json), run.started_at, run.ended_at, run.project_id
             ],
         )?;
         Ok(())
@@ -2722,6 +2730,9 @@ mod tests {
             automation_id: None,
             session_id: None,
             runtime: "test".into(),
+            provider: None,
+            model: None,
+            thinking: None,
             prompt: String::new(),
             headline: String::new(),
             error: None,
@@ -2791,6 +2802,30 @@ mod tests {
             task_id: Some(task.id.clone()),
             last_message_at: 1,
         }
+    }
+
+    #[test]
+    fn run_configuration_survives_insert_and_update() {
+        let (store, path) = store();
+        let mut configured = run("configured", "task");
+        configured.provider = Some("openai".into());
+        configured.model = Some("openai/gpt-5.6-sol".into());
+        configured.thinking = Some("xhigh".into());
+        store.insert_run(&configured, 0).unwrap();
+
+        let loaded = store.run(&configured.id).unwrap().unwrap();
+        assert_eq!(loaded.provider.as_deref(), Some("openai"));
+        assert_eq!(loaded.model.as_deref(), Some("openai/gpt-5.6-sol"));
+        assert_eq!(loaded.thinking.as_deref(), Some("xhigh"));
+
+        configured.model = Some("anthropic/claude-opus-5".into());
+        store.update_run(&configured).unwrap();
+        assert_eq!(
+            store.run(&configured.id).unwrap().unwrap().model.as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

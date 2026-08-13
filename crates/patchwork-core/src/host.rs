@@ -258,6 +258,16 @@ pub enum HostToRelay {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
     },
+    /// The configuration actually used for prompts in this run.
+    RunConfiguration {
+        run_id: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
+    },
     /// What a runtime on this machine offered when a session was opened.
     /// Sent as it is learned rather than at startup, because asking costs a
     /// process launch and the answer only matters once somebody runs something.

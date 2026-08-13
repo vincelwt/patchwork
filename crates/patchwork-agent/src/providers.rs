@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// A place to get models from, as the user thinks of it.
@@ -159,28 +160,10 @@ pub fn pi_home() -> PathBuf {
 /// Pi installs anything listed in `packages` the first time it starts, so the
 /// two extensions we depend on — a Claude subscription login, and web access —
 /// arrive without us shipping a package manager.
-pub fn pi_env(provider_id: Option<&str>, model: Option<&str>) -> Vec<(String, String)> {
+pub fn pi_env(provider_id: Option<&str>, model: Option<&str>) -> Result<Vec<(String, String)>> {
     let home = pi_home();
-    let _ = std::fs::create_dir_all(&home);
-
-    // `model` arrives as Pi names it: `provider/model-id`, where the model id
-    // may itself contain slashes (`openrouter/deepseek/deepseek-v4-flash`).
-    let (from_model, model_id) = match model.and_then(|m| m.split_once('/')) {
-        Some((p, rest)) => (Some(p.to_string()), Some(rest.to_string())),
-        None => (None, None),
-    };
-    let provider = provider_id
-        .filter(|p| !p.is_empty())
-        .map(|p| p.to_string())
-        .or(from_model)
-        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
-    let model_id = model_id.unwrap_or_else(|| DEFAULT_MODEL.to_string());
-
-    // A subscription is a way of paying, not a provider Pi knows by that name.
-    let pi_provider = match provider.as_str() {
-        "anthropic-oauth" => "anthropic",
-        other => other,
-    };
+    std::fs::create_dir_all(&home).context("could not prepare the managed Pi configuration")?;
+    let (pi_provider, model_id) = pi_selection(provider_id, model)?;
 
     let settings = serde_json::json!({
         "defaultProvider": pi_provider,
@@ -193,15 +176,52 @@ pub fn pi_env(provider_id: Option<&str>, model: Option<&str>) -> Vec<(String, St
     });
     // Rewritten every run on purpose: the agent's provider is workspace state,
     // and a stale file here would quietly outrank it.
-    let _ = std::fs::write(
+    std::fs::write(
         home.join("settings.json"),
-        serde_json::to_string_pretty(&settings).unwrap_or_default(),
-    );
+        serde_json::to_string_pretty(&settings)?,
+    )
+    .context("could not write the managed Pi configuration")?;
 
-    vec![(
+    Ok(vec![(
         "PI_CODING_AGENT_DIR".into(),
         home.to_string_lossy().to_string(),
-    )]
+    )])
+}
+
+fn pi_selection(provider_id: Option<&str>, model: Option<&str>) -> Result<(String, String)> {
+    // `model` arrives as Pi names it: `provider/model-id`, where the model id
+    // may itself contain slashes (`openrouter/deepseek/deepseek-v4-flash`).
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let (model_provider, model_id) = match model.and_then(|value| value.split_once('/')) {
+        Some((provider, id)) => (Some(provider), Some(id)),
+        None => (None, model),
+    };
+    let selected_provider = provider_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(model_provider)
+        .unwrap_or(DEFAULT_PROVIDER);
+    // A subscription is a way of paying, not a provider Pi knows by that name.
+    let pi_provider = match selected_provider {
+        "anthropic-oauth" => "anthropic",
+        other => other,
+    };
+    if model_provider.is_some_and(|value| value != selected_provider && value != pi_provider) {
+        return Err(anyhow!(
+            "provider `{selected_provider}` cannot use model `{}`",
+            model.unwrap_or_default()
+        ));
+    }
+
+    let model_id = match model_id {
+        Some(id) => id.to_string(),
+        None => provider(selected_provider)
+            .and_then(|info| info.recommended_model)
+            .and_then(|recommended| recommended.split_once('/').map(|(_, id)| id.to_string()))
+            .or_else(|| (selected_provider == DEFAULT_PROVIDER).then(|| DEFAULT_MODEL.to_string()))
+            .ok_or_else(|| anyhow!("provider `{selected_provider}` needs a model"))?,
+    };
+    Ok((pi_provider.to_string(), model_id))
 }
 
 /// The command that signs Pi into a subscription on this machine. It has to be
@@ -230,15 +250,20 @@ mod tests {
     /// rewriting it mid-assert is a flake nobody would enjoy chasing.
     #[test]
     fn a_model_id_carries_its_provider() {
-        let env = pi_env(None, Some("openrouter/deepseek/deepseek-v4-flash"));
+        let env = pi_env(None, Some("openrouter/deepseek/deepseek-v4-flash")).unwrap();
         assert_eq!(env[0].0, "PI_CODING_AGENT_DIR");
         let settings = written(&env);
         assert_eq!(settings["defaultProvider"], "openrouter");
         assert_eq!(settings["defaultModel"], "deepseek/deepseek-v4-flash");
 
         // A subscription is a way of paying for a provider, not one of its own.
-        let settings = written(&pi_env(Some("anthropic-oauth"), None));
+        let settings = written(&pi_env(Some("anthropic-oauth"), None).unwrap());
         assert_eq!(settings["defaultProvider"], "anthropic");
-        assert_eq!(settings["defaultModel"], DEFAULT_MODEL);
+        assert_eq!(settings["defaultModel"], "claude-fable-5");
+
+        assert!(pi_env(Some("anthropic"), Some("openai/gpt-5.6"))
+            .unwrap_err()
+            .to_string()
+            .contains("cannot use model"));
     }
 }
