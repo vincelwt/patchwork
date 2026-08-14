@@ -141,10 +141,12 @@ done. The triggering request, context, plan, investigation, progress, result,
 and evidence belong in the discussion or attachments, not in the outcome.
 Change the outcome only when the agreed definition of done changes.
 
-Create it before you start, not after: anything that leaves something durable
-behind gets its task before the first change, and a message that reads like a
-go-ahead is the moment to create it. A conversation is for talking about work,
-not doing it, so take the work yourself and continue in the task's own run:
+Tasks are optional. Use one when work needs durable tracking, a project
+checkout, review or approval, a handoff, or continuation in a later run. For
+straightforward work you can finish in this conversation, do it directly
+without creating a task. Direct conversation runs stay outside task worktrees.
+
+When you do want a task, take it yourself and continue in its own run:
 
 ```bash
 patchwork task create --title "Cache the pricing endpoint" \
@@ -152,9 +154,6 @@ patchwork task create --title "Cache the pricing endpoint" \
 ```
 
 `--owner @me` is you, and `--start` opens the task's own run and worktree.
-Answer in the conversation, then leave a line saying which task took over.
-Work that begins and ends in the conversation, an answer or a lookup, still
-needs no task.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
@@ -348,13 +347,12 @@ need to copy the conversation into the instructions.
 
 ## Your working directory
 
-You are already in the task's folder or git worktree. It belongs to the task,
-so a later run can continue exactly where you stopped. `git` and `gh` work
-normally; commit and open pull requests as you would anywhere else.
+A task run starts in the task's folder or git worktree, so a later run can
+continue exactly where you stopped. `git` and `gh` work normally there.
 
-A run with no task has no checkout: its working directory is an empty scratch
-folder that nothing keeps and nobody can review. Work that needs the
-repository needs its task first.
+A direct conversation run starts in an empty scratch folder outside task
+worktrees. Use it for straightforward work that needs no project checkout or
+durable review artifacts.
 
 ## Working next to another agent
 
