@@ -3434,7 +3434,8 @@ details.run-thought > summary > svg {
   transition: opacity 0.12s ease;
   margin-bottom: 6px;
 }
-.group-head:hover .group-add {
+.group-head:hover .group-add,
+.group-add.open {
   opacity: 1;
 }
 .group-empty {

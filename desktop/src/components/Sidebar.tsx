@@ -15,15 +15,17 @@ import {
   InboxIcon,
   KeyboardIcon,
   MembersIcon,
+  MoreIcon,
   PlusIcon,
   SearchIcon,
   SettingsIcon,
   Spinner,
   TasksIcon,
 } from "./icons";
+import { ConfirmDelete } from "./Pages";
 import { unreadInboxCount } from "@client/inbox";
 import { isTerminalTaskStatus } from "@client/types";
-import type { Channel, Id, Member } from "@client/types";
+import type { Channel, Id, Member, Section } from "@client/types";
 import type { View as NavView } from "./common";
 
 export type Creatable =
@@ -94,8 +96,10 @@ export function Sidebar({
   );
   const api = useApi();
   const seen = useSeen();
-  const { view, go } = useNavigation();
+  const { view, go, toast } = useNavigation();
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [renaming, setRenaming] = useState<Section | null>(null);
+  const [deleting, setDeleting] = useState<Section | null>(null);
   const [hidden, setHidden] = useState(hiddenNav);
   const [menuFor, setMenuFor] = useState<{ channel: Channel; x: number; y: number } | null>(null);
   const [navMenuFor, setNavMenuFor] = useState<{
@@ -331,6 +335,28 @@ export function Sidebar({
                 >
                   <PlusIcon size={14} />
                 </button>
+                {app.me?.is_admin && (
+                  <MenuButton
+                    className="icon-button small group-add"
+                    align="right"
+                    title={`Manage ${sentenceCase(section.name)}`}
+                    items={[
+                      {
+                        key: "rename",
+                        label: "Rename\u2026",
+                        onSelect: () => setRenaming(section),
+                      },
+                      {
+                        key: "delete",
+                        label: "Delete section",
+                        danger: true,
+                        onSelect: () => setDeleting(section),
+                      },
+                    ]}
+                  >
+                    <MoreIcon size={14} />
+                  </MenuButton>
+                )}
               </div>
               {!isCollapsed &&
                 (list.length > 0 ? (
@@ -442,6 +468,25 @@ export function Sidebar({
           channel={menuFor.channel}
           at={menuFor}
           onClose={() => setMenuFor(null)}
+        />
+      )}
+      {renaming && (
+        <RenameSectionModal section={renaming} onClose={() => setRenaming(null)} />
+      )}
+      {deleting && (
+        <ConfirmDelete
+          what={deleting.name}
+          detail={movedByDeleting((grouped.get(deleting.id) ?? []).length)}
+          onCancel={() => setDeleting(null)}
+          onConfirm={async () => {
+            try {
+              await api.deleteSection(deleting.id);
+              toast(`\u201c${deleting.name}\u201d deleted`);
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+            setDeleting(null);
+          }}
         />
       )}
       {navMenuFor && (
@@ -755,6 +800,65 @@ function JoinWorkspaceModal({
         autoFocus
       />
       <Field label="Your name" value={displayName} onChange={setDisplayName} />
+      {error && <div className="error-text">{error}</div>}
+    </Modal>
+  );
+}
+
+/// Deleting a section is a filing change, not a deletion of anything you said,
+/// and the dialog should say so before you decide.
+function movedByDeleting(count: number) {
+  const moved =
+    count === 0
+      ? "It has no channels."
+      : `Its ${count} channel${count === 1 ? "" : "s"} will move to Channels.`;
+  return `${moved} No channels or messages will be deleted.`;
+}
+
+function RenameSectionModal({
+  section,
+  onClose,
+}: {
+  section: Section;
+  onClose: () => void;
+}) {
+  const api = useApi();
+  const { toast } = useNavigation();
+  const [name, setName] = useState(section.name);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  return (
+    <Modal
+      title="Rename section"
+      onClose={onClose}
+      actions={
+        <>
+          <button className="button quiet" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || !name.trim()}
+            onClick={async () => {
+              setBusy(true);
+              setError("");
+              try {
+                await api.updateSection(section.id, name.trim());
+                toast(`Renamed to ${sentenceCase(name.trim())}`);
+                onClose();
+              } catch (err) {
+                setError(String((err as Error).message ?? err));
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Saving\u2026" : "Save"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Name" value={name} onChange={setName} autoFocus />
       {error && <div className="error-text">{error}</div>}
     </Modal>
   );

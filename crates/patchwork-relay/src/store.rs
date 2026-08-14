@@ -669,6 +669,23 @@ impl Store {
             .find(|s| s.name.eq_ignore_ascii_case(name)))
     }
 
+    pub fn rename_section(&self, id: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .execute(
+                "UPDATE sections SET name = ?2 WHERE id = ?1",
+                params![id, name],
+            )?
+            > 0)
+    }
+
+    pub fn delete_section(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn()?
+            .execute("DELETE FROM sections WHERE id = ?1", params![id])?
+            > 0)
+    }
+
     fn channel_from_row(row: &Row) -> rusqlite::Result<Channel> {
         let kind: String = row.get("kind")?;
         Ok(Channel {
