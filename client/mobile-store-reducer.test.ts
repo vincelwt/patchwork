@@ -97,6 +97,44 @@ test("workspace skills stay current in bootstrap state", () => {
   assert.equal(state.bootstrap?.skills[0]?.name, "Release checks");
 });
 
+test("task updates replace the visible durable obligation", () => {
+  const task = {
+    id: "t1",
+    key: "PW-1",
+    title: "Ship build",
+    outcome: "Build reaches testers",
+    status: "running" as const,
+    discussion_channel_id: "c1",
+    created_by: "me",
+    created_at: 1,
+    updated_at: 1,
+    position: 1,
+  };
+  let state = applyBootstrap(emptyWorkspaceData(), { ...bootstrap, tasks: [task] });
+  state = applyEnvelope(state, {
+    seq: 11,
+    at: 2,
+    kind: "task_updated",
+    task: {
+      ...task,
+      updated_at: 2,
+      active_continuation: {
+        id: "continuation",
+        status: "waiting",
+        summary: "Build is processing",
+        next_check_at: 3,
+        deadline_at: 100,
+        updated_at: 2,
+      },
+    },
+  } as Envelope);
+
+  assert.equal(
+    state.bootstrap?.tasks[0]?.active_continuation?.summary,
+    "Build is processing",
+  );
+});
+
 test("events stay monotonic and the restart cache stays bounded", () => {
   let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");
   state = {

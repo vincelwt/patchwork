@@ -112,7 +112,11 @@ async fn relay_health(
         started_at,
         hosts_online,
         runs_active,
-        system: if known { Some(system_health().await) } else { None },
+        system: if known {
+            Some(system_health().await)
+        } else {
+            None
+        },
     }))
 }
 
@@ -229,6 +233,10 @@ pub fn router(state: Shared) -> Router {
             get(task_detail).patch(update_task).delete(delete_task),
         )
         .route("/api/tasks/{id}/run", post(run_task))
+        .route(
+            "/api/tasks/{id}/continuation",
+            post(create_task_continuation),
+        )
         .route("/api/tasks/{id}/approve", post(approve_task))
         // runs
         .route("/api/runs", post(start_run))
@@ -319,7 +327,11 @@ async fn health(
         started_at: state.started_at,
         hosts_online: state.online_host_ids().await.len(),
         runs_active: state.store.active_runs().map(|r| r.len()).unwrap_or(0),
-        system: if known { Some(system_health().await) } else { None },
+        system: if known {
+            Some(system_health().await)
+        } else {
+            None
+        },
     }))
 }
 
@@ -328,8 +340,7 @@ async fn health(
 /// costs one 200ms wait and buys no shared state to keep correct.
 async fn system_health() -> SystemHealth {
     use sysinfo::{
-        get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System,
-        MINIMUM_CPU_UPDATE_INTERVAL,
+        get_current_pid, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL,
     };
 
     let mut system = System::new();
@@ -1031,6 +1042,11 @@ async fn create_task(
             "an agent cannot create a task in review without review evidence",
         ));
     }
+    if input.status == Some(TaskStatus::Running) {
+        return Err(ApiError::bad_request(
+            "create the task as planned and start it; running requires an active run or continuation",
+        ));
+    }
     if let Some(channel_id) = &input.source_channel_id {
         require_channel_access(&state, &caller, channel_id)?;
     }
@@ -1142,6 +1158,22 @@ async fn update_task(
             "only a person can reopen a completed or canceled task",
         ));
     }
+    if input.status == Some(TaskStatus::Running)
+        && state.store.active_task_runs(&task.id)?.is_empty()
+        && !task
+            .active_continuation
+            .as_ref()
+            .is_some_and(|continuation| {
+                matches!(
+                    continuation.status,
+                    ContinuationStatus::Waiting | ContinuationStatus::Ready
+                )
+            })
+    {
+        return Err(ApiError::conflict(
+            "start a run instead; running requires an active run or continuation",
+        ));
+    }
     if pull_request_blocks_completion(&task, &input) {
         return Err(ApiError::conflict(
             "the linked pull request must be closed or merged before this task can be marked done",
@@ -1226,6 +1258,99 @@ struct RunTaskInput {
     agent_id: Option<Id>,
     #[serde(default)]
     prompt: Option<String>,
+}
+
+async fn create_task_continuation(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<CreateTaskContinuation>,
+) -> ApiResult<Json<Task>> {
+    let run_id = caller
+        .run_id
+        .as_deref()
+        .filter(|_| caller.is_agent() && caller.token_kind == "run")
+        .ok_or_else(|| {
+            ApiError::forbidden("only the agent run owning this task can wait for it")
+        })?;
+    let task = state
+        .store
+        .task_by_ref(&id)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+    let run = state
+        .store
+        .run(run_id)?
+        .filter(|run| {
+            run.agent_id == caller.member.id
+                && run.task_id.as_deref() == Some(task.id.as_str())
+                && !run.status.is_terminal()
+        })
+        .ok_or_else(|| ApiError::forbidden("this run does not own that task"))?;
+
+    let command = input.command.trim();
+    let wake_prompt = input.wake_prompt.trim();
+    let summary = input.summary.trim();
+    if command.is_empty() || command.chars().count() > 8_192 {
+        return Err(ApiError::bad_request(
+            "a checker command must be between 1 and 8192 characters",
+        ));
+    }
+    if !(20..=86_400).contains(&input.every_seconds) {
+        return Err(ApiError::bad_request(
+            "the checker interval must be between 20 and 86400 seconds",
+        ));
+    }
+    if wake_prompt.is_empty() || wake_prompt.chars().count() > 8_000 {
+        return Err(ApiError::bad_request(
+            "a wake prompt must be between 1 and 8000 characters",
+        ));
+    }
+    if summary.is_empty() || summary.chars().count() > 500 {
+        return Err(ApiError::bad_request(
+            "an obligation summary must be between 1 and 500 characters",
+        ));
+    }
+    let now = now_ms();
+    if input.deadline_at <= now || input.deadline_at > now + 365 * 24 * 60 * 60 * 1000 {
+        return Err(ApiError::bad_request(
+            "the deadline must be in the future and within one year",
+        ));
+    }
+
+    let continuation = TaskContinuation {
+        id: new_id(),
+        task_id: task.id.clone(),
+        run_id: run.id,
+        agent_id: caller.member.id.clone(),
+        command: command.to_string(),
+        every_seconds: input.every_seconds,
+        deadline_at: input.deadline_at,
+        wake_prompt: wake_prompt.to_string(),
+        status: ContinuationStatus::Waiting,
+        summary: summary.to_string(),
+        next_check_at: now + input.every_seconds * 1000,
+        created_at: now,
+        updated_at: now,
+        ended_at: None,
+    };
+    let updated = state
+        .store
+        .register_task_continuation(&continuation)?
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "the run ended, the task moved, or this task already has an active obligation",
+            )
+        })?;
+    state.emit(Event::TaskUpdated {
+        task: updated.clone(),
+    });
+    let _ = orchestrator::post_system(
+        &state,
+        &updated.discussion_channel_id,
+        &format!("Patchwork will keep checking: {summary}"),
+    )
+    .await;
+    Ok(Json(updated))
 }
 
 async fn run_task(
@@ -1599,28 +1724,27 @@ async fn ask_question(
 
     // Nothing is answerable until the card, waiting run and every Inbox row
     // are durable. A concurrent Stop wins without leaving an open question.
-    let (blocked_task, superseded) = match state.store.commit_question_waiting(
-        &question,
-        &run,
-        &inbox_items,
-        input.replace,
-    )? {
-        QuestionCommit::Committed {
-            blocked,
-            superseded,
-        } => (blocked, superseded),
-        outcome => {
-            state.store.delete_message(&message.id)?;
-            state.emit(Event::MessageDeleted {
-                channel_id: run.channel_id.clone(),
-                message_id: message.id,
-            });
-            return Err(match outcome {
-                QuestionCommit::AlreadyAsking(open) => already_asking(&open),
-                _ => ApiError::conflict("that run has already ended"),
-            });
-        }
-    };
+    let (blocked_task, superseded) =
+        match state
+            .store
+            .commit_question_waiting(&question, &run, &inbox_items, input.replace)?
+        {
+            QuestionCommit::Committed {
+                blocked,
+                superseded,
+            } => (blocked, superseded),
+            outcome => {
+                state.store.delete_message(&message.id)?;
+                state.emit(Event::MessageDeleted {
+                    channel_id: run.channel_id.clone(),
+                    message_id: message.id,
+                });
+                return Err(match outcome {
+                    QuestionCommit::AlreadyAsking(open) => already_asking(&open),
+                    _ => ApiError::conflict("that run has already ended"),
+                });
+            }
+        };
     orchestrator::settle_superseded_questions(&state, superseded).await?;
     state.emit(Event::RunUpdated { run: run.clone() });
     if let Some(task) = blocked_task {
@@ -3732,6 +3856,7 @@ mod tests {
             host_id: Some("host-one".into()),
             worktree_id: None,
             current_run_id: Some("run-one".into()),
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -4042,6 +4167,121 @@ mod tests {
 
     /// Two agents in one task and one worktree: the task belongs to both of
     /// them until the last one stops, and either one's evidence is the task's.
+    #[tokio::test]
+    async fn only_the_live_task_run_can_register_its_continuation() {
+        let path = std::env::temp_dir().join(format!("patchwork-continuation-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Online,
+        };
+        store.insert_member(&agent).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let task = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "Ship build".into(),
+                outcome: "Build reaches testers".into(),
+                owner_id: Some(agent.id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let run = Run {
+            id: "run".into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger: RunTrigger::Manual { by: "human".into() },
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            host_id: Some("host".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            provider: None,
+            model: None,
+            thinking: None,
+            prompt: String::new(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store.insert_run(&run, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &run.id, None)
+            .unwrap()
+            .unwrap();
+        let input = CreateTaskContinuation {
+            command: "check-build".into(),
+            every_seconds: 60,
+            deadline_at: now_ms() + 60_000,
+            wake_prompt: "Finish the release".into(),
+            summary: "Build is processing".into(),
+        };
+        let mut caller = Caller {
+            member: agent,
+            run_id: Some("someone-elses-run".into()),
+            token_hash: "hash".into(),
+            token_kind: "run".into(),
+        };
+        assert_eq!(
+            create_task_continuation(
+                State(state.clone()),
+                caller.clone(),
+                Path(task.id.clone()),
+                Json(input.clone()),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+
+        caller.run_id = Some(run.id.clone());
+        let Json(updated) = create_task_continuation(
+            State(state.clone()),
+            caller,
+            Path(task.id.clone()),
+            Json(input),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.status, TaskStatus::Running);
+        assert_eq!(
+            updated
+                .active_continuation
+                .as_ref()
+                .map(|continuation| continuation.summary.as_str()),
+            Some("Build is processing")
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn a_task_waits_for_its_last_agent_to_stop() {
         let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));

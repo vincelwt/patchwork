@@ -4,9 +4,10 @@
 //! received, so the debugger can answer "why did this happen?" without anyone
 //! having to reproduce it.
 
+use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use patchwork_core::events::Event;
 use patchwork_core::models::*;
 use patchwork_core::wire::{CreateTask, SendMessage};
@@ -25,6 +26,28 @@ struct WatchEvent {
     outcome: String,
     #[serde(default)]
     context: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContinuationOutput {
+    status: ContinuationStatus,
+    summary: String,
+}
+
+fn parse_continuation_output(stdout: &str) -> Result<Option<(ContinuationStatus, String)>> {
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return Ok(None);
+    }
+    let output: ContinuationOutput =
+        serde_json::from_str(stdout).context("checker output must be one JSON object")?;
+    let summary = output.summary.trim();
+    if summary.is_empty() || summary.chars().count() > 500 {
+        return Err(anyhow!(
+            "checker summary must be between 1 and 500 characters"
+        ));
+    }
+    Ok(Some((output.status, summary.to_string())))
 }
 
 fn parse_watch_events(stdout: &str) -> Option<Vec<WatchEvent>> {
@@ -560,6 +583,7 @@ pub async fn scheduler(state: Shared) {
     loop {
         ticker.tick().await;
         announce_due_tasks(&state);
+        check_task_continuations(&state).await;
         let Ok(automations) = state.store.automations() else {
             continue;
         };
@@ -638,6 +662,191 @@ pub async fn scheduler(state: Shared) {
 /// watcher that quietly stopped watching.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
+async fn relay_command(
+    dir: &std::path::Path,
+    command: &str,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .context("checker state directory unavailable")?;
+    let mut process = tokio::process::Command::new("sh");
+    process
+        .arg("-c")
+        .arg(command)
+        .current_dir(dir)
+        .env("PATCHWORK_STATE_DIR", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    process.process_group(0);
+    for (key, value) in env {
+        process.env(key, value);
+    }
+    let child = process.spawn().context("checker command could not run")?;
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(output) => output.context("checker command could not finish"),
+        Err(_) => {
+            // The shell owns a process group, so a timeout also stops children
+            // it launched rather than letting them overlap the next poll.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{pid}")])
+                    .status()
+                    .await;
+            }
+            Err(anyhow!("checker command timed out"))
+        }
+    }
+}
+
+async fn check_task_continuations(state: &Shared) {
+    let now = now_ms();
+    match state.store.expire_task_continuations(now) {
+        Ok(tasks) => {
+            for task in tasks {
+                state.emit(Event::TaskUpdated { task: task.clone() });
+                let _ = orchestrator::post_system(
+                    state,
+                    &task.discussion_channel_id,
+                    task.active_continuation
+                        .as_ref()
+                        .map(|continuation| continuation.summary.as_str())
+                        .unwrap_or("The continuation deadline was reached"),
+                )
+                .await;
+                let _ = orchestrator::notify_task(
+                    state,
+                    &task,
+                    InboxKind::TaskBlocked,
+                    format!("{} needs action", task.key),
+                );
+                on_task_change(state, &task, None).await;
+            }
+        }
+        Err(err) => tracing::warn!(?err, "could not expire task continuations"),
+    }
+
+    match state.store.claim_due_task_continuations(now) {
+        Ok(continuations) => {
+            for continuation in continuations {
+                tokio::spawn(poll_task_continuation(state.clone(), continuation));
+            }
+        }
+        Err(err) => tracing::warn!(?err, "could not claim due task continuations"),
+    }
+
+    let Ok(ready) = state.store.ready_task_continuations() else {
+        return;
+    };
+    for continuation in ready {
+        let Ok(Some(task)) = state.store.task(&continuation.task_id) else {
+            continue;
+        };
+        if task.status != TaskStatus::Running
+            || !state
+                .store
+                .active_task_runs(&task.id)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            continue;
+        }
+        let prompt = format!(
+            "{}\n\nContinuation checker reported:\n{}",
+            continuation.wake_prompt, continuation.summary
+        );
+        if let Err(err) = orchestrator::start_run(
+            state,
+            StartRunParams {
+                agent_id: continuation.agent_id.clone(),
+                channel_id: task.discussion_channel_id.clone(),
+                task_id: Some(task.id.clone()),
+                prompt,
+                trigger: RunTrigger::Continuation {
+                    continuation_id: continuation.id.clone(),
+                },
+                automation_id: None,
+                depth: 0,
+                host_id: task.host_id.clone(),
+                project_id: task.project_id.clone(),
+                required_task_status: Some(TaskStatus::Running),
+            },
+        )
+        .await
+        {
+            tracing::warn!(?err, task = %task.key, "could not wake a ready task continuation");
+        }
+    }
+}
+
+async fn poll_task_continuation(state: Shared, continuation: TaskContinuation) {
+    let dir = state.files_dir.join("continuations").join(&continuation.id);
+    let timeout = Duration::from_secs(continuation.every_seconds.clamp(20, 120) as u64);
+    let output = relay_command(
+        &dir,
+        &continuation.command,
+        &[
+            ("PATCHWORK_TASK_ID", continuation.task_id.as_str()),
+            ("PATCHWORK_CONTINUATION_ID", continuation.id.as_str()),
+        ],
+        timeout,
+    )
+    .await;
+    let result = match output {
+        Ok(output) if output.status.success() => {
+            parse_continuation_output(&String::from_utf8_lossy(&output.stdout)).map(|parsed| {
+                parsed.unwrap_or((ContinuationStatus::Waiting, continuation.summary.clone()))
+            })
+        }
+        Ok(output) => Err(anyhow!(
+            "checker command exited with {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "a signal".into())
+        )),
+        Err(err) => Err(err),
+    };
+    let (status, summary) = match result {
+        Ok(result) => result,
+        Err(err) => (
+            ContinuationStatus::Waiting,
+            format!("Checker error; retrying: {err:#}")
+                .chars()
+                .take(500)
+                .collect(),
+        ),
+    };
+    let Ok(Some(task)) =
+        state
+            .store
+            .apply_task_continuation_result(&continuation.id, status, &summary)
+    else {
+        return;
+    };
+    state.emit(Event::TaskUpdated { task: task.clone() });
+    if matches!(
+        status,
+        ContinuationStatus::ActionRequired | ContinuationStatus::Failed
+    ) {
+        let _ = orchestrator::post_system(&state, &task.discussion_channel_id, &summary).await;
+        let _ = orchestrator::notify_task(
+            &state,
+            &task,
+            InboxKind::TaskBlocked,
+            format!("{} needs action", task.key),
+        );
+        on_task_change(&state, &task, None).await;
+    }
+}
+
 /// Runs one watch command and fires the agent only if it found something.
 ///
 /// This is the whole point of a watch: the scan costs a process, so it can run
@@ -647,30 +856,17 @@ async fn poll_watch(state: Shared, automation: Automation, command: String) {
     // Its own directory, kept between polls, so a script can remember the last
     // id it saw without the relay inventing a storage API for it.
     let dir = state.files_dir.join("watch").join(&automation.id);
-    if let Err(err) = tokio::fs::create_dir_all(&dir).await {
-        tracing::warn!(?err, automation = %automation.name, "watch state directory unavailable");
-        return;
-    }
-
-    let output = tokio::time::timeout(
+    let output = match relay_command(
+        &dir,
+        &command,
+        &[("PATCHWORK_AUTOMATION_ID", automation.id.as_str())],
         WATCH_TIMEOUT,
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&dir)
-            .env("PATCHWORK_STATE_DIR", &dir)
-            .env("PATCHWORK_AUTOMATION_ID", &automation.id)
-            .output(),
     )
-    .await;
-    let output = match output {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            tracing::warn!(?err, automation = %automation.name, "watch command could not run");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!(automation = %automation.name, "watch command timed out");
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::warn!(?err, automation = %automation.name, "watch command failed");
             return;
         }
     };
@@ -842,6 +1038,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -869,6 +1066,45 @@ mod tests {
     fn nonsense_expressions_do_not_schedule_anything() {
         assert!(next_cron_after("not a cron", 0).is_none());
         assert!(next_cron_after("0 9 * *", 0).is_none());
+    }
+
+    #[test]
+    fn continuation_checkers_use_one_small_json_protocol() {
+        assert!(parse_continuation_output("").unwrap().is_none());
+        for (value, expected) in [
+            ("waiting", ContinuationStatus::Waiting),
+            ("ready", ContinuationStatus::Ready),
+            ("action_required", ContinuationStatus::ActionRequired),
+            ("failed", ContinuationStatus::Failed),
+        ] {
+            let output = format!(r#"{{"status":"{value}","summary":"status changed"}}"#);
+            assert_eq!(
+                parse_continuation_output(&output).unwrap(),
+                Some((expected, "status changed".into()))
+            );
+        }
+        assert!(parse_continuation_output("not json").is_err());
+        assert!(parse_continuation_output(r#"{"status":"ready","summary":""}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn continuation_checkers_get_durable_state_and_task_identity() {
+        let dir = std::env::temp_dir().join(format!("patchwork-checker-{}", new_id()));
+        let output = relay_command(
+            &dir,
+            r#"printf '{"status":"ready","summary":"%s"}' "$PATCHWORK_TASK_ID"; printf seen > "$PATCHWORK_STATE_DIR/seen""#,
+            &[("PATCHWORK_TASK_ID", "PW-82")],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            parse_continuation_output(&String::from_utf8_lossy(&output.stdout)).unwrap(),
+            Some((ContinuationStatus::Ready, "PW-82".into()))
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("seen")).unwrap(), "seen");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -947,6 +1183,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -995,6 +1232,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,

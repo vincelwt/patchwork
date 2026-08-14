@@ -9,12 +9,14 @@
 
 import { isTerminalTaskStatus } from "@client/types";
 import type { Member, Question, Run, Task } from "@client/types";
+import { dayLabel, timeOfDay } from "./format";
 
 export type Situation =
   | "unassigned"
   | "ready"
   | "queued"
   | "working"
+  | "continuing"
   | "asking"
   | "failed"
   | "blocked"
@@ -193,6 +195,54 @@ function describe(
     };
   }
 
+  const continuation = task.active_continuation;
+  if (continuation) {
+    const deadline = `Deadline ${dayLabel(continuation.deadline_at)} at ${timeOfDay(continuation.deadline_at)}`;
+    if (continuation.status === "waiting") {
+      const next = continuation.next_check_at
+        ? `Next check ${dayLabel(continuation.next_check_at)} at ${timeOfDay(continuation.next_check_at)}`
+        : undefined;
+      return {
+        situation: "continuing",
+        headline: continuation.summary,
+        detail: [next, deadline].filter(Boolean).join(" · "),
+        run,
+        owner,
+      };
+    }
+    if (continuation.status === "ready") {
+      return {
+        situation: "continuing",
+        headline: "External work is ready; starting a fresh run",
+        detail: continuation.summary,
+        run,
+        owner,
+      };
+    }
+    if (continuation.status === "action_required") {
+      return {
+        situation: "blocked",
+        headline: "Action required",
+        detail: continuation.summary,
+        run,
+        owner,
+        action: ownerIsAgent
+          ? { label: "Try again", kind: "retry", tone: "primary" }
+          : { label: "Assign", kind: "assign", tone: "normal" },
+      };
+    }
+    return {
+      situation: "failed",
+      headline: "External work failed",
+      detail: continuation.summary,
+      run,
+      owner,
+      action: ownerIsAgent
+        ? { label: "Try again", kind: "retry", tone: "primary" }
+        : { label: "Assign", kind: "assign", tone: "normal" },
+    };
+  }
+
   if (run?.status === "failed") {
     return {
       situation: "failed",
@@ -282,6 +332,7 @@ export function stepIndex(task: Task): number {
 export function situationTone(situation: Situation): string {
   switch (situation) {
     case "working":
+    case "continuing":
     case "queued":
       return "accent";
     case "asking":

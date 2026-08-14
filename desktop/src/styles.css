@@ -2993,6 +2993,14 @@ details.run-thought > summary > svg {
   color: var(--text-muted);
   border-top-color: var(--tint-strong);
 }
+.rail-step[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.45;
+}
+.rail-step[aria-disabled="true"]:not(.current):hover {
+  color: var(--text-faint);
+  border-top-color: var(--tint);
+}
 .rail-step.past {
   border-top-color: color-mix(in srgb, var(--text) 26%, transparent);
   color: var(--text-faint);

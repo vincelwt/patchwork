@@ -419,11 +419,11 @@ async fn reconcile_interrupted_runs(state: &Shared) {
             }
         }
     }
-    // Startup is the one moment we know which runs are really alive, so it is
-    // also when a task left pointing at a dead one gets released.
-    match state.store.clear_finished_task_runs() {
-        Ok(count) if count > 0 => tracing::info!(count, "freed tasks left on a finished run"),
-        Err(err) => tracing::warn!(?err, "could not free tasks left on a finished run"),
+    // Runs and durable continuations jointly define whether a task is still
+    // moving. Repair legacy or interrupted writes before clients see them.
+    match state.store.reconcile_task_lifecycle() {
+        Ok(count) if count > 0 => tracing::info!(count, "reconciled task lifecycle state"),
+        Err(err) => tracing::warn!(?err, "could not reconcile task lifecycle state"),
         _ => {}
     }
     if let Ok(previews) = state.store.previews(true) {

@@ -3,12 +3,14 @@ import { useApi, useApp, useAppSelector } from "../lib/store";
 import {
   dateInputToMillis,
   dateInputValue,
+  dayLabel,
   dueLabel,
   pullRequestStatus,
   pullRequestTone,
   relative,
   statusLabel,
   statusTone,
+  timeOfDay,
 } from "../lib/format";
 import {
   isRunActive,
@@ -43,6 +45,7 @@ import {
   BranchIcon,
   ChevronIcon,
   CheckIcon,
+  ClockIcon,
   CloseIcon,
   ExternalIcon,
   MoreIcon,
@@ -63,10 +66,12 @@ import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
 import { isTerminalTaskStatus, TASK_STATUSES } from "@client/types";
 import type {
   Attachment,
+  ContinuationStatus,
   Id,
   Member,
   Preview,
   Task,
+  TaskContinuationSummary,
   TaskDetail,
   TaskStatus,
 } from "@client/types";
@@ -307,7 +312,12 @@ export function TasksBoard() {
   const needsYou = tasks.filter((task) => {
     if (isTerminalTaskStatus(task.status)) return false;
     const state = readTask(task, app.members, app.runs, app.questions);
-    return state.situation === "asking" || state.situation === "review";
+    return (
+      state.situation === "asking" ||
+      state.situation === "review" ||
+      task.active_continuation?.status === "action_required" ||
+      task.active_continuation?.status === "failed"
+    );
   }).length;
 
   return (
@@ -516,6 +526,14 @@ function TaskList({
                 {due && !isTerminalTaskStatus(task.status) && (
                   <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
                 )}
+                {task.active_continuation && (
+                  <Chip
+                    tone={continuationTone(task.active_continuation)}
+                    title={`Deadline ${dayLabel(task.active_continuation.deadline_at)} at ${timeOfDay(task.active_continuation.deadline_at)}`}
+                  >
+                    {continuationTiming(task.active_continuation)}
+                  </Chip>
+                )}
                 {project && <Chip>{project.name}</Chip>}
                 {state.agents.length > 1 ? (
                   <AgentStack members={state.agents} size={20} />
@@ -531,6 +549,37 @@ function TaskList({
       ))}
     </div>
   );
+}
+
+function continuationStatusLabel(status: ContinuationStatus) {
+  switch (status) {
+    case "waiting":
+      return "Waiting";
+    case "ready":
+      return "Ready";
+    case "action_required":
+      return "Action required";
+    case "failed":
+      return "Failed";
+  }
+}
+
+function continuationTone(continuation: TaskContinuationSummary) {
+  if (continuation.status === "action_required" || continuation.status === "failed") {
+    return "danger";
+  }
+  return continuation.deadline_at - Date.now() < 60 * 60 * 1000 ? "caution" : "accent";
+}
+
+function continuationTiming(continuation: TaskContinuationSummary) {
+  if (continuation.status === "ready") return "Ready to resume";
+  if (continuation.status === "action_required") return "Action required";
+  if (continuation.status === "failed") return "External failure";
+  if (!continuation.next_check_at) return "Checking";
+  const day = dayLabel(continuation.next_check_at);
+  return day === "Today"
+    ? `Check ${timeOfDay(continuation.next_check_at)}`
+    : `Check ${day} ${timeOfDay(continuation.next_check_at)}`;
 }
 
 function emptyColumn(status: TaskStatus) {
@@ -569,9 +618,14 @@ function TaskCard({
 
   // Only the situations that say something get a line of their own. A card that
   // is simply planned and owned needs no commentary.
-  const noteworthy = ["working", "queued", "asking", "failed", "blocked"].includes(
-    state.situation,
-  );
+  const noteworthy = [
+    "working",
+    "continuing",
+    "queued",
+    "asking",
+    "failed",
+    "blocked",
+  ].includes(state.situation);
 
   return (
     <div
@@ -611,6 +665,8 @@ function TaskCard({
         <div className={`situation ${situationTone(state.situation)}`}>
           {state.situation === "working" || state.situation === "queued" ? (
             <Spinner size={11} />
+          ) : state.situation === "continuing" ? (
+            <ClockIcon size={12} />
           ) : state.situation === "asking" ? (
             <QuestionIcon size={12} />
           ) : (
@@ -623,6 +679,14 @@ function TaskCard({
       <div className="meta">
         {due && !isTerminalTaskStatus(task.status) && (
           <Chip tone={due.overdue ? "danger" : "caution"}>{due.text}</Chip>
+        )}
+        {task.active_continuation && (
+          <Chip
+            tone={continuationTone(task.active_continuation)}
+            title={`Deadline ${dayLabel(task.active_continuation.deadline_at)} at ${timeOfDay(task.active_continuation.deadline_at)}`}
+          >
+            {continuationTiming(task.active_continuation)}
+          </Chip>
         )}
         {project && <Chip>{project.name}</Chip>}
         {task.pr_state && (
@@ -1358,6 +1422,10 @@ export function TaskPage({ taskId }: { taskId: string }) {
   );
   const step = stepIndex(task);
   const due = dueLabel(task.due_at);
+  const canSetRunning =
+    state.activeRuns.length > 0 ||
+    task.active_continuation?.status === "waiting" ||
+    task.active_continuation?.status === "ready";
   const performTopAction = async (action: NextAction) => {
     const succeeded = await actions.perform(action, state);
     if (
@@ -1433,10 +1501,16 @@ export function TaskPage({ taskId }: { taskId: string }) {
               className={`rail-step${index === step ? " current" : ""}${
                 index < step ? " past" : ""
               }${task.status === "blocked" && index === step ? " blocked" : ""}`}
-              title={`Move to ${entry.label}`}
-              onClick={() =>
-                void api.updateTask(task.id, { status: entry.key as TaskStatus })
+              title={
+                entry.key === "running" && !canSetRunning
+                  ? "Start a run instead"
+                  : `Move to ${entry.label}`
               }
+              aria-disabled={entry.key === "running" && !canSetRunning}
+              onClick={() => {
+                if (entry.key === "running" && !canSetRunning) return;
+                void api.updateTask(task.id, { status: entry.key as TaskStatus });
+              }}
             >
               {task.status === "blocked" && entry.key === "running"
                 ? "Blocked"
@@ -1449,6 +1523,7 @@ export function TaskPage({ taskId }: { taskId: string }) {
           {(state.situation === "working" || state.situation === "queued") && (
             <Spinner size={14} />
           )}
+          {state.situation === "continuing" && <ClockIcon size={15} />}
           {state.situation === "asking" && <QuestionIcon size={15} />}
           {(state.situation === "failed" || state.situation === "blocked") && (
             <WarningIcon size={15} />
@@ -1667,6 +1742,30 @@ function TaskDetailPanel({ taskId }: { taskId: string }) {
             {detail.worktree.path}
           </div>
           <Chip>{detail.worktree.branch || "no branch"}</Chip>
+        </Section>
+      )}
+
+      {detail.task.active_continuation && (
+        <Section title="Active obligation">
+          <div className="card-sub">{detail.task.active_continuation.summary}</div>
+          <div className="row">
+            <span className="grow">
+              <span className="name">Relay checker</span>
+              <span className="sub">
+                Deadline {dayLabel(detail.task.active_continuation.deadline_at)} at{" "}
+                {timeOfDay(detail.task.active_continuation.deadline_at)}
+              </span>
+            </span>
+            <Chip tone={continuationTone(detail.task.active_continuation)}>
+              {continuationStatusLabel(detail.task.active_continuation.status)}
+            </Chip>
+          </div>
+          {detail.task.active_continuation.next_check_at && (
+            <div className="card-sub">
+              Next check {dayLabel(detail.task.active_continuation.next_check_at)} at{" "}
+              {timeOfDay(detail.task.active_continuation.next_check_at)}
+            </div>
+          )}
         </Section>
       )}
 
