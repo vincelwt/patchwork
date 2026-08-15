@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use patchwork_core::host::RunControlMode;
 use patchwork_core::models::*;
+use patchwork_core::now_ms;
 use patchwork_core::wire::*;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -361,6 +362,24 @@ enum TaskCommand {
         /// Exact action a person can approve in review, e.g. "Approve and merge PR".
         #[arg(long)]
         approval: Option<String>,
+    },
+    /// Hand a long-lived external wait to the relay, then let this run finish.
+    Wait {
+        /// What the task is waiting for, shown on the board.
+        #[arg(long)]
+        summary: String,
+        /// Relay-side shell command that checks the external work.
+        #[arg(long)]
+        command: String,
+        /// Seconds between checks.
+        #[arg(long, default_value_t = 60)]
+        every: i64,
+        /// Seconds from now before the wait escalates for human action.
+        #[arg(long)]
+        deadline: i64,
+        /// Instruction for the fresh agent run started when the checker is ready.
+        #[arg(long)]
+        wake: String,
     },
     Delete {
         reference: String,
@@ -1629,6 +1648,13 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 if let Some(action) = &detail.task.review_action {
                     println!("Approval: {action}");
                 }
+                if let Some(continuation) = &detail.task.active_continuation {
+                    println!(
+                        "Active obligation [{}]: {}",
+                        continuation.status.as_str(),
+                        continuation.summary
+                    );
+                }
                 for run in detail.runs.iter().take(5) {
                     println!("  run [{}] {}", run.status.as_str(), run.headline);
                 }
@@ -1708,6 +1734,43 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 .await?;
             client.print(&updated, || {
                 println!("{} is now {}", updated.key, updated.status.as_str())
+            });
+        }
+        TaskCommand::Wait {
+            summary,
+            command,
+            every,
+            deadline,
+            wake,
+        } => {
+            let task_id = ctx
+                .task_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("task wait only works inside a task run"))?;
+            if deadline <= 0 {
+                bail!("--deadline must be a positive number of seconds");
+            }
+            let deadline_at = now_ms()
+                .checked_add(
+                    deadline
+                        .checked_mul(1000)
+                        .ok_or_else(|| anyhow!("--deadline is too large"))?,
+                )
+                .ok_or_else(|| anyhow!("--deadline is too large"))?;
+            let task: Task = client
+                .post(
+                    &format!("/api/tasks/{task_id}/continuation"),
+                    json!({
+                        "summary": summary,
+                        "command": command,
+                        "every_seconds": every,
+                        "deadline_at": deadline_at,
+                        "wake_prompt": wake,
+                    }),
+                )
+                .await?;
+            client.print(&task, || {
+                println!("Patchwork will keep checking {}", task.key)
             });
         }
         TaskCommand::Delete { reference } => {

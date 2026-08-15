@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::auth;
 use crate::state::{RunDestination, Shared};
-use crate::store::{InsertTaskResult, Store};
+use crate::store::{InsertTaskResult, Store, TaskRunHandoff};
 
 /// How much conversation an agent gets by default. Deeper history stays
 /// retrievable through the CLI rather than being pasted into every prompt.
@@ -1428,7 +1428,9 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     state.emit(Event::RunUpdated { run: run.clone() });
 
     if let Some(task_id) = run.task_id.as_deref() {
-        state.store.finalize_task_run_start(task_id, &run.id)?;
+        state
+            .store
+            .finalize_task_run_start(task_id, &run.id, run.created_at)?;
         if let Some(task) = state.store.task(task_id)? {
             state.emit(Event::TaskUpdated { task });
         }
@@ -2625,7 +2627,7 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     let Some(task_id) = &run.task_id else {
         return Ok(());
     };
-    let Some(mut task) = state.store.task(task_id)? else {
+    let Some(task) = state.store.task(task_id)? else {
         return Ok(());
     };
 
@@ -2657,18 +2659,16 @@ the task stays yours until you stop. Reply only if this changes your work.",
             ),
         )
         .await;
-        if task.current_run_id.as_deref() == Some(run.id.as_str()) {
-            task.current_run_id = peers.first().map(|peer| peer.id.clone());
-            state.store.update_task(&task)?;
-            state.emit(Event::TaskUpdated { task });
-        }
-        return Ok(());
     }
 
-    if task.current_run_id.as_deref() != Some(run.id.as_str()) {
-        return Ok(());
+    match state.store.hand_off_finished_task_run(task_id, &run.id)? {
+        TaskRunHandoff::Peer(task) => {
+            state.emit(Event::TaskUpdated { task });
+            return Ok(());
+        }
+        TaskRunHandoff::Moved => return Ok(()),
+        TaskRunHandoff::Last => {}
     }
-    task.current_run_id = None;
 
     // The last agent out reports for the whole group, and a failure inside it
     // is not erased by whoever happened to finish afterwards.
@@ -2684,43 +2684,74 @@ the task stays yours until you stop. Reply only if this changes your work.",
         run.status
     };
 
-    match outcome {
-        RunStatus::Succeeded => {
-            if task.status == TaskStatus::Running {
-                if has_review_evidence(state, &task, &group, None)? {
-                    task.status = TaskStatus::Review;
-                    notify_task(
-                        state,
-                        &task,
-                        InboxKind::ReviewReady,
-                        format!("{} is ready for review", task.key),
-                    )?;
-                } else {
-                    task.status = TaskStatus::Planned;
+    // A person may move the task while this run is settling. Re-read and use
+    // the existing optimistic task write so an old snapshot cannot undo them.
+    for _ in 0..8 {
+        let Some(mut task) = state.store.task(task_id)? else {
+            return Ok(());
+        };
+        if task.current_run_id.as_deref() != Some(run.id.as_str()) {
+            return Ok(());
+        }
+        let expected_updated_at = task.updated_at;
+        let mut notification = None;
+        task.current_run_id = None;
+
+        if let Some(continuation) = &task.active_continuation {
+            task.status = match continuation.status {
+                ContinuationStatus::Waiting | ContinuationStatus::Ready => TaskStatus::Running,
+                ContinuationStatus::ActionRequired | ContinuationStatus::Failed => {
+                    TaskStatus::Blocked
                 }
+            };
+        } else {
+            match outcome {
+                RunStatus::Succeeded => {
+                    if task.status == TaskStatus::Running {
+                        if has_review_evidence(state, &task, &group, None)? {
+                            task.status = TaskStatus::Review;
+                            notification = Some((
+                                InboxKind::ReviewReady,
+                                format!("{} is ready for review", task.key),
+                            ));
+                        } else {
+                            task.status = TaskStatus::Planned;
+                        }
+                    }
+                }
+                RunStatus::Failed => {
+                    if task.status == TaskStatus::Running {
+                        task.status = TaskStatus::Blocked;
+                        notification =
+                            Some((InboxKind::TaskBlocked, format!("{} is blocked", task.key)));
+                    }
+                }
+                RunStatus::Cancelled => {
+                    if task.status == TaskStatus::Running {
+                        task.status = TaskStatus::Planned;
+                    }
+                }
+                _ => {}
             }
         }
-        RunStatus::Failed => {
-            if task.status == TaskStatus::Running {
-                task.status = TaskStatus::Blocked;
-                notify_task(
-                    state,
-                    &task,
-                    InboxKind::TaskBlocked,
-                    format!("{} is blocked", task.key),
-                )?;
-            }
+
+        if task.status != TaskStatus::Review {
+            task.review_action = None;
         }
-        _ => {}
+        if !state
+            .store
+            .update_task_if_unchanged(&task, expected_updated_at, false)?
+        {
+            continue;
+        }
+        if let Some((kind, title)) = notification {
+            notify_task(state, &task, kind, title)?;
+        }
+        let task = state.store.task(task_id)?.unwrap_or(task);
+        state.emit(Event::TaskUpdated { task });
+        return Ok(());
     }
-
-    if task.status != TaskStatus::Review {
-        task.review_action = None;
-    }
-
-    state.store.update_task(&task)?;
-    state.emit(Event::TaskUpdated { task });
-    Ok(())
+    bail!("task kept changing while its run was finishing")
 }
 
 pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) -> Result<()> {
@@ -3036,6 +3067,7 @@ async fn create_task_inner(
         host_id: input.host_id.clone(),
         worktree_id: input.existing_worktree_id.clone(),
         current_run_id: None,
+        active_continuation: None,
         pr_url: None,
         pr_state: None,
         review_action: None,
@@ -3734,6 +3766,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: Some("run".into()),
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -4038,6 +4071,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -4271,6 +4305,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,

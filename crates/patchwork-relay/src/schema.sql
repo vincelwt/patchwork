@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   host_id               TEXT,
   worktree_id           TEXT,
   current_run_id        TEXT,
+  active_continuation   TEXT,
   question_blocked_run_id TEXT,
   pr_url                TEXT,
   pr_state              TEXT,
@@ -229,6 +230,27 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_task ON runs(task_id, id);
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
+
+CREATE TABLE IF NOT EXISTS task_continuations (
+  id            TEXT PRIMARY KEY,
+  task_id       TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  agent_id      TEXT NOT NULL,
+  command       TEXT NOT NULL,
+  every_seconds INTEGER NOT NULL,
+  deadline_at   INTEGER NOT NULL,
+  wake_prompt   TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  summary       TEXT NOT NULL,
+  next_check_at INTEGER NOT NULL,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  ended_at      INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS task_continuations_active
+  ON task_continuations(task_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS task_continuations_due
+  ON task_continuations(status, next_check_at) WHERE ended_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS run_events (
   id         TEXT PRIMARY KEY,

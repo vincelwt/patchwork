@@ -209,13 +209,17 @@ patchwork status "Reproduced with a Europe/Berlin fixture"
 patchwork ask --question "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
 patchwork task update MER-41 --status review --approval "Approve and merge PR"
+patchwork task wait --summary "Build is processing" --command check-build \
+  --every 300 --deadline 86400 --wake "Verify the release and finish the task"
 patchwork pr https://github.com/acme/app/pull/218
 patchwork chart weekly-actives.json --caption "Active studios, last 8 weeks"
 ```
 
-Plus `say`, `search`, `history`, `attach`, `preview`, `tell` (message another
-running agent), `automation create`, and normal access to `git`, `gh` and
-anything else on the machine.
+`task wait` hands an external build, deployment, or review to a persisted
+relay checker, so the current model run can end and a fresh run wakes when the
+work is ready. Plus `say`, `search`, `history`, `attach`, `preview`, `tell`
+(message another running agent), `automation create`, and normal access to
+`git`, `gh` and anything else on the machine.
 
 ## Contributing
 

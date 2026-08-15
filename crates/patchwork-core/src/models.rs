@@ -385,6 +385,84 @@ mod task_status_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationStatus {
+    Waiting,
+    Ready,
+    ActionRequired,
+    Failed,
+}
+
+impl ContinuationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Ready => "ready",
+            Self::ActionRequired => "action_required",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "waiting" => Self::Waiting,
+            "ready" => Self::Ready,
+            "action_required" => Self::ActionRequired,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// The active external obligation shown wherever a task appears. Checker
+/// commands stay relay-private; clients only need what is happening and when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContinuationSummary {
+    pub id: Id,
+    pub status: ContinuationStatus,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_at: Option<Millis>,
+    pub deadline_at: Millis,
+    pub updated_at: Millis,
+}
+
+/// A relay-owned external wait. It survives the agent run and is checked
+/// without depending on that run's model, provider, session, or process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContinuation {
+    pub id: Id,
+    pub task_id: Id,
+    pub run_id: Id,
+    pub agent_id: Id,
+    pub command: String,
+    pub every_seconds: i64,
+    pub deadline_at: Millis,
+    pub wake_prompt: String,
+    pub status: ContinuationStatus,
+    pub summary: String,
+    pub next_check_at: Millis,
+    pub created_at: Millis,
+    pub updated_at: Millis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<Millis>,
+}
+
+impl TaskContinuation {
+    pub fn public_summary(&self) -> TaskContinuationSummary {
+        TaskContinuationSummary {
+            id: self.id.clone(),
+            status: self.status,
+            summary: self.summary.clone(),
+            next_check_at: (self.status == ContinuationStatus::Waiting)
+                .then_some(self.next_check_at),
+            deadline_at: self.deadline_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Id,
@@ -412,6 +490,8 @@ pub struct Task {
     pub worktree_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_continuation: Option<TaskContinuationSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,6 +750,7 @@ pub enum RunTrigger {
     Automation { automation_id: Id },
     Ambient { message_id: Id },
     PullRequestFeedback { task_id: Id },
+    Continuation { continuation_id: Id },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

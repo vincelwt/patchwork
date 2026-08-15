@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
 use patchwork_core::wire::Device;
@@ -33,6 +33,12 @@ pub enum SaveWorkspaceSkillResult {
     Saved(WorkspaceSkill),
     Missing,
     TooLarge,
+}
+
+pub enum TaskRunHandoff {
+    Peer(Task),
+    Last,
+    Moved,
 }
 
 pub enum QuestionCommit {
@@ -108,6 +114,7 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE tasks ADD COLUMN review_action TEXT",
+            "ALTER TABLE tasks ADD COLUMN active_continuation TEXT",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             "ALTER TABLE runs ADD COLUMN provider TEXT",
             "ALTER TABLE runs ADD COLUMN model TEXT",
@@ -1202,6 +1209,7 @@ impl Store {
             host_id: row.get("host_id")?,
             worktree_id: row.get("worktree_id")?,
             current_run_id: row.get("current_run_id")?,
+            active_continuation: json_col(row, "active_continuation"),
             pr_url: row.get("pr_url")?,
             pr_state: json_col(row, "pr_state"),
             review_action: row.get("review_action")?,
@@ -1309,7 +1317,27 @@ impl Store {
 
     fn update_task_inner(&self, task: &Task, explicit_status: bool) -> Result<()> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if explicit_status && task.status == TaskStatus::Running {
+            let has_work: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE task_id=?1
+                                  AND status IN ('queued','dispatched','running','waiting'))
+                     OR EXISTS(SELECT 1 FROM task_continuations WHERE task_id=?1
+                                  AND ended_at IS NULL AND status IN ('waiting','ready'))",
+                params![task.id],
+                |row| row.get(0),
+            )?;
+            if !has_work {
+                bail!("start a run or register a continuation before moving a task to running");
+            }
+        }
+        if explicit_status && task.status != TaskStatus::Running {
+            tx.execute(
+                "UPDATE task_continuations SET ended_at=?2, updated_at=?2
+                 WHERE task_id=?1 AND ended_at IS NULL",
+                params![task.id, now_ms()],
+            )?;
+        }
         tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
@@ -1317,6 +1345,10 @@ impl Store {
                               question_blocked_run_id=CASE
                                 WHEN ?15 OR ?4 != 'blocked' THEN NULL
                                 ELSE question_blocked_run_id
+                              END,
+                              active_continuation=CASE
+                                WHEN ?15 AND ?4 != 'running' THEN NULL
+                                ELSE active_continuation
                               END,
                               review_action=?16
               WHERE id=?1",
@@ -1372,6 +1404,26 @@ impl Store {
     ) -> Result<bool> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if explicit_status && task.status == TaskStatus::Running {
+            let has_work: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE task_id=?1
+                                  AND status IN ('queued','dispatched','running','waiting'))
+                     OR EXISTS(SELECT 1 FROM task_continuations WHERE task_id=?1
+                                  AND ended_at IS NULL AND status IN ('waiting','ready'))",
+                params![task.id],
+                |row| row.get(0),
+            )?;
+            if !has_work {
+                bail!("start a run or register a continuation before moving a task to running");
+            }
+        }
+        if explicit_status && task.status != TaskStatus::Running {
+            tx.execute(
+                "UPDATE task_continuations SET ended_at=?2, updated_at=?2
+                 WHERE task_id=?1 AND ended_at IS NULL",
+                params![task.id, now_ms()],
+            )?;
+        }
         let changed = tx.execute(
             "UPDATE tasks SET title=?2, outcome=?3, status=?4, owner_id=?5, project_id=?6, host_id=?7,
                               worktree_id=?8, current_run_id=?9, pr_url=?10, pr_state=?11, due_at=?12,
@@ -1379,6 +1431,10 @@ impl Store {
                               question_blocked_run_id=CASE
                                 WHEN ?15 OR ?4 != 'blocked' THEN NULL
                                 ELSE question_blocked_run_id
+                              END,
+                              active_continuation=CASE
+                                WHEN ?15 AND ?4 != 'running' THEN NULL
+                                ELSE active_continuation
                               END,
                               review_action=?16
              WHERE id=?1 AND updated_at=?17",
@@ -1469,13 +1525,82 @@ impl Store {
         )?)
     }
 
-    pub fn finalize_task_run_start(&self, task_id: &str, run_id: &str) -> Result<bool> {
-        Ok(self.conn()?.execute(
+    pub fn hand_off_finished_task_run(
+        &self,
+        task_id: &str,
+        finished_run_id: &str,
+    ) -> Result<TaskRunHandoff> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT current_run_id FROM tasks WHERE id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if current.as_deref() != Some(finished_run_id) {
+            return Ok(TaskRunHandoff::Moved);
+        }
+        let peer: Option<String> = tx
+            .query_row(
+                "SELECT id FROM runs WHERE task_id=?1 AND id!=?2
+                   AND status IN ('queued','dispatched','running','waiting')
+                 ORDER BY id DESC LIMIT 1",
+                params![task_id, finished_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(peer) = peer else {
+            return Ok(TaskRunHandoff::Last);
+        };
+        tx.execute(
+            "UPDATE tasks SET current_run_id=?3, updated_at=MAX(?4, updated_at + 1)
+             WHERE id=?1 AND current_run_id=?2",
+            params![task_id, finished_run_id, peer, now_ms()],
+        )?;
+        let task = tx.query_row(
+            "SELECT * FROM tasks WHERE id=?1",
+            params![task_id],
+            Self::task_from_row,
+        )?;
+        tx.commit()?;
+        Ok(TaskRunHandoff::Peer(task))
+    }
+
+    pub fn finalize_task_run_start(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        run_created_at: Millis,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owns_task: bool = tx.query_row(
+            "SELECT COALESCE(current_run_id=?2, 0) FROM tasks WHERE id=?1",
+            params![task_id, run_id],
+            |row| row.get(0),
+        )?;
+        if !owns_task {
+            return Ok(false);
+        }
+        let now = now_ms();
+        let ended_continuation = tx.execute(
+            "UPDATE task_continuations SET ended_at=?4, updated_at=?4
+             WHERE task_id=?1 AND ended_at IS NULL AND run_id!=?2
+               AND (created_at<?3 OR (created_at=?3 AND id<?2))",
+            params![task_id, run_id, run_created_at, now],
+        )? > 0;
+        let changed = tx.execute(
             "UPDATE tasks SET review_action=NULL, question_blocked_run_id=NULL,
+                              active_continuation=CASE WHEN ?4 THEN NULL ELSE active_continuation END,
                               updated_at=MAX(?3, updated_at + 1)
              WHERE id=?1 AND current_run_id=?2",
-            params![task_id, run_id, now_ms()],
-        )? > 0)
+            params![task_id, run_id, now, ended_continuation],
+        )? > 0;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// A run that never reached its host gives the task back — unless someone
@@ -1582,9 +1707,319 @@ impl Store {
         };
         tx.execute("DELETE FROM attachments WHERE task_id = ?1", params![id])?;
         tx.execute("DELETE FROM previews WHERE task_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM task_continuations WHERE task_id = ?1",
+            params![id],
+        )?;
         tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(files)
+    }
+
+    // -- durable task continuations ----------------------------------------
+
+    fn task_continuation_from_row(row: &Row) -> rusqlite::Result<TaskContinuation> {
+        let status: String = row.get("status")?;
+        Ok(TaskContinuation {
+            id: row.get("id")?,
+            task_id: row.get("task_id")?,
+            run_id: row.get("run_id")?,
+            agent_id: row.get("agent_id")?,
+            command: row.get("command")?,
+            every_seconds: row.get("every_seconds")?,
+            deadline_at: row.get("deadline_at")?,
+            wake_prompt: row.get("wake_prompt")?,
+            status: ContinuationStatus::parse(&status).unwrap_or(ContinuationStatus::Waiting),
+            summary: row.get("summary")?,
+            next_check_at: row.get("next_check_at")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            ended_at: row.get("ended_at")?,
+        })
+    }
+
+    /// Transfer an external wait from a live task run to the relay. One task
+    /// has one visible obligation, which keeps both the lifecycle and UI clear.
+    pub fn register_task_continuation(
+        &self,
+        continuation: &TaskContinuation,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id
+                  WHERE r.id=?1 AND r.task_id=?2 AND r.agent_id=?3
+                    AND r.status IN ('queued','dispatched','running','waiting')
+                    AND t.status='running'
+               ) AND NOT EXISTS(
+                 SELECT 1 FROM task_continuations
+                  WHERE task_id=?2 AND ended_at IS NULL
+               )",
+            params![
+                continuation.run_id,
+                continuation.task_id,
+                continuation.agent_id
+            ],
+            |row| row.get(0),
+        )?;
+        if !valid {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO task_continuations
+             (id, task_id, run_id, agent_id, command, every_seconds, deadline_at, wake_prompt,
+              status, summary, next_check_at, created_at, updated_at, ended_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                continuation.id,
+                continuation.task_id,
+                continuation.run_id,
+                continuation.agent_id,
+                continuation.command,
+                continuation.every_seconds,
+                continuation.deadline_at,
+                continuation.wake_prompt,
+                continuation.status.as_str(),
+                continuation.summary,
+                continuation.next_check_at,
+                continuation.created_at,
+                continuation.updated_at,
+                continuation.ended_at,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET active_continuation=?2, updated_at=MAX(?3, updated_at + 1)
+             WHERE id=?1",
+            params![
+                continuation.task_id,
+                to_json(&continuation.public_summary()),
+                now_ms()
+            ],
+        )?;
+        let task = tx.query_row(
+            "SELECT * FROM tasks WHERE id=?1",
+            params![continuation.task_id],
+            Self::task_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(task))
+    }
+
+    /// Advance due times before commands start so a slow or crashed checker
+    /// cannot overlap itself or run on every scheduler tick.
+    pub fn claim_due_task_continuations(&self, now: Millis) -> Result<Vec<TaskContinuation>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut continuations = {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM task_continuations
+                 WHERE ended_at IS NULL AND status='waiting'
+                   AND next_check_at<=?1 AND deadline_at>?1
+                 ORDER BY next_check_at LIMIT 50",
+            )?;
+            let rows = stmt.query_map(params![now], Self::task_continuation_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for continuation in &mut continuations {
+            continuation.next_check_at = now + continuation.every_seconds * 1000;
+            continuation.updated_at = now;
+            tx.execute(
+                "UPDATE task_continuations SET next_check_at=?2, updated_at=?3
+                 WHERE id=?1 AND ended_at IS NULL AND status='waiting'",
+                params![continuation.id, continuation.next_check_at, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(continuations)
+    }
+
+    /// Apply a checker result once. A manual run, task move, or earlier result
+    /// ends the row first, so late process output becomes a harmless no-op.
+    pub fn apply_task_continuation_result(
+        &self,
+        id: &str,
+        status: ContinuationStatus,
+        summary: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut continuation) = tx
+            .query_row(
+                "SELECT * FROM task_continuations
+                 WHERE id=?1 AND ended_at IS NULL AND status='waiting'",
+                params![id],
+                Self::task_continuation_from_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        continuation.status = status;
+        continuation.summary = summary.to_string();
+        continuation.updated_at = now;
+        tx.execute(
+            "UPDATE task_continuations SET status=?2, summary=?3, updated_at=?4
+             WHERE id=?1 AND ended_at IS NULL AND status='waiting'",
+            params![id, status.as_str(), summary, now],
+        )?;
+        tx.execute(
+            "UPDATE tasks
+             SET status=CASE
+                   WHEN ?3 IN ('action_required','failed') THEN 'blocked'
+                   WHEN question_blocked_run_id IS NULL THEN 'running'
+                   ELSE status END,
+                 active_continuation=?2,
+                 updated_at=MAX(?4, updated_at + 1)
+             WHERE id=?1 AND status NOT IN ('done','canceled')",
+            params![
+                continuation.task_id,
+                to_json(&continuation.public_summary()),
+                status.as_str(),
+                now
+            ],
+        )?;
+        let task = tx
+            .query_row(
+                "SELECT * FROM tasks WHERE id=?1",
+                params![continuation.task_id],
+                Self::task_from_row,
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    pub fn expire_task_continuations(&self, now: Millis) -> Result<Vec<Task>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuations = {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM task_continuations
+                 WHERE ended_at IS NULL AND status IN ('waiting','ready') AND deadline_at<=?1",
+            )?;
+            let rows = stmt.query_map(params![now], Self::task_continuation_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut tasks = Vec::new();
+        for mut continuation in continuations {
+            let summary = format!("Deadline reached: {}", continuation.summary);
+            continuation.status = ContinuationStatus::ActionRequired;
+            continuation.summary = summary.clone();
+            continuation.updated_at = now;
+            if tx.execute(
+                "UPDATE task_continuations SET status='action_required', summary=?2, updated_at=?3
+                 WHERE id=?1 AND ended_at IS NULL AND status IN ('waiting','ready')",
+                params![continuation.id, summary, now],
+            )? == 0
+            {
+                continue;
+            }
+            tx.execute(
+                "UPDATE tasks SET status='blocked', active_continuation=?2,
+                                  updated_at=MAX(?3, updated_at + 1)
+                 WHERE id=?1 AND status NOT IN ('done','canceled')",
+                params![
+                    continuation.task_id,
+                    to_json(&continuation.public_summary()),
+                    now
+                ],
+            )?;
+            if let Some(task) = tx
+                .query_row(
+                    "SELECT * FROM tasks WHERE id=?1",
+                    params![continuation.task_id],
+                    Self::task_from_row,
+                )
+                .optional()?
+            {
+                tasks.push(task);
+            }
+        }
+        tx.commit()?;
+        Ok(tasks)
+    }
+
+    pub fn ready_task_continuations(&self) -> Result<Vec<TaskContinuation>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM task_continuations
+             WHERE ended_at IS NULL AND status='ready' ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map([], Self::task_continuation_from_row)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Repair old or interrupted writes at startup. Normal transitions enforce
+    /// the same rules transactionally; this catches states from older relays.
+    pub fn reconcile_task_lifecycle(&self) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = tx.total_changes();
+        let now = now_ms();
+        tx.execute(
+            "UPDATE task_continuations SET ended_at=?1, updated_at=?1
+             WHERE ended_at IS NULL AND task_id IN
+               (SELECT id FROM tasks WHERE status IN ('done','canceled'))",
+            params![now],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET active_continuation=NULL, updated_at=updated_at+1
+             WHERE status IN ('done','canceled') AND active_continuation IS NOT NULL",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE tasks
+             SET current_run_id=(
+                   SELECT id FROM runs WHERE task_id=tasks.id
+                     AND status IN ('queued','dispatched','running','waiting')
+                   ORDER BY id DESC LIMIT 1
+                 ),
+                 updated_at=updated_at+1
+             WHERE current_run_id IS NULL OR current_run_id IN
+               (SELECT id FROM runs WHERE status IN ('succeeded','failed','cancelled'))",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET status='planned', updated_at=updated_at+1
+             WHERE status='running'
+               AND NOT EXISTS(SELECT 1 FROM runs WHERE task_id=tasks.id
+                                AND status IN ('queued','dispatched','running','waiting'))
+               AND NOT EXISTS(SELECT 1 FROM task_continuations WHERE task_id=tasks.id
+                                AND ended_at IS NULL AND status IN ('waiting','ready'))",
+            [],
+        )?;
+        let continuations = {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM task_continuations WHERE ended_at IS NULL ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map([], Self::task_continuation_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for continuation in continuations {
+            let status = match continuation.status {
+                ContinuationStatus::Waiting | ContinuationStatus::Ready => "running",
+                ContinuationStatus::ActionRequired | ContinuationStatus::Failed => "blocked",
+            };
+            tx.execute(
+                "UPDATE tasks SET status=CASE
+                                    WHEN question_blocked_run_id IS NOT NULL THEN status
+                                    ELSE ?2 END,
+                                  active_continuation=?3,
+                                  updated_at=MAX(?4, updated_at + 1)
+                 WHERE id=?1 AND status NOT IN ('done','canceled')",
+                params![
+                    continuation.task_id,
+                    status,
+                    to_json(&continuation.public_summary()),
+                    now
+                ],
+            )?;
+        }
+        let changed = (tx.total_changes() - before) as usize;
+        tx.commit()?;
+        Ok(changed)
     }
 
     // -- projects, hosts, worktrees ----------------------------------------
@@ -2141,7 +2576,12 @@ impl Store {
         let resumed = tx
             .query_row(
                 "UPDATE tasks
-                 SET status='running', question_blocked_run_id=NULL,
+                 SET status=CASE WHEN EXISTS(
+                       SELECT 1 FROM task_continuations
+                        WHERE task_id=tasks.id AND ended_at IS NULL
+                          AND status IN ('action_required','failed')
+                     ) THEN 'blocked' ELSE 'running' END,
+                     question_blocked_run_id=NULL,
                      updated_at=MAX(?2, updated_at + 1)
                  WHERE current_run_id=?1
                    AND status='blocked'
@@ -2176,7 +2616,12 @@ impl Store {
         // transient Running event between cancellation and that final update.
         tx.execute(
             "UPDATE tasks
-             SET status='running', question_blocked_run_id=NULL,
+             SET status=CASE WHEN EXISTS(
+                   SELECT 1 FROM task_continuations
+                    WHERE task_id=tasks.id AND ended_at IS NULL
+                      AND status IN ('action_required','failed')
+                 ) THEN 'blocked' ELSE 'running' END,
+                 question_blocked_run_id=NULL,
                  updated_at=MAX(?2, updated_at + 1)
              WHERE current_run_id=?1
                AND status='blocked'
@@ -2800,6 +3245,7 @@ mod tests {
             host_id: None,
             worktree_id: None,
             current_run_id: None,
+            active_continuation: None,
             pr_url: None,
             pr_state: None,
             review_action: None,
@@ -3077,6 +3523,217 @@ mod tests {
             .activate_task_run(&task.id, "next-run", None)
             .unwrap()
             .is_some());
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_continuation_keeps_the_task_running_and_is_consumed_by_its_wake_run() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+        let mut source = run("source", &task.id);
+        store.insert_run(&source, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &source.id, None)
+            .unwrap()
+            .unwrap();
+
+        let continuation = TaskContinuation {
+            id: "continuation".into(),
+            task_id: task.id.clone(),
+            run_id: source.id.clone(),
+            agent_id: source.agent_id.clone(),
+            command: "check-build".into(),
+            every_seconds: 20,
+            deadline_at: 100_000,
+            wake_prompt: "Finish the release".into(),
+            status: ContinuationStatus::Waiting,
+            summary: "Build is processing".into(),
+            next_check_at: 2,
+            created_at: 1,
+            updated_at: 1,
+            ended_at: None,
+        };
+        let registered = store
+            .register_task_continuation(&continuation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(registered.status, TaskStatus::Running);
+        assert_eq!(
+            registered
+                .active_continuation
+                .as_ref()
+                .map(|item| item.summary.as_str()),
+            Some("Build is processing")
+        );
+        assert!(store
+            .register_task_continuation(&continuation)
+            .unwrap()
+            .is_none());
+        // A delayed finalization from the registering run must not consume the
+        // obligation that run just handed to the relay.
+        assert!(store
+            .finalize_task_run_start(&task.id, &source.id, source.created_at)
+            .unwrap());
+        assert!(store
+            .task(&task.id)
+            .unwrap()
+            .unwrap()
+            .active_continuation
+            .is_some());
+
+        source.status = RunStatus::Cancelled;
+        source.ended_at = Some(2);
+        store.update_run(&source).unwrap();
+        drop(store);
+
+        // The run is gone and the relay process may restart; the obligation is
+        // still enough to recover the task as running and resume its checker.
+        let store = Store::open(&path).unwrap();
+        store.reconcile_task_lifecycle().unwrap();
+        let waiting = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(waiting.status, TaskStatus::Running);
+        assert!(waiting.current_run_id.is_none());
+
+        assert_eq!(store.claim_due_task_continuations(2).unwrap().len(), 1);
+        store
+            .apply_task_continuation_result(
+                &continuation.id,
+                ContinuationStatus::Waiting,
+                "Still processing",
+            )
+            .unwrap()
+            .unwrap();
+        let ready = store
+            .apply_task_continuation_result(
+                &continuation.id,
+                ContinuationStatus::Ready,
+                "Build is available",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready.active_continuation.as_ref().map(|item| item.status),
+            Some(ContinuationStatus::Ready)
+        );
+
+        let wake = run("wake", &task.id);
+        store.insert_run(&wake, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &wake.id, Some(TaskStatus::Running))
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .finalize_task_run_start(&task.id, &wake.id, wake.created_at)
+            .unwrap());
+        assert!(store
+            .task(&task.id)
+            .unwrap()
+            .unwrap()
+            .active_continuation
+            .is_none());
+        assert!(store
+            .apply_task_continuation_result(
+                &continuation.id,
+                ContinuationStatus::Failed,
+                "late output",
+            )
+            .unwrap()
+            .is_none());
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_continuation_deadline_becomes_a_named_blocker() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+        let source = run("source", &task.id);
+        store.insert_run(&source, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &source.id, None)
+            .unwrap()
+            .unwrap();
+        store
+            .register_task_continuation(&TaskContinuation {
+                id: "continuation".into(),
+                task_id: task.id.clone(),
+                run_id: source.id.clone(),
+                agent_id: source.agent_id.clone(),
+                command: "check".into(),
+                every_seconds: 20,
+                deadline_at: 2,
+                wake_prompt: "Continue".into(),
+                status: ContinuationStatus::Waiting,
+                summary: "Provider review is pending".into(),
+                next_check_at: 2,
+                created_at: 1,
+                updated_at: 1,
+                ended_at: None,
+            })
+            .unwrap()
+            .unwrap();
+
+        let expired = store.expire_task_continuations(2).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].status, TaskStatus::Blocked);
+        let blocker = expired[0].active_continuation.as_ref().unwrap();
+        assert_eq!(blocker.status, ContinuationStatus::ActionRequired);
+        assert_eq!(
+            blocker.summary,
+            "Deadline reached: Provider review is pending"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reconciliation_repoints_then_releases_cancelled_runs() {
+        let (store, path) = store();
+        store.insert_member(&human("human")).unwrap();
+        let task = idempotent_task("one", "PW-1");
+        store
+            .insert_task_with_channel(&task, &task_channel(&task))
+            .unwrap();
+        let mut peer = run("peer", &task.id);
+        let mut cancelled = run("cancelled", &task.id);
+        store.insert_run(&peer, 0).unwrap();
+        store.insert_run(&cancelled, 0).unwrap();
+        store
+            .activate_task_run(&task.id, &peer.id, None)
+            .unwrap()
+            .unwrap();
+        store
+            .activate_task_run(&task.id, &cancelled.id, None)
+            .unwrap()
+            .unwrap();
+        cancelled.status = RunStatus::Cancelled;
+        cancelled.ended_at = Some(2);
+        store.update_run(&cancelled).unwrap();
+
+        store.reconcile_task_lifecycle().unwrap();
+        let working = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(working.status, TaskStatus::Running);
+        assert_eq!(working.current_run_id.as_deref(), Some(peer.id.as_str()));
+
+        peer.status = RunStatus::Cancelled;
+        peer.ended_at = Some(3);
+        store.update_run(&peer).unwrap();
+        store.reconcile_task_lifecycle().unwrap();
+        let released = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(released.status, TaskStatus::Planned);
+        assert!(released.current_run_id.is_none());
 
         drop(store);
         let _ = std::fs::remove_file(path);

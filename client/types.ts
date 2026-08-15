@@ -155,6 +155,21 @@ export function isTerminalTaskStatus(status: TaskStatus): boolean {
   return status === "done" || status === "canceled";
 }
 
+export type ContinuationStatus =
+  | "waiting"
+  | "ready"
+  | "action_required"
+  | "failed";
+
+export interface TaskContinuationSummary {
+  id: Id;
+  status: ContinuationStatus;
+  summary: string;
+  next_check_at?: Millis;
+  deadline_at: Millis;
+  updated_at: Millis;
+}
+
 export interface PullRequestState {
   number: number;
   title: string;
@@ -180,6 +195,7 @@ export interface Task {
   host_id?: Id;
   worktree_id?: Id;
   current_run_id?: Id;
+  active_continuation?: TaskContinuationSummary;
   pr_url?: string;
   pr_state?: PullRequestState;
   /// Exact action the owning agent will take if a person approves this review.
@@ -291,7 +307,8 @@ export type RunTrigger =
   | { type: "manual"; by: Id }
   | { type: "automation"; automation_id: Id }
   | { type: "ambient"; message_id: Id }
-  | { type: "pull_request_feedback"; task_id: Id };
+  | { type: "pull_request_feedback"; task_id: Id }
+  | { type: "continuation"; continuation_id: Id };
 
 export interface Run {
   id: Id;

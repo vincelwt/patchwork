@@ -226,6 +226,15 @@ pub struct UpdateTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTaskContinuation {
+    pub command: String,
+    pub every_seconds: i64,
+    pub deadline_at: Millis,
+    pub wake_prompt: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDetail {
     pub task: Task,
     #[serde(default, skip_serializing_if = "Option::is_none")]
