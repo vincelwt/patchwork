@@ -164,6 +164,14 @@ export class Api {
     return this.post<Section>("/api/sections", { name });
   }
 
+  updateSection(id: Id, name: string) {
+    return this.patch<Section>(`/api/sections/${encodeURIComponent(id)}`, { name });
+  }
+
+  deleteSection(id: Id) {
+    return this.delete(`/api/sections/${encodeURIComponent(id)}`);
+  }
+
   sections() {
     return this.get<Section[]>("/api/sections");
   }

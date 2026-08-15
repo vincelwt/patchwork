@@ -206,6 +206,10 @@ pub fn router(state: Shared) -> Router {
         .route("/api/devices/{id}", delete(revoke_device))
         // channels and messages
         .route("/api/sections", get(list_sections).post(create_section))
+        .route(
+            "/api/sections/{id}",
+            patch(update_section).delete(delete_section),
+        )
         .route("/api/channels", get(list_channels).post(create_channel))
         .route(
             "/api/channels/{id}",
@@ -684,6 +688,60 @@ async fn create_section(
         sections: state.store.sections()?,
     });
     Ok(Json(section))
+}
+
+async fn update_section(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<NameInput>,
+) -> ApiResult<Json<Section>> {
+    caller.require_admin()?;
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a section needs a name"));
+    }
+    if !state.store.rename_section(&id, name)? {
+        return Err(ApiError::not_found("section not found"));
+    }
+    let sections = state.store.sections()?;
+    let section = sections
+        .iter()
+        .find(|section| section.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("section not found"))?;
+    state.emit(Event::SectionsUpdated { sections });
+    Ok(Json(section))
+}
+
+async fn delete_section(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<Ok>> {
+    caller.require_admin()?;
+    let affected: HashSet<_> = state
+        .store
+        .channels()?
+        .into_iter()
+        .filter(|channel| channel.section_id.as_deref() == Some(id.as_str()))
+        .map(|channel| channel.id)
+        .collect();
+    if !state.store.delete_section(&id)? {
+        return Err(ApiError::not_found("section not found"));
+    }
+    for channel in state
+        .store
+        .channels()?
+        .into_iter()
+        .filter(|channel| affected.contains(&channel.id))
+    {
+        state.emit(Event::ChannelUpdated { channel });
+    }
+    state.emit(Event::SectionsUpdated {
+        sections: state.store.sections()?,
+    });
+    Ok(Json(Ok::default()))
 }
 
 async fn list_channels(
@@ -4611,6 +4669,176 @@ mod tests {
         drop(store);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(files);
+    }
+
+    #[tokio::test]
+    async fn only_admins_manage_sections_and_deleting_one_keeps_its_channels() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let add_member = |id: &str, kind: MemberKind, is_admin: bool| {
+            store
+                .insert_member(&Member {
+                    id: id.into(),
+                    kind,
+                    handle: id.into(),
+                    display_name: id.into(),
+                    email: None,
+                    avatar: None,
+                    is_admin,
+                    created_at: 1,
+                    agent: (kind == MemberKind::Agent).then(AgentProfile::default),
+                    presence: Presence::Offline,
+                })
+                .unwrap();
+            let token = auth::generate_token();
+            store
+                .insert_token(
+                    &auth::hash_token(&token),
+                    id,
+                    if kind == MemberKind::Agent {
+                        "run"
+                    } else {
+                        "device"
+                    },
+                    None,
+                    None,
+                )
+                .unwrap();
+            token
+        };
+        let human_member = add_member("human-member", MemberKind::Human, false);
+        let agent_member = add_member("agent-member", MemberKind::Agent, false);
+        let human_admin = add_member("human-admin", MemberKind::Human, true);
+        let agent_admin = add_member("agent-admin", MemberKind::Agent, true);
+
+        for (position, id) in ["agent-section", "human-section"].into_iter().enumerate() {
+            store
+                .upsert_section(&Section {
+                    id: id.into(),
+                    name: id.into(),
+                    position: position as f64,
+                })
+                .unwrap();
+            store
+                .insert_channel(&Channel {
+                    id: format!("{id}-channel"),
+                    kind: ChannelKind::Channel,
+                    section_id: Some(id.into()),
+                    slug: format!("{id}-channel"),
+                    name: format!("{id}-channel"),
+                    topic: String::new(),
+                    position: position as f64,
+                    created_at: 1,
+                    member_ids: Vec::new(),
+                    task_id: None,
+                    last_message_at: 0,
+                })
+                .unwrap();
+        }
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let request = |method: &str, path: &str, token: &str, body: &str| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        for token in [&human_member, &agent_member] {
+            let response = router(state.clone())
+                .oneshot(request(
+                    "PATCH",
+                    "/api/sections/agent-section",
+                    token,
+                    r#"{"name":"Nope"}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+            let response = router(state.clone())
+                .oneshot(request("DELETE", "/api/sections/agent-section", token, ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+
+        let response = router(state.clone())
+            .oneshot(request(
+                "PATCH",
+                "/api/sections/agent-section",
+                &agent_admin,
+                r#"{"name":"   "}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        for (token, id, name) in [
+            (&agent_admin, "agent-section", "Agent renamed"),
+            (&human_admin, "human-section", "Human renamed"),
+        ] {
+            let response = router(state.clone())
+                .oneshot(request(
+                    "PATCH",
+                    &format!("/api/sections/{id}"),
+                    token,
+                    &format!(r#"{{"name":"{name}"}}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                store
+                    .sections()
+                    .unwrap()
+                    .into_iter()
+                    .find(|section| section.id == id)
+                    .unwrap()
+                    .name,
+                name
+            );
+
+            let response = router(state.clone())
+                .oneshot(request("DELETE", &format!("/api/sections/{id}"), token, ""))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert!(store
+                .sections()
+                .unwrap()
+                .into_iter()
+                .all(|section| section.id != id));
+        }
+
+        for id in ["agent-section-channel", "human-section-channel"] {
+            assert_eq!(store.channel(id).unwrap().unwrap().section_id, None);
+        }
+        let events = store.events_since(0, 20).unwrap();
+        for id in ["agent-section-channel", "human-section-channel"] {
+            assert!(events.iter().any(|envelope| matches!(
+                &envelope.event,
+                Event::ChannelUpdated { channel }
+                    if channel.id == id && channel.section_id.is_none()
+            )));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|envelope| matches!(envelope.event, Event::SectionsUpdated { .. }))
+                .count(),
+            4
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
