@@ -2908,6 +2908,15 @@ pub struct TaskCreation {
     pub created: bool,
 }
 
+fn should_start_task(
+    start: bool,
+    status: Option<TaskStatus>,
+    creator_is_agent: bool,
+    owner_is_agent: bool,
+) -> bool {
+    start || (status.is_none() && creator_is_agent && owner_is_agent)
+}
+
 /// Boxed: creating a task can fire an automation that creates a task.
 pub fn create_task<'a>(
     state: &'a Shared,
@@ -2940,6 +2949,19 @@ async fn create_task_inner(
             });
         }
     }
+
+    let creator_is_agent = state
+        .store
+        .member(creator_id)?
+        .is_some_and(|member| member.kind == MemberKind::Agent);
+    let owner_is_agent = match input.owner_id.as_deref() {
+        Some(owner_id) => state
+            .store
+            .member(owner_id)?
+            .is_some_and(|member| member.kind == MemberKind::Agent),
+        None => false,
+    };
+    let start = should_start_task(input.start, input.status, creator_is_agent, owner_is_agent);
 
     let key = state.store.next_task_key()?;
     let now = now_ms();
@@ -3086,7 +3108,7 @@ async fn create_task_inner(
 
     crate::automations::on_task_change(state, &task, None).await;
 
-    if input.start {
+    if start {
         if let Some(owner) = task.owner_id.clone() {
             if state.store.member(&owner)?.map(|m| m.kind) == Some(MemberKind::Agent) {
                 let params = StartRunParams {
@@ -3993,6 +4015,25 @@ mod tests {
         drop(state);
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_handoffs_start_unless_explicitly_planned() {
+        assert!(should_start_task(false, None, true, true));
+        assert!(should_start_task(
+            true,
+            Some(TaskStatus::Planned),
+            true,
+            true
+        ));
+        assert!(!should_start_task(
+            false,
+            Some(TaskStatus::Planned),
+            true,
+            true
+        ));
+        assert!(!should_start_task(false, None, false, true));
+        assert!(!should_start_task(false, None, true, false));
     }
 
     #[test]
