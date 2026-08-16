@@ -135,7 +135,12 @@ export class Api {
     return this.get<MessagePage>(`/api/channels/${channelId}/messages${query}`);
   }
 
-  send(channelId: Id, body: Partial<Message> & { attachment_ids?: Id[] }) {
+  /// `client_id` is optional and makes a send idempotent: a retry after a
+  /// timeout returns the message the first attempt stored instead of a second one.
+  send(
+    channelId: Id,
+    body: Partial<Message> & { attachment_ids?: Id[]; client_id?: Id },
+  ) {
     return this.post<Message>(`/api/channels/${channelId}/messages`, body);
   }
 

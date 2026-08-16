@@ -10,6 +10,7 @@ import {
 
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { outboxFor } from "@client/mobile-store-reducer";
 import type { Id, Message } from "@client/types";
 import { useDictation } from "@/lib/dictation";
 import { useKeyboardInset } from "@/lib/keyboard";
@@ -17,7 +18,7 @@ import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { PendingImages, useImageAttachments } from "./Attachment";
-import { Glass, Icon, Measured } from "./ui";
+import { Button, Glass, Icon, Measured } from "./ui";
 
 export function Composer({
   channelId,
@@ -57,8 +58,15 @@ export function Composer({
       .slice(0, 5);
   }, [members, text]);
   const dictation = useDictation((value) => store.setDraft(draftKey, value));
-  const offline = workspace.connection !== "live";
   const empty = !text.trim() && images.pending.length === 0;
+  // Only this conversation's unsent messages: a thread and its channel each
+  // report their own.
+  const queued = outboxFor(workspace, channelId, parentId);
+  const failed = queued.find((entry) => entry.status === "failed");
+  const pending = queued.filter((entry) => entry.status !== "failed");
+  const waiting = pending.length;
+  const saving = pending.some((entry) => entry.status === "saving");
+  const sending = pending.some((entry) => entry.status === "sending");
 
   useEffect(() => {
     if (replyTo) input.current?.focus();
@@ -77,26 +85,23 @@ export function Composer({
     change(text.replace(/@[\w-]*$/, `@${handle} `));
   };
 
+  /// The draft is only cleared once the message is durably queued, so a send
+  /// that cannot leave the phone yet still leaves the composer.
   const send = async () => {
-    if (empty || busy || images.uploading || offline) return;
+    if (empty || busy || !images.ready) return;
     setBusy(true);
     setError("");
     try {
-      await store.mutate(
-        (api) =>
-          api.send(channelId, {
-            body: text.trim(),
-            parent_id: parentId,
-            reply_to_id: replyTo?.id,
-            attachment_ids: images.pending.map((item) => item.attachment.id),
-          }),
-        false,
-      );
+      await store.queueMessage({
+        channelId,
+        parentId,
+        replyToId: replyTo?.id,
+        body: text.trim(),
+        attachmentIds: images.attachmentIds,
+      });
       store.setDraft(draftKey, "");
       images.clear();
       onCancelReply?.();
-      if (parentId) await store.loadThread(parentId);
-      else await store.loadMessages(channelId);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -147,15 +152,16 @@ export function Composer({
             </Pressable>
           </View>
         ) : null}
-        <PendingImages images={images.pending} onRemove={images.remove} />
         <View style={[styles.composer, { backgroundColor: theme.input, borderColor: theme.line }]}>
-
+          {/* Inside the capsule, so what is attached reads as part of what is
+              being written rather than as a strip floating above it. */}
+          <PendingImages images={images.pending} onRemove={images.remove} />
           <TextInput
             ref={input}
             accessibilityLabel={placeholder}
             multiline
             maxLength={32_000}
-            placeholder={offline ? "Reconnect to send" : placeholder}
+            placeholder={placeholder}
             placeholderTextColor={theme.faint}
             value={text}
             onChangeText={change}
@@ -185,13 +191,13 @@ export function Composer({
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Send"
-              disabled={empty || busy || images.uploading || offline}
+              disabled={empty || busy || !images.ready}
               onPress={() => void send()}
               style={({ pressed }) => [
                 styles.send,
                 { backgroundColor: theme.accent },
                 pressed && { opacity: 0.65 },
-                (empty || busy || images.uploading || offline) && { opacity: 0.35 },
+                (empty || busy || !images.ready) && { opacity: 0.35 },
               ]}
             >
               {busy || images.uploading ? (
@@ -202,6 +208,32 @@ export function Composer({
             </Pressable>
           </View>
         </View>
+        {/* What has happened to what was already sent, in one line under the
+            capsule: waiting to go out, or refused and needing a decision. */}
+        {failed || waiting ? (
+          <View accessibilityLiveRegion="polite" style={styles.status}>
+            <Text
+              numberOfLines={2}
+              style={[styles.statusText, { color: failed ? theme.danger : theme.muted }]}
+            >
+              {failed
+                ? `Not sent: ${failed.error || "the workspace refused this message"}`
+                : saving
+                  ? "Saving message…"
+                  : workspace.connection === "live"
+                    ? sending
+                      ? `Sending ${waiting === 1 ? "message" : `${waiting} messages`}…`
+                      : `${waiting === 1 ? "Message queued" : `${waiting} messages queued`} · retrying automatically`
+                    : `${waiting === 1 ? "1 message" : `${waiting} messages`} will send when you reconnect`}
+            </Text>
+            {failed ? (
+              <>
+                <Button label="Retry" compact tone="quiet" onPress={() => store.retryQueuedMessage(failed.id)} />
+                <Button label="Remove" compact tone="quiet" onPress={() => store.removeQueuedMessage(failed.id)} />
+              </>
+            ) : null}
+          </View>
+        ) : null}
         {error || images.error || dictation.error ? (
           <Text style={[styles.error, { color: theme.danger }]}>{error || images.error || dictation.error}</Text>
         ) : null}
@@ -223,5 +255,7 @@ const styles = StyleSheet.create({
   actions: { flexDirection: "row", alignItems: "center", marginTop: 4, gap: 4 },
   iconButton: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   send: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
+  status: { flexDirection: "row", alignItems: "center", gap: 6, minHeight: 30, marginTop: 3, paddingHorizontal: 4 },
+  statusText: { flex: 1, fontSize: 12 },
   error: { fontSize: 12, marginTop: 5, paddingHorizontal: 4 },
 });

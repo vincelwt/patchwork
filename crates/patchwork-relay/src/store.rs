@@ -119,9 +119,13 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN provider TEXT",
             "ALTER TABLE runs ADD COLUMN model TEXT",
             "ALTER TABLE runs ADD COLUMN thinking TEXT",
+            "ALTER TABLE messages ADD COLUMN client_id TEXT",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
             "CREATE INDEX IF NOT EXISTS automation_runs_once ON automation_runs(automation_id, once_key)",
+            // One message per sender, channel and client id: a retried send
+            // cannot be stored twice even if two attempts arrive at once.
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_client ON messages(author_id, channel_id, client_id) WHERE client_id IS NOT NULL",
         ] {
             let _ = conn.execute(statement, []);
         }
@@ -869,11 +873,18 @@ impl Store {
     }
 
     pub fn insert_message(&self, message: &Message) -> Result<()> {
+        self.insert_message_as(message, None)
+    }
+
+    /// `client_id` is the sender's own id for this message. It is not part of
+    /// the message anyone reads; it only lets a retry be recognised as the same
+    /// send through `message_by_client_id`.
+    pub fn insert_message_as(&self, message: &Message, client_id: Option<&str>) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, reply_to_id, run_id, task_id, mentions, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, reply_to_id, run_id, task_id, mentions, created_at, client_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 message.id,
                 message.channel_id,
@@ -892,6 +903,7 @@ impl Store {
                 message.task_id,
                 to_json(&message.mentions),
                 message.created_at,
+                client_id,
             ],
         )?;
         tx.execute(
@@ -935,6 +947,28 @@ impl Store {
                 self.hydrate_messages(std::slice::from_mut(&mut m))?;
                 Ok(Some(m))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// The message a sender already stored under this id in this channel, if any.
+    pub fn message_by_client_id(
+        &self,
+        author_id: &str,
+        channel_id: &str,
+        client_id: &str,
+    ) -> Result<Option<Message>> {
+        let conn = self.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM messages WHERE author_id = ?1 AND channel_id = ?2 AND client_id = ?3",
+                params![author_id, channel_id, client_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        drop(conn);
+        match id {
+            Some(id) => self.message(&id),
             None => Ok(None),
         }
     }

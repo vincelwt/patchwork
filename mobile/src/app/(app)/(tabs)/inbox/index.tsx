@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { SymbolViewProps } from "expo-symbols";
 
 import { groupInbox, unreadInboxCount } from "@client/inbox";
@@ -10,7 +11,7 @@ import { Conversation } from "@/components/Message";
 import { TaskDetail } from "@/components/TaskDetail";
 import { Avatar, Button, Empty, Icon, Measured, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { largeTitles, useLayout } from "@/lib/layout";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme, type Palette } from "@/lib/theme";
 
@@ -19,6 +20,7 @@ export default function InboxScreen() {
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
+  const insets = useSafeAreaInsets();
   const { split, gutter } = useLayout();
   const [selected, setSelected] = useState<string>();
   const groups = groupInbox(workspace.bootstrap?.inbox ?? []);
@@ -99,16 +101,33 @@ export default function InboxScreen() {
     );
   };
 
+  const inlineTitle = !split;
+  const readAll = unread
+    ? <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} />
+    : null;
+
   const list = (
     <FlatList
       contentInsetAdjustmentBehavior="automatic"
       data={groups}
       keyExtractor={(group) => group.key}
-      contentContainerStyle={groups.length ? styles.list : styles.emptyList}
+      // The first row carries the title, so nothing is centred under it.
+      contentContainerStyle={groups.length || inlineTitle ? styles.list : styles.emptyList}
       // One list, one column. Grouping each row into its own card is what a
       // phone on its side used to do, and it looked like scattered receipts.
       renderItem={split ? row : ({ item }) => <Measured>{row({ item })}</Measured>}
-      ListHeaderComponent={split ? <Text style={[styles.paneTitle, { color: theme.text }]}>Inbox</Text> : null}
+      ListHeaderComponent={
+        inlineTitle ? (
+          <Measured>
+            <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
+              <Text accessibilityRole="header" style={[styles.screenTitle, { color: theme.text }]}>Inbox</Text>
+              {readAll}
+            </View>
+          </Measured>
+        ) : (
+          <Text style={[styles.paneTitle, { color: theme.text }]}>Inbox</Text>
+        )
+      }
       ListEmptyComponent={<Empty title="Nothing needs you" detail="Mentions, questions, reviews, and failed automations appear here." />}
       refreshControl={<RefreshControl refreshing={workspace.connection === "connecting"} onRefresh={() => void store.refresh()} />}
       showsVerticalScrollIndicator={!split}
@@ -119,11 +138,11 @@ export default function InboxScreen() {
     <Screen style={{ backgroundColor: theme.surface }}>
       <Stack.Screen
         options={{
-          headerLargeTitle: largeTitles && !split,
-          headerTransparent: largeTitles && !split,
-          headerRight: unread
-            ? () => <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} />
-            : undefined,
+          // UIKit cannot place bar buttons beside a large title, so the phone
+          // draws that row itself and skips the otherwise-empty compact bar.
+          headerShown: !inlineTitle,
+          headerTransparent: false,
+          headerRight: inlineTitle || !readAll ? undefined : () => readAll,
         }}
       />
       {split ? (
@@ -186,6 +205,8 @@ function describe(kind: InboxKind, theme: Palette): {
 const styles = StyleSheet.create({
   list: { paddingBottom: 24 },
   emptyList: { flexGrow: 1, justifyContent: "center" },
+  titleRow: { minHeight: 64, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 8 },
+  screenTitle: { fontSize: 34, fontWeight: "700", letterSpacing: -0.8 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 360, borderRightWidth: StyleSheet.hairlineWidth },
   paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },

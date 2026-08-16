@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Channel, Id } from "@client/types";
 import { Conversation } from "@/components/Message";
@@ -15,6 +16,7 @@ export default function ChannelsScreen() {
   const store = useWorkspaceStore();
   const router = useRouter();
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const { split, gutter } = useLayout();
   const [newChannel, setNewChannel] = useState(false);
   const [newDm, setNewDm] = useState(false);
@@ -112,7 +114,7 @@ export default function ChannelsScreen() {
       ) : (
         <Measured>
           {inlineTitle ? (
-            <View style={styles.titleRow}>
+            <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
               <Text accessibilityRole="header" style={[styles.title, { color: theme.text }]}>Chat</Text>
               <Glass interactive radius={24} style={styles.inlineActions}>{actions}</Glass>
             </View>
@@ -284,7 +286,7 @@ function ChannelRow({ channel, active, onPress }: { channel: Channel; active?: b
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  titleRow: { minHeight: 64, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 8 },
+  titleRow: { minHeight: 64, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 8 },
   title: { fontSize: 34, fontWeight: "700", letterSpacing: -0.8 },
   actions: { flexDirection: "row", alignItems: "center" },
   action: { width: 36, height: 44, alignItems: "center", justifyContent: "center" },
