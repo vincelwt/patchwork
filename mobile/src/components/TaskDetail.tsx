@@ -65,13 +65,12 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
     setBusy(true);
     setError("");
     try {
+      // Starting a run leaves the reader on the task. The run is one press away
+      // under "Run details"; being taken there is not the same as asking to go.
       await store.mutate(
         (api) => api.runTask(task.id, { agent_id: agentId }),
         true,
-        (run) => {
-          setAgents(false);
-          router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } });
-        },
+        () => setAgents(false),
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -84,11 +83,7 @@ export function TaskDetail({ taskId, embedded }: { taskId: string; embedded?: bo
     setBusy(true);
     setError("");
     try {
-      await store.mutate(
-        (api) => api.approveTask(task.id),
-        true,
-        (run) => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.id } }),
-      );
+      await store.mutate((api) => api.approveTask(task.id), true);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

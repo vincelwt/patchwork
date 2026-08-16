@@ -133,12 +133,12 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
   const images = useImageAttachments(taskId);
   const dictation = useDictation(setText);
   const send = async (mode: "queue" | "interrupt") => {
-    if ((!text.trim() && !images.pending.length) || busy) return;
+    if ((!text.trim() && !images.pending.length) || busy || !images.ready) return;
     setBusy(true);
     setError("");
     try {
       await store.mutate(
-        (api) => api.steerRun(runId, { prompt: text.trim(), mode, attachment_ids: images.pending.map((item) => item.attachment.id) }),
+        (api) => api.steerRun(runId, { prompt: text.trim(), mode, attachment_ids: images.attachmentIds }),
         false,
       );
       setText("");
@@ -154,8 +154,9 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
     <View style={[styles.steer, { borderTopColor: theme.line, backgroundColor: theme.bg, paddingBottom: 10 + insets.bottom + keyboard }]}>
      <Measured>
       <Text style={[styles.steerTarget, { color: theme.muted }]}>Straight to {agentName} in this run</Text>
-      <PendingImages images={images.pending} onRemove={images.remove} />
       <View style={[styles.steerBox, { backgroundColor: theme.input, borderColor: theme.line }]}>
+        {/* Inside the box: what is attached belongs to what is being written. */}
+        <PendingImages images={images.pending} onRemove={images.remove} />
         <TextInput
           multiline
           value={text}
@@ -168,8 +169,8 @@ function RunSteer({ runId, taskId, agentName }: { runId: string; taskId?: string
           <Button label="Image" compact tone="quiet" onPress={() => void images.pick()} />
           {dictation.supported ? <Button label={dictation.recording ? "Stop mic" : "Dictate"} compact tone="quiet" onPress={() => (dictation.recording ? dictation.stop() : void dictation.start(text))} /> : null}
           <View style={styles.grow} />
-          <Button label="Interrupt" compact tone="secondary" disabled={workspace.connection !== "live"} onPress={() => void send("interrupt")} />
-          <Button label="Queue" compact busy={busy} disabled={workspace.connection !== "live"} onPress={() => void send("queue")} />
+          <Button label="Interrupt" compact tone="secondary" disabled={workspace.connection !== "live" || !images.ready} onPress={() => void send("interrupt")} />
+          <Button label="Queue" compact busy={busy} disabled={workspace.connection !== "live" || !images.ready} onPress={() => void send("queue")} />
         </View>
       </View>
       <ErrorNotice message={error || images.error || dictation.error} />

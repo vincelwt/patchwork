@@ -17,10 +17,16 @@ import { Api, ApiError } from "@client/api";
 import {
   applyBootstrap,
   applyEnvelope,
+  dropOutbox,
   emptyWorkspaceData,
   fromCache,
+  nextOutbox,
+  patchOutbox,
+  queueOutbox,
+  retryableFailure,
   toCache,
   touchChannel,
+  type OutboxMessage,
   type WorkspaceData,
 } from "@client/mobile-store-reducer";
 import { REALTIME_HEARTBEAT, REALTIME_HEARTBEAT_MS } from "@client/types";
@@ -64,6 +70,8 @@ export class MobileWorkspaceStore {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private cacheTimer?: ReturnType<typeof setTimeout>;
+  private flushTimer?: ReturnType<typeof setTimeout>;
+  private flushing = false;
   private cacheWrite: Promise<void> = Promise.resolve();
   private localCleanup: Promise<void> = Promise.resolve();
   private retryDelay = 1_000;
@@ -266,6 +274,134 @@ export class MobileWorkspaceStore {
     this.socket.send(JSON.stringify({ t: "typing", channel_id: channelId }));
   }
 
+  /// A message is accepted here rather than at the relay: it is written to
+  /// local state and to the cache before this resolves, so pressing send with
+  /// no signal, or quitting straight afterwards, cannot lose what was written.
+  async queueMessage(input: {
+    channelId: Id;
+    parentId?: Id;
+    replyToId?: Id;
+    body: string;
+    attachmentIds?: Id[];
+  }): Promise<void> {
+    const entry: OutboxMessage = {
+      id: Crypto.randomUUID(),
+      channelId: input.channelId,
+      parentId: input.parentId,
+      replyToId: input.replyToId,
+      body: input.body,
+      attachmentIds: input.attachmentIds ?? [],
+      createdAt: Date.now(),
+      status: "saving",
+      attempts: 0,
+    };
+    this.replaceData(queueOutbox(this.snapshot, entry));
+    this.clearCacheTimer();
+    try {
+      await this.persistNow(true);
+    } catch {
+      this.replaceData(dropOutbox(this.snapshot, entry.id));
+      this.scheduleCache();
+      throw new Error("This message could not be saved for retry.");
+    }
+    this.replaceData(patchOutbox(this.snapshot, entry.id, { status: "queued" }));
+    void this.flushOutbox();
+  }
+
+  retryQueuedMessage(id: Id) {
+    this.replaceData(
+      patchOutbox(this.snapshot, id, { status: "queued", attempts: 0, error: undefined }),
+    );
+    this.clearCacheTimer();
+    void this.persistNow();
+    void this.flushOutbox();
+  }
+
+  removeQueuedMessage(id: Id) {
+    this.replaceData(dropOutbox(this.snapshot, id));
+    this.clearCacheTimer();
+    void this.persistNow();
+  }
+
+  /// One message at a time, oldest first, so a conversation arrives in the
+  /// order it was written. A failure worth retrying leaves the message queued
+  /// and stops the pass; the timer or the next connection picks it up again.
+  private async flushOutbox(): Promise<void> {
+    if (this.flushing) return;
+    this.clearFlushTimer();
+    const api = this.api;
+    if (!api || !this.canConnect()) return;
+    this.flushing = true;
+    try {
+      for (;;) {
+        const entry = nextOutbox(this.snapshot);
+        if (!entry || this.api !== api || !this.canConnect()) return;
+        this.replaceData(
+          patchOutbox(this.snapshot, entry.id, { status: "sending", error: undefined }),
+        );
+        try {
+          const message = await this.request(() =>
+            api.send(entry.channelId, {
+              body: entry.body,
+              parent_id: entry.parentId,
+              reply_to_id: entry.replyToId,
+              attachment_ids: entry.attachmentIds,
+              client_id: entry.id,
+            }),
+          );
+          if (this.api !== api) return;
+          const withoutEntry = dropOutbox(this.snapshot, entry.id);
+          // An unopened thread is refreshed when opened. Applying its HTTP
+          // response here as well as its realtime event would count the reply
+          // twice without retaining the reply anywhere to dedupe it.
+          this.replaceData(
+            entry.parentId && !withoutEntry.threads[entry.parentId]
+              ? withoutEntry
+              : applyEnvelope(withoutEntry, {
+                  seq: 0,
+                  at: message.created_at,
+                  kind: "message_created",
+                  message,
+                }),
+          );
+          this.clearCacheTimer();
+          void this.persistNow();
+        } catch (error) {
+          if (this.api !== api) return;
+          const status = error instanceof ApiError ? error.status : undefined;
+          const attempts = entry.attempts + 1;
+          this.replaceData(
+            patchOutbox(this.snapshot, entry.id, {
+              status: retryableFailure(status) ? "queued" : "failed",
+              attempts,
+              error: messageOf(error),
+            }),
+          );
+          this.clearCacheTimer();
+          void this.persistNow();
+          if (!retryableFailure(status)) continue;
+          this.scheduleFlush(Math.min(30_000, 1_000 * 2 ** Math.min(attempts, 5)));
+          return;
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  private scheduleFlush(delay: number) {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      void this.flushOutbox();
+    }, delay);
+  }
+
+  private clearFlushTimer() {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+  }
+
   async mutate<T>(
     operation: (api: Api) => Promise<T>,
     refresh = true,
@@ -383,6 +519,7 @@ export class MobileWorkspaceStore {
       }, REALTIME_HEARTBEAT_MS);
       this.retryDelay = 1_000;
       this.patch({ connection: "live", error: undefined });
+      void this.flushOutbox();
     };
     socket.onmessage = ({ data }) => {
       if (!this.isCurrent(generation, attempt) || socket !== this.socket) return;
@@ -503,6 +640,7 @@ export class MobileWorkspaceStore {
     ++this.attempt;
     this.connecting = undefined;
     this.clearReconnect();
+    this.clearFlushTimer();
     this.closeSocket();
   }
 
@@ -541,17 +679,22 @@ export class MobileWorkspaceStore {
     this.cacheTimer = undefined;
   }
 
-  private async persistNow() {
+  private async persistNow(required = false) {
     const cacheKey = this.cacheKey;
-    if (!cacheKey) return;
     const cache = toCache(this.snapshot, this.snapshot.lastSyncAt);
-    if (!cache) return;
+    if (!cacheKey || !cache) {
+      if (required) throw new Error("The workspace cache is not ready.");
+      return;
+    }
     const raw = JSON.stringify(cache);
-    if (raw.length > MAX_CACHE_CHARS) return;
-    this.cacheWrite = this.cacheWrite
-      .then(() => AsyncStorage.setItem(cacheKey, raw))
-      .catch(() => undefined);
-    await this.cacheWrite;
+    if (raw.length > MAX_CACHE_CHARS) {
+      if (required) throw new Error("The workspace cache is full.");
+      return;
+    }
+    const write = this.cacheWrite.then(() => AsyncStorage.setItem(cacheKey, raw));
+    this.cacheWrite = write.catch(() => undefined);
+    if (required) await write;
+    else await this.cacheWrite;
   }
 
   private async cacheKeyFor(session: PairedSession) {

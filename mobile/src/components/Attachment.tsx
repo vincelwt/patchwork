@@ -14,8 +14,10 @@ import { ErrorNotice, Sheet } from "./ui";
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 export interface PendingImage {
-  attachment: Attachment;
+  id: Id;
+  attachment?: Attachment;
   localUri: string;
+  fileName: string;
 }
 
 async function uploadImage(
@@ -69,14 +71,9 @@ async function uploadImage(
 
   const form = new FormData();
   if (taskId) form.append("task_id", taskId);
-  form.append(
-    "file",
-    {
-      uri: asset.uri,
-      name,
-      type: asset.mimeType || "image/jpeg",
-    } as unknown as Blob,
-  );
+  // Expo's standards-based fetch cannot serialize React Native's `{ uri }`
+  // FormData extension. A real Blob works in both the native and Expo fetches.
+  form.append("file", await (await fetch(asset.uri)).blob(), name);
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/api/files`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
@@ -107,14 +104,30 @@ export function useImageAttachments(taskId?: Id) {
       selectionLimit: 8,
     });
     if (result.canceled) return;
+    const selected = result.assets.map((asset, index) => ({
+      id: `${Date.now()}-${index}`,
+      asset,
+      localUri: asset.uri,
+      fileName: asset.fileName || "Image",
+    }));
+    // Show the local image immediately. Uploading is transport state, not a
+    // reason to hide what the person just attached.
+    setPending((current) => [
+      ...current,
+      ...selected.map(({ id, localUri, fileName }) => ({ id, localUri, fileName })),
+    ]);
     setUploading(true);
     try {
-      for (const asset of result.assets) {
-        const attachment = await uploadImage(session.baseUrl, session.token, asset, taskId);
-        setPending((current) => [...current, { attachment, localUri: asset.uri }]);
+      for (const item of selected) {
+        try {
+          const attachment = await uploadImage(session.baseUrl, session.token, item.asset, taskId);
+          setPending((current) => current.map((pending) =>
+            pending.id === item.id ? { ...pending, attachment } : pending,
+          ));
+        } catch (caught) {
+          setError(caught instanceof Error ? caught.message : String(caught));
+        }
       }
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setUploading(false);
     }
@@ -124,9 +137,17 @@ export function useImageAttachments(taskId?: Id) {
     pending,
     uploading,
     error,
+    ready: pending.every((item) => !!item.attachment),
+    attachmentIds: pending.flatMap((item) => item.attachment ? [item.attachment.id] : []),
     pick,
-    remove: (id: Id) => setPending((current) => current.filter((item) => item.attachment.id !== id)),
-    clear: () => setPending([]),
+    remove: (id: Id) => {
+      setPending((current) => current.filter((item) => item.id !== id));
+      setError("");
+    },
+    clear: () => {
+      setPending([]);
+      setError("");
+    },
   };
 }
 
@@ -141,13 +162,13 @@ export function PendingImages({
   if (!images.length) return null;
   return (
     <View style={styles.pending}>
-      {images.map(({ attachment, localUri }) => (
-        <View key={attachment.id} style={[styles.thumbWrap, { borderColor: theme.line }]}>
+      {images.map(({ id, localUri, fileName }) => (
+        <View key={id} style={[styles.thumbWrap, { borderColor: theme.line }]}>
           <Image source={localUri} style={styles.thumb} contentFit="cover" />
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel={`Remove ${attachment.file_name}`}
-            onPress={() => onRemove(attachment.id)}
+            accessibilityLabel={`Remove ${fileName}`}
+            onPress={() => onRemove(id)}
             style={[styles.remove, { backgroundColor: theme.danger }]}
           >
             <Text style={{ color: "white", fontWeight: "700" }}>×</Text>

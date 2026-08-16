@@ -31,7 +31,7 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
 
   const ownerMember = data.members.find((member) => member.id === owner);
   const save = async () => {
-    if (!outcome.trim() && !title.trim()) return;
+    if ((!outcome.trim() && !title.trim()) || !images.ready) return;
     setBusy(true);
     setError("");
     try {
@@ -51,7 +51,7 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
               owner_id: owner || undefined,
               project_id: project || undefined,
               due_at: due?.getTime() || undefined,
-              attachment_ids: images.pending.map((item) => item.attachment.id),
+              attachment_ids: images.attachmentIds,
               start: start && ownerMember?.kind === "agent",
             }),
         true,
@@ -136,7 +136,7 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
       <Button
         label={task ? "Save task" : "Create task"}
         busy={busy}
-        disabled={(!outcome.trim() && !title.trim()) || images.uploading}
+        disabled={(!outcome.trim() && !title.trim()) || !images.ready}
         onPress={() => void save()}
       />
     </ScrollView>

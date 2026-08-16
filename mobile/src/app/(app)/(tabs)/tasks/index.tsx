@@ -1,14 +1,15 @@
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Id, Member, Task, TaskStatus } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
 import { TaskEditor } from "@/components/TaskEditor";
 import { PullRequestLink } from "@/components/pull-request-link";
-import { Avatar, Badge, ChoiceField, Empty, Icon, Measured, Sheet } from "@/components/ui";
+import { Avatar, Badge, ChoiceField, Empty, Glass, Icon, Measured, Sheet } from "@/components/ui";
 import { relative, taskStatusLabel } from "@/lib/format";
-import { largeTitles, useLayout } from "@/lib/layout";
+import { useLayout } from "@/lib/layout";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 import { TaskDetail } from "@/components/TaskDetail";
@@ -17,6 +18,7 @@ export default function TasksScreen() {
   const theme = useTheme();
   const router = useRouter();
   const workspace = useWorkspace();
+  const insets = useSafeAreaInsets();
   const { split } = useLayout();
   const data = workspace.bootstrap;
   const [creating, setCreating] = useState(false);
@@ -35,6 +37,15 @@ export default function TasksScreen() {
 
   const open = (task: Task) =>
     split ? setSelected(task.id) : router.push({ pathname: "/tasks/[taskId]", params: { taskId: task.id } });
+
+  const inlineTitle = !split;
+  const actions = (
+    <View style={styles.actions}>
+      <Pressable accessibilityRole="button" accessibilityLabel="New task" hitSlop={8} style={styles.action} onPress={() => setCreating(true)}>
+        <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />
+      </Pressable>
+    </View>
+  );
 
   const groups = (
     <>
@@ -88,7 +99,15 @@ export default function TasksScreen() {
           {groups}
         </>
       ) : (
-        <Measured>{groups}</Measured>
+        <Measured>
+          {inlineTitle ? (
+            <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
+              <Text accessibilityRole="header" style={[styles.screenTitle, { color: theme.text }]}>Tasks</Text>
+              <Glass interactive radius={24} style={styles.inlineActions}>{actions}</Glass>
+            </View>
+          ) : null}
+          {groups}
+        </Measured>
       )}
     </ScrollView>
   );
@@ -97,15 +116,11 @@ export default function TasksScreen() {
     <View style={[styles.fill, { backgroundColor: theme.surface }]}>
       <Stack.Screen
         options={{
-          // Beside a detail pane the bar stays opaque, so neither column slides
-          // under it and no column has to guess the bar's height.
-          headerLargeTitle: largeTitles && !split,
-          headerTransparent: largeTitles && !split,
-          headerRight: () => (
-            <Pressable accessibilityRole="button" accessibilityLabel="New task" hitSlop={8} onPress={() => setCreating(true)}>
-              <Icon name={{ ios: "plus", android: "add", web: "add" }} color={theme.accent} size={23} />
-            </Pressable>
-          ),
+          // UIKit cannot place bar buttons beside a large title, so the phone
+          // draws that row itself and skips the otherwise-empty compact bar.
+          headerShown: !inlineTitle,
+          headerTransparent: false,
+          headerRight: inlineTitle ? undefined : () => actions,
         }}
       />
       {split ? (
@@ -190,6 +205,11 @@ function statusTone(status: TaskStatus): "neutral" | "accent" | "positive" | "ca
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
+  titleRow: { minHeight: 64, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingBottom: 8 },
+  screenTitle: { fontSize: 34, fontWeight: "700", letterSpacing: -0.8 },
+  actions: { flexDirection: "row", alignItems: "center" },
+  action: { width: 36, height: 44, alignItems: "center", justifyContent: "center" },
+  inlineActions: { height: 48, justifyContent: "center", paddingHorizontal: 4 },
   split: { flex: 1, flexDirection: "row" },
   pane: { width: 360, borderRightWidth: StyleSheet.hairlineWidth },
   paneTitle: { fontSize: 26, fontWeight: "700", letterSpacing: -0.6, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 8 },

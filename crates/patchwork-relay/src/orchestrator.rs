@@ -67,6 +67,7 @@ async fn post_message_inner(
     input: SendMessage,
     options: PostOptions,
 ) -> Result<Message> {
+    let client_id = input.client_id.as_deref();
     let channel = state
         .store
         .channel(channel_id)?
@@ -118,7 +119,9 @@ async fn post_message_inner(
         }
     }
 
-    state.store.insert_message(&message)?;
+    // Two attempts racing here is the unique index's job: the loser fails, and
+    // its next retry is answered from the existing message by the API.
+    state.store.insert_message_as(&message, client_id)?;
     let stored = state
         .store
         .message(&message.id)?

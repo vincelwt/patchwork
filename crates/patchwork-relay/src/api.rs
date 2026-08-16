@@ -953,7 +953,23 @@ async fn send_message(
     if input.body.trim().is_empty() && input.card.is_none() && input.attachment_ids.is_empty() {
         return Err(ApiError::bad_request("nothing to post"));
     }
+    if input
+        .client_id
+        .as_deref()
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+    {
+        return Err(ApiError::bad_request("client_id must be a UUID"));
+    }
     require_channel_access(&state, &caller, &id)?;
+    if let Some(client_id) = &input.client_id {
+        if let Some(existing) =
+            state
+                .store
+                .message_by_client_id(&caller.member.id, &id, client_id)?
+        {
+            return Ok(Json(existing));
+        }
+    }
     if input.parent_id.is_some() && input.reply_to_id.is_some() {
         return Err(ApiError::bad_request(
             "a message cannot be both an inline reply and a thread reply",
@@ -3550,7 +3566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inline_replies_reject_threads_and_other_conversations() {
+    async fn message_sends_validate_replies_and_dedupe_client_retries() {
         let path = std::env::temp_dir().join(format!("patchwork-api-reply-{}.sqlite", new_id()));
         let store = crate::store::Store::open(&path).unwrap();
         let human = Member {
@@ -3634,7 +3650,7 @@ mod tests {
         assert_eq!(both.status, axum::http::StatusCode::BAD_REQUEST);
 
         let cross_channel = send_message(
-            State(state),
+            State(state.clone()),
             caller(),
             Path("one".into()),
             Json(SendMessage {
@@ -3646,6 +3662,34 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(cross_channel.status, axum::http::StatusCode::BAD_REQUEST);
+
+        let client_id = new_id();
+        let Json(first) = send_message(
+            State(state.clone()),
+            caller(),
+            Path("one".into()),
+            Json(SendMessage {
+                body: "Retry me".into(),
+                client_id: Some(client_id.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(retried) = send_message(
+            State(state),
+            caller(),
+            Path("one".into()),
+            Json(SendMessage {
+                body: "Retry me".into(),
+                client_id: Some(client_id),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.id, first.id);
+        assert_eq!(store.messages("one", None, 50).unwrap().0.len(), 1);
 
         drop(store);
         let _ = std::fs::remove_file(path);

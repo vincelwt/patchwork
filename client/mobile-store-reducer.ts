@@ -5,12 +5,29 @@ import type {
   Event,
   Id,
   Message,
+  Millis,
   RunDetail,
   Worktree,
 } from "./types";
 
 export const MAX_CACHED_CHANNELS = 8;
 export const MAX_CACHED_MESSAGES = 60;
+
+/// A message the phone took responsibility for before the relay had it: sent
+/// while offline, or sent and not answered. `id` is also the idempotency key
+/// the relay dedupes on, so retrying an ambiguous timeout cannot post twice.
+export interface OutboxMessage {
+  id: Id;
+  channelId: Id;
+  parentId?: Id;
+  replyToId?: Id;
+  body: string;
+  attachmentIds: Id[];
+  createdAt: Millis;
+  status: "saving" | "queued" | "sending" | "failed";
+  attempts: number;
+  error?: string;
+}
 
 export interface WorkspaceData {
   bootstrap?: Bootstrap;
@@ -24,6 +41,7 @@ export interface WorkspaceData {
   typing: Record<Id, Record<Id, number>>;
   drafts: Record<Id, string>;
   recentChannels: Id[];
+  outbox: OutboxMessage[];
 }
 
 export interface WorkspaceCache {
@@ -34,7 +52,56 @@ export interface WorkspaceCache {
   hasMore: Record<Id, boolean>;
   drafts: Record<Id, string>;
   recentChannels: Id[];
+  outbox?: OutboxMessage[];
   lastSyncAt?: number;
+}
+
+export function queueOutbox(
+  state: WorkspaceData,
+  entry: OutboxMessage,
+): WorkspaceData {
+  return { ...state, outbox: [...state.outbox, entry] };
+}
+
+export function patchOutbox(
+  state: WorkspaceData,
+  id: Id,
+  patch: Partial<OutboxMessage>,
+): WorkspaceData {
+  return {
+    ...state,
+    outbox: state.outbox.map((entry) =>
+      entry.id === id ? { ...entry, ...patch } : entry,
+    ),
+  };
+}
+
+export function dropOutbox(state: WorkspaceData, id: Id): WorkspaceData {
+  return { ...state, outbox: state.outbox.filter((entry) => entry.id !== id) };
+}
+
+/// Oldest queued first, so a conversation arrives in the order it was written.
+/// A message still being saved or one the relay refused is not ready to send.
+export function nextOutbox(state: WorkspaceData): OutboxMessage | undefined {
+  return state.outbox.find((entry) => entry.status === "queued");
+}
+
+/// Which composer a queued message belongs to: its channel, and its thread.
+export function outboxFor(
+  state: WorkspaceData,
+  channelId: Id,
+  parentId?: Id,
+): OutboxMessage[] {
+  return state.outbox.filter(
+    (entry) => entry.channelId === channelId && entry.parentId === parentId,
+  );
+}
+
+/// A send that may still succeed: no answer at all, a timeout, a rate limit, or
+/// the relay having a bad moment. Anything else was refused on purpose and
+/// retrying it forever would only hide the refusal.
+export function retryableFailure(status?: number): boolean {
+  return status === undefined || status === 408 || status === 429 || status >= 500;
 }
 
 export function emptyWorkspaceData(): WorkspaceData {
@@ -49,6 +116,7 @@ export function emptyWorkspaceData(): WorkspaceData {
     typing: {},
     drafts: {},
     recentChannels: [],
+    outbox: [],
   };
 }
 
@@ -358,6 +426,7 @@ export function toCache(
     hasMore,
     drafts: state.drafts,
     recentChannels,
+    outbox: state.outbox,
     lastSyncAt,
   };
 }
@@ -391,9 +460,39 @@ export function fromCache(value: unknown): {
       ),
       drafts: value.drafts,
       recentChannels,
+      // A send that was in flight when the app went away has an unknown fate;
+      // it is queued again, and its client id keeps the relay from storing it
+      // twice if the first attempt did land.
+      outbox: (Array.isArray(value.outbox) ? value.outbox : [])
+        .filter(isOutboxMessage)
+        .map((entry) => ({
+          id: entry.id,
+          channelId: entry.channelId,
+          parentId: typeof entry.parentId === "string" ? entry.parentId : undefined,
+          replyToId: typeof entry.replyToId === "string" ? entry.replyToId : undefined,
+          body: entry.body,
+          attachmentIds: entry.attachmentIds.filter(
+            (id): id is Id => typeof id === "string",
+          ),
+          createdAt: typeof entry.createdAt === "number" ? entry.createdAt : 0,
+          attempts: typeof entry.attempts === "number" ? entry.attempts : 0,
+          status: entry.status === "failed" ? ("failed" as const) : ("queued" as const),
+          error: typeof entry.error === "string" ? entry.error : undefined,
+        })),
     },
     lastSyncAt: value.lastSyncAt,
   };
+}
+
+function isOutboxMessage(value: unknown): value is OutboxMessage {
+  const entry = value as Partial<OutboxMessage> | null;
+  return (
+    !!entry &&
+    typeof entry.id === "string" &&
+    typeof entry.channelId === "string" &&
+    typeof entry.body === "string" &&
+    Array.isArray(entry.attachmentIds)
+  );
 }
 
 function isCache(value: unknown): value is WorkspaceCache {
@@ -426,6 +525,7 @@ function withMessage(
 ): WorkspaceData {
   if (message.parent_id) {
     const thread = state.threads[message.parent_id];
+    const alreadyPresent = thread?.some((item) => item.id === message.id) ?? false;
     const list = state.messages[message.channel_id];
     return {
       ...state,
@@ -440,7 +540,7 @@ function withMessage(
               item.id === message.parent_id
                 ? {
                     ...item,
-                    reply_count: item.reply_count + (replaceOnly ? 0 : 1),
+                    reply_count: item.reply_count + (replaceOnly || alreadyPresent ? 0 : 1),
                     last_reply_at: Math.max(item.last_reply_at, message.created_at),
                   }
                 : item,
