@@ -1,4 +1,4 @@
-import type { Member, Millis, RunStatus, TaskStatus } from "@client/types";
+import type { Automation, Member, Millis, RunStatus, TaskStatus } from "@client/types";
 
 // Locale formatting is the expensive part of drawing a transcript: every
 // message carries a time, and a channel's day markers are recomputed whenever
@@ -171,6 +171,46 @@ export function pullRequestStatus(state?: string, checks?: string): string {
 
 export function pullRequestTone(state?: string, checks?: string): string {
   return PULL_REQUEST_TONES[pullRequestStatus(state, checks)] ?? "";
+}
+
+/// Only a successful command test writes this timestamp.
+export function watchValidated(automation: Automation) {
+  return automation.last_validated_at !== undefined;
+}
+
+/// The relay refuses to enable a watch whose current command has not passed a
+/// test, so a new watch and an edited command both have to be tested first.
+export function watchNeedsTest(
+  automation: Automation | undefined | null,
+  trigger: { type: string; command?: string },
+) {
+  if (trigger.type !== "watch") return false;
+  return !(
+    automation?.trigger.type === "watch" &&
+    automation.trigger.command === trigger.command &&
+    watchValidated(automation)
+  );
+}
+
+/// What a watch is worth relies on its last successful check, not its last
+/// attempt: a command that has been failing all week still has a fresh
+/// `last_run_at`, which is exactly how a dead watch looks healthy.
+export function watchHealth(automation: Automation): { tone: string; text: string } {
+  const failures = automation.failure_count;
+  if (failures > 0) {
+    const when = automation.last_error_at ? ` · ${relative(automation.last_error_at)}` : "";
+    return {
+      tone: "danger",
+      text: `${failures} failed check${failures === 1 ? "" : "s"}${when}`,
+    };
+  }
+  if (automation.last_success_at) {
+    return { tone: "positive", text: `checked ${relative(automation.last_success_at)}` };
+  }
+  return {
+    tone: "caution",
+    text: watchValidated(automation) ? "validated, no check yet" : "never tested",
+  };
 }
 
 export function statusTone(status: TaskStatus | RunStatus): string {

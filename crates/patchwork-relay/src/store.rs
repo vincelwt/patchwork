@@ -120,6 +120,16 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN model TEXT",
             "ALTER TABLE runs ADD COLUMN thinking TEXT",
             "ALTER TABLE messages ADD COLUMN client_id TEXT",
+            "ALTER TABLE automations ADD COLUMN last_success_at INTEGER",
+            "ALTER TABLE automations ADD COLUMN last_error_at INTEGER",
+            "ALTER TABLE automations ADD COLUMN last_error TEXT",
+            "ALTER TABLE automations ADD COLUMN failure_notification_key TEXT",
+            "ALTER TABLE automations ADD COLUMN execution_failure_notification_key TEXT",
+            // Existing watches have never passed the new command test. Pause
+            // them once so every transition to enabled uses the same contract.
+            "ALTER TABLE automations ADD COLUMN last_validated_at INTEGER DEFAULT 0",
+            "UPDATE automations SET enabled = 0, next_run_at = NULL WHERE last_validated_at = 0 AND json_extract(trigger, '$.type') = 'watch'",
+            "UPDATE automations SET last_validated_at = NULL WHERE last_validated_at = 0",
             // After the column, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
             "CREATE INDEX IF NOT EXISTS automation_runs_once ON automation_runs(automation_id, once_key)",
@@ -2859,6 +2869,10 @@ impl Store {
             created_at: row.get("created_at")?,
             last_run_at: row.get("last_run_at")?,
             next_run_at: row.get("next_run_at")?,
+            last_success_at: row.get("last_success_at")?,
+            last_error_at: row.get("last_error_at")?,
+            last_error: row.get("last_error")?,
+            last_validated_at: row.get("last_validated_at")?,
             failure_count: row.get("failure_count")?,
         })
     }
@@ -2867,12 +2881,15 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO automations (id, name, description, enabled, trigger, agent_id, action, instructions,
                                       context_channel_id, report_channel_id, project_id, location, host_id,
-                                      created_by, created_at, last_run_at, next_run_at, failure_count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                                      created_by, created_at, last_run_at, next_run_at, last_success_at,
+                                      last_error_at, last_error, last_validated_at, failure_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
              ON CONFLICT(id) DO UPDATE SET name=?2, description=?3, enabled=?4, trigger=?5, agent_id=?6,
                                            action=?7, instructions=?8, context_channel_id=?9,
                                            report_channel_id=?10, project_id=?11, location=?12, host_id=?13,
-                                           last_run_at=?16, next_run_at=?17, failure_count=?18",
+                                           last_run_at=?16, next_run_at=?17, last_success_at=?18,
+                                           last_error_at=?19, last_error=?20, last_validated_at=?21,
+                                           failure_count=?22",
             params![
                 automation.id, automation.name, automation.description, automation.enabled as i64,
                 to_json(&automation.trigger), automation.agent_id,
@@ -2881,10 +2898,278 @@ impl Store {
                 automation.project_id,
                 serde_json::to_string(&automation.location).unwrap_or_default().trim_matches('"'),
                 automation.host_id, automation.created_by, automation.created_at,
-                automation.last_run_at, automation.next_run_at, automation.failure_count
+                automation.last_run_at, automation.next_run_at, automation.last_success_at,
+                automation.last_error_at, automation.last_error, automation.last_validated_at,
+                automation.failure_count
             ],
         )?;
         Ok(())
+    }
+
+    pub fn update_automation_config(
+        &self,
+        automation: &Automation,
+        previous_trigger: &AutomationTrigger,
+        reset_watch_health: bool,
+    ) -> Result<Option<Automation>> {
+        let changed = self.conn()?.execute(
+            "UPDATE automations
+                SET name = ?2, description = ?3, enabled = ?4, trigger = ?5,
+                    agent_id = ?6, action = ?7, instructions = ?8,
+                    context_channel_id = ?9, report_channel_id = ?10,
+                    project_id = ?11, location = ?12, host_id = ?13,
+                    next_run_at = ?14,
+                    execution_failure_notification_key = NULL,
+                    last_success_at = CASE WHEN ?15 THEN NULL ELSE last_success_at END,
+                    last_error_at = CASE WHEN ?15 THEN NULL ELSE last_error_at END,
+                    last_error = CASE WHEN ?15 THEN NULL ELSE last_error END,
+                    last_validated_at = CASE WHEN ?15 THEN NULL ELSE last_validated_at END,
+                    failure_notification_key = CASE WHEN ?15 THEN NULL ELSE failure_notification_key END,
+                    failure_count = CASE WHEN ?15 THEN 0 ELSE failure_count END
+              WHERE id = ?1 AND trigger = ?16",
+            params![
+                automation.id,
+                automation.name,
+                automation.description,
+                automation.enabled as i64,
+                to_json(&automation.trigger),
+                automation.agent_id,
+                serde_json::to_string(&automation.action)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                automation.instructions,
+                automation.context_channel_id,
+                automation.report_channel_id,
+                automation.project_id,
+                serde_json::to_string(&automation.location)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                automation.host_id,
+                automation.next_run_at,
+                reset_watch_health as i64,
+                to_json(previous_trigger),
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.automation(&automation.id)
+    }
+
+    pub fn record_automation_firing(
+        &self,
+        id: &str,
+        trigger: &AutomationTrigger,
+        at: Millis,
+        next_run_at: Option<Millis>,
+        failed: bool,
+        update_failure_count: bool,
+    ) -> Result<Option<Automation>> {
+        let changed = if update_failure_count {
+            self.conn()?.execute(
+                "UPDATE automations
+                    SET last_run_at = ?3,
+                        next_run_at = ?4,
+                        failure_count = CASE WHEN ?5 THEN failure_count + 1 ELSE 0 END
+                  WHERE id = ?1 AND trigger = ?2",
+                params![id, to_json(trigger), at, next_run_at, failed as i64],
+            )?
+        } else {
+            self.conn()?.execute(
+                "UPDATE automations SET last_run_at = ?3
+                  WHERE id = ?1 AND trigger = ?2",
+                params![id, to_json(trigger), at],
+            )?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.automation(id)
+    }
+
+    pub fn record_automation_execution_failure(
+        &self,
+        id: &str,
+        diagnostic: &str,
+    ) -> Result<Option<(Automation, bool)>> {
+        let key: String = diagnostic.chars().take(500).collect();
+        let mut conn = self.conn()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = transaction
+            .query_row(
+                "SELECT execution_failure_notification_key FROM automations WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let notify = previous.as_deref() != Some(key.as_str());
+        if notify {
+            transaction.execute(
+                "UPDATE automations SET execution_failure_notification_key = ?2 WHERE id = ?1",
+                params![id, key],
+            )?;
+        }
+        let automation = transaction.query_row(
+            "SELECT * FROM automations WHERE id = ?1",
+            params![id],
+            Self::automation_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(Some((automation, notify)))
+    }
+
+    pub fn clear_automation_execution_failure(&self, id: &str) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE automations SET execution_failure_notification_key = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_automation_execution_notification(
+        &self,
+        id: &str,
+        diagnostic: &str,
+    ) -> Result<()> {
+        let key: String = diagnostic.chars().take(500).collect();
+        self.conn()?.execute(
+            "UPDATE automations SET execution_failure_notification_key = NULL
+              WHERE id = ?1 AND execution_failure_notification_key = ?2",
+            params![id, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_watch_failure_notification(&self, id: &str, diagnostic: &str) -> Result<()> {
+        let key: String = diagnostic.chars().take(500).collect();
+        self.conn()?.execute(
+            "UPDATE automations SET failure_notification_key = NULL
+              WHERE id = ?1 AND failure_notification_key = ?2",
+            params![id, key],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_watch_poll(
+        &self,
+        id: &str,
+        trigger: &AutomationTrigger,
+        next_run_at: Millis,
+    ) -> Result<bool> {
+        Ok(self.conn()?.execute(
+            "UPDATE automations
+                SET next_run_at = ?3
+              WHERE id = ?1 AND enabled = 1 AND trigger = ?2",
+            params![id, to_json(trigger), next_run_at],
+        )? > 0)
+    }
+
+    pub fn record_watch_success(
+        &self,
+        id: &str,
+        command: &str,
+        at: Millis,
+        validated: bool,
+    ) -> Result<Option<Automation>> {
+        let changed = self.conn()?.execute(
+            "UPDATE automations
+                SET last_success_at = ?3,
+                    last_validated_at = CASE WHEN ?4 THEN ?3 ELSE last_validated_at END,
+                    failure_notification_key = NULL,
+                    failure_count = 0
+              WHERE id = ?1 AND json_extract(trigger, '$.type') = 'watch'
+                            AND json_extract(trigger, '$.command') = ?2",
+            params![id, command, at, validated as i64],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.automation(id)
+    }
+
+    pub fn record_stale_watch_failure(
+        &self,
+        id: &str,
+        trigger: &AutomationTrigger,
+        at: Millis,
+        error: &str,
+    ) -> Result<Option<(Automation, bool)>> {
+        let error: String = error.chars().take(500).collect();
+        let mut conn = self.conn()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = transaction
+            .query_row(
+                "SELECT failure_notification_key FROM automations
+                  WHERE id = ?1 AND trigger = ?2",
+                params![id, to_json(trigger)],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let notify = previous.as_deref() != Some(error.as_str());
+        transaction.execute(
+            "UPDATE automations
+                SET last_error_at = ?3,
+                    last_error = ?4,
+                    failure_notification_key = CASE WHEN ?5 THEN ?4 ELSE failure_notification_key END,
+                    failure_count = failure_count + 1
+              WHERE id = ?1 AND trigger = ?2",
+            params![id, to_json(trigger), at, error, notify as i64],
+        )?;
+        let automation = transaction.query_row(
+            "SELECT * FROM automations WHERE id = ?1",
+            params![id],
+            Self::automation_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(Some((automation, notify)))
+    }
+
+    pub fn record_watch_failure(
+        &self,
+        id: &str,
+        command: &str,
+        at: Millis,
+        error: &str,
+    ) -> Result<Option<(Automation, bool)>> {
+        let error: String = error.chars().take(500).collect();
+        let mut conn = self.conn()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = transaction
+            .query_row(
+                "SELECT failure_notification_key FROM automations
+                  WHERE id = ?1 AND json_extract(trigger, '$.type') = 'watch'
+                                AND json_extract(trigger, '$.command') = ?2",
+                params![id, command],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        let notify = previous.as_deref() != Some(error.as_str());
+        transaction.execute(
+            "UPDATE automations
+                SET last_error_at = ?3,
+                    last_error = ?4,
+                    failure_notification_key = CASE WHEN ?5 THEN ?4 ELSE failure_notification_key END,
+                    failure_count = failure_count + 1
+              WHERE id = ?1 AND json_extract(trigger, '$.type') = 'watch'
+                            AND json_extract(trigger, '$.command') = ?2",
+            params![id, command, at, error, notify as i64],
+        )?;
+        let automation = transaction.query_row(
+            "SELECT * FROM automations WHERE id = ?1",
+            params![id],
+            Self::automation_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(Some((automation, notify)))
     }
 
     pub fn automations(&self) -> Result<Vec<Automation>> {
@@ -3218,6 +3503,36 @@ mod tests {
         }
     }
 
+    fn watch_automation() -> Automation {
+        Automation {
+            id: "watch".into(),
+            name: "Watch".into(),
+            description: String::new(),
+            enabled: false,
+            trigger: AutomationTrigger::Watch {
+                command: "true".into(),
+                every_seconds: 60,
+            },
+            agent_id: "agent".into(),
+            action: AutomationAction::CreateTask,
+            instructions: String::new(),
+            context_channel_id: None,
+            report_channel_id: None,
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 1,
+            last_run_at: None,
+            next_run_at: None,
+            last_success_at: None,
+            last_error_at: None,
+            last_error: None,
+            last_validated_at: None,
+            failure_count: 0,
+        }
+    }
+
     fn run(id: &str, task_id: &str) -> Run {
         Run {
             id: id.into(),
@@ -3306,6 +3621,238 @@ mod tests {
             task_id: Some(task.id.clone()),
             last_message_at: 1,
         }
+    }
+
+    #[test]
+    fn watch_health_records_failures_and_recovery() {
+        let (store, path) = store();
+        store.upsert_automation(&watch_automation()).unwrap();
+
+        let diagnostic = format!("HTTP 404 {}", "x".repeat(600));
+        let (failed, notify) = store
+            .record_watch_failure("watch", "true", 10, &diagnostic)
+            .unwrap()
+            .unwrap();
+        assert!(notify);
+        assert_eq!(failed.failure_count, 1);
+        assert_eq!(failed.last_error.as_ref().unwrap().chars().count(), 500);
+        assert!(failed.last_error.as_ref().unwrap().starts_with("HTTP 404"));
+        assert_eq!(failed.last_error_at, Some(10));
+        assert_eq!(failed.last_validated_at, None);
+
+        let (repeated, notify) = store
+            .record_watch_failure("watch", "true", 11, &diagnostic)
+            .unwrap()
+            .unwrap();
+        assert!(!notify);
+        assert_eq!(repeated.failure_count, 2);
+        store
+            .retry_watch_failure_notification("watch", &diagnostic)
+            .unwrap();
+        let (_, notify) = store
+            .record_watch_failure("watch", "true", 12, &diagnostic)
+            .unwrap()
+            .unwrap();
+        assert!(notify, "a failed notification is retried");
+
+        let (_, notify) = store
+            .record_watch_failure("watch", "true", 13, "HTTP 500")
+            .unwrap()
+            .unwrap();
+        assert!(notify, "a new diagnostic pings the creator again");
+
+        let healthy = store
+            .record_watch_success("watch", "true", 20, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.failure_count, 0);
+        assert_eq!(healthy.last_success_at, Some(20));
+        assert_eq!(healthy.last_validated_at, Some(20));
+        let (_, notify) = store
+            .record_watch_failure("watch", "true", 21, "HTTP 500")
+            .unwrap()
+            .unwrap();
+        assert!(notify, "recovery resets notification deduplication");
+
+        let (_, notify) = store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap()
+            .unwrap();
+        assert!(notify);
+        let (_, notify) = store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap()
+            .unwrap();
+        assert!(!notify, "identical execution failures do not spam");
+        store
+            .retry_automation_execution_notification("watch", "agent could not start")
+            .unwrap();
+        let (_, notify) = store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap()
+            .unwrap();
+        assert!(notify, "a failed execution notification is retried");
+        store.clear_automation_execution_failure("watch").unwrap();
+        let (_, notify) = store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap()
+            .unwrap();
+        assert!(notify, "execution recovery resets deduplication");
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_updates_preserve_concurrent_health_unless_the_command_changes() {
+        let (store, path) = store();
+        let mut stale = watch_automation();
+        store.upsert_automation(&stale).unwrap();
+        store
+            .record_watch_success("watch", "true", 10, true)
+            .unwrap();
+        store
+            .record_watch_failure("watch", "true", 20, "HTTP 404")
+            .unwrap();
+        store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap();
+
+        stale.name = "Renamed".into();
+        let original_trigger = stale.trigger.clone();
+        let preserved = store
+            .update_automation_config(&stale, &original_trigger, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.failure_count, 1);
+        assert_eq!(preserved.last_validated_at, Some(10));
+        assert_eq!(preserved.last_error.as_deref(), Some("HTTP 404"));
+        let (_, notify) = store
+            .record_automation_execution_failure("watch", "agent could not start")
+            .unwrap()
+            .unwrap();
+        assert!(
+            notify,
+            "a config edit makes a repeated execution failure actionable again"
+        );
+
+        stale.trigger = AutomationTrigger::Watch {
+            command: "changed".into(),
+            every_seconds: 60,
+        };
+        let reset = store
+            .update_automation_config(&stale, &original_trigger, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.failure_count, 0);
+        assert_eq!(reset.last_success_at, None);
+        assert_eq!(reset.last_validated_at, None);
+        assert_eq!(reset.last_error, None);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn firing_a_watch_action_does_not_change_command_health() {
+        let (store, path) = store();
+        let mut watch = watch_automation();
+        watch.failure_count = 3;
+        watch.last_error = Some("HTTP 404".into());
+        store.upsert_automation(&watch).unwrap();
+
+        let fired = store
+            .record_automation_firing("watch", &watch.trigger, 20, Some(80), false, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fired.last_run_at, Some(20));
+        assert_eq!(fired.next_run_at, None);
+        assert_eq!(fired.failure_count, 3);
+        assert_eq!(fired.last_error.as_deref(), Some("HTTP 404"));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_old_firing_cannot_overwrite_a_changed_schedule() {
+        let (store, path) = store();
+        let mut original = watch_automation();
+        original.trigger = AutomationTrigger::Schedule {
+            every_seconds: 60,
+            start_at: None,
+        };
+        original.next_run_at = Some(61);
+        store.upsert_automation(&original).unwrap();
+        let mut changed = original.clone();
+        changed.trigger = AutomationTrigger::Schedule {
+            every_seconds: 300,
+            start_at: None,
+        };
+        changed.next_run_at = Some(320);
+        store
+            .update_automation_config(&changed, &original.trigger, false)
+            .unwrap();
+        assert!(store
+            .update_automation_config(&original, &original.trigger, false)
+            .unwrap()
+            .is_none());
+
+        assert!(store
+            .record_automation_firing("watch", &original.trigger, 20, Some(80), false, true,)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.automation("watch").unwrap().unwrap().next_run_at,
+            Some(320)
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_finished_poll_cannot_validate_a_replaced_watch_command() {
+        let (store, path) = store();
+        let original = watch_automation();
+        store.upsert_automation(&original).unwrap();
+        let mut changed = original.clone();
+        changed.trigger = AutomationTrigger::Watch {
+            command: "different".into(),
+            every_seconds: 60,
+        };
+        store.upsert_automation(&changed).unwrap();
+
+        assert!(store
+            .record_watch_success("watch", "true", 20, true)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .automation("watch")
+                .unwrap()
+                .unwrap()
+                .last_validated_at,
+            None
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_finished_poll_survives_an_interval_only_edit() {
+        let (store, path) = store();
+        let mut watch = watch_automation();
+        watch.trigger = AutomationTrigger::Watch {
+            command: "true".into(),
+            every_seconds: 300,
+        };
+        store.upsert_automation(&watch).unwrap();
+
+        let healthy = store
+            .record_watch_success("watch", "true", 20, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(healthy.last_success_at, Some(20));
+        assert_eq!(healthy.last_validated_at, Some(20));
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3840,6 +4387,39 @@ mod tests {
             None
         );
 
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_pauses_legacy_watches_until_their_command_is_tested() {
+        let path = std::env::temp_dir().join(format!("patchwork-store-{}.sqlite", new_id()));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automations (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1, trigger TEXT NOT NULL,
+                agent_id TEXT NOT NULL, action TEXT NOT NULL, instructions TEXT NOT NULL DEFAULT '',
+                context_channel_id TEXT, report_channel_id TEXT, project_id TEXT,
+                location TEXT NOT NULL DEFAULT 'auto', host_id TEXT, created_by TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_run_at INTEGER, next_run_at INTEGER,
+                failure_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automations
+                (id, name, enabled, trigger, agent_id, action, created_by, created_at)
+             VALUES ('watch', 'Watch', 1, ?1, 'agent', 'create_task', 'human', 1)",
+            params![to_json(&watch_automation().trigger)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        let watch = store.automation("watch").unwrap().unwrap();
+        assert!(!watch.enabled);
+        assert_eq!(watch.last_validated_at, None);
         drop(store);
         let _ = std::fs::remove_file(path);
     }

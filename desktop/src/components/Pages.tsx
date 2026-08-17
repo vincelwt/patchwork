@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useApi, useApp, useWorkspaces } from "../lib/store";
-import { bytes, duration, relative, statusLabel, statusTone } from "../lib/format";
+import {
+  bytes,
+  duration,
+  relative,
+  statusLabel,
+  statusTone,
+  watchHealth,
+  watchNeedsTest,
+  watchValidated,
+} from "../lib/format";
 import {
   desktopBoot,
   desktopInfo,
@@ -72,6 +81,7 @@ import type {
   RuntimeInstallation,
   RuntimeOption,
   SystemSkill,
+  WatchTestResult,
   WorkspaceSkill,
 } from "@client/types";
 
@@ -1693,6 +1703,19 @@ export function AutomationsPage() {
   const [editing, setEditing] = useState<Automation | null>(null);
   const [deleting, setDeleting] = useState<Automation | null>(null);
 
+  /// Resuming a watch the relay has not validated is refused, and a refusal
+  /// nobody sees looks like a button that does nothing.
+  const toggle = async (automation: Automation) => {
+    try {
+      await api.updateAutomation(automation.id, {
+        ...automation,
+        enabled: !automation.enabled,
+      });
+    } catch (err) {
+      toast(String((err as Error).message ?? err));
+    }
+  };
+
   return (
     <Page
       title="Automations"
@@ -1718,6 +1741,10 @@ export function AutomationsPage() {
           const agent = app.members.find(
             (member) => member.id === automation.agent_id,
           );
+          // A watch's health is its last successful check: `last_run_at` only
+          // says the relay tried.
+          const health =
+            automation.trigger.type === "watch" ? watchHealth(automation) : undefined;
           return (
             <button
               key={automation.id}
@@ -1730,8 +1757,14 @@ export function AutomationsPage() {
                   {describeTrigger(automation)} · {agent?.display_name ?? "no agent"}
                 </span>
               </span>
-              {automation.failure_count > 0 && (
-                <Chip tone="danger">{automation.failure_count} failed</Chip>
+              {health ? (
+                <Chip tone={health.tone} title={automation.last_error}>
+                  {health.text}
+                </Chip>
+              ) : (
+                automation.failure_count > 0 && (
+                  <Chip tone="danger">{automation.failure_count} failed</Chip>
+                )
               )}
               <Chip tone={automation.enabled ? "positive" : ""}>
                 {automation.enabled ? "on" : "paused"}
@@ -1758,11 +1791,7 @@ export function AutomationsPage() {
                   {
                     key: "toggle",
                     label: automation.enabled ? "Pause" : "Resume",
-                    onSelect: () =>
-                      void api.updateAutomation(automation.id, {
-                        ...automation,
-                        enabled: !automation.enabled,
-                      }),
+                    onSelect: () => void toggle(automation),
                   },
                   "separator",
                   {
@@ -1924,6 +1953,10 @@ export function AutomationModal({
   const [instructions, setInstructions] = useState(automation?.instructions ?? "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  /// A watch is saved paused, tested, then enabled, so a failed test leaves an
+  /// automation behind. Pressing the button again fixes that one rather than
+  /// creating a second.
+  const [savedId, setSavedId] = useState(automation?.id);
 
   const cronExpression =
     preset === "custom"
@@ -1976,22 +2009,45 @@ export function AutomationModal({
   const save = async () => {
     setBusy(true);
     setError("");
+    const nextTrigger = trigger();
+    // The relay refuses to enable a watch whose command has not passed a test,
+    // and an untested watch that looks enabled is the whole failure this
+    // guards: save it paused, test it, and only then put it back on.
+    const needsTest = watchNeedsTest(automation, nextTrigger);
+    const wantEnabled = automation?.enabled ?? true;
     const body = {
       name,
-      trigger: trigger(),
+      trigger: nextTrigger,
       agent_id: agentId,
       action,
       instructions,
       context_channel_id: channelId || undefined,
       report_channel_id: channelId || undefined,
-      enabled: automation?.enabled ?? true,
+      enabled: wantEnabled && !needsTest,
     };
     try {
-      if (automation) {
-        await api.updateAutomation(automation.id, body);
+      const saved = savedId
+        ? await api.updateAutomation(savedId, body)
+        : await api.createAutomation(body);
+      setSavedId(saved.id);
+      if (needsTest) {
+        const result = await api.testAutomation(saved.id);
+        if (!result.ok) {
+          setError(
+            `The command failed, so “${name}” stays paused: ${result.error ?? "no diagnostic"}`,
+          );
+          setBusy(false);
+          return;
+        }
+        // A watch the author deliberately paused stays paused.
+        if (wantEnabled) {
+          await api.updateAutomation(saved.id, { ...body, enabled: true });
+        }
+        toast(
+          `Command checked, ${result.event_count} event${result.event_count === 1 ? "" : "s"} · ${wantEnabled ? "on" : "still paused"}`,
+        );
+      } else if (automation) {
         toast("Automation updated");
-      } else {
-        await api.createAutomation(body);
       }
       onClose();
     } catch (err) {
@@ -2114,14 +2170,15 @@ export function AutomationModal({
             label="Command"
             value={command}
             onChange={setCommand}
-            placeholder="curl -s https://api.example.com/issues/new | jq -r '.[].title'"
+            placeholder="/opt/patchwork/bin/scan-new-issues"
           />
           <Field label="Check every (minutes)" value={minutes} onChange={setMinutes} />
           <div className="form-help">
-            Runs on the relay. The agent only wakes when the command prints
-            something it did not print last time, so checking often is cheap.
-            <code>$PATCHWORK_STATE_DIR</code> is a directory of its own, kept
-            between runs.
+            Runs on the relay. Exit 0 with empty output is a healthy no-op;
+            findings must be one JSON event per line. <code>$PATCHWORK_STATE_DIR</code>
+            is a directory of its own, kept between runs. Saving runs the
+            command once without firing the action; it only starts watching if
+            that check passes.
           </div>
         </>
       )}
@@ -2185,6 +2242,8 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
   const [debug, setDebug] = useState<AutomationDebug>();
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [test, setTest] = useState<WatchTestResult>();
 
   useEffect(() => {
     void api.automationDebug(automationId).then(setDebug);
@@ -2193,6 +2252,20 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
   if (!debug) return <Empty title="Loading" />;
   const automation = debug.automation;
   const agent = app.members.find((member) => member.id === automation.agent_id);
+
+  /// Runs the command and records what it printed, without firing the action:
+  /// the point is to find out whether the watch still works.
+  const runTest = async () => {
+    setTesting(true);
+    try {
+      setTest(await api.testAutomation(automation.id));
+    } catch (err) {
+      toast(String((err as Error).message ?? err));
+    } finally {
+      setTesting(false);
+      setDebug(await api.automationDebug(automationId));
+    }
+  };
 
   return (
     <Page
@@ -2203,15 +2276,26 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
         <>
           <button
             className="button quiet"
-            onClick={() =>
-              api.updateAutomation(automation.id, {
-                ...automation,
-                enabled: !automation.enabled,
-              })
-            }
+            onClick={async () => {
+              try {
+                await api.updateAutomation(automation.id, {
+                  ...automation,
+                  enabled: !automation.enabled,
+                });
+              } catch (err) {
+                // Resuming a watch the relay has not validated is refused, and
+                // a refusal nobody sees looks like a button that does nothing.
+                toast(String((err as Error).message ?? err));
+              }
+            }}
           >
             {automation.enabled ? "Pause" : "Resume"}
           </button>
+          {automation.trigger.type === "watch" && (
+            <button className="button" disabled={testing} onClick={() => void runTest()}>
+              {testing ? "Testing…" : "Test watch"}
+            </button>
+          )}
           <button className="button" onClick={() => api.runAutomation(automation.id)}>
             Run now
           </button>
@@ -2260,10 +2344,57 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
         </div>
       )}
 
+      {/* A watch that quietly stopped working is the failure worth surfacing,
+          so its command, its last good check, and its last error live together. */}
       {automation.trigger.type === "watch" && (
         <div className="card" style={{ maxWidth: "none", marginTop: 14 }}>
           <div className="card-head">Scan</div>
           <code style={{ wordBreak: "break-all" }}>{automation.trigger.command}</code>
+          <div className="card-row">
+            <Chip
+              tone={
+                automation.failure_count > 0
+                  ? "danger"
+                  : automation.last_success_at
+                    ? "positive"
+                    : "caution"
+              }
+            >
+              {automation.last_success_at
+                ? `last good check ${relative(automation.last_success_at)}`
+                : "no good check yet"}
+            </Chip>
+            <Chip tone={watchValidated(automation) ? "positive" : "caution"}>
+              {watchValidated(automation)
+                ? `command validated${
+                    automation.last_validated_at
+                      ? ` ${relative(automation.last_validated_at)}`
+                      : ""
+                  }`
+                : "command not validated"}
+            </Chip>
+            {automation.failure_count > 0 && (
+              <Chip tone="danger">
+                {automation.failure_count} check
+                {automation.failure_count === 1 ? "" : "s"} failed in a row
+              </Chip>
+            )}
+          </div>
+          {automation.last_error && (
+            <div className="notice">
+              Failed {relative(automation.last_error_at)}
+              <div className="error-text" style={{ wordBreak: "break-word" }}>
+                {automation.last_error}
+              </div>
+            </div>
+          )}
+          {test && (
+            <div className="notice">
+              {test.ok
+                ? `Tested ${relative(test.tested_at)}: the command ran and printed ${test.event_count} event${test.event_count === 1 ? "" : "s"}. Nothing was fired.`
+                : `Tested ${relative(test.tested_at)}, and it failed: ${test.error ?? "no diagnostic"}`}
+            </div>
+          )}
         </div>
       )}
 

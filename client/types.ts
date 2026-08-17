@@ -458,7 +458,18 @@ export interface Automation {
   created_at: Millis;
   last_run_at?: Millis;
   next_run_at?: Millis;
+  last_success_at?: Millis;
+  last_error_at?: Millis;
+  last_error?: string;
+  last_validated_at?: Millis;
   failure_count: number;
+}
+
+export interface WatchTestResult {
+  ok: boolean;
+  event_count: number;
+  tested_at: Millis;
+  error?: string;
 }
 
 export interface AutomationRun {

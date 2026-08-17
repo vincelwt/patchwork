@@ -10,6 +10,7 @@ import type {
   TaskStatus,
 } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
+import { watchNeedsTest } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { Button, ChoiceField, ErrorNotice, TextField, ToggleRow } from "./ui";
 
@@ -47,6 +48,9 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
   const [enabled, setEnabled] = useState(automation?.enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /// A watch is saved paused, tested, then enabled, so a failed test leaves an
+  /// automation behind. Saving again fixes that one rather than making a second.
+  const [savedId, setSavedId] = useState(automation?.id);
   if (!data) return null;
 
   const trigger = (): AutomationTrigger => {
@@ -76,10 +80,15 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
   const save = async () => {
     setBusy(true);
     setError("");
+    const nextTrigger = trigger();
+    // The relay refuses to enable a watch whose command has not passed a test,
+    // and an untested watch that looks enabled is the failure this guards: save
+    // it paused, test it, and only then put it back on.
+    const needsTest = watchNeedsTest(automation, nextTrigger);
     const body = {
       name: name.trim(),
       description: description.trim(),
-      trigger: trigger(),
+      trigger: nextTrigger,
       agent_id: agentId,
       action,
       instructions: instructions.trim(),
@@ -88,19 +97,37 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
       project_id: projectId || undefined,
       location,
       host_id: location === "desktop" ? hostId || undefined : undefined,
-      enabled,
+      enabled: enabled && !needsTest,
     };
+    let created: string | undefined;
     try {
       await store.mutate(
-        (api) => automation
-          ? api.updateAutomation(automation.id, body)
-          : api.createAutomation(body),
+        async (api) => {
+          const saved = savedId
+            ? await api.updateAutomation(savedId, body)
+            : await api.createAutomation(body);
+          created = saved.id;
+          if (!needsTest) return { automation: saved, test: undefined };
+          const test = await api.testAutomation(saved.id);
+          // A watch the author deliberately paused stays paused.
+          const enabledNow = test.ok && enabled
+            ? await api.updateAutomation(saved.id, { ...body, enabled: true })
+            : saved;
+          return { automation: enabledNow, test };
+        },
         true,
-        onSaved,
+        ({ automation: saved, test }) => {
+          if (test && !test.ok) {
+            setError(`The command failed, so it stays paused: ${test.error ?? "no diagnostic"}`);
+            return;
+          }
+          onSaved(saved);
+        },
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
+      if (created) setSavedId(created);
       setBusy(false);
     }
   };
@@ -130,7 +157,7 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
       />
       {triggerType === "cron" ? <TextField label="Cron expression" value={cron} onChangeText={setCron} placeholder="0 9 * * 1-5" autoCapitalize="none" /> : null}
       {triggerType === "schedule" || triggerType === "watch" ? <TextField label="Every (minutes)" value={minutes} onChangeText={setMinutes} keyboardType="number-pad" /> : null}
-      {triggerType === "watch" ? <TextField label="Command" value={command} onChangeText={setCommand} multiline autoCapitalize="none" /> : null}
+      {triggerType === "watch" ? <TextField label="Command" value={command} onChangeText={setCommand} multiline autoCapitalize="none" help="Exit 0 with empty output is a healthy no-op. Findings must be one JSON event per line. Saving tests the command without firing the action." /> : null}
       {triggerType === "message" ? (
         <>
           <ChoiceField label="Watch channel" value={channelId} options={channelOptions.slice(1)} onChange={setChannelId} />

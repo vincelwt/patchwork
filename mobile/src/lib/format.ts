@@ -1,4 +1,5 @@
 import type {
+  Automation,
   AutomationTrigger,
   Message,
   Millis,
@@ -105,6 +106,43 @@ export function triggerLabel(trigger: AutomationTrigger) {
     case "manual":
       return "Manual only";
   }
+}
+
+/// Only a successful command test writes this timestamp.
+export function watchValidated(automation: Automation) {
+  return automation.last_validated_at !== undefined;
+}
+
+/// The relay refuses to enable a watch whose current command has not passed a
+/// test, so a new watch and an edited command both have to be tested first.
+export function watchNeedsTest(
+  automation: Automation | undefined,
+  trigger: { type: string; command?: string },
+) {
+  if (trigger.type !== "watch") return false;
+  return !(
+    automation?.trigger.type === "watch" &&
+    automation.trigger.command === trigger.command &&
+    watchValidated(automation)
+  );
+}
+
+/// What a watch is worth relies on its last successful check, not its last
+/// attempt: a command that has been failing all week still has a fresh
+/// `last_run_at`, which is exactly how a dead watch looks healthy.
+export function watchHealth(automation: Automation, now = Date.now()) {
+  const failures = automation.failure_count;
+  if (failures > 0) {
+    const when = automation.last_error_at ? ` · ${relative(automation.last_error_at, now)}` : "";
+    return { tone: "danger" as const, text: `${failures} failed check${failures === 1 ? "" : "s"}${when}` };
+  }
+  if (automation.last_success_at) {
+    return { tone: "positive" as const, text: `Checked ${relative(automation.last_success_at, now)}` };
+  }
+  return {
+    tone: "caution" as const,
+    text: watchValidated(automation) ? "Validated, no check yet" : "Never tested",
+  };
 }
 
 export function compactInterval(seconds: number) {

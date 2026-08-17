@@ -50,14 +50,18 @@ fn parse_continuation_output(stdout: &str) -> Result<Option<(ContinuationStatus,
     Ok(Some((output.status, summary.to_string())))
 }
 
-fn parse_watch_events(stdout: &str) -> Option<Vec<WatchEvent>> {
+fn parse_watch_events(stdout: &str) -> Result<Vec<WatchEvent>> {
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut events = Vec::new();
-    for line in stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let mut event: WatchEvent = serde_json::from_str(line).ok()?;
+    for (index, line) in stdout.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut event: WatchEvent = serde_json::from_str(line)
+            .with_context(|| format!("watch output line {} must be a JSON event", index + 1))?;
         event.event_key = event.event_key.trim().to_string();
         event.condition_key = event.condition_key.trim().to_string();
         event.title = event.title.trim().to_string();
@@ -71,11 +75,19 @@ fn parse_watch_events(stdout: &str) -> Option<Vec<WatchEvent>> {
         .into_iter()
         .any(|value| value.is_empty())
         {
-            return None;
+            return Err(anyhow!(
+                "watch output line {} has an empty required field",
+                index + 1
+            ));
         }
         events.push(event);
     }
-    (!events.is_empty()).then_some(events)
+    if events.is_empty() {
+        return Err(anyhow!(
+            "watch stdout must be empty or contain one JSON event per line"
+        ));
+    }
+    Ok(events)
 }
 
 fn watch_event(trigger: &AutomationTrigger, payload: Option<&Value>) -> Option<WatchEvent> {
@@ -341,26 +353,50 @@ pub async fn fire(
 
     let outcome = dispatch(state, automation, &mut record, task_id).await;
 
-    let mut updated = automation.clone();
-    updated.last_run_at = Some(now_ms());
-    // Whether it worked or not: a schedule that only books its next time after
-    // a success fires again on every tick once it starts failing.
-    updated.next_run_at = next_due_after(&automation.trigger, now_ms());
+    let finished_at = now_ms();
     let failure = outcome.as_ref().err().map(|err| format!("{err:#}"));
     if let Some(message) = &failure {
         record.status = RunStatus::Failed;
         record.error = Some(message.clone());
-        record.ended_at = Some(now_ms());
-        updated.failure_count += 1;
-    } else {
-        updated.failure_count = 0;
+        record.ended_at = Some(finished_at);
     }
-    state.store.upsert_automation(&updated)?;
-    state.emit(Event::AutomationUpdated {
-        automation: updated,
-    });
+    // A watch's health belongs to the command poll, not to the action it
+    // triggered. Update only firing metadata here, and never write a stale
+    // configuration back after asynchronous dispatch.
+    let is_watch = matches!(automation.trigger, AutomationTrigger::Watch { .. });
+    if let Some(updated) = state.store.record_automation_firing(
+        &automation.id,
+        &automation.trigger,
+        finished_at,
+        if is_watch {
+            None
+        } else {
+            next_due_after(&automation.trigger, finished_at)
+        },
+        failure.is_some(),
+        !is_watch,
+    )? {
+        state.emit(Event::AutomationUpdated {
+            automation: updated,
+        });
+    }
     if let Some(message) = &failure {
-        notify_creator_of_failure(state, &record, message)?;
+        if let Some((current, notify)) = state
+            .store
+            .record_automation_execution_failure(&automation.id, message)?
+        {
+            if notify {
+                if let Err(err) =
+                    deliver_execution_failure_notification(state, &current, message).await
+                {
+                    tracing::warn!(?err, automation = %automation.name, "could not notify automation creator");
+                }
+            }
+        }
+    } else if record.status == RunStatus::Succeeded {
+        state
+            .store
+            .clear_automation_execution_failure(&automation.id)?;
     }
 
     state.store.upsert_automation_run(&record)?;
@@ -535,37 +571,22 @@ pub async fn report_failure(state: &Shared, record: &AutomationRun, run: &Run) -
         .error
         .clone()
         .unwrap_or_else(|| "the run failed without an error message".into());
-    notify_creator_of_failure(state, record, &message)
+    let Some((automation, notify)) = state
+        .store
+        .record_automation_execution_failure(&record.automation_id, &message)?
+    else {
+        return Ok(());
+    };
+    if notify {
+        deliver_execution_failure_notification(state, &automation, &message).await?;
+    }
+    Ok(())
 }
 
-fn notify_creator_of_failure(state: &Shared, record: &AutomationRun, message: &str) -> Result<()> {
-    let Some(automation) = state.store.automation(&record.automation_id)? else {
-        return Ok(());
-    };
-    let Some(creator) = state.store.member(&automation.created_by)? else {
-        return Ok(());
-    };
-    if creator.kind != MemberKind::Human {
-        return Ok(());
-    }
-    let item = InboxItem {
-        id: new_id(),
-        member_id: creator.id,
-        kind: InboxKind::AutomationFailed,
-        title: format!("Automation `{}` failed", automation.name),
-        preview: message.chars().take(200).collect(),
-        actor_id: Some(automation.agent_id.clone()),
-        channel_id: automation.report_channel_id.clone(),
-        message_id: None,
-        task_id: record.task_id.clone(),
-        run_id: record.run_id.clone(),
-        automation_id: Some(automation.id.clone()),
-        created_at: now_ms(),
-        read_at: None,
-    };
-    state.store.insert_inbox(&item)?;
-    state.emit(Event::InboxItemCreated { item });
-    Ok(())
+pub fn report_success(state: &Shared, record: &AutomationRun) -> Result<()> {
+    state
+        .store
+        .clear_automation_execution_failure(&record.automation_id)
 }
 
 fn matches_pattern(pattern: &str, body: &str) -> bool {
@@ -596,9 +617,38 @@ pub async fn scheduler(state: Shared) {
                 every_seconds,
             } = &automation.trigger
             {
+                if WatchPollGuard::is_active(&state, &automation.id) {
+                    continue;
+                }
                 let due = automation
                     .next_run_at
                     .unwrap_or(automation.created_at + every_seconds * 1000);
+                let mut current = automation.clone();
+                if watch_is_stale(due, *every_seconds, now) {
+                    let reason =
+                        format!("watch missed its expected poll at {due}; relay time is {now}");
+                    match record_stale_watch_failure(&state, &automation, &reason) {
+                        Ok((updated, notify)) => {
+                            if notify {
+                                if let Err(err) =
+                                    deliver_watch_failure_notification(&state, &updated, &reason)
+                                        .await
+                                {
+                                    tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
+                                }
+                            }
+                            if let Err(err) =
+                                ensure_watch_operator_task(&state, &updated, &reason).await
+                            {
+                                tracing::warn!(?err, automation = %automation.name, "could not escalate stale watch");
+                            }
+                            current = updated;
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, automation = %automation.name, "could not record stale watch")
+                        }
+                    }
+                }
                 if due > now {
                     continue;
                 }
@@ -606,13 +656,27 @@ pub async fn scheduler(state: Shared) {
                 // hangs or dies must not be retried on every tick. Polling off
                 // the ticker thread keeps one slow watcher from delaying the
                 // rest.
-                let mut pending = automation.clone();
-                pending.next_run_at = Some(now + every_seconds * 1000);
-                let _ = state.store.upsert_automation(&pending);
+                let Some(guard) = WatchPollGuard::acquire(&state, &automation.id) else {
+                    continue;
+                };
+                match state.store.claim_watch_poll(
+                    &automation.id,
+                    &automation.trigger,
+                    now + every_seconds * 1000,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(err) => {
+                        tracing::warn!(?err, automation = %automation.name, "could not schedule watch poll");
+                        continue;
+                    }
+                }
                 tokio::spawn(poll_watch(
                     state.clone(),
-                    automation.clone(),
+                    current,
                     command.clone(),
+                    *every_seconds,
+                    guard,
                 ));
                 continue;
             }
@@ -663,6 +727,58 @@ pub async fn scheduler(state: Shared) {
 /// Long enough for a slow HTTP call, short enough that a hung script is not a
 /// watcher that quietly stopped watching.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+const WATCH_FAILURE_THRESHOLD: i64 = 3;
+const WATCH_ERROR_MAX_CHARS: usize = 500;
+const WATCH_STALE_MIN_GRACE_MS: Millis = 60_000;
+
+struct WatchPollGuard {
+    state: Shared,
+    automation_id: Id,
+}
+
+impl WatchPollGuard {
+    fn is_active(state: &Shared, automation_id: &str) -> bool {
+        state
+            .watch_polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(automation_id)
+    }
+
+    fn acquire(state: &Shared, automation_id: &str) -> Option<Self> {
+        let mut active = state
+            .watch_polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(automation_id.to_string()) {
+            return None;
+        }
+        Some(Self {
+            state: state.clone(),
+            automation_id: automation_id.to_string(),
+        })
+    }
+}
+
+impl Drop for WatchPollGuard {
+    fn drop(&mut self) {
+        self.state
+            .watch_polls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.automation_id);
+    }
+}
+
+fn bounded_watch_error(error: impl AsRef<str>) -> String {
+    error.as_ref().chars().take(WATCH_ERROR_MAX_CHARS).collect()
+}
+
+fn watch_is_stale(due_at: Millis, every_seconds: i64, now: Millis) -> bool {
+    let interval = every_seconds.max(1).saturating_mul(1_000);
+    let grace = interval.saturating_mul(2).max(WATCH_STALE_MIN_GRACE_MS);
+    now > due_at.saturating_add(grace)
+}
 
 async fn relay_command(
     dir: &std::path::Path,
@@ -703,6 +819,318 @@ async fn relay_command(
                     .await;
             }
             Err(anyhow!("checker command timed out"))
+        }
+    }
+}
+
+fn classify_watch_output(output: Result<std::process::Output>) -> Result<Vec<WatchEvent>> {
+    let output = output?;
+    if !output.status.success() {
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "a signal".into());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let diagnostic = stderr
+            .trim()
+            .is_empty()
+            .then(|| stdout.trim())
+            .unwrap_or_else(|| stderr.trim());
+        return Err(anyhow!(bounded_watch_error(format!(
+            "watch command exited with {status}: {}",
+            if diagnostic.is_empty() {
+                "no diagnostic output"
+            } else {
+                diagnostic
+            }
+        ))));
+    }
+    let stdout = String::from_utf8(output.stdout).context("watch stdout must be UTF-8")?;
+    parse_watch_events(&stdout)
+}
+
+fn watch_command(automation: &Automation) -> Result<&str> {
+    match &automation.trigger {
+        AutomationTrigger::Watch { command, .. } => Ok(command),
+        _ => Err(anyhow!("automation is not a watch")),
+    }
+}
+
+fn watch_accepts_events(automation: &Automation, command: &str) -> bool {
+    automation.enabled && watch_command(automation).is_ok_and(|saved| saved == command)
+}
+
+fn record_watch_success(
+    state: &Shared,
+    expected: &Automation,
+    validated: bool,
+) -> Result<Automation> {
+    let automation = state
+        .store
+        .record_watch_success(&expected.id, watch_command(expected)?, now_ms(), validated)?
+        .ok_or_else(|| anyhow!("automation changed or was deleted while its watch command ran"))?;
+    state.emit(Event::AutomationUpdated {
+        automation: automation.clone(),
+    });
+    Ok(automation)
+}
+
+fn record_stale_watch_failure(
+    state: &Shared,
+    expected: &Automation,
+    error: &str,
+) -> Result<(Automation, bool)> {
+    let error = bounded_watch_error(error);
+    let (automation, notify) = state
+        .store
+        .record_stale_watch_failure(&expected.id, &expected.trigger, now_ms(), &error)?
+        .ok_or_else(|| anyhow!("automation changed or was deleted before its stale check"))?;
+    state.emit(Event::AutomationUpdated {
+        automation: automation.clone(),
+    });
+    Ok((automation, notify))
+}
+
+fn record_watch_failure(
+    state: &Shared,
+    expected: &Automation,
+    error: &str,
+) -> Result<(Automation, bool)> {
+    let error = bounded_watch_error(error);
+    let (automation, notify) = state
+        .store
+        .record_watch_failure(&expected.id, watch_command(expected)?, now_ms(), &error)?
+        .ok_or_else(|| anyhow!("automation changed or was deleted while its watch command ran"))?;
+    state.emit(Event::AutomationUpdated {
+        automation: automation.clone(),
+    });
+    Ok((automation, notify))
+}
+
+fn automation_notification_channel(
+    state: &Shared,
+    automation: &Automation,
+    creator: &Member,
+) -> Result<Id> {
+    if let Some(channel_id) = automation
+        .report_channel_id
+        .clone()
+        .or_else(|| automation.context_channel_id.clone())
+    {
+        return Ok(channel_id);
+    }
+    let system = state
+        .store
+        .member_by_handle("patchwork")?
+        .ok_or_else(|| anyhow!("system member is unavailable"))?;
+    if let Some(channel) = state.store.find_dm(&system.id, &creator.id)? {
+        return Ok(channel.id);
+    }
+    let channel = Channel {
+        id: new_id(),
+        kind: ChannelKind::Dm,
+        section_id: None,
+        slug: String::new(),
+        name: creator.display_name.clone(),
+        topic: String::new(),
+        position: now_ms() as f64,
+        created_at: now_ms(),
+        member_ids: vec![system.id, creator.id.clone()],
+        task_id: None,
+        last_message_at: 0,
+    };
+    state.store.insert_channel(&channel)?;
+    state.emit(Event::ChannelCreated {
+        channel: channel.clone(),
+    });
+    Ok(channel.id)
+}
+
+async fn notify_automation_creator(
+    state: &Shared,
+    automation: &Automation,
+    diagnostic: &str,
+) -> Result<()> {
+    let diagnostic = bounded_watch_error(diagnostic);
+    let Some(creator) = state
+        .store
+        .members()?
+        .into_iter()
+        .find(|member| member.id == automation.created_by)
+    else {
+        return Ok(());
+    };
+    if creator.kind == MemberKind::Human {
+        let item = InboxItem {
+            id: new_id(),
+            member_id: creator.id,
+            kind: InboxKind::AutomationFailed,
+            title: format!("Automation `{}` failed", automation.name),
+            preview: diagnostic.chars().take(200).collect(),
+            actor_id: Some(automation.agent_id.clone()),
+            channel_id: automation
+                .report_channel_id
+                .clone()
+                .or_else(|| automation.context_channel_id.clone()),
+            message_id: None,
+            task_id: None,
+            run_id: None,
+            automation_id: Some(automation.id.clone()),
+            created_at: now_ms(),
+            read_at: None,
+        };
+        state.store.insert_inbox(&item)?;
+        state.emit(Event::InboxItemCreated { item });
+        return Ok(());
+    }
+
+    let channel_id = automation_notification_channel(state, automation, &creator)?;
+    orchestrator::start_run(
+        state,
+        StartRunParams {
+            agent_id: creator.id,
+            channel_id,
+            task_id: None,
+            prompt: format!(
+                "Automation `{}` failed.\n\nDiagnostic:\n{}\n\nInvestigate the command now. Fix it and run `patchwork automation test \"{}\"`, or pause the automation if it should not keep running.",
+                automation.name, diagnostic, automation.name
+            ),
+            trigger: RunTrigger::Automation {
+                automation_id: automation.id.clone(),
+            },
+            automation_id: Some(automation.id.clone()),
+            depth: 0,
+            host_id: None,
+            project_id: automation.project_id.clone(),
+            required_task_status: None,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn deliver_watch_failure_notification(
+    state: &Shared,
+    automation: &Automation,
+    diagnostic: &str,
+) -> Result<()> {
+    if let Err(err) = notify_automation_creator(state, automation, diagnostic).await {
+        state
+            .store
+            .retry_watch_failure_notification(&automation.id, diagnostic)?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn deliver_execution_failure_notification(
+    state: &Shared,
+    automation: &Automation,
+    diagnostic: &str,
+) -> Result<()> {
+    if let Err(err) = notify_automation_creator(state, automation, diagnostic).await {
+        state
+            .store
+            .retry_automation_execution_notification(&automation.id, diagnostic)?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn ensure_watch_operator_task(
+    state: &Shared,
+    automation: &Automation,
+    reason: &str,
+) -> Result<()> {
+    let owner_id = state
+        .store
+        .members()?
+        .into_iter()
+        .find(|member| member.id == automation.created_by && member.kind == MemberKind::Human)
+        .map(|member| member.id);
+    let creation = orchestrator::create_task_with_result(
+        state,
+        &automation.created_by,
+        CreateTask {
+            title: format!("Restore watch automation: {}", automation.name),
+            outcome: format!(
+                "The `{}` watch validates and its scheduled checks succeed",
+                automation.name
+            ),
+            initial_message: Some(format!(
+                "Watch automation `{}` needs operator action. Consecutive failures: {}.\n\n{}",
+                automation.name, automation.failure_count, reason
+            )),
+            owner_id,
+            source_channel_id: automation
+                .report_channel_id
+                .clone()
+                .or_else(|| automation.context_channel_id.clone()),
+            project_id: automation.project_id.clone(),
+            host_id: automation.host_id.clone(),
+            once_key: Some(format!("automation-watch-health:{}", automation.id)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    if creation.created && creation.task.owner_id.is_none() {
+        orchestrator::notify_task(
+            state,
+            &creation.task,
+            InboxKind::TaskBlocked,
+            format!("{} needs an operator", creation.task.key),
+        )?;
+    }
+    Ok(())
+}
+
+pub async fn test_watch(state: &Shared, automation: &Automation) -> Result<WatchTestResult> {
+    let AutomationTrigger::Watch {
+        command,
+        every_seconds,
+    } = &automation.trigger
+    else {
+        return Err(anyhow!("only watch automations have a command to test"));
+    };
+    let tested_at = now_ms();
+    let dir = state.files_dir.join("watch-test").join(&automation.id);
+    let timeout = WATCH_TIMEOUT.min(Duration::from_secs((*every_seconds).max(1) as u64));
+    let result = classify_watch_output(
+        relay_command(
+            &dir,
+            command,
+            &[("PATCHWORK_AUTOMATION_ID", automation.id.as_str())],
+            timeout,
+        )
+        .await,
+    );
+    match result {
+        Ok(events) => {
+            record_watch_success(state, automation, true)?;
+            Ok(WatchTestResult {
+                ok: true,
+                event_count: events.len(),
+                tested_at,
+                error: None,
+            })
+        }
+        Err(err) => {
+            let error = bounded_watch_error(format!("{err:#}"));
+            let (updated, notify) = record_watch_failure(state, automation, &error)?;
+            if notify {
+                if let Err(err) = deliver_watch_failure_notification(state, &updated, &error).await
+                {
+                    tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
+                }
+            }
+            Ok(WatchTestResult {
+                ok: false,
+                event_count: 0,
+                tested_at,
+                error: Some(error),
+            })
         }
     }
 }
@@ -854,94 +1282,77 @@ async fn poll_task_continuation(state: Shared, continuation: TaskContinuation) {
 /// This is the whole point of a watch: the scan costs a process, so it can run
 /// every minute, and the model is only paid for when there is something to
 /// think about.
-async fn poll_watch(state: Shared, automation: Automation, command: String) {
+async fn poll_watch(
+    state: Shared,
+    automation: Automation,
+    command: String,
+    every_seconds: i64,
+    _guard: WatchPollGuard,
+) {
     // Its own directory, kept between polls, so a script can remember the last
     // id it saw without the relay inventing a storage API for it.
     let dir = state.files_dir.join("watch").join(&automation.id);
-    let output = match relay_command(
-        &dir,
-        &command,
-        &[("PATCHWORK_AUTOMATION_ID", automation.id.as_str())],
-        WATCH_TIMEOUT,
-    )
-    .await
-    {
-        Ok(output) => output,
+    let timeout = WATCH_TIMEOUT.min(Duration::from_secs(every_seconds.max(1) as u64));
+    let events = match classify_watch_output(
+        relay_command(
+            &dir,
+            &command,
+            &[("PATCHWORK_AUTOMATION_ID", automation.id.as_str())],
+            timeout,
+        )
+        .await,
+    ) {
+        Ok(events) => events,
         Err(err) => {
-            tracing::warn!(?err, automation = %automation.name, "watch command failed");
-            return;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if output.status.success() {
-        if let Some(events) = parse_watch_events(&stdout) {
-            for event in events {
-                let event_key = event.event_key.clone();
-                let title: String = event.title.chars().take(120).collect();
-                if let Err(err) = fire(
-                    &state,
-                    &automation,
-                    format!("Watch: {title}"),
-                    json!({ "watch_event": event }),
-                    None,
-                    Some(event_key),
-                )
-                .await
-                {
-                    tracing::warn!(?err, automation = %automation.name, "watch event failed");
+            let error = bounded_watch_error(format!("{err:#}"));
+            match record_watch_failure(&state, &automation, &error) {
+                Ok((updated, notify)) => {
+                    if notify {
+                        if let Err(err) =
+                            deliver_watch_failure_notification(&state, &updated, &error).await
+                        {
+                            tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
+                        }
+                    }
+                    if updated.failure_count >= WATCH_FAILURE_THRESHOLD {
+                        if let Err(err) = ensure_watch_operator_task(&state, &updated, &error).await
+                        {
+                            tracing::warn!(?err, automation = %automation.name, "could not escalate watch failure");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(?err, automation = %automation.name, "could not record watch failure")
                 }
             }
             return;
         }
-    }
+    };
 
-    let last = state
-        .store
-        .automation_runs(&automation.id, 1)
-        .unwrap_or_default();
-    let previous = last
-        .first()
-        .and_then(|run| run.trigger_payload.as_ref())
-        .and_then(|payload| payload.get("stdout"))
-        .and_then(|value| value.as_str());
-
-    if !watch_found_something(output.status.success(), &stdout, previous) {
-        tracing::debug!(
-            automation = %automation.name,
-            code = output.status.code(),
-            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
-            "watch found nothing"
-        );
+    if let Err(err) = record_watch_success(&state, &automation, false) {
+        tracing::warn!(?err, automation = %automation.name, "could not record watch success");
         return;
     }
-
-    let headline: String = stdout
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .take(120)
-        .collect();
-    if let Err(err) = fire(
-        &state,
-        &automation,
-        format!("Watch: {headline}"),
-        json!({ "stdout": stdout }),
-        None,
-        None,
-    )
-    .await
-    {
-        tracing::warn!(?err, automation = %automation.name, "watch automation failed");
+    for event in events {
+        let event_key = event.event_key.clone();
+        let title: String = event.title.chars().take(120).collect();
+        let current = match state.store.automation(&automation.id) {
+            Ok(Some(current)) if watch_accepts_events(&current, &command) => current,
+            _ => return,
+        };
+        if let Err(err) = fire(
+            &state,
+            &current,
+            format!("Watch: {title}"),
+            json!({ "watch_event": event }),
+            None,
+            Some(event_key),
+        )
+        .await
+        {
+            tracing::warn!(?err, automation = %automation.name, "watch event failed");
+        }
     }
-}
-
-/// A non-zero exit means "nothing to report", the way `grep` means it, so the
-/// obvious one-liner works. Printing the same finding as last time is not a
-/// new finding, which is what lets a scan be stateless.
-fn watch_found_something(exited_ok: bool, stdout: &str, previous: Option<&str>) -> bool {
-    exited_ok && !stdout.is_empty() && previous != Some(stdout)
 }
 
 /// When a trigger that runs on the clock is next due. `None` for the ones that
@@ -1109,16 +1520,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn a_404_with_no_stdout_is_a_watch_failure() {
+        let dir = std::env::temp_dir().join(format!("patchwork-watch-{}", new_id()));
+        let output = relay_command(
+            &dir,
+            "printf 'HTTP 404 Not Found\\n' >&2; exit 22",
+            &[],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(output.stdout.is_empty());
+        let error = classify_watch_output(Ok(output)).unwrap_err().to_string();
+        assert!(error.contains("404 Not Found"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_watch_timeout_is_a_failure() {
+        let dir = std::env::temp_dir().join(format!("patchwork-watch-timeout-{}", new_id()));
+        let output = relay_command(&dir, "sleep 1", &[], Duration::from_millis(10)).await;
+        let error = classify_watch_output(output).unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
-    fn a_watch_fires_only_on_a_new_finding() {
-        // Nothing printed, or a failed scan: nothing happened.
-        assert!(!watch_found_something(true, "", None));
-        assert!(!watch_found_something(false, "issue-1", None));
-        // Something new.
-        assert!(watch_found_something(true, "issue-1", None));
-        assert!(watch_found_something(true, "issue-2", Some("issue-1")));
-        // The same finding as last time is not a new one.
-        assert!(!watch_found_something(true, "issue-1", Some("issue-1")));
+    fn stale_watches_allow_two_intervals_of_grace() {
+        assert!(!watch_is_stale(1_000, 60, 121_000));
+        assert!(watch_is_stale(1_000, 60, 121_001));
+        assert!(!watch_is_stale(1_000, 5, 61_000));
+        assert!(watch_is_stale(1_000, 5, 61_001));
+    }
+
+    #[test]
+    fn watch_diagnostics_are_bounded() {
+        assert_eq!(bounded_watch_error("x".repeat(600)).chars().count(), 500);
+    }
+
+    #[tokio::test]
+    async fn repeated_watch_escalation_creates_one_operator_task() {
+        let path = std::env::temp_dir().join(format!("patchwork-watch-task-{}.sqlite", new_id()));
+        let files = path.with_extension("files");
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        store
+            .insert_member(&Member {
+                id: "human".into(),
+                kind: MemberKind::Human,
+                handle: "human".into(),
+                display_name: "Human".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: None,
+                presence: Presence::Offline,
+            })
+            .unwrap();
+        store
+            .insert_member(&Member {
+                id: "system".into(),
+                kind: MemberKind::Human,
+                handle: "patchwork".into(),
+                display_name: "Patchwork".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: None,
+                presence: Presence::Offline,
+            })
+            .unwrap();
+        store
+            .insert_member(&Member {
+                id: "creator-agent".into(),
+                kind: MemberKind::Agent,
+                handle: "creator".into(),
+                display_name: "Creator".into(),
+                email: None,
+                avatar: None,
+                is_admin: false,
+                created_at: 1,
+                agent: Some(AgentProfile::default()),
+                presence: Presence::Offline,
+            })
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            files.clone(),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx: host_tx });
+        let guard = WatchPollGuard::acquire(&state, "watch").unwrap();
+        assert!(WatchPollGuard::is_active(&state, "watch"));
+        assert!(WatchPollGuard::acquire(&state, "watch").is_none());
+        drop(guard);
+        assert!(!WatchPollGuard::is_active(&state, "watch"));
+        assert!(WatchPollGuard::acquire(&state, "watch").is_some());
+
+        let automation = Automation {
+            id: "watch".into(),
+            name: "Release watch".into(),
+            description: String::new(),
+            enabled: true,
+            trigger: AutomationTrigger::Watch {
+                command: "false".into(),
+                every_seconds: 60,
+            },
+            agent_id: "agent".into(),
+            action: AutomationAction::CreateTask,
+            instructions: String::new(),
+            context_channel_id: None,
+            report_channel_id: None,
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 1,
+            last_run_at: None,
+            next_run_at: None,
+            last_success_at: None,
+            last_error_at: Some(2),
+            last_error: Some("HTTP 404".into()),
+            last_validated_at: Some(1),
+            failure_count: WATCH_FAILURE_THRESHOLD,
+        };
+        assert!(watch_accepts_events(&automation, "false"));
+        let mut paused = automation.clone();
+        paused.enabled = false;
+        assert!(!watch_accepts_events(&paused, "false"));
+        assert!(!watch_accepts_events(&automation, "changed"));
+
+        let mut agent_created = automation.clone();
+        agent_created.created_by = "creator-agent".into();
+        notify_automation_creator(&state, &agent_created, "HTTP 404")
+            .await
+            .unwrap();
+        let patchwork_core::host::RelayToHost::StartRun { spec } = host_rx.recv().await.unwrap()
+        else {
+            panic!("creator notification did not start a run");
+        };
+        assert_eq!(spec.agent_id, "creator-agent");
+        assert!(spec.prompt.contains("HTTP 404"));
+        assert!(spec.prompt.contains("patchwork automation test"));
+
+        ensure_watch_operator_task(&state, &automation, "HTTP 404")
+            .await
+            .unwrap();
+        ensure_watch_operator_task(&state, &automation, "HTTP 404")
+            .await
+            .unwrap();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].once_key.as_deref(),
+            Some("automation-watch-health:watch")
+        );
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(files);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1162,11 +1731,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_watch_output_stays_legacy() {
-        assert!(parse_watch_events("one finding\nmore detail").is_none());
+    fn watch_output_is_either_empty_or_structured() {
+        assert!(parse_watch_events("").unwrap().is_empty());
+        assert!(parse_watch_events("one finding\nmore detail").is_err());
         assert!(
-            parse_watch_events("{\"event_key\":\"missing the other required fields\"}").is_none()
+            parse_watch_events("{\"event_key\":\"missing the other required fields\"}").is_err()
         );
+        assert!(parse_watch_events("  \n").is_err());
     }
 
     #[test]

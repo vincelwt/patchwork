@@ -284,6 +284,7 @@ pub fn router(state: Shared) -> Router {
             patch(update_automation).delete(delete_automation),
         )
         .route("/api/automations/{id}/run", post(run_automation))
+        .route("/api/automations/{id}/test", post(test_automation))
         .route("/api/automations/{id}/debug", get(automation_debug))
         // previews
         .route("/api/previews", get(list_previews).post(start_preview))
@@ -2379,11 +2380,54 @@ async fn list_automations(
     ))
 }
 
+fn watch_schedule_changed(old: &AutomationTrigger, new: &AutomationTrigger) -> bool {
+    matches!(
+        (old, new),
+        (
+            AutomationTrigger::Watch { every_seconds: old, .. },
+            AutomationTrigger::Watch { every_seconds: new, .. },
+        ) if old != new
+    )
+}
+
+fn require_watch_validation(
+    existing: Option<&Automation>,
+    input: &CreateAutomation,
+) -> ApiResult<()> {
+    let AutomationTrigger::Watch {
+        command,
+        every_seconds,
+    } = &input.trigger
+    else {
+        return Ok(());
+    };
+    if command.trim().is_empty() {
+        return Err(ApiError::bad_request("a watch command is required"));
+    }
+    if *every_seconds <= 0 {
+        return Err(ApiError::bad_request("a watch interval must be positive"));
+    }
+    let validated = existing.is_some_and(|automation| {
+        automation.last_validated_at.is_some()
+            && matches!(
+                &automation.trigger,
+                AutomationTrigger::Watch { command: old, .. } if old == command
+            )
+    });
+    if input.enabled && !validated {
+        return Err(ApiError::conflict(
+            "test this watch successfully before enabling it",
+        ));
+    }
+    Ok(())
+}
+
 async fn create_automation(
     State(state): State<Shared>,
     caller: Caller,
     Json(input): Json<CreateAutomation>,
 ) -> ApiResult<Json<Automation>> {
+    require_watch_validation(None, &input)?;
     let automation = Automation {
         id: new_id(),
         name: input.name.trim().to_string(),
@@ -2408,6 +2452,10 @@ async fn create_automation(
             } => Some(start_at.unwrap_or_else(|| now_ms() + every_seconds * 1000)),
             _ => None,
         },
+        last_success_at: None,
+        last_error_at: None,
+        last_error: None,
+        last_validated_at: None,
         failure_count: 0,
     };
     require_automation_access(&state, &caller, &automation)?;
@@ -2429,6 +2477,18 @@ async fn update_automation(
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
     require_automation_access(&state, &caller, &automation)?;
+    require_watch_validation(Some(&automation), &input)?;
+    let previous_trigger = automation.trigger.clone();
+    let watch_command_changed = match (&automation.trigger, &input.trigger) {
+        (
+            AutomationTrigger::Watch { command: old, .. },
+            AutomationTrigger::Watch { command: new, .. },
+        ) => old != new,
+        (AutomationTrigger::Watch { .. }, _) | (_, AutomationTrigger::Watch { .. }) => true,
+        _ => false,
+    };
+    let watch_interval_changed = watch_schedule_changed(&automation.trigger, &input.trigger);
+    let was_enabled = automation.enabled;
     automation.name = input.name.trim().to_string();
     automation.description = input.description.clone();
     automation.enabled = input.enabled;
@@ -2441,11 +2501,27 @@ async fn update_automation(
     automation.project_id = input.project_id.clone();
     automation.location = input.location;
     automation.host_id = input.host_id.clone();
-    if let AutomationTrigger::Schedule { every_seconds, .. } = &automation.trigger {
-        automation.next_run_at = Some(now_ms() + every_seconds * 1000);
-    }
+    automation.next_run_at = match &automation.trigger {
+        AutomationTrigger::Schedule { every_seconds, .. } if automation.enabled => {
+            Some(now_ms() + every_seconds * 1000)
+        }
+        AutomationTrigger::Cron { expression } if automation.enabled => {
+            automations::next_cron_after(expression, now_ms())
+        }
+        AutomationTrigger::Watch { every_seconds, .. }
+            if automation.enabled
+                && (!was_enabled || watch_command_changed || watch_interval_changed) =>
+        {
+            Some(now_ms() + every_seconds * 1000)
+        }
+        AutomationTrigger::Watch { .. } if automation.enabled => automation.next_run_at,
+        _ => None,
+    };
     require_automation_access(&state, &caller, &automation)?;
-    state.store.upsert_automation(&automation)?;
+    let automation = state
+        .store
+        .update_automation_config(&automation, &previous_trigger, watch_command_changed)?
+        .ok_or_else(|| ApiError::conflict("automation changed; retry your update"))?;
     state.emit(Event::AutomationUpdated {
         automation: automation.clone(),
     });
@@ -2480,6 +2556,24 @@ async fn run_automation(
     Ok(Json(
         automations::run_now(&state, &automation, &caller.member.display_name).await?,
     ))
+}
+
+async fn test_automation(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+) -> ApiResult<Json<WatchTestResult>> {
+    let automation = state
+        .store
+        .automation(&id)?
+        .ok_or_else(|| ApiError::not_found("automation not found"))?;
+    require_automation_access(&state, &caller, &automation)?;
+    if !matches!(automation.trigger, AutomationTrigger::Watch { .. }) {
+        return Err(ApiError::bad_request(
+            "only watch automations can be tested",
+        ));
+    }
+    Ok(Json(automations::test_watch(&state, &automation).await?))
 }
 
 async fn automation_debug(
@@ -3346,6 +3440,67 @@ mod tests {
         assert!(system.memory_total > 0);
         assert!(system.memory_used <= system.memory_total);
         assert!(system.process_memory > 0);
+    }
+
+    fn watch_input(enabled: bool, command: &str) -> CreateAutomation {
+        CreateAutomation {
+            name: "Watch".into(),
+            description: String::new(),
+            trigger: AutomationTrigger::Watch {
+                command: command.into(),
+                every_seconds: 60,
+            },
+            agent_id: "agent".into(),
+            action: AutomationAction::CreateTask,
+            instructions: String::new(),
+            context_channel_id: None,
+            report_channel_id: None,
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn watches_must_validate_the_current_command_before_enablement() {
+        let paused = watch_input(false, "scan");
+        assert!(require_watch_validation(None, &paused).is_ok());
+        assert!(require_watch_validation(None, &watch_input(true, "scan")).is_err());
+
+        let existing = Automation {
+            id: "watch".into(),
+            name: "Watch".into(),
+            description: String::new(),
+            enabled: false,
+            trigger: paused.trigger.clone(),
+            agent_id: "agent".into(),
+            action: AutomationAction::CreateTask,
+            instructions: String::new(),
+            context_channel_id: None,
+            report_channel_id: None,
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 1,
+            last_run_at: None,
+            next_run_at: None,
+            last_success_at: Some(2),
+            last_error_at: None,
+            last_error: None,
+            last_validated_at: Some(2),
+            failure_count: 0,
+        };
+        assert!(require_watch_validation(Some(&existing), &watch_input(true, "scan")).is_ok());
+        assert!(require_watch_validation(Some(&existing), &watch_input(true, "changed")).is_err());
+        assert!(watch_schedule_changed(
+            &existing.trigger,
+            &AutomationTrigger::Watch {
+                command: "scan".into(),
+                every_seconds: 300,
+            }
+        ));
     }
 
     #[test]

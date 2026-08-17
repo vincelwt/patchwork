@@ -970,7 +970,7 @@ pub enum AutomationTrigger {
         /// Standard five-field cron (`min hour day month weekday`).
         expression: String,
     },
-    /// A command polled on a timer, firing only when it prints something.
+    /// A command polled on a timer, firing only for structured events.
     /// A watcher that finds nothing costs a process, not a model call, which
     /// is what makes polling every minute affordable.
     Watch {
@@ -1056,8 +1056,25 @@ pub struct Automation {
     pub last_run_at: Option<Millis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_validated_at: Option<Millis>,
     #[serde(default)]
     pub failure_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchTestResult {
+    pub ok: bool,
+    pub event_count: usize,
+    pub tested_at: Millis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

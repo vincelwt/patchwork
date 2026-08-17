@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { Message } from "../../../client/types.ts";
-import { isSameTurn, pullRequestLabel, relative } from "./format.ts";
+import type { Automation, Message } from "../../../client/types.ts";
+import { isSameTurn, pullRequestLabel, relative, watchHealth, watchNeedsTest } from "./format.ts";
 
 test("relative time works without Intl.RelativeTimeFormat", () => {
   const now = 1_800_000_000_000;
@@ -43,6 +43,47 @@ test("consecutive lines from one author collapse into a single turn", () => {
   // A reply or an agent run belongs to its own message, headers and all.
   assert.equal(isSameTurn(first, line({ reply_to_id: "earlier" })), false);
   assert.equal(isSameTurn(first, line({ run_id: "run" })), false);
+});
+
+test("a watch reads as healthy from its last successful check, not its last attempt", () => {
+  const now = 1_800_000_000_000;
+  const watch = (over: Partial<Automation>): Automation =>
+    ({
+      trigger: { type: "watch", command: "check", every_seconds: 60 },
+      failure_count: 0,
+      ...over,
+    }) as Automation;
+
+  // A command that has been failing all week still has a fresh last_run_at.
+  assert.deepEqual(
+    watchHealth(watch({ last_run_at: now, failure_count: 3, last_error_at: now - 120_000 }), now),
+    { tone: "danger", text: "3 failed checks · 2 minutes ago" },
+  );
+  assert.deepEqual(watchHealth(watch({ last_success_at: now - 60_000 }), now), {
+    tone: "positive",
+    text: "Checked 1 minute ago",
+  });
+  assert.deepEqual(watchHealth(watch({ last_run_at: now }), now), {
+    tone: "caution",
+    text: "Never tested",
+  });
+});
+
+test("only a watch command that already passed skips the test before enabling", () => {
+  const validated = {
+    trigger: { type: "watch", command: "check", every_seconds: 60 },
+    last_validated_at: 1,
+    failure_count: 0,
+  } as Automation;
+
+  assert.equal(watchNeedsTest(validated, { type: "watch", command: "check" }), false);
+  assert.equal(watchNeedsTest(validated, { type: "watch", command: "check --new" }), true);
+  assert.equal(watchNeedsTest(undefined, { type: "watch", command: "check" }), true);
+  assert.equal(watchNeedsTest(undefined, { type: "cron" }), false);
+  assert.equal(
+    watchNeedsTest({ ...validated, last_validated_at: undefined }, { type: "watch", command: "check" }),
+    true,
+  );
 });
 
 test("pull request labels fall back to the URL number", () => {

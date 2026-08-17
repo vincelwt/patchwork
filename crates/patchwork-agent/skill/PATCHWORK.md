@@ -323,6 +323,7 @@ patchwork automation show "PR feedback"
 patchwork automation create --name "PR feedback" --agent @dev-agent \
   --trigger pull-request --action continue-task \
   --instructions "Address review comments, then re-request review."
+patchwork automation test "Morning sweep"  # validates a watch without firing it
 patchwork automation pause "Morning sweep"
 patchwork automation resume "Morning sweep"
 patchwork automation delete "Morning sweep"
@@ -332,8 +333,8 @@ patchwork automation create --name "Bug reports" --agent @dev-agent \
   --trigger webhook --action create-task \
   --instructions "Triage the report in the payload, and fix it if it is small."
 
-# Watch for it yourself: a command polled on the relay that wakes the agent
-# only when it prints something it did not print last time.
+# Watch for it yourself: a validated command polled on the relay that wakes the
+# agent only for structured events.
 patchwork automation create --name "Failed signups" --agent @dev-agent \
   --trigger watch --every 300 --command 'scripts/scan-signup-errors.sh' \
   --action create-task --instructions "Find the cause of what the scan found."
@@ -357,13 +358,14 @@ workspace.
 Add `?once=your-key` and a redelivery of the same event is dropped instead of
 acting twice, so whatever calls it is free to retry.
 
-**Watches.** The command runs on the relay every `--every` seconds. No output,
-or a non-zero exit, means nothing happened: no run, no cost, so checking every
-minute is fine. Printing the same thing as last time is not a new finding
-either, which is why the obvious one-liner needs no state of its own. When it
-does need state, `$PATCHWORK_STATE_DIR` is a directory kept between polls.
-Write the scan as a script in the project and point the command at it, rather
-than cramming it into one line.
+**Watches.** The command runs on the relay every `--every` seconds. Exit 0 with
+empty stdout is the only healthy no-op: no run, no cost, so checking every
+minute is fine. A non-zero exit, timeout, or any non-empty stdout that is not a
+valid structured event is a visible failure. Patchwork test-runs new watches
+before enabling them; run `patchwork automation test <name>` after changing a
+command. `$PATCHWORK_STATE_DIR` is a directory kept between polls. Write the
+scan as a script in the project and point the command at it, rather than
+cramming it into one line.
 
 A watch that creates tasks can print one compact JSON object per line:
 
@@ -375,9 +377,8 @@ A watch that creates tasks can print one compact JSON object per line:
 replay. `condition_key` identifies the durable condition across the workspace
 and reuses its open task, so namespace it to its project or source. `title`
 names the work, `outcome` defines done, and `context` is preserved in the task discussion.
-Each line becomes one task event. Write diagnostics to stderr: if any non-empty
-stdout line is not a valid structured event, Patchwork treats the whole output
-as one legacy text finding.
+Each line becomes one task event. Write diagnostics to stderr. Invalid output
+increments the watch's consecutive failure count instead of waking an agent.
 
 Pause, resume and delete take a name as readily as an id, because that is how
 somebody will ask you for it.
