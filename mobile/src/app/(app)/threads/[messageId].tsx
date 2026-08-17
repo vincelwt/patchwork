@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { FlatList, StyleSheet, View } from "react-native";
 import { Stack, useLocalSearchParams } from "expo-router";
 
@@ -7,11 +7,13 @@ import { MessageRow } from "@/components/Message";
 import { Empty, Measured } from "@/components/ui";
 import { followNewest } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
+import type { Message } from "@client/types";
 
 export default function ThreadScreen() {
   const { messageId } = useLocalSearchParams<{ messageId: string }>();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
+  const list = useRef<FlatList<Message>>(null);
   const root = useMemo(
     () => Object.values(workspace.messages).flat().find((message) => message.id === messageId),
     [messageId, workspace.messages],
@@ -25,7 +27,13 @@ export default function ThreadScreen() {
 
   useEffect(() => {
     void store.loadThread(messageId);
-  }, [messageId, store]);
+    if (!channel) return;
+    return store.onMessageSent(channel.id, messageId, () =>
+      requestAnimationFrame(() =>
+        list.current?.scrollToOffset({ offset: 0, animated: true }),
+      ),
+    );
+  }, [channel?.id, messageId, store]);
 
   return (
     <View style={styles.fill}>
@@ -35,6 +43,7 @@ export default function ThreadScreen() {
       ) : (
         <>
           <FlatList
+            ref={list}
             inverted
             data={newestFirst}
             keyExtractor={(message) => message.id}
@@ -45,7 +54,12 @@ export default function ThreadScreen() {
             maintainVisibleContentPosition={followNewest}
             keyboardDismissMode="interactive"
           />
-          <Composer channelId={channel.id} parentId={messageId} taskId={channel.task_id} placeholder="Reply in thread" />
+          <Composer
+            channelId={channel.id}
+            parentId={messageId}
+            taskId={channel.task_id}
+            placeholder="Reply in thread"
+          />
         </>
       )}
     </View>

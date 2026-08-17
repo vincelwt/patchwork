@@ -119,8 +119,8 @@ async fn post_message_inner(
         }
     }
 
-    // Two attempts racing here is the unique index's job: the loser fails, and
-    // its next retry is answered from the existing message by the API.
+    // Two attempts racing here is the unique index's job. The API catches the
+    // loser, reads this winner, and returns the same message to both callers.
     state.store.insert_message_as(&message, client_id)?;
     let stored = state
         .store

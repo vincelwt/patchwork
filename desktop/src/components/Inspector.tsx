@@ -64,6 +64,7 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
   const app = useApp();
   const handles = useHandles();
   const [dropped, setDropped] = useState<File[]>([]);
+  const [sent, setSent] = useState<{ parentId: Id; messageId: Id }>();
   const clearDropped = useCallback(() => setDropped([]), []);
   const replies = app.threads[messageId];
   // Flattening every loaded channel to find one message is a lot of work to
@@ -79,11 +80,16 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
     (candidate) => candidate.id === root?.channel_id,
   );
   const authorOf = (id: Id) => app.members.find((member) => member.id === id);
-  const { scrollerRef, contentRef, updatePinned } = useBottomAnchor(messageId, 60);
+  const { scrollerRef, contentRef, scrollToEnd, updatePinned } =
+    useBottomAnchor(messageId, 60);
 
   useEffect(() => {
     void store.loadThread(messageId);
   }, [messageId]);
+
+  useEffect(() => {
+    if (sent?.parentId === messageId) scrollToEnd(true);
+  }, [messageId, scrollToEnd, sent]);
 
   if (!root || !channel) return <Empty title="That message is gone" />;
 
@@ -115,6 +121,7 @@ function ThreadPanel({ messageId }: { messageId: Id }) {
         placeholder="Reply…"
         incoming={dropped}
         onConsumed={clearDropped}
+        onSent={(message) => setSent({ parentId: messageId, messageId: message.id })}
       />
     </DropZone>
   );

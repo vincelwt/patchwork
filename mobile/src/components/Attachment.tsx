@@ -144,8 +144,12 @@ export function useImageAttachments(taskId?: Id) {
       setPending((current) => current.filter((item) => item.id !== id));
       setError("");
     },
-    clear: () => {
-      setPending([]);
+    clear: (ids?: Id[]) => {
+      setPending((current) =>
+        ids
+          ? current.filter((item) => !item.attachment || !ids.includes(item.attachment.id))
+          : [],
+      );
       setError("");
     },
   };

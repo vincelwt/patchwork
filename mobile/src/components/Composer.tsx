@@ -11,6 +11,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { outboxFor } from "@client/mobile-store-reducer";
+import { beginSend } from "@client/send";
 import type { Id, Message } from "@client/types";
 import { composerKey } from "@/lib/composer";
 import { useDictation } from "@/lib/dictation";
@@ -54,6 +55,7 @@ function ComposerBox({
   const text = workspace.drafts[draftKey] ?? "";
   const images = useImageAttachments(taskId);
   const [busy, setBusy] = useState(false);
+  const sendLock = useRef(false);
   const [error, setError] = useState("");
   const typingAt = useRef(0);
   const input = useRef<TextInput>(null);
@@ -97,7 +99,7 @@ function ComposerBox({
   /// The draft is only cleared once the message is durably queued, so a send
   /// that cannot leave the phone yet still leaves the composer.
   const send = async () => {
-    if (empty || busy || !images.ready) return;
+    if (empty || !images.ready || !beginSend(sendLock)) return;
     setBusy(true);
     setError("");
     try {
@@ -108,12 +110,15 @@ function ComposerBox({
         body: text.trim(),
         attachmentIds: images.attachmentIds,
       });
-      store.setDraft(draftKey, "");
-      images.clear();
+      if (store.getSnapshot().drafts[draftKey] === text) {
+        store.setDraft(draftKey, "");
+      }
+      images.clear(images.attachmentIds);
       onCancelReply?.();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
+      sendLock.current = false;
       setBusy(false);
     }
   };

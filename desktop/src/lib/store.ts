@@ -394,9 +394,10 @@ class Session {
     }
   }
 
-  private upsertMessage(message: Message, replaceOnly = false) {
+  upsertMessage(message: Message, replaceOnly = false) {
     if (message.parent_id) {
       const thread = this.data.threads[message.parent_id];
+      const alreadyPresent = thread?.some((item) => item.id === message.id) ?? false;
       if (thread || this.loadingThreads.has(message.parent_id)) {
         this.set({
           threads: {
@@ -413,7 +414,11 @@ class Session {
             ...this.data.messages,
             [message.channel_id]: list.map((m) =>
               m.id === message.parent_id
-                ? { ...m, reply_count: m.reply_count + (replaceOnly ? 0 : 1) }
+                ? {
+                    ...m,
+                    reply_count:
+                      m.reply_count + (replaceOnly || alreadyPresent ? 0 : 1),
+                  }
                 : m,
             ),
           },
@@ -707,6 +712,9 @@ class Workspaces {
   }
   upsertChannel(channel: Channel) {
     this.session?.upsertChannel(channel);
+  }
+  acceptMessage(workspaceId: Id, message: Message) {
+    this.sessions.get(workspaceId)?.upsertMessage(message);
   }
   loadOlder(channelId: Id) {
     return this.session?.loadOlder(channelId) ?? Promise.resolve();

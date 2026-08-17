@@ -123,6 +123,18 @@ test("only a failure that may pass later is retried automatically", () => {
   }
 });
 
+test("a message sent while its first page loads is kept", () => {
+  let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");
+  state = applyEnvelope(state, {
+    seq: 11,
+    at: 2,
+    kind: "message_created",
+    message: message(2),
+  } as Envelope);
+
+  assert.deepEqual(state.messages.c1, [message(2)]);
+});
+
 test("inline replies stay in the channel timeline", () => {
   let state = touchChannel(applyBootstrap(emptyWorkspaceData(), bootstrap), "c1");
   state = { ...state, messages: { c1: [] } };

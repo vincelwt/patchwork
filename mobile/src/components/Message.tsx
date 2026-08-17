@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -29,6 +29,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
   const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
+  const list = useRef<FlatList<Message>>(null);
   const channel = workspace.bootstrap?.channels.find((item) => item.id === channelId);
   const messages = workspace.messages[channelId] ?? [];
   const [replyTo, setReplyTo] = useState<Message>();
@@ -41,6 +42,11 @@ export function Conversation({ channelId }: { channelId: Id }) {
   useEffect(() => {
     setReplyTo(undefined);
     void store.loadMessages(channelId);
+    return store.onMessageSent(channelId, undefined, () =>
+      requestAnimationFrame(() =>
+        list.current?.scrollToOffset({ offset: 0, animated: true }),
+      ),
+    );
   }, [channelId, store]);
 
   if (!channel) return <Empty title="Conversation unavailable" detail="It may have been archived or removed." />;
@@ -48,6 +54,7 @@ export function Conversation({ channelId }: { channelId: Id }) {
   return (
     <View style={styles.conversation}>
       <FlatList
+        ref={list}
         inverted
         data={newestFirst}
         keyExtractor={(message) => message.id}

@@ -986,7 +986,8 @@ async fn send_message(
             ));
         }
     }
-    let message = orchestrator::post_message(
+    let client_id = input.client_id.clone();
+    let posted = orchestrator::post_message(
         &state,
         &id,
         &caller.member.id,
@@ -996,8 +997,22 @@ async fn send_message(
             run_id: caller.run_id.clone(),
         },
     )
-    .await?;
-    Ok(Json(message))
+    .await;
+    match posted {
+        Ok(message) => Ok(Json(message)),
+        Err(error) => {
+            if let Some(client_id) = client_id {
+                if let Some(existing) =
+                    state
+                        .store
+                        .message_by_client_id(&caller.member.id, &id, &client_id)?
+                {
+                    return Ok(Json(existing));
+                }
+            }
+            Err(error.into())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3677,7 +3692,7 @@ mod tests {
         .await
         .unwrap();
         let Json(retried) = send_message(
-            State(state),
+            State(state.clone()),
             caller(),
             Path("one".into()),
             Json(SendMessage {
@@ -3690,6 +3705,23 @@ mod tests {
         .unwrap();
         assert_eq!(retried.id, first.id);
         assert_eq!(store.messages("one", None, 50).unwrap().0.len(), 1);
+
+        let client_id = new_id();
+        let input = SendMessage {
+            body: "Race me".into(),
+            client_id: Some(client_id),
+            ..Default::default()
+        };
+        let first_send = send_message(
+            State(state.clone()),
+            caller(),
+            Path("one".into()),
+            Json(input.clone()),
+        );
+        let second_send = send_message(State(state), caller(), Path("one".into()), Json(input));
+        let (first_race, second_race) = tokio::join!(first_send, second_send);
+        assert_eq!(first_race.unwrap().0.id, second_race.unwrap().0.id);
+        assert_eq!(store.messages("one", None, 50).unwrap().0.len(), 2);
 
         drop(store);
         let _ = std::fs::remove_file(path);
