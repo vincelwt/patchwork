@@ -2537,8 +2537,12 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
             run: automation_run.clone(),
         });
 
-        if run.status == RunStatus::Failed {
-            crate::automations::report_failure(state, &automation_run, run).await?;
+        match run.status {
+            RunStatus::Failed => {
+                crate::automations::report_failure(state, &automation_run, run).await?
+            }
+            RunStatus::Succeeded => crate::automations::report_success(state, &automation_run)?,
+            _ => {}
         }
     }
 

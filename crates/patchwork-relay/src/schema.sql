@@ -316,6 +316,12 @@ CREATE TABLE IF NOT EXISTS automations (
   created_at         INTEGER NOT NULL,
   last_run_at        INTEGER,
   next_run_at        INTEGER,
+  last_success_at    INTEGER,
+  last_error_at      INTEGER,
+  last_error         TEXT,
+  last_validated_at  INTEGER,
+  failure_notification_key TEXT,
+  execution_failure_notification_key TEXT,
   failure_count      INTEGER NOT NULL DEFAULT 0
 );
 

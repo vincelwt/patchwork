@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
-import type { AutomationDebug } from "@client/types";
+import type { AutomationDebug, WatchTestResult } from "@client/types";
 import { AutomationEditor } from "@/components/AutomationEditor";
 import { Badge, Button, Card, Empty, ErrorNotice, Measured, Sheet } from "@/components/ui";
-import { relative, runStatusLabel, triggerLabel } from "@/lib/format";
+import { relative, runStatusLabel, triggerLabel, watchValidated } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -22,6 +22,8 @@ export default function AutomationScreen() {
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [test, setTest] = useState<WatchTestResult>();
 
   const load = async () => {
     try {
@@ -73,8 +75,38 @@ export default function AutomationScreen() {
               label={automation.enabled ? "Pause" : "Resume"}
               compact
               tone="secondary"
-              onPress={() => void store.mutate((api) => api.updateAutomation(automation.id, { ...automation, enabled: !automation.enabled }))}
+              onPress={async () => {
+                setError("");
+                try {
+                  // Resuming a watch the relay has not validated is refused,
+                  // and a refusal nobody sees looks like a dead button.
+                  await store.mutate((api) => api.updateAutomation(automation.id, { ...automation, enabled: !automation.enabled }));
+                } catch (caught) {
+                  setError(caught instanceof Error ? caught.message : String(caught));
+                }
+              }}
             />
+            {automation.trigger.type === "watch" ? (
+              <Button
+                label="Test watch"
+                compact
+                tone="secondary"
+                busy={testing}
+                onPress={async () => {
+                  setTesting(true);
+                  setError("");
+                  try {
+                    // Runs the command and records what it printed, without
+                    // firing the action.
+                    await store.mutate((api) => api.testAutomation(automation.id), true, setTest);
+                  } catch (caught) {
+                    setError(caught instanceof Error ? caught.message : String(caught));
+                  } finally {
+                    setTesting(false);
+                  }
+                }}
+              />
+            ) : null}
             <Button label="Delete" compact tone="danger" onPress={() => setDeleting(true)} />
           </View>
         </Card>
@@ -92,10 +124,37 @@ export default function AutomationScreen() {
             </Text>
           </Card>
         ) : null}
+        {/* A watch that quietly stopped working is the failure worth surfacing,
+            so its command, its last good check and its last error sit together. */}
         {automation.trigger.type === "watch" ? (
           <Card style={styles.instructions}>
             <Text style={{ color: theme.text, fontWeight: "700" }}>Command</Text>
             <Text selectable style={{ color: theme.muted, fontFamily: "monospace" }}>{automation.trigger.command}</Text>
+            <View style={styles.meta}>
+              <Badge tone={automation.failure_count ? "danger" : automation.last_success_at ? "positive" : "caution"}>
+                {automation.last_success_at ? `Last good check ${relative(automation.last_success_at)}` : "No good check yet"}
+              </Badge>
+              <Badge tone={watchValidated(automation) ? "positive" : "caution"}>
+                {watchValidated(automation)
+                  ? `Validated${automation.last_validated_at ? ` ${relative(automation.last_validated_at)}` : ""}`
+                  : "Not validated"}
+              </Badge>
+              {automation.failure_count ? (
+                <Badge tone="danger">{automation.failure_count} failed in a row</Badge>
+              ) : null}
+            </View>
+            {automation.last_error ? (
+              <Text selectable style={{ color: theme.danger, lineHeight: 20 }}>
+                Failed {relative(automation.last_error_at)}: {automation.last_error}
+              </Text>
+            ) : null}
+            {test ? (
+              <Text style={{ color: test.ok ? theme.positive : theme.danger, lineHeight: 20 }}>
+                {test.ok
+                  ? `Tested ${relative(test.tested_at)}: the command ran and printed ${test.event_count} event${test.event_count === 1 ? "" : "s"}. Nothing was fired.`
+                  : `Tested ${relative(test.tested_at)}, and it failed: ${test.error ?? "no diagnostic"}`}
+              </Text>
+            ) : null}
           </Card>
         ) : null}
         <Text style={[styles.section, { color: theme.faint }]}>Runs</Text>

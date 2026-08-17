@@ -31,6 +31,7 @@ import type {
   Task,
   TaskDetail,
   TaskStatus,
+  WatchTestResult,
   Workspace,
   WorkspaceSkill,
 } from "./types";
@@ -345,6 +346,10 @@ export class Api {
 
   runAutomation(id: Id) {
     return this.post<AutomationRun>(`/api/automations/${id}/run`);
+  }
+
+  testAutomation(id: Id) {
+    return this.post<WatchTestResult>(`/api/automations/${id}/test`);
   }
 
   automationDebug(id: Id) {

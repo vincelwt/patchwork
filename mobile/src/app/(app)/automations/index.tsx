@@ -5,7 +5,7 @@ import { Stack, useRouter } from "expo-router";
 import type { Automation } from "@client/types";
 import { AutomationEditor } from "@/components/AutomationEditor";
 import { Avatar, Badge, Button, Empty, Grouped, Sheet } from "@/components/ui";
-import { relative, triggerLabel } from "@/lib/format";
+import { relative, triggerLabel, watchHealth } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -43,6 +43,9 @@ export default function AutomationsScreen() {
 
   function AutomationRow({ automation }: { automation: Automation }) {
     const agent = workspace.bootstrap?.members.find((member) => member.id === automation.agent_id);
+    // A watch is only as good as its last successful check: last_run_at stays
+    // fresh while the command fails, which is how a dead watch looks healthy.
+    const health = automation.trigger.type === "watch" ? watchHealth(automation) : undefined;
     return (
       <Pressable
         onPress={() => router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: automation.id } })}
@@ -55,9 +58,15 @@ export default function AutomationsScreen() {
             <Badge tone={automation.enabled ? "positive" : "neutral"}>{automation.enabled ? "on" : "paused"}</Badge>
           </View>
           <Text numberOfLines={1} style={{ color: theme.muted }}>{triggerLabel(automation.trigger)} · {agent?.display_name ?? "no agent"}</Text>
-          <Text style={[styles.time, { color: theme.faint }]}>{automation.next_run_at ? `Next ${relative(automation.next_run_at)}` : automation.last_run_at ? `Last ${relative(automation.last_run_at)}` : "Never run"}</Text>
+          <Text style={[styles.time, { color: health?.tone === "danger" ? theme.danger : theme.faint }]}>
+            {health
+              ? health.text
+              : automation.next_run_at ? `Next ${relative(automation.next_run_at)}` : automation.last_run_at ? `Last ${relative(automation.last_run_at)}` : "Never run"}
+          </Text>
         </View>
-        {automation.failure_count ? <Badge tone="danger">{automation.failure_count} failed</Badge> : null}
+        {health ? (
+          health.tone === "danger" ? <Badge tone="danger">failing</Badge> : null
+        ) : automation.failure_count ? <Badge tone="danger">{automation.failure_count} failed</Badge> : null}
         <Button label="Run" compact tone="quiet" onPress={() => void store.mutate((api) => api.runAutomation(automation.id))} />
       </Pressable>
     );

@@ -407,10 +407,10 @@ enum AutomationCommand {
         /// Seconds between runs, for `--trigger schedule` and `--trigger watch`.
         #[arg(long)]
         every: Option<i64>,
-        /// Shell command for `--trigger watch`. It runs on the relay every
-        /// `--every` seconds and only fires the agent when it prints
-        /// something new. One JSON object per line can provide `event_key`,
-        /// `condition_key`, task `title`/`outcome`, and `context`.
+        /// Shell command for `--trigger watch`. Exit 0 with no output is a
+        /// healthy no-op. Findings must be one JSON object per line with
+        /// `event_key`, `condition_key`, task `title`/`outcome`, and `context`.
+        /// The command is test-run before the watch is enabled.
         /// `$PATCHWORK_STATE_DIR` is its own directory, kept between polls.
         #[arg(long)]
         command: Option<String>,
@@ -432,6 +432,11 @@ enum AutomationCommand {
     },
     Run {
         id: String,
+    },
+    /// Run and validate a watch command without firing its action.
+    Test {
+        /// Id or name.
+        reference: String,
     },
     /// Stop it firing, without losing it.
     Pause {
@@ -1850,6 +1855,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 "continue-task" => "continue_task",
                 _ => "post_in_chat",
             };
+            let is_watch = trigger.get("type").and_then(Value::as_str) == Some("watch");
             let created: Automation = client
                 .post(
                     "/api/automations",
@@ -1863,10 +1869,23 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                         // was created from, not a copied-in prompt.
                         "context_channel_id": ctx.channel_id,
                         "report_channel_id": channel_id,
-                        "enabled": true,
+                        "enabled": !is_watch,
                     }),
                 )
                 .await?;
+            let created = if is_watch {
+                let result = test_watch_command(client, &created).await?;
+                if !result.ok {
+                    bail!(
+                        "watch validation failed; `{}` remains paused: {}",
+                        created.name,
+                        result.error.unwrap_or_else(|| "unknown error".into())
+                    );
+                }
+                set_enabled(client, &created.id, true).await?
+            } else {
+                created
+            };
             client.print(&created, || {
                 println!("created automation {}", created.name);
                 // The URL is the whole automation for a webhook trigger, and
@@ -1887,6 +1906,23 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 .await?;
             client.print(&run, || println!("automation fired"));
         }
+        AutomationCommand::Test { reference } => {
+            let automation = resolve_automation(client, &reference).await?;
+            let result = test_watch_command(client, &automation).await?;
+            if !result.ok {
+                bail!(
+                    "watch validation failed: {}",
+                    result.error.unwrap_or_else(|| "unknown error".into())
+                );
+            }
+            client.print(&result, || {
+                println!(
+                    "watch validated; {} event{} would fire",
+                    result.event_count,
+                    if result.event_count == 1 { "" } else { "s" }
+                )
+            });
+        }
         AutomationCommand::Show { reference } => {
             let automation = resolve_automation(client, &reference).await?;
             let debug: AutomationDebug = client
@@ -1905,6 +1941,17 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 );
                 if !debug.automation.instructions.trim().is_empty() {
                     println!("Instructions: {}", debug.automation.instructions.trim());
+                }
+                if let Some(at) = debug.automation.last_success_at {
+                    println!("Last success: {}", display_millis(at));
+                }
+                if let Some(error) = &debug.automation.last_error {
+                    let at = debug
+                        .automation
+                        .last_error_at
+                        .map(display_millis)
+                        .unwrap_or_else(|| "unknown time".into());
+                    println!("Last error: {at} · {error}");
                 }
                 for run in debug.runs.iter().take(10) {
                     println!(
@@ -1935,6 +1982,21 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
         }
     }
     Ok(())
+}
+
+async fn test_watch_command(client: &Client, automation: &Automation) -> Result<WatchTestResult> {
+    client
+        .post(
+            &format!("/api/automations/{}/test", automation.id),
+            json!({}),
+        )
+        .await
+}
+
+fn display_millis(at: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| at.to_string())
 }
 
 /// An automation by id or by name, because a person tells an agent to pause
@@ -2096,6 +2158,16 @@ mod tests {
             build_trigger("schedule", Some(3600), None, None, None, None).unwrap()["every_seconds"],
             3600
         );
+    }
+
+    #[test]
+    fn watch_test_command_is_discoverable() {
+        let cli =
+            Cli::try_parse_from(["patchwork", "automation", "test", "Release watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Automation(AutomationCommand::Test { reference }) if reference == "Release watch"
+        ));
     }
 
     #[test]
