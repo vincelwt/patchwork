@@ -191,6 +191,9 @@ patchwork task create --title "Cache the pricing endpoint" \
 ```
 
 `--owner @me` is you, and `--start` opens the task's own run and worktree.
+Tasks assigned to an agent start immediately by default, even if `--start` is
+omitted. To deliberately defer one, pass `--status planned` and say what it is
+waiting for. If its work can proceed now, never leave it Planned.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,

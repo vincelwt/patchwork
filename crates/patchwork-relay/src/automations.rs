@@ -420,6 +420,8 @@ async fn dispatch(
                     outcome,
                     initial_message: Some(initial_message.clone()),
                     owner_id: Some(automation.agent_id.clone()),
+                    // The automation starts this task itself below, with its trigger context.
+                    status: Some(TaskStatus::Planned),
                     once_key,
                     source_channel_id: report_channel.clone(),
                     project_id: automation.project_id.clone(),

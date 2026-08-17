@@ -364,75 +364,6 @@ fn conversation_messages(store: &Store, message: &Message, limit: usize) -> Resu
     Ok(messages)
 }
 
-/// The agent a message is plainly a reply to, if any.
-///
-/// Deliberately narrow. Only the agent that spoke last, only if it spoke
-/// recently, only if it was answering *this* person, and only when the new
-/// message does not name somebody else instead. Say `@other-agent` and you
-/// meant that one, not the one still on screen.
-fn continuation_target(state: &Shared, message: &Message, author: &Member) -> Result<Option<Id>> {
-    if author.kind != MemberKind::Human || !message.mentions.is_empty() {
-        return Ok(None);
-    }
-
-    let recent = conversation_messages(&state.store, message, 6)?;
-    let Some(previous) = recent
-        .iter()
-        .rev()
-        .find(|candidate| candidate.id != message.id && candidate.kind != MessageKind::System)
-    else {
-        return Ok(None);
-    };
-    let Some(run_id) = &previous.run_id else {
-        return Ok(None);
-    };
-    let Some(run) = state.store.run(run_id)? else {
-        return Ok(None);
-    };
-
-    // Who the previous run was answering. An agent's aside to somebody else is
-    // not an invitation to have your next sentence routed into it.
-    let spoke_to = match &run.trigger {
-        RunTrigger::Mention { message_id }
-        | RunTrigger::Reply { message_id }
-        | RunTrigger::DirectMessage { message_id }
-        | RunTrigger::Ambient { message_id } => {
-            state.store.message(message_id)?.map(|m| m.author_id)
-        }
-        RunTrigger::Manual { by } => Some(by.clone()),
-        _ => None,
-    };
-
-    Ok(continues_conversation(
-        message,
-        previous,
-        &run,
-        spoke_to.as_deref(),
-    ))
-}
-
-/// Long enough to cover a follow-up question, short enough that returning to a
-/// channel tomorrow starts a fresh conversation rather than resuming one nobody
-/// remembers.
-const CONTINUATION_WINDOW_MS: Millis = 10 * 60 * 1000;
-
-/// The rule itself, with the database left outside so it can be read — and
-/// tested — as the single sentence it is.
-fn continues_conversation(
-    message: &Message,
-    previous: &Message,
-    previous_run: &Run,
-    spoke_to: Option<&str>,
-) -> Option<Id> {
-    if message.created_at.saturating_sub(previous.created_at) > CONTINUATION_WINDOW_MS {
-        return None;
-    }
-    if spoke_to != Some(message.author_id.as_str()) {
-        return None;
-    }
-    Some(previous_run.agent_id.clone())
-}
-
 async fn notify_inbox(
     state: &Shared,
     message: &Message,
@@ -618,20 +549,7 @@ async fn trigger_agents(
         }
     }
 
-    // Who you are plainly still talking to.
-    //
-    // A person answers the agent that just answered them without saying its
-    // name again — that is how conversation works. Without this, the follow-up
-    // reaches an ambient agent as ambient chatter, it decides it has nothing to
-    // add, and the reply you were waiting for never comes. The reader is left
-    // with a working app that simply ignored them.
-    let continuing = if message.reply_to_id.is_none() {
-        continuation_target(state, message, &author)?
-    } else {
-        None
-    };
-    // A task is already addressed: its owner is the recipient. Ordinary room
-    // chat keeps the narrower recent-reply heuristic.
+    // A task is already addressed: its owner is the recipient.
     let task_owner = if author.kind == MemberKind::Human
         && message.mentions.is_empty()
         && message.reply_to_id.is_none()
@@ -679,10 +597,7 @@ async fn trigger_agents(
         }
 
         let owns_task = task_owner.as_deref() == Some(agent.id.as_str());
-        let addressed = replied_to_agent
-            || mentioned
-            || owns_task
-            || continuing.as_deref() == Some(agent.id.as_str());
+        let addressed = replied_to_agent || mentioned || owns_task;
 
         let should_run = if replied_to_agent {
             true
@@ -2993,6 +2908,10 @@ pub struct TaskCreation {
     pub created: bool,
 }
 
+fn should_start_task(start: bool, status: Option<TaskStatus>, owner_is_agent: bool) -> bool {
+    start || (status.is_none() && owner_is_agent)
+}
+
 /// Boxed: creating a task can fire an automation that creates a task.
 pub fn create_task<'a>(
     state: &'a Shared,
@@ -3025,6 +2944,15 @@ async fn create_task_inner(
             });
         }
     }
+
+    let owner_is_agent = match input.owner_id.as_deref() {
+        Some(owner_id) => state
+            .store
+            .member(owner_id)?
+            .is_some_and(|member| member.kind == MemberKind::Agent),
+        None => false,
+    };
+    let start = should_start_task(input.start, input.status, owner_is_agent);
 
     let key = state.store.next_task_key()?;
     let now = now_ms();
@@ -3171,7 +3099,7 @@ async fn create_task_inner(
 
     crate::automations::on_task_change(state, &task, None).await;
 
-    if input.start {
+    if start {
         if let Some(owner) = task.owner_id.clone() {
             if state.store.member(&owner)?.map(|m| m.kind) == Some(MemberKind::Agent) {
                 let params = StartRunParams {
@@ -3934,6 +3862,7 @@ mod tests {
     async fn replies_and_mentions_only_invoke_the_target_agent() {
         let path = std::env::temp_dir().join(format!("patchwork-reply-{}.sqlite", new_id()));
         let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
         let human = member("human", "vince", MemberKind::Human);
         let mut target = member("target", "target", MemberKind::Agent);
         target.agent.as_mut().unwrap().default_participation = Participation::Off;
@@ -4053,9 +3982,38 @@ mod tests {
             "unmentioned ambient agents must not join an explicit mention"
         );
 
+        let mut answer = message_at("answer", "target", 5, Some(&run.id));
+        answer.channel_id = channel.id.clone();
+        answer.body = "Original answer".into();
+        store.insert_message(&answer).unwrap();
+        let mut plain_followup = message_at("plain-followup", "human", 6, None);
+        plain_followup.channel_id = channel.id.clone();
+        plain_followup.body = "One more thing".into();
+        store.insert_message(&plain_followup).unwrap();
+        trigger_agents(&state, &plain_followup, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected the ambient agent to start");
+        };
+        assert_eq!(spec.agent_id, "ambient");
+        assert!(
+            rx.try_recv().is_err(),
+            "a plain follow-up must not invoke an only-when-mentioned agent"
+        );
+
         drop(state);
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_owned_tasks_start_unless_explicitly_planned() {
+        assert!(should_start_task(false, None, true));
+        assert!(should_start_task(true, Some(TaskStatus::Planned), true));
+        assert!(!should_start_task(false, Some(TaskStatus::Planned), true));
+        assert!(!should_start_task(false, None, false));
     }
 
     #[test]
@@ -4209,66 +4167,6 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(path);
-    }
-
-    fn run_by(agent: &str) -> Run {
-        Run {
-            id: "r1".into(),
-            agent_id: agent.into(),
-            status: RunStatus::Succeeded,
-            trigger: RunTrigger::Manual { by: "vince".into() },
-            channel_id: "c".into(),
-            task_id: None,
-            host_id: None,
-            project_id: None,
-            worktree_id: None,
-            cwd: None,
-            automation_id: None,
-            session_id: None,
-            runtime: "claude".into(),
-            provider: None,
-            model: None,
-            thinking: None,
-            prompt: String::new(),
-            headline: String::new(),
-            error: None,
-            token_usage: None,
-            created_at: 0,
-            started_at: None,
-            ended_at: None,
-        }
-    }
-
-    #[test]
-    fn answering_the_agent_that_just_answered_you_counts_as_talking_to_it() {
-        let reply = message_at("m2", "agent", 1_000, Some("r1"));
-        let followup = message_at("m3", "vince", 5_000, None);
-        assert_eq!(
-            continues_conversation(&followup, &reply, &run_by("agent"), Some("vince")),
-            Some("agent".to_string()),
-            "a follow-up with no @ is still directed at whoever just replied",
-        );
-    }
-
-    #[test]
-    fn continuation_does_not_reach_across_a_long_gap() {
-        let reply = message_at("m2", "agent", 0, Some("r1"));
-        let much_later = message_at("m3", "vince", CONTINUATION_WINDOW_MS + 1, None);
-        assert_eq!(
-            continues_conversation(&much_later, &reply, &run_by("agent"), Some("vince")),
-            None,
-        );
-    }
-
-    #[test]
-    fn continuation_only_belongs_to_the_person_being_answered() {
-        let reply = message_at("m2", "agent", 1_000, Some("r1"));
-        let someone_else = message_at("m3", "mallory", 2_000, None);
-        assert_eq!(
-            continues_conversation(&someone_else, &reply, &run_by("agent"), Some("vince")),
-            None,
-            "overhearing an answer to somebody else is not a conversation with you",
-        );
     }
 
     #[test]

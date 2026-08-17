@@ -198,7 +198,8 @@ pub struct CreateTask {
     /// immutable original request.
     #[serde(default)]
     pub attachment_ids: Vec<Id>,
-    /// Start the owning agent immediately.
+    /// Start the owning agent immediately. Tasks assigned to an agent also
+    /// start by default unless `status` is explicitly `planned`.
     #[serde(default)]
     pub start: bool,
 }

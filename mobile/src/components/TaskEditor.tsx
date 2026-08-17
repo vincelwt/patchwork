@@ -52,6 +52,7 @@ export function TaskEditor({ task, onSaved }: { task?: Task; onSaved: (task: Tas
               project_id: project || undefined,
               due_at: due?.getTime() || undefined,
               attachment_ids: images.attachmentIds,
+              status: ownerMember?.kind === "agent" && !start ? "planned" : undefined,
               start: start && ownerMember?.kind === "agent",
             }),
         true,

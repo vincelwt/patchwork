@@ -873,12 +873,10 @@ export function NewTaskModal({
         project_id: project || undefined,
         source_channel_id: sourceChannelId,
         attachment_ids: attachmentIds,
-        // The relay writes the first message; the agent starts after it exists.
-        start: false,
+        // Turning Start now off is an explicit defer; agent-owned tasks otherwise start.
+        status: ownerIsAgent && !start ? "planned" : undefined,
+        start: start && ownerIsAgent,
       });
-      if (start && owner && ownerIsAgent) {
-        await api.runTask(task.id, { agent_id: owner });
-      }
       localStorage.removeItem(draftKey);
       if (after === "another") {
         setOutcome("");

@@ -335,7 +335,7 @@ enum TaskCommand {
         /// Create after reviewing the relay's possible-duplicate warning.
         #[arg(long)]
         allow_similar: bool,
-        /// Start the owning agent right away.
+        /// Start the owning agent right away (automatic for agent-owned tasks).
         #[arg(long)]
         start: bool,
     },
