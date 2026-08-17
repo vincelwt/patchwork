@@ -2908,13 +2908,8 @@ pub struct TaskCreation {
     pub created: bool,
 }
 
-fn should_start_task(
-    start: bool,
-    status: Option<TaskStatus>,
-    creator_is_agent: bool,
-    owner_is_agent: bool,
-) -> bool {
-    start || (status.is_none() && creator_is_agent && owner_is_agent)
+fn should_start_task(start: bool, status: Option<TaskStatus>, owner_is_agent: bool) -> bool {
+    start || (status.is_none() && owner_is_agent)
 }
 
 /// Boxed: creating a task can fire an automation that creates a task.
@@ -2950,10 +2945,6 @@ async fn create_task_inner(
         }
     }
 
-    let creator_is_agent = state
-        .store
-        .member(creator_id)?
-        .is_some_and(|member| member.kind == MemberKind::Agent);
     let owner_is_agent = match input.owner_id.as_deref() {
         Some(owner_id) => state
             .store
@@ -2961,7 +2952,7 @@ async fn create_task_inner(
             .is_some_and(|member| member.kind == MemberKind::Agent),
         None => false,
     };
-    let start = should_start_task(input.start, input.status, creator_is_agent, owner_is_agent);
+    let start = should_start_task(input.start, input.status, owner_is_agent);
 
     let key = state.store.next_task_key()?;
     let now = now_ms();
@@ -4018,22 +4009,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_handoffs_start_unless_explicitly_planned() {
-        assert!(should_start_task(false, None, true, true));
-        assert!(should_start_task(
-            true,
-            Some(TaskStatus::Planned),
-            true,
-            true
-        ));
-        assert!(!should_start_task(
-            false,
-            Some(TaskStatus::Planned),
-            true,
-            true
-        ));
-        assert!(!should_start_task(false, None, false, true));
-        assert!(!should_start_task(false, None, true, false));
+    fn agent_owned_tasks_start_unless_explicitly_planned() {
+        assert!(should_start_task(false, None, true));
+        assert!(should_start_task(true, Some(TaskStatus::Planned), true));
+        assert!(!should_start_task(false, Some(TaskStatus::Planned), true));
+        assert!(!should_start_task(false, None, false));
     }
 
     #[test]
