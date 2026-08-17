@@ -1450,31 +1450,7 @@ fn resolve_command(spec: &RunSpec) -> Result<Vec<String>> {
 }
 
 fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Result<Vec<(String, String)>> {
-    let mut env: Vec<(String, String)> = vec![
-        ("PATCHWORK".into(), "1".into()),
-        ("PATCHWORK_API_BASE".into(), spec.api_base.clone()),
-        ("PATCHWORK_TOKEN".into(), spec.api_token.clone()),
-        ("PATCHWORK_RUN_ID".into(), spec.run_id.clone()),
-        ("PATCHWORK_AGENT_ID".into(), spec.agent_id.clone()),
-        ("PATCHWORK_CHANNEL_ID".into(), spec.channel_id.clone()),
-        ("PATCHWORK_CWD".into(), cwd.to_string()),
-    ];
-    if let Some(task_id) = &spec.task_id {
-        env.push(("PATCHWORK_TASK_ID".into(), task_id.clone()));
-    }
-    if let Some(project_id) = &spec.project_id {
-        env.push(("PATCHWORK_PROJECT_ID".into(), project_id.clone()));
-    }
-    // The same PATH detection used, so a run finds what the machine reported —
-    // and so `npm test` works in an app that was opened from the Finder.
-    let path = detect::search_path();
-    env.push((
-        "PATH".into(),
-        match &cfg.cli_dir {
-            Some(dir) => format!("{dir}:{path}"),
-            None => path,
-        },
-    ));
+    let mut env = Vec::new();
     // Our own agent is Pi with a provider the workspace picked, pointed at a
     // config directory this app owns rather than the user's own `~/.pi`.
     if spec.runtime == detect::PATCHWORK_RUNTIME {
@@ -1487,6 +1463,34 @@ fn build_env(cfg: &RunnerConfig, spec: &RunSpec, cwd: &str) -> Result<Vec<(Strin
     env.extend(project_env(spec.project_name.as_deref()));
     env.extend(cfg.env.iter().cloned());
     env.extend(spec.env.iter().cloned());
+
+    // Run identity and the bundled CLI must win over project-provided values.
+    // Empty optional IDs also clear stale values inherited by the Desktop.
+    let path = detect::search_path();
+    env.extend([
+        ("PATCHWORK".into(), "1".into()),
+        ("PATCHWORK_API_BASE".into(), spec.api_base.clone()),
+        ("PATCHWORK_TOKEN".into(), spec.api_token.clone()),
+        ("PATCHWORK_RUN_ID".into(), spec.run_id.clone()),
+        ("PATCHWORK_AGENT_ID".into(), spec.agent_id.clone()),
+        ("PATCHWORK_CHANNEL_ID".into(), spec.channel_id.clone()),
+        ("PATCHWORK_CWD".into(), cwd.to_string()),
+        (
+            "PATCHWORK_TASK_ID".into(),
+            spec.task_id.clone().unwrap_or_default(),
+        ),
+        (
+            "PATCHWORK_PROJECT_ID".into(),
+            spec.project_id.clone().unwrap_or_default(),
+        ),
+        (
+            "PATH".into(),
+            match &cfg.cli_dir {
+                Some(dir) => format!("{dir}:{path}"),
+                None => path,
+            },
+        ),
+    ]);
     Ok(env)
 }
 
@@ -1942,17 +1946,30 @@ sleep 5
     }
 
     #[test]
-    fn env_gives_the_agent_native_access() {
+    fn run_identity_and_bundled_cli_path_override_extra_env() {
         let mut run = spec();
-        run.runtime = "claude".into();
-        let env = build_env(&RunnerConfig::default(), &run, "/tmp/wt").unwrap();
+        run.project_id = Some("p1".into());
+        run.env = parse_env("PATCHWORK_TOKEN=project-token\nPATCHWORK_RUN_ID=project-run\nPATCHWORK_TASK_ID=project-task\nPATCHWORK_PROJECT_ID=project\nPATH=/project/bin");
+        let cli_dir = "/Applications/Patchwork.app/Contents/MacOS";
+        let env = build_env(
+            &RunnerConfig {
+                cli_dir: Some(cli_dir.into()),
+                env: vec![("PATCHWORK_API_BASE".into(), "project-relay".into())],
+            },
+            &run,
+            "/tmp/wt",
+        )
+        .unwrap();
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(map.get("PATCHWORK_RUN_ID").unwrap(), "r1");
+        assert_eq!(map.get("PATCHWORK_API_BASE").unwrap(), &run.api_base);
+        assert_eq!(map.get("PATCHWORK_TOKEN").unwrap(), &run.api_token);
+        assert_eq!(map.get("PATCHWORK_RUN_ID").unwrap(), &run.run_id);
         assert_eq!(map.get("PATCHWORK_TASK_ID").unwrap(), "t1");
-        assert_eq!(map.get("PATCHWORK_TOKEN").unwrap(), "tok");
-        if let Some(path) = detect::runtime_env("claude").first() {
-            assert_eq!(map.get(&path.0), Some(&path.1));
-        }
+        assert_eq!(map.get("PATCHWORK_PROJECT_ID").unwrap(), "p1");
+        assert_eq!(
+            map.get("PATH").and_then(|path| path.split(':').next()),
+            Some(cli_dir)
+        );
     }
 
     #[test]
