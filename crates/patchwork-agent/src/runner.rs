@@ -4,7 +4,7 @@
 //! the agent's own prose, plus short status notes when something material
 //! happens. Nobody should have to read execution logs to follow the work.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -36,10 +36,30 @@ pub struct RunHandle {
     accepting: bool,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Default)]
+struct Runs {
+    active: HashMap<Id, RunHandle>,
+    started: HashSet<Id>,
+}
+
 pub struct Runner {
     cfg: RunnerConfig,
     out: Sink,
-    running: Mutex<HashMap<Id, RunHandle>>,
+    runs: Mutex<Runs>,
     previews: PreviewManager,
 }
 
@@ -48,7 +68,7 @@ impl Runner {
         Arc::new(Self {
             cfg,
             out: out.clone(),
-            running: Mutex::new(HashMap::new()),
+            runs: Mutex::new(Runs::default()),
             previews: PreviewManager::new(out),
         })
     }
@@ -56,7 +76,7 @@ impl Runner {
     /// The runs this machine is executing. The relay uses it to tell a run
     /// that is still alive from one that died with its process.
     pub async fn active_run_ids(&self) -> Vec<Id> {
-        self.running.lock().await.keys().cloned().collect()
+        self.runs.lock().await.active.keys().cloned().collect()
     }
 
     /// Route a relay command to the run it belongs to.
@@ -64,12 +84,16 @@ impl Runner {
         match msg {
             RelayToHost::StartRun { spec } => self.start(*spec).await,
             RelayToHost::CancelRun { ref run_id } => {
-                let handle = self.running.lock().await.remove(run_id);
-                if let Some(h) = handle {
-                    let _ = h.control.send(msg.clone());
-                    // Give the runtime a moment to unwind before we abort.
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    h.task.abort();
+                let handle = self.runs.lock().await.active.remove(run_id);
+                if let Some(mut handle) = handle {
+                    let _ = handle.control.send(msg.clone());
+                    if tokio::time::timeout(std::time::Duration::from_secs(3), &mut handle.task)
+                        .await
+                        .is_err()
+                    {
+                        handle.task.abort();
+                        let _ = handle.task.await;
+                    }
                 }
                 self.emit(HostToRelay::RunStatus {
                     run_id: run_id.clone(),
@@ -82,7 +106,7 @@ impl Runner {
             }
             RelayToHost::QuestionAsked { ref run_id }
             | RelayToHost::AnswerQuestion { ref run_id, .. } => {
-                if let Some(h) = self.running.lock().await.get(run_id) {
+                if let Some(h) = self.runs.lock().await.active.get(run_id) {
                     let _ = h.control.send(msg.clone());
                 }
             }
@@ -91,8 +115,8 @@ impl Runner {
                 ref control_id,
                 ..
             } => {
-                let running = self.running.lock().await;
-                if let Some(h) = running.get(run_id).filter(|handle| handle.accepting) {
+                let runs = self.runs.lock().await;
+                if let Some(h) = runs.active.get(run_id).filter(|handle| handle.accepting) {
                     let _ = h.control.send(msg.clone());
                 } else {
                     self.emit(HostToRelay::RunControlStatus {
@@ -182,6 +206,11 @@ impl Runner {
 
     pub async fn start(self: &Arc<Self>, spec: RunSpec) {
         let run_id = spec.run_id.clone();
+        let mut runs = self.runs.lock().await;
+        if !runs.started.insert(run_id.clone()) {
+            return;
+        }
+
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let this = self.clone();
         let task = tokio::spawn(async move {
@@ -211,10 +240,10 @@ impl Runner {
                     body: format!("I couldn't complete this run: {headline}"),
                 });
             }
-            this.running.lock().await.remove(&run_id);
+            this.runs.lock().await.active.remove(&run_id);
         });
 
-        self.running.lock().await.insert(
+        runs.active.insert(
             run_id,
             RunHandle {
                 control: control_tx,
@@ -225,7 +254,7 @@ impl Runner {
     }
 
     async fn set_accepting(&self, run_id: &str, accepting: bool) {
-        if let Some(handle) = self.running.lock().await.get_mut(run_id) {
+        if let Some(handle) = self.runs.lock().await.active.get_mut(run_id) {
             handle.accepting = accepting;
         }
     }
@@ -235,9 +264,21 @@ impl Runner {
     }
 
     pub async fn shutdown(&self) {
-        let mut running = self.running.lock().await;
-        for (_, handle) in running.drain() {
-            handle.task.abort();
+        let mut handles = self.runs.lock().await.active.drain().collect::<Vec<_>>();
+        for (run_id, handle) in &handles {
+            let _ = handle.control.send(RelayToHost::CancelRun {
+                run_id: run_id.clone(),
+            });
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        for (_, mut handle) in handles.drain(..) {
+            if tokio::time::timeout_at(deadline, &mut handle.task)
+                .await
+                .is_err()
+            {
+                handle.task.abort();
+                let _ = handle.task.await;
+            }
         }
         self.previews.stop_all().await;
     }
@@ -488,7 +529,7 @@ async fn execute(
         let conn = conn.clone();
         let state = state.clone();
         let run_id = run_id.clone();
-        tokio::spawn(async move {
+        AbortOnDrop(tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
                     AgentEvent::SessionUpdate { update, .. } => {
@@ -547,7 +588,7 @@ async fn execute(
                     }
                 }
             }
-        })
+        }))
     };
 
     // 5. Prompt turns. ACP accepts one prompt at a time, so steering is either
@@ -1740,6 +1781,65 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"message":"not available"}}'
         assert!(error.contains("could not select model `openai/gpt-5.6-sol`"));
         assert!(error.contains("not available"));
         conn.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_start_storm_launches_one_runtime() {
+        let count = std::env::temp_dir().join(format!("patchwork-starts-{}", uuid::Uuid::now_v7()));
+        let script = r#"
+printf x >> "$COUNT_FILE"
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
+read _
+sleep 5
+"#;
+        let (out, _messages) = mpsc::unbounded_channel();
+        let runner = Runner::new(RunnerConfig::default(), out);
+        let mut requested = spec();
+        requested.run_id = "duplicate-start-run".into();
+        let task_id = format!("duplicate-start-task-{}", uuid::Uuid::now_v7());
+        requested.task_id = Some(task_id.clone());
+        requested.runtime = "custom".into();
+        requested.custom_command = Some(vec!["sh".into(), "-c".into(), script.into()]);
+        requested
+            .env
+            .push(("COUNT_FILE".into(), count.to_string_lossy().to_string()));
+
+        for _ in 0..20 {
+            runner
+                .handle(RelayToHost::StartRun {
+                    spec: Box::new(requested.clone()),
+                })
+                .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::fs::read(&count).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the runtime should start");
+
+        assert_eq!(tokio::fs::read(&count).await.unwrap(), b"x");
+        assert_eq!(runner.active_run_ids().await, vec!["duplicate-start-run"]);
+        runner.shutdown().await;
+        assert!(runner.active_run_ids().await.is_empty());
+        runner
+            .handle(RelayToHost::StartRun {
+                spec: Box::new(requested),
+            })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(tokio::fs::read(&count).await.unwrap(), b"x");
+
+        let _ = tokio::fs::remove_file(count).await;
+        let _ =
+            tokio::fs::remove_dir_all(worktree::work_root().join("scratch").join(task_id)).await;
     }
 
     #[test]

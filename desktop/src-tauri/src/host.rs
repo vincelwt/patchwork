@@ -17,7 +17,7 @@ use patchwork_agent::{Runner, RunnerConfig};
 use patchwork_core::host::{HostRegistration, HostToRelay, RelayToHost};
 use patchwork_core::models::HostKind;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::settings::{Settings, WorkspaceSettings};
@@ -82,9 +82,14 @@ impl Links {
     }
 }
 
+struct ConnectionLoop {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 pub struct LocalHost {
     links: Arc<Mutex<Links>>,
-    stop: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    stop: Arc<Mutex<Vec<ConnectionLoop>>>,
     awake: Arc<crate::awake::Keeper>,
 }
 
@@ -104,8 +109,15 @@ impl LocalHost {
     /// Reconnect every workspace with the current settings. Safe to call
     /// whenever settings change.
     pub async fn restart(&self, settings: Settings) {
-        for handle in self.stop.lock().await.drain(..) {
-            handle.abort();
+        // Keep overlapping settings saves from creating overlapping socket
+        // loops for the same workspace.
+        let mut connections = self.stop.lock().await;
+        let previous = connections.drain(..).collect::<Vec<_>>();
+        for connection in &previous {
+            let _ = connection.stop.send(true);
+        }
+        for connection in previous {
+            let _ = connection.task.await;
         }
         {
             let mut links = self.links.lock().await;
@@ -125,9 +137,12 @@ impl LocalHost {
             let links = self.links.clone();
             let awake = self.awake.clone();
             let shared = settings.clone();
-            let handle = tokio::spawn(async move {
+            let (stop, mut stopping) = watch::channel(false);
+            let task = tokio::spawn(async move {
                 loop {
-                    if let Err(err) = connect(&shared, &workspace, &links, &awake).await {
+                    if let Err(err) =
+                        connect(&shared, &workspace, &links, &awake, stopping.clone()).await
+                    {
                         links.lock().await.last_error = Some(format!("{err:#}"));
                     }
                     {
@@ -135,10 +150,16 @@ impl LocalHost {
                         links.online.insert(workspace.id.clone(), false);
                     }
                     awake.set_running(&workspace.id, 0);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if *stopping.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = stopping.changed() => break,
+                    }
                 }
             });
-            self.stop.lock().await.push(handle);
+            connections.push(ConnectionLoop { stop, task });
         }
     }
 }
@@ -148,9 +169,13 @@ async fn connect(
     workspace: &WorkspaceSettings,
     links: &Arc<Mutex<Links>>,
     awake: &Arc<crate::awake::Keeper>,
+    mut stopping: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let ws_url = websocket_url(&workspace.base_url(), &workspace.token);
-    let (socket, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+    let (socket, _) = tokio::select! {
+        result = tokio_tungstenite::connect_async(&ws_url) => result?,
+        _ = stopping.changed() => return Ok(()),
+    };
     let (mut sink, mut stream) = socket.split();
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<HostToRelay>();
@@ -163,11 +188,7 @@ async fn connect(
         },
         out_tx.clone(),
     );
-    // This connection ending, however it ends, ends the runs it was carrying.
-    // `restart` aborts us without unwinding, and an agent left running on a
-    // connection the relay has given up on would edit a worktree the relay is
-    // about to hand to its replacement.
-    let _stop_runs = StopOnDrop(runner.clone());
+    let mut stop_runs = StopOnDrop(Some(runner.clone()));
 
     // Announce what this machine can actually do.
     let registration = HostRegistration {
@@ -189,83 +210,76 @@ async fn connect(
         settings.provider_env(),
     ));
 
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&ClientMsg::Host { msg }) else {
-                continue;
-            };
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
     {
         let mut links = links.lock().await;
         links.online.insert(workspace.id.clone(), true);
         links.last_error = None;
     }
 
-    // Keep the relay's view of this host fresh, and keep the machine awake for
-    // exactly as long as it is doing work. The heartbeat carries the runs we
-    // are actually executing: that is how the relay notices a run that died
-    // here instead of leaving it looking alive.
-    let heartbeat = {
-        let out_tx = out_tx.clone();
-        let runner = runner.clone();
-        let awake = awake.clone();
-        let workspace_id = workspace.id.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let runs = runner.active_run_ids().await;
-                awake.set_running(&workspace_id, runs.len());
-                if out_tx
-                    .send(HostToRelay::Heartbeat {
-                        capabilities: None,
-                        runs: Some(runs),
-                    })
-                    .is_err()
-                {
-                    break;
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = stopping.changed() => break,
+            outgoing = out_rx.recv() => {
+                let Some(msg) = outgoing else { break };
+                let Ok(text) = serde_json::to_string(&ClientMsg::Host { msg }) else {
+                    continue;
+                };
+                tokio::select! {
+                    result = sink.send(WsMessage::Text(text.into())) => {
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    _ = stopping.changed() => break,
                 }
             }
-        })
-    };
-
-    while let Some(Ok(message)) = stream.next().await {
-        let WsMessage::Text(text) = message else {
-            continue;
-        };
-        match serde_json::from_str::<ServerMsg>(&text) {
-            Ok(ServerMsg::Host { msg }) => {
-                runner.handle(msg).await;
-                // Checked on every command rather than only on the heartbeat,
-                // so a run that starts now is covered now.
-                awake.set_running(&workspace.id, runner.active_run_ids().await.len());
+            incoming = stream.next() => {
+                let text = match incoming {
+                    Some(Ok(WsMessage::Text(text))) => text,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) | None => break,
+                };
+                match serde_json::from_str::<ServerMsg>(&text) {
+                    Ok(ServerMsg::Host { msg }) => {
+                        runner.handle(msg).await;
+                        // Checked on every command rather than only on the heartbeat,
+                        // so a run that starts now is covered now.
+                        awake.set_running(&workspace.id, runner.active_run_ids().await.len());
+                    }
+                    Ok(ServerMsg::Error { message }) => {
+                        tracing::warn!(%message, "relay rejected a host message");
+                    }
+                    Ok(ServerMsg::Ready { .. }) | Ok(ServerMsg::Event { .. }) => {}
+                    Err(_) => {}
+                }
             }
-            Ok(ServerMsg::Error { message }) => {
-                tracing::warn!(%message, "relay rejected a host message");
+            _ = heartbeat.tick() => {
+                let runs = runner.active_run_ids().await;
+                awake.set_running(&workspace.id, runs.len());
+                let _ = out_tx.send(HostToRelay::Heartbeat {
+                    capabilities: None,
+                    runs: Some(runs),
+                });
             }
-            Ok(ServerMsg::Ready { .. }) | Ok(ServerMsg::Event { .. }) => {}
-            Err(_) => {}
         }
     }
 
-    heartbeat.abort();
-    writer.abort();
     runner.shutdown().await;
+    stop_runs.0 = None;
     awake.set_running(&workspace.id, 0);
     Ok(())
 }
 
-/// Agents stop when the connection that owns them does.
-struct StopOnDrop(Arc<Runner>);
+/// Agents stop even if the connection task itself is aborted.
+struct StopOnDrop(Option<Arc<Runner>>);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let runner = self.0.clone();
-        tokio::spawn(async move { runner.shutdown().await });
+        if let Some(runner) = self.0.take() {
+            tokio::spawn(async move { runner.shutdown().await });
+        }
     }
 }
 
@@ -298,6 +312,41 @@ fn cli_dir() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconnect_storm_keeps_one_loop_per_workspace() {
+        let host = Arc::new(LocalHost::new(Arc::new(crate::awake::Keeper::default())));
+        let settings = Settings {
+            host_id: "host".into(),
+            host_name: "Desktop".into(),
+            workspaces: vec![WorkspaceSettings {
+                id: "workspace".into(),
+                relay_url: "http://127.0.0.1:9".into(),
+                token: "token".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gate = Arc::new(tokio::sync::Barrier::new(21));
+        let mut restarts = Vec::new();
+        for _ in 0..20 {
+            let host = host.clone();
+            let settings = settings.clone();
+            let gate = gate.clone();
+            restarts.push(tokio::spawn(async move {
+                gate.wait().await;
+                host.restart(settings).await;
+            }));
+        }
+        gate.wait().await;
+        for restart in restarts {
+            restart.await.unwrap();
+        }
+
+        assert_eq!(host.stop.lock().await.len(), 1);
+        host.restart(Settings::default()).await;
+        assert!(host.stop.lock().await.is_empty());
+    }
 
     #[test]
     fn websocket_urls_follow_the_relay_scheme_and_stay_inside_the_workspace() {
