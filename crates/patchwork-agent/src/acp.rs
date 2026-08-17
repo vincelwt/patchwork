@@ -578,10 +578,12 @@ impl AcpConnection {
             unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
             for _ in 0..20 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
-                    return;
+                    break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            // The adapter may have exited while a TERM-resistant tool it
+            // launched is still alive, so always finish the process group.
             unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
 
@@ -933,6 +935,46 @@ mod tests {
         assert_eq!(restored.current_thinking.as_deref(), Some("xhigh"));
         assert_eq!(restored.model_config_id.as_deref(), Some("model"));
         runtime.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_term_resistant_descendants() {
+        let pid_file =
+            std::env::temp_dir().join(format!("patchwork-descendant-{}", uuid::Uuid::now_v7()));
+        let script = r#"
+trap 'exit 0' TERM
+sh -c 'trap "" TERM; echo $$ > "$PID_FILE"; while :; do sleep 1; done' &
+read _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+wait
+"#;
+        let command = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let env = vec![(
+            "PID_FILE".to_string(),
+            pid_file.to_string_lossy().to_string(),
+        )];
+        let (conn, _events) = AcpConnection::spawn(&command, "/tmp", &env).await.unwrap();
+        let pid: i32 = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                    break pid.trim().parse().unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the descendant should publish its pid");
+
+        conn.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the descendant process should be gone");
+        let _ = tokio::fs::remove_file(pid_file).await;
     }
 
     #[test]
