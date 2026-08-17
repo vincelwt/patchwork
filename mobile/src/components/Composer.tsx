@@ -12,6 +12,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { outboxFor } from "@client/mobile-store-reducer";
 import type { Id, Message } from "@client/types";
+import { composerKey } from "@/lib/composer";
 import { useDictation } from "@/lib/dictation";
 import { useKeyboardInset } from "@/lib/keyboard";
 import { useLayout } from "@/lib/layout";
@@ -20,28 +21,36 @@ import { useTheme } from "@/lib/theme";
 import { PendingImages, useImageAttachments } from "./Attachment";
 import { Button, Glass, Icon, Measured } from "./ui";
 
-export function Composer({
-  channelId,
-  parentId,
-  taskId,
-  placeholder = "Message the workspace",
-  replyTo,
-  onCancelReply,
-}: {
+interface ComposerProps {
   channelId: Id;
   parentId?: Id;
   taskId?: Id;
   placeholder?: string;
   replyTo?: Message;
   onCancelReply?: () => void;
-}) {
+}
+
+export function Composer(props: ComposerProps) {
+  const draftKey = composerKey(props.channelId, props.parentId);
+  // Sending, uploads and errors are transient state for this conversation only.
+  return <ComposerBox key={draftKey} draftKey={draftKey} {...props} />;
+}
+
+function ComposerBox({
+  channelId,
+  parentId,
+  taskId,
+  placeholder = "Message the workspace",
+  replyTo,
+  onCancelReply,
+  draftKey,
+}: ComposerProps & { draftKey: string }) {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardInset(insets.bottom);
   const { gutter } = useLayout();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
-  const draftKey = parentId ? `thread:${parentId}` : channelId;
   const text = workspace.drafts[draftKey] ?? "";
   const images = useImageAttachments(taskId);
   const [busy, setBusy] = useState(false);

@@ -8,7 +8,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/inbox.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts ../client/keyboard.test.ts src/lib/chart.test.ts src/lib/format.test.ts src/lib/paired.test.ts src/lib/workspace-cache.test.ts",
+    "test": "node --test --experimental-strip-types ../client/evidence.test.ts ../client/inbox.test.ts ../client/mobile-store-reducer.test.ts ../client/run-activity.test.ts ../client/scroll.test.ts ../client/keyboard.test.ts src/lib/chart.test.ts src/lib/composer.test.ts src/lib/format.test.ts src/lib/paired.test.ts src/lib/workspace-cache.test.ts",
     "export": "expo export --platform all"
   },
   "dependencies": {
