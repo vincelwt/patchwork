@@ -22,6 +22,12 @@ jobs:
           targets: aarch64-apple-darwin
       - run: npm ci
         working-directory: desktop
+      - name: Build bundled CLI
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p patchwork-cli
+          mkdir -p desktop/src-tauri/binaries
+          cp target/aarch64-apple-darwin/release/patchwork \
+            desktop/src-tauri/binaries/patchwork-aarch64-apple-darwin
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -35,7 +41,16 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
-          args: --target aarch64-apple-darwin
+          args: --target aarch64-apple-darwin --config src-tauri/tauri.release.conf.json
+      - name: Smoke test packaged CLI
+        run: |
+          app=target/aarch64-apple-darwin/release/bundle/macos/Patchwork.app
+          cli="$app/Contents/MacOS/patchwork"
+          test -x "$cli"
+          env -i HOME="$HOME" \
+            PATH="$(dirname "$cli"):/usr/bin:/bin:/usr/sbin:/sbin" \
+            patchwork --version
+          codesign --verify --deep --strict "$app"
 
   relay:
     needs: desktop
