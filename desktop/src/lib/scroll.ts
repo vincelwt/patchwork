@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
-import { isNearScrollEnd } from "@client/scroll";
+import { alignScrollEnd, isNearScrollEnd } from "@client/scroll";
 
 /// Open a scrollable history at its newest content, then keep following only
 /// while the reader remains near the end. The content callback ref lets the
@@ -11,9 +11,7 @@ export function useBottomAnchor(scopeKey: string, threshold = 80) {
 
   const scrollToEnd = useCallback((force = false) => {
     const element = scrollerRef.current;
-    if (element && (force || pinned.current)) {
-      element.scrollTop = element.scrollHeight;
-    }
+    if (element && (force || pinned.current)) alignScrollEnd(element);
   }, []);
 
   const updatePinned = useCallback(() => {
