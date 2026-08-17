@@ -550,11 +550,15 @@ function withMessage(
     };
   }
   const list = state.messages[message.channel_id];
+  const open = !!list || state.recentChannels.includes(message.channel_id);
   return {
     ...state,
     seq,
-    messages: list
-      ? { ...state.messages, [message.channel_id]: upsert(list, message) }
+    messages: open
+      ? {
+          ...state.messages,
+          [message.channel_id]: upsert(list ?? [], message),
+        }
       : state.messages,
   };
 }

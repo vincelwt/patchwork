@@ -11,6 +11,12 @@ import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
 import { useBottomAnchor } from "../lib/scroll";
 import { useFileUrl } from "../lib/file";
+import {
+  beginSend,
+  parseSendAttempt,
+  sendAttempt,
+  type SendAttempt,
+} from "@client/send";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
 import { readTask } from "../lib/task";
@@ -44,6 +50,7 @@ export function ChatView({ channelId }: { channelId: Id }) {
   }));
   const [dropped, setDropped] = useState<File[]>([]);
   const [replyTo, setReplyTo] = useState<Message>();
+  const [sent, setSent] = useState<{ channelId: Id; messageId: Id }>();
   const clearDropped = useCallback(() => setDropped([]), []);
 
   useEffect(() => {
@@ -61,6 +68,7 @@ export function ChatView({ channelId }: { channelId: Id }) {
       <Timeline
         channelId={channelId}
         messages={messages ?? []}
+        sentMessageId={sent?.channelId === channelId ? sent.messageId : undefined}
         onReply={setReplyTo}
       />
       <Composer
@@ -69,6 +77,7 @@ export function ChatView({ channelId }: { channelId: Id }) {
         onConsumed={clearDropped}
         replyTo={replyTo}
         onCancelReply={() => setReplyTo(undefined)}
+        onSent={(message) => setSent({ channelId, messageId: message.id })}
       />
     </DropZone>
   );
@@ -147,10 +156,12 @@ function groupsWithPrevious(message: Message, previous?: Message): boolean {
 export function Timeline({
   channelId,
   messages,
+  sentMessageId,
   onReply,
 }: {
   channelId: Id;
   messages: Message[];
+  sentMessageId?: Id;
   onReply: (message: Message) => void;
 }) {
   const { members, runs, hasMore, sourceMessageId } = useAppSelector((data) => {
@@ -168,8 +179,18 @@ export function Timeline({
     };
   });
   const handles = useHandles();
-  const { scrollerRef, contentRef, updatePinned } = useBottomAnchor(channelId);
+  const { scrollerRef, contentRef, scrollToEnd, updatePinned } =
+    useBottomAnchor(channelId);
+  const currentChannel = useRef(channelId);
+  currentChannel.current = channelId;
+  const sentRevision = useRef(0);
   const window_ = useVirtualWindow(scrollerRef, messages.length);
+
+  useEffect(() => {
+    if (!sentMessageId) return;
+    sentRevision.current += 1;
+    scrollToEnd(true);
+  }, [sentMessageId, scrollToEnd]);
 
   const onScroll = () => {
     const element = scrollerRef.current;
@@ -177,9 +198,14 @@ export function Timeline({
     updatePinned();
     if (element.scrollTop < 60 && hasMore) {
       const previousHeight = element.scrollHeight;
+      const revision = sentRevision.current;
       void store.loadOlder(channelId).then(() => {
         requestAnimationFrame(() => {
-          if (scrollerRef.current) {
+          if (
+            scrollerRef.current &&
+            currentChannel.current === channelId &&
+            revision === sentRevision.current
+          ) {
             scrollerRef.current.scrollTop =
               scrollerRef.current.scrollHeight - previousHeight;
           }
@@ -887,7 +913,15 @@ export function useAttachments({
     uploading,
     attach,
     strip,
-    clear: useCallback(() => setPending([]), []),
+    clear: useCallback(
+      (ids?: Id[]) =>
+        setPending((current) =>
+          ids
+            ? current.filter((attachment) => !ids.includes(attachment.id))
+            : [],
+        ),
+      [],
+    ),
   };
 }
 
@@ -918,6 +952,7 @@ interface ComposerProps {
   onConsumed?: () => void;
   replyTo?: Message;
   onCancelReply?: () => void;
+  onSent?: (message: Message) => void;
 }
 
 /// Drafts belong to one workspace, channel and optional thread. Attachments
@@ -945,15 +980,30 @@ function ComposerBox({
   onConsumed,
   replyTo,
   onCancelReply,
+  onSent,
 }: ComposerProps & { draftKey: string }) {
   const api = useApi();
-  const { members, me } = useAppSelector((data) => ({
+  const { members, me, workspaceId } = useAppSelector((data) => ({
     members: data.members,
     me: data.me,
+    workspaceId: data.workspace?.id,
   }));
   const [text, setText] = useState(() => localStorage.getItem(draftKey) ?? "");
+  const latestText = useRef(text);
   const files = useAttachments({ incoming, onConsumed, taskId: channel.task_id });
   const [busy, setBusy] = useState(false);
+  const sending = useRef(false);
+  const attemptKey = `${draftKey}.send`;
+  const attempt = useRef<SendAttempt | undefined>(
+    parseSendAttempt(localStorage.getItem(attemptKey)),
+  );
+  const draftInput = {
+    body: text.trim(),
+    parent_id: parentId,
+    reply_to_id: replyTo?.id,
+    attachment_ids: files.pending.map((attachment) => attachment.id),
+  };
+  const fingerprint = JSON.stringify(draftInput);
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const box = useRef<HTMLTextAreaElement>(null);
@@ -969,6 +1019,13 @@ function ComposerBox({
   useEffect(() => {
     if (replyTo) box.current?.focus();
   }, [replyTo?.id]);
+
+  useEffect(() => {
+    if (attempt.current && attempt.current.fingerprint !== fingerprint) {
+      attempt.current = undefined;
+      localStorage.removeItem(attemptKey);
+    }
+  }, [attemptKey, fingerprint]);
 
   // Typing, dictation and mention completion all update this same value.
   useEffect(() => {
@@ -994,19 +1051,37 @@ function ComposerBox({
   }, []);
 
   const send = async () => {
-    if (files.uploading > 0 || (!text.trim() && files.pending.length === 0)) return;
+    if (
+      files.uploading > 0 ||
+      (!text.trim() && files.pending.length === 0) ||
+      !beginSend(sending)
+    ) return;
     setBusy(true);
+    const input = draftInput;
+    attempt.current = sendAttempt(
+      fingerprint,
+      attempt.current,
+      () => crypto.randomUUID(),
+    );
+    localStorage.setItem(attemptKey, JSON.stringify(attempt.current));
     try {
-      await api.send(channel.id, {
-        body: text.trim(),
-        parent_id: parentId,
-        reply_to_id: replyTo?.id,
-        attachment_ids: files.pending.map((attachment) => attachment.id),
-      } as never);
-      setText("");
-      files.clear();
+      const message = await api.send(channel.id, {
+        ...input,
+        client_id: attempt.current.clientId,
+      });
+      if (workspaceId) store.acceptMessage(workspaceId, message);
+      attempt.current = undefined;
+      localStorage.removeItem(attemptKey);
+      if (latestText.current === text) {
+        latestText.current = "";
+        localStorage.removeItem(draftKey);
+        setText("");
+      }
+      files.clear(input.attachment_ids);
       onCancelReply?.();
+      onSent?.(message);
     } finally {
+      sending.current = false;
       setBusy(false);
     }
   };
@@ -1023,12 +1098,17 @@ function ComposerBox({
           .slice(0, 6);
 
   const applyMention = (handle: string) => {
-    setText((current) => current.replace(/@[\w-]*$/, `@${handle} `));
+    setText((current) => {
+      const next = current.replace(/@[\w-]*$/, `@${handle} `);
+      latestText.current = next;
+      return next;
+    });
     setMentionQuery(null);
     box.current?.focus();
   };
 
   const onChange = (value: string) => {
+    latestText.current = value;
     setText(value);
     const match = value.match(/@([\w-]*)$/);
     setMentionQuery(match ? match[1] : null);

@@ -72,6 +72,7 @@ export class MobileWorkspaceStore {
   private cacheTimer?: ReturnType<typeof setTimeout>;
   private flushTimer?: ReturnType<typeof setTimeout>;
   private flushing = false;
+  private sentListeners = new Map<string, Set<(message: Message) => void>>();
   private cacheWrite: Promise<void> = Promise.resolve();
   private localCleanup: Promise<void> = Promise.resolve();
   private retryDelay = 1_000;
@@ -180,6 +181,7 @@ export class MobileWorkspaceStore {
     ++this.generation;
     this.stopConnection();
     this.clearCacheTimer();
+    this.sentListeners.clear();
     this.listeners.clear();
   }
 
@@ -219,7 +221,12 @@ export class MobileWorkspaceStore {
 
   async loadMessages(channelId: Id, before?: Id): Promise<void> {
     const current = touchChannel(this.snapshot, channelId);
-    this.replaceData(current);
+    this.replaceData({
+      ...current,
+      messages: current.messages[channelId]
+        ? current.messages
+        : { ...current.messages, [channelId]: [] },
+    });
     this.scheduleCache();
     if (!this.canConnect() || !this.api) return;
 
@@ -231,9 +238,7 @@ export class MobileWorkspaceStore {
           ...this.snapshot,
           messages: {
             ...this.snapshot.messages,
-            [channelId]: before
-              ? mergeMessages(page.messages, existing)
-              : page.messages,
+            [channelId]: mergeMessages(page.messages, existing),
           },
           hasMore: { ...this.snapshot.hasMore, [channelId]: page.has_more },
         });
@@ -243,12 +248,24 @@ export class MobileWorkspaceStore {
   }
 
   async loadThread(messageId: Id): Promise<void> {
+    if (!this.snapshot.threads[messageId]) {
+      this.replaceData({
+        ...this.snapshot,
+        threads: { ...this.snapshot.threads, [messageId]: [] },
+      });
+    }
     if (!this.canConnect() || !this.api) return;
     await this.request(
       () => this.api!.thread(messageId),
       (replies) => this.replaceData({
         ...this.snapshot,
-        threads: { ...this.snapshot.threads, [messageId]: replies },
+        threads: {
+          ...this.snapshot.threads,
+          [messageId]: mergeMessages(
+            replies,
+            this.snapshot.threads[messageId] ?? [],
+          ),
+        },
       }),
     );
   }
@@ -272,6 +289,21 @@ export class MobileWorkspaceStore {
   sendTyping(channelId: Id) {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
     this.socket.send(JSON.stringify({ t: "typing", channel_id: channelId }));
+  }
+
+  onMessageSent(
+    channelId: Id,
+    parentId: Id | undefined,
+    listener: (message: Message) => void,
+  ) {
+    const key = sendScope(channelId, parentId);
+    const listeners = this.sentListeners.get(key) ?? new Set();
+    listeners.add(listener);
+    this.sentListeners.set(key, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (!listeners.size) this.sentListeners.delete(key);
+    };
   }
 
   /// A message is accepted here rather than at the relay: it is written to
@@ -366,6 +398,15 @@ export class MobileWorkspaceStore {
           );
           this.clearCacheTimer();
           void this.persistNow();
+          for (const listener of this.sentListeners.get(
+            sendScope(entry.channelId, entry.parentId),
+          ) ?? []) {
+            try {
+              listener(message);
+            } catch {
+              // Scrolling cannot turn an acknowledged send into a retry.
+            }
+          }
         } catch (error) {
           if (this.api !== api) return;
           const status = error instanceof ApiError ? error.status : undefined;
@@ -808,6 +849,10 @@ export function useWorkspaceStore(): MobileWorkspaceStore {
   const store = useContext(WorkspaceContext);
   if (!store) throw new Error("useWorkspaceStore requires WorkspaceProvider");
   return store;
+}
+
+function sendScope(channelId: Id, parentId?: Id) {
+  return parentId ? `thread:${parentId}` : `channel:${channelId}`;
 }
 
 function mergeMessages(older: Message[], newer: Message[]): Message[] {
