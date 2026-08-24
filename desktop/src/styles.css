@@ -745,6 +745,47 @@ body.resizing {
   color: var(--text-muted);
 }
 
+/* Above the transcript rather than over it: the control that decides what the
+   conversation shows must never be the thing hiding it. */
+.chat-work-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 2px 20px 0;
+  max-width: 1000px;
+  width: 100%;
+  margin: 0 auto;
+  flex: none;
+}
+.work-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  padding: 3px 9px;
+  border-radius: 7px;
+}
+.work-toggle:hover {
+  background: var(--tint);
+  color: var(--text-muted);
+}
+.work-toggle[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* The run log inline, indented to the message column so it reads as part of
+   that turn rather than as a second conversation. */
+.chat-run-trace {
+  margin: 2px 0 10px 48px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+.chat-run-trace .section-head {
+  margin: 6px 0 4px;
+  padding-left: 0;
+}
+
 /* A colour per teammate, derived from their id. Muted enough that a row of
    them is still a calm surface, distinct enough to find someone at a glance. */
 .avatar {

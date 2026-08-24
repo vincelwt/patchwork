@@ -834,6 +834,7 @@ pub enum RunEventKind {
     Lifecycle,
     Thought,
     Message,
+    Status,
     ToolCall,
     ToolResult,
     FileChange,

@@ -78,6 +78,23 @@ async fn post_message_inner(
     let task_id = channel.task_id.clone();
     let kind = input.kind.unwrap_or(MessageKind::Text);
     let run_id = options.run_id.clone().or(input.run_id.clone());
+    let status_run = if kind == MessageKind::Status {
+        match run_id.as_deref() {
+            Some(id) => match state.store.run(id)? {
+                Some(run)
+                    if run.agent_id == author_id
+                        && !run.status.is_terminal()
+                        && run_conversation(state, &run)? == channel_id =>
+                {
+                    Some(run)
+                }
+                _ => None,
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     let destination =
         if input.reply_to_id.is_none() && input.parent_id.is_none() && kind == MessageKind::Text {
             match options
@@ -103,7 +120,7 @@ async fn post_message_inner(
         reply_to: None,
         reply_count: 0,
         last_reply_at: 0,
-        run_id,
+        run_id: run_id.clone(),
         task_id,
         mentions: mentions.clone(),
         attachments: Vec::new(),
@@ -116,6 +133,34 @@ async fn post_message_inner(
     for id in &input.attachment_ids {
         if let Some((attachment, _)) = state.store.attachment(id)? {
             message.attachments.push(attachment);
+        }
+    }
+
+    // An agent owns one live status line per run. Rewriting it keeps chat calm;
+    // every version remains durable in the run log below.
+    if status_run.is_some()
+        && input.client_id.is_none()
+        && message.card.is_none()
+        && message.parent_id.is_none()
+        && message.reply_to_id.is_none()
+        && message.attachments.is_empty()
+    {
+        if let Some(existing) = state.store.run_status_message(
+            run_id.as_deref().unwrap_or_default(),
+            channel_id,
+            author_id,
+        )? {
+            state
+                .store
+                .stream_message_body(&existing.id, &message.body)?;
+            state.store.set_message_mentions(&existing.id, &mentions)?;
+            let stored = state.store.message(&existing.id)?.unwrap_or(existing);
+            state.emit(Event::MessageUpdated {
+                message: stored.clone(),
+            });
+            record_agent_status(state, status_run.clone().unwrap(), &stored.body)?;
+            follow_through(state, &stored, &channel, &members, options.trigger_agents).await?;
+            return Ok(stored);
         }
     }
 
@@ -132,10 +177,34 @@ async fn post_message_inner(
     if let Some(channel) = state.store.channel(channel_id)? {
         state.emit(Event::ChannelUpdated { channel });
     }
+    if let Some(run) = status_run {
+        record_agent_status(state, run, &stored.body)?;
+    }
 
     follow_through(state, &stored, &channel, &members, options.trigger_agents).await?;
 
     Ok(stored)
+}
+
+fn record_agent_status(state: &Shared, mut run: Run, body: &str) -> Result<()> {
+    append_run_event(
+        state,
+        &run.id,
+        RunEventKind::Status,
+        body.trim().to_string(),
+        None,
+    )?;
+    run.headline = body
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect();
+    state.store.update_run(&run)?;
+    state.emit(Event::RunUpdated { run });
+    Ok(())
 }
 
 /// Everything a finished message sets in motion. Split out because a streamed
@@ -3843,6 +3912,131 @@ mod tests {
             1,
             "a task owned and created by agents must still reach a person"
         );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn agent_statuses_share_one_chat_line_and_keep_their_run_history() {
+        let path = std::env::temp_dir().join(format!("patchwork-status-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        for item in [
+            member("agent", "developer", MemberKind::Agent),
+            member("human", "vince", MemberKind::Human),
+        ] {
+            store.insert_member(&item).unwrap();
+        }
+        let channel = Channel {
+            id: "channel".into(),
+            kind: ChannelKind::Channel,
+            section_id: None,
+            slug: "dev".into(),
+            name: "Dev".into(),
+            topic: String::new(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: Vec::new(),
+            task_id: None,
+            last_message_at: 0,
+        };
+        store.insert_channel(&channel).unwrap();
+        store
+            .insert_run(
+                &Run {
+                    id: "run".into(),
+                    agent_id: "agent".into(),
+                    status: RunStatus::Running,
+                    trigger: RunTrigger::Manual { by: "human".into() },
+                    channel_id: channel.id.clone(),
+                    task_id: None,
+                    host_id: None,
+                    project_id: None,
+                    worktree_id: None,
+                    cwd: None,
+                    automation_id: None,
+                    session_id: None,
+                    runtime: "pi".into(),
+                    provider: None,
+                    model: None,
+                    thinking: None,
+                    prompt: "Fix it".into(),
+                    headline: "Working".into(),
+                    error: None,
+                    token_usage: None,
+                    created_at: 1,
+                    started_at: Some(1),
+                    ended_at: None,
+                },
+                0,
+            )
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let post_status = |body: &str| SendMessage {
+            body: body.into(),
+            kind: Some(MessageKind::Status),
+            ..Default::default()
+        };
+        let options = || PostOptions {
+            trigger_agents: false,
+            run_id: Some("run".into()),
+        };
+
+        let first = post_message(
+            &state,
+            &channel.id,
+            "agent",
+            post_status("Tracing"),
+            options(),
+        )
+        .await
+        .unwrap();
+        let second = post_message(
+            &state,
+            &channel.id,
+            "agent",
+            post_status("Testing"),
+            options(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(store.messages(&channel.id, None, 10).unwrap().0.len(), 1);
+        assert_eq!(store.run("run").unwrap().unwrap().headline, "Testing");
+        assert_eq!(
+            store
+                .run_events("run", 0)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == RunEventKind::Status)
+                .map(|event| event.text)
+                .collect::<Vec<_>>(),
+            ["Tracing", "Testing"]
+        );
+
+        let mut spoofed = post_status("Spoofed");
+        spoofed.run_id = Some("run".into());
+        post_message(
+            &state,
+            &channel.id,
+            "human",
+            spoofed,
+            PostOptions {
+                trigger_agents: false,
+                run_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.messages(&channel.id, None, 10).unwrap().0.len(), 2);
+        assert_eq!(store.run("run").unwrap().unwrap().headline, "Testing");
 
         drop(state);
         drop(store);

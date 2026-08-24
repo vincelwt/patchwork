@@ -291,7 +291,6 @@ struct TurnState {
     thought: String,
     background_generation: u64,
     background_processes: Vec<BackgroundProcess>,
-    plan_posted: bool,
     /// Setup metadata that the adapter repeats as an agent message.
     startup_message: Option<String>,
     stderr: Vec<String>,
@@ -1215,17 +1214,6 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
                 },
                 data: Some(update.clone()),
             });
-            // Keep the run's one-line headline honest without spamming chat.
-            if kind == "tool_call" {
-                let _ = out.send(HostToRelay::RunStatus {
-                    run_id: run_id.to_string(),
-                    status: RunStatus::Running,
-                    headline: Some(headline_for(&title)),
-                    session_id: None,
-                    error: None,
-                    token_usage: None,
-                });
-            }
         }
         "plan" => {
             let entries = update
@@ -1255,18 +1243,23 @@ async fn handle_update(run_id: &str, update: Value, out: &Sink, state: &Arc<Mute
             let _ = out.send(HostToRelay::RunEvent {
                 run_id: run_id.to_string(),
                 kind: RunEventKind::Plan,
-                text: text.clone(),
+                text,
                 data: Some(update.clone()),
             });
-
-            let mut s = state.lock().await;
-            if !s.plan_posted && entries.len() > 1 {
-                s.plan_posted = true;
-                drop(s);
-                let _ = out.send(HostToRelay::RunMessage {
+            if let Some(step) = entries
+                .iter()
+                .find(|entry| entry.get("status").and_then(Value::as_str) == Some("in_progress"))
+                .and_then(|entry| entry.get("content").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|step| !step.is_empty())
+            {
+                let _ = out.send(HostToRelay::RunStatus {
                     run_id: run_id.to_string(),
-                    kind: MessageKind::Status,
-                    body: format!("Plan:\n{text}"),
+                    status: RunStatus::Running,
+                    headline: Some(step.to_string()),
+                    session_id: None,
+                    error: None,
+                    token_usage: None,
                 });
             }
         }
@@ -1352,17 +1345,6 @@ fn classify_stderr(line: &str) -> RunEventKind {
         RunEventKind::Lifecycle
     } else {
         RunEventKind::Error
-    }
-}
-
-/// `Read file src/main.rs` → `Reading src/main.rs`. Purely cosmetic, but the
-/// run header is the thing people watch.
-fn headline_for(title: &str) -> String {
-    let trimmed = title.trim();
-    if trimmed.len() > 80 {
-        format!("{}…", &trimmed[..79])
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -2084,15 +2066,60 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":
         .await;
         let mut messages = 0;
         let mut events = 0;
+        let mut headlines = 0;
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 HostToRelay::RunMessage { .. } => messages += 1,
-                HostToRelay::RunEvent { .. } | HostToRelay::RunStatus { .. } => events += 1,
+                HostToRelay::RunEvent { .. } => events += 1,
+                HostToRelay::RunStatus {
+                    headline: Some(_), ..
+                } => headlines += 1,
                 _ => {}
             }
         }
         assert_eq!(messages, 0, "tool activity must not reach the channel");
+        assert_eq!(headlines, 0, "tool titles must not become run headlines");
         assert!(events >= 1);
+    }
+
+    #[tokio::test]
+    async fn plans_stay_in_the_run_log_and_the_current_step_becomes_the_headline() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(TurnState::default()));
+        handle_update(
+            "r1",
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [
+                    { "content": "Read the code", "status": "completed" },
+                    { "content": "Fix the headline", "status": "in_progress" },
+                    { "content": "Run tests", "status": "pending" }
+                ]
+            }),
+            &tx,
+            &state,
+        )
+        .await;
+
+        let output = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(output.iter().any(|message| matches!(
+            message,
+            HostToRelay::RunEvent {
+                kind: RunEventKind::Plan,
+                ..
+            }
+        )));
+        assert!(output.iter().any(|message| matches!(
+            message,
+            HostToRelay::RunStatus { headline: Some(headline), .. }
+                if headline == "Fix the headline"
+        )));
+        assert!(
+            !output
+                .iter()
+                .any(|message| matches!(message, HostToRelay::RunMessage { .. })),
+            "plans must not be posted into chat"
+        );
     }
 
     #[tokio::test]

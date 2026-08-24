@@ -18,6 +18,7 @@ import {
   sendAttempt,
   type SendAttempt,
 } from "@client/send";
+import { foldTranscript } from "@client/transcript";
 import { Avatar, proseText, useNavigation } from "./common";
 import { useDictation } from "../lib/dictation";
 import { readTask } from "../lib/task";
@@ -42,7 +43,62 @@ import { AttachmentRow, Card } from "./Cards";
 import { Lightbox } from "./Evidence";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
+import { RunTrace } from "./RunActivity";
 import type { Attachment, Channel, Id, Member, Message, Run } from "@client/types";
+
+/// Whether this person wants to watch the agent work in this workspace.
+///
+/// Per person and per workspace, because it is a reading habit rather than a
+/// setting: the same conversation is a transcript to one reader and a log to
+/// the next. Off by default — chat is for what was said.
+const SHOW_WORK_PREFIX = "patchwork.showwork.";
+
+export function useShowWork(): [boolean, (on: boolean) => void] {
+  const { workspaceId, memberId } = useAppSelector((data) => ({
+    workspaceId: data.workspace?.id,
+    memberId: data.me?.id,
+  }));
+  const key = `${SHOW_WORK_PREFIX}${workspaceId ?? ""}.${memberId ?? ""}`;
+  const [on, setOn] = useState(() => localStorage.getItem(key) === "1");
+  // Switching workspace or account must not carry the last one's answer.
+  useEffect(() => setOn(localStorage.getItem(key) === "1"), [key]);
+  const set = useCallback(
+    (next: boolean) => {
+      setOn(next);
+      if (next) localStorage.setItem(key, "1");
+      else localStorage.removeItem(key);
+    },
+    [key],
+  );
+  return [on, set];
+}
+
+/// Lives in the conversation itself rather than in a title bar, so every chat
+/// surface — a channel, a task discussion — has it without either of them
+/// having to know about it.
+function ShowWorkToggle({
+  on,
+  onChange,
+}: {
+  on: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <button
+      className={`work-toggle${on ? " on" : ""}`}
+      aria-pressed={on}
+      title={
+        on
+          ? "Keep the transcript to what was said"
+          : "Show every status line and the full run activity inline"
+      }
+      onClick={() => onChange(!on)}
+    >
+      <PulseIcon size={14} />
+      {on ? "Hide work" : "Show work"}
+    </button>
+  );
+}
 
 export function ChatView({ channelId }: { channelId: Id }) {
   const { channel, messages } = useAppSelector((data) => ({
@@ -53,6 +109,7 @@ export function ChatView({ channelId }: { channelId: Id }) {
   const [replyTo, setReplyTo] = useState<Message>();
   const [sent, setSent] = useState<{ channelId: Id; messageId: Id }>();
   const clearDropped = useCallback(() => setDropped([]), []);
+  const [showWork, setShowWork] = useShowWork();
 
   useEffect(() => {
     setReplyTo(undefined);
@@ -66,11 +123,17 @@ export function ChatView({ channelId }: { channelId: Id }) {
     // a requirement invented by the implementation, not by the person holding
     // the file — they are dropping it *into this conversation*.
     <DropZone onFiles={(files) => setDropped(files)}>
+      {/* Its own strip above the transcript: a floating control would sit on
+          top of the messages it is there to filter. */}
+      <div className="chat-work-bar">
+        <ShowWorkToggle on={showWork} onChange={setShowWork} />
+      </div>
       <Timeline
         channelId={channelId}
         messages={messages ?? []}
         sentMessageId={sent?.channelId === channelId ? sent.messageId : undefined}
         onReply={setReplyTo}
+        showWork={showWork}
       />
       <Composer
         channel={channel}
@@ -159,11 +222,14 @@ export function Timeline({
   messages,
   sentMessageId,
   onReply,
+  showWork = false,
 }: {
   channelId: Id;
   messages: Message[];
   sentMessageId?: Id;
   onReply: (message: Message) => void;
+  /// Every status line and the whole run log, instead of the conversation.
+  showWork?: boolean;
 }) {
   const { members, runs, hasMore, sourceMessageId } = useAppSelector((data) => {
     const channel = data.channels.find((candidate) => candidate.id === channelId);
@@ -235,6 +301,7 @@ export function Timeline({
   // Day markers and grouping are decided for the whole list, not for the
   // visible slice — otherwise scrolling would change where the dividers fall.
   const rows = useMemo(() => {
+    const { superseded, traces } = foldTranscript(messages, showWork);
     let previousDay: string | undefined;
     const out = messages.map((message, index) => {
       const previous = messages[index - 1];
@@ -248,8 +315,12 @@ export function Timeline({
         /// Set on the first of a run of workspace events: the whole run,
         /// drawn as one line.
         group: undefined as Message[] | undefined,
-        /// Swallowed by the line above it.
-        hidden: false,
+        /// Swallowed by the line above it, or already said by a later status
+        /// from the same run. The relay coalesces new statuses, but histories
+        /// already on this machine still carry every one of them.
+        hidden: superseded.has(message.id),
+        /// The run whose activity this row anchors, at most once per run.
+        trace: traces.get(message.id),
       };
     });
 
@@ -275,8 +346,20 @@ export function Timeline({
       }
       start = end;
     }
+
+    // A swallowed row must not take the day divider down with it.
+    let carried: string | undefined;
+    for (const row of out) {
+      if (row.hidden) {
+        carried ??= row.day;
+        row.day = undefined;
+        continue;
+      }
+      if (carried && !row.day) row.day = carried;
+      carried = undefined;
+    }
     return out;
-  }, [messages]);
+  }, [messages, showWork]);
 
   const authorOf = useMemo(() => {
     const map = new Map<Id, Member>();
@@ -312,7 +395,10 @@ export function Timeline({
           const run = message.run_id ? runs[message.run_id] : undefined;
           // The card only still earns its own row when the run failed, is
           // waiting on someone, or produced no reply to fold itself into.
+          // With Show work it is also the peg the run's log hangs from, so it
+          // comes back — still folded, just no longer invisible.
           const folded =
+            !showWork &&
             message.kind === "card" &&
             message.card?.type === "run" &&
             runsWithReply.has(message.card.run_id) &&
@@ -347,6 +433,7 @@ export function Timeline({
                 onReply={onReply}
               />
               )}
+              {row.trace && <RunTrace runId={row.trace} />}
             </div>
           );
         })}

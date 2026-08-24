@@ -995,6 +995,30 @@ impl Store {
             .optional()?)
     }
 
+    /// The one live status line an agent run owns in this conversation.
+    pub fn run_status_message(
+        &self,
+        run_id: &str,
+        channel_id: &str,
+        author_id: &str,
+    ) -> Result<Option<Message>> {
+        let conn = self.conn()?;
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM messages WHERE run_id = ?1 AND channel_id = ?2
+                 AND author_id = ?3 AND kind = 'status' AND parent_id IS NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![run_id, channel_id, author_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        drop(conn);
+        match id {
+            Some(id) => self.message(&id),
+            None => Ok(None),
+        }
+    }
+
     /// A streamed reply only knows who it mentions once it is finished.
     pub fn set_message_mentions(&self, id: &str, mentions: &[Id]) -> Result<()> {
         self.conn()?.execute(

@@ -341,6 +341,7 @@ export type RunEventKind =
   | "lifecycle"
   | "thought"
   | "message"
+  | "status"
   | "tool_call"
   | "tool_result"
   | "file_change"
