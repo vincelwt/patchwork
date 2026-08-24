@@ -547,6 +547,7 @@ body.resizing {
 .timeline {
   flex: 1;
   overflow-y: auto;
+  overflow-anchor: none;
   min-height: 0;
   padding: 6px 0 8px;
 }
@@ -923,9 +924,13 @@ body.resizing {
   gap: 8px;
   margin-top: 7px;
 }
+/* A picture in a conversation is a thumbnail you click, not the picture: it
+   sits between two sentences and has to leave them legible. Both axes are
+   capped, so a screenshot the size of a monitor comes down to the same tile as
+   everything else, and the ratio survives because neither axis is fixed. */
 .image-attachment {
   display: block;
-  max-width: 380px;
+  max-width: min(280px, 100%);
   border-radius: 10px;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -933,9 +938,12 @@ body.resizing {
   cursor: zoom-in;
 }
 .image-attachment img {
+  display: block;
+  width: auto;
+  height: auto;
   max-width: 100%;
-  max-height: 320px;
-  object-fit: cover;
+  max-height: 220px;
+  object-fit: contain;
 }
 
 .composer-attachments {
@@ -1301,6 +1309,35 @@ button.card:hover {
   gap: 8px;
   margin-top: 12px;
   flex-wrap: wrap;
+}
+
+/* A task mentioned mid-conversation is a reference, and a reference should not
+   take more room than the sentence around it. Same fields, less air: key,
+   title, one line of outcome, status and owner. Written after the plain card
+   rules it narrows, because it matches them on specificity. */
+.card.task-inline {
+  padding: 9px 12px;
+  max-width: 480px;
+}
+.task-inline .card-head {
+  font-size: 12px;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+.task-inline .card-title {
+  font-size: 14px;
+}
+.task-inline .card-sub {
+  font-size: 13px;
+  -webkit-line-clamp: 1;
+}
+.task-inline .card-row {
+  margin-top: 7px;
+  gap: 6px;
+}
+.task-inline .chip {
+  font-size: 12px;
+  padding: 0 8px;
 }
 
 .chip {

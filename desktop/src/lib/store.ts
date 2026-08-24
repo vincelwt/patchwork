@@ -94,6 +94,7 @@ class Session {
   private retryDelay = 1000;
   private loadingChannels = new Set<Id>();
   private loadingThreads = new Set<Id>();
+  private loadingOlder = new Map<Id, Promise<void>>();
   private notifying = false;
   api?: Api;
 
@@ -473,7 +474,22 @@ class Session {
     this.set({ channels: upsert(this.data.channels, channel) });
   }
 
-  async loadOlder(channelId: Id) {
+  /// One page at a time per channel. Scrolling into the top of a conversation
+  /// fires scroll events by the dozen, and every one of them used to start its
+  /// own request from the same oldest message: the same page fetched over and
+  /// over, each landing jumping the viewport again. Callers that arrive while a
+  /// page is in flight are handed that page, so they restore against it once.
+  loadOlder(channelId: Id): Promise<void> {
+    const pending = this.loadingOlder.get(channelId);
+    if (pending) return pending;
+    const request = this.fetchOlder(channelId).finally(() => {
+      this.loadingOlder.delete(channelId);
+    });
+    this.loadingOlder.set(channelId, request);
+    return request;
+  }
+
+  private async fetchOlder(channelId: Id) {
     if (!this.api) return;
     const list = this.data.messages[channelId];
     if (!list?.length) return;

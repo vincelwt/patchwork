@@ -1,18 +1,24 @@
 // Rendering only the part of a long conversation that is on screen.
 //
-// Chat messages have no fixed height — one is a word, the next is a table and a
-// code block — so this measures rows as they render and remembers them. Until
+// Chat messages have no fixed height: one is a word, the next is a table and a
+// code block, so this measures rows as they render and remembers them. Until
 // a row has been seen it contributes an estimate, which is only ever used for
 // rows nobody has scrolled to yet.
+//
+// Measurements are filed under the message id, never under the row's position.
+// History is prepended, so positions shift under rows that have not changed,
+// and a position-keyed table quietly hands every row the height of whichever
+// message used to sit there.
 //
 // Deliberately inert below a threshold: most conversations are short, and a
 // virtualiser that engages at twenty messages is all risk and no benefit.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
+import { rowOffsets, visibleRange } from "@client/scroll";
 
-/// Below this, render everything. Chosen so that the common case — a channel
-/// you have just opened, one page of history — never goes near this code.
+/// Below this, render everything. Chosen so that the common case, a channel
+/// you have just opened with one page of history, never goes near this code.
 export const VIRTUALIZE_ABOVE = 80;
 
 /// Rows kept mounted beyond the viewport, so a flick of the wheel lands on
@@ -24,64 +30,65 @@ export interface Window {
   end: number;
   padTop: number;
   padBottom: number;
-  /// A `ref` for the row at `index`, stable for as long as that index exists.
-  /// Stability is the point: an inline `el => measure(i, el)` is a new function
-  /// on every render, so React detaches and reattaches every visible row, and
-  /// each reattachment used to throw away a ResizeObserver and build another.
-  rowRef: (index: number) => (element: HTMLElement | null) => void;
+  /// A `ref` for the row with this key, stable for as long as that key exists.
+  /// Stability is the point: an inline `el => measure(key, el)` is a new
+  /// function on every render, so React detaches and reattaches every visible
+  /// row, and each reattachment used to throw away a ResizeObserver and build
+  /// another.
+  rowRef: (key: string) => (element: HTMLElement | null) => void;
   /// True when the window is actually narrower than the list.
   active: boolean;
 }
 
 export function useVirtualWindow(
   scroller: RefObject<HTMLElement | null>,
-  count: number,
+  /// One stable id per row, in display order. Memoise it: a fresh array on
+  /// every render rebuilds the prefix sums on every render.
+  keys: string[],
   estimate = 84,
 ): Window {
-  const heights = useRef<number[]>([]);
-  const observers = useRef(new Map<number, ResizeObserver>());
-  const refs = useRef(new Map<number, (element: HTMLElement | null) => void>());
+  const heights = useRef(new Map<string, number>());
+  const observers = useRef(new Map<string, ResizeObserver>());
+  const refs = useRef(new Map<string, (element: HTMLElement | null) => void>());
   const [measured, bump] = useState(0);
+  const count = keys.length;
   const [range, setRange] = useState({ start: 0, end: count });
   const active = count > VIRTUALIZE_ABOVE;
 
-  // Prefix sums, rebuilt whenever a measurement lands. Cheap at these sizes and
-  // far easier to reason about than an incremental structure.
+  // Where each row starts, rebuilt whenever a measurement lands. Cheap at these
+  // sizes and far easier to reason about than an incremental structure.
   const offsets = useMemo(() => {
-    const out = new Array<number>(count + 1);
-    out[0] = 0;
-    for (let index = 0; index < count; index += 1) {
-      out[index + 1] = out[index] + (heights.current[index] ?? estimate);
-    }
-    return out;
+    return rowOffsets(keys, heights.current, estimate);
     // Rebuilt when a row is measured, not when the visible range moves: the
     // sums do not depend on where you are scrolled, and rebuilding them on
     // every scroll event is a full pass over the conversation per frame.
-  }, [count, estimate, measured]);
+  }, [keys, estimate, measured]);
+
+  // Read inside `measure`, which must not be rebuilt on every scroll: a new
+  // callback identity there detaches and reattaches every mounted row.
+  const positions = useRef(new Map<string, number>());
+  const firstVisible = useRef(0);
+  positions.current = useMemo(
+    () => new Map(keys.map((key, index) => [key, index])),
+    [keys],
+  );
 
   const recompute = useCallback(() => {
     const element = scroller.current;
-    if (!element || !active) {
-      setRange({ start: 0, end: count });
-      return;
-    }
-    const top = element.scrollTop;
-    const bottom = top + element.clientHeight;
-
-    // Binary search the first row whose bottom edge is past the viewport top.
-    let low = 0;
-    let high = count;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if (offsets[middle + 1] <= top) low = middle + 1;
-      else high = middle;
-    }
-    let start = low;
-    let end = start;
-    while (end < count && offsets[end] < bottom) end += 1;
-
-    start = Math.max(0, start - OVERSCAN);
-    end = Math.min(count, end + OVERSCAN);
+    if (!element) return;
+    const next = visibleRange(
+      offsets,
+      element.scrollTop,
+      element.clientHeight,
+      OVERSCAN,
+    );
+    // Wanted even when the window is inert, because it is what tells a row
+    // settling above the viewport how much height it has to pay back.
+    firstVisible.current = next.first;
+    const start = active ? next.start : 0;
+    const end = active ? next.end : count;
+    // Compared rather than replaced: a fresh object every scroll event used to
+    // redraw a short conversation on every wheel tick to say nothing changed.
     setRange((current) =>
       current.start === start && current.end === end ? current : { start, end },
     );
@@ -95,37 +102,46 @@ export function useVirtualWindow(
     return () => element.removeEventListener("scroll", recompute);
   }, [scroller, recompute]);
 
-  // A row that changes height — an image loading, a reply streaming in — has to
+  // A row that changes height, an image loading or a reply streaming in, has to
   // update the sums, or everything below it drifts.
   const measure = useCallback(
-    (index: number, element: HTMLElement | null) => {
-      const existing = observers.current.get(index);
+    (key: string, element: HTMLElement | null) => {
+      const existing = observers.current.get(key);
       if (existing) {
         existing.disconnect();
-        observers.current.delete(index);
+        observers.current.delete(key);
       }
       if (!element) return;
 
       const record = (height: number) => {
-        if (height > 0 && Math.abs((heights.current[index] ?? 0) - height) > 0.5) {
-          heights.current[index] = height;
-          bump((n) => n + 1);
+        const previous = heights.current.get(key) ?? estimate;
+        if (height <= 0 || Math.abs(previous - height) <= 0.5) return;
+        heights.current.set(key, height);
+        // A row that settles above the viewport pushes everything below it
+        // down by the difference, which drags the words being read off the
+        // screen. Move the viewport by the same amount and it stays still.
+        // WebKit has no scroll anchoring of its own, so nothing else will.
+        const viewport = scroller.current;
+        const index = positions.current.get(key);
+        if (viewport && index !== undefined && index < firstVisible.current) {
+          viewport.scrollTop += height - previous;
         }
+        bump((n) => n + 1);
       };
       record(element.offsetHeight);
       const observer = new ResizeObserver(() => record(element.offsetHeight));
       observer.observe(element);
-      observers.current.set(index, observer);
+      observers.current.set(key, observer);
     },
-    [],
+    [scroller, estimate],
   );
 
   const rowRef = useCallback(
-    (index: number) => {
-      const known = refs.current.get(index);
+    (key: string) => {
+      const known = refs.current.get(key);
       if (known) return known;
-      const callback = (element: HTMLElement | null) => measure(index, element);
-      refs.current.set(index, callback);
+      const callback = (element: HTMLElement | null) => measure(key, element);
+      refs.current.set(key, callback);
       return callback;
     },
     [measure],
@@ -139,10 +155,20 @@ export function useVirtualWindow(
     };
   }, []);
 
-  // A shorter list must not keep stale heights from the old one.
+  // Ids that are no longer on the list, because the window moved to another
+  // conversation, must not sit in these maps for the life of the app. Stale
+  // entries are never read, so this is only about memory: swept in bulk rather
+  // than tracked per row.
   useEffect(() => {
-    if (heights.current.length > count) heights.current.length = count;
-  }, [count]);
+    if (heights.current.size + refs.current.size <= 4 * count + 64) return;
+    const live = new Set(keys);
+    for (const key of heights.current.keys()) {
+      if (!live.has(key)) heights.current.delete(key);
+    }
+    for (const key of refs.current.keys()) {
+      if (!live.has(key)) refs.current.delete(key);
+    }
+  }, [keys, count]);
 
   if (!active) {
     return { start: 0, end: count, padTop: 0, padBottom: 0, rowRef, active: false };
