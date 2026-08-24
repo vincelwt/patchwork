@@ -413,6 +413,11 @@ async fn notify_inbox(
     };
 
     for member_id in &message.mentions {
+        // A mention inside a direct message must not carry its preview to
+        // somebody outside it. Members already get the DirectMessage item.
+        if channel.kind == ChannelKind::Dm && !channel.member_ids.contains(member_id) {
+            continue;
+        }
         push(
             state,
             member_id,
@@ -580,6 +585,13 @@ async fn trigger_agents(
         let profile = agent.agent.clone().unwrap_or_default();
         let mentioned = message.mentions.contains(&agent.id);
         let in_dm = channel.kind == ChannelKind::Dm && channel.member_ids.contains(&agent.id);
+        // A direct message is between the people in it. Naming an outside
+        // agent there refers to it; it does not summon it into a private
+        // conversation it cannot even read. Ambient wandering was closed
+        // earlier; this closes the mention door too.
+        if channel.kind == ChannelKind::Dm && !in_dm {
+            continue;
+        }
         let participation = profile
             .channel_participation
             .get(&channel.id)
@@ -4021,6 +4033,69 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a plain follow-up must not invoke an only-when-mentioned agent"
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_mention_does_not_summon_an_outside_agent_into_a_dm() {
+        let path = std::env::temp_dir().join(format!("patchwork-dm-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        let human = member("human", "vince", MemberKind::Human);
+        let insider = member("insider", "wise", MemberKind::Agent);
+        let outsider = member("outsider", "developer", MemberKind::Agent);
+        for member in [&human, &insider, &outsider] {
+            store.insert_member(member).unwrap();
+        }
+        let members = [human, insider, outsider];
+        let channel = Channel {
+            id: "dm".into(),
+            kind: ChannelKind::Dm,
+            section_id: None,
+            slug: "dm".into(),
+            name: "DM".into(),
+            topic: String::new(),
+            position: 0.0,
+            created_at: 1,
+            member_ids: vec!["human".into(), "insider".into()],
+            task_id: None,
+            last_message_at: 0,
+        };
+        store.insert_channel(&channel).unwrap();
+        let mut message = message_at("ask", "human", 1, None);
+        message.channel_id = channel.id.clone();
+        message.body = "assign all of it to @developer".into();
+        message.mentions = vec!["outsider".into()];
+        store.insert_message(&message).unwrap();
+
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx });
+
+        trigger_agents(&state, &message, &channel, &members)
+            .await
+            .unwrap();
+
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected the DM member agent to start");
+        };
+        assert_eq!(spec.agent_id, "insider");
+        assert!(
+            rx.try_recv().is_err(),
+            "a mentioned outsider must not be pulled into a DM it is not part of"
         );
 
         drop(state);
