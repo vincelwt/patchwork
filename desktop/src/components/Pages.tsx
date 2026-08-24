@@ -2208,9 +2208,15 @@ export function AutomationModal({
         onChange={setChannelId}
         options={[
           { value: "", label: "None" },
+          // A report can land in a direct message as easily as in a channel —
+          // the daily sweep does exactly that — so both are offered here.
           ...app.channels
-            .filter((channel) => channel.kind === "channel")
-            .map((channel) => ({ value: channel.id, label: `#${channel.name}` })),
+            .filter((channel) => channel.kind === "channel" || channel.kind === "dm")
+            .map((channel) => ({
+              value: channel.id,
+              label:
+                channel.kind === "dm" ? `DM · ${channel.name}` : `#${channel.name}`,
+            })),
         ]}
         help="The automation stays connected to this conversation rather than copying it."
       />

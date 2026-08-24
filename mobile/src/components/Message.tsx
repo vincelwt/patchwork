@@ -121,6 +121,7 @@ export const MessageRow = memo(function MessageRow({
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [actions, setActions] = useState(false);
+  const [queueing, setQueueing] = useState(false);
   const author = workspace.bootstrap?.members.find((member) => member.id === message.author_id);
   const replyTo = message.reply_to_id
     ? workspace.messages[message.channel_id]?.find((item) => item.id === message.reply_to_id)
@@ -136,6 +137,25 @@ export const MessageRow = memo(function MessageRow({
   const react = async (emoji: string) => {
     setActions(false);
     await store.mutate((api) => api.react(message.id, emoji), false);
+  };
+
+  /// A suggested next step is said in your own words and in the place it was
+  /// offered: inside its thread, or quoting the message it came from. Queued
+  /// like any other send, so it survives having no signal.
+  const say = async (suggestion: string) => {
+    if (queueing) return;
+    setQueueing(true);
+    try {
+      await store.queueMessage({
+        channelId: message.channel_id,
+        parentId: message.parent_id,
+        replyToId: message.parent_id ? undefined : message.id,
+        body: suggestion,
+        attachmentIds: [],
+      });
+    } finally {
+      setQueueing(false);
+    }
   };
 
   if (message.kind === "status" || message.kind === "system") {
@@ -197,6 +217,25 @@ export const MessageRow = memo(function MessageRow({
         {message.body ? <Markdown body={message.body} /> : null}
         {message.card ? <CardView card={message.card} /> : null}
         {message.attachments.map((attachment) => <AttachmentView key={attachment.id} attachment={attachment} />)}
+        {message.suggestions?.length ? (
+          <View style={styles.suggestionRow}>
+            {message.suggestions.map((suggestion) => (
+              <Pressable
+                key={suggestion}
+                accessibilityRole="button"
+                accessibilityLabel={`Send suggestion: ${suggestion}`}
+                accessibilityState={{ disabled: queueing, busy: queueing }}
+                // One press, one message: pressing again while the first is
+                // still queueing would say the same thing twice.
+                disabled={queueing}
+                onPress={() => void say(suggestion)}
+                style={[styles.suggestion, { backgroundColor: theme.surface, borderColor: theme.line, opacity: queueing ? 0.55 : 1 }]}
+              >
+                <Text style={[styles.suggestionText, { color: theme.text }]}>{suggestion}</Text>
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
         {message.reactions.length ? (
           <View style={styles.reactionRow}>
             {message.reactions.map((reaction) => (
@@ -364,6 +403,9 @@ const styles = StyleSheet.create({
   replyReference: { flexDirection: "row", alignItems: "center", gap: 5, minWidth: 0, marginBottom: 3 },
   replyAuthor: { fontSize: 12, fontWeight: "600" },
   replyPreview: { flex: 1, fontSize: 12 },
+  suggestionRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 7 },
+  suggestion: { minHeight: 34, justifyContent: "center", borderWidth: StyleSheet.hairlineWidth, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
+  suggestionText: { fontSize: 13, fontWeight: "600" },
   reactionRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
   reaction: { minHeight: 32, justifyContent: "center", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   threadLine: { minHeight: 28, justifyContent: "center", marginTop: 1 },

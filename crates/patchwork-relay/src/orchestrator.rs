@@ -115,6 +115,7 @@ async fn post_message_inner(
         kind,
         body: input.body.clone(),
         card: input.card.clone(),
+        suggestions: clean_suggestions(input.suggestions.clone()),
         parent_id: input.parent_id.clone().or(destination.parent_id),
         reply_to_id: input.reply_to_id.clone().or(destination.reply_to_id),
         reply_to: None,
@@ -316,6 +317,7 @@ async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str)
         kind: MessageKind::Text,
         body: body.to_string(),
         card: None,
+        suggestions: Vec::new(),
         parent_id: destination.parent_id,
         reply_to_id: destination.reply_to_id,
         reply_to: None,
@@ -371,6 +373,42 @@ pub(crate) async fn finish_streamed_reply(state: &Shared, run_id: &str) -> Resul
         }
     }
     Ok(())
+}
+
+const SUGGESTIONS_PREFIX: &str = "<!-- patchwork-suggestions:";
+
+fn clean_suggestions(suggestions: Vec<String>) -> Vec<String> {
+    let mut clean = Vec::new();
+    for suggestion in suggestions {
+        let suggestion = suggestion.trim();
+        if !suggestion.is_empty() && !clean.iter().any(|item| item == suggestion) {
+            clean.push(suggestion.to_string());
+            if clean.len() == 3 {
+                break;
+            }
+        }
+    }
+    clean
+}
+
+/// Agents put a hidden JSON footer at the end of their final prose. The relay
+/// removes that transport detail and stores the actions as message data.
+fn split_suggestions(body: &str) -> (String, Vec<String>) {
+    let end = body.trim_end();
+    let Some(start) = end.rfind(SUGGESTIONS_PREFIX) else {
+        return (body.to_string(), Vec::new());
+    };
+    if (start > 0 && !end[..start].ends_with('\n')) || !end.ends_with("-->") {
+        return (body.to_string(), Vec::new());
+    }
+    let json = &end[start + SUGGESTIONS_PREFIX.len()..end.len() - 3];
+    let Ok(suggestions) = serde_json::from_str::<Vec<String>>(json.trim()) else {
+        return (body.to_string(), Vec::new());
+    };
+    (
+        end[..start].trim_end().to_string(),
+        clean_suggestions(suggestions),
+    )
 }
 
 /// `@handle` mentions, resolved against real members so unknown handles are
@@ -1029,6 +1067,7 @@ fn post_control_note(
         kind: MessageKind::Status,
         body,
         card: None,
+        suggestions: Vec::new(),
         parent_id: None,
         reply_to_id: None,
         reply_to: None,
@@ -2228,6 +2267,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
         }
 
         HostToRelay::RunMessage { run_id, kind, body } => {
+            let (body, suggestions) = split_suggestions(&body);
             let Some(run) = state.store.run(&run_id)? else {
                 return Ok(());
             };
@@ -2258,6 +2298,9 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             // than posting the same text twice.
             if let Some(message_id) = draft {
                 state.store.stream_message_body(&message_id, &body)?;
+                state
+                    .store
+                    .set_message_suggestions(&message_id, &suggestions)?;
                 if let Some(message) = state.store.message(&message_id)? {
                     state.emit(Event::MessageUpdated {
                         message: message.clone(),
@@ -2275,6 +2318,7 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 SendMessage {
                     body,
                     kind: Some(kind),
+                    suggestions,
                     parent_id: destination.parent_id,
                     reply_to_id: destination.reply_to_id,
                     ..Default::default()
@@ -4375,6 +4419,18 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_footer_becomes_at_most_three_clean_suggestions() {
+        let (body, suggestions) = split_suggestions(
+            "Done.\n\n<!-- patchwork-suggestions: [\" First \" , \"\", \"Second\", \"Second\", \"Third\", \"Fourth\"] -->\n",
+        );
+        assert_eq!(body, "Done.");
+        assert_eq!(suggestions, ["First", "Second", "Third"]);
+
+        let malformed = "Done.\n<!-- patchwork-suggestions: not-json -->";
+        assert_eq!(split_suggestions(malformed), (malformed.into(), Vec::new()));
+    }
+
+    #[test]
     fn mentions_need_a_word_boundary() {
         let members = vec![
             member("1", "dev", MemberKind::Agent),
@@ -4396,6 +4452,7 @@ mod tests {
             kind: MessageKind::Text,
             body: String::new(),
             card: None,
+            suggestions: Vec::new(),
             parent_id: None,
             reply_to_id: None,
             reply_to: None,

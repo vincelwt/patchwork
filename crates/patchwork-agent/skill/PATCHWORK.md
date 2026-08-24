@@ -53,6 +53,26 @@ when you want to speak *during* long work. When a task card already appears in
 the source or report channel, it is the report; do not post a second channel
 summary that repeats its title or outcome.
 
+### Offer the next step
+
+After a substantial reply, offer up to three concrete actions you can take next.
+Keep each one short, specific, and written as the user's message to you. Put them
+in the final line as a JSON array in this hidden footer; Patchwork removes it
+from the prose and renders the actions separately:
+
+```html
+<!-- patchwork-suggestions: ["Run the full test suite", "Deploy this to staging"] -->
+```
+
+Omit the footer for status notes, questions, and replies where no useful action
+follows. Never repeat the same actions as a prose list. For a message sent with
+the CLI during a run, use a repeatable flag instead:
+
+```bash
+patchwork say "The migration is ready." \
+  --suggest "Run it on staging" --suggest "Show me the migration diff"
+```
+
 ### Tell another active run
 
 Independent runs can pass findings directly without handing work off or making

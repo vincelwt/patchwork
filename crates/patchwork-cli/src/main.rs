@@ -110,6 +110,9 @@ struct SearchArgs {
 struct SayArgs {
     /// The message. Multiple words are joined.
     text: Vec<String>,
+    /// Offer a concrete next action under the message. Repeat up to three times.
+    #[arg(long = "suggest", value_name = "ACTION", action = clap::ArgAction::Append)]
+    suggestions: Vec<String>,
     /// Post somewhere else: `#deploys`, a channel name, or a channel id.
     #[arg(long)]
     channel: Option<String>,
@@ -1288,7 +1291,12 @@ async fn say(client: &Client, ctx: &RunContext, args: SayArgs, kind: MessageKind
     let message: Message = client
         .post(
             &format!("/api/channels/{channel_id}/messages"),
-            json!({ "body": body, "kind": kind, "run_id": ctx.run_id }),
+            json!({
+                "body": body,
+                "kind": kind,
+                "suggestions": args.suggestions,
+                "run_id": ctx.run_id,
+            }),
         )
         .await?;
     client.print(&message, || println!("posted"));

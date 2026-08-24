@@ -120,6 +120,7 @@ export interface Message {
   kind: MessageKind;
   body: string;
   card?: MessageCard;
+  suggestions: string[];
   parent_id?: Id;
   reply_to_id?: Id;
   reply_to?: ReplyPreview;
