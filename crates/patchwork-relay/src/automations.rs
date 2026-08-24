@@ -204,19 +204,6 @@ pub async fn on_task_change(state: &Shared, task: &Task, previous: Option<&Task>
         {
             tracing::warn!(?err, automation = %automation.name, "automation failed to start");
         }
-        // A listener naming one task has nothing left to wait for once it
-        // fires; leaving it enabled is clutter on the automations list.
-        if let AutomationTrigger::TaskStatus {
-            task_id: Some(_), ..
-        } = &automation.trigger
-        {
-            if let Ok(Some(mut latest)) = state.store.automation(&automation.id) {
-                latest.enabled = false;
-                if state.store.upsert_automation(&latest).is_ok() {
-                    state.emit(Event::AutomationUpdated { automation: latest });
-                }
-            }
-        }
     }
 }
 
@@ -320,7 +307,8 @@ pub async fn run_now(state: &Shared, automation: &Automation, by: &str) -> Resul
     fire(state, automation, summary, json!({ "by": by }), None, None).await
 }
 
-/// The single path every trigger funnels through.
+/// The single path every trigger funnels through. The occurrence is committed
+/// before any task, message, or host dispatch is attempted.
 pub async fn fire(
     state: &Shared,
     automation: &Automation,
@@ -329,18 +317,24 @@ pub async fn fire(
     task_id: Option<Id>,
     once_key: Option<String>,
 ) -> Result<AutomationRun> {
-    let mut record = AutomationRun {
+    let record = AutomationRun {
         id: new_id(),
         automation_id: automation.id.clone(),
         run_id: None,
         trigger_summary,
-        trigger_payload: Some(trigger_payload.clone()),
+        trigger_payload: Some(trigger_payload),
         selection: None,
         context_preview: String::new(),
         status: RunStatus::Queued,
         error: None,
-        task_id: task_id.clone(),
+        task_id,
         once_key,
+        kind: AutomationRunKind::Action,
+        due_at: None,
+        attempt_count: 0,
+        retry_at: None,
+        lease_until: None,
+        accepted_at: None,
         created_at: now_ms(),
         ended_at: None,
     };
@@ -350,60 +344,120 @@ pub async fn fire(
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });
+    attempt_automation_run(state, &record.id).await
+}
 
-    let outcome = dispatch(state, automation, &mut record, task_id).await;
+const AUTOMATION_LEASE_MS: Millis = 5 * 60 * 1000;
 
-    let finished_at = now_ms();
-    let failure = outcome.as_ref().err().map(|err| format!("{err:#}"));
-    if let Some(message) = &failure {
-        record.status = RunStatus::Failed;
-        record.error = Some(message.clone());
-        record.ended_at = Some(finished_at);
-    }
-    // A watch's health belongs to the command poll, not to the action it
-    // triggered. Update only firing metadata here, and never write a stale
-    // configuration back after asynchronous dispatch.
-    let is_watch = matches!(automation.trigger, AutomationTrigger::Watch { .. });
-    if let Some(updated) = state.store.record_automation_firing(
-        &automation.id,
-        &automation.trigger,
-        finished_at,
-        if is_watch {
-            None
-        } else {
-            next_due_after(&automation.trigger, finished_at)
-        },
-        failure.is_some(),
-        !is_watch,
-    )? {
-        state.emit(Event::AutomationUpdated {
-            automation: updated,
-        });
-    }
-    if let Some(message) = &failure {
-        if let Some((current, notify)) = state
-            .store
-            .record_automation_execution_failure(&automation.id, message)?
-        {
-            if notify {
-                if let Err(err) =
-                    deliver_execution_failure_notification(state, &current, message).await
-                {
-                    tracing::warn!(?err, automation = %automation.name, "could not notify automation creator");
-                }
-            }
-        }
-    } else if record.status == RunStatus::Succeeded {
+async fn attempt_automation_run(state: &Shared, id: &str) -> Result<AutomationRun> {
+    let now = now_ms();
+    let Some(mut record) =
         state
             .store
-            .clear_automation_execution_failure(&automation.id)?;
-    }
-
-    state.store.upsert_automation_run(&record)?;
+            .claim_automation_run(id, now, now.saturating_add(AUTOMATION_LEASE_MS))?
+    else {
+        return state
+            .store
+            .automation_run(id)?
+            .ok_or_else(|| anyhow!("automation occurrence no longer exists"));
+    };
     state.emit(Event::AutomationRunUpdated {
         run: record.clone(),
     });
+
+    let Some(automation) = state.store.automation(&record.automation_id)? else {
+        return state
+            .store
+            .complete_automation_run(&record.id, record.attempt_count, now_ms())?
+            .ok_or_else(|| anyhow!("automation occurrence no longer exists"));
+    };
+    if !automation.enabled {
+        return state
+            .store
+            .release_automation_run(&record.id, record.attempt_count)?
+            .ok_or_else(|| anyhow!("automation occurrence no longer exists"));
+    }
+
+    let outcome = match record.kind {
+        AutomationRunKind::Action => {
+            let task_id = record.task_id.clone();
+            dispatch(state, &automation, &mut record, task_id).await
+        }
+        AutomationRunKind::WatchPoll => {
+            let outcome = poll_watch(state, &automation, &record).await;
+            if outcome.is_ok() {
+                record.status = RunStatus::Succeeded;
+            }
+            outcome
+        }
+    };
+
+    if let Err(error) = outcome {
+        let diagnostic = format!("{error:#}");
+        let retry = state
+            .store
+            .retry_automation_run(&record.id, record.attempt_count, &diagnostic, now_ms())?
+            .ok_or_else(|| anyhow!("automation occurrence was accepted while failing"))?;
+        state.emit(Event::AutomationRunUpdated { run: retry.clone() });
+        if record.kind == AutomationRunKind::Action {
+            let notification = format!(
+                "Occurrence {} is blocked: {}. It will retry automatically; fix the configuration or pause the automation.",
+                retry.id, diagnostic
+            );
+            if let Some((current, notify)) = state
+                .store
+                .record_automation_execution_failure(&automation.id, &notification)?
+            {
+                if notify {
+                    if let Err(err) =
+                        deliver_execution_failure_notification(state, &current, &notification).await
+                    {
+                        tracing::warn!(?err, automation = %automation.name, "could not notify automation creator");
+                    }
+                }
+            }
+        }
+        if let Some(current) = state.store.automation(&automation.id)? {
+            state.emit(Event::AutomationUpdated {
+                automation: current,
+            });
+        }
+        return Ok(retry);
+    }
+
+    if record.status == RunStatus::Succeeded {
+        record = state
+            .store
+            .complete_automation_run(&record.id, record.attempt_count, now_ms())?
+            .ok_or_else(|| anyhow!("automation occurrence no longer exists"))?;
+        state
+            .store
+            .clear_automation_execution_failure(&automation.id)?;
+    } else {
+        // `start_run` linked the durable run in the same transaction that
+        // inserted it. Reload so a fast host acknowledgement cannot be
+        // overwritten by this attempt's older in-memory copy.
+        record = state
+            .store
+            .automation_run(&record.id)?
+            .ok_or_else(|| anyhow!("automation occurrence no longer exists"))?;
+    }
+    state.emit(Event::AutomationRunUpdated {
+        run: record.clone(),
+    });
+    if let Some(current) = state.store.automation(&automation.id)? {
+        state.emit(Event::AutomationUpdated {
+            automation: current,
+        });
+    }
     Ok(record)
+}
+
+fn persist_claimed_run(state: &Shared, record: &AutomationRun) -> Result<()> {
+    if !state.store.upsert_automation_run(record)? {
+        return Err(anyhow!("automation occurrence lease expired"));
+    }
+    Ok(())
 }
 
 async fn dispatch(
@@ -412,87 +466,110 @@ async fn dispatch(
     record: &mut AutomationRun,
     trigger_task_id: Option<Id>,
 ) -> Result<()> {
+    persist_claimed_run(state, record)?;
     let report_channel = automation
         .report_channel_id
         .clone()
         .or_else(|| automation.context_channel_id.clone());
 
-    let (channel_id, task_id, start_agent, required_task_status) = match automation.action {
-        AutomationAction::PostInChat => {
-            let channel = report_channel
-                .ok_or_else(|| anyhow::anyhow!("this automation has no channel to post in"))?;
-            (channel, None, true, None)
-        }
-        AutomationAction::ContinueTask => {
-            let task_id = trigger_task_id
-                .ok_or_else(|| anyhow::anyhow!("nothing in this trigger identifies a task"))?;
-            let task = state
-                .store
-                .task(&task_id)?
-                .ok_or_else(|| anyhow::anyhow!("the task no longer exists"))?;
-            (task.discussion_channel_id, Some(task.id), true, None)
-        }
-        AutomationAction::CreateTask => {
-            let event = watch_event(&automation.trigger, record.trigger_payload.as_ref());
-            let (title, outcome, once_key, initial_message) = match &event {
-                Some(event) => (
-                    event.title.clone(),
-                    event.outcome.clone(),
-                    Some(event.condition_key.clone()),
-                    event_source_message(event),
-                ),
-                None => (
-                    automation.name.clone(),
-                    String::new(),
-                    record.once_key.clone(),
-                    trigger_source_message(record),
-                ),
-            };
-            let creation = orchestrator::create_task_with_result(
-                state,
-                &automation.created_by,
-                CreateTask {
-                    title,
-                    outcome,
-                    initial_message: Some(initial_message.clone()),
-                    owner_id: Some(automation.agent_id.clone()),
-                    // The automation starts this task itself below, with its trigger context.
-                    status: Some(TaskStatus::Planned),
-                    once_key,
-                    source_channel_id: report_channel.clone(),
-                    project_id: automation.project_id.clone(),
-                    host_id: automation.host_id.clone(),
-                    start: false,
-                    ..Default::default()
-                },
-            )
-            .await?;
-            let task = creation.task;
-            if !creation.created {
-                orchestrator::post_message(
-                    state,
-                    &task.discussion_channel_id,
-                    &automation.created_by,
-                    SendMessage {
-                        body: initial_message,
-                        ..Default::default()
-                    },
-                    orchestrator::PostOptions {
-                        trigger_agents: false,
-                        run_id: None,
-                    },
-                )
-                .await?;
+    let (channel_id, task_id, start_agent, required_task_status, previous_task_status) =
+        match automation.action {
+            AutomationAction::PostInChat => {
+                let channel = report_channel
+                    .ok_or_else(|| anyhow::anyhow!("this automation has no channel to post in"))?;
+                (channel, None, true, None, None)
             }
-            let start_agent = task_needs_run(&task);
-            (
-                task.discussion_channel_id.clone(),
-                Some(task.id),
-                start_agent,
-                Some(TaskStatus::Planned),
-            )
-        }
-    };
+            AutomationAction::ContinueTask => {
+                let task_id = trigger_task_id
+                    .ok_or_else(|| anyhow::anyhow!("nothing in this trigger identifies a task"))?;
+                let task = state
+                    .store
+                    .task(&task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("the task no longer exists"))?;
+                let previous_status = task.status;
+                (
+                    task.discussion_channel_id,
+                    Some(task.id),
+                    true,
+                    None,
+                    Some(previous_status),
+                )
+            }
+            AutomationAction::CreateTask => {
+                let event = watch_event(&automation.trigger, record.trigger_payload.as_ref());
+                let (title, outcome, once_key, initial_message) = match &event {
+                    Some(event) => (
+                        event.title.clone(),
+                        event.outcome.clone(),
+                        Some(event.condition_key.clone()),
+                        event_source_message(event),
+                    ),
+                    None => (
+                        automation.name.clone(),
+                        String::new(),
+                        Some(format!("automation-occurrence:{}", record.id)),
+                        trigger_source_message(record),
+                    ),
+                };
+                let resumed_task = record
+                    .task_id
+                    .as_deref()
+                    .and_then(|id| state.store.task(id).ok().flatten());
+                let (task, created) = if let Some(task) = resumed_task {
+                    (task, false)
+                } else {
+                    let creation = orchestrator::create_task_with_result(
+                        state,
+                        &automation.created_by,
+                        CreateTask {
+                            title,
+                            outcome,
+                            initial_message: Some(initial_message.clone()),
+                            owner_id: Some(automation.agent_id.clone()),
+                            // The automation starts this task itself below, with its trigger context.
+                            status: Some(TaskStatus::Planned),
+                            once_key,
+                            source_channel_id: report_channel.clone(),
+                            project_id: automation.project_id.clone(),
+                            host_id: automation.host_id.clone(),
+                            start: false,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    (creation.task, creation.created)
+                };
+                let already_linked = record.task_id.as_deref() == Some(task.id.as_str());
+                record.task_id = Some(task.id.clone());
+                persist_claimed_run(state, record)?;
+                if !created && !already_linked {
+                    orchestrator::post_message(
+                        state,
+                        &task.discussion_channel_id,
+                        &automation.created_by,
+                        SendMessage {
+                            body: initial_message,
+                            client_id: Some(record.id.clone()),
+                            ..Default::default()
+                        },
+                        orchestrator::PostOptions {
+                            trigger_agents: false,
+                            run_id: None,
+                        },
+                    )
+                    .await?;
+                }
+                let start_agent = task_needs_run(&task);
+                let previous_status = task.status;
+                (
+                    task.discussion_channel_id.clone(),
+                    Some(task.id),
+                    start_agent,
+                    Some(TaskStatus::Planned),
+                    Some(previous_status),
+                )
+            }
+        };
 
     record.task_id = task_id.clone();
     record.selection = Some(json!({
@@ -503,7 +580,9 @@ async fn dispatch(
         "host_id": automation.host_id,
         "action": automation.action,
         "started": start_agent,
+        "previous_task_status": previous_task_status,
     }));
+    persist_claimed_run(state, record)?;
 
     if !start_agent {
         record.status = RunStatus::Succeeded;
@@ -526,6 +605,7 @@ async fn dispatch(
         }
     }
     record.context_preview = prompt.chars().take(4000).collect();
+    persist_claimed_run(state, record)?;
 
     let run = match orchestrator::start_run(
         state,
@@ -538,6 +618,8 @@ async fn dispatch(
                 automation_id: automation.id.clone(),
             },
             automation_id: Some(automation.id.clone()),
+            automation_run_id: Some(record.id.clone()),
+            automation_run_attempt: Some(record.attempt_count),
             depth: 0,
             host_id: automation.host_id.clone(),
             project_id: automation.project_id.clone(),
@@ -562,15 +644,23 @@ async fn dispatch(
     };
 
     record.run_id = Some(run.id);
-    record.status = RunStatus::Running;
+    record.status = RunStatus::Dispatched;
     Ok(())
 }
 
 pub async fn report_failure(state: &Shared, record: &AutomationRun, run: &Run) -> Result<()> {
-    let message = run
+    let error = run
         .error
         .clone()
         .unwrap_or_else(|| "the run failed without an error message".into());
+    let message = if record.accepted_at.is_none() {
+        format!(
+            "Occurrence {} was not accepted by its host: {}. It will retry automatically; fix the host or pause the automation.",
+            record.id, error
+        )
+    } else {
+        error
+    };
     let Some((automation, notify)) = state
         .store
         .record_automation_execution_failure(&record.automation_id, &message)?
@@ -599,129 +689,122 @@ fn matches_pattern(pattern: &str, body: &str) -> bool {
     body.to_lowercase().contains(&pattern.to_lowercase())
 }
 
-/// Runs schedule-triggered automations. One task, one wake-up a minute: the
-/// relay should stay cheap on an ordinary VPS.
+/// Runs clock triggers. Each due occurrence is committed before a worker can
+/// claim it, so process and relay restarts only delay work; they cannot erase it.
 pub async fn scheduler(state: Shared) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(20));
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         ticker.tick().await;
         announce_due_tasks(&state);
         check_task_continuations(&state).await;
-        let Ok(automations) = state.store.automations() else {
-            continue;
-        };
-        let now = now_ms();
-        for automation in automations.into_iter().filter(|a| a.enabled) {
-            if let AutomationTrigger::Watch {
-                command,
-                every_seconds,
-            } = &automation.trigger
-            {
-                if WatchPollGuard::is_active(&state, &automation.id) {
-                    continue;
-                }
-                let due = automation
-                    .next_run_at
-                    .unwrap_or(automation.created_at + every_seconds * 1000);
-                let mut current = automation.clone();
-                if watch_is_stale(due, *every_seconds, now) {
-                    let reason =
-                        format!("watch missed its expected poll at {due}; relay time is {now}");
-                    match record_stale_watch_failure(&state, &automation, &reason) {
-                        Ok((updated, notify)) => {
-                            if notify {
-                                if let Err(err) =
-                                    deliver_watch_failure_notification(&state, &updated, &reason)
-                                        .await
-                                {
-                                    tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
-                                }
-                            }
-                            if let Err(err) =
-                                ensure_watch_operator_task(&state, &updated, &reason).await
-                            {
-                                tracing::warn!(?err, automation = %automation.name, "could not escalate stale watch");
-                            }
-                            current = updated;
-                        }
-                        Err(err) => {
-                            tracing::warn!(?err, automation = %automation.name, "could not record stale watch")
-                        }
-                    }
-                }
-                if due > now {
-                    continue;
-                }
-                // Book the next poll before running this one: a scan that
-                // hangs or dies must not be retried on every tick. Polling off
-                // the ticker thread keeps one slow watcher from delaying the
-                // rest.
-                let Some(guard) = WatchPollGuard::acquire(&state, &automation.id) else {
-                    continue;
-                };
-                match state.store.claim_watch_poll(
-                    &automation.id,
-                    &automation.trigger,
-                    now + every_seconds * 1000,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(err) => {
-                        tracing::warn!(?err, automation = %automation.name, "could not schedule watch poll");
-                        continue;
-                    }
-                }
-                tokio::spawn(poll_watch(
-                    state.clone(),
-                    current,
-                    command.clone(),
-                    *every_seconds,
-                    guard,
-                ));
-                continue;
-            }
-            let (due_at, summary) = match &automation.trigger {
+        if let Err(err) = scheduler_tick(&state, now_ms()).await {
+            tracing::warn!(?err, "automation scheduler tick failed");
+        }
+    }
+}
+
+async fn scheduler_tick(state: &Shared, now: Millis) -> Result<()> {
+    for automation in state.store.automations()?.into_iter().filter(|a| a.enabled) {
+        let mut current = automation;
+        // Materialize every missed clock occurrence. The batch keeps one old
+        // schedule from monopolising a tick; the next tick resumes at the
+        // first still-unrecorded due time.
+        for _ in 0..100 {
+            let (kind, due_at, summary) = match &current.trigger {
+                AutomationTrigger::Watch { every_seconds, .. } => (
+                    AutomationRunKind::WatchPoll,
+                    current.next_run_at.unwrap_or(
+                        current
+                            .created_at
+                            .saturating_add(every_seconds.saturating_mul(1000)),
+                    ),
+                    format!("Watch poll every {every_seconds}s"),
+                ),
                 AutomationTrigger::Schedule {
                     every_seconds,
                     start_at,
                 } => (
-                    automation
-                        .next_run_at
-                        .or(*start_at)
-                        .unwrap_or(automation.created_at + every_seconds * 1000),
+                    AutomationRunKind::Action,
+                    current.next_run_at.or(*start_at).unwrap_or(
+                        current
+                            .created_at
+                            .saturating_add(every_seconds.saturating_mul(1000)),
+                    ),
                     format!("Scheduled every {every_seconds}s"),
                 ),
                 AutomationTrigger::Cron { expression } => {
-                    // No stored next time yet — work out the first one from
-                    // when it was created, not from now, or restarting the
-                    // relay would postpone every schedule indefinitely.
-                    let Some(due) = automation
+                    let Some(due) = current
                         .next_run_at
-                        .or_else(|| next_cron_after(expression, automation.created_at))
+                        .or_else(|| next_cron_after(expression, current.created_at))
                     else {
-                        continue;
+                        break;
                     };
-                    (due, format!("Scheduled: {expression}"))
+                    (
+                        AutomationRunKind::Action,
+                        due,
+                        format!("Scheduled: {expression}"),
+                    )
                 }
-                _ => continue,
+                _ => break,
             };
             if due_at > now {
-                continue;
+                break;
             }
-            if let Err(err) = fire(
-                &state,
-                &automation,
-                summary,
-                json!({ "at": now }),
-                None,
-                None,
-            )
-            .await
+            if let Some(run) = state.store.materialize_due_automation_run(
+                &current,
+                kind,
+                due_at,
+                next_due_after(&current.trigger, due_at),
+                &summary,
+                Some(&json!({ "at": due_at })),
+            )? {
+                state.emit(Event::AutomationRunUpdated { run });
+            }
+            let Some(updated) = state.store.automation(&current.id)? else {
+                break;
+            };
+            current = updated;
+            if !current.enabled {
+                break;
+            }
+        }
+
+        state.emit(Event::AutomationUpdated {
+            automation: current.clone(),
+        });
+        if current.blocked_reason.is_none()
+            && current
+                .overdue_since
+                .is_some_and(|due| now.saturating_sub(due) >= 60_000)
+        {
+            let diagnostic = format!(
+                "Occurrence due at {} is overdue. Patchwork will keep retrying; fix the execution host or explicitly pause the automation.",
+                current.overdue_since.unwrap_or_default()
+            );
+            if let Some((current, notify)) = state
+                .store
+                .record_automation_execution_failure(&current.id, &diagnostic)?
             {
-                tracing::warn!(?err, automation = %automation.name, "scheduled automation failed");
+                if notify {
+                    if let Err(err) =
+                        deliver_execution_failure_notification(state, &current, &diagnostic).await
+                    {
+                        tracing::warn!(?err, automation = %current.name, "could not notify overdue automation creator");
+                    }
+                }
             }
         }
     }
+
+    for run in state.store.ready_automation_runs(now, 100)? {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = attempt_automation_run(&state, &run.id).await {
+                tracing::warn!(?err, occurrence = %run.id, "automation occurrence attempt failed");
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Long enough for a slow HTTP call, short enough that a hung script is not a
@@ -729,55 +812,9 @@ pub async fn scheduler(state: Shared) {
 const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
 const WATCH_FAILURE_THRESHOLD: i64 = 3;
 const WATCH_ERROR_MAX_CHARS: usize = 500;
-const WATCH_STALE_MIN_GRACE_MS: Millis = 60_000;
-
-struct WatchPollGuard {
-    state: Shared,
-    automation_id: Id,
-}
-
-impl WatchPollGuard {
-    fn is_active(state: &Shared, automation_id: &str) -> bool {
-        state
-            .watch_polls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(automation_id)
-    }
-
-    fn acquire(state: &Shared, automation_id: &str) -> Option<Self> {
-        let mut active = state
-            .watch_polls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !active.insert(automation_id.to_string()) {
-            return None;
-        }
-        Some(Self {
-            state: state.clone(),
-            automation_id: automation_id.to_string(),
-        })
-    }
-}
-
-impl Drop for WatchPollGuard {
-    fn drop(&mut self) {
-        self.state
-            .watch_polls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.automation_id);
-    }
-}
 
 fn bounded_watch_error(error: impl AsRef<str>) -> String {
     error.as_ref().chars().take(WATCH_ERROR_MAX_CHARS).collect()
-}
-
-fn watch_is_stale(due_at: Millis, every_seconds: i64, now: Millis) -> bool {
-    let interval = every_seconds.max(1).saturating_mul(1_000);
-    let grace = interval.saturating_mul(2).max(WATCH_STALE_MIN_GRACE_MS);
-    now > due_at.saturating_add(grace)
 }
 
 async fn relay_command(
@@ -877,22 +914,6 @@ fn record_watch_success(
     Ok(automation)
 }
 
-fn record_stale_watch_failure(
-    state: &Shared,
-    expected: &Automation,
-    error: &str,
-) -> Result<(Automation, bool)> {
-    let error = bounded_watch_error(error);
-    let (automation, notify) = state
-        .store
-        .record_stale_watch_failure(&expected.id, &expected.trigger, now_ms(), &error)?
-        .ok_or_else(|| anyhow!("automation changed or was deleted before its stale check"))?;
-    state.emit(Event::AutomationUpdated {
-        automation: automation.clone(),
-    });
-    Ok((automation, notify))
-}
-
 fn record_watch_failure(
     state: &Shared,
     expected: &Automation,
@@ -967,7 +988,7 @@ async fn notify_automation_creator(
             id: new_id(),
             member_id: creator.id,
             kind: InboxKind::AutomationFailed,
-            title: format!("Automation `{}` failed", automation.name),
+            title: format!("Automation `{}` needs attention", automation.name),
             preview: diagnostic.chars().take(200).collect(),
             actor_id: Some(automation.agent_id.clone()),
             channel_id: automation
@@ -994,13 +1015,15 @@ async fn notify_automation_creator(
             channel_id,
             task_id: None,
             prompt: format!(
-                "Automation `{}` failed.\n\nDiagnostic:\n{}\n\nInvestigate the command now. Fix it and run `patchwork automation test \"{}\"`, or pause the automation if it should not keep running.",
+                "Automation `{}` needs attention.\n\nDiagnostic:\n{}\n\nIts enabled state and pending occurrence are preserved, and Patchwork will keep retrying. Fix it and run `patchwork automation test \"{}\"`, or explicitly pause it if the obligation should stop.",
                 automation.name, diagnostic, automation.name
             ),
             trigger: RunTrigger::Automation {
                 automation_id: automation.id.clone(),
             },
             automation_id: Some(automation.id.clone()),
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: None,
             project_id: automation.project_id.clone(),
@@ -1202,6 +1225,8 @@ async fn check_task_continuations(state: &Shared) {
                     continuation_id: continuation.id.clone(),
                 },
                 automation_id: None,
+                automation_run_id: None,
+                automation_run_attempt: None,
                 depth: 0,
                 host_id: task.host_id.clone(),
                 project_id: task.project_id.clone(),
@@ -1277,26 +1302,29 @@ async fn poll_task_continuation(state: Shared, continuation: TaskContinuation) {
     }
 }
 
-/// Runs one watch command and fires the agent only if it found something.
-///
-/// This is the whole point of a watch: the scan costs a process, so it can run
-/// every minute, and the model is only paid for when there is something to
-/// think about.
+/// Runs one durable watch-poll occurrence. A command failure requeues this
+/// same row; structured event keys make a rerun after a crash idempotent.
 async fn poll_watch(
-    state: Shared,
-    automation: Automation,
-    command: String,
-    every_seconds: i64,
-    _guard: WatchPollGuard,
-) {
+    state: &Shared,
+    automation: &Automation,
+    _record: &AutomationRun,
+) -> Result<()> {
+    let AutomationTrigger::Watch {
+        command,
+        every_seconds,
+    } = &automation.trigger
+    else {
+        // An explicit configuration change superseded this old poll.
+        return Ok(());
+    };
     // Its own directory, kept between polls, so a script can remember the last
     // id it saw without the relay inventing a storage API for it.
     let dir = state.files_dir.join("watch").join(&automation.id);
-    let timeout = WATCH_TIMEOUT.min(Duration::from_secs(every_seconds.max(1) as u64));
+    let timeout = WATCH_TIMEOUT.min(Duration::from_secs((*every_seconds).max(1) as u64));
     let events = match classify_watch_output(
         relay_command(
             &dir,
-            &command,
+            command,
             &[("PATCHWORK_AUTOMATION_ID", automation.id.as_str())],
             timeout,
         )
@@ -1305,54 +1333,41 @@ async fn poll_watch(
         Ok(events) => events,
         Err(err) => {
             let error = bounded_watch_error(format!("{err:#}"));
-            match record_watch_failure(&state, &automation, &error) {
-                Ok((updated, notify)) => {
-                    if notify {
-                        if let Err(err) =
-                            deliver_watch_failure_notification(&state, &updated, &error).await
-                        {
-                            tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
-                        }
-                    }
-                    if updated.failure_count >= WATCH_FAILURE_THRESHOLD {
-                        if let Err(err) = ensure_watch_operator_task(&state, &updated, &error).await
-                        {
-                            tracing::warn!(?err, automation = %automation.name, "could not escalate watch failure");
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(?err, automation = %automation.name, "could not record watch failure")
+            let (updated, notify) = record_watch_failure(state, automation, &error)?;
+            if notify {
+                if let Err(err) = deliver_watch_failure_notification(state, &updated, &error).await
+                {
+                    tracing::warn!(?err, automation = %automation.name, "could not notify watch creator");
                 }
             }
-            return;
+            if updated.failure_count >= WATCH_FAILURE_THRESHOLD {
+                if let Err(err) = ensure_watch_operator_task(state, &updated, &error).await {
+                    tracing::warn!(?err, automation = %automation.name, "could not escalate watch failure");
+                }
+            }
+            return Err(anyhow!(error));
         }
     };
 
-    if let Err(err) = record_watch_success(&state, &automation, false) {
-        tracing::warn!(?err, automation = %automation.name, "could not record watch success");
-        return;
-    }
+    record_watch_success(state, automation, true)?;
     for event in events {
         let event_key = event.event_key.clone();
         let title: String = event.title.chars().take(120).collect();
-        let current = match state.store.automation(&automation.id) {
-            Ok(Some(current)) if watch_accepts_events(&current, &command) => current,
-            _ => return,
+        let current = match state.store.automation(&automation.id)? {
+            Some(current) if watch_accepts_events(&current, command) => current,
+            _ => return Ok(()),
         };
-        if let Err(err) = fire(
-            &state,
+        Box::pin(fire(
+            state,
             &current,
             format!("Watch: {title}"),
             json!({ "watch_event": event }),
             None,
             Some(event_key),
-        )
-        .await
-        {
-            tracing::warn!(?err, automation = %automation.name, "watch event failed");
-        }
+        ))
+        .await?;
     }
+    Ok(())
 }
 
 /// When a trigger that runs on the clock is next due. `None` for the ones that
@@ -1360,7 +1375,9 @@ async fn poll_watch(
 fn next_due_after(trigger: &AutomationTrigger, now: Millis) -> Option<Millis> {
     match trigger {
         AutomationTrigger::Schedule { every_seconds, .. }
-        | AutomationTrigger::Watch { every_seconds, .. } => Some(now + every_seconds * 1000),
+        | AutomationTrigger::Watch { every_seconds, .. } => {
+            Some(now.saturating_add(every_seconds.saturating_mul(1000)))
+        }
         AutomationTrigger::Cron { expression } => next_cron_after(expression, now),
         _ => None,
     }
@@ -1547,12 +1564,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn stale_watches_allow_two_intervals_of_grace() {
-        assert!(!watch_is_stale(1_000, 60, 121_000));
-        assert!(watch_is_stale(1_000, 60, 121_001));
-        assert!(!watch_is_stale(1_000, 5, 61_000));
-        assert!(watch_is_stale(1_000, 5, 61_001));
+    #[tokio::test]
+    async fn transient_dispatch_failure_retries_one_durable_occurrence() {
+        let path = std::env::temp_dir().join(format!("patchwork-dispatch-{}.sqlite", new_id()));
+        let files = path.with_extension("files");
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        store
+            .insert_member(&Member {
+                id: "human".into(),
+                kind: MemberKind::Human,
+                handle: "human".into(),
+                display_name: "Human".into(),
+                email: None,
+                avatar: None,
+                is_admin: true,
+                created_at: 1,
+                agent: None,
+                presence: Presence::Offline,
+            })
+            .unwrap();
+        store
+            .insert_member(&Member {
+                id: "agent".into(),
+                kind: MemberKind::Agent,
+                handle: "agent".into(),
+                display_name: "Agent".into(),
+                email: None,
+                avatar: None,
+                is_admin: false,
+                created_at: 1,
+                agent: Some(AgentProfile::default()),
+                presence: Presence::Offline,
+            })
+            .unwrap();
+        store
+            .insert_channel(&Channel {
+                id: "channel".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "test".into(),
+                name: "test".into(),
+                topic: String::new(),
+                position: 1.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+        let automation = Automation {
+            id: "automation".into(),
+            name: "Retry me".into(),
+            description: String::new(),
+            enabled: true,
+            trigger: AutomationTrigger::Manual,
+            agent_id: "agent".into(),
+            action: AutomationAction::PostInChat,
+            instructions: String::new(),
+            context_channel_id: Some("channel".into()),
+            report_channel_id: Some("channel".into()),
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 1,
+            last_run_at: None,
+            next_run_at: None,
+            last_success_at: None,
+            last_error_at: None,
+            last_error: None,
+            last_validated_at: None,
+            failure_count: 0,
+            overdue_since: None,
+            blocked_reason: None,
+            retry_at: None,
+        };
+        store.upsert_automation(&automation).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            files.clone(),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+
+        let queued = fire(
+            &state,
+            &automation,
+            "Manual test".into(),
+            json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued.status, RunStatus::Queued);
+        assert!(queued
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no execution host")));
+        assert_eq!(store.automation_runs(&automation.id, 10).unwrap().len(), 1);
+
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx: host_tx });
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        let dispatched = attempt_automation_run(&state, &queued.id).await.unwrap();
+        assert_eq!(dispatched.id, queued.id);
+        assert_eq!(dispatched.status, RunStatus::Dispatched);
+        let patchwork_core::host::RelayToHost::StartRun { spec } = host_rx.recv().await.unwrap()
+        else {
+            panic!("retry did not dispatch to the recovered host");
+        };
+        orchestrator::handle_host_message(
+            &state,
+            "relay",
+            patchwork_core::host::HostToRelay::RunAccepted {
+                run_id: spec.run_id,
+                cwd: None,
+            },
+        )
+        .await;
+        let accepted = store.automation_run(&queued.id).unwrap().unwrap();
+        assert_eq!(accepted.status, RunStatus::Running);
+        assert!(accepted.accepted_at.is_some());
+        assert_eq!(store.automation_runs(&automation.id, 10).unwrap().len(), 1);
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(files);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1620,13 +1764,6 @@ mod tests {
             .write()
             .await
             .insert("relay".into(), crate::state::HostConn { tx: host_tx });
-        let guard = WatchPollGuard::acquire(&state, "watch").unwrap();
-        assert!(WatchPollGuard::is_active(&state, "watch"));
-        assert!(WatchPollGuard::acquire(&state, "watch").is_none());
-        drop(guard);
-        assert!(!WatchPollGuard::is_active(&state, "watch"));
-        assert!(WatchPollGuard::acquire(&state, "watch").is_some());
-
         let automation = Automation {
             id: "watch".into(),
             name: "Release watch".into(),
@@ -1653,6 +1790,9 @@ mod tests {
             last_error: Some("HTTP 404".into()),
             last_validated_at: Some(1),
             failure_count: WATCH_FAILURE_THRESHOLD,
+            overdue_since: None,
+            blocked_reason: None,
+            retry_at: None,
         };
         assert!(watch_accepts_events(&automation, "false"));
         let mut paused = automation.clone();
@@ -1789,6 +1929,73 @@ mod tests {
         };
         assert_eq!(next_due_after(&watch, 1_000), Some(61_000));
         assert_eq!(next_due_after(&AutomationTrigger::Manual, 1_000), None);
+    }
+
+    #[tokio::test]
+    async fn restart_materializes_every_missed_clock_occurrence() {
+        let path = std::env::temp_dir().join(format!("patchwork-catchup-{}.sqlite", new_id()));
+        let files = path.with_extension("files");
+        let store = crate::store::Store::open(&path).unwrap();
+        let automation = Automation {
+            id: "schedule".into(),
+            name: "Every second".into(),
+            description: String::new(),
+            enabled: true,
+            trigger: AutomationTrigger::Schedule {
+                every_seconds: 1,
+                start_at: None,
+            },
+            agent_id: "agent".into(),
+            action: AutomationAction::PostInChat,
+            instructions: String::new(),
+            context_channel_id: Some("channel".into()),
+            report_channel_id: Some("channel".into()),
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 0,
+            last_run_at: None,
+            next_run_at: Some(1_000),
+            last_success_at: None,
+            last_error_at: None,
+            last_error: None,
+            last_validated_at: None,
+            failure_count: 0,
+            overdue_since: None,
+            blocked_reason: None,
+            retry_at: None,
+        };
+        store.upsert_automation(&automation).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            files.clone(),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+
+        scheduler_tick(&state, 4_000).await.unwrap();
+        let mut due: Vec<_> = store
+            .automation_runs(&automation.id, 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|run| run.due_at)
+            .collect();
+        due.sort_unstable();
+        assert_eq!(due, vec![1_000, 2_000, 3_000, 4_000]);
+        assert_eq!(
+            store
+                .automation(&automation.id)
+                .unwrap()
+                .unwrap()
+                .next_run_at,
+            Some(5_000)
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(files);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

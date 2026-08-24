@@ -416,8 +416,9 @@ enum AutomationCommand {
         /// Shell command for `--trigger watch`. Exit 0 with no output is a
         /// healthy no-op. Findings must be one JSON object per line with
         /// `event_key`, `condition_key`, task `title`/`outcome`, and `context`.
-        /// The command is test-run before the watch is enabled.
-        /// `$PATCHWORK_STATE_DIR` is its own directory, kept between polls.
+        /// The command is test-run diagnostically without changing whether
+        /// the watch is enabled. `$PATCHWORK_STATE_DIR` is its own directory,
+        /// kept between polls.
         #[arg(long)]
         command: Option<String>,
         /// Channel for message triggers and for reporting.
@@ -1825,7 +1826,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                     println!(
                         "{} [{}] {}",
                         automation.name,
-                        if automation.enabled { "on" } else { "off" },
+                        automation_state(automation),
                         automation.description
                     );
                 }
@@ -1882,25 +1883,30 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                         // was created from, not a copied-in prompt.
                         "context_channel_id": ctx.channel_id,
                         "report_channel_id": channel_id,
-                        "enabled": !is_watch,
+                        "enabled": true,
                     }),
                 )
                 .await?;
-            let created = if is_watch {
-                let result = test_watch_command(client, &created).await?;
-                if !result.ok {
-                    bail!(
-                        "watch validation failed; `{}` remains paused: {}",
-                        created.name,
-                        result.error.unwrap_or_else(|| "unknown error".into())
-                    );
-                }
-                set_enabled(client, &created.id, true).await?
+            let watch_test = if is_watch {
+                Some(test_watch_command(client, &created).await?)
             } else {
-                created
+                None
             };
             client.print(&created, || {
                 println!("created automation {}", created.name);
+                if let Some(result) = &watch_test {
+                    if result.ok {
+                        println!(
+                            "watch validated; {} event(s) would fire",
+                            result.event_count
+                        );
+                    } else {
+                        println!(
+                            "watch is enabled but degraded: {}; Patchwork will keep retrying",
+                            result.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
                 // The URL is the whole automation for a webhook trigger, and
                 // it is not knowable without being told.
                 if let AutomationTrigger::Webhook { token } = &created.trigger {
@@ -1945,11 +1951,7 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                 println!(
                     "{} [{}] {}",
                     debug.automation.name,
-                    if debug.automation.enabled {
-                        "on"
-                    } else {
-                        "off"
-                    },
+                    automation_state(&debug.automation),
                     debug.automation.description
                 );
                 if !debug.automation.instructions.trim().is_empty() {
@@ -1965,6 +1967,15 @@ async fn automation(client: &Client, ctx: &RunContext, command: AutomationComman
                         .map(display_millis)
                         .unwrap_or_else(|| "unknown time".into());
                     println!("Last error: {at} · {error}");
+                }
+                if let Some(reason) = &debug.automation.blocked_reason {
+                    println!("Blocked: {reason}");
+                }
+                if let Some(at) = debug.automation.overdue_since {
+                    println!("Overdue since: {}", display_millis(at));
+                }
+                if let Some(at) = debug.automation.retry_at {
+                    println!("Retry at: {}", display_millis(at));
                 }
                 for run in debug.runs.iter().take(10) {
                     println!(
@@ -2004,6 +2015,24 @@ async fn test_watch_command(client: &Client, automation: &Automation) -> Result<
             json!({}),
         )
         .await
+}
+
+fn automation_state(automation: &Automation) -> &'static str {
+    if !automation.enabled {
+        "paused"
+    } else if automation.blocked_reason.is_some() {
+        "blocked"
+    } else if automation.overdue_since.is_some() {
+        "overdue"
+    } else if matches!(automation.trigger, AutomationTrigger::Watch { .. })
+        && automation.last_validated_at.is_none()
+    {
+        "needs-validation"
+    } else if automation.failure_count > 0 {
+        "degraded"
+    } else {
+        "on"
+    }
 }
 
 fn display_millis(at: i64) -> String {

@@ -1549,6 +1549,8 @@ async fn start_run(
                 by: caller.member.id.clone(),
             },
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: input.host_id.clone(),
             project_id: None,
@@ -2074,6 +2076,9 @@ fn ensure_daily_sweep(state: &Shared, owner: &Member, agent: &Member) -> ApiResu
         last_error: None,
         last_validated_at: None,
         failure_count: 0,
+        overdue_since: None,
+        blocked_reason: None,
+        retry_at: None,
     };
     state.store.upsert_automation(&automation)?;
     state.emit(Event::AutomationUpdated { automation });
@@ -2456,34 +2461,30 @@ fn watch_schedule_changed(old: &AutomationTrigger, new: &AutomationTrigger) -> b
     )
 }
 
-fn require_watch_validation(
-    existing: Option<&Automation>,
-    input: &CreateAutomation,
-) -> ApiResult<()> {
-    let AutomationTrigger::Watch {
-        command,
-        every_seconds,
-    } = &input.trigger
-    else {
-        return Ok(());
-    };
-    if command.trim().is_empty() {
-        return Err(ApiError::bad_request("a watch command is required"));
-    }
-    if *every_seconds <= 0 {
-        return Err(ApiError::bad_request("a watch interval must be positive"));
-    }
-    let validated = existing.is_some_and(|automation| {
-        automation.last_validated_at.is_some()
-            && matches!(
-                &automation.trigger,
-                AutomationTrigger::Watch { command: old, .. } if old == command
-            )
-    });
-    if input.enabled && !validated {
-        return Err(ApiError::conflict(
-            "test this watch successfully before enabling it",
-        ));
+fn validate_automation_config(input: &CreateAutomation) -> ApiResult<()> {
+    match &input.trigger {
+        AutomationTrigger::Watch {
+            command,
+            every_seconds,
+        } => {
+            if command.trim().is_empty() {
+                return Err(ApiError::bad_request("a watch command is required"));
+            }
+            if *every_seconds <= 0 {
+                return Err(ApiError::bad_request("a watch interval must be positive"));
+            }
+        }
+        AutomationTrigger::Schedule { every_seconds, .. } if *every_seconds <= 0 => {
+            return Err(ApiError::bad_request(
+                "a schedule interval must be positive",
+            ));
+        }
+        AutomationTrigger::Cron { expression }
+            if automations::next_cron_after(expression, now_ms()).is_none() =>
+        {
+            return Err(ApiError::bad_request("a valid cron expression is required"));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2493,7 +2494,8 @@ async fn create_automation(
     caller: Caller,
     Json(input): Json<CreateAutomation>,
 ) -> ApiResult<Json<Automation>> {
-    require_watch_validation(None, &input)?;
+    validate_automation_config(&input)?;
+    let created_at = now_ms();
     let automation = Automation {
         id: new_id(),
         name: input.name.trim().to_string(),
@@ -2509,20 +2511,36 @@ async fn create_automation(
         location: input.location,
         host_id: input.host_id.clone(),
         created_by: caller.member.id.clone(),
-        created_at: now_ms(),
+        created_at,
         last_run_at: None,
-        next_run_at: match &input.trigger {
-            AutomationTrigger::Schedule {
-                every_seconds,
-                start_at,
-            } => Some(start_at.unwrap_or_else(|| now_ms() + every_seconds * 1000)),
-            _ => None,
+        next_run_at: if input.enabled {
+            match &input.trigger {
+                AutomationTrigger::Schedule {
+                    every_seconds,
+                    start_at,
+                } => Some(
+                    start_at
+                        .unwrap_or(created_at.saturating_add(every_seconds.saturating_mul(1000))),
+                ),
+                AutomationTrigger::Cron { expression } => {
+                    automations::next_cron_after(expression, created_at)
+                }
+                AutomationTrigger::Watch { every_seconds, .. } => {
+                    Some(created_at.saturating_add(every_seconds.saturating_mul(1000)))
+                }
+                _ => None,
+            }
+        } else {
+            None
         },
         last_success_at: None,
         last_error_at: None,
         last_error: None,
         last_validated_at: None,
         failure_count: 0,
+        overdue_since: None,
+        blocked_reason: None,
+        retry_at: None,
     };
     require_automation_access(&state, &caller, &automation)?;
     state.store.upsert_automation(&automation)?;
@@ -2543,7 +2561,7 @@ async fn update_automation(
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
     require_automation_access(&state, &caller, &automation)?;
-    require_watch_validation(Some(&automation), &input)?;
+    validate_automation_config(&input)?;
     let previous_trigger = automation.trigger.clone();
     let watch_command_changed = match (&automation.trigger, &input.trigger) {
         (
@@ -2569,7 +2587,7 @@ async fn update_automation(
     automation.host_id = input.host_id.clone();
     automation.next_run_at = match &automation.trigger {
         AutomationTrigger::Schedule { every_seconds, .. } if automation.enabled => {
-            Some(now_ms() + every_seconds * 1000)
+            Some(now_ms().saturating_add(every_seconds.saturating_mul(1000)))
         }
         AutomationTrigger::Cron { expression } if automation.enabled => {
             automations::next_cron_after(expression, now_ms())
@@ -2578,7 +2596,7 @@ async fn update_automation(
             if automation.enabled
                 && (!was_enabled || watch_command_changed || watch_interval_changed) =>
         {
-            Some(now_ms() + every_seconds * 1000)
+            Some(now_ms().saturating_add(every_seconds.saturating_mul(1000)))
         }
         AutomationTrigger::Watch { .. } if automation.enabled => automation.next_run_at,
         _ => None,
@@ -2586,7 +2604,12 @@ async fn update_automation(
     require_automation_access(&state, &caller, &automation)?;
     let automation = state
         .store
-        .update_automation_config(&automation, &previous_trigger, watch_command_changed)?
+        .update_automation_config(
+            &automation,
+            &previous_trigger,
+            was_enabled,
+            watch_command_changed,
+        )?
         .ok_or_else(|| ApiError::conflict("automation changed; retry your update"))?;
     state.emit(Event::AutomationUpdated {
         automation: automation.clone(),
@@ -2619,6 +2642,11 @@ async fn run_automation(
         .automation(&id)?
         .ok_or_else(|| ApiError::not_found("automation not found"))?;
     require_automation_access(&state, &caller, &automation)?;
+    if !automation.enabled {
+        return Err(ApiError::conflict(
+            "resume this automation before running it",
+        ));
+    }
     Ok(Json(
         automations::run_now(&state, &automation, &caller.member.display_name).await?,
     ))
@@ -3529,39 +3557,17 @@ mod tests {
     }
 
     #[test]
-    fn watches_must_validate_the_current_command_before_enablement() {
-        let paused = watch_input(false, "scan");
-        assert!(require_watch_validation(None, &paused).is_ok());
-        assert!(require_watch_validation(None, &watch_input(true, "scan")).is_err());
+    fn watch_validation_is_health_not_enabled_state() {
+        assert!(validate_automation_config(&watch_input(false, "scan")).is_ok());
+        assert!(validate_automation_config(&watch_input(true, "scan")).is_ok());
+        assert!(validate_automation_config(&watch_input(true, "  ")).is_err());
 
-        let existing = Automation {
-            id: "watch".into(),
-            name: "Watch".into(),
-            description: String::new(),
-            enabled: false,
-            trigger: paused.trigger.clone(),
-            agent_id: "agent".into(),
-            action: AutomationAction::CreateTask,
-            instructions: String::new(),
-            context_channel_id: None,
-            report_channel_id: None,
-            project_id: None,
-            location: ExecutionLocation::Auto,
-            host_id: None,
-            created_by: "human".into(),
-            created_at: 1,
-            last_run_at: None,
-            next_run_at: None,
-            last_success_at: Some(2),
-            last_error_at: None,
-            last_error: None,
-            last_validated_at: Some(2),
-            failure_count: 0,
+        let current = AutomationTrigger::Watch {
+            command: "scan".into(),
+            every_seconds: 60,
         };
-        assert!(require_watch_validation(Some(&existing), &watch_input(true, "scan")).is_ok());
-        assert!(require_watch_validation(Some(&existing), &watch_input(true, "changed")).is_err());
         assert!(watch_schedule_changed(
-            &existing.trigger,
+            &current,
             &AutomationTrigger::Watch {
                 command: "scan".into(),
                 every_seconds: 300,

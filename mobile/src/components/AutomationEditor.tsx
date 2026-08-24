@@ -48,8 +48,8 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
   const [enabled, setEnabled] = useState(automation?.enabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  /// A watch is saved paused, tested, then enabled, so a failed test leaves an
-  /// automation behind. Saving again fixes that one rather than making a second.
+  /// A failed diagnostic leaves the saved automation visible for correction.
+  /// Saving again fixes that one rather than making a second.
   const [savedId, setSavedId] = useState(automation?.id);
   if (!data) return null;
 
@@ -81,9 +81,6 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
     setBusy(true);
     setError("");
     const nextTrigger = trigger();
-    // The relay refuses to enable a watch whose command has not passed a test,
-    // and an untested watch that looks enabled is the failure this guards: save
-    // it paused, test it, and only then put it back on.
     const needsTest = watchNeedsTest(automation, nextTrigger);
     const body = {
       name: name.trim(),
@@ -97,7 +94,7 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
       project_id: projectId || undefined,
       location,
       host_id: location === "desktop" ? hostId || undefined : undefined,
-      enabled: enabled && !needsTest,
+      enabled,
     };
     let created: string | undefined;
     try {
@@ -109,16 +106,14 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
           created = saved.id;
           if (!needsTest) return { automation: saved, test: undefined };
           const test = await api.testAutomation(saved.id);
-          // A watch the author deliberately paused stays paused.
-          const enabledNow = test.ok && enabled
-            ? await api.updateAutomation(saved.id, { ...body, enabled: true })
-            : saved;
-          return { automation: enabledNow, test };
+          return { automation: saved, test };
         },
         true,
         ({ automation: saved, test }) => {
           if (test && !test.ok) {
-            setError(`The command failed, so it stays paused: ${test.error ?? "no diagnostic"}`);
+            setError(
+              `Saved ${enabled ? "enabled" : "paused"}, but the command is degraded: ${test.error ?? "no diagnostic"}. Patchwork will keep retrying while it is enabled.`,
+            );
             return;
           }
           onSaved(saved);

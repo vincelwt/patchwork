@@ -43,9 +43,10 @@ export default function AutomationsScreen() {
 
   function AutomationRow({ automation }: { automation: Automation }) {
     const agent = workspace.bootstrap?.members.find((member) => member.id === automation.agent_id);
-    // A watch is only as good as its last successful check: last_run_at stays
-    // fresh while the command fails, which is how a dead watch looks healthy.
-    const health = automation.trigger.type === "watch" ? watchHealth(automation) : undefined;
+    const health =
+      automation.trigger.type === "watch" || automation.blocked_reason || automation.overdue_since
+        ? watchHealth(automation)
+        : undefined;
     return (
       <Pressable
         onPress={() => router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: automation.id } })}
@@ -67,7 +68,7 @@ export default function AutomationsScreen() {
         {health ? (
           health.tone === "danger" ? <Badge tone="danger">failing</Badge> : null
         ) : automation.failure_count ? <Badge tone="danger">{automation.failure_count} failed</Badge> : null}
-        <Button label="Run" compact tone="quiet" onPress={() => void store.mutate((api) => api.runAutomation(automation.id))} />
+        <Button label="Run" compact tone="quiet" disabled={!automation.enabled} onPress={() => void store.mutate((api) => api.runAutomation(automation.id))} />
       </Pressable>
     );
   }

@@ -339,6 +339,12 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   error           TEXT,
   task_id         TEXT,
   once_key        TEXT,
+  kind            TEXT NOT NULL DEFAULT 'action',
+  due_at          INTEGER,
+  attempt_count   INTEGER NOT NULL DEFAULT 0,
+  retry_at        INTEGER,
+  lease_until     INTEGER,
+  accepted_at     INTEGER,
   created_at      INTEGER NOT NULL,
   ended_at        INTEGER
 );

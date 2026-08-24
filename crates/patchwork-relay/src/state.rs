@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -73,8 +73,6 @@ pub struct AppState {
     pub file_grants: StdMutex<HashMap<Id, (Id, Millis)>>,
     /// Browser-loadable preview URLs cannot carry a bearer header on every asset.
     pub preview_grants: StdMutex<HashMap<Id, (Id, Millis)>>,
-    /// A watch command never overlaps its previous poll.
-    pub watch_polls: StdMutex<HashSet<Id>>,
     /// HTTP requests currently travelling to an execution host.
     pub preview_waiters: RwLock<HashMap<Id, oneshot::Sender<PreviewReply>>>,
     pub system_skill_waiters: RwLock<HashMap<Id, SystemSkillWaiter>>,
@@ -122,7 +120,6 @@ impl AppState {
             control_destinations: RwLock::new(HashMap::new()),
             file_grants: StdMutex::new(HashMap::new()),
             preview_grants: StdMutex::new(HashMap::new()),
-            watch_polls: StdMutex::new(HashSet::new()),
             preview_waiters: RwLock::new(HashMap::new()),
             system_skill_waiters: RwLock::new(HashMap::new()),
             preview_sockets: RwLock::new(HashMap::new()),

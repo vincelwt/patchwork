@@ -211,6 +211,8 @@ the feedback in this worktree, push, and reply with a short summary of what chan
             task_id: task.id.clone(),
         },
         automation_id: None,
+        automation_run_id: None,
+        automation_run_attempt: None,
         depth: 0,
         host_id: task.host_id.clone(),
         project_id: task.project_id.clone(),

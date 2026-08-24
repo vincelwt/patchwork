@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use patchwork_core::events::{Envelope, Event};
 use patchwork_core::models::*;
 use patchwork_core::wire::Device;
-use patchwork_core::{now_ms, Id, Millis};
+use patchwork_core::{new_id, now_ms, Id, Millis};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row, TransactionBehavior};
 use serde_json::Value as Json;
@@ -65,6 +65,25 @@ fn to_json(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".into())
 }
 
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.is_ok_and(|name| name == column));
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))
+        .with_context(|| format!("failed to add {table}.{column}"))?;
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -91,7 +110,7 @@ impl Store {
             .build(manager)
             .context("failed to open the Patchwork database")?;
 
-        let conn = pool.get()?;
+        let mut conn = pool.get()?;
         conn.execute_batch(include_str!("schema.sql"))
             .context("failed to apply schema")?;
 
@@ -127,12 +146,7 @@ impl Store {
             "ALTER TABLE automations ADD COLUMN last_error TEXT",
             "ALTER TABLE automations ADD COLUMN failure_notification_key TEXT",
             "ALTER TABLE automations ADD COLUMN execution_failure_notification_key TEXT",
-            // Existing watches have never passed the new command test. Pause
-            // them once so every transition to enabled uses the same contract.
-            "ALTER TABLE automations ADD COLUMN last_validated_at INTEGER DEFAULT 0",
-            "UPDATE automations SET enabled = 0, next_run_at = NULL WHERE last_validated_at = 0 AND json_extract(trigger, '$.type') = 'watch'",
-            "UPDATE automations SET last_validated_at = NULL WHERE last_validated_at = 0",
-            // After the column, never in schema.sql: an index on a column an
+            // After the columns, never in schema.sql: an index on a column an
             // older database has not been given yet would fail the batch.
             "CREATE INDEX IF NOT EXISTS automation_runs_once ON automation_runs(automation_id, once_key)",
             // One message per sender, channel and client id: a retried send
@@ -140,6 +154,64 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS messages_client ON messages(author_id, channel_id, client_id) WHERE client_id IS NOT NULL",
         ] {
             let _ = conn.execute(statement, []);
+        }
+        // These columns carry user intent and durable obligations, so unlike
+        // the legacy best-effort list above, an unexpected migration failure
+        // must stop startup rather than silently dropping work.
+        for (table, column, definition) in [
+            ("automations", "last_validated_at", "INTEGER"),
+            ("automation_runs", "kind", "TEXT NOT NULL DEFAULT 'action'"),
+            ("automation_runs", "due_at", "INTEGER"),
+            (
+                "automation_runs",
+                "attempt_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("automation_runs", "retry_at", "INTEGER"),
+            ("automation_runs", "lease_until", "INTEGER"),
+            ("automation_runs", "accepted_at", "INTEGER"),
+        ] {
+            ensure_column(&conn, table, column, definition)?;
+        }
+
+        let migration_version: i64 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if migration_version < 1 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // v0.2.6 silently disabled unvalidated watches without emitting an
+            // event. Restore the latest explicit state still in the durable
+            // event log; if provenance has expired, preserve the current value.
+            tx.execute(
+                "UPDATE automations AS automation
+                    SET enabled = (
+                            SELECT json_extract(events.payload, '$.automation.enabled')
+                              FROM events
+                             WHERE json_extract(events.payload, '$.kind') = 'automation_updated'
+                               AND json_extract(events.payload, '$.automation.id') = automation.id
+                             ORDER BY events.seq DESC LIMIT 1
+                        ),
+                        next_run_at = CASE
+                            WHEN enabled = 0 AND (
+                                SELECT json_extract(events.payload, '$.automation.enabled')
+                                  FROM events
+                                 WHERE json_extract(events.payload, '$.kind') = 'automation_updated'
+                                   AND json_extract(events.payload, '$.automation.id') = automation.id
+                                 ORDER BY events.seq DESC LIMIT 1
+                            ) = 1
+                            THEN ?1 + COALESCE(json_extract(automation.trigger, '$.every_seconds'), 60) * 1000
+                            ELSE next_run_at
+                        END
+                  WHERE json_extract(automation.trigger, '$.type') = 'watch'
+                    AND automation.last_validated_at IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM events
+                         WHERE json_extract(events.payload, '$.kind') = 'automation_updated'
+                           AND json_extract(events.payload, '$.automation.id') = automation.id
+                    )",
+                params![now_ms()],
+            )?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
         }
 
         // Canonicalize legacy keys before enforcing one open task per key.
@@ -177,7 +249,12 @@ impl Store {
                 );
              CREATE UNIQUE INDEX IF NOT EXISTS automation_runs_once_unique
                 ON automation_runs(automation_id, once_key)
-             WHERE once_key IS NOT NULL;",
+             WHERE once_key IS NOT NULL;
+             CREATE UNIQUE INDEX IF NOT EXISTS automation_runs_due_unique
+                ON automation_runs(automation_id, kind, due_at)
+             WHERE due_at IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS automation_runs_ready
+                ON automation_runs(status, retry_at, lease_until, due_at);",
         )
         .context("failed to enforce task idempotency")?;
 
@@ -2323,6 +2400,93 @@ impl Store {
         Ok(())
     }
 
+    pub fn insert_run_for_automation(
+        &self,
+        run: &Run,
+        depth: i32,
+        automation_run_id: &str,
+        automation_run_attempt: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO runs (id, agent_id, status, trigger, channel_id, task_id, host_id, project_id,
+                               worktree_id, cwd, automation_id, session_id, runtime, provider, model,
+                               thinking, prompt, headline, error, token_usage, depth, created_at,
+                               started_at, ended_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            params![
+                run.id, run.agent_id, run.status.as_str(), to_json(&run.trigger), run.channel_id,
+                run.task_id, run.host_id, run.project_id, run.worktree_id, run.cwd, run.automation_id,
+                run.session_id, run.runtime, run.provider, run.model, run.thinking, run.prompt,
+                run.headline, run.error, run.token_usage.as_ref().map(to_json), depth, run.created_at,
+                run.started_at, run.ended_at
+            ],
+        )?;
+        if tx.execute(
+            "UPDATE automation_runs
+                SET run_id = ?2, status = 'dispatched'
+              WHERE id = ?1 AND attempt_count = ?3 AND accepted_at IS NULL
+                AND run_id IS NULL AND lease_until IS NOT NULL",
+            params![automation_run_id, run.id, automation_run_attempt],
+        )? == 0
+        {
+            bail!("automation occurrence is no longer claimed");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist host acceptance and the linked occurrence together. Sending a
+    /// StartRun frame is not acceptance: the host must acknowledge it.
+    pub fn accept_run_dispatch(
+        &self,
+        run: &Run,
+        at: Millis,
+    ) -> Result<(bool, Option<AutomationRun>)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transitioned = tx.execute(
+            "UPDATE runs SET status=?2, host_id=?3, worktree_id=?4, cwd=?5, session_id=?6, runtime=?7,
+                             provider=?8, model=?9, thinking=?10, headline=?11, error=?12,
+                             token_usage=?13, started_at=?14, ended_at=?15, project_id=?16
+              WHERE id=?1 AND status IN ('queued','dispatched','running','waiting')",
+            params![
+                run.id, run.status.as_str(), run.host_id, run.worktree_id, run.cwd, run.session_id,
+                run.runtime, run.provider, run.model, run.thinking, run.headline, run.error,
+                run.token_usage.as_ref().map(to_json), run.started_at, run.ended_at, run.project_id
+            ],
+        )? > 0;
+        if !transitioned {
+            tx.rollback()?;
+            return Ok((false, None));
+        }
+        tx.execute(
+            "UPDATE automation_runs
+                SET status = 'running', accepted_at = COALESCE(accepted_at, ?2),
+                    error = NULL, retry_at = NULL, lease_until = NULL
+              WHERE run_id = ?1 AND status IN ('queued','dispatched','running')",
+            params![run.id, at],
+        )?;
+        let occurrence = tx
+            .query_row(
+                "SELECT * FROM automation_runs WHERE run_id = ?1",
+                params![run.id],
+                Self::automation_run_from_row,
+            )
+            .optional()?;
+        if let Some(occurrence) = &occurrence {
+            tx.execute(
+                "UPDATE automations
+                    SET last_run_at = ?2, execution_failure_notification_key = NULL
+                  WHERE id = ?1",
+                params![occurrence.automation_id, at],
+            )?;
+        }
+        tx.commit()?;
+        Ok((true, occurrence))
+    }
+
     pub fn update_run(&self, run: &Run) -> Result<()> {
         self.conn()?.execute(
             "UPDATE runs SET status=?2, host_id=?3, worktree_id=?4, cwd=?5, session_id=?6, runtime=?7,
@@ -2923,6 +3087,9 @@ impl Store {
             last_error: row.get("last_error")?,
             last_validated_at: row.get("last_validated_at")?,
             failure_count: row.get("failure_count")?,
+            overdue_since: row.get("overdue_since").unwrap_or(None),
+            blocked_reason: row.get("blocked_reason").unwrap_or(None),
+            retry_at: row.get("retry_at").unwrap_or(None),
         })
     }
 
@@ -2959,6 +3126,7 @@ impl Store {
         &self,
         automation: &Automation,
         previous_trigger: &AutomationTrigger,
+        previous_enabled: bool,
         reset_watch_health: bool,
     ) -> Result<Option<Automation>> {
         let changed = self.conn()?.execute(
@@ -2975,7 +3143,7 @@ impl Store {
                     last_validated_at = CASE WHEN ?15 THEN NULL ELSE last_validated_at END,
                     failure_notification_key = CASE WHEN ?15 THEN NULL ELSE failure_notification_key END,
                     failure_count = CASE WHEN ?15 THEN 0 ELSE failure_count END
-              WHERE id = ?1 AND trigger = ?16",
+              WHERE id = ?1 AND trigger = ?16 AND enabled = ?17",
             params![
                 automation.id,
                 automation.name,
@@ -2997,43 +3165,13 @@ impl Store {
                 automation.next_run_at,
                 reset_watch_health as i64,
                 to_json(previous_trigger),
+                previous_enabled as i64,
             ],
         )?;
         if changed == 0 {
             return Ok(None);
         }
         self.automation(&automation.id)
-    }
-
-    pub fn record_automation_firing(
-        &self,
-        id: &str,
-        trigger: &AutomationTrigger,
-        at: Millis,
-        next_run_at: Option<Millis>,
-        failed: bool,
-        update_failure_count: bool,
-    ) -> Result<Option<Automation>> {
-        let changed = if update_failure_count {
-            self.conn()?.execute(
-                "UPDATE automations
-                    SET last_run_at = ?3,
-                        next_run_at = ?4,
-                        failure_count = CASE WHEN ?5 THEN failure_count + 1 ELSE 0 END
-                  WHERE id = ?1 AND trigger = ?2",
-                params![id, to_json(trigger), at, next_run_at, failed as i64],
-            )?
-        } else {
-            self.conn()?.execute(
-                "UPDATE automations SET last_run_at = ?3
-                  WHERE id = ?1 AND trigger = ?2",
-                params![id, to_json(trigger), at],
-            )?
-        };
-        if changed == 0 {
-            return Ok(None);
-        }
-        self.automation(id)
     }
 
     pub fn record_automation_execution_failure(
@@ -3102,20 +3240,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn claim_watch_poll(
-        &self,
-        id: &str,
-        trigger: &AutomationTrigger,
-        next_run_at: Millis,
-    ) -> Result<bool> {
-        Ok(self.conn()?.execute(
-            "UPDATE automations
-                SET next_run_at = ?3
-              WHERE id = ?1 AND enabled = 1 AND trigger = ?2",
-            params![id, to_json(trigger), next_run_at],
-        )? > 0)
-    }
-
     pub fn record_watch_success(
         &self,
         id: &str,
@@ -3137,46 +3261,6 @@ impl Store {
             return Ok(None);
         }
         self.automation(id)
-    }
-
-    pub fn record_stale_watch_failure(
-        &self,
-        id: &str,
-        trigger: &AutomationTrigger,
-        at: Millis,
-        error: &str,
-    ) -> Result<Option<(Automation, bool)>> {
-        let error: String = error.chars().take(500).collect();
-        let mut conn = self.conn()?;
-        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous = transaction
-            .query_row(
-                "SELECT failure_notification_key FROM automations
-                  WHERE id = ?1 AND trigger = ?2",
-                params![id, to_json(trigger)],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        let Some(previous) = previous else {
-            return Ok(None);
-        };
-        let notify = previous.as_deref() != Some(error.as_str());
-        transaction.execute(
-            "UPDATE automations
-                SET last_error_at = ?3,
-                    last_error = ?4,
-                    failure_notification_key = CASE WHEN ?5 THEN ?4 ELSE failure_notification_key END,
-                    failure_count = failure_count + 1
-              WHERE id = ?1 AND trigger = ?2",
-            params![id, to_json(trigger), at, error, notify as i64],
-        )?;
-        let automation = transaction.query_row(
-            "SELECT * FROM automations WHERE id = ?1",
-            params![id],
-            Self::automation_from_row,
-        )?;
-        transaction.commit()?;
-        Ok(Some((automation, notify)))
     }
 
     pub fn record_watch_failure(
@@ -3223,8 +3307,23 @@ impl Store {
 
     pub fn automations(&self) -> Result<Vec<Automation>> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT * FROM automations ORDER BY name COLLATE NOCASE")?;
-        let rows = stmt.query_map([], |r| Self::automation_from_row(r))?;
+        let mut stmt = conn.prepare(
+            "SELECT automations.*,
+                    (SELECT MIN(COALESCE(due_at, created_at)) FROM automation_runs
+                      WHERE automation_id = automations.id AND accepted_at IS NULL
+                        AND status IN ('queued','dispatched')
+                        AND (lease_until IS NULL OR lease_until <= CAST(strftime('%s','now') AS INTEGER) * 1000)) AS overdue_since,
+                    (SELECT error FROM automation_runs
+                      WHERE automation_id = automations.id AND accepted_at IS NULL
+                        AND status IN ('queued','dispatched') AND error IS NOT NULL
+                      ORDER BY COALESCE(due_at, created_at), id LIMIT 1) AS blocked_reason,
+                    (SELECT retry_at FROM automation_runs
+                      WHERE automation_id = automations.id AND accepted_at IS NULL
+                        AND status IN ('queued','dispatched')
+                      ORDER BY COALESCE(due_at, created_at), id LIMIT 1) AS retry_at
+               FROM automations ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], Self::automation_from_row)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -3232,9 +3331,22 @@ impl Store {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
-                "SELECT * FROM automations WHERE id = ?1",
+                "SELECT automations.*,
+                        (SELECT MIN(COALESCE(due_at, created_at)) FROM automation_runs
+                          WHERE automation_id = automations.id AND accepted_at IS NULL
+                            AND status IN ('queued','dispatched')
+                            AND (lease_until IS NULL OR lease_until <= CAST(strftime('%s','now') AS INTEGER) * 1000)) AS overdue_since,
+                        (SELECT error FROM automation_runs
+                          WHERE automation_id = automations.id AND accepted_at IS NULL
+                            AND status IN ('queued','dispatched') AND error IS NOT NULL
+                          ORDER BY COALESCE(due_at, created_at), id LIMIT 1) AS blocked_reason,
+                        (SELECT retry_at FROM automation_runs
+                          WHERE automation_id = automations.id AND accepted_at IS NULL
+                            AND status IN ('queued','dispatched')
+                          ORDER BY COALESCE(due_at, created_at), id LIMIT 1) AS retry_at
+                   FROM automations WHERE automations.id = ?1",
                 params![id],
-                |r| Self::automation_from_row(r),
+                Self::automation_from_row,
             )
             .optional()?)
     }
@@ -3254,6 +3366,7 @@ impl Store {
 
     fn automation_run_from_row(row: &Row) -> rusqlite::Result<AutomationRun> {
         let status: String = row.get("status")?;
+        let kind: String = row.get("kind")?;
         Ok(AutomationRun {
             id: row.get("id")?,
             automation_id: row.get("automation_id")?,
@@ -3266,27 +3379,42 @@ impl Store {
             error: row.get("error")?,
             task_id: row.get("task_id")?,
             once_key: row.get("once_key")?,
+            kind: if kind == "watch_poll" {
+                AutomationRunKind::WatchPoll
+            } else {
+                AutomationRunKind::Action
+            },
+            due_at: row.get("due_at")?,
+            attempt_count: row.get("attempt_count")?,
+            retry_at: row.get("retry_at")?,
+            lease_until: row.get("lease_until")?,
+            accepted_at: row.get("accepted_at")?,
             created_at: row.get("created_at")?,
             ended_at: row.get("ended_at")?,
         })
     }
 
-    pub fn upsert_automation_run(&self, run: &AutomationRun) -> Result<()> {
-        self.conn()?.execute(
+    pub fn upsert_automation_run(&self, run: &AutomationRun) -> Result<bool> {
+        let changed = self.conn()?.execute(
             "INSERT INTO automation_runs (id, automation_id, run_id, trigger_summary, trigger_payload,
-                                          selection, context_preview, status, error, task_id, created_at, ended_at,
-                                          once_key)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                                          selection, context_preview, status, error, task_id, once_key,
+                                          kind, due_at, attempt_count, retry_at, lease_until, accepted_at,
+                                          created_at, ended_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(id) DO UPDATE SET run_id=?3, selection=?6, context_preview=?7, status=?8,
-                                           error=?9, task_id=?10, ended_at=?12",
+                                           error=?9, task_id=?10, retry_at=?15,
+                                           lease_until=?16, ended_at=?19
+             WHERE automation_runs.attempt_count=?14 AND automation_runs.accepted_at IS ?17",
             params![
                 run.id, run.automation_id, run.run_id, run.trigger_summary,
                 run.trigger_payload.as_ref().map(to_json), run.selection.as_ref().map(to_json),
-                run.context_preview, run.status.as_str(), run.error, run.task_id,
-                run.created_at, run.ended_at, run.once_key
+                run.context_preview, run.status.as_str(), run.error, run.task_id, run.once_key,
+                match run.kind { AutomationRunKind::Action => "action", AutomationRunKind::WatchPoll => "watch_poll" },
+                run.due_at, run.attempt_count, run.retry_at, run.lease_until, run.accepted_at,
+                run.created_at, run.ended_at
             ],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Reserve a keyed delivery before dispatch. `Some` means another caller
@@ -3311,18 +3439,277 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO automation_runs (id, automation_id, run_id, trigger_summary, trigger_payload,
-                                          selection, context_preview, status, error, task_id, created_at, ended_at,
-                                          once_key)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                                          selection, context_preview, status, error, task_id, once_key,
+                                          kind, due_at, attempt_count, retry_at, lease_until, accepted_at,
+                                          created_at, ended_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 run.id, run.automation_id, run.run_id, run.trigger_summary,
                 run.trigger_payload.as_ref().map(to_json), run.selection.as_ref().map(to_json),
-                run.context_preview, run.status.as_str(), run.error, run.task_id,
-                run.created_at, run.ended_at, run.once_key
+                run.context_preview, run.status.as_str(), run.error, run.task_id, run.once_key,
+                match run.kind { AutomationRunKind::Action => "action", AutomationRunKind::WatchPoll => "watch_poll" },
+                run.due_at, run.attempt_count, run.retry_at, run.lease_until, run.accepted_at,
+                run.created_at, run.ended_at
             ],
         )?;
         tx.commit()?;
         Ok(None)
+    }
+
+    /// Materialize a clock occurrence and advance its schedule in one commit.
+    /// A duplicate tick returns the already durable occurrence.
+    pub fn materialize_due_automation_run(
+        &self,
+        automation: &Automation,
+        kind: AutomationRunKind,
+        due_at: Millis,
+        next_run_at: Option<Millis>,
+        trigger_summary: &str,
+        trigger_payload: Option<&Json>,
+    ) -> Result<Option<AutomationRun>> {
+        let kind = match kind {
+            AutomationRunKind::Action => "action",
+            AutomationRunKind::WatchPoll => "watch_poll",
+        };
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT enabled, trigger, next_run_at FROM automations WHERE id = ?1",
+                params![automation.id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Millis>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let expected_trigger = to_json(&automation.trigger);
+        if !matches!(current, Some((true, ref trigger, next)) if trigger == &expected_trigger && next == automation.next_run_at)
+        {
+            let existing = tx
+                .query_row(
+                    "SELECT * FROM automation_runs
+                     WHERE automation_id = ?1 AND kind = ?2 AND due_at = ?3",
+                    params![automation.id, kind, due_at],
+                    Self::automation_run_from_row,
+                )
+                .optional()?;
+            tx.rollback()?;
+            return Ok(existing);
+        }
+
+        let id = new_id();
+        let created_at = now_ms();
+        tx.execute(
+            "INSERT OR IGNORE INTO automation_runs
+                (id, automation_id, trigger_summary, trigger_payload, context_preview,
+                 status, kind, due_at, created_at)
+             VALUES (?1,?2,?3,?4,'','queued',?5,?6,?7)",
+            params![
+                id,
+                automation.id,
+                trigger_summary,
+                trigger_payload.map(to_json),
+                kind,
+                due_at,
+                created_at
+            ],
+        )?;
+        tx.execute(
+            "UPDATE automations SET next_run_at = ?2
+             WHERE id = ?1 AND enabled = 1 AND trigger = ?3 AND next_run_at IS ?4",
+            params![
+                automation.id,
+                next_run_at,
+                expected_trigger,
+                automation.next_run_at
+            ],
+        )?;
+        let run = tx.query_row(
+            "SELECT * FROM automation_runs
+             WHERE automation_id = ?1 AND kind = ?2 AND due_at = ?3",
+            params![automation.id, kind, due_at],
+            Self::automation_run_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(run))
+    }
+
+    /// Work ready for an attempt, oldest occurrence first. Claiming remains a
+    /// separate atomic step so concurrent scheduler ticks are harmless.
+    pub fn ready_automation_runs(&self, now: Millis, limit: usize) -> Result<Vec<AutomationRun>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT candidate.* FROM automation_runs AS candidate
+             JOIN automations ON automations.id = candidate.automation_id
+             WHERE automations.enabled = 1
+               AND candidate.accepted_at IS NULL
+               AND candidate.run_id IS NULL
+               AND candidate.status IN ('queued','dispatched')
+               AND (candidate.retry_at IS NULL OR candidate.retry_at <= ?1)
+               AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs AS older
+                    WHERE older.automation_id = candidate.automation_id
+                      AND older.kind = candidate.kind
+                      AND older.accepted_at IS NULL
+                      AND older.status IN ('queued','dispatched')
+                      AND (COALESCE(older.due_at, older.created_at) < COALESCE(candidate.due_at, candidate.created_at)
+                           OR (COALESCE(older.due_at, older.created_at) = COALESCE(candidate.due_at, candidate.created_at)
+                               AND older.id < candidate.id))
+               )
+             ORDER BY COALESCE(candidate.due_at, candidate.created_at), candidate.id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now, limit as i64], Self::automation_run_from_row)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn claim_automation_run(
+        &self,
+        id: &str,
+        now: Millis,
+        lease_until: Millis,
+    ) -> Result<Option<AutomationRun>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE automation_runs AS candidate
+                SET status = 'dispatched', lease_until = ?3,
+                    attempt_count = attempt_count + 1, error = NULL, retry_at = NULL
+              WHERE candidate.id = ?1
+                AND candidate.accepted_at IS NULL
+                AND candidate.run_id IS NULL
+                AND candidate.status IN ('queued','dispatched')
+                AND (candidate.retry_at IS NULL OR candidate.retry_at <= ?2)
+                AND (candidate.lease_until IS NULL OR candidate.lease_until <= ?2)
+                AND EXISTS (SELECT 1 FROM automations
+                             WHERE id = candidate.automation_id AND enabled = 1)
+                AND NOT EXISTS (
+                    SELECT 1 FROM automation_runs AS older
+                     WHERE older.automation_id = candidate.automation_id
+                       AND older.kind = candidate.kind
+                       AND older.accepted_at IS NULL
+                       AND older.status IN ('queued','dispatched')
+                       AND (COALESCE(older.due_at, older.created_at) < COALESCE(candidate.due_at, candidate.created_at)
+                            OR (COALESCE(older.due_at, older.created_at) = COALESCE(candidate.due_at, candidate.created_at)
+                                AND older.id < candidate.id))
+                )",
+            params![id, now, lease_until],
+        )?;
+        let run = if changed == 0 {
+            None
+        } else {
+            tx.query_row(
+                "SELECT * FROM automation_runs WHERE id = ?1",
+                params![id],
+                Self::automation_run_from_row,
+            )
+            .optional()?
+        };
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn retry_automation_run(
+        &self,
+        id: &str,
+        attempt: i64,
+        error: &str,
+        now: Millis,
+    ) -> Result<Option<AutomationRun>> {
+        let exponent = attempt.saturating_sub(1).clamp(0, 8) as u32;
+        let delay = 1_000_i64.saturating_mul(1_i64 << exponent).min(300_000);
+        let retry_at = now.saturating_add(delay);
+        let error: String = error.chars().take(500).collect();
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx.execute(
+            "UPDATE automation_runs
+                SET run_id = NULL, status = 'queued', error = ?3, retry_at = ?4,
+                    lease_until = NULL, ended_at = NULL
+              WHERE id = ?1 AND attempt_count = ?2 AND accepted_at IS NULL",
+            params![id, attempt, error, retry_at],
+        )? == 0
+        {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        let run = tx.query_row(
+            "SELECT * FROM automation_runs WHERE id = ?1",
+            params![id],
+            Self::automation_run_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(run))
+    }
+
+    pub fn release_automation_run(&self, id: &str, attempt: i64) -> Result<Option<AutomationRun>> {
+        let conn = self.conn()?;
+        if conn.execute(
+            "UPDATE automation_runs
+                SET status = 'queued', error = NULL, retry_at = NULL, lease_until = NULL
+              WHERE id = ?1 AND attempt_count = ?2 AND accepted_at IS NULL AND run_id IS NULL",
+            params![id, attempt],
+        )? == 0
+        {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT * FROM automation_runs WHERE id = ?1",
+                params![id],
+                Self::automation_run_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn complete_automation_run(
+        &self,
+        id: &str,
+        attempt: i64,
+        at: Millis,
+    ) -> Result<Option<AutomationRun>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx.execute(
+            "UPDATE automation_runs
+                SET status = 'succeeded', error = NULL, retry_at = NULL, lease_until = NULL,
+                    accepted_at = ?3, ended_at = ?3
+              WHERE id = ?1 AND attempt_count = ?2 AND accepted_at IS NULL",
+            params![id, attempt, at],
+        )? == 0
+        {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE automations SET last_run_at = ?2,
+                                    execution_failure_notification_key = NULL
+              WHERE id = (SELECT automation_id FROM automation_runs WHERE id = ?1)",
+            params![id, at],
+        )?;
+        let run = tx.query_row(
+            "SELECT * FROM automation_runs WHERE id = ?1",
+            params![id],
+            Self::automation_run_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(run))
+    }
+
+    pub fn automation_run(&self, id: &str) -> Result<Option<AutomationRun>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM automation_runs WHERE id = ?1",
+                params![id],
+                Self::automation_run_from_row,
+            )
+            .optional()?)
     }
 
     /// Has this automation already acted on this key? The guard that makes a
@@ -3579,6 +3966,9 @@ mod tests {
             last_error: None,
             last_validated_at: None,
             failure_count: 0,
+            overdue_since: None,
+            blocked_reason: None,
+            retry_at: None,
         }
     }
 
@@ -3770,7 +4160,7 @@ mod tests {
         stale.name = "Renamed".into();
         let original_trigger = stale.trigger.clone();
         let preserved = store
-            .update_automation_config(&stale, &original_trigger, false)
+            .update_automation_config(&stale, &original_trigger, false, false)
             .unwrap()
             .unwrap();
         assert_eq!(preserved.failure_count, 1);
@@ -3790,7 +4180,7 @@ mod tests {
             every_seconds: 60,
         };
         let reset = store
-            .update_automation_config(&stale, &original_trigger, true)
+            .update_automation_config(&stale, &original_trigger, false, true)
             .unwrap()
             .unwrap();
         assert_eq!(reset.failure_count, 0);
@@ -3802,27 +4192,7 @@ mod tests {
     }
 
     #[test]
-    fn firing_a_watch_action_does_not_change_command_health() {
-        let (store, path) = store();
-        let mut watch = watch_automation();
-        watch.failure_count = 3;
-        watch.last_error = Some("HTTP 404".into());
-        store.upsert_automation(&watch).unwrap();
-
-        let fired = store
-            .record_automation_firing("watch", &watch.trigger, 20, Some(80), false, false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(fired.last_run_at, Some(20));
-        assert_eq!(fired.next_run_at, None);
-        assert_eq!(fired.failure_count, 3);
-        assert_eq!(fired.last_error.as_deref(), Some("HTTP 404"));
-        drop(store);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn an_old_firing_cannot_overwrite_a_changed_schedule() {
+    fn a_stale_config_update_cannot_overwrite_a_changed_schedule() {
         let (store, path) = store();
         let mut original = watch_automation();
         original.trigger = AutomationTrigger::Schedule {
@@ -3838,17 +4208,13 @@ mod tests {
         };
         changed.next_run_at = Some(320);
         store
-            .update_automation_config(&changed, &original.trigger, false)
+            .update_automation_config(&changed, &original.trigger, false, false)
             .unwrap();
         assert!(store
-            .update_automation_config(&original, &original.trigger, false)
+            .update_automation_config(&original, &original.trigger, false, false)
             .unwrap()
             .is_none());
 
-        assert!(store
-            .record_automation_firing("watch", &original.trigger, 20, Some(80), false, true,)
-            .unwrap()
-            .is_none());
         assert_eq!(
             store.automation("watch").unwrap().unwrap().next_run_at,
             Some(320)
@@ -4442,7 +4808,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_pauses_legacy_watches_until_their_command_is_tested() {
+    fn migration_preserves_an_enabled_legacy_watch_as_unvalidated() {
         let path = std::env::temp_dir().join(format!("patchwork-store-{}.sqlite", new_id()));
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -4468,8 +4834,317 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         let watch = store.automation("watch").unwrap().unwrap();
-        assert!(!watch.enabled);
+        assert!(watch.enabled, "an upgrade must not change user intent");
         assert_eq!(watch.last_validated_at, None);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v026_damage_is_repaired_from_the_last_explicit_enabled_state() {
+        let (store, path) = store();
+        let mut enabled = watch_automation();
+        enabled.id = "enabled".into();
+        enabled.enabled = true;
+        store.upsert_automation(&enabled).unwrap();
+        store
+            .append_event(&Event::AutomationUpdated {
+                automation: enabled.clone(),
+            })
+            .unwrap();
+
+        let mut paused = enabled.clone();
+        paused.id = "paused".into();
+        paused.enabled = false;
+        store.upsert_automation(&paused).unwrap();
+        store
+            .append_event(&Event::AutomationUpdated {
+                automation: paused.clone(),
+            })
+            .unwrap();
+
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "UPDATE automations SET enabled=0, next_run_at=NULL WHERE id='enabled'",
+            [],
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE automation_runs DROP COLUMN accepted_at", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(conn);
+        drop(store);
+
+        let repaired = Store::open(&path).unwrap();
+        assert!(repaired.automation("enabled").unwrap().unwrap().enabled);
+        assert!(!repaired.automation("paused").unwrap().unwrap().enabled);
+        drop(repaired);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn due_occurrence_survives_restart_and_duplicate_ticks() {
+        let (store, path) = store();
+        let mut automation = watch_automation();
+        automation.enabled = true;
+        automation.next_run_at = Some(10);
+        store.upsert_automation(&automation).unwrap();
+
+        let first = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::WatchPoll,
+                10,
+                Some(70),
+                "Watch poll",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let duplicate = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::WatchPoll,
+                10,
+                Some(70),
+                "Watch poll",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(duplicate.id, first.id);
+        assert_eq!(store.automation_runs("watch", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.automation("watch").unwrap().unwrap().next_run_at,
+            Some(70)
+        );
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let ready = reopened.ready_automation_runs(10, 10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, first.id);
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transient_failure_retries_the_same_occurrence_and_pause_blocks_claims() {
+        let (store, path) = store();
+        let mut automation = watch_automation();
+        automation.enabled = true;
+        automation.next_run_at = Some(10);
+        store.upsert_automation(&automation).unwrap();
+        let occurrence = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::WatchPoll,
+                10,
+                Some(70),
+                "Watch poll",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_automation_run(&occurrence.id, 10, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.attempt_count, 1);
+        let retry = store
+            .retry_automation_run(&occurrence.id, 1, "host offline", 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.id, occurrence.id);
+        assert_eq!(retry.retry_at, Some(1_010));
+        assert_eq!(
+            store
+                .automation("watch")
+                .unwrap()
+                .unwrap()
+                .blocked_reason
+                .as_deref(),
+            Some("host offline")
+        );
+
+        let mut paused = store.automation("watch").unwrap().unwrap();
+        paused.enabled = false;
+        let trigger = paused.trigger.clone();
+        store
+            .update_automation_config(&paused, &trigger, true, false)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .claim_automation_run(&occurrence.id, 1_010, 20_000)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.automation_runs("watch", 10).unwrap().len(), 1);
+        let mut stale_edit = automation.clone();
+        stale_edit.description = "stale editor".into();
+        assert!(store
+            .update_automation_config(&stale_edit, &trigger, true, false)
+            .unwrap()
+            .is_none());
+        assert!(!store.automation("watch").unwrap().unwrap().enabled);
+
+        paused.enabled = true;
+        store
+            .update_automation_config(&paused, &trigger, false, false)
+            .unwrap()
+            .unwrap();
+        let retried = store
+            .claim_automation_run(&occurrence.id, 1_010, 20_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.id, occurrence.id);
+        assert_eq!(retried.attempt_count, 2);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_active_lease_is_not_reported_as_overdue() {
+        let (store, path) = store();
+        let now = now_ms();
+        let mut automation = watch_automation();
+        automation.enabled = true;
+        automation.next_run_at = Some(now - 120_000);
+        store.upsert_automation(&automation).unwrap();
+        let occurrence = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::WatchPoll,
+                now - 120_000,
+                Some(now + 60_000),
+                "Watch poll",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .automation("watch")
+            .unwrap()
+            .unwrap()
+            .overdue_since
+            .is_some());
+        let claimed = store
+            .claim_automation_run(&occurrence.id, now, now + 300_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.automation("watch").unwrap().unwrap().overdue_since,
+            None
+        );
+        store
+            .retry_automation_run(&occurrence.id, claimed.attempt_count, "host offline", now)
+            .unwrap()
+            .unwrap();
+        assert!(store
+            .automation("watch")
+            .unwrap()
+            .unwrap()
+            .overdue_since
+            .is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_lease_attempts_are_fenced_from_newer_workers() {
+        let (store, path) = store();
+        let mut automation = watch_automation();
+        automation.enabled = true;
+        automation.next_run_at = Some(10);
+        store.upsert_automation(&automation).unwrap();
+        let occurrence = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::WatchPoll,
+                10,
+                Some(70),
+                "Watch poll",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let first = store
+            .claim_automation_run(&occurrence.id, 10, 20)
+            .unwrap()
+            .unwrap();
+        let second = store
+            .claim_automation_run(&occurrence.id, 21, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempt_count, 1);
+        assert_eq!(second.attempt_count, 2);
+        assert!(store
+            .retry_automation_run(&occurrence.id, first.attempt_count, "late failure", 21)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .complete_automation_run(&occurrence.id, first.attempt_count, 21)
+            .unwrap()
+            .is_none());
+        let current = store.automation_run(&occurrence.id).unwrap().unwrap();
+        assert_eq!(current.attempt_count, 2);
+        assert_eq!(current.lease_until, Some(100));
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn run_dispatch_is_not_accepted_until_the_host_acknowledges_it() {
+        let (store, path) = store();
+        let mut automation = watch_automation();
+        automation.enabled = true;
+        automation.next_run_at = Some(10);
+        store.upsert_automation(&automation).unwrap();
+        let occurrence = store
+            .materialize_due_automation_run(
+                &automation,
+                AutomationRunKind::Action,
+                10,
+                Some(70),
+                "Scheduled",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .claim_automation_run(&occurrence.id, 10, 100)
+            .unwrap()
+            .unwrap();
+        let mut dispatched = run("run", "task");
+        dispatched.task_id = None;
+        dispatched.automation_id = Some(automation.id.clone());
+        dispatched.status = RunStatus::Dispatched;
+        store
+            .insert_run_for_automation(&dispatched, 0, &occurrence.id, 1)
+            .unwrap();
+        let sent = store.automation_run(&occurrence.id).unwrap().unwrap();
+        assert_eq!(sent.status, RunStatus::Dispatched);
+        assert_eq!(sent.accepted_at, None);
+
+        dispatched.status = RunStatus::Running;
+        let (transitioned, accepted) = store.accept_run_dispatch(&dispatched, 20).unwrap();
+        assert!(transitioned);
+        let accepted = accepted.unwrap();
+        assert_eq!(accepted.status, RunStatus::Running);
+        assert_eq!(accepted.accepted_at, Some(20));
+
+        let mut ended = dispatched.clone();
+        ended.status = RunStatus::Failed;
+        ended.ended_at = Some(30);
+        store.update_run(&ended).unwrap();
+        let (transitioned, _) = store.accept_run_dispatch(&dispatched, 40).unwrap();
+        assert!(
+            !transitioned,
+            "a late acknowledgement cannot revive a terminal run"
+        );
+        assert_eq!(
+            store.run(&dispatched.id).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
     }
@@ -4524,6 +5199,12 @@ mod tests {
                     error: None,
                     task_id: None,
                     once_key: Some("delivery-123".into()),
+                    kind: AutomationRunKind::Action,
+                    due_at: None,
+                    attempt_count: 0,
+                    retry_at: None,
+                    lease_until: None,
+                    accepted_at: None,
                     created_at: 1,
                     ended_at: None,
                 };

@@ -466,6 +466,9 @@ export interface Automation {
   last_error?: string;
   last_validated_at?: Millis;
   failure_count: number;
+  overdue_since?: Millis;
+  blocked_reason?: string;
+  retry_at?: Millis;
 }
 
 export interface WatchTestResult {
@@ -486,6 +489,13 @@ export interface AutomationRun {
   status: RunStatus;
   error?: string;
   task_id?: Id;
+  once_key?: string;
+  kind: "action" | "watch_poll";
+  due_at?: Millis;
+  attempt_count: number;
+  retry_at?: Millis;
+  lease_until?: Millis;
+  accepted_at?: Millis;
   created_at: Millis;
   ended_at?: Millis;
 }

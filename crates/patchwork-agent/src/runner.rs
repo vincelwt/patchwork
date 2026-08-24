@@ -14,7 +14,7 @@ use patchwork_core::host::{
 use patchwork_core::models::{MessageKind, RunEventKind, RunStatus};
 use patchwork_core::Id;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::acp::{choose_permission, AcpConnection, AgentEvent, NewSession};
 use crate::preview::PreviewManager;
@@ -208,12 +208,19 @@ impl Runner {
         let run_id = spec.run_id.clone();
         let mut runs = self.runs.lock().await;
         if !runs.started.insert(run_id.clone()) {
+            let active = runs.active.contains_key(&run_id);
+            drop(runs);
+            if active {
+                self.emit(HostToRelay::RunAccepted { run_id, cwd: None });
+            }
             return;
         }
 
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (start_tx, start_rx) = oneshot::channel();
         let this = self.clone();
         let task = tokio::spawn(async move {
+            let _ = start_rx.await;
             let run_id = spec.run_id.clone();
             if let Err(err) = execute(this.clone(), spec, control_rx).await {
                 let message = format!("{err:#}");
@@ -244,13 +251,16 @@ impl Runner {
         });
 
         runs.active.insert(
-            run_id,
+            run_id.clone(),
             RunHandle {
                 control: control_tx,
                 task,
                 accepting: true,
             },
         );
+        drop(runs);
+        self.emit(HostToRelay::RunAccepted { run_id, cwd: None });
+        let _ = start_tx.send(());
     }
 
     async fn set_accepting(&self, run_id: &str, accepting: bool) {
@@ -1781,7 +1791,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}'
 read _
 sleep 5
 "#;
-        let (out, _messages) = mpsc::unbounded_channel();
+        let (out, mut messages) = mpsc::unbounded_channel();
         let runner = Runner::new(RunnerConfig::default(), out);
         let mut requested = spec();
         requested.run_id = "duplicate-start-run".into();
@@ -1813,6 +1823,18 @@ sleep 5
 
         assert_eq!(tokio::fs::read(&count).await.unwrap(), b"x");
         assert_eq!(runner.active_run_ids().await, vec!["duplicate-start-run"]);
+        let acknowledgements = std::iter::from_fn(|| messages.try_recv().ok())
+            .filter(|message| {
+                matches!(
+                    message,
+                    HostToRelay::RunAccepted { run_id, .. } if run_id == "duplicate-start-run"
+                )
+            })
+            .count();
+        assert!(
+            acknowledgements >= 20,
+            "every duplicate delivery of an active run must recover a lost acknowledgement"
+        );
         runner.shutdown().await;
         assert!(runner.active_run_ids().await.is_empty());
         runner

@@ -1704,8 +1704,6 @@ export function AutomationsPage() {
   const [editing, setEditing] = useState<Automation | null>(null);
   const [deleting, setDeleting] = useState<Automation | null>(null);
 
-  /// Resuming a watch the relay has not validated is refused, and a refusal
-  /// nobody sees looks like a button that does nothing.
   const toggle = async (automation: Automation) => {
     try {
       await api.updateAutomation(automation.id, {
@@ -1742,10 +1740,12 @@ export function AutomationsPage() {
           const agent = app.members.find(
             (member) => member.id === automation.agent_id,
           );
-          // A watch's health is its last successful check: `last_run_at` only
-          // says the relay tried.
           const health =
-            automation.trigger.type === "watch" ? watchHealth(automation) : undefined;
+            automation.trigger.type === "watch" ||
+            automation.blocked_reason ||
+            automation.overdue_since
+              ? watchHealth(automation)
+              : undefined;
           return (
             <button
               key={automation.id}
@@ -1770,15 +1770,17 @@ export function AutomationsPage() {
               <Chip tone={automation.enabled ? "positive" : ""}>
                 {automation.enabled ? "on" : "paused"}
               </Chip>
-              <span
-                className="button quiet"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void api.runAutomation(automation.id);
-                }}
-              >
-                Run now
-              </span>
+              {automation.enabled && (
+                <span
+                  className="button quiet"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void api.runAutomation(automation.id);
+                  }}
+                >
+                  Run now
+                </span>
+              )}
               <MenuButton
                 align="right"
                 title="Manage"
@@ -1954,9 +1956,8 @@ export function AutomationModal({
   const [instructions, setInstructions] = useState(automation?.instructions ?? "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  /// A watch is saved paused, tested, then enabled, so a failed test leaves an
-  /// automation behind. Pressing the button again fixes that one rather than
-  /// creating a second.
+  /// A failed diagnostic leaves the saved automation visible for correction.
+  /// Pressing the button again updates it rather than creating a second.
   const [savedId, setSavedId] = useState(automation?.id);
 
   const cronExpression =
@@ -2011,9 +2012,6 @@ export function AutomationModal({
     setBusy(true);
     setError("");
     const nextTrigger = trigger();
-    // The relay refuses to enable a watch whose command has not passed a test,
-    // and an untested watch that looks enabled is the whole failure this
-    // guards: save it paused, test it, and only then put it back on.
     const needsTest = watchNeedsTest(automation, nextTrigger);
     const wantEnabled = automation?.enabled ?? true;
     const body = {
@@ -2024,7 +2022,7 @@ export function AutomationModal({
       instructions,
       context_channel_id: channelId || undefined,
       report_channel_id: channelId || undefined,
-      enabled: wantEnabled && !needsTest,
+      enabled: wantEnabled,
     };
     try {
       const saved = savedId
@@ -2035,17 +2033,13 @@ export function AutomationModal({
         const result = await api.testAutomation(saved.id);
         if (!result.ok) {
           setError(
-            `The command failed, so “${name}” stays paused: ${result.error ?? "no diagnostic"}`,
+            `Saved ${wantEnabled ? "enabled" : "paused"}, but the command is degraded: ${result.error ?? "no diagnostic"}. Patchwork will keep retrying while it is enabled.`,
           );
           setBusy(false);
           return;
         }
-        // A watch the author deliberately paused stays paused.
-        if (wantEnabled) {
-          await api.updateAutomation(saved.id, { ...body, enabled: true });
-        }
         toast(
-          `Command checked, ${result.event_count} event${result.event_count === 1 ? "" : "s"} · ${wantEnabled ? "on" : "still paused"}`,
+          `Command checked, ${result.event_count} event${result.event_count === 1 ? "" : "s"} · ${wantEnabled ? "on" : "paused"}`,
         );
       } else if (automation) {
         toast("Automation updated");
@@ -2303,7 +2297,11 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
               {testing ? "Testing…" : "Test watch"}
             </button>
           )}
-          <button className="button" onClick={() => api.runAutomation(automation.id)}>
+          <button
+            className="button"
+            disabled={!automation.enabled}
+            onClick={() => api.runAutomation(automation.id)}
+          >
             Run now
           </button>
           <button className="button" onClick={() => setEditing(true)}>
@@ -2337,6 +2335,23 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
           {automation.enabled ? "on" : "paused"}
         </Chip>
       </div>
+
+      {automation.enabled && automation.blocked_reason && (
+        <div className="notice" style={{ marginTop: 14 }}>
+          This occurrence is blocked, but remains durable and will retry
+          {automation.retry_at ? ` ${relative(automation.retry_at)}` : " automatically"}.
+          <div className="error-text" style={{ wordBreak: "break-word" }}>
+            {automation.blocked_reason}
+          </div>
+          Fix the configuration, or pause the automation to stop the obligation.
+        </div>
+      )}
+      {automation.enabled && automation.overdue_since && !automation.blocked_reason && (
+        <div className="notice" style={{ marginTop: 14 }}>
+          Work due {relative(automation.overdue_since)} is still waiting for durable acceptance.
+          Patchwork will keep retrying automatically.
+        </div>
+      )}
 
       {automation.trigger.type === "webhook" && (
         <div className="card" style={{ maxWidth: "none", marginTop: 14 }}>
