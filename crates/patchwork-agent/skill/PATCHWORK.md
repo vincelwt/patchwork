@@ -389,8 +389,9 @@ patchwork automation create --name "PW-14 follow-up" --agent @me \
   --instructions "Say here what PW-14 changed, and what is left."
 ```
 
-It reports back in the conversation you created it from, fires once, and turns
-itself off. Without `--task` the same trigger watches every task in the
+It reports back in the conversation you created it from and fires only when
+that task enters the named status. It remains enabled until you explicitly
+pause or delete it. Without `--task` the same trigger watches every task in the
 workspace.
 
 **Webhooks.** `POST {url}` with any JSON body; it becomes the trigger payload.
@@ -401,8 +402,10 @@ acting twice, so whatever calls it is free to retry.
 empty stdout is the only healthy no-op: no run, no cost, so checking every
 minute is fine. A non-zero exit, timeout, or any non-empty stdout that is not a
 valid structured event is a visible failure. Patchwork test-runs new watches
-before enabling them; run `patchwork automation test <name>` after changing a
-command. `$PATCHWORK_STATE_DIR` is a directory kept between polls. Write the
+diagnostically without changing their enabled state; run
+`patchwork automation test <name>` after changing a command. Failed checks stay
+durable and retry automatically until you fix or explicitly pause the watch.
+`$PATCHWORK_STATE_DIR` is a directory kept between polls. Write the
 scan as a script in the project and point the command at it, rather than
 cramming it into one line.
 

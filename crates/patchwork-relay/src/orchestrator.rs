@@ -813,6 +813,8 @@ async fn trigger_agents(
             prompt: message.body.clone(),
             trigger,
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: (author_depth + 1).max(0),
             host_id: None,
             project_id: None,
@@ -1267,6 +1269,10 @@ pub struct StartRunParams {
     pub prompt: String,
     pub trigger: RunTrigger,
     pub automation_id: Option<Id>,
+    /// Durable occurrence that owns this dispatch, when started by an automation.
+    pub automation_run_id: Option<Id>,
+    /// Lease generation fencing stale occurrence workers.
+    pub automation_run_attempt: Option<i64>,
     pub depth: i32,
     pub host_id: Option<Id>,
     pub project_id: Option<Id>,
@@ -1370,7 +1376,16 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         started_at: Some(now),
         ended_at: None,
     };
-    state.store.insert_run(&run, params.depth)?;
+    if let Some(automation_run_id) = params.automation_run_id.as_deref() {
+        state.store.insert_run_for_automation(
+            &run,
+            params.depth,
+            automation_run_id,
+            params.automation_run_attempt.unwrap_or_default(),
+        )?;
+    } else {
+        state.store.insert_run(&run, params.depth)?;
+    }
 
     // A token scoped to this run: the agent's native access to Patchwork.
     let token = auth::generate_token();
@@ -1466,15 +1481,6 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
 
     state.emit(Event::RunUpdated { run: run.clone() });
 
-    if let Some(task_id) = run.task_id.as_deref() {
-        state
-            .store
-            .finalize_task_run_start(task_id, &run.id, run.created_at)?;
-        if let Some(task) = state.store.task(task_id)? {
-            state.emit(Event::TaskUpdated { task });
-        }
-    }
-
     // Whoever is already in this worktree hears that someone joined them,
     // rather than discovering it in a file that moved.
     if let (Some(task_id), Some(task)) = (run.task_id.as_deref(), task.as_ref()) {
@@ -1484,6 +1490,11 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
             .as_deref()
             .map(|path| format!(" ({path})"))
             .unwrap_or_default();
+        let agent_name = state
+            .store
+            .members()
+            .map(|members| agent_label(&members, &agent.id))
+            .unwrap_or_else(|_| agent.display_name.clone());
         tell_task_peers(
             state,
             task_id,
@@ -1492,8 +1503,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
                 "{} just started working on {} alongside you, in the same worktree{where_}. \
 They were asked:\n\n{asked}\n\n{SHARED_WORKTREE_ETIQUETTE} Carry on with your own work; \
 reply only if this changes it.",
-                agent_label(&state.store.members()?, &agent.id),
-                task.key,
+                agent_name, task.key,
             ),
         )
         .await;
@@ -2072,8 +2082,34 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 }
                 run.status = RunStatus::Running;
                 run.cwd = cwd.or(run.cwd);
-                state.store.update_run(&run)?;
-                state.emit(Event::RunUpdated { run });
+                let (accepted, occurrence) = state.store.accept_run_dispatch(&run, now_ms())?;
+                if !accepted {
+                    return Ok(());
+                }
+                state.emit(Event::RunUpdated { run: run.clone() });
+                if let Some(task_id) = run.task_id.as_deref() {
+                    match state
+                        .store
+                        .finalize_task_run_start(task_id, &run.id, run.created_at)
+                    {
+                        Ok(_) => {
+                            if let Ok(Some(task)) = state.store.task(task_id) {
+                                state.emit(Event::TaskUpdated { task });
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, run = %run.id, "could not finalize accepted task metadata");
+                        }
+                    }
+                }
+                if let Some(occurrence) = occurrence {
+                    state.emit(Event::AutomationRunUpdated {
+                        run: occurrence.clone(),
+                    });
+                    if let Some(automation) = state.store.automation(&occurrence.automation_id)? {
+                        state.emit(Event::AutomationUpdated { automation });
+                    }
+                }
             }
         }
 
@@ -2699,22 +2735,60 @@ pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     finish_streamed_reply(state, &run.id).await?;
     state.run_destinations.write().await.remove(&run.id);
 
-    if let Some(automation_run) = state.store.automation_run_by_run(&run.id)? {
-        let mut automation_run = automation_run;
-        automation_run.status = run.status;
-        automation_run.error = run.error.clone();
-        automation_run.ended_at = Some(now_ms());
-        state.store.upsert_automation_run(&automation_run)?;
-        state.emit(Event::AutomationRunUpdated {
-            run: automation_run.clone(),
-        });
-
-        match run.status {
-            RunStatus::Failed => {
-                crate::automations::report_failure(state, &automation_run, run).await?
+    if let Some(mut automation_run) = state.store.automation_run_by_run(&run.id)? {
+        if automation_run.accepted_at.is_none() {
+            let diagnostic = run
+                .error
+                .clone()
+                .unwrap_or_else(|| "the host stopped before accepting the run".into());
+            if let Some(retry) = state.store.retry_automation_run(
+                &automation_run.id,
+                automation_run.attempt_count,
+                &diagnostic,
+                now_ms(),
+            )? {
+                state.emit(Event::AutomationRunUpdated { run: retry.clone() });
+                crate::automations::report_failure(state, &retry, run).await?;
+                if let Some(automation) = state.store.automation(&retry.automation_id)? {
+                    state.emit(Event::AutomationUpdated { automation });
+                }
             }
-            RunStatus::Succeeded => crate::automations::report_success(state, &automation_run)?,
-            _ => {}
+            if let Some(task_id) = run.task_id.as_deref() {
+                let previous_status = automation_run
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.get("previous_task_status"))
+                    .and_then(|value| value.as_str())
+                    .and_then(TaskStatus::parse)
+                    .unwrap_or(TaskStatus::Planned);
+                state
+                    .store
+                    .restore_task_after_failed_start(task_id, &run.id, previous_status)?;
+                if let Some(task) = state.store.task(task_id)? {
+                    state.emit(Event::TaskUpdated { task });
+                }
+            }
+            return Ok(());
+        } else {
+            automation_run.status = run.status;
+            automation_run.error = run.error.clone();
+            automation_run.ended_at = Some(now_ms());
+            automation_run.lease_until = None;
+            let _ = state.store.upsert_automation_run(&automation_run)?;
+            state.emit(Event::AutomationRunUpdated {
+                run: automation_run.clone(),
+            });
+
+            match run.status {
+                RunStatus::Failed => {
+                    crate::automations::report_failure(state, &automation_run, run).await?
+                }
+                RunStatus::Succeeded => crate::automations::report_success(state, &automation_run)?,
+                _ => {}
+            }
+            if let Some(automation) = state.store.automation(&automation_run.automation_id)? {
+                state.emit(Event::AutomationUpdated { automation });
+            }
         }
     }
 
@@ -3289,6 +3363,8 @@ async fn create_task_inner(
                         task_id: task.id.clone(),
                     },
                     automation_id: None,
+                    automation_run_id: None,
+                    automation_run_attempt: None,
                     depth: 0,
                     host_id: task.host_id.clone(),
                     project_id: task.project_id.clone(),
@@ -3525,6 +3601,8 @@ pub async fn run_task(
                 by: actor_id.to_string(),
             },
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: task.host_id.clone(),
             project_id: task.project_id.clone(),
@@ -3800,6 +3878,147 @@ mod tests {
         assert_eq!(stored.status, RunStatus::Dispatched);
         assert_eq!(stored.headline, "Restarting");
 
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn unaccepted_automation_run_requeues_without_blocking_its_created_task() {
+        let path = std::env::temp_dir().join(format!("patchwork-unaccepted-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        store
+            .insert_member(&member("human", "human", MemberKind::Human))
+            .unwrap();
+        store
+            .insert_member(&member("agent", "agent", MemberKind::Agent))
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let task = create_task_with_result(
+            &state,
+            "human",
+            patchwork_core::wire::CreateTask {
+                title: "Retry dispatch".into(),
+                outcome: "The run reaches its host".into(),
+                owner_id: Some("agent".into()),
+                status: Some(TaskStatus::Planned),
+                start: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .task;
+        let automation = Automation {
+            id: "automation".into(),
+            name: "Create task".into(),
+            description: String::new(),
+            enabled: true,
+            trigger: AutomationTrigger::Manual,
+            agent_id: "agent".into(),
+            action: AutomationAction::CreateTask,
+            instructions: String::new(),
+            context_channel_id: None,
+            report_channel_id: None,
+            project_id: None,
+            location: ExecutionLocation::Auto,
+            host_id: None,
+            created_by: "human".into(),
+            created_at: 1,
+            last_run_at: None,
+            next_run_at: None,
+            last_success_at: None,
+            last_error_at: None,
+            last_error: None,
+            last_validated_at: None,
+            failure_count: 0,
+            overdue_since: None,
+            blocked_reason: None,
+            retry_at: None,
+        };
+        store.upsert_automation(&automation).unwrap();
+        let mut occurrence = AutomationRun {
+            id: "occurrence".into(),
+            automation_id: automation.id.clone(),
+            run_id: None,
+            trigger_summary: "Scheduled".into(),
+            trigger_payload: None,
+            selection: Some(json!({ "previous_task_status": "planned" })),
+            context_preview: String::new(),
+            status: RunStatus::Queued,
+            error: None,
+            task_id: Some(task.id.clone()),
+            once_key: None,
+            kind: AutomationRunKind::Action,
+            due_at: Some(1),
+            attempt_count: 0,
+            retry_at: None,
+            lease_until: None,
+            accepted_at: None,
+            created_at: 1,
+            ended_at: None,
+        };
+        store.reserve_automation_run(&occurrence).unwrap();
+        occurrence = store
+            .claim_automation_run(&occurrence.id, 1, 100)
+            .unwrap()
+            .unwrap();
+        occurrence.selection = Some(json!({ "previous_task_status": "planned" }));
+        assert!(store.upsert_automation_run(&occurrence).unwrap());
+        let mut run = Run {
+            id: "run".into(),
+            agent_id: "agent".into(),
+            status: RunStatus::Dispatched,
+            trigger: RunTrigger::Automation {
+                automation_id: automation.id.clone(),
+            },
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            host_id: Some("relay".into()),
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: Some(automation.id.clone()),
+            session_id: None,
+            runtime: "pi".into(),
+            provider: None,
+            model: None,
+            thinking: None,
+            prompt: String::new(),
+            headline: "Starting".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        store
+            .insert_run_for_automation(&run, 0, &occurrence.id, occurrence.attempt_count)
+            .unwrap();
+        store
+            .activate_task_run(&task.id, &run.id, Some(TaskStatus::Planned))
+            .unwrap()
+            .unwrap();
+        run.status = RunStatus::Failed;
+        run.error = Some("host disconnected before acceptance".into());
+        run.ended_at = Some(2);
+        store.update_run(&run).unwrap();
+
+        finish_run(&state, &run).await.unwrap();
+
+        let task = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Planned);
+        assert_eq!(task.current_run_id, None);
+        let occurrence = store.automation_run(&occurrence.id).unwrap().unwrap();
+        assert_eq!(occurrence.status, RunStatus::Queued);
+        assert_eq!(occurrence.run_id, None);
+        assert!(occurrence.retry_at.is_some());
         drop(state);
         drop(store);
         let _ = std::fs::remove_file(path);
@@ -4561,6 +4780,8 @@ mod tests {
                 message_id: "m".into(),
             },
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: None,
             project_id: None,
@@ -4580,6 +4801,8 @@ mod tests {
             prompt: "Help me".into(),
             trigger: RunTrigger::Manual { by: "vince".into() },
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: None,
             project_id: None,
@@ -4637,6 +4860,8 @@ mod tests {
             prompt: "Work on it".into(),
             trigger: RunTrigger::Manual { by: "vince".into() },
             automation_id: None,
+            automation_run_id: None,
+            automation_run_attempt: None,
             depth: 0,
             host_id: None,
             project_id: None,

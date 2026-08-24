@@ -67,9 +67,20 @@ test("a watch reads as healthy from its last successful check, not its last atte
     tone: "caution",
     text: "Never tested",
   });
+  assert.deepEqual(
+    watchHealth(
+      watch({ blocked_reason: "host offline", retry_at: now + 60_000, overdue_since: now - 60_000 }),
+      now,
+    ),
+    { tone: "danger", text: "Blocked · retry in 1 minute" },
+  );
+  assert.deepEqual(
+    watchHealth(watch({ overdue_since: now - 60_000, failure_count: 3 }), now),
+    { tone: "danger", text: "Overdue 1 minute ago" },
+  );
 });
 
-test("only a watch command that already passed skips the test before enabling", () => {
+test("new or changed watch commands request a diagnostic test", () => {
   const validated = {
     trigger: { type: "watch", command: "check", every_seconds: 60 },
     last_validated_at: 1,

@@ -70,7 +70,7 @@ export default function AutomationScreen() {
             <Badge>{automation.action.replaceAll("_", " ")}</Badge>
           </View>
           <View style={styles.actions}>
-            <Button label="Run now" compact onPress={async () => { await store.mutate((api) => api.runAutomation(automation.id), true, (run) => { if (run.run_id) router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }); void load(); }); }} />
+            <Button label="Run now" compact disabled={!automation.enabled} onPress={async () => { await store.mutate((api) => api.runAutomation(automation.id), true, (run) => { if (run.run_id) router.push({ pathname: "/(app)/runs/[runId]", params: { runId: run.run_id } }); void load(); }); }} />
             <Button
               label={automation.enabled ? "Pause" : "Resume"}
               compact
@@ -121,6 +121,25 @@ export default function AutomationScreen() {
             <Text style={{ color: theme.text, fontWeight: "700" }}>Webhook</Text>
             <Text selectable style={{ color: theme.accent }}>
               POST {session.baseUrl}/api/webhooks/{automation.trigger.token}
+            </Text>
+          </Card>
+        ) : null}
+        {automation.enabled && automation.blocked_reason ? (
+          <Card style={styles.instructions}>
+            <Text style={{ color: theme.danger, fontWeight: "700" }}>Blocked, retrying automatically</Text>
+            <Text selectable style={{ color: theme.danger, lineHeight: 20 }}>
+              {automation.blocked_reason}
+            </Text>
+            <Text style={{ color: theme.muted, lineHeight: 20 }}>
+              {automation.retry_at ? `Next retry ${relative(automation.retry_at)}. ` : ""}
+              Fix the configuration, or pause the automation to stop the obligation.
+            </Text>
+          </Card>
+        ) : automation.enabled && automation.overdue_since ? (
+          <Card style={styles.instructions}>
+            <Text style={{ color: theme.danger, fontWeight: "700" }}>Overdue</Text>
+            <Text style={{ color: theme.muted, lineHeight: 20 }}>
+              Work due {relative(automation.overdue_since)} is still waiting for durable acceptance. Patchwork will keep retrying.
             </Text>
           </Card>
         ) : null}

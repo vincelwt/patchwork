@@ -1073,6 +1073,14 @@ pub struct Automation {
     pub last_validated_at: Option<Millis>,
     #[serde(default)]
     pub failure_count: i64,
+    /// Earliest due occurrence still waiting for durable host acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue_since: Option<Millis>,
+    /// Why the oldest unaccepted occurrence is waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<Millis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1082,6 +1090,14 @@ pub struct WatchTestResult {
     pub tested_at: Millis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationRunKind {
+    #[default]
+    Action,
+    WatchPoll,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1109,6 +1125,20 @@ pub struct AutomationRun {
     /// carrying a key that already fired is dropped before it costs a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub once_key: Option<String>,
+    #[serde(default)]
+    pub kind: AutomationRunKind,
+    /// The clock occurrence this row fulfils. `None` for event and manual triggers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<Millis>,
+    #[serde(default)]
+    pub attempt_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<Millis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<Millis>,
+    /// A host, or a synchronous database action, durably accepted this occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<Millis>,
     pub created_at: Millis,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<Millis>,

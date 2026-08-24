@@ -178,8 +178,8 @@ export function watchValidated(automation: Automation) {
   return automation.last_validated_at !== undefined;
 }
 
-/// The relay refuses to enable a watch whose current command has not passed a
-/// test, so a new watch and an edited command both have to be tested first.
+/// A new or edited command should be tested diagnostically. Testing never
+/// changes the user's enabled state.
 export function watchNeedsTest(
   automation: Automation | undefined | null,
   trigger: { type: string; command?: string },
@@ -196,6 +196,15 @@ export function watchNeedsTest(
 /// attempt: a command that has been failing all week still has a fresh
 /// `last_run_at`, which is exactly how a dead watch looks healthy.
 export function watchHealth(automation: Automation): { tone: string; text: string } {
+  if (automation.blocked_reason) {
+    return {
+      tone: "danger",
+      text: automation.retry_at ? `blocked · retry ${relative(automation.retry_at)}` : "blocked",
+    };
+  }
+  if (automation.overdue_since) {
+    return { tone: "danger", text: `overdue ${relative(automation.overdue_since)}` };
+  }
   const failures = automation.failure_count;
   if (failures > 0) {
     const when = automation.last_error_at ? ` · ${relative(automation.last_error_at)}` : "";
