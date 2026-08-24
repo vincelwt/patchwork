@@ -1263,7 +1263,8 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
     )?;
 
     let context = build_context(state, &run, &task).await?;
-    let prompt = compose_prompt(&params, &task, &params.trigger);
+    let autonomy = state.store.workspace()?.autonomy;
+    let prompt = compose_prompt(&params, &task, &params.trigger, &autonomy);
 
     let spec = RunSpec {
         run_id: run.id.clone(),
@@ -1271,7 +1272,7 @@ a worktree of its own. Wait for that run, or give the project a repository URL."
         agent_handle: agent.handle.clone(),
         agent_name: agent.display_name.clone(),
         agent_description: profile.description.clone(),
-        autonomy: state.store.workspace()?.autonomy,
+        autonomy,
         skills: state.store.workspace_skills()?,
         runtime: profile.runtime.clone(),
         provider: profile.provider.clone(),
@@ -1795,8 +1796,23 @@ fn task_files(state: &Shared, task: &Option<Task>) -> Vec<RunFile> {
         .collect()
 }
 
-fn compose_prompt(params: &StartRunParams, task: &Option<Task>, trigger: &RunTrigger) -> String {
+fn compose_prompt(
+    params: &StartRunParams,
+    task: &Option<Task>,
+    trigger: &RunTrigger,
+    autonomy: &str,
+) -> String {
     let mut prompt = String::new();
+    if autonomy.trim().is_empty() {
+        prompt.push_str(
+            "Working stance: collaborator mode. Follow the collaborator-mode guidance in PATCHWORK.md.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "Working stance: assistant mode. Follow the assistant-mode guidance in PATCHWORK.md: \
+act on reversible work without asking, report outcomes rather than process, and propose useful next steps.\n\n",
+        );
+    }
     if let Some(task) = task {
         prompt.push_str(&format!("You own task {}: {}.\n", task.key, task.title));
         if !task.outcome.trim().is_empty() {
@@ -4189,9 +4205,40 @@ mod tests {
             project_id: None,
             required_task_status: None,
         };
-        let prompt = compose_prompt(&params, &None, &params.trigger);
+        let prompt = compose_prompt(&params, &None, &params.trigger, "");
         assert!(prompt.contains("NOTHING"));
         assert!(prompt.contains("deploy is failing"));
+    }
+
+    #[test]
+    fn workspace_autonomy_selects_the_run_stance() {
+        let params = StartRunParams {
+            agent_id: "a".into(),
+            channel_id: "c".into(),
+            task_id: None,
+            prompt: "Help me".into(),
+            trigger: RunTrigger::Manual { by: "vince".into() },
+            automation_id: None,
+            depth: 0,
+            host_id: None,
+            project_id: None,
+            required_task_status: None,
+        };
+
+        let collaborator = compose_prompt(&params, &None, &params.trigger, "  ");
+        assert!(collaborator.contains("Working stance: collaborator mode"));
+        assert!(!collaborator.contains("act on reversible work without asking"));
+
+        let assistant = compose_prompt(
+            &params,
+            &None,
+            &params.trigger,
+            "Merge pull requests after checks pass.",
+        );
+        assert!(assistant.contains("Working stance: assistant mode"));
+        assert!(assistant.contains("act on reversible work without asking"));
+        assert!(assistant.contains("report outcomes rather than process"));
+        assert!(assistant.contains("propose useful next steps"));
     }
 
     #[test]
@@ -4233,7 +4280,7 @@ mod tests {
             project_id: None,
             required_task_status: None,
         };
-        let prompt = compose_prompt(&params, &Some(task), &params.trigger);
+        let prompt = compose_prompt(&params, &Some(task), &params.trigger, "");
         assert!(prompt.contains("Leave work in Review when it needs approval"));
         assert!(prompt.contains("mark the task Done"));
         assert!(!prompt.contains("do not mark the task Done yourself"));

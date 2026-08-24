@@ -1920,6 +1920,9 @@ sleep 5
         let p = compose_first_prompt(&spec(), &[]);
         assert!(p.contains("Developer agent"));
         assert!(p.contains("You ship small, reviewable changes."));
+        assert!(p.contains("## Working stance"));
+        assert!(p.contains("Act on safe, reversible work without asking permission"));
+        assert!(p.contains("Stay within the requested scope"));
         assert!(p.contains("patchwork ask"));
         assert!(p.contains("## AUTONOMY.md"));
         assert!(p.contains("Merge pull requests after checks pass."));

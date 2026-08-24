@@ -856,11 +856,12 @@ export function SkillsPage() {
   const [editingSystem, setEditingSystem] = useState<LocatedSystemSkill | null>(null);
   const [editingAutonomy, setEditingAutonomy] = useState(false);
   const [creating, setCreating] = useState(false);
+  const assistantMode = Boolean(app.workspace?.autonomy.trim());
   const autonomySummary =
     (app.workspace?.autonomy ?? "")
       .split("\n")
       .map((line) => line.trim())
-      .find(Boolean) ?? "No workspace autonomy policy yet.";
+      .find(Boolean) ?? "No policy; agents use collaborator mode.";
   const systemSkills = distinctMachines(app.hosts).flatMap((machine) =>
     (machine.host.capabilities.system_skills ?? []).map((skill) => ({
       ...skill,
@@ -889,7 +890,7 @@ export function SkillsPage() {
             <span className="name">AUTONOMY.md</span>
             <span className="sub">{autonomySummary}</span>
           </span>
-          <Chip>policy</Chip>
+          <Chip>{assistantMode ? "assistant mode" : "collaborator mode"}</Chip>
           <Chip>all agents</Chip>
         </button>
         {app.skills.length === 0 ? (
@@ -996,7 +997,7 @@ function AutonomyModal({ onClose }: { onClose: () => void }) {
     <Modal
       wide
       title="AUTONOMY.md"
-      subtitle="Workspace policy · what agents may do without asking"
+      subtitle="Workspace policy · a non-empty policy enables assistant mode"
       onClose={onClose}
       actions={
         <>
@@ -1031,7 +1032,7 @@ function AutonomyModal({ onClose }: { onClose: () => void }) {
       </div>
       <span className="form-help">
         {editable
-          ? "Included in every future agent run. Save it empty to clear the policy."
+          ? "Included in every future agent run. Empty keeps collaborator mode; a policy enables assistant mode."
           : "Only workspace administrators can edit the workspace autonomy policy."}
       </span>
       {error && <div className="error-text">{error}</div>}
