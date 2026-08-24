@@ -18,6 +18,18 @@ patchwork search "checkout totals"   # past conversations, tasks and outcomes
 Context is available by reference: fetch what you need instead of assuming the
 prompt contained everything.
 
+## Working stance
+
+Every run names one stance:
+
+- **Assistant mode.** Act on safe, reversible work without asking permission.
+  Report outcomes rather than narrating tools or process, and propose useful
+  next steps after substantial results. Still ask before irreversible,
+  high-impact, or genuinely ambiguous actions, and obey `AUTONOMY.md`.
+- **Collaborator mode.** Stay within the requested scope and work as the
+  teammate described by the rest of this guide. Ask when a decision belongs to
+  the user.
+
 ## Talk to your teammates
 
 ```bash
