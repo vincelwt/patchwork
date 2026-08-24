@@ -24,6 +24,7 @@ import {
 } from "./icons";
 import { ConfirmDelete } from "./Pages";
 import { unreadInboxCount } from "@client/inbox";
+import { visibleOnTaskBoard } from "@client/tasks";
 import { isTerminalTaskStatus } from "@client/types";
 import type { Channel, Id, Member, Section } from "@client/types";
 import type { View as NavView } from "./common";
@@ -90,7 +91,9 @@ export function Sidebar({
   const [menuFor, setMenuFor] = useState<{ channel: Channel; x: number; y: number } | null>(null);
 
   const unread = unreadInboxCount(app.inbox);
-  const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
+  const openTasks = app.tasks.filter(
+    (task) => visibleOnTaskBoard(task) && !isTerminalTaskStatus(task.status),
+  ).length;
 
   // Things actually addressed to you, per conversation. This is the number
   // worth colouring; plain activity gets a dot and nothing more.

@@ -2548,6 +2548,37 @@ fn asks_for_written_answer(request: &str) -> bool {
     .any(|prefix| normalized.starts_with(prefix))
 }
 
+async fn report_background_outcome(state: &Shared, task: &Task, run: &Run) -> Result<()> {
+    if !task.background || task.status == TaskStatus::Running {
+        return Ok(());
+    }
+    let Some(channel_id) = task
+        .source_channel_id
+        .as_deref()
+        .filter(|channel_id| *channel_id != task.discussion_channel_id)
+    else {
+        return Ok(());
+    };
+    let Some(summary) = state.store.last_run_message(&run.id, &run.agent_id)? else {
+        return Ok(());
+    };
+    post_message(
+        state,
+        channel_id,
+        &run.agent_id,
+        SendMessage {
+            body: summary.body,
+            ..Default::default()
+        },
+        PostOptions {
+            trigger_agents: false,
+            run_id: Some(run.id.clone()),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// A finished run updates the board and the Inbox so nothing silently stalls.
 pub(crate) async fn finish_run(state: &Shared, run: &Run) -> Result<()> {
     // A run that died mid-sentence leaves its half-written reply in place —
@@ -2698,7 +2729,8 @@ the task stays yours until you stop. Reply only if this changes your work.",
             notify_task(state, &task, kind, title)?;
         }
         let task = state.store.task(task_id)?.unwrap_or(task);
-        state.emit(Event::TaskUpdated { task });
+        state.emit(Event::TaskUpdated { task: task.clone() });
+        report_background_outcome(state, &task, run).await?;
         return Ok(());
     }
     bail!("task kept changing while its run was finishing")
@@ -3025,6 +3057,7 @@ async fn create_task_inner(
         owner_id: input.owner_id.clone(),
         source_channel_id: input.source_channel_id.clone(),
         source_message_id: input.source_message_id.clone(),
+        background: input.background,
         discussion_channel_id: discussion.id.clone(),
         project_id: input.project_id.clone(),
         host_id: input.host_id.clone(),
@@ -3724,6 +3757,7 @@ mod tests {
             owner_id: Some("agent".into()),
             source_channel_id: None,
             source_message_id: None,
+            background: false,
             discussion_channel_id: channel.id.clone(),
             project_id: None,
             host_id: None,
@@ -4122,6 +4156,7 @@ mod tests {
             owner_id: None,
             source_channel_id: None,
             source_message_id: None,
+            background: false,
             discussion_channel_id: "c".into(),
             project_id: None,
             host_id: None,
@@ -4327,6 +4362,7 @@ mod tests {
             owner_id: None,
             source_channel_id: None,
             source_message_id: None,
+            background: false,
             discussion_channel_id: "c".into(),
             project_id: None,
             host_id: None,

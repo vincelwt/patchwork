@@ -190,6 +190,7 @@ export interface Task {
   owner_id?: Id;
   source_channel_id?: Id;
   source_message_id?: Id;
+  background: boolean;
   discussion_channel_id: Id;
   project_id?: Id;
   host_id?: Id;

@@ -480,6 +480,9 @@ pub struct Task {
     pub source_channel_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_message_id: Option<Id>,
+    /// Quiet delegated work that reports its result to the source conversation.
+    #[serde(default)]
+    pub background: bool,
     /// Its own discussion (a channel of kind `task`).
     pub discussion_channel_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]

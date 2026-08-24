@@ -115,6 +115,7 @@ impl Store {
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE tasks ADD COLUMN review_action TEXT",
             "ALTER TABLE tasks ADD COLUMN active_continuation TEXT",
+            "ALTER TABLE tasks ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE automation_runs ADD COLUMN once_key TEXT",
             "ALTER TABLE runs ADD COLUMN provider TEXT",
             "ALTER TABLE runs ADD COLUMN model TEXT",
@@ -691,13 +692,10 @@ impl Store {
     }
 
     pub fn rename_section(&self, id: &str, name: &str) -> Result<bool> {
-        Ok(self
-            .conn()?
-            .execute(
-                "UPDATE sections SET name = ?2 WHERE id = ?1",
-                params![id, name],
-            )?
-            > 0)
+        Ok(self.conn()?.execute(
+            "UPDATE sections SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )? > 0)
     }
 
     pub fn delete_section(&self, id: &str) -> Result<bool> {
@@ -983,6 +981,20 @@ impl Store {
         }
     }
 
+    /// The final response authored by an agent run, excluding progress notes.
+    pub fn last_run_message(&self, run_id: &str, author_id: &str) -> Result<Option<Message>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM messages
+                 WHERE run_id=?1 AND author_id=?2 AND kind='text' AND trim(body)!=''
+                 ORDER BY id DESC LIMIT 1",
+                params![run_id, author_id],
+                Self::message_from_row,
+            )
+            .optional()?)
+    }
+
     /// A streamed reply only knows who it mentions once it is finished.
     pub fn set_message_mentions(&self, id: &str, mentions: &[Id]) -> Result<()> {
         self.conn()?.execute(
@@ -1248,6 +1260,7 @@ impl Store {
             owner_id: row.get("owner_id")?,
             source_channel_id: row.get("source_channel_id")?,
             source_message_id: row.get("source_message_id")?,
+            background: row.get("background")?,
             discussion_channel_id: row.get("discussion_channel_id")?,
             project_id: row.get("project_id")?,
             host_id: row.get("host_id")?,
@@ -1270,14 +1283,15 @@ impl Store {
         self.conn()?.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
-                                pr_state, review_action, created_by, due_at, once_key, position, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                                pr_state, review_action, created_by, due_at, once_key, position, created_at, updated_at, background)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             params![
                 task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.source_channel_id, task.source_message_id, task.discussion_channel_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
                 task.pr_state.as_ref().map(to_json), task.review_action, task.created_by,
-                task.due_at, task.once_key, task.position, task.created_at, task.updated_at
+                task.due_at, task.once_key, task.position, task.created_at, task.updated_at,
+                task.background
             ],
         )?;
         Ok(())
@@ -1334,14 +1348,14 @@ impl Store {
         tx.execute(
             "INSERT INTO tasks (id, key, title, outcome, status, owner_id, source_channel_id, source_message_id,
                                 discussion_channel_id, project_id, host_id, worktree_id, current_run_id, pr_url,
-                                pr_state, created_by, due_at, once_key, position, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                                pr_state, created_by, due_at, once_key, position, created_at, updated_at, background)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 task.id, task.key, task.title, task.outcome, task.status.as_str(), task.owner_id,
                 task.source_channel_id, task.source_message_id, task.discussion_channel_id,
                 task.project_id, task.host_id, task.worktree_id, task.current_run_id, task.pr_url,
                 task.pr_state.as_ref().map(to_json), task.created_by, task.due_at, task.once_key,
-                task.position, task.created_at, task.updated_at
+                task.position, task.created_at, task.updated_at, task.background
             ],
         )?;
         tx.commit()?;
@@ -3589,6 +3603,7 @@ mod tests {
             owner_id: None,
             source_channel_id: None,
             source_message_id: None,
+            background: false,
             discussion_channel_id: format!("channel-{id}"),
             project_id: None,
             host_id: None,

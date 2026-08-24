@@ -60,6 +60,7 @@ import {
 import { Attached, ChatView, DictateButton } from "./Chat";
 import { Lightbox, TextEvidence } from "./Evidence";
 import { evidenceKind, isTextEvidence } from "@client/evidence";
+import { visibleOnTaskBoard } from "@client/tasks";
 import { RunPanel } from "./Inspector";
 import { openExternal } from "../lib/desktop";
 import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
@@ -303,6 +304,7 @@ export function TasksBoard() {
     () =>
       app.tasks.filter(
         (task) =>
+          visibleOnTaskBoard(task) &&
           (!filterOwner || task.owner_id === filterOwner) &&
           (!filterProject || task.project_id === filterProject),
       ),
