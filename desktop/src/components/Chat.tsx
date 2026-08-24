@@ -10,6 +10,7 @@ import { store, useApi, useAppSelector } from "../lib/store";
 import { bytes, dayLabel, duration, timeOfDay } from "../lib/format";
 import { useVirtualWindow } from "../lib/virtual";
 import { useBottomAnchor } from "../lib/scroll";
+import { scrollTopAfterPrepend } from "@client/scroll";
 import { useFileUrl } from "../lib/file";
 import {
   beginSend,
@@ -184,7 +185,11 @@ export function Timeline({
   const currentChannel = useRef(channelId);
   currentChannel.current = channelId;
   const sentRevision = useRef(0);
-  const window_ = useVirtualWindow(scrollerRef, messages.length);
+  const loadingOlder = useRef(new Set<Id>());
+  // Rows are measured against the message they hold, not the slot it occupies,
+  // so a prepended page does not shuffle every stored height one row along.
+  const rowKeys = useMemo(() => messages.map((message) => message.id), [messages]);
+  const window_ = useVirtualWindow(scrollerRef, rowKeys);
 
   useEffect(() => {
     if (!sentMessageId) return;
@@ -196,21 +201,34 @@ export function Timeline({
     const element = scrollerRef.current;
     if (!element) return;
     updatePinned();
-    if (element.scrollTop < 60 && hasMore) {
+    if (
+      element.scrollTop < 60 &&
+      hasMore &&
+      !loadingOlder.current.has(channelId)
+    ) {
+      loadingOlder.current.add(channelId);
       const previousHeight = element.scrollHeight;
+      const previousTop = element.scrollTop;
       const revision = sentRevision.current;
-      void store.loadOlder(channelId).then(() => {
-        requestAnimationFrame(() => {
-          if (
-            scrollerRef.current &&
-            currentChannel.current === channelId &&
-            revision === sentRevision.current
-          ) {
-            scrollerRef.current.scrollTop =
-              scrollerRef.current.scrollHeight - previousHeight;
-          }
-        });
-      });
+      void store.loadOlder(channelId).then(
+        () => {
+          requestAnimationFrame(() => {
+            if (
+              scrollerRef.current &&
+              currentChannel.current === channelId &&
+              revision === sentRevision.current
+            ) {
+              scrollerRef.current.scrollTop = scrollTopAfterPrepend(
+                previousHeight,
+                previousTop,
+                scrollerRef.current.scrollHeight,
+              );
+            }
+            loadingOlder.current.delete(channelId);
+          });
+        },
+        () => loadingOlder.current.delete(channelId),
+      );
     }
   };
 
@@ -289,8 +307,7 @@ export function Timeline({
           </div>
         )}
         {window_.padTop > 0 && <div style={{ height: window_.padTop }} />}
-        {rows.slice(window_.start, window_.end).map((row, offset) => {
-          const index = window_.start + offset;
+        {rows.slice(window_.start, window_.end).map((row) => {
           const message = row.message;
           const run = message.run_id ? runs[message.run_id] : undefined;
           // The card only still earns its own row when the run failed, is
@@ -302,9 +319,9 @@ export function Timeline({
             !!runs[message.card.run_id] &&
             !["failed", "waiting"].includes(runs[message.card.run_id].status);
           if (folded || row.hidden)
-            return <div key={message.id} ref={window_.rowRef(index)} />;
+            return <div key={message.id} ref={window_.rowRef(message.id)} />;
           return (
-            <div key={message.id} ref={window_.rowRef(index)}>
+            <div key={message.id} ref={window_.rowRef(message.id)}>
               {row.day && (
                 <div className="day-marker">
                   <span>{row.day}</span>

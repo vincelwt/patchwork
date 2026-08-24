@@ -37,23 +37,11 @@ export type Creatable =
   | "project"
   | "invite";
 
-type HideableNav = "agents" | "automations";
-const HIDDEN_NAV_KEY = "patchwork.hiddenSidebarItems";
-
-function hiddenNav(): Record<HideableNav, boolean> {
-  try {
-    const saved = JSON.parse(localStorage.getItem(HIDDEN_NAV_KEY) ?? "[]");
-    return {
-      agents: saved.includes("agents"),
-      automations: saved.includes("automations"),
-    };
-  } catch {
-    return { agents: false, automations: false };
-  }
-}
-
 /// The main sidebar keeps everyday destinations and conversations in reach.
-/// Everything else lives in the drop-up behind your own name at the bottom.
+/// Everything else lives in the drop-up behind your own name at the bottom,
+/// Agents and Automations included: those are places you visit now and then,
+/// not destinations for the day, so they no longer hold a permanent row above
+/// your channels.
 /// Everything you can *create* lives behind one plus, so "how do I add a
 /// channel / a section / a project" has a single answer.
 export function Sidebar({
@@ -84,7 +72,6 @@ export function Sidebar({
     channels: data.channels,
     tasks: data.tasks,
     inbox: data.inbox,
-    automations: data.automations,
   }));
   // Presence is global; only a run in this DM should spin its row.
   // An array of ids rather than the runs map avoids unrelated redraws.
@@ -100,29 +87,10 @@ export function Sidebar({
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [renaming, setRenaming] = useState<Section | null>(null);
   const [deleting, setDeleting] = useState<Section | null>(null);
-  const [hidden, setHidden] = useState(hiddenNav);
   const [menuFor, setMenuFor] = useState<{ channel: Channel; x: number; y: number } | null>(null);
-  const [navMenuFor, setNavMenuFor] = useState<{
-    item: HideableNav;
-    x: number;
-    y: number;
-  } | null>(null);
-
-  useEffect(() => {
-    localStorage.setItem(
-      HIDDEN_NAV_KEY,
-      JSON.stringify(
-        (Object.keys(hidden) as HideableNav[]).filter((item) => hidden[item]),
-      ),
-    );
-  }, [hidden]);
 
   const unread = unreadInboxCount(app.inbox);
   const openTasks = app.tasks.filter((task) => !isTerminalTaskStatus(task.status)).length;
-  const liveAutomations = app.automations.filter((a) => a.enabled).length;
-  const failingAutomations = app.automations.filter(
-    (a) => a.enabled && a.failure_count > 0,
-  ).length;
 
   // Things actually addressed to you, per conversation. This is the number
   // worth colouring; plain activity gets a dot and nothing more.
@@ -272,43 +240,6 @@ export function Sidebar({
           <span className="label">Tasks</span>
           {openTasks > 0 && <span className="count">{openTasks}</span>}
         </button>
-        {!hidden.agents && (
-          <button
-            className={`nav-item${isActive({ kind: "agents" }) ? " active" : ""}`}
-            title="Agents"
-            onClick={() => go({ kind: "agents" })}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              setNavMenuFor({ item: "agents", x: event.clientX, y: event.clientY });
-            }}
-          >
-            <AgentIcon />
-            <span className="label">Agents</span>
-          </button>
-        )}
-        {!hidden.automations && (
-          <button
-            className={`nav-item${isActive({ kind: "automations" }) ? " active" : ""}`}
-            title="Automations"
-            onClick={() => go({ kind: "automations" })}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              setNavMenuFor({
-                item: "automations",
-                x: event.clientX,
-                y: event.clientY,
-              });
-            }}
-          >
-            <AutomationIcon />
-            <span className="label">Automations</span>
-            {failingAutomations > 0 ? (
-              <span className="badge danger">{failingAutomations}</span>
-            ) : (
-              liveAutomations > 0 && <span className="count">{liveAutomations}</span>
-            )}
-          </button>
-        )}
 
         {app.sections.map((section) => {
           const list = grouped.get(section.id) ?? [];
@@ -454,8 +385,6 @@ export function Sidebar({
       <div className="sidebar-footer">
         <MoreMenu
           me={app.me}
-          hidden={hidden}
-          onShow={(item) => setHidden({ ...hidden, [item]: false })}
           onCreate={onCreate}
           onHelp={onHelp}
           onSignOut={onSignOut}
@@ -489,21 +418,6 @@ export function Sidebar({
           }}
         />
       )}
-      {navMenuFor && (
-        <Menu
-          at={navMenuFor}
-          header={navMenuFor.item === "agents" ? "Agents" : "Automations"}
-          onClose={() => setNavMenuFor(null)}
-          items={[
-            {
-              key: "hide",
-              label: "Hide from sidebar",
-              onSelect: () =>
-                setHidden({ ...hidden, [navMenuFor.item]: true }),
-            },
-          ]}
-        />
-      )}
 
       <SidebarResizer onResize={onResize} />
     </aside>
@@ -513,15 +427,11 @@ export function Sidebar({
 /// Everything that is not a conversation, one click from your own name.
 function MoreMenu({
   me,
-  hidden,
-  onShow,
   onCreate,
   onHelp,
   onSignOut,
 }: {
   me?: Member;
-  hidden: Record<HideableNav, boolean>;
-  onShow: (item: HideableNav) => void;
   onCreate: (what: Creatable, sectionId?: Id) => void;
   onHelp: () => void;
   onSignOut: () => void;
@@ -537,22 +447,14 @@ function MoreMenu({
         {
           key: "agents",
           label: "Agents",
-          hint: hidden.agents ? "Show in sidebar" : undefined,
           icon: <AgentIcon />,
-          onSelect: () => {
-            if (hidden.agents) onShow("agents");
-            go({ kind: "agents" });
-          },
+          onSelect: () => go({ kind: "agents" }),
         },
         {
           key: "automations",
           label: "Automations",
-          hint: hidden.automations ? "Show in sidebar" : undefined,
           icon: <AutomationIcon />,
-          onSelect: () => {
-            if (hidden.automations) onShow("automations");
-            go({ kind: "automations" });
-          },
+          onSelect: () => go({ kind: "automations" }),
         },
         {
           key: "skills",

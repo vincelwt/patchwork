@@ -61,7 +61,10 @@ function TaskCardInline({ taskId }: { taskId: string }) {
   if (!task) return null;
 
   return (
-    <button className="card" onClick={() => go({ kind: "task", id: task.id })}>
+    <button
+      className="card task-inline"
+      onClick={() => go({ kind: "task", id: task.id })}
+    >
       <div className="card-head">
         <TasksIcon size={14} />
         <span>{task.key}</span>
