@@ -132,7 +132,14 @@ export function AutomationEditor({ automation, onSaved }: { automation?: Automat
     }
   };
 
-  const channelOptions = [{ value: "", label: "None" }, ...data.channels.filter((channel) => channel.kind === "channel").map((channel) => ({ value: channel.id, label: `# ${channel.name}` }))];
+  // A report can land in a direct message as easily as in a channel — the daily
+  // sweep does exactly that — so both are offered here.
+  const channelOptions = [
+    { value: "", label: "None" },
+    ...data.channels
+      .filter((channel) => channel.kind === "channel" || channel.kind === "dm")
+      .map((channel) => ({ value: channel.id, label: channel.kind === "dm" ? `DM · ${channel.name}` : `# ${channel.name}` })),
+  ];
 
   return (
     <ScrollView contentContainerStyle={styles.form} keyboardShouldPersistTaps="handled">

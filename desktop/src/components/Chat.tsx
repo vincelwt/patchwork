@@ -698,6 +698,7 @@ export const MessageRow = memo(function MessageRow({
             ))}
           </div>
         )}
+        {message.suggestions?.length > 0 && <Suggestions message={message} />}
         <ReactionRow message={message} onAdd={setPicker} />
         {message.reply_count > 0 && (
           <button
@@ -766,6 +767,51 @@ export const MessageRow = memo(function MessageRow({
     </div>
   );
 });
+
+/// What the agent thinks you might want next. Pressing one says it for you —
+/// it is your message, sent where the suggestion was made: inside the thread
+/// it came from, or quoting the message it came from so the reply reads with
+/// its context.
+function Suggestions({ message }: { message: Message }) {
+  const api = useApi();
+  const [sending, setSending] = useState("");
+
+  const send = async (suggestion: string) => {
+    if (sending) return;
+    setSending(suggestion);
+    try {
+      const sent = await api.send(message.channel_id, {
+        body: suggestion,
+        parent_id: message.parent_id,
+        reply_to_id: message.parent_id ? undefined : message.id,
+        client_id: crypto.randomUUID(),
+      });
+      const workspaceId = store.activeWorkspaceId;
+      if (workspaceId) store.acceptMessage(workspaceId, sent);
+    } finally {
+      setSending("");
+    }
+  };
+
+  return (
+    <div className="suggestions">
+      {message.suggestions.map((suggestion) => (
+        <button
+          key={suggestion}
+          className="suggestion"
+          // One press, one message: a second press while the first is in flight
+          // would say the same thing twice.
+          disabled={!!sending}
+          title={`Send “${suggestion}”`}
+          aria-label={`Send suggestion: ${suggestion}`}
+          onClick={() => void send(suggestion)}
+        >
+          {suggestion}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /// Text selected inside this message, if any. Right-clicking a highlighted
 /// quote should still copy the quote, not the whole message.

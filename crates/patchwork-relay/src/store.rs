@@ -111,6 +111,7 @@ impl Store {
             "ALTER TABLE workspace ADD COLUMN autonomy TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE attachments ADD COLUMN caption TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
+            "ALTER TABLE messages ADD COLUMN suggestions TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE tasks ADD COLUMN once_key TEXT",
             "ALTER TABLE tasks ADD COLUMN question_blocked_run_id TEXT",
             "ALTER TABLE tasks ADD COLUMN review_action TEXT",
@@ -865,6 +866,7 @@ impl Store {
             },
             body: row.get("body")?,
             card: json_col(row, "card"),
+            suggestions: json_col_or(row, "suggestions"),
             parent_id: row.get("parent_id")?,
             reply_to_id: row.get("reply_to_id")?,
             reply_to: None,
@@ -891,8 +893,8 @@ impl Store {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, parent_id, reply_to_id, run_id, task_id, mentions, created_at, client_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO messages (id, channel_id, author_id, kind, body, card, suggestions, parent_id, reply_to_id, run_id, task_id, mentions, created_at, client_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 message.id,
                 message.channel_id,
@@ -905,6 +907,7 @@ impl Store {
                 },
                 message.body,
                 message.card.as_ref().map(to_json),
+                to_json(&message.suggestions),
                 message.parent_id,
                 message.reply_to_id,
                 message.run_id,
@@ -1039,6 +1042,14 @@ impl Store {
         conn.execute(
             "UPDATE message_search SET body = ?2 WHERE message_id = ?1",
             params![id, body],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_message_suggestions(&self, id: &str, suggestions: &[String]) -> Result<()> {
+        self.conn()?.execute(
+            "UPDATE messages SET suggestions = ?2 WHERE id = ?1",
+            params![id, to_json(&suggestions)],
         )?;
         Ok(())
     }
@@ -4972,6 +4983,7 @@ mod tests {
             kind: MessageKind::Text,
             body: "First".into(),
             card: None,
+            suggestions: vec!["Continue".into()],
             parent_id: None,
             reply_to_id: None,
             reply_to: None,
@@ -5002,6 +5014,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["m1", "m2"]
         );
+        assert_eq!(timeline[0].suggestions, ["Continue"]);
         assert_eq!(timeline[1].reply_to_id.as_deref(), Some("m1"));
         assert_eq!(timeline[1].reply_to.as_ref().unwrap().body, "First");
         assert!(store.thread("m1").unwrap().is_empty());
@@ -5052,6 +5065,7 @@ mod tests {
                 kind: MessageKind::Text,
                 body: String::new(),
                 card: None,
+                suggestions: Vec::new(),
                 parent_id: None,
                 reply_to_id: None,
                 reply_to: None,

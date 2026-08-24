@@ -880,6 +880,30 @@ async fn archive_channel(
     Ok(Json(Ok::default()))
 }
 
+fn dm_between(state: &Shared, owner: &Member, other: &Member) -> ApiResult<Channel> {
+    if let Some(existing) = state.store.find_dm(&owner.id, &other.id)? {
+        return Ok(existing);
+    }
+    let channel = Channel {
+        id: new_id(),
+        kind: ChannelKind::Dm,
+        section_id: None,
+        slug: String::new(),
+        name: other.display_name.clone(),
+        topic: String::new(),
+        position: now_ms() as f64,
+        created_at: now_ms(),
+        member_ids: vec![owner.id.clone(), other.id.clone()],
+        task_id: None,
+        last_message_at: 0,
+    };
+    state.store.insert_channel(&channel)?;
+    state.emit(Event::ChannelCreated {
+        channel: channel.clone(),
+    });
+    Ok(channel)
+}
+
 async fn open_dm(
     State(state): State<Shared>,
     caller: Caller,
@@ -894,29 +918,7 @@ async fn open_dm(
         .into_iter()
         .find(|member| member.id == input.member_id)
         .ok_or_else(|| ApiError::not_found("no such active member"))?;
-
-    if let Some(existing) = state.store.find_dm(&caller.member.id, &other.id)? {
-        return Ok(Json(existing));
-    }
-
-    let channel = Channel {
-        id: new_id(),
-        kind: ChannelKind::Dm,
-        section_id: None,
-        slug: String::new(),
-        name: other.display_name.clone(),
-        topic: String::new(),
-        position: now_ms() as f64,
-        created_at: now_ms(),
-        member_ids: vec![caller.member.id.clone(), other.id.clone()],
-        task_id: None,
-        last_message_at: 0,
-    };
-    state.store.insert_channel(&channel)?;
-    state.emit(Event::ChannelCreated {
-        channel: channel.clone(),
-    });
-    Ok(Json(channel))
+    Ok(Json(dm_between(&state, &caller.member, &other)?))
 }
 
 #[derive(Deserialize)]
@@ -2034,6 +2036,50 @@ async fn remove_member(
     Ok(Json(Ok::default()))
 }
 
+const DAILY_SWEEP_NAME: &str = "Daily sweep";
+const DAILY_SWEEP_INSTRUCTIONS: &str = "Review recent workspace conversations, open and running tasks, inbox items, and automation health. DM the user a concise daily sweep based on that state, ending with 2-3 concrete proposals they can tap as structured suggestions.";
+
+fn ensure_daily_sweep(state: &Shared, owner: &Member, agent: &Member) -> ApiResult<()> {
+    if owner.kind != MemberKind::Human
+        || state.store.automations()?.iter().any(|automation| {
+            automation.created_by == owner.id && automation.name == DAILY_SWEEP_NAME
+        })
+    {
+        return Ok(());
+    }
+    let channel = dm_between(state, owner, agent)?;
+    let now = now_ms();
+    let automation = Automation {
+        id: new_id(),
+        name: DAILY_SWEEP_NAME.into(),
+        description: "A daily workspace scan with proposed next actions.".into(),
+        enabled: true,
+        trigger: AutomationTrigger::Cron {
+            expression: "0 9 * * *".into(),
+        },
+        agent_id: agent.id.clone(),
+        action: AutomationAction::PostInChat,
+        instructions: DAILY_SWEEP_INSTRUCTIONS.into(),
+        context_channel_id: Some(channel.id.clone()),
+        report_channel_id: Some(channel.id),
+        project_id: None,
+        location: ExecutionLocation::Auto,
+        host_id: None,
+        created_by: owner.id.clone(),
+        created_at: now,
+        last_run_at: None,
+        next_run_at: automations::next_cron_after("0 9 * * *", now),
+        last_success_at: None,
+        last_error_at: None,
+        last_error: None,
+        last_validated_at: None,
+        failure_count: 0,
+    };
+    state.store.upsert_automation(&automation)?;
+    state.emit(Event::AutomationUpdated { automation });
+    Ok(())
+}
+
 async fn create_agent(
     State(state): State<Shared>,
     caller: Caller,
@@ -2064,6 +2110,7 @@ async fn create_agent(
         presence: Presence::Offline,
     };
     state.store.insert_member(&member)?;
+    ensure_daily_sweep(&state, &caller.member, &member)?;
     state.emit(Event::MemberUpdated {
         member: member.clone(),
     });
@@ -3796,6 +3843,7 @@ mod tests {
                 kind: MessageKind::Text,
                 body: "Source".into(),
                 card: None,
+                suggestions: Vec::new(),
                 parent_id: None,
                 reply_to_id: None,
                 reply_to: None,
@@ -3859,6 +3907,13 @@ mod tests {
             Path("one".into()),
             Json(SendMessage {
                 body: "Retry me".into(),
+                suggestions: vec![
+                    " First ".into(),
+                    String::new(),
+                    "Second".into(),
+                    "Third".into(),
+                    "Fourth".into(),
+                ],
                 client_id: Some(client_id.clone()),
                 ..Default::default()
             }),
@@ -3871,6 +3926,7 @@ mod tests {
             Path("one".into()),
             Json(SendMessage {
                 body: "Retry me".into(),
+                suggestions: vec!["First".into(), "Second".into(), "Third".into()],
                 client_id: Some(client_id),
                 ..Default::default()
             }),
@@ -3878,6 +3934,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retried.id, first.id);
+        assert_eq!(first.suggestions, ["First", "Second", "Third"]);
         assert_eq!(store.messages("one", None, 50).unwrap().0.len(), 1);
 
         let client_id = new_id();
@@ -4607,6 +4664,7 @@ mod tests {
                 kind: MessageKind::Text,
                 body: "The delegated result is ready.".into(),
                 card: None,
+                suggestions: Vec::new(),
                 parent_id: None,
                 reply_to_id: None,
                 reply_to: None,
@@ -5500,6 +5558,67 @@ mod tests {
                 .count(),
             4
         );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_first_agent_gets_one_daily_sweep_to_its_creator() {
+        let path = std::env::temp_dir().join(format!("patchwork-api-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        let human = Member {
+            id: "human".into(),
+            kind: MemberKind::Human,
+            handle: "human".into(),
+            display_name: "Human".into(),
+            email: None,
+            avatar: None,
+            is_admin: true,
+            created_at: 1,
+            agent: None,
+            presence: Presence::Offline,
+        };
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Offline,
+        };
+        store.insert_member(&human).unwrap();
+        store.insert_member(&agent).unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+
+        ensure_daily_sweep(&state, &human, &agent).unwrap();
+        ensure_daily_sweep(&state, &human, &agent).unwrap();
+
+        let automations = store.automations().unwrap();
+        assert_eq!(automations.len(), 1);
+        let sweep = &automations[0];
+        assert_eq!(sweep.name, DAILY_SWEEP_NAME);
+        assert_eq!(sweep.agent_id, agent.id);
+        assert!(sweep.enabled);
+        assert!(sweep.next_run_at.is_some());
+        let channel = store
+            .channel(sweep.report_channel_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(channel.kind, ChannelKind::Dm);
+        assert_eq!(channel.member_ids.len(), 2);
+        assert!(channel.member_ids.contains(&human.id));
+        assert!(channel.member_ids.contains(&agent.id));
 
         drop(state);
         drop(store);

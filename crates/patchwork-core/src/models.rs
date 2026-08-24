@@ -265,6 +265,9 @@ pub struct Message {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<MessageCard>,
+    /// Concrete follow-up actions the author offers to take next.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
     /// Root message of the thread this reply belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Id>,

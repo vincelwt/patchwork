@@ -96,6 +96,9 @@ pub struct SendMessage {
     pub kind: Option<MessageKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<MessageCard>,
+    /// Concrete follow-up actions rendered separately from the prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
     #[serde(default)]
     pub attachment_ids: Vec<Id>,
     /// Set by agents so the message is attributed to their run.

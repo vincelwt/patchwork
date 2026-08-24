@@ -957,6 +957,35 @@ body.resizing {
   background: var(--accent-soft);
 }
 
+/* Next steps offered by an agent. They are things to say, not controls on the
+   message, so they stay quiet: flat, outlined, and wrapping like text. */
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+.suggestion {
+  max-width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  padding: 3px 11px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.suggestion:hover:not(:disabled) {
+  background: var(--tint);
+  border-color: var(--tint-strong);
+  color: var(--text);
+}
+.suggestion:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 /* --- attachments ---------------------------------------------------------- */
 
 .attachments {

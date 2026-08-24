@@ -117,6 +117,7 @@ mod tests {
                     kind: MessageKind::Text,
                     body: "secret".into(),
                     card: None,
+                    suggestions: Vec::new(),
                     parent_id: None,
                     reply_to_id: None,
                     reply_to: None,

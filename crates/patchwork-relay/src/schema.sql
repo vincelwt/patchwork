@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS messages (
   kind          TEXT NOT NULL,
   body          TEXT NOT NULL DEFAULT '',
   card          TEXT,
+  suggestions   TEXT NOT NULL DEFAULT '[]',
   parent_id     TEXT,
   reply_to_id   TEXT,
   run_id        TEXT,
