@@ -335,6 +335,9 @@ enum TaskCommand {
         /// Create after reviewing the relay's possible-duplicate warning.
         #[arg(long)]
         allow_similar: bool,
+        /// Run off the task board and report the final response here.
+        #[arg(long)]
+        background: bool,
         /// Start the owning agent right away (automatic for agent-owned tasks).
         #[arg(long)]
         start: bool,
@@ -1674,6 +1677,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             due,
             once,
             allow_similar,
+            background,
             start,
         } => {
             let owner_id = match owner {
@@ -1693,6 +1697,7 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                         "once_key": once,
                         "allow_similar": allow_similar,
                         "source_channel_id": ctx.channel_id,
+                        "background": background,
                         "start": start,
                     }),
                 )

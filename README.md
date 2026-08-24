@@ -205,6 +205,8 @@ scoped to that run and revoked when it ends.
 
 ```bash
 patchwork task create --title "Fix DST double-booking" --outcome "No duplicate slots across a DST change"
+patchwork task create --background --title "Research the edge case" \
+  --outcome "A recommended fix" --owner @researcher
 patchwork status "Reproduced with a Europe/Berlin fixture"
 patchwork ask --question "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
@@ -215,9 +217,11 @@ patchwork pr https://github.com/acme/app/pull/218
 patchwork chart weekly-actives.json --caption "Active studios, last 8 weeks"
 ```
 
-`task wait` hands an external build, deployment, or review to a persisted
-relay checker, so the current model run can end and a fresh run wakes when the
-work is ready. Plus `say`, `search`, `history`, `attach`, `preview`, `tell`
+A `--background` task stays off the normal board while it runs and posts its
+agent's final response back to the conversation that spawned it. `task wait`
+hands an external build, deployment, or review to a persisted relay checker,
+so the current model run can end and a fresh run wakes when the work is ready.
+Plus `say`, `search`, `history`, `attach`, `preview`, `tell`
 (message another running agent), `automation create`, and normal access to
 `git`, `gh` and anything else on the machine.
 

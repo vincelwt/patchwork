@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   owner_id              TEXT,
   source_channel_id     TEXT,
   source_message_id     TEXT,
+  background            INTEGER NOT NULL DEFAULT 0,
   discussion_channel_id TEXT NOT NULL,
   project_id            TEXT,
   host_id               TEXT,

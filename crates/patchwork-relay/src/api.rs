@@ -1122,7 +1122,7 @@ async fn list_tasks(State(state): State<Shared>, _c: Caller) -> ApiResult<Json<V
 async fn create_task(
     State(state): State<Shared>,
     caller: Caller,
-    Json(input): Json<CreateTask>,
+    Json(mut input): Json<CreateTask>,
 ) -> ApiResult<Json<Task>> {
     if input.title.trim().is_empty() && input.outcome.trim().is_empty() {
         return Err(ApiError::bad_request("a task needs an expected result"));
@@ -1146,6 +1146,25 @@ async fn create_task(
             .message(message_id)?
             .ok_or_else(|| ApiError::not_found("source message not found"))?;
         require_channel_access(&state, &caller, &message.channel_id)?;
+    }
+    if input.background {
+        if let Some(run_id) = caller.run_id.as_deref() {
+            if let Some(parent_task) = state
+                .store
+                .run(run_id)?
+                .and_then(|run| run.task_id)
+                .map(|task_id| state.store.task(&task_id))
+                .transpose()?
+                .flatten()
+            {
+                input.source_channel_id = parent_task.source_channel_id.or(input.source_channel_id);
+            }
+        }
+        if input.source_channel_id.is_none() {
+            return Err(ApiError::bad_request(
+                "a background task needs an originating conversation",
+            ));
+        }
     }
     let exact_once_match = input
         .once_key
@@ -4140,6 +4159,7 @@ mod tests {
             owner_id: Some(agent.id.clone()),
             source_channel_id: Some("channel".into()),
             source_message_id: None,
+            background: false,
             discussion_channel_id: "channel".into(),
             project_id: None,
             host_id: Some("host-one".into()),
@@ -4448,6 +4468,180 @@ mod tests {
             .unwrap()
             .iter()
             .all(|item| item.run_id.as_deref() != Some("run-two")));
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn background_continuations_report_to_the_original_conversation() {
+        let path = std::env::temp_dir().join(format!("patchwork-background-{}.sqlite", new_id()));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.create_workspace("ws", "Test").unwrap();
+        let agent = Member {
+            id: "agent".into(),
+            kind: MemberKind::Agent,
+            handle: "agent".into(),
+            display_name: "Agent".into(),
+            email: None,
+            avatar: None,
+            is_admin: false,
+            created_at: 1,
+            agent: Some(AgentProfile::default()),
+            presence: Presence::Online,
+        };
+        store.insert_member(&agent).unwrap();
+        store
+            .insert_channel(&Channel {
+                id: "origin".into(),
+                kind: ChannelKind::Channel,
+                section_id: None,
+                slug: "origin".into(),
+                name: "Origin".into(),
+                topic: String::new(),
+                position: 0.0,
+                created_at: 1,
+                member_ids: Vec::new(),
+                task_id: None,
+                last_message_at: 0,
+            })
+            .unwrap();
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "host".into(),
+        ));
+        let parent = orchestrator::create_task(
+            &state,
+            &agent.id,
+            CreateTask {
+                title: "Parent".into(),
+                outcome: "Delegate work".into(),
+                status: Some(TaskStatus::Planned),
+                source_channel_id: Some("origin".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let run = |id: &str, task: &Task, trigger: RunTrigger| Run {
+            id: id.into(),
+            agent_id: agent.id.clone(),
+            status: RunStatus::Running,
+            trigger,
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            host_id: None,
+            project_id: None,
+            worktree_id: None,
+            cwd: None,
+            automation_id: None,
+            session_id: None,
+            runtime: "test".into(),
+            provider: None,
+            model: None,
+            thinking: None,
+            prompt: String::new(),
+            headline: "Working".into(),
+            error: None,
+            token_usage: None,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+        };
+        let parent_run = run(
+            "parent-run",
+            &parent,
+            RunTrigger::TaskAssignment {
+                task_id: parent.id.clone(),
+            },
+        );
+        store.insert_run(&parent_run, 0).unwrap();
+
+        let child = create_task(
+            State(state.clone()),
+            Caller {
+                member: agent.clone(),
+                run_id: Some(parent_run.id.clone()),
+                token_hash: "hash".into(),
+                token_kind: "run".into(),
+            },
+            Json(CreateTask {
+                title: "Background child".into(),
+                outcome: "The delegated result is ready".into(),
+                status: Some(TaskStatus::Planned),
+                source_channel_id: Some(parent.discussion_channel_id.clone()),
+                background: true,
+                allow_similar: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(child.background);
+        assert_eq!(child.source_channel_id.as_deref(), Some("origin"));
+
+        let mut continuation_run = run(
+            "continuation-run",
+            &child,
+            RunTrigger::Continuation {
+                continuation_id: "wait".into(),
+            },
+        );
+        store.insert_run(&continuation_run, 0).unwrap();
+        store
+            .activate_task_run(&child.id, &continuation_run.id, None)
+            .unwrap()
+            .unwrap();
+        let mut completed = store.task(&child.id).unwrap().unwrap();
+        completed.status = TaskStatus::Done;
+        store.update_task(&completed).unwrap();
+        store
+            .insert_message(&Message {
+                id: "summary".into(),
+                channel_id: child.discussion_channel_id.clone(),
+                author_id: agent.id.clone(),
+                kind: MessageKind::Text,
+                body: "The delegated result is ready.".into(),
+                card: None,
+                parent_id: None,
+                reply_to_id: None,
+                reply_to: None,
+                reply_count: 0,
+                last_reply_at: 0,
+                run_id: Some(continuation_run.id.clone()),
+                task_id: Some(child.id.clone()),
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+                reactions: Vec::new(),
+                created_at: 2,
+                edited_at: None,
+            })
+            .unwrap();
+        continuation_run.status = RunStatus::Succeeded;
+        continuation_run.ended_at = Some(3);
+        store.update_run(&continuation_run).unwrap();
+        orchestrator::finish_run(&state, &continuation_run)
+            .await
+            .unwrap();
+
+        let reports: Vec<_> = store
+            .messages("origin", None, 20)
+            .unwrap()
+            .0
+            .into_iter()
+            .filter(|message| message.body == "The delegated result is ready.")
+            .collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].author_id, agent.id);
+        assert_eq!(reports[0].run_id.as_deref(), Some("continuation-run"));
+        assert_eq!(
+            store.task(&child.id).unwrap().unwrap().status,
+            TaskStatus::Done
+        );
 
         drop(state);
         drop(store);

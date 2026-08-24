@@ -5,6 +5,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { Id, Member, Task, TaskStatus } from "@client/types";
 import { TASK_STATUSES } from "@client/types";
+import { visibleOnTaskBoard } from "@client/tasks";
 import { TaskEditor } from "@/components/TaskEditor";
 import { PullRequestLink } from "@/components/pull-request-link";
 import { Avatar, Badge, ChoiceField, Empty, Glass, Icon, Measured, Sheet } from "@/components/ui";
@@ -28,7 +29,7 @@ export default function TasksScreen() {
   const tasks = useMemo(
     () =>
       (data?.tasks ?? [])
-        .filter((task) => (!owner || task.owner_id === owner) && (!status || task.status === status))
+        .filter((task) => visibleOnTaskBoard(task) && (!owner || task.owner_id === owner) && (!status || task.status === status))
         .sort((a, b) => (a.due_at ?? Number.MAX_SAFE_INTEGER) - (b.due_at ?? Number.MAX_SAFE_INTEGER) || b.updated_at - a.updated_at),
     [data?.tasks, owner, status],
   );

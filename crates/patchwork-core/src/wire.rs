@@ -173,6 +173,9 @@ pub struct CreateTask {
     pub source_channel_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_message_id: Option<Id>,
+    /// Run quietly and report the final agent response to `source_channel_id`.
+    #[serde(default)]
+    pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

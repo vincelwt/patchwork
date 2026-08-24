@@ -174,6 +174,8 @@ patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @support-agent
 patchwork task create --title "Cache the pricing endpoint" \
   --outcome "p95 under 100ms" --owner @me --start   # take it yourself
+patchwork task create --background --title "Research cache options" \
+  --outcome "A recommended cache strategy" --owner @researcher
 patchwork task update PW-14 --status review --evidence test-results.txt \
   --approval "Approve and deploy app"
 patchwork evidence list
@@ -206,6 +208,11 @@ patchwork task create --title "Cache the pricing endpoint" \
 Tasks assigned to an agent start immediately by default, even if `--start` is
 omitted. To deliberately defer one, pass `--status planned` and say what it is
 waiting for. If its work can proceed now, never leave it Planned.
+
+Use `--background` for separable work that should return here when finished.
+Patchwork preserves this conversation as the origin, posts the background
+agent's final response back automatically, and keeps the task off the normal
+board unless it is blocked or needs review.
 
 Split work into new tasks when a piece is genuinely separable and someone else
 (or a later run) should own it. When a task began as a rambling transcript,
