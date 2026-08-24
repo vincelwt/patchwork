@@ -48,6 +48,7 @@ test("run activity folds protocol events into useful rows", () => {
       _meta: { terminal_exit: { exit_code: 2, signal: "SIGTERM" } },
       rawOutput: { ignored: "terminal output is more useful" },
     }),
+    event("status", "Running the final checks"),
     event("plan", "[x] Final plan"),
     event("file_change", " M src/Inspector.tsx\n?? src/new.ts\n… and 2 more"),
     event("permission", "Denied: deploy"),
@@ -58,6 +59,7 @@ test("run activity folds protocol events into useful rows", () => {
   assert.deepEqual(activity.items.map((item) => item.type), [
     "thought",
     "tool",
+    "event",
     "event",
     "event",
     "event",
@@ -83,14 +85,18 @@ test("run activity folds protocol events into useful rows", () => {
   assert.equal(activity.warningCount, 3);
   assert.equal(
     activity.items[2].type === "event" && activity.items[2].event.text,
+    "Running the final checks",
+  );
+  assert.equal(
+    activity.items[3].type === "event" && activity.items[3].event.text,
     "[x] Final plan",
   );
   assert.equal(
-    activity.items[4].type === "event" && activity.items[4].event.text,
+    activity.items[5].type === "event" && activity.items[5].event.text,
     "Denied: deploy",
   );
   assert.equal(
-    activity.items[5].type === "event" && activity.items[5].event.text,
+    activity.items[6].type === "event" && activity.items[6].event.text,
     "orphaned tool — failed",
   );
 });
