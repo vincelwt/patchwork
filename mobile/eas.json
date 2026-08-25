@@ -11,7 +11,8 @@
   "submit": {
     "production": {
       "ios": {
-        "ascAppId": "6799497310"
+        "ascAppId": "6799497310",
+        "groups": ["Internal Testers"]
       }
     }
   }

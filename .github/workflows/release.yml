@@ -94,8 +94,30 @@ jobs:
       - if: steps.changes.outputs.changed == 'true'
         run: npm ci
         working-directory: mobile
-      - if: steps.changes.outputs.changed == 'true'
-        run: npx --yes eas-cli@21.8.0 build --platform ios --profile production --non-interactive --auto-submit
+      - name: Build, submit, and distribute to Internal Testers
+        if: steps.changes.outputs.changed == 'true'
+        id: ios
+        run: |
+          npx --yes eas-cli@21.8.0 build --platform ios --profile production \
+            --non-interactive --auto-submit --json > "$RUNNER_TEMP/eas-build.json"
+          echo "build_id=$(jq -er '.[0].id' "$RUNNER_TEMP/eas-build.json")" >> "$GITHUB_OUTPUT"
+        working-directory: mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+      - name: Verify Internal Testers distribution
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          npx --yes eas-cli@21.8.0 submit:status --platform ios --json \
+            --non-interactive > "$RUNNER_TEMP/testflight-status.json"
+          jq -e --arg build_id "${{ steps.ios.outputs.build_id }}" '
+            .ios.testFlightBuilds[]
+            | select(.easBuildId == $build_id)
+            | select(.processingState == "VALID" and .internalState == "IN_BETA_TESTING")
+          ' "$RUNNER_TEMP/testflight-status.json" || {
+            echo "::error::iOS build ${{ steps.ios.outputs.build_id }} was not distributed to Internal Testers"
+            jq '.ios.testFlightBuilds' "$RUNNER_TEMP/testflight-status.json"
+            exit 1
+          }
         working-directory: mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
