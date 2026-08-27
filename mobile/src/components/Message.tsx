@@ -15,12 +15,13 @@ import { dayLabel, isSameTurn, runStatusLabel, timeOfDay } from "@/lib/format";
 import { followNewest, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
+import { AskCard } from "./AskCard";
 import { AttachmentView } from "./Attachment";
 import { ChartCard } from "./Chart";
 import { Composer } from "./Composer";
 import { useGrantedOpen } from "./Evidence";
 import { Markdown } from "./Markdown";
-import { Avatar, Badge, Button, Empty, ErrorNotice, Icon, Measured, Sheet } from "./ui";
+import { Avatar, Badge, Button, Empty, ErrorNotice, Measured, Sheet } from "./ui";
 
 const EMOJI = ["👍", "❤️", "🎉", "👀", "✅", "🤔", "🙏", "🚀"];
 
@@ -121,6 +122,7 @@ export const MessageRow = memo(function MessageRow({
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const [actions, setActions] = useState(false);
+  const [full, setFull] = useState(false);
   const [queueing, setQueueing] = useState(false);
   const author = workspace.bootstrap?.members.find((member) => member.id === message.author_id);
   const replyTo = message.reply_to_id
@@ -214,7 +216,18 @@ export const MessageRow = memo(function MessageRow({
             ) : null}
           </View>
         ) : null}
-        {message.body ? <Markdown body={message.body} /> : null}
+        {/* Long prose stands behind the one line it comes to, until the line
+            is not enough. */}
+        {message.digest && message.digest !== message.body && !full ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`${message.digest}. Show the full message`}
+            onPress={() => setFull(true)}
+          >
+            <Text style={[styles.digest, { color: theme.text }]}>{message.digest}</Text>
+            <Text style={[styles.actionLabel, { color: theme.accent }]}>Show more</Text>
+          </Pressable>
+        ) : message.body ? <Markdown body={message.body} /> : null}
         {message.card ? <CardView card={message.card} /> : null}
         {message.attachments.map((attachment) => <AttachmentView key={attachment.id} attachment={attachment} />)}
         {message.suggestions?.length ? (
@@ -324,16 +337,19 @@ function CardView({ card }: { card: MessageCard }) {
   const router = useRouter();
   const workspace = useWorkspace();
   const { open, busy, error } = useGrantedOpen();
+  const ask = card.type === "ask"
+    ? workspace.bootstrap?.open_asks.find((item) => item.id === card.ask_id)
+    : undefined;
   const content = useMemo(() => {
     switch (card.type) {
       case "task": {
         const task = workspace.bootstrap?.tasks.find((item) => item.id === card.task_id);
-        return { title: task?.title ?? "Task", detail: task?.key, press: () => router.push({ pathname: "/tasks/[taskId]", params: { taskId: card.task_id } }) };
+        return { title: task?.title ?? "Task", detail: task?.brief, press: () => router.push({ pathname: "/tasks/[taskId]", params: { taskId: card.task_id } }) };
       }
       case "run":
         return { title: "Agent run", detail: "Open activity", press: () => router.push({ pathname: "/(app)/runs/[runId]", params: { runId: card.run_id } }) };
-      case "question":
-        return { title: "Question", detail: "Answer an agent", press: () => router.push({ pathname: "/(app)/questions/[questionId]", params: { questionId: card.question_id } }) };
+      case "ask":
+        return { title: "Ask", detail: "Already answered", press: undefined };
       case "pull_request":
         return { title: "Pull request", detail: card.url, press: () => void Linking.openURL(card.url) };
       case "artifact":
@@ -353,6 +369,9 @@ function CardView({ card }: { card: MessageCard }) {
   }, [card, open, router, workspace.bootstrap?.tasks]);
   // Drawn from its spec rather than announced, so the numbers are on screen.
   if (card.type === "chart") return <ChartCard spec={card.spec} caption={card.caption} />;
+  // Answerable where it was asked: the transcript is the flow, not a stop on
+  // the way to one.
+  if (ask) return <AskCard ask={ask} />;
   return (
     <>
       <Pressable
@@ -408,6 +427,7 @@ const styles = StyleSheet.create({
   suggestionText: { fontSize: 13, fontWeight: "600" },
   reactionRow: { flexDirection: "row", flexWrap: "wrap", gap: 5, marginTop: 6 },
   reaction: { minHeight: 32, justifyContent: "center", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
+  digest: { fontSize: 15, lineHeight: 21 },
   threadLine: { minHeight: 28, justifyContent: "center", marginTop: 1 },
   actionLabel: { fontSize: 13, fontWeight: "600" },
   sheetActions: { paddingHorizontal: 18, paddingBottom: 20, gap: 10 },

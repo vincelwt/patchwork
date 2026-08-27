@@ -103,15 +103,6 @@ export function workspaceLabel(session: PairedSession): string {
   return session.name || relayLabel(session);
 }
 
-/// The tab bar holds one glyph, not a coloured tile, so the workspace's first
-/// initial goes in as an SF Symbol letter. Anything outside a-z0-9 has no letter
-/// symbol of its own and falls back to the generic workspace mark.
-export function workspaceSymbol(session?: PairedSession | null): { default: string; selected: string } {
-  const initial = session ? workspaceInitials(session)[0].toLowerCase() : "";
-  if (!/^[a-z0-9]$/.test(initial)) return { default: "square.grid.2x2", selected: "square.grid.2x2.fill" };
-  return { default: `${initial}.square`, selected: `${initial}.square.fill` };
-}
-
 export function workspaceInitials(session: PairedSession): string {
   const label = workspaceLabel(session);
   const parts = label.split(/[\s._-]+/).filter(Boolean).slice(0, 2);

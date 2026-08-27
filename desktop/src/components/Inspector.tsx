@@ -123,14 +123,14 @@ export function RunPanel({
   // A live run appends to this log several times a second, so the panel reads
   // only what it draws — otherwise every unrelated message in the workspace
   // redraws the whole activity list.
-  const { run, events, agent, host, question } = useAppSelector((data) => {
+  const { run, events, agent, host, ask } = useAppSelector((data) => {
     const run = data.runs[runId];
     return {
       run,
       events: data.runEvents[runId],
       agent: data.members.find((member) => member.id === run?.agent_id),
       host: data.hosts.find((candidate) => candidate.id === run?.host_id),
-      question: Object.values(data.questions).find(
+      ask: Object.values(data.asks).find(
         (candidate) => candidate.run_id === runId && candidate.status === "open",
       ),
     };
@@ -196,9 +196,9 @@ export function RunPanel({
             </div>
           )}
 
-          {/* The question belongs where the person looking at the run is, not only
-              in a transcript they may have scrolled away from. */}
-          {question && <Card card={{ type: "question", question_id: question.id }} />}
+          {/* The ask belongs where the person looking at the run is, not only in
+              a transcript they may have scrolled away from. */}
+          {ask && <Card card={{ type: "ask", ask_id: ask.id }} />}
 
           <RunActivityList events={events} active={active} />
         </div>

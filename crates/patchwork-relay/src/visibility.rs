@@ -50,7 +50,7 @@ fn event_result(store: &Store, member_id: &str, event: &Event) -> Result<bool> {
         Event::RunEventAppended { event } => store
             .run(&event.run_id)?
             .is_some_and(|run| channel(store, member_id, &run.channel_id).unwrap_or(false)),
-        Event::QuestionUpdated { question } => channel(store, member_id, &question.channel_id)?,
+        Event::AskUpdated { ask } => channel(store, member_id, &ask.channel_id)?,
         Event::InboxItemCreated { item } | Event::InboxItemUpdated { item } => {
             item.member_id == member_id
         }
@@ -116,6 +116,7 @@ mod tests {
                     author_id: "inside".into(),
                     kind: MessageKind::Text,
                     body: "secret".into(),
+                    digest: String::new(),
                     card: None,
                     suggestions: Vec::new(),
                     parent_id: None,

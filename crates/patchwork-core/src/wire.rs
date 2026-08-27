@@ -75,7 +75,7 @@ pub struct Bootstrap {
     pub tasks: Vec<Task>,
     pub inbox: Vec<InboxItem>,
     pub automations: Vec<Automation>,
-    pub open_questions: Vec<Question>,
+    pub open_asks: Vec<Ask>,
     pub active_runs: Vec<Run>,
     pub previews: Vec<Preview>,
     /// Latest event sequence number; resume the stream from here.
@@ -88,6 +88,10 @@ pub struct Bootstrap {
 pub struct SendMessage {
     #[serde(default)]
     pub body: String,
+    /// One line standing in for the prose. Long agent messages render folded
+    /// to it; without one the relay distils the first sentence itself.
+    #[serde(default)]
+    pub digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +172,11 @@ pub struct CreateTask {
     /// outcome, or the title when the outcome is blank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_message: Option<String>,
+    /// Where the task stands, in at most two sentences.
+    #[serde(default)]
+    pub brief: String,
+    /// Only `planned` (defer it) and the terminal states are accepted; every
+    /// other status is derived from runs and the open ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,9 +185,6 @@ pub struct CreateTask {
     pub source_channel_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_message_id: Option<Id>,
-    /// Run quietly and report the final agent response to `source_channel_id`.
-    #[serde(default)]
-    pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +222,9 @@ pub struct UpdateTask {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// Overwrite-only: the brief is where the task is, not what it has been.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,10 +235,6 @@ pub struct UpdateTask {
     pub host_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
-    /// Exact label and instruction offered to a person in the review state.
-    /// An empty string clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_action: Option<String>,
     /// Epoch millis, or 0 to clear the date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<i64>,
@@ -254,7 +259,7 @@ pub struct TaskDetail {
     pub runs: Vec<Run>,
     pub attachments: Vec<Attachment>,
     pub previews: Vec<Preview>,
-    pub questions: Vec<Question>,
+    pub asks: Vec<Ask>,
 }
 
 // --- runs -------------------------------------------------------------------
@@ -277,7 +282,7 @@ pub struct StartRun {
 pub struct RunDetail {
     pub run: Run,
     pub events: Vec<RunEvent>,
-    pub questions: Vec<Question>,
+    pub asks: Vec<Ask>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -295,23 +300,43 @@ pub struct SteerRunResponse {
     pub control_id: Id,
 }
 
-// --- questions --------------------------------------------------------------
+// --- asks -------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AskQuestion {
-    pub run_id: Id,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAsk {
+    /// Defaults to `answer`, which is what `patchwork ask` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AskKind>,
+    /// The run doing the asking. Omitted when a task asks outside a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Id>,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     #[serde(default)]
-    pub headline: String,
-    pub items: Vec<QuestionItem>,
-    /// Cancel whatever this run already asked and ask this instead. Without
-    /// it, a second question is refused while the first is unanswered.
+    pub summary: Vec<String>,
+    #[serde(default)]
+    pub evidence_ids: Vec<Id>,
+    #[serde(default)]
+    pub options: Vec<AskOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default)]
+    pub require_option: bool,
+    /// Cancel whatever is already open here and ask this instead. Without it,
+    /// a second ask is refused while the first is unanswered.
     #[serde(default)]
     pub replace: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnswerQuestion {
-    pub answers: Vec<QuestionAnswer>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnswerAsk {
+    #[serde(default)]
+    pub answer: Vec<String>,
+    #[serde(default)]
+    pub note: String,
 }
 
 // --- agents, skills, projects, hosts ----------------------------------------

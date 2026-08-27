@@ -21,7 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::orchestrator::{self, PostOptions, StartRunParams};
 use crate::relay::Relay;
 use crate::state::Shared;
-use crate::store::{QuestionCommit, SaveWorkspaceSkillResult};
+use crate::store::SaveWorkspaceSkillResult;
 use crate::{automations, preview_proxy};
 
 /// The relay itself: what is true before you have picked a workspace.
@@ -241,18 +241,17 @@ pub fn router(state: Shared) -> Router {
             "/api/tasks/{id}/continuation",
             post(create_task_continuation),
         )
-        .route("/api/tasks/{id}/approve", post(approve_task))
         // runs
         .route("/api/runs", post(start_run))
         .route("/api/runs/{id}", get(run_detail))
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/runs/{id}/steer", post(steer_run))
         .route("/api/runs/{id}/events", get(run_events))
-        // questions
-        .route("/api/questions", get(list_questions).post(ask_question))
-        .route("/api/questions/{id}", get(get_question))
-        .route("/api/questions/{id}/answer", post(answer_question))
-        .route("/api/questions/{id}/wait", get(wait_for_answer))
+        // asks
+        .route("/api/asks", get(list_asks).post(open_ask))
+        .route("/api/asks/{id}", get(get_ask))
+        .route("/api/asks/{id}/answer", post(answer_ask))
+        .route("/api/asks/{id}/wait", get(wait_for_answer))
         // inbox
         .route("/api/inbox", get(list_inbox))
         .route("/api/inbox/{id}/read", post(mark_read))
@@ -575,11 +574,11 @@ async fn bootstrap(State(state): State<Shared>, caller: Caller) -> ApiResult<Jso
                     .unwrap_or(false)
             })
             .collect(),
-        open_questions: state
+        open_asks: state
             .store
-            .open_questions()?
+            .open_asks()?
             .into_iter()
-            .filter(|question| visible_ids.contains(&question.channel_id))
+            .filter(|ask| visible_ids.contains(&ask.channel_id))
             .collect(),
         active_runs,
         previews: state.store.previews(true)?,
@@ -1149,9 +1148,12 @@ async fn create_task(
             .ok_or_else(|| ApiError::not_found("source message not found"))?;
         require_channel_access(&state, &caller, &message.channel_id)?;
     }
-    if input.background {
+    // Every task reports back where it came from, so an agent's task inherits
+    // the conversation its parent came from rather than vanishing into its own
+    // discussion.
+    if input.source_channel_id.is_none() {
         if let Some(run_id) = caller.run_id.as_deref() {
-            if let Some(parent_task) = state
+            if let Some(parent) = state
                 .store
                 .run(run_id)?
                 .and_then(|run| run.task_id)
@@ -1159,13 +1161,8 @@ async fn create_task(
                 .transpose()?
                 .flatten()
             {
-                input.source_channel_id = parent_task.source_channel_id.or(input.source_channel_id);
+                input.source_channel_id = parent.source_channel_id;
             }
-        }
-        if input.source_channel_id.is_none() {
-            return Err(ApiError::bad_request(
-                "a background task needs an originating conversation",
-            ));
         }
     }
     let exact_once_match = input
@@ -1215,7 +1212,7 @@ async fn task_detail(
         runs: state.store.task_runs(&task.id)?,
         attachments: state.store.task_attachments(&task.id)?,
         previews: state.store.task_previews(&task.id)?,
-        questions: state.store.task_questions(&task.id)?,
+        asks: state.store.task_asks(&task.id)?,
         worktree,
         task,
     }))
@@ -1250,57 +1247,32 @@ async fn update_task(
         .store
         .task_by_ref(&id)?
         .ok_or_else(|| ApiError::not_found("task not found"))?;
-    if let Some(action) = input.review_action.as_deref() {
-        let action = action.trim();
-        if action.chars().any(char::is_control) || action.chars().count() > 80 {
-            return Err(ApiError::bad_request(
-                "a review action must be one line of at most 80 characters",
-            ));
-        }
-        let resulting_status = input.status.unwrap_or(task.status);
-        if !action.is_empty() && resulting_status != TaskStatus::Review {
-            return Err(ApiError::bad_request(
-                "a review action can only be set while the task is in review",
-            ));
+    if let Some(brief) = input.brief.as_deref() {
+        if brief.chars().count() > TASK_BRIEF_LIMIT {
+            return Err(ApiError::bad_request(format!(
+                "a brief is at most {TASK_BRIEF_LIMIT} characters: two sentences of where this stands"
+            )));
         }
     }
-    if caller.is_agent() && reopens_terminal(task.status, input.status) {
-        return Err(ApiError::bad_request(
-            "only a person can reopen a completed or canceled task",
-        ));
-    }
-    if input.status == Some(TaskStatus::Running)
-        && state.store.active_task_runs(&task.id)?.is_empty()
-        && !task
-            .active_continuation
-            .as_ref()
-            .is_some_and(|continuation| {
-                matches!(
-                    continuation.status,
-                    ContinuationStatus::Waiting | ContinuationStatus::Ready
-                )
-            })
-    {
-        return Err(ApiError::conflict(
-            "start a run instead; running requires an active run or continuation",
-        ));
+    // Only closing is a choice, and reopening is a person's. Everything else
+    // follows from runs and the open ask, so accepting it here would be
+    // accepting a lie the next refresh would silently overwrite.
+    if let Some(status) = input.status {
+        if !status.is_terminal() && status != TaskStatus::Planned {
+            return Err(ApiError::bad_request(
+                "status is derived from the runs and the open ask: use done, cancel, or open an ask",
+            ));
+        }
+        if caller.is_agent() && reopens_terminal(task.status, Some(status)) {
+            return Err(ApiError::bad_request(
+                "only a person can reopen a completed or canceled task",
+            ));
+        }
     }
     if pull_request_blocks_completion(&task, &input) {
         return Err(ApiError::conflict(
             "the linked pull request must be closed or merged before this task can be marked done",
         ));
-    }
-    if caller.is_agent() && input.status == Some(TaskStatus::Review) {
-        if !orchestrator::has_review_evidence(
-            &state,
-            &task,
-            &orchestrator::evidence_run_ids(&state, &task, caller.run_id.as_deref())?,
-            input.pr_url.as_deref(),
-        )? {
-            return Err(ApiError::bad_request(
-                "review needs evidence from this run: answer the original question, attach a file, expose a preview, or link a pull request; otherwise leave the task planned or blocked",
-            ));
-        }
     }
     Ok(Json(
         orchestrator::update_task(
@@ -1487,34 +1459,6 @@ async fn run_task(
     ))
 }
 
-async fn approve_task(
-    State(state): State<Shared>,
-    caller: Caller,
-    Path(id): Path<Id>,
-) -> ApiResult<Json<Run>> {
-    caller.require_device()?;
-    let task = state
-        .store
-        .task_by_ref(&id)?
-        .ok_or_else(|| ApiError::not_found("task not found"))?;
-    if task.status != TaskStatus::Review || task.review_action.is_none() {
-        return Err(ApiError::conflict(
-            "this task no longer has an action awaiting approval",
-        ));
-    }
-    // Approving starts another run in the task's worktree. While an agent is
-    // still working in there, waiting is the honest answer.
-    if task.current_run_id.is_some() {
-        return Err(ApiError::conflict(
-            "an agent is still working on this task; approve once it stops",
-        ));
-    }
-    let run = orchestrator::approve_task(&state, &caller.member.id, &task.id)
-        .await?
-        .ok_or_else(|| ApiError::conflict("this review action was already handled"))?;
-    Ok(Json(run))
-}
-
 // ---------------------------------------------------------------------------
 // runs
 // ---------------------------------------------------------------------------
@@ -1579,7 +1523,7 @@ async fn run_detail(
     require_run_access(&state, &caller, &run)?;
     Ok(Json(RunDetail {
         events: state.store.run_events(&id, 0)?,
-        questions: state.store.run_questions(&id)?,
+        asks: state.store.run_asks(&id)?,
         run,
     }))
 }
@@ -1664,287 +1608,248 @@ async fn cancel_run(
     state.store.revoke_run_tokens(&run.id).ok();
     state.store.update_run(&run)?;
     state.emit(Event::RunUpdated { run: run.clone() });
-    orchestrator::cancel_questions_for_run(&state, &run.id).await?;
+    orchestrator::cancel_asks_for_run(&state, &run.id).await?;
     state.set_presence(&run.agent_id, Presence::Online).await;
     orchestrator::finish_run(&state, &run).await?;
     Ok(Json(Ok::default()))
 }
 
 // ---------------------------------------------------------------------------
-// questions
+// asks
 // ---------------------------------------------------------------------------
 
-async fn list_questions(
-    State(state): State<Shared>,
-    caller: Caller,
-) -> ApiResult<Json<Vec<Question>>> {
+async fn list_asks(State(state): State<Shared>, caller: Caller) -> ApiResult<Json<Vec<Ask>>> {
     Ok(Json(
         state
             .store
-            .open_questions()?
+            .open_asks()?
             .into_iter()
-            .filter(|question| {
-                crate::visibility::channel(&state.store, &caller.member.id, &question.channel_id)
+            .filter(|ask| {
+                crate::visibility::channel(&state.store, &caller.member.id, &ask.channel_id)
                     .unwrap_or(false)
             })
             .collect(),
     ))
 }
 
-async fn get_question(
+async fn get_ask(
     State(state): State<Shared>,
     caller: Caller,
     Path(id): Path<Id>,
-) -> ApiResult<Json<Question>> {
-    let question = state
+) -> ApiResult<Json<Ask>> {
+    let ask = state
         .store
-        .question(&id)?
-        .ok_or_else(|| ApiError::not_found("question not found"))?;
-    require_channel_access(&state, &caller, &question.channel_id)?;
-    Ok(Json(question))
+        .ask(&id)?
+        .ok_or_else(|| ApiError::not_found("ask not found"))?;
+    require_channel_access(&state, &caller, &ask.channel_id)?;
+    Ok(Json(ask))
 }
 
-/// An agent asks. The card lands in the conversation and the right Inboxes.
-fn open_question(state: &Shared, run_id: &str) -> ApiResult<Option<Question>> {
-    Ok(state
-        .store
-        .run_questions(run_id)?
-        .into_iter()
-        .find(|question| question.status == QuestionStatus::Open))
-}
-
-fn already_asking(open: &Question) -> ApiError {
-    ApiError::conflict(format!(
-        "this run is already waiting on the question \"{}\": let it be answered, \
- or pass --replace to cancel it and ask this instead",
-        open.headline.trim()
-    ))
-}
-
-async fn ask_question(
-    State(state): State<Shared>,
-    caller: Caller,
-    Json(input): Json<AskQuestion>,
-) -> ApiResult<Json<Question>> {
-    if input.items.is_empty() {
-        return Err(ApiError::bad_request("ask at least one question"));
+/// Every rule about what an ask may be lives here, as a rejection rather than
+/// as advice in a document an agent has to remember.
+fn check_ask(input: &OpenAsk, kind: AskKind) -> ApiResult<String> {
+    let text = input.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("say what you need"));
     }
-    let run = state
-        .store
-        .run(&input.run_id)?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    require_run_access(&state, &caller, &run)?;
-    if !caller.is_agent()
-        || caller.member.id != run.agent_id
-        || caller.run_id.as_deref() != Some(run.id.as_str())
-    {
-        return Err(ApiError::forbidden("only this run's agent can ask"));
+    if text.chars().count() > ASK_TEXT_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "an ask is at most {ASK_TEXT_LIMIT} characters; put the detail in the conversation"
+        )));
     }
-    if run.status.is_terminal() {
-        return Err(ApiError::conflict("that run has already ended"));
-    }
-    // One run asks one thing at a time, so nobody is left with two cards and
-    // no idea which one the run is waiting on. Several things at once belong in
-    // one question with several items.
-    if !input.replace {
-        if let Some(open) = open_question(&state, &run.id)? {
-            return Err(already_asking(&open));
+    if let Some(action) = input.action.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        if action.chars().any(char::is_control) || action.chars().count() > ASK_ACTION_LIMIT {
+            return Err(ApiError::bad_request(format!(
+                "an action must be one line of at most {ASK_ACTION_LIMIT} characters"
+            )));
         }
     }
-
-    let mut question = Question {
-        id: new_id(),
-        run_id: run.id.clone(),
-        agent_id: run.agent_id.clone(),
-        channel_id: run.channel_id.clone(),
-        task_id: run.task_id.clone(),
-        message_id: None,
-        headline: input.headline.clone(),
-        items: input.items.clone(),
-        status: QuestionStatus::Open,
-        answers: None,
-        answered_by: None,
-        created_at: now_ms(),
-        answered_at: None,
-    };
-    orchestrator::finish_streamed_reply(&state, &run.id).await?;
-
-    let message = orchestrator::post_message(
-        &state,
-        &run.channel_id,
-        &run.agent_id,
-        SendMessage {
-            kind: Some(MessageKind::Card),
-            card: Some(MessageCard::Question {
-                question_id: question.id.clone(),
-            }),
-            run_id: Some(run.id.clone()),
-            // Asked where the work was asked for.
-            parent_id: orchestrator::reply_parent(&state, &run).await,
-            ..Default::default()
-        },
-        PostOptions {
-            trigger_agents: false,
-            run_id: Some(run.id.clone()),
-        },
-    )
-    .await?;
-    question.message_id = Some(message.id.clone());
-
-    // The run is visibly waiting, and the people who can answer are told.
-    let mut run = run;
-    run.status = RunStatus::Waiting;
-    run.headline = if question.headline.is_empty() {
-        "Waiting for an answer".into()
-    } else {
-        question.headline.clone()
-    };
-
-    let agent_name = state
-        .store
-        .member(&run.agent_id)?
-        .map(|m| m.display_name)
-        .unwrap_or_else(|| "An agent".into());
-    let mut inbox_items = Vec::new();
-    for member_id in state.store.channel_audience(&run.channel_id)? {
-        let Some(member) = state.store.member(&member_id)? else {
-            continue;
-        };
-        if member.kind != MemberKind::Human {
-            continue;
-        }
-        let item = InboxItem {
-            id: new_id(),
-            member_id: member.id.clone(),
-            kind: InboxKind::Question,
-            title: format!("{agent_name} has a question"),
-            preview: question
-                .items
-                .first()
-                .map(|i| i.question.clone())
-                .unwrap_or_default(),
-            actor_id: Some(run.agent_id.clone()),
-            channel_id: Some(run.channel_id.clone()),
-            message_id: Some(message.id.clone()),
-            task_id: run.task_id.clone(),
-            run_id: Some(run.id.clone()),
-            automation_id: None,
-            created_at: now_ms(),
-            read_at: None,
-        };
-        inbox_items.push(item);
+    if input.summary.len() > ASK_SUMMARY_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "a summary is at most {ASK_SUMMARY_LIMIT} bullets"
+        )));
     }
-
-    // Nothing is answerable until the card, waiting run and every Inbox row
-    // are durable. A concurrent Stop wins without leaving an open question.
-    let (blocked_task, superseded) =
-        match state
-            .store
-            .commit_question_waiting(&question, &run, &inbox_items, input.replace)?
-        {
-            QuestionCommit::Committed {
-                blocked,
-                superseded,
-            } => (blocked, superseded),
-            outcome => {
-                state.store.delete_message(&message.id)?;
-                state.emit(Event::MessageDeleted {
-                    channel_id: run.channel_id.clone(),
-                    message_id: message.id,
-                });
-                return Err(match outcome {
-                    QuestionCommit::AlreadyAsking(open) => already_asking(&open),
-                    _ => ApiError::conflict("that run has already ended"),
-                });
-            }
-        };
-    orchestrator::settle_superseded_questions(&state, superseded).await?;
-    state.emit(Event::RunUpdated { run: run.clone() });
-    if let Some(task) = blocked_task {
-        state.emit(Event::TaskUpdated { task });
-    }
-    state.set_presence(&run.agent_id, Presence::Waiting).await;
-    for item in inbox_items {
-        state.emit(Event::InboxItemCreated { item });
-    }
-    if let Some(host_id) = &run.host_id {
-        state
-            .send_to_host(
-                host_id,
-                RelayToHost::QuestionAsked {
-                    run_id: run.id.clone(),
-                },
-            )
-            .await;
-    }
-    state.emit(Event::QuestionUpdated {
-        question: question.clone(),
-    });
-    Ok(Json(question))
-}
-
-async fn answer_question(
-    State(state): State<Shared>,
-    caller: Caller,
-    Path(id): Path<Id>,
-    Json(input): Json<AnswerQuestion>,
-) -> ApiResult<Json<Question>> {
-    caller.require_device()?;
-    let question = state
-        .store
-        .question(&id)?
-        .ok_or_else(|| ApiError::not_found("question not found"))?;
-    require_channel_access(&state, &caller, &question.channel_id)?;
-    if question.status != QuestionStatus::Open {
-        return Err(ApiError::conflict(
-            "that question is no longer waiting for an answer",
+    if kind == AskKind::Review && input.summary.iter().all(|line| line.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "a review needs a summary: up to three bullets saying what changed",
         ));
     }
+    Ok(text.to_string())
+}
+
+async fn open_ask(
+    State(state): State<Shared>,
+    caller: Caller,
+    Json(input): Json<OpenAsk>,
+) -> ApiResult<Json<Ask>> {
+    let kind = input.kind.unwrap_or(AskKind::Answer);
+    let text = check_ask(&input, kind)?;
+
+    let run = match &input.run_id {
+        Some(run_id) => {
+            let run = state
+                .store
+                .run(run_id)?
+                .ok_or_else(|| ApiError::not_found("run not found"))?;
+            require_run_access(&state, &caller, &run)?;
+            if !caller.is_agent()
+                || caller.member.id != run.agent_id
+                || caller.run_id.as_deref() != Some(run.id.as_str())
+            {
+                return Err(ApiError::forbidden("only this run's agent can ask"));
+            }
+            if run.status.is_terminal() {
+                return Err(ApiError::conflict("that run has already ended"));
+            }
+            Some(run)
+        }
+        None => None,
+    };
+    let task_id = input
+        .task_id
+        .clone()
+        .or_else(|| run.as_ref().and_then(|run| run.task_id.clone()));
+    let task = match &task_id {
+        Some(id) => Some(
+            state
+                .store
+                .task_by_ref(id)?
+                .ok_or_else(|| ApiError::not_found("task not found"))?,
+        ),
+        None => None,
+    };
+    if let Some(task) = &task {
+        if task.status.is_terminal() {
+            return Err(ApiError::conflict("that task is already closed"));
+        }
+    }
+    let channel_id = match (&run, &task) {
+        (Some(run), _) => run.channel_id.clone(),
+        (None, Some(task)) => task.discussion_channel_id.clone(),
+        _ => return Err(ApiError::bad_request("an ask needs a run or a task")),
+    };
+    require_channel_access(&state, &caller, &channel_id)?;
+
+    // Review is mechanical: without something concrete to look at, "have a
+    // look" is the whole of what a person would be handed.
+    if kind == AskKind::Review {
+        let task = task
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("a review belongs to a task"))?;
+        if !orchestrator::has_review_evidence(
+            &state,
+            task,
+            &orchestrator::evidence_run_ids(&state, task, caller.run_id.as_deref())?,
+            None,
+        )? && input.evidence_ids.is_empty()
+        {
+            return Err(ApiError::bad_request(
+                "a review needs something to inspect: attach a file, expose a preview, or link a pull request",
+            ));
+        }
+    }
+
+    let agent_id = run
+        .as_ref()
+        .map(|run| run.agent_id.clone())
+        .unwrap_or_else(|| caller.member.id.clone());
+    let (_, ask) = orchestrator::open_ask(
+        &state,
+        orchestrator::NewAsk {
+            kind,
+            agent_id,
+            channel_id,
+            task_id,
+            run,
+            text,
+            action: input
+                .action
+                .as_deref()
+                .map(str::trim)
+                .filter(|action| !action.is_empty())
+                .map(str::to_string),
+            summary: input
+                .summary
+                .iter()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect(),
+            evidence_ids: input.evidence_ids.clone(),
+            options: input.options.clone(),
+            allow_free_text: !input.require_option,
+            multi_select: input.multi_select,
+            replace: input.replace,
+        },
+    )
+    .await
+    .map_err(|err| match err.downcast::<orchestrator::AlreadyAsking>() {
+        Ok(already) => ApiError::conflict(already.to_string()),
+        Err(err) => ApiError::from(err),
+    })?;
+    Ok(Json(ask))
+}
+
+async fn answer_ask(
+    State(state): State<Shared>,
+    caller: Caller,
+    Path(id): Path<Id>,
+    Json(input): Json<AnswerAsk>,
+) -> ApiResult<Json<Ask>> {
+    caller.require_device()?;
+    let ask = state
+        .store
+        .ask(&id)?
+        .ok_or_else(|| ApiError::not_found("ask not found"))?;
+    require_channel_access(&state, &caller, &ask.channel_id)?;
+    if ask.status != AskStatus::Open {
+        return Err(ApiError::conflict("that ask is no longer waiting"));
+    }
     Ok(Json(
-        orchestrator::answer_question(&state, &id, input.answers, &caller.member.id).await?,
+        orchestrator::answer_ask(&state, &id, input.answer, input.note, &caller.member.id).await?,
     ))
 }
 
-/// The agent side of `patchwork ask`: hold the connection until a human
+/// The agent side of `patchwork ask`: hold the connection until a person
 /// answers, so the run genuinely continues in context.
 async fn wait_for_answer(
     State(state): State<Shared>,
     caller: Caller,
     Path(id): Path<Id>,
-) -> ApiResult<Json<Question>> {
-    let question = state
+) -> ApiResult<Json<Ask>> {
+    let ask = state
         .store
-        .question(&id)?
-        .ok_or_else(|| ApiError::not_found("question not found"))?;
-    require_channel_access(&state, &caller, &question.channel_id)?;
+        .ask(&id)?
+        .ok_or_else(|| ApiError::not_found("ask not found"))?;
+    require_channel_access(&state, &caller, &ask.channel_id)?;
     if !caller.is_agent()
-        || caller.member.id != question.agent_id
-        || caller.run_id.as_deref() != Some(question.run_id.as_str())
+        || caller.member.id != ask.agent_id
+        || caller.run_id.as_deref() != ask.run_id.as_deref()
     {
         return Err(ApiError::forbidden(
             "only the asking run can wait for this answer",
         ));
     }
-    if question.status != QuestionStatus::Open {
-        return Ok(Json(question));
+    if ask.status != AskStatus::Open {
+        return Ok(Json(ask));
     }
 
     let rx = state.wait_for_answer(&id).await;
     // Re-read after registering: an answer that landed in between would
     // otherwise make the agent wait out the whole long-poll for nothing.
-    if let Some(answered) = state.store.question(&id)? {
-        if answered.status != QuestionStatus::Open {
+    if let Some(answered) = state.store.ask(&id)? {
+        if answered.status != AskStatus::Open {
             return Ok(Json(answered));
         }
     }
     match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
         Ok(Result::Ok(answered)) => Ok(Json(answered)),
         // A timeout is not an error: the caller polls again.
-        _ => {
-            Ok(Json(state.store.question(&id)?.ok_or_else(|| {
-                ApiError::not_found("question not found")
-            })?))
-        }
+        _ => Ok(Json(
+            state
+                .store
+                .ask(&id)?
+                .ok_or_else(|| ApiError::not_found("ask not found"))?,
+        )),
     }
 }
 
@@ -3848,6 +3753,7 @@ mod tests {
                 author_id: human.id.clone(),
                 kind: MessageKind::Text,
                 body: "Source".into(),
+                digest: String::new(),
                 card: None,
                 suggestions: Vec::new(),
                 parent_id: None,
@@ -4218,11 +4124,11 @@ mod tests {
             key: "PW-1".into(),
             title: "Needs a decision".into(),
             outcome: "Continue after the human decides".into(),
+            brief: String::new(),
             status: TaskStatus::Running,
             owner_id: Some(agent.id.clone()),
             source_channel_id: Some("channel".into()),
             source_message_id: None,
-            background: false,
             discussion_channel_id: "channel".into(),
             project_id: None,
             host_id: Some("host-one".into()),
@@ -4231,7 +4137,7 @@ mod tests {
             active_continuation: None,
             pr_url: None,
             pr_state: None,
-            review_action: None,
+            ask: None,
             created_by: human.id.clone(),
             due_at: None,
             once_key: None,
@@ -4261,23 +4167,16 @@ mod tests {
             token_hash: "agent-token".into(),
             token_kind: "run".into(),
         };
-        let ask = |run_id: &str| AskQuestion {
-            run_id: run_id.into(),
-            headline: "Approval".into(),
-            items: vec![QuestionItem {
-                id: "choice".into(),
-                header: String::new(),
-                question: "Continue?".into(),
-                options: Vec::new(),
-                allow_free_text: true,
-                multi_select: false,
-            }],
-            replace: false,
+        let asking = |run_id: &str| OpenAsk {
+            run_id: Some(run_id.into()),
+            text: "Continue?".into(),
+            ..Default::default()
         };
-        let replace = |run_id: &str| AskQuestion {
+        let replace = |run_id: &str| OpenAsk {
             replace: true,
-            ..ask(run_id)
+            ..asking(run_id)
         };
+        let nothing = || AnswerAsk::default();
 
         orchestrator::handle_host_message(
             &state,
@@ -4298,17 +4197,17 @@ mod tests {
         );
 
         assert_eq!(
-            ask_question(State(state.clone()), human_caller(), Json(ask("run-one")),)
+            open_ask(State(state.clone()), human_caller(), Json(asking("run-one")),)
                 .await
                 .unwrap_err()
                 .status,
             axum::http::StatusCode::FORBIDDEN
         );
         assert_eq!(
-            ask_question(
+            open_ask(
                 State(state.clone()),
                 agent_caller("another-run"),
-                Json(ask("run-one")),
+                Json(asking("run-one")),
             )
             .await
             .unwrap_err()
@@ -4316,15 +4215,17 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN
         );
 
-        let question = ask_question(
+        let first = open_ask(
             State(state.clone()),
             agent_caller("run-one"),
-            Json(ask("run-one")),
+            Json(asking("run-one")),
         )
         .await
         .unwrap()
         .0;
-        assert!(question.message_id.is_some());
+        assert!(first.message_id.is_some());
+        // An open ask of any kind other than review reads as blocked, and the
+        // task never had to be told so.
         assert_eq!(
             store.task(&task.id).unwrap().unwrap().status,
             TaskStatus::Blocked
@@ -4335,13 +4236,11 @@ mod tests {
             .iter()
             .any(|item| item.run_id.as_deref() == Some("run-one")));
         assert_eq!(
-            answer_question(
+            answer_ask(
                 State(state.clone()),
                 agent_caller("run-one"),
-                Path(question.id.clone()),
-                Json(AnswerQuestion {
-                    answers: Vec::new()
-                }),
+                Path(first.id.clone()),
+                Json(nothing()),
             )
             .await
             .unwrap_err()
@@ -4352,7 +4251,7 @@ mod tests {
             wait_for_answer(
                 State(state.clone()),
                 agent_caller("another-run"),
-                Path(question.id.clone()),
+                Path(first.id.clone()),
             )
             .await
             .unwrap_err()
@@ -4364,10 +4263,10 @@ mod tests {
         let count = || store.messages("channel", None, 200).unwrap().0.len();
         let before = count();
         assert_eq!(
-            ask_question(
+            open_ask(
                 State(state.clone()),
                 agent_caller("run-one"),
-                Json(ask("run-one")),
+                Json(asking("run-one")),
             )
             .await
             .unwrap_err()
@@ -4375,9 +4274,9 @@ mod tests {
             axum::http::StatusCode::CONFLICT
         );
         assert_eq!(count(), before, "a refused ask posts no card");
-        // Replacing is how a run whose `ask` died gets to ask again. The
+        // Replacing is how a run whose ask died gets to ask again. The
         // abandoned card stops holding the task in Blocked.
-        let second = ask_question(
+        let second = open_ask(
             State(state.clone()),
             agent_caller("run-one"),
             Json(replace("run-one")),
@@ -4386,17 +4285,15 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(
-            store.question(&question.id).unwrap().unwrap().status,
-            QuestionStatus::Cancelled,
+            store.ask(&first.id).unwrap().unwrap().status,
+            AskStatus::Cancelled,
         );
         assert_eq!(
-            answer_question(
+            answer_ask(
                 State(state.clone()),
                 human_caller(),
-                Path(question.id),
-                Json(AnswerQuestion {
-                    answers: Vec::new(),
-                }),
+                Path(first.id),
+                Json(nothing()),
             )
             .await
             .unwrap_err()
@@ -4412,8 +4309,8 @@ mod tests {
             TaskStatus::Blocked
         );
         assert_eq!(
-            store.question(&second.id).unwrap().unwrap().status,
-            QuestionStatus::Open
+            store.ask(&second.id).unwrap().unwrap().status,
+            AskStatus::Open
         );
         assert_eq!(
             store
@@ -4423,18 +4320,24 @@ mod tests {
                 .filter(|item| item.run_id.as_deref() == Some("run-one"))
                 .count(),
             1,
-            "the superseded question's Inbox row is resolved with its card",
+            "the superseded ask's Inbox row is resolved with its card",
         );
-        let _ = answer_question(
+        let answered = answer_ask(
             State(state.clone()),
             human_caller(),
             Path(second.id),
-            Json(AnswerQuestion {
-                answers: Vec::new(),
+            Json(AnswerAsk {
+                answer: vec!["Continue".into()],
+                note: "ship it".into(),
             }),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
+        assert_eq!(answered.answer, ["Continue"]);
+        assert_eq!(answered.answer_text(), "Continue, ship it");
+        // Answering releases the run that was waiting on it, and the task
+        // follows the run again because nothing is open any more.
         assert_eq!(
             store.run("run-one").unwrap().unwrap().status,
             RunStatus::Running
@@ -4444,50 +4347,14 @@ mod tests {
             TaskStatus::Running
         );
 
-        let explicit_block = ask_question(
-            State(state.clone()),
-            agent_caller("run-one"),
-            Json(ask("run-one")),
-        )
-        .await
-        .unwrap()
-        .0;
-        let _ = orchestrator::update_task(
-            &state,
-            &human.id,
-            false,
-            &task.id,
-            UpdateTask {
-                status: Some(TaskStatus::Blocked),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let _ = answer_question(
-            State(state.clone()),
-            human_caller(),
-            Path(explicit_block.id),
-            Json(AnswerQuestion {
-                answers: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            store.task(&task.id).unwrap().unwrap().status,
-            TaskStatus::Blocked,
-            "an explicit Blocked status must outlive the question that first blocked it",
-        );
-
         store.insert_run(&make_run("run-two"), 0).unwrap();
         store
             .insert_token("run-two-token", &agent.id, "run", Some("run-two"), None)
             .unwrap();
-        let waiting = ask_question(
+        let waiting = open_ask(
             State(state.clone()),
             agent_caller("run-two"),
-            Json(ask("run-two")),
+            Json(asking("run-two")),
         )
         .await
         .unwrap()
@@ -4512,14 +4379,14 @@ mod tests {
         );
         assert!(store.lookup_token("run-two-token").unwrap().is_none());
         assert_eq!(
-            store.question(&waiting.id).unwrap().unwrap().status,
-            QuestionStatus::Cancelled
+            store.ask(&waiting.id).unwrap().unwrap().status,
+            AskStatus::Cancelled
         );
         assert_eq!(
-            ask_question(
+            open_ask(
                 State(state.clone()),
                 agent_caller("run-two"),
-                Json(ask("run-two")),
+                Json(asking("run-two")),
             )
             .await
             .unwrap_err()
@@ -4538,8 +4405,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_continuations_report_to_the_original_conversation() {
-        let path = std::env::temp_dir().join(format!("patchwork-background-{}.sqlite", new_id()));
+    async fn a_delegated_task_reports_to_the_conversation_its_parent_came_from() {
+        let path = std::env::temp_dir().join(format!("patchwork-delegated-{}.sqlite", new_id()));
         let store = crate::store::Store::open(&path).unwrap();
         store.create_workspace("ws", "Test").unwrap();
         let agent = Member {
@@ -4632,11 +4499,9 @@ mod tests {
                 token_kind: "run".into(),
             },
             Json(CreateTask {
-                title: "Background child".into(),
+                title: "Delegated child".into(),
                 outcome: "The delegated result is ready".into(),
                 status: Some(TaskStatus::Planned),
-                source_channel_id: Some(parent.discussion_channel_id.clone()),
-                background: true,
                 allow_similar: true,
                 ..Default::default()
             }),
@@ -4644,7 +4509,9 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert!(child.background);
+        // Every task reports back where the work was asked for, so a task an
+        // agent creates mid-run inherits its parent's conversation rather than
+        // disappearing into its own discussion.
         assert_eq!(child.source_channel_id.as_deref(), Some("origin"));
 
         let mut continuation_run = run(
@@ -4669,6 +4536,7 @@ mod tests {
                 author_id: agent.id.clone(),
                 kind: MessageKind::Text,
                 body: "The delegated result is ready.".into(),
+                digest: String::new(),
                 card: None,
                 suggestions: Vec::new(),
                 parent_id: None,
@@ -4942,7 +4810,11 @@ mod tests {
         store.update_run(&writer).unwrap();
         orchestrator::finish_run(&state, &writer).await.unwrap();
         let done = store.task(&task.id).unwrap().unwrap();
-        assert_eq!(done.status, TaskStatus::Review);
+        // The last one out gives the task back, and gives it back to nobody in
+        // particular: a finished run promotes nothing, so a task that wants a
+        // person has to say so with an ask.
+        assert_eq!(done.status, TaskStatus::Planned);
+        assert!(done.ask.is_none());
         assert!(done.current_run_id.is_none());
 
         drop(state);
@@ -5035,26 +4907,54 @@ mod tests {
             })
             .unwrap();
 
+        // Handing work to a person is opening a review ask, and a review ask is
+        // mechanical: it needs bullets saying what changed and something
+        // concrete to inspect, so "have a look" can never be all somebody gets.
+        let ask_as = |bearer: &str, body: String| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/asks")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
         let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri(format!("/api/tasks/{}", task.id))
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"status":"review"}"#))
-                    .unwrap(),
-            )
+            .oneshot(ask_as(
+                &token,
+                format!(
+                    r#"{{"kind":"review","task_id":"{}","text":"Ready for you"}}"#,
+                    task.id
+                ),
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a review without a summary is refused"
+        );
+        let response = router(state.clone())
+            .oneshot(ask_as(
+                &token,
+                format!(
+                    r#"{{"kind":"review","task_id":"{}","text":"Ready for you","summary":["Rewrote the proxy"]}}"#,
+                    task.id
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a stopped preview is not something to inspect"
+        );
         assert_eq!(
             store.task(&task.id).unwrap().unwrap().status,
             TaskStatus::Planned
         );
 
         let mut running = store.task(&task.id).unwrap().unwrap();
-        running.status = TaskStatus::Running;
         running.current_run_id = Some("run".into());
         store.update_task(&running).unwrap();
         orchestrator::finish_run(
@@ -5163,7 +5063,6 @@ mod tests {
             })
             .unwrap();
         let mut running = auto_reviewed.clone();
-        running.status = TaskStatus::Running;
         running.current_run_id = Some("answer-run".into());
         store.update_task(&running).unwrap();
         orchestrator::finish_run(
@@ -5200,8 +5099,38 @@ mod tests {
         .unwrap();
         assert_eq!(
             store.task(&auto_reviewed.id).unwrap().unwrap().status,
-            TaskStatus::Review,
-            "a successful written answer should wait for human review",
+            TaskStatus::Planned,
+            "a finished run promotes nothing; only an ask makes a task wait",
+        );
+
+        // For an inquiry, the written answer is itself the thing a person
+        // reviews, so the review ask is accepted with no file or preview.
+        let answer_run_token = auth::generate_token();
+        store
+            .insert_token(
+                &auth::hash_token(&answer_run_token),
+                &agent.id,
+                "run",
+                Some("answer-run"),
+                None,
+            )
+            .unwrap();
+        let response = router(state.clone())
+            .oneshot(ask_as(
+                &answer_run_token,
+                format!(
+                    r#"{{"kind":"review","task_id":"{}","text":"Is this the answer you needed?","summary":["It indexes task titles and outcomes"]}}"#,
+                    auto_reviewed.id
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let reviewing = store.task(&auto_reviewed.id).unwrap().unwrap();
+        assert_eq!(reviewing.status, TaskStatus::Review);
+        assert_eq!(
+            reviewing.ask.as_ref().map(|ask| ask.kind),
+            Some(AskKind::Review)
         );
 
         let response = router(state.clone())
@@ -5266,114 +5195,85 @@ mod tests {
             b"abcdef"
         );
 
+        // The uploaded file is something to inspect, so the same review ask is
+        // now accepted. Its `action` is the approval button.
         let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri(format!("/api/tasks/{}", task.id))
-                    .header("authorization", format!("Bearer {token}"))
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        r#"{"status":"review","review_action":"Approve and deploy app"}"#,
-                    ))
-                    .unwrap(),
-            )
+            .oneshot(ask_as(
+                &token,
+                format!(
+                    r#"{{"kind":"review","task_id":"{}","text":"Ready for you","action":"Approve and deploy app","summary":["Rewrote the proxy","Recorded a demo"]}}"#,
+                    task.id
+                ),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            store
-                .task(&task.id)
-                .unwrap()
-                .unwrap()
-                .review_action
-                .as_deref(),
-            Some("Approve and deploy app")
-        );
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/tasks/{}/approve", task.id))
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
-
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/tasks/{}/approve", task.id))
-                    .header("authorization", format!("Bearer {human_token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let restored = store.task(&task.id).unwrap().unwrap();
-        assert_eq!(restored.status, TaskStatus::Review);
-        assert_eq!(
-            restored.review_action.as_deref(),
-            Some("Approve and deploy app")
-        );
-
-        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
-        state
-            .hosts
-            .write()
-            .await
-            .insert("host".into(), crate::state::HostConn { tx: host_tx });
-        let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/tasks/{}/approve", task.id))
-                    .header("authorization", format!("Bearer {human_token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let approved: Run = serde_json::from_slice(
+        let review: Ask = serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap(),
         )
         .unwrap();
-        let dispatched = host_rx.recv().await.unwrap();
-        let RelayToHost::StartRun { spec } = dispatched else {
-            panic!("approval did not dispatch a run")
-        };
-        assert_eq!(spec.run_id, approved.id);
-        assert!(spec.prompt.contains("Human approved"));
-        assert!(spec.prompt.contains("Approve and deploy app"));
-        let approved_task = store.task(&task.id).unwrap().unwrap();
-        assert_eq!(approved_task.status, TaskStatus::Running);
-        assert!(approved_task.review_action.is_none());
+        let reviewing = store.task(&task.id).unwrap().unwrap();
+        assert_eq!(reviewing.status, TaskStatus::Review);
         assert_eq!(
-            approved_task.current_run_id.as_deref(),
-            Some(approved.id.as_str())
+            reviewing.ask.as_ref().and_then(|ask| ask.action.as_deref()),
+            Some("Approve and deploy app")
         );
 
+        // Approval is answering that ask with its action label, and only a
+        // person on a device may do it.
+        let answer = |bearer: &str, id: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/asks/{id}/answer"))
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
         let response = router(state.clone())
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/tasks/{}/approve", task.id))
-                    .header("authorization", format!("Bearer {human_token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(answer(
+                &token,
+                &review.id,
+                r#"{"answer":["Approve and deploy app"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let response = router(state.clone())
+            .oneshot(answer(
+                &human_token,
+                &review.id,
+                r#"{"answer":["Approve and deploy app"],"note":"ship it"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let approved: Ask = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(approved.status, AskStatus::Answered);
+        assert_eq!(approved.answer, ["Approve and deploy app"]);
+        assert_eq!(approved.answered_by.as_deref(), Some(human.id.as_str()));
+        let approved_task = store.task(&task.id).unwrap().unwrap();
+        assert!(
+            approved_task.ask.is_none(),
+            "an answered ask stops the task waiting on anybody"
+        );
+        assert_ne!(approved_task.status, TaskStatus::Review);
+
+        // Answering is once: the second attempt has nothing left to answer.
+        let response = router(state.clone())
+            .oneshot(answer(
+                &human_token,
+                &review.id,
+                r#"{"answer":["Approve and deploy app"]}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);

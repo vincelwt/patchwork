@@ -59,15 +59,10 @@ enum Command {
     Ask(AskArgs),
     /// Attach a file as evidence.
     Attach(AttachArgs),
-    /// List or remove evidence attached to the current task.
-    #[command(subcommand)]
-    Evidence(EvidenceCommand),
     /// Post a chart from a Flint chart spec.
     Chart(ChartArgs),
     /// Expose a dev server you started as a task preview.
     Preview(PreviewArgs),
-    /// Link a pull request to the current task.
-    Pr { url: String },
     /// Read and change workspace settings.
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
@@ -113,6 +108,10 @@ struct SayArgs {
     /// Offer a concrete next action under the message. Repeat up to three times.
     #[arg(long = "suggest", value_name = "ACTION", action = clap::ArgAction::Append)]
     suggestions: Vec<String>,
+    /// One line standing in for a long message. Without it the relay picks the
+    /// first sentence, which is rarely the line you would have chosen.
+    #[arg(long, default_value = "")]
+    digest: String,
     /// Post somewhere else: `#deploys`, a channel name, or a channel id.
     #[arg(long)]
     channel: Option<String>,
@@ -128,12 +127,9 @@ struct TellArgs {
 
 #[derive(Args)]
 struct AskArgs {
-    /// The question to ask.
-    #[arg(long)]
-    question: String,
-    /// Short chip label, e.g. "Auth method".
-    #[arg(long, default_value = "")]
-    header: String,
+    /// What you need, in one line of at most 200 characters.
+    #[arg(long, alias = "question")]
+    text: String,
     /// `Label:description`. Repeat for each choice.
     #[arg(long = "option")]
     options: Vec<String>,
@@ -143,7 +139,7 @@ struct AskArgs {
     /// Require one of the options.
     #[arg(long)]
     no_free_text: bool,
-    /// Cancel the question this run already asked and ask this one instead.
+    /// Cancel what this run already asked and ask this instead.
     #[arg(long)]
     replace: bool,
 }
@@ -156,14 +152,6 @@ struct AttachArgs {
     /// Replace an earlier evidence attachment (its id) with this file.
     #[arg(long)]
     replace: Option<String>,
-}
-
-#[derive(Subcommand)]
-enum EvidenceCommand {
-    /// List evidence attached to the current task.
-    List,
-    /// Remove an attachment from the current task's review evidence.
-    Remove { attachment_id: String },
 }
 
 #[derive(Args)]
@@ -320,15 +308,16 @@ enum TaskCommand {
         title: String,
         #[arg(long, default_value = "")]
         outcome: String,
+        /// Where this stands, in at most two sentences.
+        #[arg(long, default_value = "")]
+        brief: String,
         /// `@handle` of the owner, or `@me` for yourself. A person, when the
         /// task is for a person.
         #[arg(long)]
         owner: Option<String>,
         #[arg(long)]
-        status: Option<String>,
-        #[arg(long)]
         project: Option<String>,
-        /// `YYYY-MM-DD`. It reaches the owner's Inbox on the day.
+        /// `YYYY-MM-DD`.
         #[arg(long)]
         due: Option<String>,
         /// Your own name for what this is about. Creating it again with the
@@ -338,36 +327,60 @@ enum TaskCommand {
         /// Create after reviewing the relay's possible-duplicate warning.
         #[arg(long)]
         allow_similar: bool,
-        /// Run off the task board and report the final response here.
+        /// Leave it waiting rather than starting the owning agent.
         #[arg(long)]
-        background: bool,
-        /// Start the owning agent right away (automatic for agent-owned tasks).
-        #[arg(long)]
-        start: bool,
+        planned: bool,
     },
-    Update {
+    /// Overwrite where the task stands. A state, not a log.
+    Brief {
         reference: String,
+        /// At most two sentences.
+        text: Vec<String>,
+    },
+    /// Open the one thing this task needs from a person.
+    Ask {
+        reference: String,
+        /// `answer`, `review`, `decide`, or `unblock`.
+        #[arg(long, default_value = "answer")]
+        kind: String,
         #[arg(long)]
-        title: Option<String>,
+        text: String,
+        /// The button a person presses. Answering with it is the approval.
         #[arg(long)]
-        outcome: Option<String>,
+        action: Option<String>,
+        /// One bullet of what changed. Repeat up to three times. Required for
+        /// `--kind review`.
+        #[arg(long = "summary")]
+        summary: Vec<String>,
+        /// Attachment id to pin to this ask. Repeat for each one.
+        #[arg(long = "evidence")]
+        evidence: Vec<String>,
+        /// `Label:description`. Repeat for each choice.
+        #[arg(long = "option")]
+        options: Vec<String>,
         #[arg(long)]
-        status: Option<String>,
+        multi: bool,
         #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        project: Option<String>,
-        /// `YYYY-MM-DD`, or `none` to clear it.
-        #[arg(long)]
-        due: Option<String>,
-        #[arg(long)]
-        pr: Option<String>,
-        /// File proving the work is ready to review.
-        #[arg(long)]
-        evidence: Option<String>,
-        /// Exact action a person can approve in review, e.g. "Approve and merge PR".
-        #[arg(long)]
-        approval: Option<String>,
+        replace: bool,
+    },
+    /// The agreed outcome is achieved and nothing is left for a person.
+    Done {
+        reference: String,
+        /// Final brief: what the reader gets out of this.
+        #[arg(long, default_value = "")]
+        brief: String,
+    },
+    /// This will not be done, and saying so is the honest end.
+    Cancel {
+        reference: String,
+        #[arg(long, default_value = "")]
+        brief: String,
+    },
+    /// Give the task to somebody else, and tell them it is theirs.
+    Handoff {
+        reference: String,
+        /// `@handle`, or `@me`.
+        owner: String,
     },
     /// Hand a long-lived external wait to the relay, then let this run finish.
     Wait {
@@ -599,10 +612,8 @@ async fn run() -> Result<()> {
         Command::Tell(args) => tell(&client, args).await,
         Command::Ask(args) => ask(&client, &ctx, args).await,
         Command::Attach(args) => attach(&client, &ctx, args).await,
-        Command::Evidence(command) => evidence(&client, &ctx, command).await,
         Command::Chart(args) => chart(&client, &ctx, args).await,
         Command::Preview(args) => preview(&client, &ctx, args).await,
-        Command::Pr { url } => link_pr(&client, &ctx, url).await,
         Command::Workspace(command) => workspace(&client, command).await,
         Command::Agent(command) => agent(&client, command).await,
         Command::Invite(command) => invite(&client, command).await,
@@ -1160,7 +1171,7 @@ fn card_label(card: &MessageCard) -> &'static str {
     match card {
         MessageCard::Task { .. } => "task card",
         MessageCard::Run { .. } => "run card",
-        MessageCard::Question { .. } => "question",
+        MessageCard::Ask { .. } => "ask",
         MessageCard::Artifact { .. } => "artifact",
         MessageCard::Preview { .. } => "preview",
         MessageCard::PullRequest { .. } => "pull request",
@@ -1294,6 +1305,7 @@ async fn say(client: &Client, ctx: &RunContext, args: SayArgs, kind: MessageKind
             &format!("/api/channels/{channel_id}/messages"),
             json!({
                 "body": body,
+                "digest": args.digest,
                 "kind": kind,
                 "suggestions": args.suggestions,
                 "run_id": ctx.run_id,
@@ -1355,69 +1367,61 @@ async fn chart(client: &Client, ctx: &RunContext, args: ChartArgs) -> Result<()>
     Ok(())
 }
 
+/// Parse `Label:description` choices once, for `ask` and `task ask` alike.
+fn ask_options(raw: &[String]) -> Vec<AskOption> {
+    raw.iter()
+        .map(|raw| match raw.split_once(':') {
+            Some((label, description)) => AskOption {
+                label: label.trim().to_string(),
+                description: description.trim().to_string(),
+            },
+            None => AskOption {
+                label: raw.trim().to_string(),
+                description: String::new(),
+            },
+        })
+        .collect()
+}
+
+/// Hold here until a person answers. The relay long-polls in 90s slices, so a
+/// dropped connection costs one slice rather than the answer.
+async fn wait_for_answer(client: &Client, ask: &Ask) -> Result<Ask> {
+    loop {
+        let current: Ask = client.get(&format!("/api/asks/{}/wait", ask.id)).await?;
+        match current.status {
+            AskStatus::Answered => return Ok(current),
+            AskStatus::Cancelled => bail!("the ask was cancelled"),
+            AskStatus::Open => continue,
+        }
+    }
+}
+
+/// `patchwork ask` is sugar: an `answer` ask that blocks this run until it is
+/// answered. Everything else an agent needs from a person goes through
+/// `patchwork task ask`, which is the same primitive without the waiting.
 async fn ask(client: &Client, ctx: &RunContext, args: AskArgs) -> Result<()> {
     let run_id = ctx
         .run_id
         .clone()
         .ok_or_else(|| anyhow!("`ask` only works inside a run"))?;
 
-    let options: Vec<QuestionOption> = args
-        .options
-        .iter()
-        .map(|raw| match raw.split_once(':') {
-            Some((label, description)) => QuestionOption {
-                label: label.trim().to_string(),
-                description: description.trim().to_string(),
-            },
-            None => QuestionOption {
-                label: raw.trim().to_string(),
-                description: String::new(),
-            },
-        })
-        .collect();
-
-    let item = QuestionItem {
-        id: "q1".to_string(),
-        header: args.header.clone(),
-        question: args.question.clone(),
-        options,
-        allow_free_text: !args.no_free_text,
-        multi_select: args.multi,
-    };
-
-    let question: Question = client
+    let opened: Ask = client
         .post(
-            "/api/questions",
+            "/api/asks",
             json!({
+                "kind": AskKind::Answer,
                 "run_id": run_id,
-                "headline": args.header,
-                "items": [item],
+                "text": args.text,
+                "options": ask_options(&args.options),
+                "multi_select": args.multi,
+                "require_option": args.no_free_text,
                 "replace": args.replace,
             }),
         )
         .await?;
 
-    // Hold here until a human answers. The relay long-polls in 90s slices.
-    let answered = loop {
-        let current: Question = client
-            .get(&format!("/api/questions/{}/wait", question.id))
-            .await?;
-        match current.status {
-            QuestionStatus::Answered => break current,
-            QuestionStatus::Cancelled => bail!("the question was cancelled"),
-            QuestionStatus::Open => continue,
-        }
-    };
-
-    client.print(&answered, || {
-        for answer in answered.answers.iter().flatten() {
-            let mut parts = answer.values.clone();
-            if !answer.note.trim().is_empty() {
-                parts.push(answer.note.clone());
-            }
-            println!("{}", parts.join(", "));
-        }
-    });
+    let answered = wait_for_answer(client, &opened).await?;
+    client.print(&answered, || println!("{}", answered.answer_text()));
     Ok(())
 }
 
@@ -1545,35 +1549,6 @@ async fn attach(client: &Client, ctx: &RunContext, args: AttachArgs) -> Result<(
     Ok(())
 }
 
-async fn evidence(client: &Client, ctx: &RunContext, command: EvidenceCommand) -> Result<()> {
-    match command {
-        EvidenceCommand::List => {
-            let task_id = ctx
-                .task_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("evidence belongs to a task; this run has none"))?;
-            let detail: TaskDetail = client.get(&format!("/api/tasks/{task_id}")).await?;
-            client.print(&detail.attachments, || {
-                for attachment in &detail.attachments {
-                    println!(
-                        "{}\t{}\t{}",
-                        attachment.id, attachment.file_name, attachment.caption
-                    );
-                }
-            });
-        }
-        EvidenceCommand::Remove { attachment_id } => {
-            let attachment: Attachment = client
-                .delete(&format!("/api/files/{attachment_id}/evidence"))
-                .await?;
-            client.print(&attachment, || {
-                println!("removed {} from review evidence", attachment.file_name)
-            });
-        }
-    }
-    Ok(())
-}
-
 async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result<()> {
     let task_id = ctx
         .task_id
@@ -1609,18 +1584,17 @@ async fn preview(client: &Client, ctx: &RunContext, args: PreviewArgs) -> Result
     Ok(())
 }
 
-async fn link_pr(client: &Client, ctx: &RunContext, url: String) -> Result<()> {
-    let task_id = ctx
-        .task_id
-        .clone()
-        .ok_or_else(|| anyhow!("this run has no task to attach a pull request to"))?;
-    let task: Task = client
-        .patch(&format!("/api/tasks/{task_id}"), json!({ "pr_url": url }))
-        .await?;
-    client.print(&task, || {
-        println!("linked {}", task.pr_url.as_deref().unwrap_or_default())
-    });
-    Ok(())
+/// One line about where a task actually is, the same one everywhere. The relay
+/// derives the status and keeps the brief current, so nothing here has to guess.
+fn situation(task: &Task) -> String {
+    if let Some(ask) = &task.ask {
+        return format!("needs you [{}]: {}", ask.kind.as_str(), ask.text);
+    }
+    let brief = task.brief.trim();
+    if !brief.is_empty() {
+        return format!("{}: {brief}", task.status.as_str());
+    }
+    task.status.as_str().to_string()
 }
 
 async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result<()> {
@@ -1640,7 +1614,11 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 .collect();
             client.print(&filtered, || {
                 for task in &filtered {
-                    println!("{} [{}] {}", task.key, task.status.as_str(), task.title);
+                    println!("{} {}", task.key, task.title);
+                    // The brief and the ask are the whole of what another agent
+                    // needs to know from the board. Anything longer is the
+                    // wall this release exists to stop printing.
+                    println!("  {}", situation(task));
                 }
             });
         }
@@ -1656,14 +1634,17 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                 if !detail.task.outcome.trim().is_empty() {
                     println!("Expected result: {}", detail.task.outcome.trim());
                 }
+                if !detail.task.brief.trim().is_empty() {
+                    println!("Where it stands: {}", detail.task.brief.trim());
+                }
                 if let Some(worktree) = &detail.worktree {
                     println!("Worktree: {} ({})", worktree.path, worktree.branch);
                 }
                 if let Some(pr) = &detail.task.pr_url {
                     println!("Pull request: {pr}");
                 }
-                if let Some(action) = &detail.task.review_action {
-                    println!("Approval: {action}");
+                if let Some(ask) = &detail.task.ask {
+                    println!("Waiting on you [{}]: {}", ask.kind.as_str(), ask.text);
                 }
                 if let Some(continuation) = &detail.task.active_continuation {
                     println!(
@@ -1680,14 +1661,13 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
         TaskCommand::Create {
             title,
             outcome,
+            brief,
             owner,
-            status,
             project,
             due,
             once,
             allow_similar,
-            background,
-            start,
+            planned,
         } => {
             let owner_id = match owner {
                 Some(handle) => Some(resolve_member(client, ctx, &handle).await?),
@@ -1699,61 +1679,84 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
                     json!({
                         "title": title,
                         "outcome": outcome,
+                        "brief": brief,
                         "owner_id": owner_id,
-                        "status": status.as_deref().and_then(TaskStatus::parse),
+                        "status": planned.then_some("planned"),
                         "project_id": project,
                         "due_at": due.as_deref().map(parse_due).transpose()?,
                         "once_key": once,
                         "allow_similar": allow_similar,
                         "source_channel_id": ctx.channel_id,
-                        "background": background,
-                        "start": start,
+                        "start": !planned,
                     }),
                 )
                 .await?;
             client.print(&created, || println!("{} created", created.key));
         }
-        TaskCommand::Update {
-            reference,
-            title,
-            outcome,
-            status,
-            owner,
-            project,
-            due,
-            pr,
-            evidence,
-            approval,
-        } => {
-            let owner_id = match owner {
-                Some(handle) => Some(resolve_member(client, ctx, &handle).await?),
-                None => None,
-            };
-            if let Some(path) = evidence {
-                let detail: TaskDetail = client.get(&format!("/api/tasks/{reference}")).await?;
-                let mut evidence_ctx = ctx.clone();
-                evidence_ctx.task_id = Some(detail.task.id);
-                evidence_ctx.channel_id = Some(detail.task.discussion_channel_id);
-                upload_attachment(client, &evidence_ctx, &path, "Review evidence").await?;
-            }
+        TaskCommand::Brief { reference, text } => {
             let updated: Task = client
                 .patch(
                     &format!("/api/tasks/{reference}"),
+                    json!({ "brief": text.join(" ") }),
+                )
+                .await?;
+            client.print(&updated, || println!("{}: {}", updated.key, updated.brief));
+        }
+        TaskCommand::Ask {
+            reference,
+            kind,
+            text,
+            action,
+            summary,
+            evidence,
+            options,
+            multi,
+            replace,
+        } => {
+            let kind = AskKind::parse(&kind)
+                .ok_or_else(|| anyhow!("--kind is answer, review, decide, or unblock"))?;
+            let opened: Ask = client
+                .post(
+                    "/api/asks",
                     json!({
-                        "title": title,
-                        "outcome": outcome,
-                        "status": status.as_deref().and_then(TaskStatus::parse),
-                        "owner_id": owner_id,
-                        "project_id": project,
-                        "due_at": due.as_deref().map(parse_due).transpose()?,
-                        "pr_url": pr,
-                        "review_action": approval,
+                        "kind": kind,
+                        "task_id": reference,
+                        "run_id": ctx.run_id,
+                        "text": text,
+                        "action": action,
+                        "summary": summary,
+                        "evidence_ids": evidence,
+                        "options": ask_options(&options),
+                        "multi_select": multi,
+                        "replace": replace,
                     }),
                 )
                 .await?;
-            client.print(&updated, || {
-                println!("{} is now {}", updated.key, updated.status.as_str())
-            });
+            // An `answer` or `decide` ask is the run saying it cannot go on, so
+            // waiting is the honest thing to do. A review or unblock is handed
+            // over and the run is free to end.
+            if kind.blocks_run() && ctx.run_id.is_some() {
+                let answered = wait_for_answer(client, &opened).await?;
+                client.print(&answered, || println!("{}", answered.answer_text()));
+            } else {
+                client.print(&opened, || println!("asked: {}", opened.text));
+            }
+        }
+        TaskCommand::Done { reference, brief } => {
+            close_task(client, &reference, TaskStatus::Done, &brief).await?;
+        }
+        TaskCommand::Cancel { reference, brief } => {
+            close_task(client, &reference, TaskStatus::Canceled, &brief).await?;
+        }
+        TaskCommand::Handoff { reference, owner } => {
+            let owner_id = resolve_member(client, ctx, &owner).await?;
+            let updated: Task = client
+                .patch(
+                    &format!("/api/tasks/{reference}"),
+                    json!({ "owner_id": owner_id }),
+                )
+                .await?;
+            client.print(&updated, || println!("{} handed over", updated.key));
         }
         TaskCommand::Wait {
             summary,
@@ -1799,6 +1802,29 @@ async fn task(client: &Client, ctx: &RunContext, command: TaskCommand) -> Result
             });
         }
     }
+    Ok(())
+}
+
+/// Closing is the only status anybody chooses, and it is worth one last brief:
+/// the reader gets the result without opening the task.
+async fn close_task(
+    client: &Client,
+    reference: &str,
+    status: TaskStatus,
+    brief: &str,
+) -> Result<()> {
+    let updated: Task = client
+        .patch(
+            &format!("/api/tasks/{reference}"),
+            json!({
+                "status": status,
+                "brief": (!brief.trim().is_empty()).then_some(brief),
+            }),
+        )
+        .await?;
+    client.print(&updated, || {
+        println!("{} is {}", updated.key, updated.status.as_str())
+    });
     Ok(())
 }
 

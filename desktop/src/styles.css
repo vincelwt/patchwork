@@ -1,7 +1,3 @@
-/* Patchwork's visual language.
-   Calm, near-monochrome, native-feeling. Hierarchy comes from spacing, weight
-   and a single flat surface tint — not from rules, boxes or drop shadows.
-   Colour is reserved for state that actually matters. */
 
 :root {
   --bg: #ffffff;
@@ -155,8 +151,6 @@ code {
     transform: rotate(360deg);
   }
 }
-
-/* --- shell --------------------------------------------------------------- */
 
 .shell {
   display: grid;
@@ -431,8 +425,6 @@ body.resizing {
   margin-bottom: 10px;
 }
 
-/* --- main ---------------------------------------------------------------- */
-
 .main {
   display: flex;
   flex-direction: column;
@@ -542,8 +534,6 @@ body.resizing {
   flex: 1;
 }
 
-/* --- chat ---------------------------------------------------------------- */
-
 .timeline {
   flex: 1;
   overflow-y: auto;
@@ -644,17 +634,6 @@ body.resizing {
 .message-author {
   font-weight: 600;
   letter-spacing: -0.006em;
-}
-.message-time,
-.message-badge {
-  color: var(--text-faint);
-  font-size: 12px;
-}
-.message-badge {
-  background: var(--tint-strong);
-  border-radius: 4px;
-  padding: 0 5px;
-  font-size: 11px;
 }
 /* What the run cost, in the header of the reply it produced. */
 .message-run {
@@ -986,8 +965,6 @@ body.resizing {
   cursor: default;
 }
 
-/* --- attachments ---------------------------------------------------------- */
-
 .attachments {
   display: flex;
   flex-wrap: wrap;
@@ -1092,8 +1069,6 @@ body.resizing {
   z-index: 30;
 }
 
-/* --- emoji picker --------------------------------------------------------- */
-
 .emoji-picker {
   background: var(--bg);
   border: 1px solid var(--line);
@@ -1162,8 +1137,6 @@ body.resizing {
   color: var(--accent);
   font-weight: 550;
 }
-
-/* --- composer ------------------------------------------------------------ */
 
 .composer-wrap {
   padding: 14px 28px 20px;
@@ -1329,8 +1302,6 @@ body.resizing {
 .mention-menu .row.active {
   background: var(--tint);
 }
-
-/* --- cards --------------------------------------------------------------- */
 
 .card {
   background: var(--surface);
@@ -1505,8 +1476,6 @@ button.chip:not(.accent):not(.positive):not(.caution):not(.danger):hover {
   cursor: default;
 }
 
-/* --- question card ------------------------------------------------------- */
-
 .question-option {
   display: flex;
   gap: 9px;
@@ -1538,6 +1507,29 @@ button.chip:not(.accent):not(.positive):not(.caution):not(.danger):hover {
   opacity: 0.8;
 }
 
+/* At most three bullets, so the reader can decide without opening anything. */
+.ask-summary {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.ask-summary li {
+  margin-top: 2px;
+}
+
+/* Everything an agent needs beyond a name and a description, folded away:
+   a first agent is two answers, not fourteen. */
+details.advanced > summary {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+  margin: 14px 0 4px;
+}
+details.advanced > summary:hover {
+  color: var(--text-muted);
+}
+
 .field {
   width: 100%;
   background: var(--surface-sunken);
@@ -1562,8 +1554,6 @@ textarea.field {
 select.field {
   cursor: pointer;
 }
-
-/* --- dropdown ------------------------------------------------------------ */
 
 .dropdown {
   position: relative;
@@ -1664,8 +1654,6 @@ select.field {
   color: var(--text-faint);
 }
 
-/* --- toggle --------------------------------------------------------------- */
-
 .toggle-row {
   display: flex;
   align-items: center;
@@ -1720,8 +1708,6 @@ select.field {
   margin-top: 2px;
 }
 
-/* --- board --------------------------------------------------------------- */
-
 .board {
   display: flex;
   gap: 12px;
@@ -1736,9 +1722,6 @@ select.field {
   display: flex;
   flex-direction: column;
   min-height: 0;
-}
-.board-column.collapsed {
-  width: 116px;
 }
 .board-column-head {
   display: flex;
@@ -1767,19 +1750,6 @@ select.field {
   min-height: 0;
   padding-bottom: 24px;
   border-radius: var(--radius-card);
-}
-.board-column.drop-target .board-column-body {
-  background: var(--tint);
-  outline: 1px dashed var(--tint-strong);
-}
-
-.board-empty {
-  border: 1px dashed var(--line);
-  border-radius: var(--radius-card);
-  padding: 18px 12px;
-  text-align: center;
-  color: var(--text-faint);
-  font-size: 13px;
 }
 
 .task-card {
@@ -1816,8 +1786,6 @@ select.field {
   flex-wrap: wrap;
   align-items: center;
 }
-
-/* --- pages --------------------------------------------------------------- */
 
 .page {
   flex: 1;
@@ -1943,8 +1911,6 @@ button.row:hover,
   margin-top: 14px;
   cursor: pointer;
 }
-
-/* --- run log ------------------------------------------------------------- */
 
 .run-event {
   display: flex;
@@ -2153,8 +2119,6 @@ details.run-thought > summary > svg {
   padding-left: 12px;
 }
 
-/* --- onboarding and overlays --------------------------------------------- */
-
 .onboarding {
   height: 100%;
   display: grid;
@@ -2207,20 +2171,12 @@ details.run-thought > summary > svg {
 }
 
 /* On the box you are talking into, not in the row of tools underneath it. */
-.composer,
-.task-composer {
-  position: relative;
-}
 .icon-button.dictate {
   position: absolute;
   top: 6px;
   right: 6px;
   z-index: 2;
   color: var(--text-faint);
-}
-.task-composer .icon-button.dictate {
-  top: 12px;
-  right: 0;
 }
 .icon-button.dictate:hover {
   color: var(--text-muted);
@@ -2299,37 +2255,6 @@ details.run-thought > summary > svg {
   overflow: auto;
 }
 
-/* A picture and a chart are the thing itself: no frame, no header. The
-   message above is the title; the chart draws none of its own. */
-.artifact,
-.chart {
-  margin: 8px 0 0;
-  max-width: 640px;
-}
-.artifact img {
-  display: block;
-  max-width: 100%;
-  border-radius: 10px;
-  cursor: zoom-in;
-}
-.artifact .card-sub,
-.chart .card-sub {
-  margin-top: 4px;
-}
-
-/* Evidence pinned to a task, small enough to sit under its description. */
-.task-files {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-}
-.task-files .image-attachment img {
-  max-height: 96px;
-  border-radius: 8px;
-}
-
 /* Talking to a run while it works: the composer's own box, sitting under the
    log rather than floating over it. */
 .run-steer {
@@ -2358,6 +2283,35 @@ details.run-thought > summary > svg {
 }
 .original-request > summary:hover {
   color: var(--text-muted);
+}
+
+/* A report or a table in the transcript: its name until you want the thing
+   itself, because a conversation is not a document viewer by default. */
+.evidence-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  margin-top: 6px;
+}
+.evidence-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.evidence-head:hover {
+  background: var(--tint);
+}
+.evidence-head .name {
+  flex: 1;
+  font-weight: 550;
+}
+.evidence-head .sub {
+  color: var(--text-faint);
+  font-size: 12.5px;
 }
 
 .task-list {
@@ -2476,98 +2430,6 @@ details.run-thought > summary > svg {
 
 /* The task composer: the sentence is the dialog, and what it needs to know
    sits under it as controls rather than as a form in front of it. */
-.task-composer {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 18px 0 4px;
-  border-radius: 12px;
-}
-.task-composer.dropping {
-  outline: 2px dashed var(--accent);
-  outline-offset: 6px;
-}
-.task-composer-text {
-  border: none;
-  outline: none;
-  resize: none;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 19px;
-  line-height: 1.45;
-  letter-spacing: -0.011em;
-  min-height: 132px;
-}
-.task-composer-text::placeholder {
-  color: var(--text-faint);
-}
-.task-composer-files {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.pending-image {
-  position: relative;
-  display: inline-flex;
-}
-.pending-image img {
-  height: 72px;
-  border-radius: 8px;
-  display: block;
-}
-.pending-image .remove {
-  position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 18px;
-  height: 18px;
-  border-radius: 999px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1;
-  display: grid;
-  place-items: center;
-}
-.task-composer-attributes {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 0 2px;
-  border-top: 1px solid var(--line);
-}
-.task-composer-fields,
-.task-composer-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-}
-.task-composer-actions {
-  justify-content: flex-end;
-  margin-left: auto;
-}
-.task-composer-attributes .button,
-.task-composer-attributes .dropdown,
-.task-composer-attributes .chip-button {
-  flex: none;
-}
-.task-composer-attributes .button {
-  font-size: 13px;
-  padding: 5px 10px;
-}
-.task-composer-attributes .dropdown-trigger {
-  font-size: 13px;
-  max-width: 150px;
-}
-.task-composer-attributes .toggle-row .name {
-  font-size: 13px;
-}
 .chip-button {
   font-size: 13px;
   color: var(--text-muted);
@@ -2576,13 +2438,6 @@ details.run-thought > summary > svg {
 }
 .chip-button:hover {
   background: var(--tint);
-}
-.task-composer-attributes .toggle-row {
-  flex: none;
-  width: auto;
-  padding: 5px;
-  gap: 8px;
-  margin-top: 0;
 }
 .date-input.quiet {
   background: transparent;
@@ -2653,12 +2508,6 @@ details.run-thought > summary > svg {
   padding: 3px;
   flex: none;
 }
-
-/* --- markdown ------------------------------------------------------------- */
-
-/* An agent's reply is prose, and prose needs a typographic scale. The rules
-   here are about restraint: enough hierarchy to skim a long answer, never so
-   much that a three-line reply looks like a document. */
 
 .md > *:first-child {
   margin-top: 0;
@@ -2853,8 +2702,6 @@ details.run-thought > summary > svg {
   padding-left: 1.15em;
 }
 
-/* --- a run in the transcript ---------------------------------------------- */
-
 /* A run is not an announcement. It is one line, the same weight as a status
    note, that you can act on without it dominating the conversation. */
 .run-line {
@@ -2921,8 +2768,6 @@ details.run-thought > summary > svg {
   color: var(--text-muted);
   font-size: 13px;
 }
-
-/* --- menus ---------------------------------------------------------------- */
 
 .menu-anchor {
   position: relative;
@@ -3031,8 +2876,6 @@ details.run-thought > summary > svg {
   white-space: nowrap;
 }
 
-/* --- editable text -------------------------------------------------------- */
-
 .editable {
   display: block;
   width: 100%;
@@ -3062,8 +2905,6 @@ details.run-thought > summary > svg {
   color: inherit;
 }
 
-/* --- task page ------------------------------------------------------------ */
-
 .task-header {
   padding: 2px 20px 14px;
   max-width: 1000px;
@@ -3077,49 +2918,6 @@ details.run-thought > summary > svg {
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.25;
-}
-
-/* Four steps, so where the task is arrives before you have read anything. */
-.task-rail {
-  display: flex;
-  gap: 3px;
-  margin-top: 14px;
-}
-.rail-step {
-  flex: 1;
-  font-size: 12.5px;
-  color: var(--text-faint);
-  text-align: left;
-  padding: 5px 0 0;
-  border-top: 2.5px solid var(--tint);
-  transition:
-    color 0.14s ease,
-    border-color 0.14s ease;
-}
-.rail-step:hover {
-  color: var(--text-muted);
-  border-top-color: var(--tint-strong);
-}
-.rail-step[aria-disabled="true"] {
-  cursor: default;
-  opacity: 0.45;
-}
-.rail-step[aria-disabled="true"]:not(.current):hover {
-  color: var(--text-faint);
-  border-top-color: var(--tint);
-}
-.rail-step.past {
-  border-top-color: color-mix(in srgb, var(--text) 26%, transparent);
-  color: var(--text-faint);
-}
-.rail-step.current {
-  border-top-color: var(--accent);
-  color: var(--text);
-  font-weight: 550;
-}
-.rail-step.current.blocked {
-  border-top-color: var(--danger);
-  color: var(--danger);
 }
 
 /* One line about where the task is, and one button about it. */
@@ -3238,58 +3036,6 @@ details.run-thought > summary > svg {
   display: flex;
   flex-direction: column;
 }
-.review-picker {
-  display: flex;
-  gap: 7px;
-  overflow-x: auto;
-  padding: 2px 14px 10px;
-  flex: none;
-}
-.review-pick {
-  width: 144px;
-  flex: none;
-  padding: 8px 10px;
-  border-radius: 9px;
-  background: var(--surface-sunken);
-  color: var(--text-muted);
-  text-align: left;
-}
-.review-pick.active {
-  background: var(--accent-soft);
-  color: var(--text);
-}
-.review-pick span,
-.review-pick strong {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.review-pick span {
-  color: var(--text-faint);
-  font-size: 11.5px;
-  font-weight: 500;
-}
-.review-pick strong {
-  margin-top: 2px;
-  font-size: 12.5px;
-  font-weight: 550;
-}
-.review-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 0 14px 10px;
-  flex: none;
-}
-.review-toolbar .name,
-.review-toolbar .sub {
-  display: block;
-}
-.review-toolbar .sub {
-  color: var(--text-faint);
-  font-size: 12px;
-}
 .review-frame,
 .review-image,
 .review-video,
@@ -3307,19 +3053,6 @@ details.run-thought > summary > svg {
      until it says otherwise — including in dark mode, where its own dark text
      would otherwise land on our dark surface. */
   background: #fff;
-}
-.review-image {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: auto;
-  cursor: zoom-in;
-}
-.review-image img {
-  display: block;
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
 }
 .review-video {
   object-fit: contain;
@@ -3432,8 +3165,6 @@ details.run-thought > summary > svg {
   line-height: 1.5;
 }
 
-/* --- board ---------------------------------------------------------------- */
-
 .column-dot {
   width: 7px;
   height: 7px;
@@ -3527,8 +3258,6 @@ details.run-thought > summary > svg {
   color: var(--bg);
 }
 
-/* --- sidebar signals ------------------------------------------------------ */
-
 .group-head {
   display: flex;
   align-items: center;
@@ -3584,8 +3313,6 @@ details.run-thought > summary > svg {
 .badge.danger {
   background: var(--danger);
 }
-
-/* --- inbox ---------------------------------------------------------------- */
 
 .inbox-row {
   display: flex;
@@ -3648,8 +3375,6 @@ details.run-thought > summary > svg {
   flex: none;
   margin-top: 2px;
 }
-
-/* --- command palette ------------------------------------------------------ */
 
 .palette {
   width: 620px;
@@ -3753,8 +3478,6 @@ details.run-thought > summary > svg {
   color: var(--text-muted);
 }
 
-/* --- channel header ------------------------------------------------------- */
-
 .topbar-hash {
   display: flex;
   color: var(--text-faint);
@@ -3797,8 +3520,6 @@ details.run-thought > summary > svg {
   margin-left: 10px;
   box-shadow: none;
 }
-
-/* --- machines ------------------------------------------------------------- */
 
 .machine {
   border: 1px solid var(--line);
@@ -3863,31 +3584,8 @@ details.run-thought > summary > svg {
   color: var(--text-faint);
 }
 
-/* --- settings ------------------------------------------------------------- */
-
 /* Tabs, not a toolbar: they hug their labels so the strip reads as navigation
    rather than as a row of buttons competing with the content below it. */
-.settings-tabs {
-  display: inline-flex;
-  flex-wrap: wrap;
-  max-width: 100%;
-  margin: 18px 0 4px;
-}
-.settings-tabs button {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
-}
-/* The icon is the label's marker, not a second thing to read: it stays a shade
-   back until the tab is the one you are on. */
-.settings-tabs button svg {
-  opacity: 0.55;
-}
-.settings-tabs button.active svg {
-  opacity: 1;
-}
 
 /* The relay's vitals: two rates worth a bar, and five facts worth a number. */
 .health {

@@ -1,26 +1,35 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChartAssemblyInput } from "flint-chart";
 import type { EChartsType } from "echarts";
-import { normalizedChartSpec } from "@client/evidence";
+import { evidenceKind, isTextEvidence, normalizedChartSpec } from "@client/evidence";
 import { useApi, useAppSelector, store } from "../lib/store";
 import { bytes, duration, pullRequestTone, statusLabel, statusTone } from "../lib/format";
 import { openExternal } from "../lib/desktop";
-import { useFileUrl, usePreviewUrl } from "../lib/file";
+import { useFileUrl, useGrantedFileUrl, usePreviewUrl } from "../lib/file";
 import { Chip, proseText, useNavigation } from "./common";
-import { Lightbox } from "./Evidence";
+import { Lightbox, TextEvidence } from "./Evidence";
 import {
   ExternalIcon,
   PreviewIcon,
   QuestionIcon,
   RunIcon,
-  TasksIcon,
 } from "./icons";
-import type { MessageCard, QuestionAnswer } from "@client/types";
+import type { Attachment, MessageCard } from "@client/types";
 
-/// Cards are how tasks, runs, questions, artifacts, previews and pull requests
+/// Cards are how tasks, runs, asks, artifacts, previews and pull requests
 /// appear inline in a conversation — the same objects the rest of the app
 /// navigates to, not copies of them.
-export function Card({ card, body = "" }: { card: MessageCard; body?: string }) {
+export function Card({
+  card,
+  body = "",
+  attachments = [],
+}: {
+  card: MessageCard;
+  body?: string;
+  /// The message's own files, so an artifact card renders as the evidence it
+  /// points at rather than as a second, thinner viewer.
+  attachments?: Attachment[];
+}) {
   // The message above already says it. A caption that repeats the sentence
   // word for word is the same title twice.
   const captionOf = (caption?: string) =>
@@ -31,15 +40,18 @@ export function Card({ card, body = "" }: { card: MessageCard; body?: string }) 
       return <TaskCardInline taskId={card.task_id} />;
     case "run":
       return <RunCardInline runId={card.run_id} />;
-    case "question":
-      return <QuestionCard questionId={card.question_id} />;
-    case "artifact":
-      return (
-        <ArtifactCard
-          attachmentId={card.attachment_id}
-          caption={captionOf(card.caption)}
-        />
+    case "ask":
+      return <AskCard askId={card.ask_id} />;
+    case "artifact": {
+      const attachment = attachments.find(
+        (candidate) => candidate.id === card.attachment_id,
       );
+      return attachment ? (
+        <EvidenceCard attachment={attachment} caption={captionOf(card.caption)} />
+      ) : (
+        <PinnedEvidence attachmentId={card.attachment_id} />
+      );
+    }
     case "preview":
       return <PreviewCard previewId={card.preview_id} />;
     case "pull_request":
@@ -49,32 +61,23 @@ export function Card({ card, body = "" }: { card: MessageCard; body?: string }) 
   }
 }
 
+/// What the task is called and where it stands. The key, the owner and the
+/// status were three more things to read that the brief already accounts for.
 function TaskCardInline({ taskId }: { taskId: string }) {
-  const { task, owner } = useAppSelector((data) => {
-    const task = data.tasks.find((candidate) => candidate.id === taskId);
-    return {
-      task,
-      owner: data.members.find((member) => member.id === task?.owner_id),
-    };
-  });
+  const task = useAppSelector((data) =>
+    data.tasks.find((candidate) => candidate.id === taskId),
+  );
   const { go } = useNavigation();
   if (!task) return null;
 
   return (
     <button
       className="card task-inline"
+      title={task.key}
       onClick={() => go({ kind: "task", id: task.id })}
     >
-      <div className="card-head">
-        <TasksIcon size={14} />
-        <span>{task.key}</span>
-      </div>
       <div className="card-title">{task.title}</div>
-      {task.outcome && <div className="card-sub">{task.outcome}</div>}
-      <div className="card-row">
-        <Chip tone={statusTone(task.status)}>{statusLabel(task.status)}</Chip>
-        {owner && <Chip>{owner.display_name}</Chip>}
-      </div>
+      {task.brief && <div className="card-sub">{task.brief}</div>}
     </button>
   );
 }
@@ -117,9 +120,12 @@ function RunCardInline({ runId }: { runId: string }) {
     return (
       <div className="run-line">
         <RunIcon size={14} />
+        {/* Which runtime it was is a fact about the plumbing. What a reader
+            wants from this line is that it is over and roughly how long it
+            took. */}
         <span className="text">
           <span className="who">{agent?.display_name} </span>
-          {run.status === "cancelled" ? "was stopped" : `ran ${run.runtime}`} ·{" "}
+          {run.status === "cancelled" ? "stopped" : "finished"} ·{" "}
           {duration(run.started_at, run.ended_at)}
         </span>
         <button
@@ -161,121 +167,103 @@ function RunCardInline({ runId }: { runId: string }) {
   );
 }
 
-/// The clarification flow: an agent's question is answered in place, and the
-/// answer goes straight back to the waiting run.
-function QuestionCard({ questionId }: { questionId: string }) {
-  const question = useAppSelector((data) => data.questions[questionId]);
+/// The one thing an agent needs from a person, answered where it was asked.
+///
+/// Every way out of it is the same call: picking an option, typing a sentence,
+/// or pressing the action a review names. Approval is not a separate gesture,
+/// it is answering with the label on the button.
+function AskCard({ askId }: { askId: string }) {
+  const ask = useAppSelector((data) => data.asks[askId]);
   const api = useApi();
-  const [selection, setSelection] = useState<Record<string, string[]>>({});
-  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [picked, setPicked] = useState<string[]>([]);
+  const [note, setNote] = useState("");
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState("");
 
   useEffect(() => {
-    // The card event can arrive just before its question transaction settles.
-    void store.loadQuestion(questionId).catch(() => {});
-  }, [questionId]);
+    // The card event can arrive just before its ask transaction settles.
+    void store.loadAsk(askId).catch(() => {});
+  }, [askId]);
 
-  if (!question) return null;
-  // Only an open question is something to answer. A cancelled one is over:
-  // the run moved on without you, and offering a box that cannot post is
-  // worse than saying so.
-  const open = question.status === "open";
-  const answered = question.status === "answered";
+  if (!ask) return null;
+  // Only an open ask is something to answer. A cancelled one is over: the run
+  // moved on without you, and offering a box that cannot post is worse than
+  // saying so.
+  const open = ask.status === "open";
+  const answered = ask.status === "answered";
 
-  const toggle = (itemId: string, label: string, multi: boolean) => {
-    const current = selection[itemId] ?? [];
-    if (multi) {
-      setSelection({
-        ...selection,
-        [itemId]: current.includes(label)
-          ? current.filter((value) => value !== label)
-          : [...current, label],
-      });
-    } else {
-      setSelection({ ...selection, [itemId]: [label] });
-    }
-  };
-
-  const submit = async () => {
+  const answer = async (values: string[]) => {
     setSending(true);
     setFailed("");
     try {
-      const answers: QuestionAnswer[] = question.items.map((item) => ({
-        item_id: item.id,
-        values: selection[item.id] ?? [],
-        note: notes[item.id] ?? "",
-      }));
-      await api.answerQuestion(question.id, answers);
+      await api.answerAsk(ask.id, values, note.trim());
     } catch (error) {
       // A refusal often means this copy is stale, so show it and refresh.
       setFailed(String((error as Error).message ?? error));
-      void store.loadQuestion(question.id, true).catch(() => {});
+      void store.loadAsk(ask.id, true).catch(() => {});
     } finally {
       setSending(false);
     }
   };
 
-  const ready = question.items.every(
-    (item) =>
-      (selection[item.id]?.length ?? 0) > 0 || (notes[item.id] ?? "").trim() !== "",
-  );
+  const choose = (label: string) => {
+    if (!ask.multi_select) {
+      void answer([label]);
+      return;
+    }
+    setPicked((current) =>
+      current.includes(label)
+        ? current.filter((value) => value !== label)
+        : [...current, label],
+    );
+  };
+
+  const chosen = answered ? ask.answer : picked;
+  const ready = picked.length > 0 || note.trim() !== "";
 
   return (
     <div className="card">
       <div className="card-head">
         <QuestionIcon size={14} />
-        <span>{open || answered ? "Needs your answer" : "No longer needed"}</span>
+        <span>{open || answered ? "Needs you" : "No longer needed"}</span>
       </div>
-      {question.items.map((item) => (
-        <div key={item.id} style={{ marginTop: 8 }}>
-          {item.header && <Chip tone="accent">{item.header}</Chip>}
-          <div className="card-title" style={{ marginTop: 4 }}>
-            {item.question}
-          </div>
-          {item.options.map((option) => {
-            const chosen = (
-              answered
-                ? (question.answers?.find((a) => a.item_id === item.id)?.values ?? [])
-                : (selection[item.id] ?? [])
-            ).includes(option.label);
-            return (
-              <button
-                key={option.label}
-                className={`question-option${chosen ? " selected" : ""}`}
-                disabled={!open}
-                onClick={() => toggle(item.id, option.label, item.multi_select)}
-              >
-                <div>
-                  <div className="label">{option.label}</div>
-                  {option.description && (
-                    <div className="description">{option.description}</div>
-                  )}
-                </div>
-              </button>
-            );
-          })}
-          {item.allow_free_text && open && (
-            <input
-              className="field"
-              {...proseText}
-              style={{ marginTop: 6 }}
-              placeholder={item.options.length ? "Or say something else" : "Your answer"}
-              value={notes[item.id] ?? ""}
-              onChange={(event) =>
-                setNotes({ ...notes, [item.id]: event.target.value })
-              }
-            />
-          )}
-          {answered && (
-            <div className="card-sub" style={{ marginTop: 6 }}>
-              {question.answers
-                ?.find((a) => a.item_id === item.id)
-                ?.note}
-            </div>
-          )}
-        </div>
+      <div className="card-title">{ask.text}</div>
+      {ask.summary.length > 0 && (
+        <ul className="ask-summary">
+          {ask.summary.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      )}
+      {ask.evidence_ids.map((id) => (
+        <PinnedEvidence key={id} attachmentId={id} />
       ))}
+
+      {ask.options.map((option) => (
+        <button
+          key={option.label}
+          className={`question-option${chosen.includes(option.label) ? " selected" : ""}`}
+          disabled={!open || sending}
+          onClick={() => choose(option.label)}
+        >
+          <div>
+            <div className="label">{option.label}</div>
+            {option.description && (
+              <div className="description">{option.description}</div>
+            )}
+          </div>
+        </button>
+      ))}
+      {ask.allow_free_text && open && (
+        <input
+          className="field"
+          {...proseText}
+          style={{ marginTop: 6 }}
+          placeholder={ask.options.length ? "Or say something else" : "Your answer"}
+          value={note}
+          onChange={(event) => setNote(event.target.value)}
+        />
+      )}
 
       {failed && (
         <div className="card-sub" style={{ color: "var(--danger)" }}>
@@ -283,21 +271,20 @@ function QuestionCard({ questionId }: { questionId: string }) {
         </div>
       )}
 
-      {open && (
+      {open && (ask.action || ask.multi_select || ask.allow_free_text) && (
         <div className="card-row">
           <button
             className="button primary"
-            disabled={!ready || sending}
-            onClick={submit}
+            disabled={sending || (!ask.action && !ready)}
+            onClick={() => void answer(ask.action ? [ask.action] : picked)}
           >
-            {sending ? "Sending" : "Answer"}
+            {sending ? "Sending" : (ask.action ?? "Answer")}
           </button>
-          <span className="composer-hint">This unblocks the run.</span>
         </div>
       )}
       {answered && (
         <div className="card-row">
-          <Chip tone="positive">Answered</Chip>
+          <Chip tone="positive">{ask.answer.join(", ") || "Answered"}</Chip>
         </div>
       )}
       {!open && !answered && (
@@ -309,54 +296,104 @@ function QuestionCard({ questionId }: { questionId: string }) {
   );
 }
 
-function ArtifactCard({
-  attachmentId,
+/// An ask points at what to look at first. The file itself is already in the
+/// transcript with the message that posted it, so this is the same card again
+/// rather than a second gallery.
+function PinnedEvidence({ attachmentId }: { attachmentId: string }) {
+  const api = useApi();
+  const attachment = useAppSelector((data) => {
+    for (const list of Object.values(data.messages)) {
+      for (const message of list) {
+        const hit = message.attachments.find((item) => item.id === attachmentId);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  });
+
+  // Pinned from further back than this client has loaded: still openable.
+  if (!attachment) {
+    return (
+      <button
+        className="attachment-chip"
+        onClick={() => void api.openFile(`/api/files/${attachmentId}`)}
+      >
+        Open the attached file
+      </button>
+    );
+  }
+  return <EvidenceCard attachment={attachment} />;
+}
+
+/// Evidence, rendered where it was posted.
+///
+/// One card for every kind: a screenshot opens big, a video plays, a report or
+/// a table renders as itself. Folded to a preview, because a transcript is a
+/// conversation and not a document viewer until you ask it to be.
+export function EvidenceCard({
+  attachment,
   caption,
 }: {
-  attachmentId: string;
+  attachment: Attachment;
   caption?: string;
 }) {
   const api = useApi();
-  const path = `/api/files/${attachmentId}`;
-  const url = useFileUrl(path);
-  const [broken, setBroken] = useState(false);
+  const kind = evidenceKind(attachment.mime, attachment.file_name);
+  const image = kind === "image";
+  const video = kind === "video";
+  const [open, setOpen] = useState(false);
   const [zoomed, setZoomed] = useState(false);
+  const [broken, setBroken] = useState(false);
+  // Only a video needs a URL the media element can fetch on its own; text is
+  // read through the authenticated client and images are already blobs.
+  const granted = useGrantedFileUrl(video ? attachment.id : undefined);
+  const imageUrl = useFileUrl(image && !broken ? attachment.url : "");
+  const label = caption || attachment.caption || attachment.file_name;
 
-  if (broken) {
+  if (image && !broken) {
+    if (!imageUrl) return <span className="attachment-chip">Loading image…</span>;
     return (
-      <div className="card">
-        <div className="card-head">
-          <span>Attached</span>
-        </div>
-        <button className="button" onClick={() => void api.openFile(path)}>
-          Open file
+      <>
+        <button
+          className="image-attachment"
+          title="Open this image"
+          onClick={() => setZoomed(true)}
+        >
+          <img src={imageUrl} alt={label} onError={() => setBroken(true)} />
         </button>
-        {caption && <div className="card-sub">{caption}</div>}
-      </div>
+        {zoomed && (
+          <Lightbox url={imageUrl} alt={label} onClose={() => setZoomed(false)} />
+        )}
+      </>
     );
   }
-  if (!url) return <div className="card-sub">Loading attachment…</div>;
 
-  // No frame around a picture: a border, a header and a caption stacked
-  // around an image say nothing the image does not.
-  return (
-    <figure className="artifact">
-      <img
-        src={url}
-        alt={caption ?? "attachment"}
-        title="Open this image"
-        onClick={() => setZoomed(true)}
-        onError={() => setBroken(true)}
+  if (video) {
+    return granted ? (
+      <video className="review-video" src={granted} controls preload="metadata" />
+    ) : (
+      <span className="attachment-chip">Loading video…</span>
+    );
+  }
+
+  if (!isTextEvidence(kind)) {
+    return (
+      <AttachmentRow
+        fileName={attachment.file_name}
+        size={attachment.size}
+        onOpen={() => void api.openFile(attachment.url)}
       />
-      {caption && <figcaption className="card-sub">{caption}</figcaption>}
-      {zoomed && (
-        <Lightbox
-          url={url}
-          alt={caption ?? "attachment"}
-          onClose={() => setZoomed(false)}
-        />
-      )}
-    </figure>
+    );
+  }
+
+  return (
+    <div className="evidence-card">
+      <button className="evidence-head" onClick={() => setOpen(!open)}>
+        <span className="name">{label}</span>
+        <span className="sub">{open ? "Hide" : "Show"}</span>
+      </button>
+      {open && <TextEvidence attachment={attachment} />}
+    </div>
   );
 }
 

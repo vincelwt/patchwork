@@ -39,8 +39,7 @@ import {
   ThreadIcon,
 } from "./icons";
 import { Menu, type MenuItem } from "./ui";
-import { AttachmentRow, Card } from "./Cards";
-import { Lightbox } from "./Evidence";
+import { Card, EvidenceCard } from "./Cards";
 import { Markdown } from "./Markdown";
 import { ReactionPicker, ReactionRow } from "./Reactions";
 import { RunTrace } from "./RunActivity";
@@ -423,6 +422,8 @@ export function Timeline({
                 handles={handles}
                 run={run}
                 original={message.id === sourceMessageId}
+                newest={message.id === messages[messages.length - 1]?.id}
+                showWork={showWork}
                 replyTo={messageOf.get(message.reply_to_id ?? "")}
                 replyPreview={message.reply_to}
                 replyAuthor={authorOf.get(
@@ -464,7 +465,7 @@ export function DictateButton({
   return (
     <button
       ref={(node) => {
-        within.current = node?.closest(".composer, .task-composer") ?? null;
+        within.current = node?.closest(".composer") ?? null;
       }}
       className={`icon-button dictate${recording ? " recording" : ""}`}
       title={error || (recording ? "Stop dictating (⌘D)" : "Dictate (⌘D)")}
@@ -530,6 +531,8 @@ export const MessageRow = memo(function MessageRow({
   handles,
   run,
   original = false,
+  newest = false,
+  showWork = false,
   replyTo,
   replyPreview,
   replyAuthor,
@@ -543,6 +546,10 @@ export const MessageRow = memo(function MessageRow({
   run?: Run;
   /// The immutable request this task started from.
   original?: boolean;
+  /// The last thing said here. Only the newest message offers next steps: a
+  /// transcript scattered with old suggestions is a transcript of dead ends.
+  newest?: boolean;
+  showWork?: boolean;
   replyTo?: Message;
   replyPreview?: Message["reply_to"];
   replyAuthor?: Member;
@@ -653,11 +660,12 @@ export const MessageRow = memo(function MessageRow({
       <div className="message-main">
         {showHead && (
           <div className="message-head">
+            {/* No "agent" badge: the avatar is already a circle rather than a
+                squircle, and by now everyone knows which teammates are which. */}
             <span className="message-author">{author?.display_name ?? "Unknown"}</span>
-            {author?.kind === "agent" && <span className="message-badge">agent</span>}
             <span className="message-time">{timeOfDay(message.created_at)}</span>
             {message.edited_at && <span className="message-time">edited</span>}
-            {run && <RunMeta run={run} />}
+            {run && <RunMeta run={run} showWork={showWork} />}
           </div>
         )}
         {message.reply_to_id && (
@@ -686,19 +694,25 @@ export const MessageRow = memo(function MessageRow({
                 <Markdown body={message.body} handles={handles} />
               </details>
             ) : (
-              <Markdown body={message.body} handles={handles} />
+              <Body message={message} agent={author?.kind === "agent"} handles={handles} />
             )}
           </div>
         )}
-        {message.card && <Card card={message.card} body={message.body} />}
+        {message.card && (
+          <Card
+            card={message.card}
+            body={message.body}
+            attachments={message.attachments}
+          />
+        )}
         {message.attachments.length > 0 && (
           <div className="attachments">
             {message.attachments.map((attachment: Attachment) => (
-              <Attached key={attachment.id} attachment={attachment} />
+              <EvidenceCard key={attachment.id} attachment={attachment} />
             ))}
           </div>
         )}
-        {message.suggestions?.length > 0 && <Suggestions message={message} />}
+        {message.suggestions?.length > 0 && newest && <Suggestions message={message} />}
         <ReactionRow message={message} onAdd={setPicker} />
         {message.reply_count > 0 && (
           <button
@@ -822,62 +836,63 @@ function selectionIn(row: Node | null) {
   return row.contains(selection.anchorNode) ? text : "";
 }
 
-/// What the run behind a reply cost, sitting in the reply's own header: which
-/// runtime, how long, and the way into the full trace. Live runs say nothing
-/// here — the pill above the composer is already saying it.
-function RunMeta({ run }: { run: Run }) {
+/// Long enough that reading it is a decision rather than a glance.
+const FOLD_AFTER = 600;
+
+/// An agent writing at length is normal; a conversation made of essays is not.
+/// Past a paragraph or so the digest stands in for the message, and the rest is
+/// one press away. A person's own words are never folded: they wrote what they
+/// meant to write.
+function Body({
+  message,
+  agent,
+  handles,
+}: {
+  message: Message;
+  agent: boolean;
+  handles?: Set<string>;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!agent || open || message.body.length <= FOLD_AFTER) {
+    return <Markdown body={message.body} handles={handles} />;
+  }
+  return (
+    <>
+      <Markdown body={digestOf(message)} handles={handles} />
+      <button className="activity-toggle" onClick={() => setOpen(true)}>
+        Show more
+      </button>
+    </>
+  );
+}
+
+/// The relay writes a digest; an older message has none, and its first sentence
+/// is the closest thing to one it has.
+function digestOf(message: Message): string {
+  if (message.digest) return message.digest;
+  const first = /^.*?[.!?](\s|$)/s.exec(message.body.trim());
+  return (first?.[0] ?? message.body.slice(0, FOLD_AFTER)).trim();
+}
+
+/// What the run behind a reply cost. A run that finished is a fact about how
+/// the reply was made, not news, so it only draws itself when the reader has
+/// asked to see the work, or when it failed, which is always news.
+function RunMeta({ run, showWork }: { run: Run; showWork: boolean }) {
   const { inspect } = useNavigation();
   if (!["succeeded", "failed", "cancelled"].includes(run.status)) return null;
+  const failed = run.status === "failed";
+  if (!failed && !showWork) return null;
   return (
     <button
-      className={`message-run${run.status === "failed" ? " failed" : ""}`}
+      className={`message-run${failed ? " failed" : ""}`}
       title="Open the run"
       onClick={() => inspect({ kind: "run", runId: run.id })}
     >
       <RunIcon size={11} />
-      {run.status === "cancelled" ? "stopped" : run.runtime}
+      {failed ? "failed" : run.status === "cancelled" ? "stopped" : "finished"}
       <span className="sep">·</span>
       {duration(run.started_at, run.ended_at)}
     </button>
-  );
-}
-
-/// An image someone dropped in should be visible without a download step, and
-/// legible without leaving the app: the thumbnail opens into the zoom view.
-export function Attached({ attachment }: { attachment: Attachment }) {
-  const api = useApi();
-  const image = attachment.mime.startsWith("image/");
-  const url = useFileUrl(image ? attachment.url : "");
-  const [broken, setBroken] = useState(false);
-  const [zoomed, setZoomed] = useState(false);
-
-  if (image && !broken) {
-    if (!url) return <span className="attachment-chip">Loading image…</span>;
-    return (
-      <>
-        <button
-          className="image-attachment"
-          title="Open this image"
-          onClick={() => setZoomed(true)}
-        >
-          <img src={url} alt={attachment.file_name} onError={() => setBroken(true)} />
-        </button>
-        {zoomed && (
-          <Lightbox
-            url={url}
-            alt={attachment.caption || attachment.file_name}
-            onClose={() => setZoomed(false)}
-          />
-        )}
-      </>
-    );
-  }
-  return (
-    <AttachmentRow
-      fileName={attachment.file_name}
-      size={attachment.size}
-      onOpen={() => void api.openFile(attachment.url)}
-    />
   );
 }
 
@@ -1273,7 +1288,7 @@ function ComposerBox({
     if (channel.kind !== "task" || !channel.task_id) return "";
     const task = data.tasks.find((candidate) => candidate.id === channel.task_id);
     if (!task) return "";
-    const state = readTask(task, data.members, data.runs, data.questions);
+    const state = readTask(task, data.members, data.runs);
     if (state.owner?.kind !== "agent") return "";
     switch (state.situation) {
       case "working":

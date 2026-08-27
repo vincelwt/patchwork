@@ -1,9 +1,7 @@
-import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
-import { AgentEditor } from "@/components/AgentEditor";
-import { Avatar, Badge, Button, Card, Empty, Measured, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Card, Empty, Measured } from "@/components/ui";
 import { relative, runStatusLabel } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -16,7 +14,6 @@ export default function AgentScreen() {
   const store = useWorkspaceStore();
   const data = workspace.bootstrap;
   const agent = data?.members.find((member) => member.id === agentId && member.kind === "agent");
-  const [editing, setEditing] = useState(false);
   if (!agent || !data) return <Empty title="Agent unavailable" />;
 
   const profile = agent.agent!;
@@ -38,12 +35,7 @@ export default function AgentScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <Stack.Screen
-        options={{
-          title: agent.display_name,
-          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
-        }}
-      />
+      <Stack.Screen options={{ title: agent.display_name }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
        <Measured style={styles.measured}>
         <View style={styles.hero}>
@@ -103,9 +95,6 @@ export default function AgentScreen() {
         </Card>
        </Measured>
       </ScrollView>
-      <Sheet visible={editing} title={`Edit ${agent.display_name}`} onClose={() => setEditing(false)}>
-        <AgentEditor agent={agent} onSaved={() => setEditing(false)} />
-      </Sheet>
     </View>
   );
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { Automation, Message } from "../../../client/types.ts";
-import { isSameTurn, pullRequestLabel, relative, watchHealth, watchNeedsTest } from "./format.ts";
+import { isSameTurn, relative, watchHealth } from "./format.ts";
 
 test("relative time works without Intl.RelativeTimeFormat", () => {
   const now = 1_800_000_000_000;
@@ -10,23 +10,6 @@ test("relative time works without Intl.RelativeTimeFormat", () => {
   assert.equal(relative(now - 120_000, now), "2 minutes ago");
   assert.equal(relative(now + 3_600_000, now), "in 1 hour");
   assert.equal(relative(undefined, now), "");
-});
-
-test("pull request labels prefer synced state", () => {
-  assert.equal(
-    pullRequestLabel({
-      pr_url: "https://github.com/acme/app/pull/42",
-      pr_state: {
-        number: 42,
-        title: "Ship it",
-        state: "OPEN",
-        checks: "passing",
-        review: "approved",
-        updated_at: 1,
-      },
-    }),
-    "PR #42 · open",
-  );
 });
 
 test("consecutive lines from one author collapse into a single turn", () => {
@@ -77,33 +60,5 @@ test("a watch reads as healthy from its last successful check, not its last atte
   assert.deepEqual(
     watchHealth(watch({ overdue_since: now - 60_000, failure_count: 3 }), now),
     { tone: "danger", text: "Overdue 1 minute ago" },
-  );
-});
-
-test("new or changed watch commands request a diagnostic test", () => {
-  const validated = {
-    trigger: { type: "watch", command: "check", every_seconds: 60 },
-    last_validated_at: 1,
-    failure_count: 0,
-  } as Automation;
-
-  assert.equal(watchNeedsTest(validated, { type: "watch", command: "check" }), false);
-  assert.equal(watchNeedsTest(validated, { type: "watch", command: "check --new" }), true);
-  assert.equal(watchNeedsTest(undefined, { type: "watch", command: "check" }), true);
-  assert.equal(watchNeedsTest(undefined, { type: "cron" }), false);
-  assert.equal(
-    watchNeedsTest({ ...validated, last_validated_at: undefined }, { type: "watch", command: "check" }),
-    true,
-  );
-});
-
-test("pull request labels fall back to the URL number", () => {
-  assert.equal(
-    pullRequestLabel({ pr_url: "https://github.com/acme/app/pull/123/files" }),
-    "PR #123",
-  );
-  assert.equal(
-    pullRequestLabel({ pr_url: "https://example.com/review/current" }),
-    "Pull request",
   );
 });

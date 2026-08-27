@@ -108,14 +108,14 @@ export default function ChannelsScreen() {
     >
       {split ? (
         <>
-          <Text style={[styles.paneTitle, { color: theme.text }]}>Chat</Text>
+          <Text style={[styles.paneTitle, { color: theme.text }]}>Chats</Text>
           {groups}
         </>
       ) : (
         <Measured>
           {inlineTitle ? (
             <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
-              <Text accessibilityRole="header" style={[styles.title, { color: theme.text }]}>Chat</Text>
+              <Text accessibilityRole="header" style={[styles.title, { color: theme.text }]}>Chats</Text>
               <Glass interactive radius={24} style={styles.inlineActions}>{actions}</Glass>
             </View>
           ) : null}

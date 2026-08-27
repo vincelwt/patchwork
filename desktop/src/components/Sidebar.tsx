@@ -6,11 +6,7 @@ import { hasUnseen, useSeen } from "../lib/unread";
 import { Avatar, Field, Modal, useNavigation, WorkspaceMark } from "./common";
 import { Menu, MenuButton } from "./ui";
 import {
-  AgentIcon,
-  AutomationIcon,
   ChevronIcon,
-  FileIcon,
-  FolderIcon,
   HashIcon,
   InboxIcon,
   KeyboardIcon,
@@ -23,20 +19,21 @@ import {
   TasksIcon,
 } from "./icons";
 import { ConfirmDelete } from "./Pages";
-import { unreadInboxCount } from "@client/inbox";
-import { visibleOnTaskBoard } from "@client/tasks";
-import { isTerminalTaskStatus } from "@client/types";
+import { needsYou } from "@client/tasks";
 import type { Channel, Id, Member, Section } from "@client/types";
 import type { View as NavView } from "./common";
 
 export type Creatable =
-  | "task"
   | "channel"
   | "section"
   | "agent"
   | "skill"
   | "project"
   | "invite";
+
+/// Past this many channels a sidebar needs managing; below it, rename and
+/// delete buttons are chrome on a list you can read in one glance.
+const FILING_MATTERS_AT = 8;
 
 /// The main sidebar keeps everyday destinations and conversations in reach.
 /// Everything else lives in the drop-up behind your own name at the bottom,
@@ -90,10 +87,12 @@ export function Sidebar({
   const [deleting, setDeleting] = useState<Section | null>(null);
   const [menuFor, setMenuFor] = useState<{ channel: Channel; x: number; y: number } | null>(null);
 
-  const unread = unreadInboxCount(app.inbox);
-  const openTasks = app.tasks.filter(
-    (task) => visibleOnTaskBoard(task) && !isTerminalTaskStatus(task.status),
-  ).length;
+  // Only what somebody is actually waiting on you for. A count of everything
+  // not yet done is a number that never reaches zero, and a badge that never
+  // clears is a badge nobody reads.
+  const waitingOnYou = app.tasks.filter(needsYou).length;
+  const filing = app.channels.filter((channel) => channel.kind === "channel").length >=
+    FILING_MATTERS_AT;
 
   // Things actually addressed to you, per conversation. This is the number
   // worth colouring; plain activity gets a dot and nothing more.
@@ -175,13 +174,6 @@ export function Sidebar({
           header="Create"
           items={[
             {
-              key: "task",
-              label: "Task",
-              hint: "Work an agent or a person owns",
-              shortcut: "⌘N",
-              onSelect: () => onCreate("task"),
-            },
-            {
               key: "channel",
               label: "Channel",
               hint: "A room for a topic",
@@ -227,26 +219,19 @@ export function Sidebar({
       <div className="sidebar-scroll">
         <button
           className={`nav-item${isActive({ kind: "inbox" }) ? " active" : ""}`}
-          title="Inbox"
+          title="Home"
           onClick={() => go({ kind: "inbox" })}
         >
           <InboxIcon />
-          <span className="label">Inbox</span>
-          {unread > 0 && <span className="badge">{unread}</span>}
-        </button>
-        <button
-          className={`nav-item${isActive({ kind: "tasks" }) ? " active" : ""}`}
-          title="Tasks"
-          onClick={() => go({ kind: "tasks" })}
-        >
-          <TasksIcon />
-          <span className="label">Tasks</span>
-          {openTasks > 0 && <span className="count">{openTasks}</span>}
+          <span className="label">Home</span>
+          {waitingOnYou > 0 && <span className="badge">{waitingOnYou}</span>}
         </button>
 
         {app.sections.map((section) => {
           const list = grouped.get(section.id) ?? [];
-          const isCollapsed = collapsed[section.id];
+          // Nothing collapses in a short sidebar: hiding four rows to save
+          // four rows is a control that costs more than it returns.
+          const isCollapsed = filing && collapsed[section.id];
           const hiddenUnseen =
             isCollapsed && list.some((channel) => hasUnseen(channel, seen));
           return (
@@ -255,21 +240,25 @@ export function Sidebar({
                 <button
                   className={`group-label${isCollapsed ? " collapsed" : ""}`}
                   onClick={() =>
+                    filing &&
                     setCollapsed({ ...collapsed, [section.id]: !isCollapsed })
                   }
                 >
-                  <ChevronIcon size={13} />
+                  {filing && <ChevronIcon size={13} />}
                   <span>{sentenceCase(section.name)}</span>
                   {hiddenUnseen && <span className="dot unread" />}
                 </button>
-                <button
-                  className="icon-button small group-add"
-                  title={`New channel in ${sentenceCase(section.name)}`}
-                  onClick={() => onCreate("channel", section.id)}
-                >
-                  <PlusIcon size={14} />
-                </button>
-                {app.me?.is_admin && (
+                {/* Filing is only a problem once there is enough to file. */}
+                {filing && (
+                  <button
+                    className="icon-button small group-add"
+                    title={`New channel in ${sentenceCase(section.name)}`}
+                    onClick={() => onCreate("channel", section.id)}
+                  >
+                    <PlusIcon size={14} />
+                  </button>
+                )}
+                {filing && app.me?.is_admin && (
                   <MenuButton
                     className="icon-button small group-add"
                     align="right"
@@ -314,23 +303,26 @@ export function Sidebar({
           <div className="sidebar-group">
             <div className="group-head">
               <button
-                className={`group-label${collapsed.channels ? " collapsed" : ""}`}
+                className={`group-label${filing && collapsed.channels ? " collapsed" : ""}`}
                 onClick={() =>
+                  filing &&
                   setCollapsed({ ...collapsed, channels: !collapsed.channels })
                 }
               >
-                <ChevronIcon size={13} />
+                {filing && <ChevronIcon size={13} />}
                 <span>Channels</span>
               </button>
-              <button
-                className="icon-button small group-add"
-                title="New channel"
-                onClick={() => onCreate("channel")}
-              >
-                <PlusIcon size={14} />
-              </button>
+              {filing && (
+                <button
+                  className="icon-button small group-add"
+                  title="New channel"
+                  onClick={() => onCreate("channel")}
+                >
+                  <PlusIcon size={14} />
+                </button>
+              )}
             </div>
-            {!collapsed.channels &&
+            {!(filing && collapsed.channels) &&
               (grouped.get("") ?? []).map((channel) => (
                 <ChannelRow
                   key={channel.id}
@@ -448,40 +440,24 @@ function MoreMenu({
       title="You, and everything else"
       items={[
         {
-          key: "agents",
-          label: "Agents",
-          icon: <AgentIcon />,
-          onSelect: () => go({ kind: "agents" }),
-        },
-        {
-          key: "automations",
-          label: "Automations",
-          icon: <AutomationIcon />,
-          onSelect: () => go({ kind: "automations" }),
-        },
-        {
-          key: "skills",
-          label: "Skills",
-          icon: <FileIcon />,
-          onSelect: () => go({ kind: "skills" }),
-        },
-        {
-          key: "projects",
-          label: "Projects and machines",
-          icon: <FolderIcon />,
-          onSelect: () => go({ kind: "projects" }),
-        },
-        {
-          key: "members",
-          label: "Members",
+          key: "people",
+          label: "People",
+          hint: "Everyone here, human and agent",
           icon: <MembersIcon />,
-          onSelect: () => go({ kind: "members" }),
+          onSelect: () => go({ kind: "people" }),
         },
         {
-          key: "settings",
-          label: "Settings",
+          key: "workspace",
+          label: "Workspace",
+          hint: "Projects, machines, automations, skills, settings",
           icon: <SettingsIcon />,
-          onSelect: () => go({ kind: "settings" }),
+          onSelect: () => go({ kind: "workspace" }),
+        },
+        {
+          key: "board",
+          label: "Board",
+          icon: <TasksIcon />,
+          onSelect: () => go({ kind: "tasks" }),
         },
         "separator",
         {
@@ -957,6 +933,8 @@ function MemberRow({
   );
 }
 
+/// Which runtime powers an agent is not something a teammate's name should
+/// have to carry around.
 function presenceWord(member: Member) {
   switch (member.presence) {
     case "working":
@@ -966,13 +944,9 @@ function presenceWord(member: Member) {
     case "waiting":
       return "waiting for you";
     case "online":
-      return member.kind === "agent"
-        ? `ready · ${member.agent?.runtime ?? ""}`.trim()
-        : "online";
+      return member.kind === "agent" ? "ready" : "online";
     default:
-      return member.kind === "agent"
-        ? `offline · ${member.agent?.runtime ?? ""}`.trim()
-        : "offline";
+      return "offline";
   }
 }
 

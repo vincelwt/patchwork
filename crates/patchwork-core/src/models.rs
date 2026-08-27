@@ -219,8 +219,8 @@ pub enum MessageCard {
     Run {
         run_id: Id,
     },
-    Question {
-        question_id: Id,
+    Ask {
+        ask_id: Id,
     },
     Artifact {
         attachment_id: Id,
@@ -263,6 +263,11 @@ pub struct Message {
     pub kind: MessageKind,
     #[serde(default)]
     pub body: String,
+    /// One line standing in for a long message. Clients render the digest and
+    /// fold the prose behind it, so a wall of text costs one line of a
+    /// person's attention until they ask for the rest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<MessageCard>,
     /// Concrete follow-up actions the author offers to take next.
@@ -325,6 +330,10 @@ pub struct Attachment {
 // Tasks
 // ---------------------------------------------------------------------------
 
+/// Where a task is. Only `Done` and `Canceled` are ever chosen: the rest is
+/// derived by the relay from what is actually true — an open ask, a live run,
+/// or neither — so no agent has to remember to keep a status honest and no
+/// two clients can disagree about one. See [`derive_task_status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -334,6 +343,23 @@ pub enum TaskStatus {
     Review,
     Done,
     Canceled,
+}
+
+/// The one place that decides what a task's status is. Terminal wins, then an
+/// open ask (because nothing moves without the person it names), then a live
+/// run, then nothing.
+pub fn derive_task_status(
+    terminal: Option<TaskStatus>,
+    open_ask: Option<AskKind>,
+    has_live_work: bool,
+) -> TaskStatus {
+    match (terminal, open_ask) {
+        (Some(status), _) if status.is_terminal() => status,
+        (_, Some(AskKind::Review)) => TaskStatus::Review,
+        (_, Some(_)) => TaskStatus::Blocked,
+        _ if has_live_work => TaskStatus::Running,
+        _ => TaskStatus::Planned,
+    }
 }
 
 impl TaskStatus {
@@ -385,6 +411,27 @@ mod task_status_tests {
         assert!(TaskStatus::Canceled.is_terminal());
         assert!(TaskStatus::Done.is_terminal());
         assert!(!TaskStatus::Review.is_terminal());
+    }
+
+    #[test]
+    fn status_follows_the_ask_then_the_run() {
+        use super::{derive_task_status, AskKind};
+        // An open ask outranks a run: the person is the blocker either way.
+        assert_eq!(
+            derive_task_status(None, Some(AskKind::Review), true),
+            TaskStatus::Review
+        );
+        assert_eq!(
+            derive_task_status(None, Some(AskKind::Answer), true),
+            TaskStatus::Blocked
+        );
+        assert_eq!(derive_task_status(None, None, true), TaskStatus::Running);
+        assert_eq!(derive_task_status(None, None, false), TaskStatus::Planned);
+        // Closed work never goes back to asking because of a stale ask.
+        assert_eq!(
+            derive_task_status(Some(TaskStatus::Done), Some(AskKind::Review), true),
+            TaskStatus::Done
+        );
     }
 }
 
@@ -475,6 +522,11 @@ pub struct Task {
     /// The expected result, in the requester's words.
     #[serde(default)]
     pub outcome: String,
+    /// Where this task actually is, in at most two sentences. A state, not a
+    /// log: it is overwritten at every transition and never appended to, which
+    /// is what lets it be the card body everywhere without growing.
+    #[serde(default)]
+    pub brief: String,
     pub status: TaskStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<Id>,
@@ -483,9 +535,6 @@ pub struct Task {
     pub source_channel_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_message_id: Option<Id>,
-    /// Quiet delegated work that reports its result to the source conversation.
-    #[serde(default)]
-    pub background: bool,
     /// Its own discussion (a channel of kind `task`).
     pub discussion_channel_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,10 +551,11 @@ pub struct Task {
     pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_state: Option<PullRequestState>,
-    /// The exact action a person can approve while this task is in review.
-    /// Approval resumes the owning agent with this instruction.
+    /// The one thing being asked of a person right now, if anything is. A task
+    /// without one is not waiting on anybody and does not surface: no badge,
+    /// no Inbox row, no card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_action: Option<String>,
+    pub ask: Option<Ask>,
     pub created_by: Id,
     /// When this is meant to be done. The Inbox says so on the day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -849,25 +899,102 @@ pub enum RunEventKind {
 }
 
 // ---------------------------------------------------------------------------
-// Agent questions — a first-class clarification flow.
+// Asks — the single shape for everything an agent needs from a person.
+//
+// One primitive replaces four: the clarification question, review-plus-approval
+// button, blocked-with-prose, and "I mentioned you and hope you noticed". A
+// task has at most one open ask, which is what makes "needs you" countable and
+// makes silence mean silence.
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// A fact or preference only the person has. The run waits.
+    Answer,
+    /// Work is finished and needs looking at. Requires a summary and something
+    /// concrete to inspect.
+    Review,
+    /// A choice that belongs to the person, not the agent.
+    Decide,
+    /// The agent cannot proceed until the person does something outside
+    /// Patchwork — a credential, an account, an approval elsewhere.
+    Unblock,
+}
+
+impl AskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskKind::Answer => "answer",
+            AskKind::Review => "review",
+            AskKind::Decide => "decide",
+            AskKind::Unblock => "unblock",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "answer" => AskKind::Answer,
+            "review" => AskKind::Review,
+            "decide" => AskKind::Decide,
+            "unblock" => AskKind::Unblock,
+            _ => return None,
+        })
+    }
+
+    /// Whether answering it should resume the asking run. A review ask is
+    /// answered long after the run that opened it has finished.
+    pub fn blocks_run(self) -> bool {
+        matches!(self, AskKind::Answer | AskKind::Decide)
+    }
+}
+
+/// The longest an ask may be. Past this it is a conversation, not a question.
+pub const ASK_TEXT_LIMIT: usize = 200;
+/// The longest a task brief may be: two sentences of where things stand.
+pub const TASK_BRIEF_LIMIT: usize = 280;
+/// The longest an action label may be, so it still fits on a button.
+pub const ASK_ACTION_LIMIT: usize = 80;
+/// How many bullets a review summary may carry.
+pub const ASK_SUMMARY_LIMIT: usize = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Question {
+pub struct Ask {
     pub id: Id,
-    pub run_id: Id,
+    pub kind: AskKind,
+    /// The run that opened it, when one did. A review ask outlives its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Id>,
     pub agent_id: Id,
     pub channel_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<Id>,
-    #[serde(default)]
-    pub headline: String,
-    pub items: Vec<QuestionItem>,
-    pub status: QuestionStatus,
+    /// What is being asked, in one line.
+    pub text: String,
+    /// What the button says. Answering with it recorded is the approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answers: Option<Vec<QuestionAnswer>>,
+    pub action: Option<String>,
+    /// At most three bullets. Required on a review ask, so "have a look" can
+    /// never be the whole of what a person is handed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary: Vec<String>,
+    /// The attachments this ask pins — what to look at first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ids: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AskOption>,
+    #[serde(default = "default_true")]
+    pub allow_free_text: bool,
+    #[serde(default)]
+    pub multi_select: bool,
+    pub status: AskStatus,
+    /// The chosen options, or the free text, or both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_by: Option<Id>,
     pub created_at: Millis,
@@ -875,42 +1002,30 @@ pub struct Question {
     pub answered_at: Option<Millis>,
 }
 
+impl Ask {
+    /// What the person actually said, as one line for a prompt or a preview.
+    pub fn answer_text(&self) -> String {
+        let mut parts = self.answer.clone();
+        if !self.note.is_empty() {
+            parts.push(self.note.clone());
+        }
+        parts.join(", ")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum QuestionStatus {
+pub enum AskStatus {
     Open,
     Answered,
     Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionItem {
-    pub id: String,
-    /// Short chip label, e.g. `Auth method`.
-    #[serde(default)]
-    pub header: String,
-    pub question: String,
-    #[serde(default)]
-    pub options: Vec<QuestionOption>,
-    #[serde(default = "default_true")]
-    pub allow_free_text: bool,
-    #[serde(default)]
-    pub multi_select: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionOption {
+pub struct AskOption {
     pub label: String,
     #[serde(default)]
     pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuestionAnswer {
-    pub item_id: String,
-    pub values: Vec<String>,
-    #[serde(default)]
-    pub note: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -920,14 +1035,11 @@ pub struct QuestionAnswer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
+    /// Somebody said your name, replied to you, or wrote to you directly.
     Mention,
-    Reply,
-    DirectMessage,
-    Question,
-    TaskAssigned,
-    TaskBlocked,
-    TaskDue,
-    ReviewReady,
+    /// An open ask names you. The ask's own kind says which sort.
+    Ask,
+    /// A watch or scheduled automation is failing and nobody else will notice.
     AutomationFailed,
 }
 

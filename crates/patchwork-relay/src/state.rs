@@ -61,7 +61,7 @@ pub struct AppState {
     pub hosts: RwLock<HashMap<Id, HostConn>>,
     pub presence: RwLock<HashMap<Id, Presence>>,
     /// Agents waiting inside a blocking `patchwork ask`.
-    pub question_waiters: RwLock<HashMap<Id, Vec<oneshot::Sender<Question>>>>,
+    pub ask_waiters: RwLock<HashMap<Id, Vec<oneshot::Sender<Ask>>>>,
     /// Replies still being written, by run: the message the next delta rewrites.
     pub streaming_messages: RwLock<HashMap<Id, Id>>,
     /// Where each live run is talking. One value keeps thread and inline reply
@@ -114,7 +114,7 @@ impl AppState {
             bus,
             hosts: RwLock::new(HashMap::new()),
             presence: RwLock::new(HashMap::new()),
-            question_waiters: RwLock::new(HashMap::new()),
+            ask_waiters: RwLock::new(HashMap::new()),
             streaming_messages: RwLock::new(HashMap::new()),
             run_destinations: RwLock::new(HashMap::new()),
             control_destinations: RwLock::new(HashMap::new()),
@@ -262,19 +262,19 @@ impl AppState {
     }
 
     /// Wake an agent blocked in `patchwork ask`.
-    pub async fn resolve_question(&self, question: &Question) {
-        let waiters = self.question_waiters.write().await.remove(&question.id);
+    pub async fn resolve_ask(&self, ask: &Ask) {
+        let waiters = self.ask_waiters.write().await.remove(&ask.id);
         for tx in waiters.unwrap_or_default() {
-            let _ = tx.send(question.clone());
+            let _ = tx.send(ask.clone());
         }
     }
 
-    pub async fn wait_for_answer(&self, question_id: &str) -> oneshot::Receiver<Question> {
+    pub async fn wait_for_answer(&self, ask_id: &str) -> oneshot::Receiver<Ask> {
         let (tx, rx) = oneshot::channel();
-        self.question_waiters
+        self.ask_waiters
             .write()
             .await
-            .entry(question_id.to_string())
+            .entry(ask_id.to_string())
             .or_default()
             .push(tx);
         rx

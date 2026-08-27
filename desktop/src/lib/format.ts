@@ -242,8 +242,25 @@ export function statusTone(status: TaskStatus | RunStatus): string {
   }
 }
 
+/// Four words cover everything a person needs from a status: it is waiting to
+/// start, something is happening, it wants you, or it is over. "Blocked",
+/// "review" and "waiting" are three names for the same thing to the reader.
+const STATUS_WORDS: Record<string, string> = {
+  planned: "Queued",
+  queued: "Queued",
+  dispatched: "Working",
+  running: "Working",
+  waiting: "Ready for you",
+  blocked: "Ready for you",
+  review: "Ready for you",
+  done: "Done",
+  succeeded: "Done",
+};
+
 export function statusLabel(status: TaskStatus | RunStatus) {
-  return status.charAt(0).toUpperCase() + status.slice(1);
+  return (
+    STATUS_WORDS[status] ?? status.charAt(0).toUpperCase() + status.slice(1)
+  );
 }
 
 export function bytes(size: number) {

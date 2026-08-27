@@ -291,27 +291,28 @@ export function applyEnvelope(
           }
         : { ...state, seq };
     }
-    case "question_updated": {
-      const detail = state.runDetails[event.question.run_id];
-      const runDetails = detail
-        ? {
-            ...state.runDetails,
-            [event.question.run_id]: {
-              ...detail,
-              questions: upsert(detail.questions, event.question),
-            },
-          }
-        : state.runDetails;
+    case "ask_updated": {
+      // A review ask outlives its run, so an ask without one still belongs in
+      // the open list even though no run detail is holding it.
+      const detail = event.ask.run_id ? state.runDetails[event.ask.run_id] : undefined;
+      const runDetails =
+        detail && event.ask.run_id
+          ? {
+              ...state.runDetails,
+              [event.ask.run_id]: {
+                ...detail,
+                asks: upsert(detail.asks, event.ask),
+              },
+            }
+          : state.runDetails;
       return bootstrap
         ? {
             ...withBootstrap(state, seq, {
               ...bootstrap,
-              open_questions:
-                event.question.status === "open"
-                  ? upsert(bootstrap.open_questions, event.question)
-                  : bootstrap.open_questions.filter(
-                      (item) => item.id !== event.question.id,
-                    ),
+              open_asks:
+                event.ask.status === "open"
+                  ? upsert(bootstrap.open_asks, event.ask)
+                  : bootstrap.open_asks.filter((item) => item.id !== event.ask.id),
             }),
             runDetails,
           }

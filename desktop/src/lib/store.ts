@@ -7,6 +7,7 @@ import { Api } from "./api";
 import { unreadInboxCount } from "@client/inbox";
 import { REALTIME_HEARTBEAT, REALTIME_HEARTBEAT_MS } from "@client/types";
 import type {
+  Ask,
   Automation,
   Bootstrap,
   Channel,
@@ -19,7 +20,6 @@ import type {
   Message,
   Preview,
   Project,
-  Question,
   Run,
   RunEvent,
   Section,
@@ -43,7 +43,7 @@ export interface AppData {
   tasks: Task[];
   inbox: InboxItem[];
   automations: Automation[];
-  questions: Record<Id, Question>;
+  asks: Record<Id, Ask>;
   runs: Record<Id, Run>;
   runEvents: Record<Id, RunEvent[]>;
   previews: Record<Id, Preview>;
@@ -66,7 +66,7 @@ const EMPTY: AppData = {
   tasks: [],
   inbox: [],
   automations: [],
-  questions: {},
+  asks: {},
   runs: {},
   runEvents: {},
   previews: {},
@@ -108,7 +108,7 @@ class Session {
   getSnapshot = () => this.data;
 
   // Applying one event often means more than one `set` — a message and its
-  // parent's reply count, a run and its question. Each of those used to be a
+  // parent's reply count, a run and its ask. Each of those used to be a
   // separate render of every subscribed component. The snapshot is updated
   // synchronously, so anything reading it sees the truth immediately; only the
   // telling-everyone part waits for the end of the turn.
@@ -166,8 +166,8 @@ class Session {
   }
 
   private applyBootstrap(bootstrap: Bootstrap) {
-    const questions: Record<Id, Question> = {};
-    bootstrap.open_questions.forEach((q) => (questions[q.id] = q));
+    const asks: Record<Id, Ask> = {};
+    bootstrap.open_asks.forEach((ask) => (asks[ask.id] = ask));
     const runs: Record<Id, Run> = {};
     bootstrap.active_runs.forEach((r) => (runs[r.id] = r));
     const previews: Record<Id, Preview> = {};
@@ -187,7 +187,7 @@ class Session {
       tasks: bootstrap.tasks,
       inbox: bootstrap.inbox,
       automations: bootstrap.automations,
-      questions,
+      asks,
       runs,
       previews,
       seq: bootstrap.seq,
@@ -352,10 +352,8 @@ class Session {
         }
         break;
       }
-      case "question_updated":
-        this.set({
-          questions: { ...this.data.questions, [event.question.id]: event.question },
-        });
+      case "ask_updated":
+        this.set({ asks: { ...this.data.asks, [event.ask.id]: event.ask } });
         break;
       case "inbox_item_created":
       case "inbox_item_updated":
@@ -533,19 +531,17 @@ class Session {
     this.set({
       runs: { ...this.data.runs, [runId]: detail.run },
       runEvents: { ...this.data.runEvents, [runId]: detail.events },
-      questions: {
-        ...this.data.questions,
-        ...Object.fromEntries(detail.questions.map((q) => [q.id, q])),
+      asks: {
+        ...this.data.asks,
+        ...Object.fromEntries(detail.asks.map((ask) => [ask.id, ask])),
       },
     });
   }
 
-  async loadQuestion(questionId: Id, force = false) {
-    if (!this.api || (!force && this.data.questions[questionId])) return;
-    const question = await this.api.question(questionId);
-    this.set({
-      questions: { ...this.data.questions, [questionId]: question },
-    });
+  async loadAsk(askId: Id, force = false) {
+    if (!this.api || (!force && this.data.asks[askId])) return;
+    const ask = await this.api.ask(askId);
+    this.set({ asks: { ...this.data.asks, [askId]: ask } });
   }
 
   async loadPreview(previewId: Id) {
@@ -741,8 +737,8 @@ class Workspaces {
   loadRun(runId: Id) {
     return this.session?.loadRun(runId);
   }
-  loadQuestion(questionId: Id, force = false) {
-    return this.session?.loadQuestion(questionId, force) ?? Promise.resolve();
+  loadAsk(askId: Id, force = false) {
+    return this.session?.loadAsk(askId, force) ?? Promise.resolve();
   }
   loadPreview(previewId: Id) {
     return this.session?.loadPreview(previewId);

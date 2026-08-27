@@ -1,9 +1,7 @@
-import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 
-import { AgentEditor } from "@/components/AgentEditor";
-import { Avatar, Badge, Button, Empty, Grouped, Icon, Sheet } from "@/components/ui";
+import { Avatar, Badge, Empty, Grouped, Icon } from "@/components/ui";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -11,16 +9,10 @@ export default function AgentsScreen() {
   const theme = useTheme();
   const router = useRouter();
   const data = useWorkspace().bootstrap;
-  const [creating, setCreating] = useState(false);
   const agents = data?.members.filter((member) => member.kind === "agent") ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <Stack.Screen
-        options={{
-          title: "Agents",
-          headerRight: () => <Button label="New" compact tone="quiet" onPress={() => setCreating(true)} />,
-        }}
-      />
+      <Stack.Screen options={{ title: "Agents" }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
        <Grouped>
         {agents.length ? (
@@ -48,17 +40,10 @@ export default function AgentsScreen() {
             })}
           </View>
         ) : null}
-        {!agents.length ? <Empty title="No agents yet" detail="Create an agent teammate and choose where it runs." /> : null}
+        {/* Agents are built at a keyboard, so the phone only reads them. */}
+        {!agents.length ? <Empty title="No agents yet" detail="Create an agent teammate in Patchwork Desktop." /> : null}
        </Grouped>
       </ScrollView>
-      <Sheet visible={creating} title="New agent" onClose={() => setCreating(false)}>
-        <AgentEditor
-          onSaved={(agent) => {
-            setCreating(false);
-            router.push({ pathname: "/(app)/agents/[agentId]", params: { agentId: agent.id } });
-          }}
-        />
-      </Sheet>
     </View>
   );
 }
