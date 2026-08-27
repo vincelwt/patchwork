@@ -20,6 +20,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+      - name: Set version from release tag
+        run: scripts/set-release-version.sh "$GITHUB_REF_NAME"
       - run: npm ci
         working-directory: desktop
       - name: Build bundled CLI
@@ -39,18 +41,45 @@ jobs:
           releaseName: Patchwork ${{ github.ref_name }}
           releaseBody: Desktop and relay binaries for ${{ github.ref_name }}.
           generateReleaseNotes: true
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: --target aarch64-apple-darwin --config src-tauri/tauri.release.conf.json
-      - name: Smoke test packaged CLI
+      - name: Smoke test packaged app and CLI
         run: |
+          version=${GITHUB_REF_NAME#v}
           app=target/aarch64-apple-darwin/release/bundle/macos/Patchwork.app
           cli="$app/Contents/MacOS/patchwork"
           test -x "$cli"
-          env -i HOME="$HOME" \
-            PATH="$(dirname "$cli"):/usr/bin:/bin:/usr/sbin:/sbin" \
-            patchwork --version
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+          test "$(env -i HOME="$HOME" PATH="$(dirname "$cli"):/usr/bin:/bin:/usr/sbin:/sbin" patchwork --version)" = "patchwork $version"
           codesign --verify --deep --strict "$app"
+      - name: Verify desktop update artifacts before publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          archive="Patchwork_${version}_aarch64.app.tar.gz"
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir "$assets"
+          gh release download "$GITHUB_REF_NAME" --dir "$assets" \
+            --pattern 'Patchwork_*' --pattern latest.json
+          for name in "$archive" "$archive.sig" "Patchwork_${version}_aarch64.dmg"; do
+            test -f "$assets/$name"
+          done
+          for asset in "$assets"/Patchwork_*; do
+            case "$(basename "$asset")" in
+              Patchwork_"${version}"_*) ;;
+              *) echo "::error::Artifact version does not match $GITHUB_REF_NAME: $(basename "$asset")"; exit 1 ;;
+            esac
+          done
+          gh release view "$GITHUB_REF_NAME" --json assets,isDraft > "$assets/release.json"
+          archive_url=$(jq -er --arg archive "$archive" '.assets[] | select(.name == $archive) | .apiUrl' "$assets/release.json")
+          jq -e '.isDraft' "$assets/release.json"
+          jq -e --arg version "$version" --arg archive_url "$archive_url" '
+            .version == $version
+            and (.platforms | length > 0)
+            and all(.platforms[]; .url == $archive_url)
+          ' "$assets/latest.json"
 
   relay:
     needs: desktop
@@ -58,8 +87,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Set version from release tag
+        run: scripts/set-release-version.sh "$GITHUB_REF_NAME"
       - run: |
+          version=${GITHUB_REF_NAME#v}
           cargo build --release -p patchwork-relay -p patchwork-cli
+          test "$(target/release/patchwork-relay --version)" = "patchwork-relay $version"
+          test "$(target/release/patchwork --version)" = "patchwork $version"
           cp target/release/patchwork-relay patchwork-relay-linux-x86_64
           cp target/release/patchwork patchwork-linux-x86_64
           sha256sum patchwork-relay-linux-x86_64 > patchwork-relay-linux-x86_64.sha256
@@ -70,6 +104,7 @@ jobs:
             patchwork-linux-x86_64 \
             patchwork-linux-x86_64.sha256 \
             --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
 
