@@ -7,7 +7,7 @@ import type { Channel, Id } from "@client/types";
 import { Conversation } from "@/components/Message";
 import { Avatar, Button, ChoiceField, Empty, ErrorNotice, Glass, Icon, Measured, Sheet, TextField } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { useLayout } from "@/lib/layout";
+import { autoTopInset, useLayout } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -114,7 +114,7 @@ export default function ChannelsScreen() {
       ) : (
         <Measured>
           {inlineTitle ? (
-            <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
+            <View style={[styles.titleRow, { paddingTop: (autoTopInset ? 0 : insets.top) + 8 }]}>
               <Text accessibilityRole="header" style={[styles.title, { color: theme.text }]}>Chats</Text>
               <Glass interactive radius={24} style={styles.inlineActions}>{actions}</Glass>
             </View>

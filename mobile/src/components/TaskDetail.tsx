@@ -3,6 +3,7 @@ import { Stack } from "expo-router";
 
 import { AskCard } from "./AskCard";
 import { Conversation } from "./Message";
+import { Empty } from "./ui";
 import { useLayout } from "@/lib/layout";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -19,6 +20,7 @@ export function TaskDetail({ taskId }: { taskId: string }) {
     return (
       <View style={styles.fill}>
         <Stack.Screen options={{ title: "Task", headerTransparent: false }} />
+        <Empty title="Task unavailable" detail="It may have been closed long enough to have left this workspace's open list." />
       </View>
     );
   }

@@ -1,6 +1,10 @@
 import { NativeTabs } from "expo-router/unstable-native-tabs";
 
+import type { SFSymbol } from "sf-symbols-typescript";
+
 import { unreadInboxCount } from "@client/inbox";
+import { workspaceSymbol } from "@/lib/paired";
+import { usePairedSession } from "@/lib/session";
 import { useWorkspace } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -8,6 +12,13 @@ export default function TabLayout() {
   const theme = useTheme();
   const bootstrap = useWorkspace().bootstrap;
   const unread = unreadInboxCount(bootstrap?.inbox ?? []);
+  const { session } = usePairedSession();
+  // Which workspace is on screen rides on the More tab, the way a settings tab
+  // carries the current account, instead of taking a header row on every tab.
+  const workspace = workspaceSymbol(session && bootstrap ? { ...session, name: bootstrap.workspace.name } : session) as {
+    default: SFSymbol;
+    selected: SFSymbol;
+  };
 
   return (
     <NativeTabs
@@ -31,6 +42,10 @@ export default function TabLayout() {
           md="forum"
         />
         <NativeTabs.Trigger.Label>Chats</NativeTabs.Trigger.Label>
+      </NativeTabs.Trigger>
+      <NativeTabs.Trigger name="more" role="more">
+        <NativeTabs.Trigger.Icon sf={workspace} md="workspaces" />
+        <NativeTabs.Trigger.Label>More</NativeTabs.Trigger.Label>
       </NativeTabs.Trigger>
       <NativeTabs.Trigger name="search" role="search">
         <NativeTabs.Trigger.Icon sf="magnifyingglass" md="search" />

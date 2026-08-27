@@ -698,6 +698,40 @@ async fn trigger_agents(
         }
     }
 
+    // Naming an agent on a closed task is asking for more work on it, so the
+    // task reopens itself rather than answering a person with an error and a
+    // chore. Only a person can do this; an agent still cannot reopen its own.
+    // An agent that is muted here would not run, so naming it must not reopen
+    // the task either: the gate is the same one the run loop uses below.
+    if author.kind == MemberKind::Human && channel.kind == ChannelKind::Task {
+        let addressed = reply_agent.is_some()
+            || members.iter().any(|member| {
+                member.kind == MemberKind::Agent
+                    && message.mentions.contains(&member.id)
+                    && participation_in(member, &channel.id) != Participation::Off
+            });
+        let closed = channel
+            .task_id
+            .as_deref()
+            .and_then(|id| state.store.task(id).ok().flatten())
+            .filter(|task| task.status.is_terminal());
+        if let (true, Some(task)) = (addressed, closed) {
+            // Boxed: reopening posts a system note, which comes back through
+            // here for a message no agent can be triggered by.
+            Box::pin(update_task(
+                state,
+                &message.author_id,
+                false,
+                &task.id,
+                patchwork_core::wire::UpdateTask {
+                    status: Some(TaskStatus::Planned),
+                    ..Default::default()
+                },
+            ))
+            .await?;
+        }
+    }
+
     // A task is already addressed: its owner is the recipient.
     let task_owner = if author.kind == MemberKind::Human
         && message.mentions.is_empty()
@@ -736,11 +770,7 @@ async fn trigger_agents(
         if channel.kind == ChannelKind::Dm && !in_dm {
             continue;
         }
-        let participation = profile
-            .channel_participation
-            .get(&channel.id)
-            .copied()
-            .unwrap_or(profile.default_participation);
+        let participation = participation_in(agent, &channel.id);
 
         let replied_to_agent = reply_agent.as_deref() == Some(agent.id.as_str());
         // Agent-authored messages only ever wake an explicitly mentioned agent,
@@ -868,6 +898,17 @@ async fn trigger_agents(
         }
     }
     Ok(())
+}
+
+fn participation_in(member: &Member, channel_id: &str) -> Participation {
+    match member.agent.as_ref() {
+        Some(profile) => profile
+            .channel_participation
+            .get(channel_id)
+            .copied()
+            .unwrap_or(profile.default_participation),
+        None => Participation::default(),
+    }
 }
 
 fn display_name_of(members: &[Member], id: &str) -> String {
@@ -4686,6 +4727,115 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a plain follow-up must not invoke an only-when-mentioned agent"
+        );
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn naming_an_agent_on_a_closed_task_reopens_it_instead_of_refusing() {
+        let path = std::env::temp_dir().join(format!("patchwork-reopen-{}.sqlite", new_id()));
+        let store = Store::open(&path).unwrap();
+        store.create_workspace("workspace", "Test").unwrap();
+        let human = member("human", "vince", MemberKind::Human);
+        let mut agent = member("agent", "claude", MemberKind::Agent);
+        agent.agent.as_mut().unwrap().default_participation = Participation::Mention;
+        store.insert_member(&human).unwrap();
+        store.insert_member(&agent).unwrap();
+        let members = [human, agent];
+        let state = std::sync::Arc::new(crate::state::AppState::new(
+            store.clone(),
+            path.with_extension("files"),
+            "http://workspace".into(),
+            "relay".into(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hosts
+            .write()
+            .await
+            .insert("relay".into(), crate::state::HostConn { tx });
+        let task = create_task_with_result(
+            &state,
+            "human",
+            patchwork_core::wire::CreateTask {
+                title: "Ship the thing".into(),
+                outcome: "It is shipped".into(),
+                owner_id: Some("agent".into()),
+                status: Some(TaskStatus::Planned),
+                start: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .task;
+        let task = update_task(
+            &state,
+            "human",
+            false,
+            &task.id,
+            patchwork_core::wire::UpdateTask {
+                status: Some(TaskStatus::Done),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        let channel = store.channel(&task.discussion_channel_id).unwrap().unwrap();
+        let mut nudge = message_at("nudge", "human", 9, None);
+        nudge.channel_id = channel.id.clone();
+        nudge.task_id = Some(task.id.clone());
+        nudge.body = "@claude this is still broken".into();
+        nudge.mentions = vec!["agent".into()];
+        store.insert_message(&nudge).unwrap();
+
+        trigger_agents(&state, &nudge, &channel, &members)
+            .await
+            .unwrap();
+
+        assert!(
+            !store.task(&task.id).unwrap().unwrap().status.is_terminal(),
+            "a person writing to a closed task reopens it"
+        );
+        let RelayToHost::StartRun { spec } = rx.recv().await.unwrap() else {
+            panic!("expected the named agent to start on the reopened task");
+        };
+        assert_eq!(spec.agent_id, "agent");
+
+        // Muted here, so naming it starts nothing — and must not reopen either.
+        let task = update_task(
+            &state,
+            "human",
+            false,
+            &task.id,
+            patchwork_core::wire::UpdateTask {
+                status: Some(TaskStatus::Done),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+        let mut members = members.to_vec();
+        members[1].agent.as_mut().unwrap().default_participation = Participation::Off;
+        let mut muted = message_at("muted", "human", 10, None);
+        muted.channel_id = channel.id.clone();
+        muted.task_id = Some(task.id.clone());
+        muted.body = "@claude again".into();
+        muted.mentions = vec!["agent".into()];
+        store.insert_message(&muted).unwrap();
+
+        trigger_agents(&state, &muted, &channel, &members)
+            .await
+            .unwrap();
+
+        assert!(
+            store.task(&task.id).unwrap().unwrap().status.is_terminal(),
+            "naming a muted agent must not reopen a task nothing will work on"
         );
 
         drop(state);
