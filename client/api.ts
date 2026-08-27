@@ -21,8 +21,7 @@ import type {
   PairingResponse,
   Preview,
   Project,
-  Question,
-  QuestionAnswer,
+  Ask,
   Run,
   RunDetail,
   SearchResults,
@@ -206,6 +205,8 @@ export class Api {
     return this.patch<Task>(`/api/tasks/${id}`, input);
   }
 
+  /// Only `done` and `canceled` are choices; everything else is derived from
+  /// runs and the open ask.
   moveTask(id: Id, status: TaskStatus) {
     return this.updateTask(id, { status });
   }
@@ -216,10 +217,6 @@ export class Api {
 
   runTask(id: Id, input?: { agent_id?: Id; prompt?: string }) {
     return this.post<Run>(`/api/tasks/${id}/run`, input ?? {});
-  }
-
-  approveTask(id: Id) {
-    return this.post<Run>(`/api/tasks/${id}/approve`, {});
   }
 
   run(id: Id) {
@@ -241,12 +238,14 @@ export class Api {
     return this.post<{ control_id: Id }>(`/api/runs/${id}/steer`, input);
   }
 
-  question(id: Id) {
-    return this.get<Question>(`/api/questions/${id}`);
+  ask(id: Id) {
+    return this.get<Ask>(`/api/asks/${id}`);
   }
 
-  answerQuestion(id: Id, answers: QuestionAnswer[]) {
-    return this.post<Question>(`/api/questions/${id}/answer`, { answers });
+  /// Answering is the only way an ask closes — including an approval, where
+  /// the answer is the action label the person clicked.
+  answerAsk(id: Id, answer: string[], note = "") {
+    return this.post<Ask>(`/api/asks/${id}/answer`, { answer, note });
   }
 
   inbox(all = false) {

@@ -34,7 +34,7 @@ pub enum Event {
     TaskDeleted { task_id: Id },
     RunUpdated { run: Run },
     RunEventAppended { event: RunEvent },
-    QuestionUpdated { question: Question },
+    AskUpdated { ask: Ask },
     InboxItemCreated { item: InboxItem },
     InboxItemUpdated { item: InboxItem },
     HostUpdated { host: Host },

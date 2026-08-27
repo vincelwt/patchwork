@@ -1,16 +1,10 @@
 import type { InboxItem, InboxKind } from "./types";
 
-// Blocking work sorts ahead of chatty conversations, regardless of timestamp.
+// Something asked of you sorts ahead of chatter, regardless of timestamp.
 const URGENCY: Record<InboxKind, number> = {
-  question: 0,
-  task_blocked: 1,
+  ask: 0,
   automation_failed: 1,
-  task_due: 1,
-  review_ready: 2,
-  task_assigned: 3,
-  direct_message: 4,
-  mention: 5,
-  reply: 6,
+  mention: 2,
 };
 
 export interface InboxGroup {
@@ -26,7 +20,7 @@ export function groupInbox(items: readonly InboxItem[]): InboxGroup[] {
   const grouped = new Map<string, InboxItem[]>();
   for (const item of items) {
     // These point to one specific action, even when they share a conversation.
-    const standalone = item.kind === "question" || item.kind === "automation_failed";
+    const standalone = item.kind === "ask" || item.kind === "automation_failed";
     const key = standalone
       ? item.id
       : (item.task_id ?? item.channel_id ?? item.automation_id ?? item.id);

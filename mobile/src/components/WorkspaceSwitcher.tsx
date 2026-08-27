@@ -44,7 +44,7 @@ export function WorkspaceSheet({
     onClose();
     if (session.baseUrl === active.baseUrl) return;
     await switchTo(session.baseUrl);
-    router.replace("/inbox");
+    router.replace("/home");
   };
 
   return (

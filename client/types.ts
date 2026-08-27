@@ -80,7 +80,7 @@ export type MessageKind = "text" | "status" | "system" | "card";
 export type MessageCard =
   | { type: "task"; task_id: Id }
   | { type: "run"; run_id: Id }
-  | { type: "question"; question_id: Id }
+  | { type: "ask"; ask_id: Id }
   | { type: "artifact"; attachment_id: Id; caption?: string }
   | { type: "preview"; preview_id: Id }
   | { type: "pull_request"; url: string; task_id?: Id }
@@ -119,6 +119,9 @@ export interface Message {
   author_id: Id;
   kind: MessageKind;
   body: string;
+  /// One line standing in for long prose. Rendered instead of the body, with
+  /// the rest folded behind it.
+  digest: string;
   card?: MessageCard;
   suggestions: string[];
   parent_id?: Id;
@@ -187,11 +190,14 @@ export interface Task {
   key: string;
   title: string;
   outcome: string;
+  /// Where the task stands, in at most two sentences. Overwritten at every
+  /// transition, never appended to. This is the card body everywhere.
+  brief: string;
+  /// Derived by the relay from runs and the open ask; never set by an agent.
   status: TaskStatus;
   owner_id?: Id;
   source_channel_id?: Id;
   source_message_id?: Id;
-  background: boolean;
   discussion_channel_id: Id;
   project_id?: Id;
   host_id?: Id;
@@ -200,8 +206,9 @@ export interface Task {
   active_continuation?: TaskContinuationSummary;
   pr_url?: string;
   pr_state?: PullRequestState;
-  /// Exact action the owning agent will take if a person approves this review.
-  review_action?: string;
+  /// The one thing being asked of a person right now. Without it the task is
+  /// not waiting on anybody and does not surface.
+  ask?: Ask;
   created_by: Id;
   /// When this is meant to be done. The Inbox says so on the day.
   due_at?: Millis;
@@ -362,52 +369,42 @@ export interface RunEvent {
   created_at: Millis;
 }
 
-export interface QuestionOption {
+export interface AskOption {
   label: string;
   description: string;
 }
 
-export interface QuestionItem {
-  id: string;
-  header: string;
-  question: string;
-  options: QuestionOption[];
-  allow_free_text: boolean;
-  multi_select: boolean;
-}
+/// What an agent needs from a person, in one shape. `answer` and `decide` hold
+/// a run open; `review` and `unblock` outlive it.
+export type AskKind = "answer" | "review" | "decide" | "unblock";
 
-export interface QuestionAnswer {
-  item_id: string;
-  values: string[];
-  note: string;
-}
-
-export interface Question {
+export interface Ask {
   id: Id;
-  run_id: Id;
+  kind: AskKind;
+  run_id?: Id;
   agent_id: Id;
   channel_id: Id;
   task_id?: Id;
   message_id?: Id;
-  headline: string;
-  items: QuestionItem[];
+  text: string;
+  /// What the button says. Answering with it recorded is the approval.
+  action?: string;
+  /// At most three bullets. Always present on a review ask.
+  summary: string[];
+  /// Attachments this ask pins: what to look at first.
+  evidence_ids: Id[];
+  options: AskOption[];
+  allow_free_text: boolean;
+  multi_select: boolean;
   status: "open" | "answered" | "cancelled";
-  answers?: QuestionAnswer[];
+  answer: string[];
+  note: string;
   answered_by?: Id;
   created_at: Millis;
   answered_at?: Millis;
 }
 
-export type InboxKind =
-  | "mention"
-  | "reply"
-  | "direct_message"
-  | "question"
-  | "task_assigned"
-  | "task_blocked"
-  | "task_due"
-  | "review_ready"
-  | "automation_failed";
+export type InboxKind = "mention" | "ask" | "automation_failed";
 
 export interface InboxItem {
   id: Id;
@@ -584,7 +581,7 @@ export interface Bootstrap {
   tasks: Task[];
   inbox: InboxItem[];
   automations: Automation[];
-  open_questions: Question[];
+  open_asks: Ask[];
   active_runs: Run[];
   previews: Preview[];
   seq: number;
@@ -596,13 +593,13 @@ export interface TaskDetail {
   runs: Run[];
   attachments: Attachment[];
   previews: Preview[];
-  questions: Question[];
+  asks: Ask[];
 }
 
 export interface RunDetail {
   run: Run;
   events: RunEvent[];
-  questions: Question[];
+  asks: Ask[];
 }
 
 export interface AutomationDebug {
@@ -646,7 +643,7 @@ export type Event =
   | { kind: "task_deleted"; task_id: Id }
   | { kind: "run_updated"; run: Run }
   | { kind: "run_event_appended"; event: RunEvent }
-  | { kind: "question_updated"; question: Question }
+  | { kind: "ask_updated"; ask: Ask }
   | { kind: "inbox_item_created"; item: InboxItem }
   | { kind: "inbox_item_updated"; item: InboxItem }
   | { kind: "host_updated"; host: Host }

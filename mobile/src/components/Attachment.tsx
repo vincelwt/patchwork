@@ -8,8 +8,8 @@ import type { Attachment, Id } from "@client/types";
 import { bytes } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useTheme } from "@/lib/theme";
-import { EvidenceView, opensExternally, useGrantedOpen } from "./Evidence";
-import { ErrorNotice, Sheet } from "./ui";
+import { EvidenceBody, opensExternally, useGrantedOpen } from "./Evidence";
+import { ErrorNotice } from "./ui";
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -183,54 +183,43 @@ export function PendingImages({
   );
 }
 
-/// In the transcript: a screenshot to look at, or a line to press. What can be
-/// read on the phone opens over the app; a video, a page or a download goes to
-/// whatever the phone uses for it.
+/// Evidence in the transcript, folded to one line and opened in place: the
+/// conversation is the surface it belongs to, so nothing here takes over the
+/// screen. A video, a page or a download still goes to whatever the phone uses
+/// for it, because Patchwork has nothing better to show them in.
 export function AttachmentView({ attachment }: { attachment: Attachment }) {
-  const { session } = usePairedSession();
   const theme = useTheme();
   const { open, busy, error } = useGrantedOpen();
-  const [viewing, setViewing] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const kind = evidenceKind(attachment.mime, attachment.file_name);
-  const press = () =>
-    opensExternally(kind) ? void open((api) => api.grantFile(attachment.id)) : setViewing(true);
+  const external = opensExternally(kind);
   const label = attachment.caption || attachment.file_name;
-  if (!session) return null;
 
   return (
     <>
-      {kind === "image" ? (
-        <Pressable accessibilityRole="button" accessibilityLabel={`Open ${label}`} onPress={press}>
-          <Image
-            source={{
-              uri: `${session.baseUrl.replace(/\/$/, "")}${attachment.url}`,
-              headers: { Authorization: `Bearer ${session.token}` },
-            }}
-            style={[styles.image, { backgroundColor: theme.surface }]}
-            contentFit="cover"
-            transition={120}
-            cachePolicy="none"
-            accessibilityLabel={label}
-          />
-        </Pressable>
-      ) : (
+      <View style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Open ${label}`}
-          accessibilityState={{ busy }}
-          onPress={press}
-          style={[styles.file, { backgroundColor: theme.surface, borderColor: theme.line }]}
+          accessibilityLabel={external ? `Open ${label}` : `${expanded ? "Hide" : "Show"} ${label}`}
+          accessibilityState={{ busy, expanded: external ? undefined : expanded }}
+          onPress={() =>
+            external ? void open((api) => api.grantFile(attachment.id)) : setExpanded(!expanded)
+          }
+          style={styles.fileHead}
         >
-          <Text numberOfLines={1} style={[styles.fileName, { color: theme.text }]}>{label}</Text>
-          <Text style={{ color: theme.muted }}>
-            {kind === "video" ? "Video · " : ""}{bytes(attachment.size)}{busy ? " · opening…" : ""}
+          <View style={styles.fileText}>
+            <Text numberOfLines={1} style={[styles.fileName, { color: theme.text }]}>{label}</Text>
+            <Text style={{ color: theme.muted }}>
+              {kind === "file" ? "" : `${kind} · `}{bytes(attachment.size)}{busy ? " · opening…" : ""}
+            </Text>
+          </View>
+          <Text style={{ color: theme.accent, fontWeight: "600" }}>
+            {external ? "Open" : expanded ? "Hide" : "Show"}
           </Text>
         </Pressable>
-      )}
+        {expanded ? <EvidenceBody attachment={attachment} /> : null}
+      </View>
       <ErrorNotice message={error} />
-      <Sheet visible={viewing} title={label} onClose={() => setViewing(false)}>
-        {viewing ? <EvidenceView attachment={attachment} /> : null}
-      </Sheet>
     </>
   );
 }
@@ -240,7 +229,8 @@ const styles = StyleSheet.create({
   thumbWrap: { width: 70, height: 70, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth },
   thumb: { width: "100%", height: "100%", borderRadius: 10 },
   remove: { position: "absolute", right: -6, top: -6, width: 24, height: 24, borderRadius: 12, alignItems: "center", justifyContent: "center" },
-  image: { width: "100%", maxWidth: 460, aspectRatio: 4 / 3, borderRadius: 12, marginTop: 8 },
-  file: { marginTop: 8, minHeight: 48, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, padding: 10, justifyContent: "center" },
+  file: { marginTop: 8, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 10, paddingVertical: 8 },
+  fileHead: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 10 },
+  fileText: { flex: 1, minWidth: 0 },
   fileName: { fontWeight: "600", marginBottom: 2 },
 });

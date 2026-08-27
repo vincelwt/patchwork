@@ -148,15 +148,15 @@ pub enum RelayToHost {
     CancelRun {
         run_id: Id,
     },
-    /// The relay committed a question card. Prose after this belongs below it.
-    QuestionAsked {
+    /// The relay committed an ask card. Prose after this belongs below it.
+    AskOpened {
         run_id: Id,
     },
-    /// A user answered the agent's question; resume the waiting turn.
-    AnswerQuestion {
+    /// A person answered the agent's ask; resume the waiting turn.
+    AnswerAsk {
         run_id: Id,
-        question_id: Id,
-        answers: Vec<QuestionAnswer>,
+        ask_id: Id,
+        answer: String,
     },
     /// Another prompt for the run's existing ACP session.
     FollowUp {
@@ -312,11 +312,13 @@ pub enum HostToRelay {
         kind: MessageKind,
         body: String,
     },
-    RunQuestion {
+    RunAsk {
         run_id: Id,
+        text: String,
         #[serde(default)]
-        headline: String,
-        items: Vec<QuestionItem>,
+        options: Vec<AskOption>,
+        #[serde(default)]
+        multi_select: bool,
         /// Correlation id chosen by the host; the answer comes back with it.
         request_id: String,
     },

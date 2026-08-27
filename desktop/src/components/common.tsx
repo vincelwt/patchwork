@@ -8,13 +8,9 @@ export type View =
   | { kind: "tasks" }
   | { kind: "channel"; id: Id }
   | { kind: "task"; id: Id }
-  | { kind: "agents" }
-  | { kind: "skills" }
-  | { kind: "projects" }
-  | { kind: "members" }
-  | { kind: "automations" }
+  | { kind: "people" }
+  | { kind: "workspace" }
   | { kind: "automation"; id: Id }
-  | { kind: "settings" }
   | { kind: "search"; query: string };
 
 export type Inspector =
@@ -50,6 +46,9 @@ export const useNavigation = () => useContext(NavigationContext);
 /// teammate this is before you have read the name. `presence` adds the live
 /// dot, and is off by default because most avatars are historical (who said
 /// this, three days ago) rather than a statement about right now.
+///
+/// Agents never get the dot: one lives on the relay and is therefore always
+/// there, so a light saying so is a light that is always on.
 export function Avatar({
   member,
   size = 26,
@@ -76,7 +75,7 @@ export function Avatar({
     </div>
   );
 
-  if (!presence || !member) return avatar;
+  if (!presence || !member || isAgent) return avatar;
   return (
     <span className="avatar-wrap" style={{ width: size, height: size }}>
       {avatar}

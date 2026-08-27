@@ -1,6 +1,6 @@
 //! Deciding what should happen, and making it happen.
 //!
-//! Posting a message, creating a task, answering a question and finishing a run
+//! Posting a message, creating a task, answering an ask and finishing a run
 //! all funnel through here so that the conversation, the board, the Inbox and
 //! the running agents never disagree with each other.
 
@@ -114,6 +114,7 @@ async fn post_message_inner(
         author_id: author_id.to_string(),
         kind,
         body: input.body.clone(),
+        digest: digest_for(&input),
         card: input.card.clone(),
         suggestions: clean_suggestions(input.suggestions.clone()),
         parent_id: input.parent_id.clone().or(destination.parent_id),
@@ -316,6 +317,7 @@ async fn stream_message(state: &Shared, host_id: &str, run_id: &str, body: &str)
         author_id: run.agent_id.clone(),
         kind: MessageKind::Text,
         body: body.to_string(),
+        digest: first_sentence(body),
         card: None,
         suggestions: Vec::new(),
         parent_id: destination.parent_id,
@@ -364,8 +366,8 @@ async fn finish_posted_message(state: &Shared, message: &Message) -> Result<()> 
     follow_through(state, &settled, &channel, &members, true).await
 }
 
-/// A question is a transcript boundary. Text after the human answers must get
-/// a newer message id so it appears below the question card.
+/// An ask is a transcript boundary. Text after the person answers must get a
+/// newer message id so it appears below the ask card.
 pub(crate) async fn finish_streamed_reply(state: &Shared, run_id: &str) -> Result<()> {
     if let Some(message_id) = state.streaming_messages.write().await.remove(run_id) {
         if let Some(message) = state.store.message(&message_id)? {
@@ -539,7 +541,7 @@ async fn notify_inbox(
             push(
                 state,
                 member_id,
-                InboxKind::DirectMessage,
+                InboxKind::Mention,
                 format!("{author_name} sent you a message"),
                 &mut notified,
             )?;
@@ -551,7 +553,7 @@ async fn notify_inbox(
             push(
                 state,
                 &parent.author_id,
-                InboxKind::Reply,
+                InboxKind::Mention,
                 format!("{author_name} replied to your message"),
                 &mut notified,
             )?;
@@ -561,7 +563,7 @@ async fn notify_inbox(
             push(
                 state,
                 &parent.author_id,
-                InboxKind::Reply,
+                InboxKind::Mention,
                 format!("{author_name} replied in a thread"),
                 &mut notified,
             )?;
@@ -569,6 +571,41 @@ async fn notify_inbox(
     }
 
     Ok(())
+}
+
+/// What a long message folds to. An author who wrote their own digest gets it
+/// verbatim; otherwise the first sentence is a better one line than the first
+/// eighty characters, and both beat making a person scroll a wall to find out
+/// whether it concerns them.
+pub fn digest_for(input: &SendMessage) -> String {
+    if !input.digest.trim().is_empty() {
+        return crate::store::truncate_chars(&input.digest, MESSAGE_DIGEST_LIMIT);
+    }
+    if input.body.chars().count() <= FOLD_ABOVE {
+        return String::new();
+    }
+    first_sentence(&input.body)
+}
+
+/// Messages longer than this fold to their digest. Roughly a screenful: below
+/// it, folding costs a person more than reading.
+pub const FOLD_ABOVE: usize = 600;
+pub const MESSAGE_DIGEST_LIMIT: usize = 200;
+
+fn first_sentence(body: &str) -> String {
+    let body = body.trim();
+    if body.chars().count() <= FOLD_ABOVE {
+        return String::new();
+    }
+    let end = body
+        .char_indices()
+        .find(|(i, c)| {
+            matches!(c, '.' | '!' | '?' | '\n')
+                && body[i + c.len_utf8()..].starts_with(|next: char| next.is_whitespace() || next == '\0')
+        })
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(body.len());
+    crate::store::truncate_chars(&body[..end], MESSAGE_DIGEST_LIMIT)
 }
 
 pub fn channel_label(channel: &Channel) -> String {
@@ -1067,6 +1104,7 @@ fn post_control_note(
         channel_id: channel.id.clone(),
         author_id: author_id.to_string(),
         kind: MessageKind::Status,
+        digest: String::new(),
         body,
         card: None,
         suggestions: Vec::new(),
@@ -1520,7 +1558,7 @@ reply only if this changes it.",
                 run_id: run.id.clone(),
             }),
             run_id: Some(run.id.clone()),
-            // Where the work was asked for. A card about a thread's question
+            // Where the work was asked for. A card about a thread's ask
             // does not belong at the top of the channel.
             parent_id: reply_parent(state, &run).await,
             ..Default::default()
@@ -1576,7 +1614,7 @@ pub(crate) async fn resume_interrupted_run(state: &Shared, run: &Run) -> Result<
 
     // An answer routed to the old process cannot be applied to the restored
     // turn. Cancel it so the resumed agent can ask again if it still needs it.
-    cancel_questions_for_run(state, &run.id).await?;
+    cancel_asks_for_run(state, &run.id).await?;
 
     let spec = RunSpec {
         run_id: run.id.clone(),
@@ -1771,8 +1809,8 @@ pub(crate) async fn fail_run(state: &Shared, run: &Run, why: &str) -> Result<()>
     state.store.update_run(&run)?;
     state.store.revoke_run_tokens(&run.id).ok();
     append_run_event(state, &run.id, RunEventKind::Error, why.to_string(), None)?;
-    if let Err(err) = cancel_questions_for_run(state, &run.id).await {
-        tracing::warn!(?err, run = %run.id, "could not cancel the questions of a dead run");
+    if let Err(err) = cancel_asks_for_run(state, &run.id).await {
+        tracing::warn!(?err, run = %run.id, "could not cancel the asks of a dead run");
     }
     state.emit(Event::RunUpdated { run: run.clone() });
     state.set_presence(&run.agent_id, Presence::Online).await;
@@ -1804,7 +1842,21 @@ pub(crate) async fn fail_run(state: &Shared, run: &Run, why: &str) -> Result<()>
         }
     }
 
-    finish_run(state, &run).await
+    finish_run(state, &run).await?;
+
+    // A run that died mid-flight leaves nobody waiting on anything, and a task
+    // waiting on nobody is silent. Say what needs doing, on the task, where
+    // somebody will see it.
+    if let Some(task) = run
+        .task_id
+        .as_deref()
+        .map(|id| state.store.task(id))
+        .transpose()?
+        .flatten()
+    {
+        needs_person(state, &task, &format!("The run stopped: {why}")).await?;
+    }
+    Ok(())
 }
 
 fn resume_session_for(
@@ -2199,12 +2251,12 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
                 run.ended_at = Some(now_ms());
                 state.store.revoke_run_tokens(&run_id).ok();
             }
-            // Persist terminal status before settling questions so a concurrent
+            // Persist terminal status before settling asks so a concurrent
             // `patchwork ask` cannot recreate waiting work in between.
             state.store.update_run(&run)?;
             if status.is_terminal() {
-                if let Err(err) = cancel_questions_for_run(state, &run_id).await {
-                    tracing::warn!(?err, run = %run_id, "could not cancel run questions");
+                if let Err(err) = cancel_asks_for_run(state, &run_id).await {
+                    tracing::warn!(?err, run = %run_id, "could not cancel the run's asks");
                 }
             }
             state.emit(Event::RunUpdated { run: run.clone() });
@@ -2367,8 +2419,8 @@ async fn handle_host_message_inner(state: &Shared, host_id: &str, msg: HostToRel
             .await?;
         }
 
-        HostToRelay::RunQuestion { .. } => {
-            // Questions arrive through the CLI's blocking `ask`, which owns the
+        HostToRelay::RunAsk { .. } => {
+            // Asks arrive through the CLI's blocking `ask`, which owns the
             // waiting side of the flow.
         }
 
@@ -2697,8 +2749,17 @@ fn asks_for_written_answer(request: &str) -> bool {
     .any(|prefix| normalized.starts_with(prefix))
 }
 
-async fn report_background_outcome(state: &Shared, task: &Task, run: &Run) -> Result<()> {
-    if !task.background || task.status == TaskStatus::Running {
+/// Say what happened where the work was asked for. Every agent task does this,
+/// which is what lets a task with nothing open stay off the board entirely:
+/// the conversation carries the result, so the board does not have to.
+async fn report_outcome(
+    state: &Shared,
+    task: &Task,
+    run: &Run,
+    instead: Option<String>,
+) -> Result<()> {
+    // A task still waiting on somebody speaks through its ask, not twice.
+    if task.ask.is_some() || task.status == TaskStatus::Running {
         return Ok(());
     }
     let Some(channel_id) = task
@@ -2708,15 +2769,19 @@ async fn report_background_outcome(state: &Shared, task: &Task, run: &Run) -> Re
     else {
         return Ok(());
     };
-    let Some(summary) = state.store.last_run_message(&run.id, &run.agent_id)? else {
-        return Ok(());
+    let body = match instead {
+        Some(body) => body,
+        None => match state.store.last_run_message(&run.id, &run.agent_id)? {
+            Some(message) => message.body,
+            None => return Ok(()),
+        },
     };
     post_message(
         state,
         channel_id,
         &run.agent_id,
         SendMessage {
-            body: summary.body,
+            body,
             ..Default::default()
         },
         PostOptions {
@@ -2862,122 +2927,46 @@ the task stays yours until you stop. Reply only if this changes your work.",
             return Ok(());
         }
         let expected_updated_at = task.updated_at;
-        let mut notification = None;
         task.current_run_id = None;
-
-        if let Some(continuation) = &task.active_continuation {
-            task.status = match continuation.status {
-                ContinuationStatus::Waiting | ContinuationStatus::Ready => TaskStatus::Running,
-                ContinuationStatus::ActionRequired | ContinuationStatus::Failed => {
-                    TaskStatus::Blocked
-                }
-            };
-        } else {
-            match outcome {
-                RunStatus::Succeeded => {
-                    if task.status == TaskStatus::Running {
-                        if has_review_evidence(state, &task, &group, None)? {
-                            task.status = TaskStatus::Review;
-                            notification = Some((
-                                InboxKind::ReviewReady,
-                                format!("{} is ready for review", task.key),
-                            ));
-                        } else {
-                            task.status = TaskStatus::Planned;
-                        }
-                    }
-                }
-                RunStatus::Failed => {
-                    if task.status == TaskStatus::Running {
-                        task.status = TaskStatus::Blocked;
-                        notification =
-                            Some((InboxKind::TaskBlocked, format!("{} is blocked", task.key)));
-                    }
-                }
-                RunStatus::Cancelled => {
-                    if task.status == TaskStatus::Running {
-                        task.status = TaskStatus::Planned;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if task.status != TaskStatus::Review {
-            task.review_action = None;
-        }
+        // Nothing here chooses a status. Letting go of the run is the whole
+        // change; what the task becomes follows from whether an ask is open
+        // and whether anything is still running, which the store works out.
         if !state
             .store
-            .update_task_if_unchanged(&task, expected_updated_at, false)?
+            .update_task_if_unchanged(&task, expected_updated_at)?
         {
             continue;
         }
-        if let Some((kind, title)) = notification {
-            notify_task(state, &task, kind, title)?;
-        }
-        let task = state.store.task(task_id)?.unwrap_or(task);
+        let task = state
+            .store
+            .refresh_task_status(task_id)?
+            .unwrap_or(task);
         state.emit(Event::TaskUpdated { task: task.clone() });
-        report_background_outcome(state, &task, run).await?;
+        // A failed run leaves nobody waiting on anything, which would make the
+        // task silent. Say so where the work was asked for.
+        if outcome == RunStatus::Failed {
+            report_outcome(
+                state,
+                &task,
+                run,
+                Some(format!(
+                    "{} stopped on an error.{}",
+                    task.key,
+                    run.error
+                        .as_deref()
+                        .map(|error| format!(" {error}"))
+                        .unwrap_or_default()
+                )),
+            )
+            .await?;
+        } else {
+            report_outcome(state, &task, run, None).await?;
+        }
         return Ok(());
     }
     bail!("task kept changing while its run was finishing")
 }
 
-pub fn notify_task(state: &Shared, task: &Task, kind: InboxKind, title: String) -> Result<()> {
-    for member_id in task_recipients(state, task)? {
-        let item = InboxItem {
-            id: new_id(),
-            member_id: member_id.clone(),
-            kind,
-            title: title.clone(),
-            preview: task.title.clone(),
-            actor_id: task.owner_id.clone(),
-            channel_id: Some(task.discussion_channel_id.clone()),
-            message_id: None,
-            task_id: Some(task.id.clone()),
-            run_id: task.current_run_id.clone(),
-            automation_id: None,
-            created_at: now_ms(),
-            read_at: None,
-        };
-        state.store.insert_inbox(&item)?;
-        state.emit(Event::InboxItemCreated { item });
-    }
-    Ok(())
-}
-
-/// Who hears about a task. Agents own tasks and create them for each other, so
-/// an Inbox item addressed only to them would reach nobody at all: fall back to
-/// the people who run the workspace, and then to everybody in it.
-fn task_recipients(state: &Shared, task: &Task) -> Result<Vec<Id>> {
-    let members = state.store.members()?;
-    let system = system_member_id(state)?;
-    let people: Vec<&Member> = members
-        .iter()
-        .filter(|member| member.kind == MemberKind::Human && member.id != system)
-        .collect();
-
-    let mut targets: Vec<Id> = [task.owner_id.clone(), Some(task.created_by.clone())]
-        .into_iter()
-        .flatten()
-        .filter(|id| people.iter().any(|member| &member.id == id))
-        .collect();
-    targets.dedup();
-    if !targets.is_empty() {
-        return Ok(targets);
-    }
-
-    let admins: Vec<Id> = people
-        .iter()
-        .filter(|member| member.is_admin)
-        .map(|member| member.id.clone())
-        .collect();
-    Ok(if admins.is_empty() {
-        people.iter().map(|member| member.id.clone()).collect()
-    } else {
-        admins
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Tasks
@@ -3244,7 +3233,7 @@ async fn create_task_inner(
         owner_id: input.owner_id.clone(),
         source_channel_id: input.source_channel_id.clone(),
         source_message_id: input.source_message_id.clone(),
-        background: input.background,
+        brief: crate::store::truncate_chars(&input.brief, TASK_BRIEF_LIMIT),
         discussion_channel_id: discussion.id.clone(),
         project_id: input.project_id.clone(),
         host_id: input.host_id.clone(),
@@ -3253,7 +3242,7 @@ async fn create_task_inner(
         active_continuation: None,
         pr_url: None,
         pr_state: None,
-        review_action: None,
+        ask: None,
         created_by: creator_id.to_string(),
         due_at: input.due_at.filter(|at| *at > 0),
         once_key: input
@@ -3338,14 +3327,8 @@ async fn create_task_inner(
     }
 
     if let Some(owner) = &task.owner_id {
-        let owner_member = state.store.member(owner)?;
-        if owner_member.as_ref().map(|m| m.kind) == Some(MemberKind::Human) {
-            notify_task(
-                state,
-                &task,
-                InboxKind::TaskAssigned,
-                format!("{} was assigned to you", task.key),
-            )?;
+        if state.store.member(owner)?.map(|m| m.kind) == Some(MemberKind::Human) {
+            task = hand_to_person(state, &task, creator_id).await?;
         }
     }
 
@@ -3407,15 +3390,13 @@ pub async fn update_task(
     if let Some(outcome) = input.outcome {
         task.outcome = outcome;
     }
-    let has_explicit_status = input.status.is_some();
+    if let Some(brief) = input.brief {
+        task.brief = crate::store::truncate_chars(&brief, TASK_BRIEF_LIMIT);
+    }
+    // Only closing is a choice. Everything else is derived, so a status in a
+    // patch that is not terminal is a request to reopen, not to set a state.
     if let Some(status) = input.status {
         task.status = status;
-    }
-    if let Some(review_action) = input.review_action {
-        task.review_action = match review_action.trim() {
-            "" => None,
-            action => Some(action.to_string()),
-        };
     }
     if let Some(owner_id) = input.owner_id {
         task.owner_id = if owner_id.is_empty() {
@@ -3453,22 +3434,16 @@ pub async fn update_task(
     if let Some(position) = input.position {
         task.position = position;
     }
-    if task.status != TaskStatus::Review {
-        task.review_action = None;
-    }
-
     if actor_is_agent && previous.status.is_terminal() && !task.status.is_terminal() {
         bail!("only a person can reopen a completed or canceled task");
     }
     if actor_is_agent {
         if !state
             .store
-            .update_task_if_unchanged(&task, previous.updated_at, has_explicit_status)?
+            .update_task_if_unchanged(&task, previous.updated_at)?
         {
             bail!("the task changed while the agent was updating it; reload it and try again");
         }
-    } else if has_explicit_status {
-        state.store.update_task_with_explicit_status(&task)?;
     } else {
         state.store.update_task(&task)?;
     }
@@ -3483,23 +3458,13 @@ pub async fn update_task(
         }
     }
 
-    // A moved date is a new promise, so it gets to be announced again.
-    if previous.due_at != task.due_at {
-        state.store.clear_inbox(&task.id, InboxKind::TaskDue)?;
-    }
-
     if previous.owner_id != task.owner_id {
         if let Some(owner) = &task.owner_id {
             state
                 .store
                 .add_channel_member(&task.discussion_channel_id, owner)?;
             if state.store.member(owner)?.map(|m| m.kind) == Some(MemberKind::Human) {
-                notify_task(
-                    state,
-                    &task,
-                    InboxKind::TaskAssigned,
-                    format!("{} was assigned to you", task.key),
-                )?;
+                task = hand_to_person(state, &task, actor_id).await?;
             }
         }
     }
@@ -3521,15 +3486,6 @@ pub async fn update_task(
         )
         .await;
         if task.status.is_terminal() {
-            resolve_inbox(state, Some(&task.id), None, None)?;
-        } else if task.status == TaskStatus::Review {
-            notify_task(
-                state,
-                &task,
-                InboxKind::ReviewReady,
-                format!("{} is ready for review", task.key),
-            )?;
-        } else if previous.status == TaskStatus::Review {
             resolve_inbox(state, Some(&task.id), None, None)?;
         }
     }
@@ -3613,93 +3569,296 @@ pub async fn run_task(
     .context("could not start the run")
 }
 
-/// Execute the action an agent put behind the review gate. Claiming the task
-/// before dispatch makes the approval single-use; a failed dispatch restores
-/// the exact gate so the person can try again after the host recovers.
-pub async fn approve_task(state: &Shared, actor_id: &str, task_id: &str) -> Result<Option<Run>> {
-    let task = state
-        .store
-        .task(task_id)?
-        .ok_or_else(|| anyhow!("task not found"))?;
-    let Some(action) = task.review_action.clone() else {
-        return Ok(None);
+/// Hand a task to a person. Assignment on its own would leave the task silent
+/// under "no open ask, no surface", so it opens the ask that makes it theirs.
+pub async fn hand_to_person(state: &Shared, task: &Task, by: &str) -> Result<Task> {
+    if task.ask.is_some() || task.status.is_terminal() {
+        return Ok(task.clone());
+    }
+    let text = if task.brief.trim().is_empty() {
+        task.outcome.trim()
+    } else {
+        task.brief.trim()
     };
-    if task.status != TaskStatus::Review || !state.store.claim_review_action(&task.id, &action)? {
-        return Ok(None);
+    let (updated, _) = open_ask(
+        state,
+        NewAsk {
+            kind: AskKind::Unblock,
+            agent_id: by.to_string(),
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            run: None,
+            text: crate::store::truncate_chars(
+                if text.is_empty() { "This is yours now" } else { text },
+                ASK_TEXT_LIMIT,
+            ),
+            action: None,
+            summary: Vec::new(),
+            evidence_ids: Vec::new(),
+            options: Vec::new(),
+            allow_free_text: true,
+            multi_select: false,
+            replace: false,
+        },
+    )
+    .await?;
+    Ok(updated.unwrap_or_else(|| task.clone()))
+}
+
+/// The relay itself needs a person on this task. Same primitive as an agent
+/// asking: without an open ask the task would sit there silently, which is the
+/// one failure the new model is built to make impossible.
+pub async fn needs_person(state: &Shared, task: &Task, text: &str) -> Result<()> {
+    if task.ask.is_some() || task.status.is_terminal() {
+        return Ok(());
+    }
+    let by = task
+        .owner_id
+        .clone()
+        .unwrap_or_else(|| task.created_by.clone());
+    let opening = open_ask(
+        state,
+        NewAsk {
+            kind: AskKind::Unblock,
+            agent_id: by,
+            channel_id: task.discussion_channel_id.clone(),
+            task_id: Some(task.id.clone()),
+            run: None,
+            text: crate::store::truncate_chars(text, ASK_TEXT_LIMIT),
+            action: None,
+            summary: Vec::new(),
+            evidence_ids: Vec::new(),
+            options: Vec::new(),
+            allow_free_text: true,
+            multi_select: false,
+            replace: false,
+        },
+    );
+    // Boxed because a relay-opened ask posts a card, which can reach an
+    // automation, which can end up back here. The cycle is real but bounded by
+    // the one-open-ask rule; the box is only what lets it compile.
+    Box::pin(opening).await?;
+    Ok(())
+}
+
+/// Everything needed to open an ask, in the one shape the relay commits.
+pub struct NewAsk {
+    pub kind: AskKind,
+    pub agent_id: Id,
+    pub channel_id: Id,
+    pub task_id: Option<Id>,
+    pub run: Option<Run>,
+    pub text: String,
+    pub action: Option<String>,
+    pub summary: Vec<String>,
+    pub evidence_ids: Vec<Id>,
+    pub options: Vec<AskOption>,
+    pub allow_free_text: bool,
+    pub multi_select: bool,
+    pub replace: bool,
+}
+
+/// Open the one thing a task is waiting on. The card, the waiting run, the
+/// task's new status and every Inbox row become visible together or not at
+/// all, so nothing is ever answerable before it is durable.
+pub async fn open_ask(state: &Shared, input: NewAsk) -> Result<(Option<Task>, Ask)> {
+    let mut ask = Ask {
+        id: new_id(),
+        kind: input.kind,
+        run_id: input.run.as_ref().map(|run| run.id.clone()),
+        agent_id: input.agent_id.clone(),
+        channel_id: input.channel_id.clone(),
+        task_id: input.task_id.clone(),
+        message_id: None,
+        text: input.text.clone(),
+        action: input.action.clone(),
+        summary: input.summary.clone(),
+        evidence_ids: input.evidence_ids.clone(),
+        options: input.options.clone(),
+        allow_free_text: input.allow_free_text,
+        multi_select: input.multi_select,
+        status: AskStatus::Open,
+        answer: Vec::new(),
+        note: String::new(),
+        answered_by: None,
+        created_at: now_ms(),
+        answered_at: None,
+    };
+    if let Some(run) = &input.run {
+        finish_streamed_reply(state, &run.id).await?;
     }
 
-    let actor = state
-        .store
-        .member(actor_id)?
-        .map(|member| member.display_name)
-        .unwrap_or_else(|| "A workspace member".into());
-    let prompt = format!(
-        "{actor} approved the requested review action:\n\n{action}\n\nCarry out the approved action now. Ask again only if its scope or risk has materially changed."
-    );
+    let message = post_message(
+        state,
+        &input.channel_id,
+        &input.agent_id,
+        SendMessage {
+            kind: Some(MessageKind::Card),
+            card: Some(MessageCard::Ask {
+                ask_id: ask.id.clone(),
+            }),
+            run_id: input.run.as_ref().map(|run| run.id.clone()),
+            // Asked where the work was asked for.
+            parent_id: match &input.run {
+                Some(run) => reply_parent(state, run).await,
+                None => None,
+            },
+            ..Default::default()
+        },
+        PostOptions {
+            trigger_agents: false,
+            run_id: input.run.as_ref().map(|run| run.id.clone()),
+        },
+    )
+    .await?;
+    ask.message_id = Some(message.id.clone());
 
-    match run_task(state, actor_id, &task.id, None, Some(prompt)).await {
-        Ok(run) => {
-            resolve_inbox(state, Some(&task.id), None, None)?;
-            let _ = post_system(
-                state,
-                &task.discussion_channel_id,
-                &format!("{actor} approved: {action}"),
-            )
-            .await;
-            Ok(Some(run))
+    // A run only waits on what it cannot proceed without. A review ask is
+    // handed over as the run ends, so holding the run open for it would be a
+    // process sitting on a worktree for however long a person takes.
+    let waiting_run = input.run.clone().filter(|_| input.kind.blocks_run()).map(|mut run| {
+        run.status = RunStatus::Waiting;
+        run.headline = if ask.text.is_empty() {
+            "Waiting for an answer".into()
+        } else {
+            crate::store::truncate_chars(&ask.text, 80)
+        };
+        run
+    });
+
+    let agent_name = state
+        .store
+        .member(&input.agent_id)?
+        .map(|m| m.display_name)
+        .unwrap_or_else(|| "An agent".into());
+    let mut inbox_items = Vec::new();
+    for member_id in state.store.channel_audience(&input.channel_id)? {
+        let Some(member) = state.store.member(&member_id)? else {
+            continue;
+        };
+        if member.kind != MemberKind::Human {
+            continue;
         }
-        Err(err) => {
-            if state.store.restore_review_action(&task.id, &action)? {
-                if let Some(task) = state.store.task(&task.id)? {
-                    state.emit(Event::TaskUpdated { task });
-                }
-            }
-            Err(err)
+        inbox_items.push(InboxItem {
+            id: new_id(),
+            member_id: member.id.clone(),
+            kind: InboxKind::Ask,
+            title: match input.kind {
+                AskKind::Review => format!("{agent_name} has something for you to look at"),
+                AskKind::Unblock => format!("{agent_name} is blocked on you"),
+                AskKind::Decide => format!("{agent_name} needs a decision"),
+                AskKind::Answer => format!("{agent_name} has a question"),
+            },
+            preview: ask.text.clone(),
+            actor_id: Some(input.agent_id.clone()),
+            channel_id: Some(input.channel_id.clone()),
+            message_id: Some(message.id.clone()),
+            task_id: input.task_id.clone(),
+            run_id: input.run.as_ref().map(|run| run.id.clone()),
+            automation_id: None,
+            created_at: now_ms(),
+            read_at: None,
+        });
+    }
+
+    let (task, superseded) = match state.store.commit_ask(
+        &ask,
+        waiting_run.as_ref(),
+        &inbox_items,
+        input.replace,
+    )? {
+        crate::store::AskCommit::Committed { task, superseded } => (task, superseded),
+        outcome => {
+            state.store.delete_message(&message.id)?;
+            state.emit(Event::MessageDeleted {
+                channel_id: input.channel_id.clone(),
+                message_id: message.id,
+            });
+            return Err(match outcome {
+                crate::store::AskCommit::AlreadyAsking(open) => AlreadyAsking(open).into(),
+                _ => anyhow!("that run has already ended"),
+            });
         }
+    };
+    settle_superseded_asks(state, superseded).await?;
+    if let Some(run) = waiting_run {
+        state.emit(Event::RunUpdated { run: run.clone() });
+        state.set_presence(&run.agent_id, Presence::Waiting).await;
+        if let Some(host_id) = &run.host_id {
+            state
+                .send_to_host(host_id, RelayToHost::AskOpened { run_id: run.id.clone() })
+                .await;
+        }
+    }
+    if let Some(task) = &task {
+        state.emit(Event::TaskUpdated { task: task.clone() });
+    }
+    for item in inbox_items {
+        state.emit(Event::InboxItemCreated { item });
+    }
+    state.emit(Event::AskUpdated { ask: ask.clone() });
+    Ok((task, ask))
+}
+
+/// The one open ask stood in the way. Carried as its own error so the API can
+/// answer 409 with the text of what is already waiting.
+#[derive(Debug)]
+pub struct AlreadyAsking(pub Ask);
+
+impl std::fmt::Display for AlreadyAsking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "already waiting on \"{}\": let it be answered, or pass --replace to cancel it and ask this instead",
+            self.0.text.trim()
+        )
     }
 }
 
-/// Answering a question un-blocks the run that asked it.
-pub async fn answer_question(
+impl std::error::Error for AlreadyAsking {}
+
+/// Answering an ask closes it, resumes whatever run was waiting on it, and
+/// clears every badge that pointed at it. Approval is this and nothing else:
+/// the person answers with the action label, and the agent reads it back.
+pub async fn answer_ask(
     state: &Shared,
-    question_id: &str,
-    answers: Vec<QuestionAnswer>,
+    ask_id: &str,
+    answer: Vec<String>,
+    note: String,
     by: &str,
-) -> Result<Question> {
-    let (question, resumed_task) = state.store.answer_question(question_id, &answers, by)?;
-    state.emit(Event::QuestionUpdated {
-        question: question.clone(),
-    });
-    if let Some(task) = resumed_task {
+) -> Result<Ask> {
+    let (ask, task) = state.store.answer_ask(ask_id, &answer, &note, by)?;
+    state.emit(Event::AskUpdated { ask: ask.clone() });
+    if let Some(task) = task {
         state.emit(Event::TaskUpdated { task });
     }
 
-    let run = state.store.run(&question.run_id)?;
+    let run = ask.run_id.as_deref().map(|id| state.store.run(id)).transpose()?.flatten();
     if let Some(run) = &run {
         if let Some(host_id) = &run.host_id {
             state
                 .send_to_host(
                     host_id,
-                    RelayToHost::AnswerQuestion {
+                    RelayToHost::AnswerAsk {
                         run_id: run.id.clone(),
-                        question_id: question.id.clone(),
-                        answers: answers.clone(),
+                        ask_id: ask.id.clone(),
+                        answer: ask.answer_text(),
                     },
                 )
                 .await;
         }
     }
     // Reset the transcript boundary before the long-poll lets the CLI return.
-    state.resolve_question(&question).await;
-    resolve_inbox(state, None, None, question.message_id.as_deref())?;
+    state.resolve_ask(&ask).await;
+    resolve_inbox(state, None, None, ask.message_id.as_deref())?;
 
     // The host send above yields, so cancellation may have won meanwhile.
-    if let Some(mut run) = state.store.run(&question.run_id)? {
+    if let Some(mut run) = run.as_ref().and_then(|run| state.store.run(&run.id).ok().flatten()) {
         let has_open = state
             .store
-            .run_questions(&run.id)?
+            .run_asks(&run.id)?
             .iter()
-            .any(|question| question.status == QuestionStatus::Open);
+            .any(|ask| ask.status == AskStatus::Open && ask.kind.blocks_run());
         let mut changed = false;
         if has_open && !run.status.is_terminal() && run.status != RunStatus::Waiting {
             run.status = RunStatus::Waiting;
@@ -3728,46 +3887,44 @@ pub async fn answer_question(
             .await;
     }
 
-    Ok(question)
+    Ok(ask)
 }
 
 fn resolve_inbox(
     state: &Shared,
     task_id: Option<&str>,
-    question_run_id: Option<&str>,
-    question_message_id: Option<&str>,
+    ask_run_id: Option<&str>,
+    ask_message_id: Option<&str>,
 ) -> Result<()> {
     for item in state
         .store
-        .resolve_inbox_for(task_id, question_run_id, question_message_id)?
+        .resolve_inbox_for(task_id, ask_run_id, ask_message_id)?
     {
         state.emit(Event::InboxItemUpdated { item });
     }
     Ok(())
 }
 
-/// Retire the questions a re-asking run left open: the card stops inviting an
+/// Retire the asks a re-asking run left open: the card stops inviting an
 /// answer nobody is waiting for, the Inbox badge clears, and a `patchwork ask`
 /// still long-polling learns it lost the floor instead of hanging.
-pub async fn settle_superseded_questions(state: &Shared, questions: Vec<Question>) -> Result<()> {
-    for question in questions {
-        state.emit(Event::QuestionUpdated {
-            question: question.clone(),
-        });
-        state.resolve_question(&question).await;
-        resolve_inbox(state, None, None, question.message_id.as_deref())?;
+pub async fn settle_superseded_asks(state: &Shared, asks: Vec<Ask>) -> Result<()> {
+    for ask in asks {
+        state.emit(Event::AskUpdated { ask: ask.clone() });
+        state.resolve_ask(&ask).await;
+        resolve_inbox(state, None, None, ask.message_id.as_deref())?;
     }
     Ok(())
 }
 
-/// Settle every outstanding question when its run ends, including the card,
-/// Inbox badge and any long-polling `patchwork ask` process.
-pub async fn cancel_questions_for_run(state: &Shared, run_id: &str) -> Result<()> {
-    for question in state.store.cancel_questions_for_run(run_id)? {
-        state.emit(Event::QuestionUpdated {
-            question: question.clone(),
-        });
-        state.resolve_question(&question).await;
+/// Settle every outstanding ask when its run ends, including the card, the
+/// Inbox badge and any long-polling `patchwork ask` process. A review ask is
+/// deliberately left open: it is addressed to a person, and the run ending is
+/// exactly when it starts mattering.
+pub async fn cancel_asks_for_run(state: &Shared, run_id: &str) -> Result<()> {
+    for ask in state.store.cancel_asks_for_run(run_id)? {
+        state.emit(Event::AskUpdated { ask: ask.clone() });
+        state.resolve_ask(&ask).await;
     }
     resolve_inbox(state, None, Some(run_id), None)
 }
@@ -4085,11 +4242,11 @@ mod tests {
             key: "PW-1".into(),
             title: "Ship it".into(),
             outcome: "Shipped".into(),
+            brief: String::new(),
             status: TaskStatus::Running,
             owner_id: Some("agent".into()),
             source_channel_id: None,
             source_message_id: None,
-            background: false,
             discussion_channel_id: channel.id.clone(),
             project_id: None,
             host_id: None,
@@ -4098,7 +4255,7 @@ mod tests {
             active_continuation: None,
             pr_url: None,
             pr_state: None,
-            review_action: None,
+            ask: None,
             created_by: "manager".into(),
             due_at: None,
             once_key: None,
@@ -4166,9 +4323,14 @@ mod tests {
             .into_iter()
             .any(|message| message.body.contains("stopped working here"));
         assert!(said, "the channel it was talking in must be told why");
+        // A dead run leaves work nobody is looking at. Under "no open ask, no
+        // surface" that has to become an ask, or the task sits there silently
+        // and the machine going away is something nobody ever finds out.
+        let stranded = store.task("task").unwrap().unwrap();
+        assert_eq!(stranded.status, TaskStatus::Blocked);
         assert_eq!(
-            store.task("task").unwrap().unwrap().status,
-            TaskStatus::Blocked
+            stranded.ask.as_ref().map(|ask| ask.kind),
+            Some(AskKind::Unblock)
         );
         assert_eq!(
             store.inbox("human", true).unwrap().len(),
@@ -4609,11 +4771,11 @@ mod tests {
             key: "PW-1".into(),
             title: "Ship it".into(),
             outcome: "It is shipped".into(),
+            brief: String::new(),
             status: TaskStatus::Done,
             owner_id: None,
             source_channel_id: None,
             source_message_id: None,
-            background: false,
             discussion_channel_id: "c".into(),
             project_id: None,
             host_id: None,
@@ -4622,7 +4784,7 @@ mod tests {
             active_continuation: None,
             pr_url: None,
             pr_state: None,
-            review_action: None,
+            ask: None,
             created_by: "human".into(),
             due_at: None,
             once_key: None,
@@ -4670,6 +4832,7 @@ mod tests {
             author_id: author.into(),
             kind: MessageKind::Text,
             body: String::new(),
+            digest: String::new(),
             card: None,
             suggestions: Vec::new(),
             parent_id: None,
@@ -4832,11 +4995,11 @@ mod tests {
             key: "PW-1".into(),
             title: "Answer it".into(),
             outcome: "What is the answer?".into(),
+            brief: String::new(),
             status: TaskStatus::Planned,
             owner_id: None,
             source_channel_id: None,
             source_message_id: None,
-            background: false,
             discussion_channel_id: "c".into(),
             project_id: None,
             host_id: None,
@@ -4845,7 +5008,7 @@ mod tests {
             active_continuation: None,
             pr_url: None,
             pr_state: None,
-            review_action: None,
+            ask: None,
             created_by: "vince".into(),
             due_at: None,
             once_key: None,

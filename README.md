@@ -50,9 +50,10 @@ them, @-mention them, or let them start work themselves:
   The run log records tool calls, diffs, previews and screenshots, and the PR
   is the artifact you actually review. Trust plus a receipt, instead of
   babysitting.
-- **They escalate instead of guessing.** A real decision becomes a question
-  card in your Inbox with options and trade-offs, and the run blocks until you
-  answer. Your Inbox is the short list of what needs a human.
+- **They escalate instead of guessing.** A real decision becomes an ask in your
+  Inbox with options and trade-offs, and the run blocks until you answer. A
+  task with nothing open on it does not surface at all, so what you see is
+  exactly the short list of what needs a human.
 - **They bring evidence.** Screenshots, live dev-server previews any teammate
   can open, and charts posted as data rather than pixels.
 
@@ -205,25 +206,27 @@ scoped to that run and revoked when it ends.
 
 ```bash
 patchwork task create --title "Fix DST double-booking" --outcome "No duplicate slots across a DST change"
-patchwork task create --background --title "Research the edge case" \
-  --outcome "A recommended fix" --owner @researcher
+patchwork task brief MER-41 "Reproduced with a Europe/Berlin fixture. Fix is in, tests pending."
 patchwork status "Reproduced with a Europe/Berlin fixture"
-patchwork ask --question "Where should the DST warning surface?" \
+patchwork ask --text "Where should the DST warning surface?" \
   --option "In-app banner:cheapest, misses quiet studios" --option "Email:reaches everyone"
-patchwork task update MER-41 --status review --approval "Approve and merge PR"
+patchwork task ask MER-41 --kind review --text "DST fix is ready" \
+  --summary "Slots are generated in UTC and rendered locally" --action "Approve and merge PR"
 patchwork task wait --summary "Build is processing" --command check-build \
   --every 300 --deadline 86400 --wake "Verify the release and finish the task"
-patchwork pr https://github.com/acme/app/pull/218
 patchwork chart weekly-actives.json --caption "Active studios, last 8 weeks"
 ```
 
-A `--background` task stays off the normal board while it runs and posts its
-agent's final response back to the conversation that spawned it. `task wait`
-hands an external build, deployment, or review to a persisted relay checker,
-so the current model run can end and a fresh run wakes when the work is ready.
-Plus `say`, `search`, `history`, `attach`, `preview`, `tell`
-(message another running agent), `automation create`, and normal access to
-`git`, `gh` and anything else on the machine.
+A task carries four short strings: title, outcome, a **brief** saying where it
+stands, and at most one open **ask** saying what it needs from a person. No open
+ask means nobody is waiting, so the task stays off the board and reports its
+result to the conversation it came from. Agents never set a status; the relay
+derives it from the runs and the ask. `task wait` hands an external build,
+deployment or review to a persisted relay checker, so the current model run can
+end and a fresh run wakes when the work is ready. Plus `say`, `search`,
+`history`, `attach`, `preview`, `tell` (message another running agent),
+`automation create`, and normal access to `git`, `gh` and anything else on the
+machine.
 
 ## Contributing
 

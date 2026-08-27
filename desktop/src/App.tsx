@@ -28,20 +28,16 @@ import { Sidebar, SIDEBAR_RAIL } from "./components/Sidebar";
 import type { Creatable } from "./components/Sidebar";
 import { ChatView, useHandles } from "./components/Chat";
 import { Inspector } from "./components/Inspector";
-import { InboxView } from "./components/Inbox";
-import { NewTaskModal, TaskPage, TasksBoard } from "./components/Tasks";
+import { Home } from "./components/Inbox";
+import { TaskPage, TasksBoard } from "./components/Tasks";
 import {
   AgentModal,
-  AgentsPage,
   AutomationDebugPage,
-  AutomationsPage,
   InviteModal,
-  MembersPage,
+  PeoplePage,
   ProjectModal,
-  ProjectsPage,
-  SettingsPage,
   SkillModal,
-  SkillsPage,
+  WorkspacePage,
 } from "./components/Pages";
 import {
   Avatar,
@@ -632,21 +628,6 @@ function useShortcuts(actions: {
         run: openHelp,
       },
       {
-        id: "new-task",
-        keys: "C",
-        label: "New task",
-        group: "Create",
-        // A bare letter, the way Linear does it, plus ⌘N for the muscle memory
-        // every other app has trained. Both mean the same thing.
-        match: (event) =>
-          combo("n")(event) ||
-          (!event.metaKey &&
-            !event.ctrlKey &&
-            !event.altKey &&
-            event.key.toLowerCase() === "c"),
-        run: () => create("task"),
-      },
-      {
         id: "new-channel",
         keys: "⌘⇧N",
         label: "New channel",
@@ -655,67 +636,31 @@ function useShortcuts(actions: {
         run: () => create("channel"),
       },
       {
-        id: "go-inbox",
-        keys: "G then I",
-        label: "Inbox",
+        id: "go-home",
+        keys: "G then H",
+        label: "Home",
         group: "Go to",
         chord: "g",
-        match: chord("g", "i"),
+        match: chord("g", "h"),
         run: () => go({ kind: "inbox" }),
       },
       {
-        id: "go-tasks",
-        keys: "G then T",
-        label: "Tasks",
-        group: "Go to",
-        chord: "g",
-        match: chord("g", "t"),
-        run: () => go({ kind: "tasks" }),
-      },
-      {
-        id: "go-agents",
-        keys: "G then A",
-        label: "Agents",
-        group: "Go to",
-        chord: "g",
-        match: chord("g", "a"),
-        run: () => go({ kind: "agents" }),
-      },
-      {
-        id: "go-projects",
+        id: "go-people",
         keys: "G then P",
-        label: "Projects and machines",
+        label: "People",
         group: "Go to",
         chord: "g",
         match: chord("g", "p"),
-        run: () => go({ kind: "projects" }),
+        run: () => go({ kind: "people" }),
       },
       {
-        id: "go-members",
-        keys: "G then M",
-        label: "Members",
+        id: "go-workspace",
+        keys: "G then W",
+        label: "Workspace",
         group: "Go to",
         chord: "g",
-        match: chord("g", "m"),
-        run: () => go({ kind: "members" }),
-      },
-      {
-        id: "go-automations",
-        keys: "G then U",
-        label: "Automations",
-        group: "Go to",
-        chord: "g",
-        match: chord("g", "u"),
-        run: () => go({ kind: "automations" }),
-      },
-      {
-        id: "go-settings",
-        keys: "G then S",
-        label: "Settings",
-        group: "Go to",
-        chord: "g",
-        match: chord("g", "s"),
-        run: () => go({ kind: "settings" }),
+        match: chord("g", "w"),
+        run: () => go({ kind: "workspace" }),
       },
       {
         id: "close-panel",
@@ -810,8 +755,6 @@ function CreateSomething({
   onClose: () => void;
 }) {
   switch (what) {
-    case "task":
-      return <NewTaskModal onClose={onClose} />;
     case "channel":
       return <NewChannelModal sectionId={sectionId} onClose={onClose} />;
     case "section":
@@ -960,27 +903,19 @@ function NewSectionModal({ onClose }: { onClose: () => void }) {
 function MainView({ view, onSignOut }: { view: View; onSignOut: () => void }) {
   switch (view.kind) {
     case "inbox":
-      return <InboxView />;
+      return <Home />;
     case "tasks":
       return <TasksBoard />;
     case "channel":
       return <ChannelView channelId={view.id} />;
     case "task":
       return <TaskPage taskId={view.id} />;
-    case "agents":
-      return <AgentsPage />;
-    case "skills":
-      return <SkillsPage />;
-    case "projects":
-      return <ProjectsPage />;
-    case "members":
-      return <MembersPage />;
-    case "automations":
-      return <AutomationsPage />;
+    case "people":
+      return <PeoplePage />;
+    case "workspace":
+      return <WorkspacePage onSignOut={onSignOut} />;
     case "automation":
       return <AutomationDebugPage automationId={view.id} />;
-    case "settings":
-      return <SettingsPage onSignOut={onSignOut} />;
     case "search":
       return <SearchPage query={view.query} />;
   }
@@ -990,7 +925,6 @@ function ChannelView({ channelId }: { channelId: string }) {
   const app = useApp();
   const api = useApi();
   const { toast } = useNavigation();
-  const [creatingTask, setCreatingTask] = useState(false);
   const channel = app.channels.find((candidate) => candidate.id === channelId);
   if (!channel) return <Empty title="This conversation is gone" />;
 
@@ -1041,48 +975,31 @@ function ChannelView({ channelId }: { channelId: string }) {
             {partner.presence}
           </Chip>
         )}
-        <button className="button quiet" onClick={() => setCreatingTask(true)}>
-          <PlusIcon size={15} />
-          New task
-        </button>
-        <MenuButton
-          align="right"
-          title="More"
-          items={[
-            {
-              key: "task",
-              label: "Turn this into a task",
-              onSelect: () => setCreatingTask(true),
-            },
-            ...(channel.kind === "channel"
-              ? [
-                  {
-                    key: "archive",
-                    label: "Archive channel",
-                    danger: true,
-                    onSelect: async () => {
-                      try {
-                        await api.archiveChannel(channel.id);
-                        toast(`#${channel.name} archived`);
-                      } catch (err) {
-                        toast(String((err as Error).message ?? err));
-                      }
-                    },
-                  },
-                ]
-              : []),
-          ]}
-        >
-          <MoreIcon size={17} />
-        </MenuButton>
+        {channel.kind === "channel" && (
+          <MenuButton
+            align="right"
+            title="More"
+            items={[
+              {
+                key: "archive",
+                label: "Archive channel",
+                danger: true,
+                onSelect: async () => {
+                  try {
+                    await api.archiveChannel(channel.id);
+                    toast(`#${channel.name} archived`);
+                  } catch (err) {
+                    toast(String((err as Error).message ?? err));
+                  }
+                },
+              },
+            ]}
+          >
+            <MoreIcon size={17} />
+          </MenuButton>
+        )}
       </div>
       <ChatView channelId={channelId} />
-      {creatingTask && (
-        <NewTaskModal
-          sourceChannelId={channelId}
-          onClose={() => setCreatingTask(false)}
-        />
-      )}
     </div>
   );
 }
@@ -1157,6 +1074,7 @@ function CommandPalette({
 }) {
   const { go } = useNavigation();
   const app = useApp();
+  const api = useApi();
   const workspaces = useWorkspaces();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -1229,10 +1147,29 @@ function CommandPalette({
       out.push({
         key: task.id,
         group: "Tasks",
-        label: `${task.key} · ${task.title}`,
-        hint: task.status,
+        label: task.title,
+        hint: task.brief,
         icon: <TasksIcon size={16} />,
         run: () => open({ kind: "task", id: task.id }),
+      });
+    }
+
+    // The one way left for a person to make a task by hand. Everything else
+    // starts as a sentence in a conversation, which is where the agent that
+    // will actually do the work is already reading.
+    const wanted = /^task create\s+(.+)/i.exec(query.trim())?.[1];
+    if (wanted) {
+      out.push({
+        key: "task-create",
+        group: "Create",
+        label: `task create “${wanted}”`,
+        icon: <PlusIcon size={16} />,
+        run: () => {
+          onClose();
+          void api.createTask({ outcome: wanted }).then((task) =>
+            go({ kind: "task", id: task.id }),
+          );
+        },
       });
     }
 
@@ -1264,7 +1201,7 @@ function CommandPalette({
     }
 
     return out.slice(0, 40);
-  }, [app, needle, query, shortcuts, workspaces, open, onClose]);
+  }, [api, app, go, needle, query, shortcuts, workspaces, open, onClose]);
 
   // Arrow keys must walk the list the way it is *drawn*. Grouping reorders
   // everything — two channels either side of a task end up adjacent — so the
@@ -1454,15 +1391,13 @@ function SearchPage({ query }: { query: string }) {
         <button
           key={task.id}
           className="row"
+          title={task.key}
           onClick={() => go({ kind: "task", id: task.id })}
         >
           <span className="grow">
-            <span className="name">
-              {task.key} — {task.title}
-            </span>
-            <span className="sub">{task.outcome}</span>
+            <span className="name">{task.title}</span>
+            <span className="sub">{task.brief}</span>
           </span>
-          <Chip>{task.status}</Chip>
         </button>
       ))}
       {results?.messages.length ? (

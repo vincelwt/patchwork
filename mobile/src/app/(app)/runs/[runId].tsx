@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { FlatList, StyleSheet, Text, TextInput, View } from "react-native";
+import { Stack, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { RunEvent } from "@client/types";
+import { AskCard } from "@/components/AskCard";
 import { PendingImages, useImageAttachments } from "@/components/Attachment";
 import { Markdown } from "@/components/Markdown";
 import { Avatar, Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/components/ui";
@@ -18,15 +19,14 @@ export default function RunScreen() {
   const { runId } = useLocalSearchParams<{ runId: string }>();
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const detail = workspace.runDetails[runId];
   const run = detail?.run ?? workspace.bootstrap?.active_runs.find((item) => item.id === runId);
   const agent = workspace.bootstrap?.members.find((member) => member.id === run?.agent_id);
   const host = workspace.bootstrap?.hosts.find((item) => item.id === run?.host_id);
-  const question = detail?.questions.find((item) => item.status === "open")
-    ?? workspace.bootstrap?.open_questions.find((item) => item.run_id === runId);
+  const ask = detail?.asks.find((item) => item.status === "open")
+    ?? workspace.bootstrap?.open_asks.find((item) => item.run_id === runId);
   const events = detail?.events ?? [];
   // Newest first and drawn upside down, so a run that is still working opens on
   // what it just did rather than on where it started.
@@ -88,15 +88,7 @@ export default function RunScreen() {
               {run.cwd ? <Text selectable style={[styles.cwd, { color: theme.faint }]}>{run.cwd}</Text> : null}
               {run.error ? <Text selectable style={[styles.runError, { color: theme.danger }]}>{run.error}</Text> : null}
             </Card>
-            {question ? (
-              <Pressable
-                onPress={() => router.push({ pathname: "/(app)/questions/[questionId]", params: { questionId: question.id } })}
-                style={[styles.question, { backgroundColor: theme.cautionSoft }]}
-              >
-                <Text style={{ color: theme.caution, fontWeight: "700" }}>Waiting for your answer</Text>
-                <Text style={{ color: theme.text }}>{question.headline}</Text>
-              </Pressable>
-            ) : null}
+            {ask ? <AskCard ask={ask} /> : null}
             <Text style={[styles.section, { color: theme.faint }]}>Activity</Text>
             {!events.length ? <Empty title={active ? "Waiting for activity" : "Nothing was recorded"} /> : null}
           </Measured>
@@ -190,7 +182,6 @@ const styles = StyleSheet.create({
   meta: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   cwd: { fontSize: 11 },
   runError: { fontSize: 14, lineHeight: 20 },
-  question: { borderRadius: 11, padding: 13, gap: 4 },
   section: { fontSize: 13, fontWeight: "600" },
   event: { flexDirection: "row", gap: 10, paddingHorizontal: 14, paddingVertical: 8 },
   eventKind: { width: 72, fontSize: 10, fontWeight: "700" },

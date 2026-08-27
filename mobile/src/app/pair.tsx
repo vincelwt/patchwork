@@ -46,7 +46,7 @@ export default function PairDevice() {
         throw new Error(body && "error" in body ? body.error?.message || "Pairing failed." : "Pairing failed.");
       }
       await pair({ baseUrl: url.toString(), token: body.token, name: body.workspace?.name });
-      router.replace("/inbox");
+      router.replace("/home");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
       scanned.current = false;

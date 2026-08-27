@@ -1,10 +1,8 @@
-import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useRouter } from "expo-router";
 
 import type { Automation } from "@client/types";
-import { AutomationEditor } from "@/components/AutomationEditor";
-import { Avatar, Badge, Button, Empty, Grouped, Sheet } from "@/components/ui";
+import { Avatar, Badge, Button, Empty, Grouped } from "@/components/ui";
 import { relative, triggerLabel, watchHealth } from "@/lib/format";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
@@ -14,30 +12,18 @@ export default function AutomationsScreen() {
   const router = useRouter();
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
-  const [creating, setCreating] = useState(false);
   const automations = workspace.bootstrap?.automations ?? [];
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <Stack.Screen
-        options={{
-          title: "Automations",
-          headerRight: () => <Button label="New" compact tone="quiet" onPress={() => setCreating(true)} />,
-        }}
-      />
+      <Stack.Screen options={{ title: "Automations" }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
        <Grouped>
         {automations.map((automation) => <AutomationRow key={automation.id} automation={automation} />)}
-        {!automations.length ? <Empty title="No automations yet" detail="Choose what fires, which agent acts, and where the result lands." /> : null}
+        {/* Automations are wired up at a keyboard; the phone runs and watches
+            them. */}
+        {!automations.length ? <Empty title="No automations yet" detail="Set one up in Patchwork Desktop." /> : null}
        </Grouped>
       </ScrollView>
-      <Sheet visible={creating} title="New automation" onClose={() => setCreating(false)}>
-        <AutomationEditor
-          onSaved={(automation) => {
-            setCreating(false);
-            router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: automation.id } });
-          }}
-        />
-      </Sheet>
     </View>
   );
 

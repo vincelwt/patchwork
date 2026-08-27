@@ -46,22 +46,16 @@ import {
   Toggle,
 } from "./ui";
 import {
-  AgentIcon,
-  AppIcon,
   CheckIcon,
   ChevronIcon,
   ExternalIcon,
   FileIcon,
   FolderIcon,
-  MachineIcon,
   MoreIcon,
   PencilIcon,
-  PhoneIcon,
   PlusIcon,
-  RelayIcon,
   Spinner,
   TrashIcon,
-  WorkspaceIcon,
 } from "./icons";
 import { RuntimeIcon } from "./RuntimeIcon";
 import { PairDeviceModal } from "./PairDeviceModal";
@@ -95,16 +89,32 @@ function useHostSignature(hosts: Host[]): string {
   );
 }
 
-// --- agents ----------------------------------------------------------------
+// --- people ----------------------------------------------------------------
 
-export function AgentsPage() {
+/// Everyone in the workspace, human and agent, in one list.
+///
+/// They were two pages because they are two rows in the database. To the
+/// person looking for "who is in here", they are one question, and an agent
+/// you talk to like a colleague should not live under Administration.
+export function PeoplePage() {
   const app = useApp();
   const api = useApi();
+  const { toast } = useNavigation();
   const [editing, setEditing] = useState<Member | null>(null);
   const [creating, setCreating] = useState(false);
   const [addingManager, setAddingManager] = useState(false);
+  const [inviting, setInviting] = useState(false);
+  const [pairing, setPairing] = useState(false);
+  const [removing, setRemoving] = useState<Member | null>(null);
   const [error, setError] = useState("");
+  // People first, then agents: both are teammates, and one order has to win.
+  const people = [...app.members].sort(
+    (a, b) =>
+      Number(a.kind === "agent") - Number(b.kind === "agent") ||
+      a.display_name.localeCompare(b.display_name),
+  );
   const agents = app.members.filter((member) => member.kind === "agent");
+  const iAmAdmin = app.me?.is_admin ?? false;
 
   const addManager = async () => {
     const relay = app.hosts.find((host) => host.kind === "relay" && host.online);
@@ -140,52 +150,91 @@ export function AgentsPage() {
 
   return (
     <Page
-      title="Agents"
+      title="People"
       actions={
-        <button className="button" onClick={() => setCreating(true)}>
-          <PlusIcon size={15} />
-          New agent
-        </button>
+        <>
+          <button className="button quiet" onClick={() => setPairing(true)}>
+            Pair phone or tablet
+          </button>
+          <button className="button quiet" onClick={() => setInviting(true)}>
+            Invite someone
+          </button>
+          <button className="button" onClick={() => setCreating(true)}>
+            <PlusIcon size={15} />
+            New agent
+          </button>
+        </>
       }
     >
-      {agents.length === 0 ? (
+      {agents.length === 0 && (
         <Empty
           title="No agents yet"
           hint="An agent is a teammate: a name, a description that defines what it owns, a runtime, and where it runs."
           action={
-            <div className="field-row">
-              <button
-                className="button primary"
-                disabled={addingManager}
-                onClick={() => void addManager()}
-              >
-                {addingManager ? "Adding…" : "Add Manager (recommended)"}
-              </button>
-              <button className="button" onClick={() => setCreating(true)}>
-                Create a custom agent
-              </button>
-            </div>
+            <button
+              className="button primary"
+              disabled={addingManager}
+              onClick={() => void addManager()}
+            >
+              {addingManager ? "Adding…" : "Add Manager (recommended)"}
+            </button>
           }
         />
-      ) : (
-        agents.map((agent) => (
-          <button key={agent.id} className="row" onClick={() => setEditing(agent)}>
-            <Avatar member={agent} size={30} />
+      )}
+
+      {people.map((member) => {
+        const isAgent = member.kind === "agent";
+        return (
+          <div
+            className="row hoverable"
+            key={member.id}
+            onClick={isAgent ? () => setEditing(member) : undefined}
+          >
+            <Avatar member={member} size={30} presence={!isAgent} />
             <span className="grow">
-              <span className="name">{agent.display_name}</span>
+              <span className="name">
+                {member.display_name}
+                {member.id === app.me?.id && <span className="you"> you</span>}
+              </span>
               <span className="sub">
-                @{agent.handle}
-                {agent.agent?.description ? ` · ${agent.agent.description}` : ""}
+                @{member.handle}
+                {isAgent
+                  ? member.agent?.description
+                    ? ` · ${member.agent.description}`
+                    : ""
+                  : member.email
+                    ? ` · ${member.email}`
+                    : ""}
               </span>
             </span>
-            {agent.is_admin && <Chip>admin</Chip>}
-            <Chip>{agent.agent?.runtime}</Chip>
-            <Chip tone={agent.presence === "working" ? "accent" : ""}>
-              {locationLabel(agent.agent)}
-            </Chip>
-          </button>
-        ))
-      )}
+            {member.is_admin && <Chip>admin</Chip>}
+            {isAgent ? (
+              <Chip>{locationLabel(member.agent)}</Chip>
+            ) : (
+              <Chip tone={member.presence === "online" ? "positive" : ""}>
+                {member.presence}
+              </Chip>
+            )}
+            {iAmAdmin && member.id !== app.me?.id && (
+              <MenuButton
+                align="right"
+                title="Manage"
+                items={[
+                  {
+                    key: "remove",
+                    label: `Remove ${member.display_name}`,
+                    icon: <TrashIcon size={15} />,
+                    danger: true,
+                    onSelect: () => setRemoving(member),
+                  },
+                ]}
+              >
+                <MoreIcon size={17} />
+              </MenuButton>
+            )}
+          </div>
+        );
+      })}
 
       {error && <div className="error-text">{error}</div>}
 
@@ -195,6 +244,24 @@ export function AgentsPage() {
           onClose={() => {
             setCreating(false);
             setEditing(null);
+          }}
+        />
+      )}
+      {inviting && <InviteModal onClose={() => setInviting(false)} />}
+      {pairing && <PairDeviceModal onClose={() => setPairing(false)} />}
+      {removing && (
+        <ConfirmDelete
+          what={removing.display_name}
+          detail="They lose access immediately. What they wrote stays in the transcript; removing someone does not rewrite history."
+          onCancel={() => setRemoving(null)}
+          onConfirm={async () => {
+            try {
+              await api.removeMember(removing.id);
+              toast(`${removing.display_name} was removed`);
+            } catch (err) {
+              toast(String((err as Error).message ?? err));
+            }
+            setRemoving(null);
           }}
         />
       )}
@@ -629,6 +696,11 @@ export function AgentModal({
         textarea
         placeholder="Who is this teammate, what do they own, and what will they decline?"
       />
+
+      {/* Everything below here has a working default. Somebody creating their
+          first agent should have to answer two questions, not fourteen. */}
+      <details className="advanced">
+      <summary>Advanced</summary>
       <FormSelect
         label="Runs on"
         value={chosenPlacement?.value ?? placementValue}
@@ -807,42 +879,67 @@ export function AgentModal({
         />
       )}
 
-      {app.channels.some((channel) => channel.kind === "channel") && (
-        <Section title="Per-channel participation">
-          {app.channels
-            .filter((channel) => channel.kind === "channel")
-            .map((channel) => (
-              <div className="row hoverable" key={channel.id}>
-                <span className="grow name">#{channel.name}</span>
-                <Dropdown
-                  quiet
-                  align="right"
-                  width={130}
-                  value={
-                    profile.channel_participation[channel.id] ??
-                    profile.default_participation
-                  }
-                  onChange={(value) =>
-                    setProfile({
-                      ...profile,
-                      channel_participation: {
-                        ...profile.channel_participation,
-                        [channel.id]: value as Participation,
-                      },
-                    })
-                  }
-                  options={[
-                    { value: "off", label: "Off" },
-                    { value: "mention", label: "Mention" },
-                    { value: "ambient", label: "Ambient" },
-                  ]}
-                />
-              </div>
-            ))}
-        </Section>
-      )}
+      <AgentChannels profile={profile} onChange={setProfile} />
+      </details>
       {error && <div className="error-text">{error}</div>}
     </Modal>
+  );
+}
+
+/// Which channels this agent is in, added and removed the way a person is
+/// invited to one. The grid of every channel against every participation mode
+/// asked you to answer a question per room before you had been in any of them.
+function AgentChannels({
+  profile,
+  onChange,
+}: {
+  profile: AgentProfile;
+  onChange: (profile: AgentProfile) => void;
+}) {
+  const app = useApp();
+  const channels = app.channels.filter((channel) => channel.kind === "channel");
+  const joined = channels.filter(
+    (channel) => (profile.channel_participation[channel.id] ?? "off") !== "off",
+  );
+  const available = channels.filter((channel) => !joined.includes(channel));
+
+  const set = (channelId: Id, participation: Participation) =>
+    onChange({
+      ...profile,
+      channel_participation: {
+        ...profile.channel_participation,
+        [channelId]: participation,
+      },
+    });
+
+  if (channels.length === 0) return null;
+
+  return (
+    <Section title="Channels">
+      {joined.map((channel) => (
+        <div className="row hoverable" key={channel.id}>
+          <span className="grow name">#{channel.name}</span>
+          <button
+            className="button quiet"
+            onClick={() => set(channel.id, "off")}
+            title={`Take this agent out of #${channel.name}`}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      {available.length > 0 && (
+        <Dropdown
+          value=""
+          placeholder="Add to a channel…"
+          onChange={(channelId) => set(channelId, profile.default_participation)}
+          options={available.map((channel) => ({
+            value: channel.id,
+            label: `#${channel.name}`,
+          }))}
+        />
+      )}
+    </Section>
   );
 }
 
@@ -850,7 +947,7 @@ export function AgentModal({
 
 type LocatedSystemSkill = SystemSkill & { machine: string; hostId: Id };
 
-export function SkillsPage() {
+function SkillsSection() {
   const app = useApp();
   const [editing, setEditing] = useState<WorkspaceSkill | null>(null);
   const [editingSystem, setEditingSystem] = useState<LocatedSystemSkill | null>(null);
@@ -871,17 +968,16 @@ export function SkillsPage() {
   );
 
   return (
-    <Page
-      title="Skills"
-      subtitle="Workspace skills and global skills found on execution machines"
-      actions={
-        <button className="button" onClick={() => setCreating(true)}>
-          <PlusIcon size={15} />
-          New skill
-        </button>
-      }
-    >
-      <Section title="Workspace skills">
+    <>
+      <Section
+        title="Skills"
+        action={
+          <button className="button quiet" onClick={() => setCreating(true)}>
+            <PlusIcon size={15} />
+            New skill
+          </button>
+        }
+      >
         <button className="row" onClick={() => setEditingAutonomy(true)}>
           <span style={{ color: "var(--text-muted)", display: "flex" }}>
             <FileIcon />
@@ -966,7 +1062,7 @@ export function SkillsPage() {
           onClose={() => setEditingSystem(null)}
         />
       )}
-    </Page>
+    </>
   );
 }
 
@@ -1209,35 +1305,25 @@ export function SkillModal({
   );
 }
 
-// --- projects and machines --------------------------------------------------
+// --- projects ---------------------------------------------------------------
 
-export function ProjectsPage() {
+function ProjectsSection() {
   const app = useApp();
   const api = useApi();
   const [editing, setEditing] = useState<Project | null>(null);
   const [creating, setCreating] = useState(false);
-  const [info, setInfo] = useState<DesktopInfo>();
-
-  // Which machines exist and whether they are up — not every heartbeat. The
-  // hosts array gets a new identity on each one, and re-asking this machine
-  // about itself forty times an hour is work nobody sees.
-  const hostSignature = useHostSignature(app.hosts);
-  useEffect(() => {
-    void desktopInfo().then(setInfo);
-  }, [hostSignature]);
 
   return (
-    <Page
-      title="Projects and machines"
-      subtitle="A repository every machine clones for itself, or a folder that already exists on one"
-      actions={
-        <button className="button" onClick={() => setCreating(true)}>
-          <PlusIcon size={15} />
-          New project
-        </button>
-      }
-    >
-      <Section title="Projects">
+    <>
+      <Section
+        title="Projects"
+        action={
+          <button className="button quiet" onClick={() => setCreating(true)}>
+            <PlusIcon size={15} />
+            New project
+          </button>
+        }
+      >
         {app.projects.length === 0 ? (
           <Empty
             title="No projects yet"
@@ -1284,46 +1370,6 @@ export function ProjectsPage() {
         )}
       </Section>
 
-      <Section title="Execution machines">
-        {app.hosts.map((host) => {
-          const ready = host.capabilities.runtimes.filter(
-            (runtime) => runtime.available && runtime.id !== "custom",
-          );
-          return (
-            <div className="row hoverable" key={host.id}>
-              <span className={`dot ${host.online ? "online" : ""}`} />
-              <span className="grow">
-                <span className="name">{host.name}</span>
-                <span className="sub">
-                  {host.platform}
-                  {ready.length
-                    ? ` · ${ready.map((runtime) => runtime.label).join(", ")}`
-                    : " · no agent installations detected"}
-                </span>
-              </span>
-              {host.capabilities.has_gh && (
-                <Chip tone={host.capabilities.gh_authenticated ? "positive" : "caution"}>
-                  gh
-                </Chip>
-              )}
-              <Chip tone={host.online ? "positive" : ""}>
-                {host.online ? "online" : `seen ${relative(host.last_seen)}`}
-              </Chip>
-            </div>
-          );
-        })}
-      </Section>
-
-      {info && info.capabilities.notes.length > 0 && (
-        <Section title="This machine">
-          {info.capabilities.notes.map((note) => (
-            <div className="row" key={note}>
-              <span className="grow sub">{note}</span>
-            </div>
-          ))}
-        </Section>
-      )}
-
       {(creating || editing) && (
         <ProjectModal
           project={editing}
@@ -1341,7 +1387,7 @@ export function ProjectsPage() {
           }
         />
       )}
-    </Page>
+    </>
   );
 }
 
@@ -1498,128 +1544,6 @@ export function ProjectModal({
   );
 }
 
-// --- members ---------------------------------------------------------------
-
-export function MembersPage() {
-  const app = useApp();
-  const api = useApi();
-  const { toast } = useNavigation();
-  const [inviting, setInviting] = useState(false);
-  const [pairing, setPairing] = useState(false);
-  const [removing, setRemoving] = useState<Member | null>(null);
-  const humans = app.members.filter((member) => member.kind === "human");
-  const iAmAdmin = app.me?.is_admin ?? false;
-
-  return (
-    <Page
-      title="Members"
-      subtitle={`${humans.length} ${humans.length === 1 ? "person" : "people"}`}
-      actions={
-        <>
-          <button className="button quiet" onClick={() => setPairing(true)}>
-            Pair phone or tablet
-          </button>
-          <button className="button" onClick={() => setInviting(true)}>
-            <PlusIcon size={15} />
-            Invite someone
-          </button>
-        </>
-      }
-    >
-      {humans.map((member) => (
-        <div className="row hoverable" key={member.id}>
-          <Avatar member={member} size={30} presence />
-          <span className="grow">
-            <span className="name">
-              {member.display_name}
-              {member.id === app.me?.id && <span className="you"> you</span>}
-            </span>
-            <span className="sub">
-              @{member.handle}
-              {member.email ? ` · ${member.email}` : ""}
-            </span>
-          </span>
-          {member.is_admin && <Chip>admin</Chip>}
-          <Chip tone={member.presence === "online" ? "positive" : ""}>
-            {member.presence}
-          </Chip>
-          {iAmAdmin && member.id !== app.me?.id && (
-            <MenuButton
-              align="right"
-              title="Manage"
-              items={[
-                {
-                  key: "admin",
-                  label: member.is_admin ? "Remove admin" : "Make admin",
-                  disabled: true,
-                  hint: "Admin rights are set by the relay for now",
-                  onSelect: () => {},
-                },
-                "separator",
-                {
-                  key: "remove",
-                  label: `Remove ${member.display_name}`,
-                  icon: <TrashIcon size={15} />,
-                  danger: true,
-                  onSelect: () => setRemoving(member),
-                },
-              ]}
-            >
-              <MoreIcon size={17} />
-            </MenuButton>
-          )}
-        </div>
-      ))}
-
-      {!iAmAdmin && humans.length > 1 && (
-        <div className="notice" style={{ marginTop: 18 }}>
-          Only an admin can remove someone from this workspace.
-        </div>
-      )}
-
-      {inviting && <InviteModal onClose={() => setInviting(false)} />}
-      {pairing && <PairDeviceModal onClose={() => setPairing(false)} />}
-
-      {removing && (
-        <Modal
-          title={`Remove ${removing.display_name}?`}
-          subtitle="They lose access immediately. What they wrote stays in the transcript — removing a person does not rewrite history."
-          onClose={() => setRemoving(null)}
-          actions={
-            <>
-              <button className="button quiet" onClick={() => setRemoving(null)}>
-                Cancel
-              </button>
-              <button
-                className="button primary danger-solid"
-                onClick={async () => {
-                  try {
-                    await api.removeMember(removing.id);
-                    toast(`${removing.display_name} was removed`);
-                  } catch (err) {
-                    toast(String((err as Error).message ?? err));
-                  }
-                  setRemoving(null);
-                }}
-              >
-                Remove
-              </button>
-            </>
-          }
-        >
-          <div className="row hoverable" style={{ marginTop: 14 }}>
-            <Avatar member={removing} size={30} />
-            <span className="grow">
-              <span className="name">{removing.display_name}</span>
-              <span className="sub">@{removing.handle}</span>
-            </span>
-          </div>
-        </Modal>
-      )}
-    </Page>
-  );
-}
-
 /// One copyable invitation: the recipient should not have to ask which URL a
 /// code belongs to or configure any networking before they can use it.
 export function InviteModal({ onClose }: { onClose: () => void }) {
@@ -1696,7 +1620,7 @@ export function InviteModal({ onClose }: { onClose: () => void }) {
 
 // --- automations -----------------------------------------------------------
 
-export function AutomationsPage() {
+function AutomationsSection() {
   const app = useApp();
   const api = useApi();
   const { go, toast } = useNavigation();
@@ -1716,25 +1640,25 @@ export function AutomationsPage() {
   };
 
   return (
-    <Page
+    <Section
       title="Automations"
-      actions={
-        <button className="button" onClick={() => setCreating(true)}>
+      action={
+        <button className="button quiet" onClick={() => setCreating(true)}>
           <PlusIcon size={15} />
           New automation
         </button>
       }
     >
       {app.automations.length === 0 ? (
-        <Empty
-          title="No automations yet"
-          hint="An automation says what fires it, which agent acts, where it gets context, and where it reports."
-          action={
-            <button className="button primary" onClick={() => setCreating(true)}>
-              Create an automation
-            </button>
-          }
-        />
+        <div className="row">
+          <span className="grow">
+            <span className="name">No automations yet</span>
+            <span className="sub">
+              An automation says what fires it, which agent acts, where it gets
+              context, and where it reports.
+            </span>
+          </span>
+        </div>
       ) : (
         app.automations.map((automation) => {
           const agent = app.members.find(
@@ -1838,7 +1762,7 @@ export function AutomationsPage() {
           }}
         />
       )}
-    </Page>
+    </Section>
   );
 }
 
@@ -2272,7 +2196,7 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
     <Page
       wide
       title={automation.name}
-      back={{ label: "Automations", onClick: () => go({ kind: "automations" }) }}
+      back={{ label: "Workspace", onClick: () => go({ kind: "workspace" }) }}
       actions={
         <>
           <button
@@ -2475,7 +2399,7 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
             try {
               await api.deleteAutomation(automation.id);
               toast(`“${automation.name}” deleted`);
-              go({ kind: "automations" });
+              go({ kind: "workspace" });
             } catch (err) {
               toast(String((err as Error).message ?? err));
             }
@@ -2487,29 +2411,21 @@ export function AutomationDebugPage({ automationId }: { automationId: string }) 
   );
 }
 
-// --- settings --------------------------------------------------------------
+// --- the workspace ----------------------------------------------------------
 
-/// Settings is a handful of unrelated conversations: this workspace, the
-/// machines that run agents, remote access, the relay everything hangs off,
-/// the built-in agent's keys, and the app itself. One scroll made you hunt
-/// through all of them to change one thing, so each is a tab that stands alone.
-const SETTINGS_TABS = [
-  { id: "workspace", label: "Workspace", Icon: WorkspaceIcon },
-  { id: "machines", label: "Machines", Icon: MachineIcon },
-  { id: "remote", label: "Remote", Icon: PhoneIcon },
-  { id: "relay", label: "Relay", Icon: RelayIcon },
-  // Nothing to hold a key in a browser tab, so nothing to show there.
-  ...(inTauri ? [{ id: "agent", label: "Agent", Icon: AgentIcon }] : []),
-  { id: "app", label: "App", Icon: AppIcon },
-] as const;
-
-type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
-
-export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
+/// Everything the workspace is made of, on one page you scroll.
+///
+/// This was twelve destinations (agents, skills, projects, machines,
+/// automations and six settings tabs) for a set of things most people touch
+/// twice a year. Tabs made every one of them a place you had to already know
+/// about; a single scroll makes them things you pass on the way somewhere else.
+export function WorkspacePage({ onSignOut }: { onSignOut: () => void }) {
   const app = useApp();
-  const [tab, setTab] = useState<SettingsTab>("workspace");
   const [info, setInfo] = useState<DesktopInfo>();
 
+  // Which machines exist and whether they are up, not every heartbeat. The
+  // hosts array gets a new identity on each one, and re-asking this machine
+  // about itself forty times an hour is work nobody sees.
   const hostSignature = useHostSignature(app.hosts);
   useEffect(() => {
     void desktopInfo().then(setInfo);
@@ -2521,32 +2437,21 @@ export function SettingsPage({ onSignOut }: { onSignOut: () => void }) {
     )?.relay_url ?? "";
 
   return (
-    <Page title="Settings">
-      <div className="segmented settings-tabs">
-        {SETTINGS_TABS.map((option) => (
-          <button
-            key={option.id}
-            className={option.id === tab ? "active" : ""}
-            onClick={() => setTab(option.id)}
-          >
-            <option.Icon size={15} />
-            {option.label}
-          </button>
-        ))}
-      </div>
-
-      {tab === "workspace" && <WorkspaceSettings />}
-      {tab === "machines" && <MachineSettings info={info} />}
-      {tab === "remote" && <RemoteSettings />}
-      {tab === "relay" && <RelaySettings info={info} relayUrl={relayUrl} />}
-      {tab === "agent" && <ProviderSection />}
-      {tab === "app" && (
-        <AppSettings
-          info={info}
-          onChanged={async () => setInfo(await desktopInfo())}
-          onSignOut={onSignOut}
-        />
-      )}
+    <Page title="Workspace">
+      <ProjectsSection />
+      <MachineSettings info={info} />
+      <AutomationsSection />
+      <SkillsSection />
+      <WorkspaceSettings />
+      <RemoteSettings />
+      <RelaySettings info={info} relayUrl={relayUrl} />
+      {/* Nothing to hold a key in a browser tab, so nothing to show there. */}
+      {inTauri && <ProviderSection />}
+      <AppSettings
+        info={info}
+        onChanged={async () => setInfo(await desktopInfo())}
+        onSignOut={onSignOut}
+      />
     </Page>
   );
 }

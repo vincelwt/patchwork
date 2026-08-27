@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS messages (
   author_id     TEXT NOT NULL,
   kind          TEXT NOT NULL,
   body          TEXT NOT NULL DEFAULT '',
+  digest        TEXT NOT NULL DEFAULT '',
   card          TEXT,
   suggestions   TEXT NOT NULL DEFAULT '[]',
   parent_id     TEXT,
@@ -146,21 +147,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   key                   TEXT NOT NULL UNIQUE,
   title                 TEXT NOT NULL,
   outcome               TEXT NOT NULL DEFAULT '',
+  brief                 TEXT NOT NULL DEFAULT '',
+  -- Derived from runs, the open ask and `closed`; never chosen by an agent.
   status                TEXT NOT NULL,
+  -- The only status anybody sets: NULL, 'done' or 'canceled'.
+  closed                TEXT,
   owner_id              TEXT,
   source_channel_id     TEXT,
   source_message_id     TEXT,
-  background            INTEGER NOT NULL DEFAULT 0,
   discussion_channel_id TEXT NOT NULL,
   project_id            TEXT,
   host_id               TEXT,
   worktree_id           TEXT,
   current_run_id        TEXT,
   active_continuation   TEXT,
-  question_blocked_run_id TEXT,
   pr_url                TEXT,
   pr_state              TEXT,
-  review_action         TEXT,
   created_by            TEXT NOT NULL,
   due_at                INTEGER,
   once_key              TEXT,
@@ -265,23 +267,33 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 CREATE INDEX IF NOT EXISTS run_events_run ON run_events(run_id, seq);
 
-CREATE TABLE IF NOT EXISTS questions (
-  id          TEXT PRIMARY KEY,
-  run_id      TEXT NOT NULL,
-  agent_id    TEXT NOT NULL,
-  channel_id  TEXT NOT NULL,
-  task_id     TEXT,
-  message_id  TEXT,
-  headline    TEXT NOT NULL DEFAULT '',
-  items       TEXT NOT NULL,
-  status      TEXT NOT NULL,
-  answers     TEXT,
-  answered_by TEXT,
-  created_at  INTEGER NOT NULL,
-  answered_at INTEGER
+CREATE TABLE IF NOT EXISTS asks (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL DEFAULT 'answer',
+  run_id       TEXT,
+  agent_id     TEXT NOT NULL,
+  channel_id   TEXT NOT NULL,
+  task_id      TEXT,
+  message_id   TEXT,
+  text         TEXT NOT NULL DEFAULT '',
+  action       TEXT,
+  summary      TEXT NOT NULL DEFAULT '[]',
+  evidence_ids TEXT NOT NULL DEFAULT '[]',
+  options      TEXT NOT NULL DEFAULT '[]',
+  allow_free_text INTEGER NOT NULL DEFAULT 1,
+  multi_select INTEGER NOT NULL DEFAULT 0,
+  status       TEXT NOT NULL,
+  answer       TEXT NOT NULL DEFAULT '[]',
+  note         TEXT NOT NULL DEFAULT '',
+  answered_by  TEXT,
+  created_at   INTEGER NOT NULL,
+  answered_at  INTEGER
 );
-CREATE INDEX IF NOT EXISTS questions_run ON questions(run_id);
-CREATE INDEX IF NOT EXISTS questions_status ON questions(status);
+CREATE INDEX IF NOT EXISTS asks_run ON asks(run_id);
+CREATE INDEX IF NOT EXISTS asks_status ON asks(status);
+-- At most one open ask per task, enforced where it cannot be forgotten.
+CREATE UNIQUE INDEX IF NOT EXISTS asks_one_open_per_task
+  ON asks(task_id) WHERE status = 'open' AND task_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS inbox (
   id            TEXT PRIMARY KEY,

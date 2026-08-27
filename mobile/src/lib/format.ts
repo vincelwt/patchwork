@@ -4,8 +4,6 @@ import type {
   Message,
   Millis,
   RunStatus,
-  Task,
-  TaskStatus,
 } from "@client/types";
 
 export function relative(value?: Millis, now = Date.now()) {
@@ -62,23 +60,6 @@ export function bytes(value: number) {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
-export function taskStatusLabel(status: TaskStatus) {
-  return status[0].toUpperCase() + status.slice(1);
-}
-
-export function pullRequestLabel(task: Pick<Task, "pr_url" | "pr_state">) {
-  const number = task.pr_state?.number ?? pullRequestNumber(task.pr_url);
-  const prefix = number ? `PR #${number}` : "Pull request";
-  return task.pr_state?.state
-    ? `${prefix} · ${task.pr_state.state.toLowerCase()}`
-    : prefix;
-}
-
-function pullRequestNumber(url?: string) {
-  const match = url?.match(/\/pull\/(\d+)(?:[/?#]|$)/);
-  return match ? Number(match[1]) : undefined;
-}
-
 export function runStatusLabel(status: RunStatus) {
   if (status === "succeeded") return "Finished";
   if (status === "cancelled") return "Stopped";
@@ -111,20 +92,6 @@ export function triggerLabel(trigger: AutomationTrigger) {
 /// Only a successful command test writes this timestamp.
 export function watchValidated(automation: Automation) {
   return automation.last_validated_at !== undefined;
-}
-
-/// A new or edited command should be tested diagnostically. Testing never
-/// changes the user's enabled state.
-export function watchNeedsTest(
-  automation: Automation | undefined,
-  trigger: { type: string; command?: string },
-) {
-  if (trigger.type !== "watch") return false;
-  return !(
-    automation?.trigger.type === "watch" &&
-    automation.trigger.command === trigger.command &&
-    watchValidated(automation)
-  );
 }
 
 /// What a watch is worth relies on its last successful check, not its last

@@ -3,8 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 
 import type { AutomationDebug, WatchTestResult } from "@client/types";
-import { AutomationEditor } from "@/components/AutomationEditor";
-import { Badge, Button, Card, Empty, ErrorNotice, Measured, Sheet } from "@/components/ui";
+import { Badge, Button, Card, Empty, ErrorNotice, Measured } from "@/components/ui";
 import { relative, runStatusLabel, triggerLabel, watchValidated } from "@/lib/format";
 import { usePairedSession } from "@/lib/session";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
@@ -19,8 +18,6 @@ export default function AutomationScreen() {
   const { session } = usePairedSession();
   const automation = workspace.bootstrap?.automations.find((item) => item.id === automationId);
   const [debug, setDebug] = useState<AutomationDebug>();
-  const [editing, setEditing] = useState(false);
-  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState<WatchTestResult>();
@@ -48,12 +45,7 @@ export default function AutomationScreen() {
 
   return (
     <View style={[styles.fill, { backgroundColor: theme.bg }]}>
-      <Stack.Screen
-        options={{
-          title: automation.name,
-          headerRight: () => <Button label="Edit" compact tone="quiet" onPress={() => setEditing(true)} />,
-        }}
-      />
+      <Stack.Screen options={{ title: automation.name }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.scroll}>
        <Measured style={styles.measured}>
         <Card style={styles.card}>
@@ -107,7 +99,6 @@ export default function AutomationScreen() {
                 }}
               />
             ) : null}
-            <Button label="Delete" compact tone="danger" onPress={() => setDeleting(true)} />
           </View>
         </Card>
         <Text style={[styles.section, { color: theme.faint }]}>Instructions</Text>
@@ -196,15 +187,6 @@ export default function AutomationScreen() {
         <ErrorNotice message={error} />
        </Measured>
       </ScrollView>
-      <Sheet visible={editing} title={`Edit ${automation.name}`} onClose={() => setEditing(false)}>
-        <AutomationEditor automation={automation} onSaved={() => { setEditing(false); void load(); }} />
-      </Sheet>
-      <Sheet visible={deleting} title={`Delete ${automation.name}?`} onClose={() => setDeleting(false)}>
-        <View style={styles.confirm}>
-          <Text style={{ color: theme.muted, lineHeight: 21 }}>It stops firing immediately. Runs already created remain in the record.</Text>
-          <Button label="Delete automation" tone="danger" onPress={async () => { await store.mutate((api) => api.deleteAutomation(automation.id)); router.replace("/(app)/automations"); }} />
-        </View>
-      </Sheet>
     </View>
   );
 }
@@ -222,5 +204,4 @@ const styles = StyleSheet.create({
   section: { fontSize: 13, fontWeight: "600", marginTop: 6 },
   instructions: { padding: 14, gap: 8 },
   runRow: { minHeight: 62, flexDirection: "row", alignItems: "center", gap: 10, padding: 12, borderBottomWidth: StyleSheet.hairlineWidth },
-  confirm: { padding: 18, gap: 16 },
 });

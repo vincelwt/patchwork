@@ -46,7 +46,7 @@ const bootstrap: Bootstrap = {
   tasks: [],
   inbox: [],
   automations: [],
-  open_questions: [],
+  open_asks: [],
   active_runs: [],
   previews: [],
   seq: 10,

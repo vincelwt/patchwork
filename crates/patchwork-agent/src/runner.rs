@@ -104,8 +104,8 @@ impl Runner {
                     token_usage: None,
                 });
             }
-            RelayToHost::QuestionAsked { ref run_id }
-            | RelayToHost::AnswerQuestion { ref run_id, .. } => {
+            RelayToHost::AskOpened { ref run_id }
+            | RelayToHost::AnswerAsk { ref run_id, .. } => {
                 if let Some(h) = self.runs.lock().await.active.get(run_id) {
                     let _ = h.control.send(msg.clone());
                 }
@@ -377,7 +377,7 @@ fn reject_pending(pending: &mut VecDeque<QueuedControl>, run_id: &str, out: &Sin
     }
 }
 
-async fn begin_message_after_question(state: &Arc<Mutex<TurnState>>) {
+async fn begin_message_after_ask(state: &Arc<Mutex<TurnState>>) {
     let mut turn = state.lock().await;
     turn.message.clear();
     turn.message_phase = None;
@@ -645,13 +645,13 @@ async fn execute(
                         conn.cancel(&session_id);
                         break Ok("cancelled".to_string());
                     }
-                    Some(RelayToHost::QuestionAsked { .. }) => {
-                        begin_message_after_question(&state).await;
+                    Some(RelayToHost::AskOpened { .. }) => {
+                        begin_message_after_ask(&state).await;
                     }
-                    Some(RelayToHost::AnswerQuestion { .. }) => {
+                    Some(RelayToHost::AnswerAsk { .. }) => {
                         // The HTTP long-poll carries the value; this signal
                         // preserves the message boundary if the earlier one was lost.
-                        begin_message_after_question(&state).await;
+                        begin_message_after_ask(&state).await;
                     }
                     Some(_) => {}
                     None => break (&mut prompt_call).await,
@@ -802,9 +802,9 @@ async fn execute(
                             conn.cancel(&session_id);
                             break;
                         }
-                        Some(RelayToHost::QuestionAsked { .. })
-                        | Some(RelayToHost::AnswerQuestion { .. }) => {
-                            begin_message_after_question(&state).await;
+                        Some(RelayToHost::AskOpened { .. })
+                        | Some(RelayToHost::AnswerAsk { .. }) => {
+                            begin_message_after_ask(&state).await;
                         }
                         Some(_) => {}
                         None => return Err(anyhow!(
@@ -1537,10 +1537,23 @@ fn parse_env(text: &str) -> Vec<(String, String)> {
 /// The Patchwork skill: how an agent talks back to the workspace it lives in.
 pub const SKILL: &str = include_str!("../skill/PATCHWORK.md");
 
+/// The rest, written beside it and read only when the work calls for them. Four
+/// subjects most runs never touch cost four filenames in the core instead of
+/// 170 lines every agent has to skim past to find the part that matters.
+const REFERENCE: [(&str, &str); 4] = [
+    ("AUTOMATIONS.md", include_str!("../skill/AUTOMATIONS.md")),
+    ("WAITING.md", include_str!("../skill/WAITING.md")),
+    ("CHARTS.md", include_str!("../skill/CHARTS.md")),
+    ("ADMIN.md", include_str!("../skill/ADMIN.md")),
+];
+
 async fn write_skill(cwd: &str) {
     let dir = std::path::Path::new(cwd).join(".patchwork");
     if tokio::fs::create_dir_all(&dir).await.is_ok() {
         let _ = tokio::fs::write(dir.join("PATCHWORK.md"), SKILL).await;
+        for (name, body) in REFERENCE {
+            let _ = tokio::fs::write(dir.join(name), body).await;
+        }
         let _ = tokio::fs::write(dir.join(".gitignore"), "*\n").await;
     }
 }
@@ -1895,7 +1908,7 @@ sleep 5
     }
 
     #[tokio::test]
-    async fn a_confirmed_question_starts_a_new_transcript_message() {
+    async fn a_confirmed_ask_starts_a_new_transcript_message() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(TurnState::default()));
         let chunk = |text: &str| {
@@ -1906,7 +1919,7 @@ sleep 5
         };
 
         handle_update("r1", chunk("Before."), &tx, &state).await;
-        begin_message_after_question(&state).await;
+        begin_message_after_ask(&state).await;
         assert!(state.lock().await.message.is_empty());
 
         handle_update("r1", chunk("After."), &tx, &state).await;

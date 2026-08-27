@@ -4,8 +4,8 @@ import { router, Stack, useFocusEffect } from "expo-router";
 import type { SearchBarCommands } from "react-native-screens";
 
 import type { SearchResults } from "@client/types";
-import { Badge, ErrorNotice, Glass, Icon, Measured, Screen } from "@/components/ui";
-import { relative, taskStatusLabel } from "@/lib/format";
+import { ErrorNotice, Glass, Icon, Measured, Screen } from "@/components/ui";
+import { relative } from "@/lib/format";
 import { useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -127,7 +127,7 @@ export default function SearchScreen() {
           <SearchPrompt
             icon={{ ios: "magnifyingglass", android: "search", web: "search" }}
             title="Search your workspace"
-            detail="Find messages, task titles, and outcomes as you type."
+            detail="Find messages and tasks as you type."
           />
         ) : results && total === 0 && !loading ? (
           <SearchPrompt
@@ -178,8 +178,8 @@ export default function SearchScreen() {
                         <Icon name={{ ios: "checkmark.circle", android: "task_alt", web: "task_alt" }} color={theme.positive} size={19} />
                       </View>
                       <View style={styles.main}>
-                        <Text numberOfLines={2} style={[styles.title, { color: theme.text }]}>{task.key} · {task.title || task.outcome}</Text>
-                        <Badge>{taskStatusLabel(task.status)}</Badge>
+                        <Text numberOfLines={2} style={[styles.title, { color: theme.text }]}>{task.title}</Text>
+                        {task.brief ? <Text numberOfLines={2} style={[styles.snippet, { color: theme.muted }]}>{task.brief}</Text> : null}
                       </View>
                       <Icon name={{ ios: "chevron.right", android: "chevron_right", web: "chevron_right" }} color={theme.faint} size={15} />
                     </Pressable>
