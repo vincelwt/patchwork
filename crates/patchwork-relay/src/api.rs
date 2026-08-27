@@ -1705,11 +1705,11 @@ async fn open_ask(
         }
         None => None,
     };
-    let task_id = input
+    let reference = input
         .task_id
         .clone()
         .or_else(|| run.as_ref().and_then(|run| run.task_id.clone()));
-    let task = match &task_id {
+    let task = match &reference {
         Some(id) => Some(
             state
                 .store
@@ -1718,6 +1718,10 @@ async fn open_ask(
         ),
         None => None,
     };
+    // Callers name a task however they read it — "PW-102" as often as its id —
+    // so the ask hangs off what the reference resolved to. Stored raw, the ask
+    // belongs to no task: no card, no status, and nothing to answer it from.
+    let task_id = task.as_ref().map(|task| task.id.clone());
     if let Some(task) = &task {
         if task.status.is_terminal() {
             return Err(ApiError::conflict("that task is already closed"));
@@ -5115,12 +5119,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        // Named by its key, the way a person or an agent reads it back. The
+        // ask must hang off the task that resolved to, or it belongs to no
+        // task at all: no card, no status, and nothing to answer it from.
         let response = router(state.clone())
             .oneshot(ask_as(
                 &answer_run_token,
                 format!(
                     r#"{{"kind":"review","task_id":"{}","text":"Is this the answer you needed?","summary":["It indexes task titles and outcomes"]}}"#,
-                    auto_reviewed.id
+                    auto_reviewed.key
                 ),
             ))
             .await

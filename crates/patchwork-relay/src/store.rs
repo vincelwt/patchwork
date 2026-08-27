@@ -3073,12 +3073,21 @@ impl Store {
         Ok(())
     }
 
+    /// What actually reached this person. An ask that is no longer open needs
+    /// nobody, whatever row it left behind: it can close by being answered, by
+    /// its run ending, by being superseded, or by the task closing under it,
+    /// and one of those paths will always forget to clear the notification. So
+    /// the row is only ever shown while the ask behind it is still open, which
+    /// also retires the ones a migration brought over from the old model.
     pub fn inbox(&self, member_id: &str, include_read: bool) -> Result<Vec<InboxItem>> {
         let conn = self.conn()?;
         let sql = if include_read {
-            "SELECT * FROM inbox WHERE member_id = ?1 ORDER BY id DESC LIMIT 200"
+            "SELECT * FROM inbox WHERE member_id = ?1 AND (kind != 'ask' OR message_id IN
+              (SELECT message_id FROM asks WHERE status = 'open')) ORDER BY id DESC LIMIT 200"
         } else {
-            "SELECT * FROM inbox WHERE member_id = ?1 AND read_at IS NULL ORDER BY id DESC LIMIT 200"
+            "SELECT * FROM inbox WHERE member_id = ?1 AND read_at IS NULL AND (kind != 'ask' OR
+              message_id IN (SELECT message_id FROM asks WHERE status = 'open'))
+             ORDER BY id DESC LIMIT 200"
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![member_id], |r| Self::inbox_from_row(r))?;
@@ -5633,6 +5642,52 @@ mod tests {
         assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_none());
         store.mark_inbox_read("item", "two").unwrap();
         assert!(store.inbox_item("item").unwrap().unwrap().read_at.is_some());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_inbox_only_carries_an_ask_while_the_ask_is_open() {
+        let (store, path) = store();
+        let item = |id: &str, message_id: Option<&str>| InboxItem {
+            id: id.into(),
+            member_id: "human".into(),
+            kind: InboxKind::Ask,
+            title: "Ready for review".into(),
+            preview: String::new(),
+            actor_id: None,
+            channel_id: Some("channel".into()),
+            message_id: message_id.map(str::to_string),
+            task_id: Some("task".into()),
+            run_id: Some("run".into()),
+            automation_id: None,
+            created_at: 1,
+            read_at: None,
+        };
+        let mut open = ask("open", Some("run"), Some("task"));
+        open.message_id = Some("asking".into());
+        let mut closed = ask("closed", Some("other-run"), Some("other-task"));
+        closed.message_id = Some("answered".into());
+        store.commit_ask(&open, None, &[], false).unwrap();
+        store.commit_ask(&closed, None, &[], false).unwrap();
+        store
+            .answer_ask("closed", &["looks good".into()], "", "human")
+            .unwrap();
+        store.insert_inbox(&item("live", Some("asking"))).unwrap();
+        store.insert_inbox(&item("stale", Some("answered"))).unwrap();
+        // What a migration leaves behind: an ask item with no ask at all.
+        store.insert_inbox(&item("legacy", None)).unwrap();
+
+        for include_read in [false, true] {
+            let ids = store
+                .inbox("human", include_read)
+                .unwrap()
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["live".to_string()]);
+        }
+
         drop(store);
         let _ = std::fs::remove_file(path);
     }
