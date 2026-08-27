@@ -24,6 +24,11 @@ export interface Layout {
 /// paints the title straight onto the first row of the list.
 export const largeTitles = process.env.EXPO_OS === "ios";
 
+/// iOS already insets a scroll view that adjusts its content automatically
+/// clear of the status bar, so a screen drawing its own title row there must
+/// not pay the top inset a second time. Android adjusts nothing, so it does.
+export const autoTopInset = process.env.EXPO_OS === "ios";
+
 /// What an upside-down transcript does when an entry arrives. Inverted, offset
 /// zero is the newest end, so pinning the first item keeps whatever an unhurried
 /// reader is looking at exactly where it is, and the threshold lets a reader who

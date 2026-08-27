@@ -6,10 +6,9 @@ import { groupInbox, unreadInboxCount } from "@client/inbox";
 import type { InboxGroup } from "@client/inbox";
 import type { Ask, InboxItem, InboxKind } from "@client/types";
 import { AskCard } from "@/components/AskCard";
-import { WorkspaceMark } from "@/components/WorkspaceSwitcher";
 import { Avatar, Button, Empty, Icon, Measured, Screen } from "@/components/ui";
 import { relative } from "@/lib/format";
-import { usePairedSession } from "@/lib/session";
+import { autoTopInset } from "@/lib/layout";
 import { useWorkspace, useWorkspaceStore } from "@/lib/store";
 import { useTheme } from "@/lib/theme";
 
@@ -26,7 +25,6 @@ export default function HomeScreen() {
   const workspace = useWorkspace();
   const store = useWorkspaceStore();
   const insets = useSafeAreaInsets();
-  const { session } = usePairedSession();
   const data = workspace.bootstrap;
   const groups = groupInbox(data?.inbox ?? []);
   const unread = unreadInboxCount(data?.inbox ?? []);
@@ -50,10 +48,13 @@ export default function HomeScreen() {
         false,
       ).catch(() => undefined);
     }
+    // What arrived was said somewhere, so it opens where it was said. A run's
+    // activity log is a drill-down from there, never the destination for
+    // something addressed to a person.
     if (item.task_id) return router.push({ pathname: "/tasks/[taskId]", params: { taskId: item.task_id } });
-    if (item.run_id) return router.push({ pathname: "/(app)/runs/[runId]", params: { runId: item.run_id } });
     if (item.channel_id) return router.push({ pathname: "/channels/[channelId]", params: { channelId: item.channel_id } });
     if (item.automation_id) return router.push({ pathname: "/(app)/automations/[automationId]", params: { automationId: item.automation_id } });
+    if (item.run_id) return router.push({ pathname: "/(app)/runs/[runId]", params: { runId: item.run_id } });
   };
 
   return (
@@ -71,20 +72,11 @@ export default function HomeScreen() {
         )}
         ListHeaderComponent={
           <Measured>
-            <View style={[styles.titleRow, { paddingTop: insets.top + 8 }]}>
+            <View style={[styles.titleRow, { paddingTop: (autoTopInset ? 0 : insets.top) + 8 }]}>
               <Text accessibilityRole="header" style={[styles.screenTitle, { color: theme.text }]}>Home</Text>
               {unread ? (
                 <Button label="Read all" compact tone="quiet" onPress={() => void store.mutate((api) => api.markAllRead())} />
               ) : null}
-              {/* Which workspace this is, and everything the phone only reads. */}
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Workspace and settings"
-                hitSlop={8}
-                onPress={() => router.push("/(app)/more")}
-              >
-                {session ? <WorkspaceMark session={session} size={30} /> : null}
-              </Pressable>
             </View>
             <View style={styles.asks}>
               {asks.map((ask) => <AskCard key={ask.id} ask={ask} />)}

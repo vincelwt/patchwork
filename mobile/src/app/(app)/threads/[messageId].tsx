@@ -37,7 +37,7 @@ export default function ThreadScreen() {
 
   return (
     <View style={styles.fill}>
-      <Stack.Screen options={{ title: "Thread", headerBackTitle: "Back" }} />
+      <Stack.Screen options={{ title: "Thread", headerBackTitle: "Back", headerTransparent: false }} />
       {!root || !channel ? (
         <Empty title="Thread unavailable" detail="Open it from its conversation so the original message can be loaded." />
       ) : (

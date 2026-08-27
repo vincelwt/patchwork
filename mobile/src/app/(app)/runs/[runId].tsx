@@ -39,7 +39,7 @@ export default function RunScreen() {
   if (!run) {
     return (
       <View style={styles.fill}>
-        <Stack.Screen options={{ title: "Run" }} />
+        <Stack.Screen options={{ title: "Run", headerTransparent: false }} />
         <Empty title="Loading run" />
       </View>
     );
@@ -50,6 +50,9 @@ export default function RunScreen() {
       <Stack.Screen
         options={{
           title: agent?.display_name || "Agent run",
+          // An upside-down list insets its newest end, not its top, so a
+          // transparent bar would have the summary card sliding under it.
+          headerTransparent: false,
           headerRight: active
             ? () => <Button label="Stop" compact tone="danger" onPress={() => void store.mutate((api) => api.cancelRun(run.id))} />
             : undefined,

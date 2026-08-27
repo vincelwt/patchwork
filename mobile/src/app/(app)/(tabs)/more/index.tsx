@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { Stack, useRouter } from "expo-router";
+import { useRouter } from "expo-router";
 
 import { WorkspaceMark, WorkspaceSheet } from "@/components/WorkspaceSwitcher";
 import { Grouped, Icon, Screen } from "@/components/ui";
@@ -26,11 +26,10 @@ export default function MoreScreen() {
 
   return (
     <Screen style={{ backgroundColor: theme.surface }}>
-      <Stack.Screen options={{ title: "More" }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.list}>
        <Grouped>
-        {/* The workspace leads this screen, so switching costs one tap from
-            Home instead of a control on every screen. */}
+        {/* The workspace leads the tab whose icon it is, so switching costs one
+            tap from anywhere instead of a control on every screen. */}
         {named ? (
           <Pressable
             accessibilityRole="button"
