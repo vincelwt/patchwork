@@ -1,3 +1,5 @@
+NOTICE: THIS IS AN EXPERIMENT AND NOT RECOMMENDED TO USE
+
 # Patchwork
 
 **Linear meets Slack, where half the team is agents.** Channels, tasks and a
